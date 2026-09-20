@@ -1,0 +1,45 @@
+# --- data / model artifacts (never commit; multi-GB) ---
+data/
+data_smoke/
+teacher_out/
+teacher_out_smoke/
+checkpoints/
+runs/
+outputs/
+*.flac
+*.ogg
+*.wav
+*.mp3
+*.tar
+*.parquet
+*.arrow
+*.npy
+*.npz
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# --- HF / experiment caches ---
+.cache/
+hf_cache/
+wandb/
+tensorboard/
+*.log
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+
+# --- os / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/

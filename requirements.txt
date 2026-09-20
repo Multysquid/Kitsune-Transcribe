@@ -1,0 +1,14 @@
+# torch: install the CUDA build separately, see README
+transformers>=5.13
+huggingface_hub>=1.0
+datasets>=5.0
+pyarrow
+numpy
+soundfile>=0.13
+librosa
+tqdm
+jiwer
+evaluate
+accelerate
+bitsandbytes
+sentencepiece
