@@ -9,8 +9,11 @@ exits 0; after two consecutive attempts without a finished shard it escalates to
 (serialised launches, ~1.8x slower) until progress resumes, and gives up only after three blocking-mode attempts
 in a row make no progress (that is a deterministic failure that needs a human).
 
-Usage: python scripts/run_teacher_pass.py [any 02_teacher_pass.py arguments]
+Usage: python scripts/run_teacher_pass.py [supervisor options] [any wrapped-script arguments]
+Supervisor options: --script <path> (default scripts/02_teacher_pass.py), --watch-dir <dir> and
+--done-suffix <ext> override where finished-shard files are counted (progress detection).
 """
+import argparse
 import os
 import subprocess
 import sys
@@ -18,36 +21,43 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "02_teacher_pass.py"
-
-
-def n_done(out_root: Path) -> int:
-    return sum(1 for _ in out_root.rglob("*.npz")) if out_root.exists() else 0
 
 
 def main():
-    args = sys.argv[1:]
-    out_root = ROOT / "teacher_out"
-    if "--out" in args:
+    sup = argparse.ArgumentParser(add_help=False)
+    sup.add_argument("--script", default=str(ROOT / "scripts" / "02_teacher_pass.py"))
+    sup.add_argument("--watch-dir", default=None)
+    sup.add_argument("--done-suffix", default=".npz")
+    opts, args = sup.parse_known_args()
+    script = Path(opts.script)
+
+    if opts.watch_dir:
+        out_root = Path(opts.watch_dir)
+    elif "--out" in args:
         out_root = Path(args[args.index("--out") + 1])
     elif "--limit-rows" in args:
         out_root = ROOT / "teacher_out_smoke"
+    else:
+        out_root = ROOT / "teacher_out"
+
+    def n_done(root: Path = out_root) -> int:
+        return sum(1 for f in root.rglob(f"*{opts.done_suffix}")) if root.exists() else 0
 
     attempt, stalled, stalled_blocking, t0 = 0, 0, 0, time.time()
     while True:
         attempt += 1
         blocking = stalled >= 2
-        before = n_done(out_root)
+        before = n_done()
         print(f"=== attempt {attempt}: {before} shards done, {(time.time() - t0) / 60:.0f} min elapsed"
               f"{', CUDA_LAUNCH_BLOCKING=1' if blocking else ''} ===", flush=True)
         env = dict(os.environ, CUDA_LAUNCH_BLOCKING="1") if blocking else None
         # a blocking attempt only clears the stuck shard (shards complete in manifest order), then we go back to fast mode
         extra = ["--limit-shards", str(before + 1)] if blocking else []
-        rc = subprocess.run([sys.executable, str(SCRIPT), *args, *extra], env=env).returncode
+        rc = subprocess.run([sys.executable, str(script), *args, *extra], env=env).returncode
         if rc == 0 and not blocking:
             print(f"=== finished after {attempt} attempt(s), {(time.time() - t0) / 3600:.2f} h ===", flush=True)
             return 0
-        after = n_done(out_root)
+        after = n_done()
         if after > before:
             stalled, stalled_blocking = 0, 0
         else:

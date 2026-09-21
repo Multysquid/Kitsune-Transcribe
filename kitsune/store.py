@@ -10,6 +10,7 @@ A shard's manifest line is appended the moment the shard is flushed, so an inter
 finished shards; `progress.json` records which input files are complete so a re-run skips them.
 """
 import json
+import os
 import shutil
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -33,6 +34,13 @@ SCHEMA = pa.schema(
 ROWS_PER_SHARD = 2048  # ~150-400 MB per shard; small enough for cheap random access at train time
 
 
+def fsync_path(path: Path):
+    """Flush a file's data to disk. A hard process kill after rename-over can otherwise leave the target
+    full of NUL bytes on NTFS (metadata committed, data blocks never written) - observed in practice."""
+    with open(path, "rb+") as f:
+        os.fsync(f.fileno())
+
+
 @dataclass
 class ShardInfo:
     path: str  # relative to data root, forward slashes
@@ -47,9 +55,19 @@ def manifest_path(root: Path) -> Path:
 
 
 def append_manifest(root: Path, shards: list[ShardInfo]):
-    with open(manifest_path(root), "a", encoding="utf-8") as f:
+    p = manifest_path(root)
+    lead = ""
+    if p.exists() and p.stat().st_size > 0:
+        with open(p, "rb") as g:  # a torn line from a killed append must not swallow the next good line
+            g.seek(-1, os.SEEK_END)
+            if g.read(1) != b"\n":
+                lead = "\n"
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(lead)
         for s in shards:
             f.write(json.dumps(asdict(s), ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def write_manifest(root: Path, shards: list[ShardInfo]):
@@ -59,6 +77,8 @@ def write_manifest(root: Path, shards: list[ShardInfo]):
     with open(tmp, "w", encoding="utf-8") as f:
         for s in shards:
             f.write(json.dumps(asdict(s), ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(p)
 
 
@@ -66,15 +86,22 @@ def read_manifest(root: Path) -> list[ShardInfo]:
     p = manifest_path(root)
     if not p.exists():
         return []
-    out, seen = [], set()
-    with open(p, encoding="utf-8") as f:
+    out, seen, bad = [], set(), 0
+    with open(p, encoding="utf-8", errors="replace") as f:
         for line in f:
             if not line.strip():
                 continue
-            s = ShardInfo(**json.loads(line))
+            try:
+                s = ShardInfo(**json.loads(line))
+            except (json.JSONDecodeError, TypeError):
+                bad += 1  # a process killed mid-append leaves a garbage line; its shard is re-ingested on resume
+                continue
             if s.path not in seen:  # append-only file; tolerate a duplicated line
                 seen.add(s.path)
                 out.append(s)
+    if bad:
+        print(f"  manifest: skipped {bad} corrupt line(s); shard files not in the manifest are orphans "
+              f"(safe to delete - their rows were re-ingested)")
     return out
 
 
@@ -94,6 +121,7 @@ def save_progress(root: Path, source: str, progress: dict):
     d.mkdir(parents=True, exist_ok=True)
     tmp = d / "progress.json.tmp"
     tmp.write_text(json.dumps(progress, indent=1), encoding="utf-8")
+    fsync_path(tmp)
     tmp.replace(d / "progress.json")
 
 
@@ -136,6 +164,7 @@ class ShardWriter:
         tmp = path.with_suffix(".parquet.tmp")
         table = pa.Table.from_pylist(self.buf, schema=SCHEMA)
         pq.write_table(table, tmp, compression="none", row_group_size=256)  # audio is already compressed
+        fsync_path(tmp)
         tmp.replace(path)
         hours = sum(r["duration"] for r in self.buf) / 3600
         info = ShardInfo(str(path.relative_to(self.root)).replace("\\", "/"), self.source, self.split, len(self.buf), hours)
