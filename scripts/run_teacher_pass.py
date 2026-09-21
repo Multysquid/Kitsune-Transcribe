@@ -1,13 +1,17 @@
 """Supervisor for 02_teacher_pass.py: relaunch it when the process dies.
 
 Why: on this laptop the GPU intermittently throws `CUDA error: an illegal instruction was encountered` (~once per
-few hundred batches, independent of allocator / cuDNN / attention kernel / TF32 / threading - verified). A CUDA
-fault poisons the process, but the teacher pass is atomic per shard and resumes from the next unfinished shard,
-so a restart costs ~20 s. This wrapper restarts until the pass exits 0, and gives up if three consecutive attempts
-make no progress (a deterministic failure that needs a human).
+few hundred batches, independent of allocator / cuDNN / attention kernel / TF32 / threading - verified). The
+faults cluster on some shards' long-utterance batches, but every diagnostic run with CUDA_LAUNCH_BLOCKING=1
+survived, so it looks timing/power dependent. A CUDA fault poisons the process, but the teacher pass is atomic per
+shard and resumes from the next unfinished shard, so a restart costs ~20 s. This wrapper restarts until the pass
+exits 0; after two consecutive attempts without a finished shard it escalates to CUDA_LAUNCH_BLOCKING=1
+(serialised launches, ~1.8x slower) until progress resumes, and gives up only after three blocking-mode attempts
+in a row make no progress (that is a deterministic failure that needs a human).
 
 Usage: python scripts/run_teacher_pass.py [any 02_teacher_pass.py arguments]
 """
+import os
 import subprocess
 import sys
 import time
@@ -29,21 +33,30 @@ def main():
     elif "--limit-rows" in args:
         out_root = ROOT / "teacher_out_smoke"
 
-    attempt, stalled, t0 = 0, 0, time.time()
+    attempt, stalled, stalled_blocking, t0 = 0, 0, 0, time.time()
     while True:
         attempt += 1
+        blocking = stalled >= 2
         before = n_done(out_root)
-        print(f"=== attempt {attempt}: {before} shards done, {(time.time() - t0) / 60:.0f} min elapsed ===", flush=True)
-        rc = subprocess.run([sys.executable, str(SCRIPT), *args]).returncode
-        if rc == 0:
+        print(f"=== attempt {attempt}: {before} shards done, {(time.time() - t0) / 60:.0f} min elapsed"
+              f"{', CUDA_LAUNCH_BLOCKING=1' if blocking else ''} ===", flush=True)
+        env = dict(os.environ, CUDA_LAUNCH_BLOCKING="1") if blocking else None
+        # a blocking attempt only clears the stuck shard (shards complete in manifest order), then we go back to fast mode
+        extra = ["--limit-shards", str(before + 1)] if blocking else []
+        rc = subprocess.run([sys.executable, str(SCRIPT), *args, *extra], env=env).returncode
+        if rc == 0 and not blocking:
             print(f"=== finished after {attempt} attempt(s), {(time.time() - t0) / 3600:.2f} h ===", flush=True)
             return 0
         after = n_done(out_root)
-        stalled = stalled + 1 if after == before else 0
-        print(f"=== attempt {attempt} died (exit {rc}); progress {before} -> {after} shards; "
-              f"{'no progress ' + str(stalled) + 'x' if stalled else 'restarting'} ===", flush=True)
-        if stalled >= 3:
-            print("=== giving up: three attempts without progress ===", flush=True)
+        if after > before:
+            stalled, stalled_blocking = 0, 0
+        else:
+            stalled += 1
+            stalled_blocking = stalled_blocking + 1 if blocking else 0
+        print(f"=== attempt {attempt} ended (exit {rc}); progress {before} -> {after} shards; "
+              f"stalled {stalled}x (blocking {stalled_blocking}x) ===", flush=True)
+        if stalled_blocking >= 3:
+            print("=== giving up: three blocking-mode attempts without progress ===", flush=True)
             return rc
         time.sleep(10)  # let the driver settle before re-creating the context
 
