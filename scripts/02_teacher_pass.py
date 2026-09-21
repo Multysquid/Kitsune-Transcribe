@@ -49,9 +49,10 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 from transformers import AutoProcessor, CohereAsrForConditionalGeneration  # noqa: E402
-from transformers.generation import StoppingCriteria, StoppingCriteriaList  # noqa: E402
+from transformers.generation import StoppingCriteriaList  # noqa: E402
 
 from kitsune.audio import TARGET_SR, decode_audio  # noqa: E402
+from kitsune.generation import RepetitionStop  # noqa: E402
 from kitsune.store import read_manifest, read_shard  # noqa: E402
 from kitsune.text import cer as cer_fn  # noqa: E402
 
@@ -77,24 +78,6 @@ def fp32_head(model):
             head.bias.copy_(old.bias)
     head.requires_grad_(False)
     model.proj_out = head
-
-
-class RepetitionStop(StoppingCriteria):
-    """Stop a row once its last `window` generated tokens are periodic (period <= max_period): a decoder loop.
-    Without this one runaway row pins the whole batch to max_new_tokens, and the decode loop is latency-bound."""
-
-    def __init__(self, prompt_len: int, window: int = 24, max_period: int = 12):
-        self.prompt_len, self.window, self.max_period = prompt_len, window, max_period
-
-    def __call__(self, input_ids, scores, **kwargs):
-        gen = input_ids[:, self.prompt_len:]
-        done = torch.zeros(gen.shape[0], dtype=torch.bool, device=gen.device)
-        if gen.shape[1] < self.window:
-            return done
-        last = gen[:, -self.window:]
-        for p in range(1, self.max_period + 1):
-            done |= (last[:, p:] == last[:, :-p]).all(dim=1)
-        return done
 
 
 def make_batches(durations: np.ndarray, max_batch_seconds: float, max_batch: int) -> list[np.ndarray]:
