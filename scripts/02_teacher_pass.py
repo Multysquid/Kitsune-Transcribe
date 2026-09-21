@@ -193,19 +193,32 @@ def process_shard(model, processor, shard_path: Path, out_dir: Path, args, pool:
 
     # decode + featurise batch j+1.. on CPU threads while the GPU is busy with batch j
     def prepare(idx):
-        audios = [decode_audio(audio_col[int(i)].as_py()) for i in idx]
-        return processor(audios, language=LANG, punctuation=PUNCT, sampling_rate=TARGET_SR, return_tensors="pt")
+        audios, ok = [], []
+        for i in idx:
+            try:  # ingest only checked the container header; a truncated payload still fails full decode
+                audios.append(decode_audio(audio_col[int(i)].as_py()))
+                ok.append(int(i))
+            except Exception as e:
+                tqdm.write(f"  bad audio, skipping {ids[int(i)]}: {e}")
+        ok = np.array(ok, dtype=np.int64)
+        if not audios:
+            return None, ok
+        return processor(audios, language=LANG, punctuation=PUNCT, sampling_rate=TARGET_SR, return_tensors="pt"), ok
 
     prefetch = max(1, args.prefetch)
     futures = [pool.submit(prepare, b) for b in batches[:prefetch]]
     per = {}  # row index -> dict
     audio_seconds = 0.0
+    bad_decode = 0
     prompt = None
-    for j, b in enumerate(tqdm(batches, desc=shard_path.stem, unit="batch", leave=False)):
-        inputs = futures[j].result()
+    for j, full_b in enumerate(tqdm(batches, desc=shard_path.stem, unit="batch", leave=False)):
+        inputs, b = futures[j].result()
         if j + prefetch < len(batches):
             futures.append(pool.submit(prepare, batches[j + prefetch]))
         futures[j] = None
+        bad_decode += len(full_b) - len(b)
+        if inputs is None:
+            continue
         r = run_batch(model, inputs, float(durs[b].max()), args.k, args.save_encoder)
         for bi, i in enumerate(b):
             L = r["lengths"][bi]
@@ -256,8 +269,8 @@ def process_shard(model, processor, shard_path: Path, out_dir: Path, args, pool:
         np.savez(f, **packed)
     npz.with_suffix(".npz.tmp").replace(npz)  # npz last: its presence marks the shard as done
 
-    return dict(rows=len(rows), skipped_long=skipped_long, audio_s=audio_seconds, wall_s=time.time() - t0,
-                mean_cer=float(cers.mean()) if len(cers) else float("nan"),
+    return dict(rows=len(rows), skipped_long=skipped_long, bad_decode=bad_decode, audio_s=audio_seconds,
+                wall_s=time.time() - t0, mean_cer=float(cers.mean()) if len(cers) else float("nan"),
                 truncated=int(sum(per[i]["truncated"] for i in rows)), prompt=prompt)
 
 
@@ -329,7 +342,7 @@ def main():
     print(f"teacher loaded: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B params, "
           f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB")
 
-    totals = dict(rows=0, skipped_long=0, audio_s=0.0, wall_s=0.0, truncated=0)
+    totals = dict(rows=0, skipped_long=0, bad_decode=0, audio_s=0.0, wall_s=0.0, truncated=0)
     remaining_h = sum(s.hours for s in todo)
     with ThreadPoolExecutor(max_workers=4) as pool:
         for s in tqdm(todo, desc="shards", unit="shard"):
@@ -342,7 +355,7 @@ def main():
             eta_h = remaining_h * rtf
             tqdm.write(f"{s.source}/{shard_path.stem}: {r['rows']} utts, {r['audio_s'] / 3600:.2f} h in {r['wall_s'] / 60:.1f} min "
                        f"(RTF {r['wall_s'] / max(r['audio_s'], 1e-6):.4f}), CER vs ref {r['mean_cer']:.3f}, truncated {r['truncated']}, "
-                       f">30s {r['skipped_long']} | running RTF {rtf:.4f}, ETA {eta_h:.2f} h | VRAM alloc "
+                       f">30s {r['skipped_long']}, bad audio {r['bad_decode']} | running RTF {rtf:.4f}, ETA {eta_h:.2f} h | VRAM alloc "
                        f"{torch.cuda.max_memory_allocated() / 2**30:.2f} reserved {torch.cuda.max_memory_reserved() / 2**30:.2f} "
                        f"free {torch.cuda.mem_get_info()[0] / 2**30:.2f} GiB")
             if (args.force or not meta_path.exists()) and r["prompt"]:
@@ -355,7 +368,8 @@ def main():
                 ), indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"\ndone: {totals['rows']} utterances, {totals['audio_s'] / 3600:.2f} h audio in {totals['wall_s'] / 3600:.2f} h wall "
-          f"(RTF {totals['wall_s'] / max(totals['audio_s'], 1e-6):.4f}); truncated={totals['truncated']}, skipped >30s={totals['skipped_long']}")
+          f"(RTF {totals['wall_s'] / max(totals['audio_s'], 1e-6):.4f}); truncated={totals['truncated']}, "
+          f"skipped >30s={totals['skipped_long']}, bad audio={totals['bad_decode']}")
 
 
 def shard_path_of(root: Path, s) -> Path:
