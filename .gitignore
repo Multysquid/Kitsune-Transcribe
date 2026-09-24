@@ -43,3 +43,5 @@ Thumbs.db
 .vscode/
 .idea/
 .claude/
+second_out/
+second_out_smoke/

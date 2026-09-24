@@ -38,13 +38,16 @@ MIN_DUR, MAX_DUR = 0.3, 30.0  # teacher fast path is <=30 s; shorter than 0.3 s 
 HF_PARQUET_SOURCES = {
     # name: (repo, split)
     "reazon_small": ("japanese-asr/whisper_transcriptions.reazonspeech.small", "train"),
+    "reazon_medium": ("japanese-asr/whisper_transcriptions.reazonspeech.medium", "train"),
     "eval_jsut": ("japanese-asr/ja_asr.jsut_basic5000", "eval"),
     "eval_cv8": ("japanese-asr/ja_asr.common_voice_8_0", "eval"),
     "eval_reazon": ("japanese-asr/ja_asr.reazonspeech_test", "eval"),
 }
 GALGAME_REPO = "litagin/Galgame_Speech_ASR_16kHz"
 GALGAME_EVAL_ROWS = 1000  # first N kept utterances become the in-domain eval split
-ALL_SOURCES = ["reazon_small", "galgame", "cv", "eval", "eval_jsut", "eval_cv8", "eval_reazon"]
+ALL_SOURCES = ["reazon_small", "reazon_medium", "galgame", "cv", "eval", "eval_jsut", "eval_cv8", "eval_reazon"]
+# ReazonSpeech tiers are nested (small is a subset of medium), so a larger tier must skip rows already ingested
+DEDUP_AGAINST = {"reazon_medium": "reazon_small"}
 
 
 class Ingest:
@@ -54,7 +57,7 @@ class Ingest:
         self.root, self.raw, self.source, self.limit = root, raw, source, limit_rows
         self.progress = load_progress(root, source)
         self.writers: dict[str, ShardWriter] = {}
-        self.stats = dict(kept=0, empty_text=0, bad_audio=0, bad_duration=0, seconds=0.0)
+        self.stats = dict(kept=0, empty_text=0, bad_audio=0, bad_duration=0, dup=0, seconds=0.0)
         self.counted = 0  # rows that count against --limit-rows
 
     def writer(self, split: str) -> ShardWriter:
@@ -121,18 +124,31 @@ class Ingest:
         save_progress(self.root, self.source, self.progress)
         s = self.stats
         print(f"  {self.source}: kept={s['kept']} ({s['seconds'] / 3600:.1f} h)  dropped: empty_text={s['empty_text']} "
-              f"bad_audio={s['bad_audio']} bad_duration={s['bad_duration']}")
+              f"bad_audio={s['bad_audio']} bad_duration={s['bad_duration']} dup={s['dup']}")
 
 
 def ingest_hf_parquet(ing: Ingest, repo: str, split: str):
     files = sorted(f for f in HfApi().list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet"))
-    columns = ["audio", "transcription"] + (["name"] if ing.source == "reazon_small" else [])
+    columns = ["audio", "transcription"] + (["name"] if ing.source.startswith("reazon") else [])
+    # dedup against a nested smaller tier AND against this source's own manifest shards (a crash mid input
+    # file re-reads rows already flushed; only manifest-listed shards count - orphans are re-ingested).
+    seen: set[str] = set()
+    dedup_sources = {ing.source} | ({DEDUP_AGAINST[ing.source]} if ing.source in DEDUP_AGAINST else set())
+    for sh in read_manifest(ing.root):
+        if sh.source in dedup_sources:
+            for row in iter_rows(ing.root / sh.path, columns=["id"]):
+                seen.add(row["id"].split("/", 1)[1])
+    if seen:
+        print(f"  {ing.source}: deduplicating against {len(seen)} rows already in {sorted(dedup_sources)}")
     for f in tqdm(files, desc=ing.source, unit="file"):
         if ing.is_finished(f):
             continue
         local = ing.download(repo, f)
         for i, row in enumerate(iter_rows(local, columns=columns)):
             rid = row.get("name") or row["audio"].get("path") or f"{Path(f).stem}-{i}"
+            if rid in seen:
+                ing.stats["dup"] += 1
+                continue
             ing.add(split, f"{ing.source}/{rid}", row["audio"]["bytes"], row["transcription"])
             if ing.limit_hit():
                 break
@@ -145,8 +161,18 @@ def ingest_hf_parquet(ing: Ingest, repo: str, split: str):
 
 def ingest_galgame(ing: Ingest, n_shards: int):
     tars = sorted(f for f in HfApi().list_repo_files(GALGAME_REPO, repo_type="dataset") if f.endswith(".tar"))[:n_shards]
-    # the hold-out is filled from the very first rows; on a resume it was written during the first (finished) tar
-    eval_kept = GALGAME_EVAL_ROWS if ing.progress["finished_inputs"] else 0
+    # self-dedup: resuming an interrupted tar re-reads rows already stored; skip everything already ingested.
+    # Gate on the manifest, not finished_inputs - a crash inside the FIRST tar also leaves flushed shards behind.
+    seen: set[str] = set()
+    eval_kept = 0
+    for sh in read_manifest(ing.root):
+        if sh.source == "galgame":
+            if sh.split == "eval":
+                eval_kept += sh.rows
+            for row in iter_rows(ing.root / sh.path, columns=["id"]):
+                seen.add(row["id"])
+    if seen:
+        print(f"  galgame: {len(seen)} rows already ingested (duplicates will be skipped), eval hold-out {eval_kept}")
     pending: dict[str, dict] = {}  # webdataset pairs <key>.ogg / <key>.txt can arrive in either order
     for f in tqdm(tars, desc="galgame", unit="tar"):
         if ing.is_finished(f):
@@ -162,6 +188,9 @@ def ingest_galgame(ing: Ingest, n_shards: int):
                 if "ogg" in d and "txt" in d:
                     del pending[key]
                     txt = d["txt"].decode("utf-8", "replace")
+                    if f"galgame/{key}" in seen:
+                        ing.stats["dup"] += 1
+                        continue
                     if eval_kept < GALGAME_EVAL_ROWS:  # hold-out first; it does not count against --limit-rows
                         eval_kept += ing.add("eval", f"galgame/{key}", d["ogg"], txt, count=False)
                     else:
@@ -226,9 +255,6 @@ def main():
             remove_source(root, s)
             print(f"  {s}: wiped (--force). If teacher_out/{s} exists, delete it too - its outputs no longer match.")
         prog = load_progress(root, s)
-        if prog["done"]:
-            print(f"  {s}: already done, skipping (use --force to redo)")
-            continue
         if prog["finished_inputs"]:
             print(f"  {s}: resuming, {len(prog['finished_inputs'])} input files already done")
         ing = Ingest(root, raw, s, args.limit_rows)
