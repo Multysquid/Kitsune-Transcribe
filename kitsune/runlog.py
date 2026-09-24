@@ -8,7 +8,10 @@ Layout (relative to runs/<run_id>/):
   config.json                 resolved config + argv + student_meta.json (config.<stamp>.json on a restart)
   env/                        git_sha.txt, git_status.txt, git_diff.patch, pip_freeze.txt, nvidia_smi.txt,
                               system.json, sdpa_backends.json      (env/restart-<stamp>/ on a restart)
-  tb/                         TensorBoard event files (mirror of everything below)
+  tb/                         TensorBoard event files (mirror of everything below), every tag under one of three
+                              buckets: 1_operational/, 2_loss_accuracy/, 3_misc/ (TB_BUCKET_RULES)
+  metrics/tag_map.json        {logged tag: {"tb_tag", "bucket", "plugin"}}: where TensorBoard shows each tag; the
+                              files below keep the tag as logged
   metrics/scalars.jsonl       EVERY scalar: {"step","wall","elapsed_s","tag","value"}; a non-finite value is written
                               as null with "nf": "nan"|"inf"|"-inf" (JSON has no NaN)
   metrics/scalars.parquet     rewritten from the jsonl at each sync (tag, step, wall, elapsed_s, value)
@@ -33,12 +36,27 @@ whose size, hash and content disagree. Upload errors are retried with back-off a
 Resume: pass the dict from state_dict() (kept in the trainer's full state) as `resume=`. elapsed_s continues, steps
 after the restored step are dropped from steps.parquet and purged from TensorBoard, and are then logged again. The
 append-only jsonl files keep both copies; the later wall time is the one that counts.
+
+TensorBoard buckets: TensorBoard groups cards by the first component of a tag, so tb/ gets every tag under one of
+  1_operational     time, throughput, memory, system, data progress (tokens per source too), schedule, early-stop
+                    bookkeeping, eval cost and counts (CER denominators: ref_chars); events and config as text
+  2_loss_accuracy   train and held-out loss, accuracy (top-1 agreement, CER = characters gotten wrong), both per
+                    source and per teacher-confidence bucket, the train probe, the overfit gap, the early-stop metric
+                    and its best; the eval sample tables
+  3_misc            per-layer stats, L2-SP distances, optimizer internals, augmentation, token diagnostics (the share
+                    of tokens per confidence bucket included), every histogram, and any tag no rule matches (one
+                    tb_tag_unmapped event per such tag)
+by TB_BUCKET_RULES. Only TensorBoard sees the new names. tools/regroup_tb.py rebuilds tb/ of an existing run in this
+layout from the open files. A restart into a run logged before the buckets (event files in tb/, no
+metrics/tag_map.json) leaves one tb_layout_mixed event: TensorBoard then shows the earlier launches under the flat tags
+and this one under the buckets until tools/regroup_tb.py is run on the finished run.
 """
 import io
 import json
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -167,6 +185,158 @@ def _copy_prefix(src: Path, dst: Path, limit: int | None = None):
 def _next_part(d: Path) -> int:
     parts = sorted(d.glob("part-*.parquet"))
     return int(parts[-1].stem.split("-")[1]) + 1 if parts else 0
+
+
+# ------------------------------------------------------------------------------------------ TensorBoard buckets
+
+TB_BUCKETS = ("1_operational", "2_loss_accuracy", "3_misc")  # names sort in this order in TensorBoard
+TB_PLUGINS = ("scalars", "histograms", "text")
+_SPLIT = r"(_utt_mean|_p1_gt_0\.99|_p1_lt_0\.9)?"  # per-utterance mean, or one teacher-confidence bucket
+_CER = ("cer_ref_corpus|cer_ref_mean|cer_teacher_corpus|cer_teacher_mean|ratio_vs_teacher|trunc_rate|ref_edits|"
+        "n_truncated|n_empty_hyp|teacher_cer_ref_corpus|teacher_cer_ref_mean|teacher_trunc_rate")  # not ref_chars
+_EVAL_OPS = "wall_s|rtf|tok_per_s|audio_s|n_bad_audio|n_utts|n_tok|n"  # eval/<kind>/<m>: cost and counts
+_EVAL_SET_OPS = "audio_s|tok_per_s|n|n_tok|n_utts|n_missing_teacher|n_empty_ref"  # eval/<kind>/<set>/<m>
+_TOK_DIAG = (r"student_entropy_coarse|student_tail|teacher_entropy_coarse|teacher_tail|teacher_p1|frac_p1_gt_0\.99|"
+             r"frac_p1_lt_0\.9")
+_SET = r"(?P<set>[^/]+)"
+# (regex, template): the first rule whose regex matches the WHOLE tag wins; the template's first component is the
+# bucket. Scalars and text; a histogram always goes to 3_misc/<tag>.
+TB_BUCKET_RULES = (
+    # 2_loss_accuracy: loss (train, held-out) and accuracy (top-1 agreement with the teacher, CER)
+    (r"loss/(?P<m>.+)", r"2_loss_accuracy/train_loss/\g<m>"),
+    (r"src/(?P<src>[^/]+)/(?P<m>kl|ce)", r"2_loss_accuracy/train_loss/by_source/\g<src>/\g<m>"),
+    (r"bucket/(?P<b>[^/]+)/(?P<m>kl|ce)", r"2_loss_accuracy/train_loss/by_teacher_confidence/\g<b>/\g<m>"),
+    (r"tok/top1", r"2_loss_accuracy/train_accuracy/top1_agreement"),
+    (r"src/(?P<src>[^/]+)/top1", r"2_loss_accuracy/train_accuracy/by_source/\g<src>/top1"),
+    (r"bucket/(?P<b>[^/]+)/top1", r"2_loss_accuracy/train_accuracy/by_teacher_confidence/\g<b>/top1"),
+    (rf"eval/tf/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/val_loss/\g<set>/\g<m>"),
+    (rf"eval/tf/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/val_accuracy/\g<set>/\g<m>"),
+    (rf"eval/greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/val_accuracy/\g<set>/\g<m>"),
+    (rf"eval/greedy_full/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/val_accuracy_full/\g<set>/\g<m>"),
+    (rf"eval/probe/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/train_probe_loss/\g<set>/\g<m>"),
+    (rf"eval/probe/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/train_probe_accuracy/\g<set>/\g<m>"),
+    (rf"eval/probe_greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/train_probe_accuracy/\g<set>/\g<m>"),
+    (r"eval/(?P<m>kl_gap_heldout_minus_probe|cer_teacher_gap_heldout_minus_probe)",
+     r"2_loss_accuracy/overfit_gap/\g<m>"),
+    (r"early_stop/(?P<m>value|best)", r"2_loss_accuracy/early_stop/\g<m>"),  # the monitored metric, its best
+    (r"samples(?P<rest>/.+)?", r"2_loss_accuracy/samples\g<rest>"),
+    # 1_operational: time, throughput, memory, system, data progress (tokens per source), schedule, early-stop
+    # bookkeeping (evals since the best, triggered), eval cost and counts (ref_chars: a CER denominator), lifecycle text
+    (r"(?P<t>(time|perf|mem|sys|data|sched|early_stop)/.+|opt/lr|src/[^/]+/tokens)", r"1_operational/\g<t>"),
+    (r"eval/epoch", r"1_operational/progress/epoch"),
+    (rf"eval/(?P<kind>greedy|greedy_full|probe_greedy)/{_SET}/ref_chars",
+     r"1_operational/eval/\g<kind>/\g<set>/ref_chars"),
+    (rf"eval/(?P<kind>[^/]+)/(?P<m>{_EVAL_OPS})", r"1_operational/eval/\g<kind>/\g<m>"),
+    (rf"eval/(?P<kind>[^/]+)/{_SET}/(?P<m>{_EVAL_SET_OPS})", r"1_operational/eval/\g<kind>/\g<set>/\g<m>"),
+    (r"eval/wall_s", r"1_operational/eval/wall_s"),
+    (r"(?P<t>events/.+|(config|env|run[_-]info)(/.+)?)", r"1_operational/\g<t>"),
+    # 3_misc: per-layer stats, L2-SP distances, optimizer internals, augmentation, BN drift, token-distribution
+    # diagnostics (tok/* except top1, each confidence bucket's share of the tokens, the eval entropy / tail /
+    # teacher-confidence columns)
+    (r"(?P<t>(layers|l2sp|aug|bn|tok)/.+|opt/(grad_norm|clip_coef)|bucket/[^/]+/frac)", r"3_misc/\g<t>"),
+    (rf"(?P<t>eval/(tf|probe)/[^/]+/({_TOK_DIAG}))", r"3_misc/\g<t>"),
+)
+_TB_RULES = tuple((re.compile(p), t) for p, t in TB_BUCKET_RULES)
+
+
+def _tb_match(tag: str, plugin: str = "scalars") -> tuple[str, bool]:
+    """(TensorBoard tag, whether a rule matched). Unmatched: 3_misc/<tag>."""
+    if plugin == "histograms":
+        return f"3_misc/{tag}", True
+    for rx, template in _TB_RULES:
+        m = rx.fullmatch(tag)
+        if m:
+            return m.expand(template), True
+    return f"3_misc/{tag}", False
+
+
+def tb_tag(tag: str, plugin: str = "scalars") -> tuple[str, str]:
+    """Logged tag -> (TensorBoard tag, bucket) by TB_BUCKET_RULES; plugin is "scalars", "histograms" or "text"."""
+    tb, _ = _tb_match(tag, plugin)
+    return tb, tb.split("/", 1)[0]
+
+
+def load_tag_map(path) -> dict:
+    """metrics/tag_map.json, {} when absent or unreadable."""
+    try:
+        obj = json.loads(Path(path).read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def tag_map_entries(tag_map: dict):
+    """(tag, plugin, entry) for every entry of a tag_map.json, the other plugins of a tag included."""
+    for tag, e in tag_map.items():
+        if isinstance(e, dict) and "tb_tag" in e:
+            yield tag, e.get("plugin", "scalars"), e
+            for plugin, o in (e.get("other_plugins") or {}).items():
+                yield tag, plugin, o
+
+
+def tb_inverse(tag_map: dict) -> dict[str, dict[str, str]]:
+    """tag_map.json -> {plugin: {TensorBoard tag: logged tag}}."""
+    inv: dict[str, dict[str, str]] = {p: {} for p in TB_PLUGINS}
+    for tag, plugin, e in tag_map_entries(tag_map):
+        inv.setdefault(plugin, {})[e["tb_tag"]] = tag
+    return inv
+
+
+class TagMapper:
+    """Logged tag -> TensorBoard tag per plugin, the state behind metrics/tag_map.json.
+
+    Two logged tags never share a TensorBoard tag within a plugin: a tag whose rule output is taken already goes to
+    3_misc/<tag> and counts as unmapped. A saved map (restart) is compared, not trusted: every tag is mapped again by
+    the current rules the first time it is logged, and a tag the saved map already flagged is not reported twice."""
+
+    def __init__(self, saved: dict | None = None):
+        self.map: dict[str, dict] = {}
+        self._tb: dict[tuple[str, str], str] = {}  # (plugin, tag) -> TensorBoard tag, resolved in this session
+        self._owner: dict[tuple[str, str], str] = {}  # (plugin, TensorBoard tag) -> tag
+        self.dirty = False
+        for tag, plugin, e in tag_map_entries(saved or {}):
+            self._set(tag, plugin, {k: e[k] for k in ("tb_tag", "bucket", "unmapped") if k in e})
+            self._owner[(plugin, e["tb_tag"])] = tag
+        self.dirty = False
+
+    def lookup(self, tag: str, plugin: str = "scalars") -> dict | None:
+        """The entry (tb_tag, bucket[, unmapped]) of a tag: saved, or resolved in this session; None if neither."""
+        e = self.map.get(tag)
+        if e is None:
+            return None
+        return e if e.get("plugin", "scalars") == plugin else (e.get("other_plugins") or {}).get(plugin)
+
+    def _set(self, tag: str, plugin: str, rec: dict):
+        e = self.map.get(tag)
+        if e is None or e.get("plugin") == plugin:
+            self.map[tag] = dict(rec, plugin=plugin, **({"other_plugins": e["other_plugins"]}
+                                                         if e and "other_plugins" in e else {}))
+        else:
+            e.setdefault("other_plugins", {})[plugin] = rec
+        self.dirty = True
+
+    def resolve(self, tag: str, plugin: str = "scalars") -> tuple[str, bool]:
+        """(TensorBoard tag, warn): warn is True once per tag no rule matches (or whose TensorBoard tag is taken)."""
+        tb = self._tb.get((plugin, tag))
+        if tb is not None:
+            return tb, False
+        tb, mapped = _tb_match(tag, plugin)
+        owner = self._owner.get((plugin, tb))
+        if owner is not None and owner != tag:
+            tb, mapped = f"3_misc/{tag}", False
+        prev = self.lookup(tag, plugin)
+        rec = dict(tb_tag=tb, bucket=tb.split("/", 1)[0], **({} if mapped else {"unmapped": True}))
+        warn = not mapped and not (prev and prev.get("unmapped") and prev.get("tb_tag") == tb)
+        if prev is None or {k: prev.get(k) for k in rec} != rec or ("unmapped" in prev) != ("unmapped" in rec):
+            if prev is not None and self._owner.get((plugin, prev.get("tb_tag"))) == tag:
+                del self._owner[(plugin, prev["tb_tag"])]
+            self._set(tag, plugin, rec)
+        self._owner[(plugin, tb)] = tag
+        self._tb[(plugin, tag)] = tb
+        return tb, warn
+
+    def to_json(self) -> dict:
+        return dict(sorted(self.map.items()))
 
 
 # -------------------------------------------------------------------------------------------- env / system
@@ -434,6 +604,11 @@ class RunLogger:
         self.p_scalars, self.p_text, self.p_events = m / "scalars.jsonl", m / "text.jsonl", self.dir / "events.jsonl"
         for p in (self.p_scalars, self.p_text, self.p_events):
             _repair_tail(p)
+        self.p_tag_map = m / "tag_map.json"
+        self._tags = TagMapper(load_tag_map(self.p_tag_map))  # a restart keeps the tags of the earlier launches
+        # event files but no tag map: the earlier launches logged flat tags (before the buckets), this one will not
+        flat_tb = [] if self.p_tag_map.exists() else sorted(
+            p.name for p in (self.dir / "tb").iterdir() if p.is_file() and "tfevents" in p.name)
 
         self._t0 = time.monotonic()
         self._elapsed0 = float(resume["elapsed_s"]) if resume else 0.0
@@ -477,6 +652,11 @@ class RunLogger:
                 self.event("env_capture_error", error=f"{type(e).__name__}: {e}")
         self.text("config", "```json\n" + json.dumps(conf, indent=2, ensure_ascii=False, default=str) + "\n```", self.step)
         self.event("logger_start", run_id=self.run_id, restart=restart, resume=resume, hf_repo=hf_repo)
+        if flat_tb:
+            self.event("tb_layout_mixed", files=flat_tb,
+                       hint=f"TensorBoard shows the earlier launches under their flat tags and this one under "
+                            f"{', '.join(TB_BUCKETS)}; after the run ends, python tools/regroup_tb.py "
+                            f"{self.dir.as_posix()} rebuilds tb/ in the bucketed layout from the open files")
 
     # ------------------------------------------------------------------------------------------ helpers
 
@@ -502,6 +682,21 @@ class RunLogger:
                 self._steps[name] = array("d", t.column(name).to_numpy(zero_copy_only=False).astype(np.float64))
         self._n_steps = t.num_rows
 
+    def _tb_tag(self, tag: str, plugin: str) -> str:
+        """The tag TensorBoard gets (TB_BUCKET_RULES). A tag no rule matches leaves one tb_tag_unmapped event."""
+        with self._lock:
+            tb, warn = self._tags.resolve(tag, plugin)
+        if warn:
+            self.event("tb_tag_unmapped", tag=tag, plugin=plugin, tb_tag=tb)
+        return tb
+
+    def _save_tag_map(self):
+        """metrics/tag_map.json, rewritten when a tag was added (or mapped differently than a saved map said)."""
+        with self._lock:
+            if self._tags.dirty:
+                _atomic_json(self.p_tag_map, self._tags.to_json())
+                self._tags.dirty = False
+
     def elapsed(self) -> float:
         return self._elapsed0 + time.monotonic() - self._t0
 
@@ -516,12 +711,14 @@ class RunLogger:
         if hist:
             self._write_part("hist", hist)
         self._write_steps(self._steps_table())
+        self._save_tag_map()
         return dict(elapsed_s=self.elapsed(), step=self.step, run_id=self.run_id)
 
     # --------------------------------------------------------------------------------------------- scalars
 
-    def scalar(self, tag: str, value, step: int):
+    def _scalar(self, tag: str, value, step: int):
         v = _num(value)
+        tb = self._tb_tag(tag, "scalars")
         wall = time.time()
         row = dict(step=int(step), wall=round(wall, 3), elapsed_s=round(self.elapsed(), 3), tag=tag,
                    value=v if math.isfinite(v) else None)
@@ -529,11 +726,16 @@ class RunLogger:
             row["nf"] = "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")
         with self._lock:
             self._f_scalars.write(json.dumps(row, ensure_ascii=False) + "\n")
-            self.tb.add_scalar(tag, v, int(step), walltime=wall)
+            self.tb.add_scalar(tb, v, int(step), walltime=wall)
+
+    def scalar(self, tag: str, value, step: int):
+        self._scalar(tag, value, step)
+        self._save_tag_map()
 
     def scalars(self, values: dict, step: int):
         for k, v in values.items():
-            self.scalar(k, v, step)
+            self._scalar(k, v, step)
+        self._save_tag_map()  # once per call: a first step brings hundreds of new tags
 
     def step_row(self, values: dict, step: int, also_scalars: bool = True):
         """The wide per-optimizer-step row (numeric values only). By default every value is also logged as a
@@ -607,20 +809,25 @@ class RunLogger:
             row.update(min=mn, max=mx, mean=s / n, std=float(td.std(correction=0)) if n > 1 else 0.0,
                        counts=json.dumps(counts), edges=json.dumps(edges))
             row.update({f"p{round(q * 100)}": v for q, v in zip(QUANTILES, qs)})
+            tb = self._tb_tag(tag, "histograms")
             with self._lock:
-                self.tb.add_histogram_raw(tag, min=mn, max=mx, num=n, sum=s, sum_squares=s2,
-                                          bucket_limits=edges[1:], bucket_counts=counts, global_step=int(step))
+                self.tb.add_histogram_raw(tb, min=mn, max=mx, num=n, sum=s, sum_squares=s2,
+                                          bucket_limits=edges[1:], bucket_counts=counts, global_step=int(step),
+                                          walltime=row["wall"])
+            self._save_tag_map()
         with self._lock:
             self._hist_rows.append(row)
 
     # ------------------------------------------------------------------------------------- text / tables
 
     def text(self, tag: str, s: str, step: int):
+        tb = self._tb_tag(tag, "text")
         row = dict(step=int(step), wall=round(time.time(), 3), elapsed_s=round(self.elapsed(), 3), tag=tag, text=s)
         with self._lock:
             self._f_text.write(json.dumps(row, ensure_ascii=False) + "\n")
             self._f_text.flush()
-            self.tb.add_text(tag, s, int(step))
+            self.tb.add_text(tb, s, int(step), walltime=row["wall"])
+        self._save_tag_map()
 
     def eval_dir(self, step: int) -> Path:
         d = self.dir / "evals" / f"step_{int(step)}"
@@ -667,7 +874,9 @@ class RunLogger:
                 f.flush()
                 os.fsync(f.fileno())
             if not self._closed:
-                self.tb.add_text(f"events/{kind}", "```\n" + line + "\n```", self.step)
+                self.tb.add_text(self._tb_tag(f"events/{kind}", "text"), "```\n" + line + "\n```", row["step"],
+                                 walltime=row["wall"])
+                self._save_tag_map()
         brief = {k: v for k, v in fields.items() if k != "traceback"}
         print(f"[event] {kind} {json.dumps(brief, ensure_ascii=False, default=str)[:300]}", flush=True)
 
@@ -718,6 +927,7 @@ class RunLogger:
                 return False
             self._sync_thread.join()
         self._last_sync = time.monotonic()
+        self._save_tag_map()  # normally a no-op: every logging call that meets a new tag saves it
         with self._lock:
             self._f_scalars.flush()
             self._f_text.flush()

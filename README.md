@@ -30,7 +30,10 @@ tokens that occur in Japanese.
 02b_second_opinion.py  second ASR opinion per utterance -> second_out/ (agreement-based label filter)
 make_selection.py    which utterances train / evaluate, and why -> selection/*.parquet
 03_build_student.py  prune the teacher to the student (20 enc layers, FFN 2560, 4 dec layers), init from teacher
-04_distill.py        KL on the stored top-16 + CE on the teacher tokens + L2-SP; TensorBoard + open-format logs
+04_distill.py        KL on the stored top-16 + CE on the teacher tokens + L2-SP; TensorBoard (cards in three groups:
+                     1_operational, 2_loss_accuracy, 3_misc) + open-format logs
+tools/               export_run.py: a run -> parquet/CSV tables + README; regroup_tb.py: rebuild an older run's
+                     TensorBoard files in the three groups
 vast/                training image, CI build and the vast.ai run scripts (see vast/README.md)
 ```
 

@@ -3,7 +3,11 @@
 Why: the run dir is written for crash-safety (append-only jsonl, parquet parts, per-eval folders, TensorBoard event
 files); analysis wants one table per kind. This folds everything into export/:
   - TensorBoard events (EventAccumulator: scalars, histograms, text) -> tb_*.parquet/csv. A resumed run's purged steps
-    are dropped by the accumulator, exactly as TensorBoard shows them.
+    are dropped by the accumulator, exactly as TensorBoard shows them. TensorBoard files the tags under three buckets
+    (1_operational/, 2_loss_accuracy/, 3_misc/); the tables give back the logged tag (`tag`) with `bucket` and
+    `tb_tag` next to it, from metrics/tag_map.json (copied as tag_map.json, and as the tag_map table); a tag the map
+    lacks (no tag_map.json: a run logged before the buckets, or a copy without the file) is mapped by the same rules
+    from the tags of the open files
   - metrics/*: scalars (rebuilt from scalars.jsonl, the source of truth; the parquet mirror may lag one sync),
     steps, train_utts parts, hist parts, text
   - evals/step_<N>/*.parquet concatenated per kind with a step column (eval_tf, eval_greedy, eval_probe, ...),
@@ -32,7 +36,8 @@ import pandas as pd  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
-from kitsune.runlog import read_scalars_jsonl  # noqa: E402
+from kitsune.runlog import (TB_BUCKETS, TagMapper, load_tag_map, read_scalars_jsonl, tag_map_entries,  # noqa: E402
+                            tb_inverse, tb_tag)
 
 # column descriptions for the README; anything not listed is described generically
 COLUMNS = {
@@ -64,6 +69,10 @@ COLUMNS = {
                "after the next resume's at_step (events) come from weights a crash discarded",
     "emitter": "box script that wrote the record (finish, ...)", "phase": "bootstrap phase",
     "seconds": "wall time of the phase (s)", "end": "unix time the phase ended",
+    "bucket": "TensorBoard bucket of the tag: 1_operational, 2_loss_accuracy or 3_misc",
+    "tb_tag": "the tag as TensorBoard shows it (bucketed; metrics/tag_map.json)",
+    "plugin": "TensorBoard plugin the tag is logged to: scalars, histograms or text",
+    "unmapped": "no bucket rule matched the tag (it went to 3_misc)",
 }
 FILES = {
     "tb_scalars": "every TensorBoard scalar (mirror of scalars; purged steps dropped)",
@@ -81,6 +90,9 @@ FILES = {
     "events": "lifecycle events (phases, smoke results, OOM fallbacks, checkpoints, exceptions, syncs, verdict)",
     "infra_events": "box lifecycle records from $KITSUNE_STATE/events.jsonl (sync failures, verification, stop/destroy)",
     "infra_bootstrap_timings": "vast/bootstrap.sh phase timings (plan, derived-data pull, audio rebuild, coverage)",
+    "tag_map": "where TensorBoard shows each logged tag, one row per (tag, plugin) (metrics/tag_map.json; a tag it "
+               "lacks, all of them for a run logged before the buckets or without the file, computed from "
+               "kitsune.runlog.TB_BUCKET_RULES)",
 }
 
 
@@ -102,31 +114,98 @@ def resolve(src: str, out: Path) -> Path:
     return local / prefix
 
 
-def tb_tables(tb_dir: Path) -> dict[str, pd.DataFrame]:
+def _from_tb(file_tag: str, plugin: str, inv: dict[str, dict[str, str]],
+             fwd: dict[str, dict[str, str]] | None = None) -> tuple[str, str, str]:
+    """Tag in the event files -> (logged tag, tb_tag, bucket), by the inverse (inv) and forward (fwd) tag map. Event
+    files written before the buckets hold the logged tags themselves; the bucket columns then say where the bucketed
+    layout (tools/regroup_tb.py) puts them."""
+    tag = inv.get(plugin, {}).get(file_tag)
+    if tag is not None:
+        return tag, file_tag, file_tag.split("/", 1)[0]
+    head = file_tag.split("/", 1)[0]
+    if head in TB_BUCKETS:  # bucketed but in no map, nor made by the rules from a logged tag: the tag cannot be told
+        return file_tag, file_tag, head
+    tb = (fwd or {}).get(plugin, {}).get(file_tag) or tb_tag(file_tag, plugin)[0]
+    return file_tag, tb, tb.split("/", 1)[0]
+
+
+def tb_tables(tb_dir: Path, tag_map: dict | None = None) -> dict[str, pd.DataFrame]:
+    """The event files as tables, each TensorBoard tag given back as the logged tag by tag_map (tag_map.json, or the
+    fuller map of tag_mapper() that also covers a run without one)."""
     from tensorboard.backend.event_processing.event_accumulator import STORE_EVERYTHING_SIZE_GUIDANCE, EventAccumulator
     from tensorboard.util import tensor_util
 
     acc = EventAccumulator(str(tb_dir), size_guidance=STORE_EVERYTHING_SIZE_GUIDANCE)
     acc.Reload()
     tags = acc.Tags()
-    sc = [dict(tag=t, step=e.step, wall_time=e.wall_time, value=e.value) for t in tags.get("scalars", [])
-          for e in acc.Scalars(t)]
-    hi = [dict(tag=t, step=e.step, wall_time=e.wall_time, min=h.min, max=h.max, num=h.num, sum=h.sum,
-               sum_squares=h.sum_squares, bucket_limits=json.dumps(list(h.bucket_limit)), bucket_counts=json.dumps(list(h.bucket)))
+    inv, fwd = tb_inverse(tag_map or {}), {}
+    for tag, plugin, e in tag_map_entries(tag_map or {}):
+        fwd.setdefault(plugin, {})[tag] = e["tb_tag"]
+    sc = [dict(zip(("tag", "tb_tag", "bucket"), _from_tb(t, "scalars", inv, fwd)), step=e.step,
+               wall_time=e.wall_time, value=e.value) for t in tags.get("scalars", []) for e in acc.Scalars(t)]
+    hi = [dict(zip(("tag", "tb_tag", "bucket"), _from_tb(t, "histograms", inv, fwd)), step=e.step,
+               wall_time=e.wall_time, min=h.min, max=h.max, num=h.num, sum=h.sum, sum_squares=h.sum_squares,
+               bucket_limits=json.dumps(list(h.bucket_limit)), bucket_counts=json.dumps(list(h.bucket)))
           for t in tags.get("histograms", []) for e in acc.Histograms(t) for h in [e.histogram_value]]
     tx = []
     for t in tags.get("tensors", []):
         if acc.SummaryMetadata(t).plugin_data.plugin_name != "text":
             continue
+        # torch's SummaryWriter.add_text stores "<tag>/text_summary"; give back the tag the run logged
+        names = dict(zip(("tag", "tb_tag", "bucket"), _from_tb(t.removesuffix("/text_summary"), "text", inv, fwd)))
         for e in acc.Tensors(t):
             arr = tensor_util.make_ndarray(e.tensor_proto)
             vals = [v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v) for v in np.asarray(arr).ravel()]
-            # torch's SummaryWriter.add_text stores "<tag>/text_summary"; give back the tag the run logged
-            tx.append(dict(tag=t.removesuffix("/text_summary"), step=e.step, wall_time=e.wall_time, text="\n".join(vals)))
-    return {"tb_scalars": pd.DataFrame(sc, columns=["tag", "step", "wall_time", "value"]),
-            "tb_histograms": pd.DataFrame(hi, columns=["tag", "step", "wall_time", "min", "max", "num", "sum",
-                                                       "sum_squares", "bucket_limits", "bucket_counts"]),
-            "tb_text": pd.DataFrame(tx, columns=["tag", "step", "wall_time", "text"])}
+            tx.append(dict(names, step=e.step, wall_time=e.wall_time, text="\n".join(vals)))
+    return {"tb_scalars": pd.DataFrame(sc, columns=["tag", "bucket", "tb_tag", "step", "wall_time", "value"]),
+            "tb_histograms": pd.DataFrame(hi, columns=["tag", "bucket", "tb_tag", "step", "wall_time", "min", "max",
+                                                       "num", "sum", "sum_squares", "bucket_limits", "bucket_counts"]),
+            "tb_text": pd.DataFrame(tx, columns=["tag", "bucket", "tb_tag", "step", "wall_time", "text"])}
+
+
+OPEN_TAGS = (("scalars", "scalars"), ("hist", "histograms"), ("text", "text"))  # open-format table, plugin
+
+
+def tag_mapper(tables: dict[str, pd.DataFrame], tag_map: dict) -> TagMapper:
+    """The run's tag map (metrics/tag_map.json), plus where TB_BUCKET_RULES put every logged tag of the open files
+    (scalars, hist, text, events/<kind>) that it lacks, in the order the tags were first logged: the fallback for a
+    run logged before the buckets, or a copy without metrics/tag_map.json (its event files bucketed all the same)."""
+    tm = TagMapper(tag_map)
+
+    def add(tags, plugin: str):
+        for t in tags:
+            if tm.lookup(t, plugin) is None:
+                tm.resolve(t, plugin)
+
+    for name, plugin in OPEN_TAGS:
+        df = tables.get(name)
+        if df is not None and "tag" in df.columns:
+            add(df["tag"].dropna().unique(), plugin)
+    if "events" in tables:
+        add((f"events/{k}" for k in tables["events"]["kind"].dropna().unique()), "text")
+    return tm
+
+
+def tag_tables(tables: dict[str, pd.DataFrame], tm: TagMapper) -> None:
+    """bucket + tb_tag next to the tag of the open-format tables (scalars, hist, text), and the tag_map table: every
+    entry of tm (tag_mapper(): the run's map, plus where the rules put a logged tag the map lacks)."""
+    def entry(tag: str, plugin: str) -> dict:
+        if tm.lookup(tag, plugin) is None:
+            tm.resolve(tag, plugin)
+        return tm.lookup(tag, plugin)
+
+    for name, plugin in OPEN_TAGS:
+        df = tables.get(name)
+        if df is None or "tag" not in df.columns:
+            continue
+        look = {t: entry(t, plugin) for t in df["tag"].unique()}
+        at = df.columns.get_loc("tag") + 1
+        df.insert(at, "bucket", df["tag"].map({t: e["bucket"] for t, e in look.items()}))
+        df.insert(at + 1, "tb_tag", df["tag"].map({t: e["tb_tag"] for t, e in look.items()}))
+    rows = [dict(tag=tag, plugin=plugin, bucket=e["bucket"], tb_tag=e["tb_tag"], unmapped=bool(e.get("unmapped")))
+            for tag, plugin, e in tag_map_entries(tm.to_json())]
+    if rows:
+        tables["tag_map"] = pd.DataFrame(rows).sort_values(["plugin", "bucket", "tb_tag"], ignore_index=True)
 
 
 def _read_parts(d: Path) -> pd.DataFrame | None:
@@ -237,7 +316,30 @@ def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: l
     lines = [f"# Run export: {Path(src).name if not src.startswith('hf://') else src}", "",
              f"Source: `{src}`  ", f"Exported: {datetime.now(timezone.utc).isoformat(timespec='seconds')}", "",
              "Every table is a parquet file (read with `pandas.read_parquet`); a `.csv` twin exists unless noted. "
-             "Losses are in nats per target token; CER values are fractions (0.083 = 8.3 %).", ""]
+             "Losses are in nats per target token; CER values are fractions (0.083 = 8.3 %).", "",
+             "## TensorBoard layout", "",
+             "TensorBoard groups cards by the first component of a tag, so the run's event files put every tag under "
+             "one of three buckets: `1_operational/` (time, throughput, memory, system, data progress with the tokens "
+             "per source, schedule, early-stop bookkeeping, eval cost and counts with the CER denominators "
+             "`ref_chars`; lifecycle events and the config as text), `2_loss_accuracy/` (train and held-out loss, "
+             "accuracy as top-1 agreement with the teacher and CER, both per source and per teacher-confidence "
+             "bucket, the train probe, the overfit gap, the early-stop metric and its best; the eval sample tables) "
+             "and `3_misc/` (per-layer stats, L2-SP distances, optimizer internals, augmentation, token diagnostics "
+             "with each confidence bucket's share of the tokens, every histogram, and any tag no rule matched). The "
+             "tables here keep the tag as logged "
+             "(`tag`); `tb_tag` is where TensorBoard shows it and `bucket` its first component. The run's "
+             "`metrics/tag_map.json` (copied as `tag_map.json`: `{tag: {tb_tag, bucket, plugin}}`) holds the mapping, "
+             "the `tag_map` table lists it; the rules are `TB_BUCKET_RULES` in kitsune/runlog.py. A run logged before "
+             "the buckets has the logged tags in its event files; `tools/regroup_tb.py` rebuilds them in this layout.",
+             ""]
+    tm = tables.get("tag_map")
+    if tm is not None and len(tm):
+        counts = tm.groupby(["bucket", "plugin"]).size().unstack(fill_value=0)
+        plugins = [p for p in ("scalars", "histograms", "text") if p in counts.columns]
+        lines += ["Tags per bucket:", "", "| bucket | " + " | ".join(plugins) + " |", "|---|" + "---|" * len(plugins)]
+        lines += [f"| `{b}` | " + " | ".join(str(int(counts.loc[b, p])) for p in plugins) + " |" for b in counts.index]
+        unmapped = sorted(tm.loc[tm["unmapped"], "tag"])
+        lines += ["", f"No rule matched (so in 3_misc): {', '.join(f'`{t}`' for t in unmapped) or 'none'}.", ""]
     for name, df in tables.items():
         desc = FILES.get(name) or (f"per-utterance eval table `{name[5:]}` from every evals/step_<N>/ (step, set added)"
                                    if name.startswith("eval_") else "")
@@ -249,13 +351,18 @@ def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: l
                                    "logged metric (see the tag list)" if name == "steps" else "")
             lines.append(f"| `{c}` | {df[c].dtype} | {d} |")
         if name in ("scalars", "tb_scalars") and len(df):
-            g = df.groupby("tag")["step"].agg(["count", "min", "max"])
-            lines += ["", f"Tags ({len(g)}):", "", "| tag | rows | first step | last step |", "|---|---|---|---|"]
-            lines += [f"| `{tag}` | {r['count']} | {r['min']} | {r['max']} |" for tag, r in g.iterrows()]
+            g = df.groupby("tag").agg(count=("step", "count"), min=("step", "min"), max=("step", "max"),
+                                      bucket=("bucket", "first"), tb_tag=("tb_tag", "first"))
+            lines += ["", f"Tags ({len(g)}):", "", "| tag | bucket | TensorBoard tag | rows | first step | last step |",
+                      "|---|---|---|---|---|---|"]
+            lines += [f"| `{tag}` | {r['bucket']} | `{r['tb_tag']}` | {r['count']} | {r['min']} | {r['max']} |"
+                      for tag, r in g.iterrows()]
         lines.append("")
     if copied:
         lines += ["## Copied as is", ""]
         descs = {"config.json": "resolved config, argv and student_meta.json", "summary.json": "final run summary and verdict",
+                 "tag_map.json": "the run's metrics/tag_map.json: {logged tag: {tb_tag, bucket, plugin}}, where "
+                                 "TensorBoard shows each tag (see TensorBoard layout above)",
                  "env": "git SHA/diff, pip freeze, nvidia-smi, system.json (host, versions, vast env minus secrets), SDPA backends",
                  "events.jsonl": "raw lifecycle events (one JSON object per line)",
                  "infra": "box logs and state from the vast instance: kitsune.log (bootstrap, supervisor and trainer "
@@ -269,10 +376,12 @@ def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: l
 def export(src: str, out: Path, max_csv_rows: int = 2_000_000) -> dict[str, pd.DataFrame]:
     out.mkdir(parents=True, exist_ok=True)
     run = resolve(src, out)
-    tables = {}
-    if (run / "tb").is_dir():
-        tables.update(tb_tables(run / "tb"))
-    tables.update(run_tables(run))
+    opened = run_tables(run)
+    # tag_map.json, completed from the open files' tags by the rules: a run without one still gets its logged tags back
+    tm = tag_mapper(opened, load_tag_map(run / "metrics" / "tag_map.json"))
+    tables = tb_tables(run / "tb", tm.to_json()) if (run / "tb").is_dir() else {}
+    tables.update(opened)
+    tag_tables(tables, tm)
     for name, df in tables.items():
         df.to_parquet(out / f"{name}.parquet", index=False)
         if len(df) <= max_csv_rows:
@@ -283,6 +392,9 @@ def export(src: str, out: Path, max_csv_rows: int = 2_000_000) -> dict[str, pd.D
         if (run / f).exists():
             shutil.copy2(run / f, out / f)
             copied.append(f)
+    if (run / "metrics" / "tag_map.json").exists():
+        shutil.copy2(run / "metrics" / "tag_map.json", out / "tag_map.json")
+        copied.append("tag_map.json")
     for d in ("env", "infra"):
         if (run / d).is_dir():
             shutil.copytree(run / d, out / d, dirs_exist_ok=True)
