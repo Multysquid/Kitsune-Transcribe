@@ -12,7 +12,8 @@ files); analysis wants one table per kind. This folds everything into export/:
     steps, train_utts parts, hist parts, text
   - evals/step_<N>/*.parquet concatenated per kind with a step column (eval_tf, eval_greedy, eval_probe, ...), the
     mini evals' evals/step_<N>_mini/ likewise (eval_mini_tf, eval_mini_greedy, ...), summary.json files flattened to
-    eval_summaries (a `mini` column), samples/*.jsonl -> samples, events.jsonl -> events
+    eval_summaries (a `mini` column; the eval's final and complete flags and its val-CER scope as columns),
+    samples/*.jsonl -> samples, events.jsonl -> events
   - infra/ (box logs and state that vast/finish.py uploads: kitsune.log, supervise.json, bootstrap timings, the
     lifecycle events of the stop/destroy scripts) copied, its events and bootstrap timings also as tables
   - config.json (config.<stamp>.json of each restart), summary.json and env/ copied as they are
@@ -86,6 +87,14 @@ COLUMNS = {
     "plugin": "TensorBoard plugin the tag is logged to: scalars, histograms or text",
     "unmapped": "no bucket rule matched the tag (it went to 3_misc)",
     "mini": "the row comes from a mini eval (evals/step_<N>_mini/), not a full one",
+    "final": "the step's summary.json `final`: the end phase decoded this eval (false when the end phase reused an "
+             "in-loop complete eval at the last step; verdict.json rows mark the final step either way); empty for a "
+             "mini eval",
+    "complete": "the step's summary.json `complete`: the eval decoded the complete eval sets (greedy_full/*), not "
+                "only the fixed greedy subset; empty for a mini eval",
+    "scope": "what the eval's headline/val_cer* pools (summary.json headline_scope.val_greedy): complete = the "
+             "complete eval sets, subset = the fixed greedy subset (e.g. the step-0 eval of a full_every_epochs run); "
+             "empty for a mini eval",
 }
 FILES = {
     "tb_scalars": "every TensorBoard scalar (mirror of scalars; purged steps dropped)",
@@ -100,8 +109,10 @@ FILES = {
     "hist": "histogram summaries (quantiles, moments, 64-bin counts)",
     "text": "every text() call",
     "eval_summaries": "every eval summary.json flattened (mini evals too, mini = true): one row per (step, mini, "
-                      "key); headline/<name> are the eval's headline numbers (CER as fractions); NaN: null in "
-                      "the file, a NaN or infinity (JSON has none) or a field with no value",
+                      "key) of each number in the file; its flags and scope (booleans and strings) are the final, "
+                      "complete and scope columns on every row of that step instead; headline/<name> are the eval's "
+                      "headline numbers (CER as fractions), headline/val_cer* over the eval sets `scope` names; NaN: "
+                      "null in the file, a NaN or infinity (JSON has none) or a field with no value",
     "samples": "text samples written at each eval",
     "events": "lifecycle events (phases, smoke results, OOM fallbacks, checkpoints, exceptions, syncs, verdict)",
     "infra_events": "box lifecycle records from $KITSUNE_STATE/events.jsonl (sync failures, verification, stop/destroy)",
@@ -360,10 +371,16 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
                 df.insert(1, "set", eset)
             df["discarded"] = gone
             per_kind.setdefault(f"eval_{'mini_' if mini else ''}{kind}", []).append(df)
-        for f in sorted(d.glob("*.json")):
-            flat = _flatten(json.loads(f.read_text(encoding="utf-8")))
-            summaries += [dict(step=step, mini=mini, file=f.name, key=k, value=v, discarded=gone)
-                          for k, v in flat.items()]
+        objs = {f.name: json.loads(f.read_text(encoding="utf-8")) for f in sorted(d.glob("*.json"))}
+        # a full eval's flags and val-CER scope, a bool and a string that _flatten leaves out, on every row of its dir
+        # (verdict.json's too): step 0 decodes the greedy subset, a full_every_epochs run's later evals the complete
+        # sets, and headline/val_cer* holds both on one curve. None for a mini eval (its `mini` column says so)
+        s = objs.get("summary.json", {})
+        marks = dict(final=s.get("final"), complete=s.get("complete"),
+                     scope=(s.get("headline_scope") or {}).get("val_greedy"))
+        for name, obj in objs.items():
+            summaries += [dict(step=step, mini=mini, **marks, file=name, key=k, value=v, discarded=gone)
+                          for k, v in _flatten(obj).items()]
     for k, dfs in per_kind.items():
         t[k] = pd.concat(dfs, ignore_index=True)
     if summaries:

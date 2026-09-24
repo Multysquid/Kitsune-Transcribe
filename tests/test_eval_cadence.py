@@ -508,6 +508,21 @@ def test_export_keeps_minis_apart(steps_runs, tmp_path):
     assert not set(t["eval_tf"]["step"]) & set(want)
     es = t["eval_summaries"]
     assert set(es.loc[es["mini"], "step"]) == set(want) and "headline/val_cer" in set(es["key"])
+    # which eval sets headline/val_cer pools, and the final/complete flags, on every row of the step: step 0 decodes
+    # the greedy subset, the epoch-end evals the complete sets; a mini eval has none of them
+    assert es.loc[es["mini"], ["final", "complete", "scope"]].isna().all().all()
+    full = es[~es["mini"]]
+    for step, g in full.groupby("step"):
+        s = json.loads((run / "evals" / f"step_{step}" / "summary.json").read_text(encoding="utf-8"))
+        assert (g["scope"] == s["headline_scope"]["val_greedy"]).all(), step
+        assert (g["complete"] == s["complete"]).all() and (g["final"] == s["final"]).all(), step
+    assert set(full.loc[full["step"] == 0, "scope"]) == {"subset"} and not full.loc[full["step"] == 0, "complete"].any()
+    ends = [e for e in epoch_ends(run) if e < MAX_STEPS]
+    assert ends and set(full.loc[full["step"].isin(ends), "scope"]) == {"complete"}
+    assert set(full.loc[full["final"].astype(bool), "step"]) <= {MAX_STEPS}
+    assert {"final", "complete", "headline_scope/val_greedy"}.isdisjoint(es["key"])  # columns, not keys
+    readme = (tmp_path / "export" / "README.md").read_text(encoding="utf-8")
+    assert "| `scope` |" in readme and "| `final` |" in readme and "| `complete` |" in readme
 
 
 def test_full_eval_every_other_epoch_on_the_wall_clock_and_gate_off(env, monkeypatch):
