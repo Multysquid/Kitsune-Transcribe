@@ -11,6 +11,8 @@ Sources (all streamed file-by-file from HF; each raw download is deleted after c
                 NEVER point this at the amphion Emilia/JA (non-YODAS) files: those are CC BY-NC.
   cv            Common Voice ja  -- NOT on HF anymore. Download cv-corpus-*-ja.tar.gz from
                 https://datacollective.mozillafoundation.org and extract to data/raw/common_voice/ ; this script ingests it.
+  eval_emilia   monitor-only Emilia hold-out: first 1000 Japanese clips of JA-B000029 from videos absent from
+                emilia_yodas (ingest that first); scored against the teacher's hypothesis, not part of the gate
   eval          japanese-asr/ja_asr.jsut_basic5000, ja_asr.common_voice_8_0, ja_asr.reazonspeech_test  (eval_jsut / eval_cv8 / eval_reazon)
 
 Resumable: every flushed shard is added to the manifest immediately and shards/<source>/progress.json records the
@@ -69,10 +71,11 @@ REVISIONS = {
     "TTS-AGI/emilia-yodas": "613a372ba2cc5ecb6b27ea38a4a0926abb38263d",
 }
 EMILIA_REPO = "TTS-AGI/emilia-yodas"
+EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS = "JA/JA-B000029.tar", 1000  # last tar: far beyond any training budget
 # Emilia's language tag is per video, so a 'ja' tar still holds some English clips; require Japanese script instead
 _JA_SCRIPT = re.compile(r"[぀-ヿ㐀-䶿一-鿿]")
 ALL_SOURCES = ["reazon_small", "reazon_medium", "galgame", "emilia_yodas", "cv", "eval", "eval_jsut", "eval_cv8",
-               "eval_reazon"]
+               "eval_reazon", "eval_emilia"]
 # ReazonSpeech tiers are nested (small is a subset of medium), so a larger tier must skip rows already ingested
 DEDUP_AGAINST = {"reazon_medium": "reazon_small"}
 
@@ -292,6 +295,58 @@ def ingest_emilia(ing: Ingest, max_hours: float):
     print(f"  {ing.source}: dropped non-Japanese text={ing.stats['non_ja']}")
 
 
+def ingest_emilia_eval(ing: Ingest, tar: str, n_rows: int, train_source: str = "emilia_yodas"):
+    """Monitor-only in-domain hold-out: the first n_rows Japanese clips of a tar the training budget never reaches,
+    minus any video that also has clips in the training set. Its text is Whisper-medium output, so the useful score
+    is CER against the TEACHER's hypothesis; it is not part of the pre-registered gate. Run after `train_source`."""
+    train_videos = set()
+    for sh in read_manifest(ing.root):
+        if sh.source == train_source:
+            for row in iter_rows(ing.root / sh.path, columns=["id"]):
+                train_videos.add(_emilia_video(row["id"]))
+    if not train_videos:
+        raise SystemExit(f"{ing.source}: ingest {train_source} first (its video ids are excluded from the hold-out)")
+    kept = sum(sh.rows for sh in read_manifest(ing.root) if sh.source == ing.source)
+    if kept >= n_rows or ing.is_finished(tar):
+        ing.done()
+        return
+    ing.stats.setdefault("train_video", 0)
+    ing.stats.setdefault("non_ja", 0)
+    local = ing.download(EMILIA_REPO, tar)
+    pending: dict[str, dict] = {}
+    with tarfile.open(local, "r") as tf:
+        for m in tf:
+            if not m.isfile():
+                continue
+            key, ext = m.name.rsplit("/", 1)[-1].rsplit(".", 1)
+            d = pending.setdefault(key, {})
+            d[ext] = tf.extractfile(m).read()
+            if "mp3" not in d or "json" not in d:
+                continue
+            del pending[key]
+            if _emilia_video(key) in train_videos:
+                ing.stats["train_video"] += 1
+                continue
+            meta = json.loads(d["json"].decode("utf-8", "replace"))
+            text = meta.get("text") or ""
+            if meta.get("language", "ja") != "ja" or not _JA_SCRIPT.search(text):
+                ing.stats["non_ja"] += 1
+                continue
+            kept += ing.add("eval", f"{ing.source}/{key}", d["mp3"], text, count=False)
+            if kept >= n_rows:
+                break
+    ing.finish_input(tar)
+    ing.free_download(local)
+    ing.done()
+    print(f"  {ing.source}: skipped clips of training videos={ing.stats['train_video']} non-Japanese={ing.stats['non_ja']}")
+
+
+def _emilia_video(id_or_key: str) -> str:
+    """'emilia_yodas/JA_<video>_W000123' or 'JA_<video>_W000123' -> '<video>' (YODAS video ids may contain '_')."""
+    key = id_or_key.rsplit("/", 1)[-1]
+    return key[len("JA_"):key.rfind("_W")] if key.startswith("JA_") and "_W" in key else key
+
+
 def ingest_common_voice(ing: Ingest):
     """Ingest a manually downloaded Common Voice ja corpus from data/raw/common_voice/<cv-corpus-*>/ja/."""
     cands = list((ing.raw / "common_voice").glob("**/ja/clips"))
@@ -351,6 +406,8 @@ def main():
             ingest_galgame(ing, args.galgame_shards)
         elif s == "emilia_yodas":
             ingest_emilia(ing, args.emilia_hours)
+        elif s == "eval_emilia":
+            ingest_emilia_eval(ing, EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS)
         elif s == "cv":
             ingest_common_voice(ing)
 

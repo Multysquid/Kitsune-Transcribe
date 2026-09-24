@@ -60,6 +60,7 @@ JOIN_SOURCES = {  # sources whose mirror parquets already carry whisper-large-v3
 }
 SELF_TEXT_SOURCES = {  # sources whose dataset text is itself a second-model transcript
     "emilia_yodas": "whisper-medium (Emilia WhisperX)",
+    "eval_emilia": "whisper-medium (Emilia WhisperX)",
 }
 
 

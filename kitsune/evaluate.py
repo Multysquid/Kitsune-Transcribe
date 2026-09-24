@@ -428,7 +428,12 @@ def eval_record(step: int, elapsed_s: float, tf: dict | None = None, greedy: dic
     """Compact per-eval record; the trainer appends one per eval to the history that verdict() reads."""
     rec = dict(step=int(step), elapsed_s=float(elapsed_s))
     if tf and "all" in tf:
-        rec["heldout_kl"] = tf["all"]["kl"]
+        # the pre-registered held-out KL pools the GATE sets only, so adding a monitor-only eval set (eval_emilia)
+        # cannot move the over-fitting test; the all-sets value is kept alongside
+        gate = [d for s, d in tf.get("sets", {}).items() if s in GATE_SETS and d.get("n_tok")]
+        ntok = sum(d["n_tok"] for d in gate)
+        rec["heldout_kl"] = sum(d["kl"] * d["n_tok"] for d in gate) / ntok if ntok else tf["all"]["kl"]
+        rec["heldout_kl_all_sets"] = tf["all"]["kl"]
         rec["tf"] = {s: {k: d[k] for k in ("kl", "ce", "top1")} for s, d in tf["sets"].items()}
     if probe and "all" in probe:
         rec["probe_kl"] = probe["all"]["kl"]

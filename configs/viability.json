@@ -9,7 +9,7 @@
   "cache_dir": "cache",
   "runs_root": "runs",
   "sources": ["reazon_small", "emilia_yodas"],
-  "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon"],
+  "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia"],
   "mix": "natural",
   "subset": {"train_utts": null, "eval_utts_per_set": null},
   "device": "auto",
