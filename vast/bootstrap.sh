@@ -60,6 +60,22 @@ phase() {  # phase <name> <command...>: run it and append its wall time
     log "phase $name done in $(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }') s"
 }
 
+# retry <tries> <command...>: re-run a resumable network step after a failure. One Hub 5xx/429 or dropped connection
+# (01's listing calls are sent once, with no HTTP timeout) would otherwise stop the box after the paid boot; a stalled
+# call is cut by the timeout the caller puts in <command>. The exit code of the last attempt is returned.
+retry() {
+    local n=$1 i rc=0
+    shift
+    for (( i = 1; i <= n; i++ )); do
+        rc=0
+        "$@" || rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        log "attempt $i/$n of $* failed (exit $rc)"
+        if [ "$i" -lt "$n" ]; then sleep $(( i * 60 )); fi
+    done
+    return "$rc"
+}
+
 cat > "$HELPER" <<'PYEOF'
 """bootstrap helper: plan / pull / coverage. Reads the run config for sources and paths."""
 import fnmatch
@@ -168,7 +184,11 @@ DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["dat
 mapfile -t REBUILD < <("$PY" -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1]))["rebuild"]))' "$STATE/bootstrap_plan.json" | sed '/^$/d')
 if [ "${#REBUILD[@]}" -gt 0 ]; then
     read -r -a PREP_ARGS <<< "${KITSUNE_PREP_ARGS:-}"
-    phase rebuild_audio "$PY" scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" --sources "${REBUILD[@]}" "${PREP_ARGS[@]}"
+    # 01 resumes from its progress.json and manifest and its writes are kill-safe, so a retry, or a timeout that proves
+    # too short for a healthy rebuild, only redoes the input in progress; 3 x 60 min caps a stall well before the
+    # 5.5 h watchdog
+    phase rebuild_audio retry 3 timeout -k 60 60m "$PY" scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" \
+        --sources "${REBUILD[@]}" "${PREP_ARGS[@]}"
 else
     log "every source has parked shards; nothing to rebuild"
 fi

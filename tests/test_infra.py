@@ -158,6 +158,37 @@ def test_onstart_stub_stops_the_box_when_the_clone_fails(tmp_path):
     assert "full 40-hex" in text and "KITSUNE_NO_SELF_STOP=1" in text
 
 
+def test_bootstrap_retries_the_audio_rebuild(tmp_path):
+    """One transient Hub error in 01's listing calls (sent once, with no HTTP timeout) must not stop the box after the
+    paid boot: the rebuild runs through retry() with a timeout. retry() returns 0 once an attempt passes, and after
+    the last one the last exit code, so set -e still stops bootstrap with the real cause."""
+    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if ln.lstrip().startswith("phase rebuild_audio"))
+    assert re.search(r"phase rebuild_audio retry \d+ timeout -k \d+ \d+m \"\$PY\" scripts/01_prepare_data\.py", line)
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    func = re.search(r"^retry\(\) \{\n.*?^\}\n", text, re.M | re.S).group(0)
+    # an external command that fails until its n-th run
+    (tmp_path / "flaky.sh").write_text('n=$(( $(cat "$1" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$1"; '
+                                       '[ "$n" -ge "$2" ]\n', encoding="utf-8", newline="\n")
+
+    def run(counter: str, passes_at: int):
+        script = tmp_path / f"{counter}.sh"
+        script.write_text("\n".join([
+            "set -euo pipefail", f'cd "{tmp_path.as_posix()}"', "log() { printf '%s\\n' \"$*\"; }",
+            "sleep() { :; }",  # the real waits are minutes
+            func, f'retry 3 "$BASH" flaky.sh {counter} {passes_at}', f'echo "after $(cat {counter})"', ""]),
+            encoding="utf-8", newline="\n")
+        return subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=60)
+
+    r = run("once", 2)
+    assert r.returncode == 0 and "attempt 1/3" in r.stdout and "after 2" in r.stdout, r.stdout + r.stderr
+    r = run("always", 99)
+    assert r.returncode == 1 and "attempt 3/3" in r.stdout and "after" not in r.stdout, r.stdout + r.stderr
+    assert (tmp_path / "always").read_text().strip() == "3"
+
+
 def test_onstart_fits_vast_limits():
     raw = (VAST / "onstart.sh").read_bytes()
     assert len(raw) < 16 * 1024, "vast's on-start field is limited to 16 KB (it is run from the clone by the stub)"
