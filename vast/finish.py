@@ -13,6 +13,8 @@ Expected files for each run dir runs/<run_id>/ (see scripts/04_distill.py):
     (all of them, not just the newest: an earlier upload that failed would otherwise go with the destroyed disk; the
     hub skips re-uploads of content it already has)
   the newest full state   checkpoints/full_step_<N>/   -> runs/<run_id>/checkpoints/full_step_<N>/  (--expect-full)
+  and every full state the trainer meant for the Hub whose upload has not succeeded (UPLOAD_MARK in it: the
+    pre_cooldown one, which the trainer keeps from rotation for this; the marker itself is not uploaded)
 The files outside checkpoints/ are uploaded from a snapshot copy: the watchdog's --sync-only runs while the trainer
 still appends to its logs, and a file handed to the Hub by path is sized when it is listed but hashed and read later
 (a growing file would go up as a size/hash/content mismatch). Finished checkpoint dirs never change and go up in place.
@@ -54,6 +56,9 @@ INFRA_TIMEOUT_S = 180  # a hung infra upload must not keep a paid instance up
 # .tmp/.partial and never match.
 WEIGHTS_RE = re.compile(r"^step[_-]?(\d+)$")
 FULL_RE = re.compile(r"^full[_-]?(?:step[_-]?)?(\d+)(?:\.(?!tmp$|partial$)[A-Za-z0-9]+)?$")
+# scripts/04_distill.py's marker in a full state meant for the Hub (ckpt.upload_full_at), removed once its upload
+# succeeded
+UPLOAD_MARK = ".upload_pending"
 HASH_CHUNK = 8 << 20
 
 
@@ -107,12 +112,16 @@ def expected_files(run_dir: Path, expect_full: bool = True) -> dict[str, Path]:
         out[f"{prefix}/{rel}"] = f
     ckpt = run_dir / "checkpoints"
     weights = sorted(p for p in ckpt.iterdir() if WEIGHTS_RE.match(p.name)) if ckpt.is_dir() else []
-    picks = weights + ([newest_checkpoint(ckpt, FULL_RE)] if expect_full else [])
+    # a full state whose trainer upload failed (the pre_cooldown one) has no other copy than this disk
+    marked = sorted(p for p in ckpt.iterdir()
+                    if FULL_RE.match(p.name) and (p / UPLOAD_MARK).is_file()) if ckpt.is_dir() else []
+    picks = weights + (marked + [newest_checkpoint(ckpt, FULL_RE)] if expect_full else [])  # a dir twice: same keys
     for pick in picks:
         if pick is None:
             continue
         for f in files_under(pick):
-            out[f"{prefix}/checkpoints/{f.relative_to(ckpt).as_posix()}"] = f
+            if f.name != UPLOAD_MARK:
+                out[f"{prefix}/checkpoints/{f.relative_to(ckpt).as_posix()}"] = f
     return out
 
 
@@ -353,7 +362,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--run-dir", action="append", default=None, help="restrict to these run dirs (repeatable)")
     ap.add_argument("--no-sync", action="store_true", help="skip the upload step")
     ap.add_argument("--no-hash", action="store_true", help="compare sizes only")
-    ap.add_argument("--no-full", action="store_true", help="do not require the newest full training state in the repo")
+    ap.add_argument("--no-full", action="store_true",
+                    help="do not require the full training states in the repo (the newest, and any whose trainer "
+                         "upload failed)")
     ap.add_argument("--dry-run", action="store_true", help="print the actions; no upload, stop or destroy")
     args = ap.parse_args(argv)
 

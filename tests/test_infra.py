@@ -743,6 +743,18 @@ def test_expected_files_picks_every_weights_dir_and_the_newest_full_state(tmp_pa
     assert not any("full_step" in p for p in finish.expected_files(run, expect_full=False))
 
 
+def test_expected_files_takes_a_full_state_whose_trainer_upload_failed(tmp_path):
+    """The trainer marks a full state meant for the Hub (the pre_cooldown one) until its upload succeeds and keeps it
+    from rotation meanwhile: finish uploads and verifies a marked one too (not the marker), and --no-full none."""
+    run = make_run(tmp_path)
+    (run / "checkpoints" / "full_step_100" / finish.UPLOAD_MARK).write_bytes(b"")
+    exp = finish.expected_files(run)
+    prefix = f"runs/{run.name}"
+    assert {f"{prefix}/checkpoints/full_step_{s}/state.pt" for s in (100, 200)} <= set(exp)
+    assert not any(p.endswith(finish.UPLOAD_MARK) for p in exp)
+    assert not any("full_step" in p for p in finish.expected_files(run, expect_full=False))
+
+
 def test_git_blob_id_matches_git(tmp_path):
     p = tmp_path / "x.json"
     p.write_bytes(b'{"a": 1}\n')

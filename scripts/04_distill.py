@@ -84,8 +84,9 @@ Checkpoints under runs/<run_id>/checkpoints/:
                    format), l2sp.pt (theta_0), trainer.pt (config, progress counters and clocks, eval history,
                    planner position, RNG states, logger state). Every ckpt.full_local_every_min, the newest
                    ckpt.keep_local are kept; uploaded at ckpt.upload_full_at ("pre_cooldown", "end"; a resume
-                   queues the pre_cooldown one again, as a crash may have cut its upload short). Written as
-                   <name>.tmp/ and renamed, so a crash never leaves a torn one.
+                   queues the pre_cooldown one again, as a crash may have cut its upload short; one whose upload
+                   failed is kept past keep_local, UPLOAD_MARK, for vast/finish.py). Written as <name>.tmp/ and
+                   renamed, so a crash never leaves a torn one.
 `--resume <full_step_N dir | run dir>` restores all of it into the same run dir and continues the same schedule and
 time budget; the config comes from the checkpoint, with this invocation's --set overrides applied on top (--config is
 then ignored). optim.*, loss.* and memory.grad_ckpt among them go on top of the restored optimizer, L2-SP and memory
@@ -171,6 +172,9 @@ FAILED_UPLOAD_WAIT_S = 120
 SR = 16000
 FULL_RE = re.compile(r"^full_step_(\d+)$")
 WEIGHTS_RE = re.compile(r"^step_(\d+)$")
+# an empty file in a full state meant for the Hub (ckpt.upload_full_at) until its upload succeeds: rotate_full keeps
+# the dir meanwhile and vast/finish.py uploads and verifies it before a destroy (the same name there); never uploaded
+UPLOAD_MARK = ".upload_pending"
 TERMS = ("kl", "ce", "top1_match", "student_entropy_coarse", "teacher_entropy_coarse", "student_tail", "teacher_tail",
          "teacher_p1")
 TERM_TAGS = dict(kl="loss/kl", ce="loss/ce", top1_match="tok/top1", student_entropy_coarse="tok/entropy_student",
@@ -637,7 +641,8 @@ def hf_api():
 class Uploader:
     """Checkpoint uploads to <repo>:runs/<run_id>/checkpoints/<name>/ in one background thread, so a 1-9 GB upload
     never blocks training. Every attempt is an event; failures are retried and never raise (vast/finish.py uploads
-    again and verifies before an instance is destroyed). A directory with a pending upload is never rotated away.
+    again and verifies before an instance is destroyed). A directory with a pending upload is never rotated away; a
+    success removes a full state's UPLOAD_MARK (save_full), so one whose upload failed stays too, for finish.py.
     The thread is a daemon fed by a queue (not a ThreadPoolExecutor, whose worker the interpreter joins at exit): an
     upload that never returns must not keep the trainer, and with it a paid instance, alive, so wait() and shutdown()
     take a bound and the thread dies with the process."""
@@ -684,7 +689,12 @@ class Uploader:
                     self._repo_ready = True
                 self.api.upload_folder(repo_id=self.repo, repo_type="model", folder_path=str(local),
                                        path_in_repo=f"runs/{self.run_id}/checkpoints/{name}",
-                                       commit_message=f"{self.run_id}: checkpoint {name}")
+                                       commit_message=f"{self.run_id}: checkpoint {name}",
+                                       ignore_patterns=[UPLOAD_MARK])
+                try:
+                    (local / UPLOAD_MARK).unlink(missing_ok=True)  # on the Hub now: rotation may take it
+                except OSError:
+                    pass  # kept a little longer, and uploaded once more by finish.py: no harm
                 self.log.event("ckpt_upload_ok", name=name, attempt=attempt, gb=round(size / 1e9, 3),
                                upload_s=round(time.time() - t0, 1))
                 return True
@@ -1874,6 +1884,8 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False) -> Path:
         R.log.event("checkpoint", ckpt="full", name=name, reason=reason, trainer_only=True,
                     save_s=round(time.time() - t0, 1))
     if upload:
+        if R.uploader.repo:  # the Uploader removes it once the upload succeeded (no repo: nothing ever would)
+            (d / UPLOAD_MARK).touch()
         R.uploader.submit(d, name)
     rotate_full(R)
     return d
@@ -1888,12 +1900,15 @@ def _disk_free_gb(p: Path) -> float | None:
 
 def rotate_full(R: Run):
     """Keep the newest ckpt.keep_local full states (~8.6 GB each for the real student). The one a resume started
-    from is not special: once keep_local newer ones exist it goes too, or a resumed run fills the 80 GB disk."""
+    from is not special: once keep_local newer ones exist it goes too, or a resumed run fills the 80 GB disk. Kept past
+    that: one still uploading, and one meant for the Hub whose upload has not succeeded (UPLOAD_MARK: the
+    pre_cooldown state whose upload failed, rotated away at the end save by a periodic one in the cooldown, was on no
+    disk and no Hub once the box was destroyed; vast/finish.py uploads and verifies it): normally one more dir."""
     keep = max(1, int(R.cfg["ckpt"]["keep_local"]))
     fulls = sorted((p for p in R.ckpt_dir.iterdir() if FULL_RE.match(p.name)), key=lambda p: int(FULL_RE.match(p.name)[1]))
     busy = R.uploader.busy()
     for p in fulls[:-keep]:
-        if p in busy:
+        if p in busy or (p / UPLOAD_MARK).exists():
             continue
         shutil.rmtree(p, ignore_errors=True)
         R.log.event("checkpoint_deleted", name=p.name, keep_local=keep)

@@ -231,6 +231,56 @@ def test_a_resume_sets_newer_states_aside_and_uploads_the_pre_cooldown_state_aga
         R.log.close()
 
 
+@pytest.mark.parametrize("pre_upload_ok", [False, True])
+def test_a_failed_pre_cooldown_upload_is_kept_for_finish(tmp_path, pre_upload_ok):
+    """The pre_cooldown full state whose upload failed every retry counted as done, so the end save's rotation
+    (keep_local 2, a periodic full state inside the cooldown) deleted it, and finish.py, which took only the newest
+    full state, verified the run and destroyed the box: the stable-phase resume point was on no disk and no Hub. Its
+    UPLOAD_MARK now keeps it from rotation until an upload succeeds, and finish.py uploads and verifies it."""
+    import importlib.util
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    evs = []
+
+    class FlakyHub(FakeHub):
+        def upload_folder(self, **kw):
+            if kw["path_in_repo"].endswith("/full_step_4") and not pre_upload_ok:
+                raise RuntimeError("503 Service Unavailable")
+            super().upload_folder(**kw)
+
+    hub, run = FlakyHub(), tmp_path / "runs" / "run"
+    log = SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw.get("name"))), state_dict=dict)
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 2}}, run_dir=run, ckpt_dir=run / "checkpoints", st=dict(fulls=[]),
+                        clock=lambda: 0.0, planner=SimpleNamespace(state_dict=dict), log=log,
+                        model=torch.nn.Linear(1, 1), opt=SimpleNamespace(state_dict=dict),
+                        l2sp=SimpleNamespace(state_dict=dict))
+    R.uploader = m.Uploader(hub, "u/r", "run", True, log, retries=())
+    R.ckpt_dir.mkdir(parents=True)
+    try:
+        for step, reason, upload in ((2, "periodic", False), (4, "pre_cooldown", True), (6, "periodic", False),
+                                     (8, "end", True)):
+            m.save_full(R, step, reason, upload=upload)
+            R.uploader.wait(10)
+    finally:
+        R.uploader.shutdown(5)
+    left = sorted(p.name for p in R.ckpt_dir.iterdir())
+    assert ("ckpt_upload_failed", "full_step_4") in evs or pre_upload_ok
+    assert not (R.ckpt_dir / "full_step_8" / m.UPLOAD_MARK).exists()  # uploaded: nothing to keep it for
+    assert all(ign == [m.UPLOAD_MARK] for _, _, ign in hub.folders)  # the marker never leaves the box
+    spec = importlib.util.spec_from_file_location("finish", ROOT / "vast" / "finish.py")
+    finish = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(finish)
+    fulls = {p.split("/")[3] for p in finish.expected_files(run) if "/full_step_" in p}
+    if pre_upload_ok:
+        assert left == ["full_step_6", "full_step_8"] and fulls == {"full_step_8"}
+    else:
+        assert left == ["full_step_4", "full_step_6", "full_step_8"]
+        assert (R.ckpt_dir / "full_step_4" / m.UPLOAD_MARK).exists()
+        assert fulls == {"full_step_4", "full_step_8"}
+        assert not any(p.endswith(m.UPLOAD_MARK) for p in finish.expected_files(run))
+
+
 def test_hf_roundtrip_retries_a_transient_hub_error(tmp_path):
     """The smoke round trip's create_repo and commit POSTs are sent once by the hub: one 503 must be retried (on the
     uploads' schedule) instead of stopping the paid run after its bootstrap; bad credentials fail at once."""
