@@ -3,10 +3,13 @@
 Run this on the laptop. It
   1. searches on-demand offers with the strict host filter (D45a): 1x A100 SXM4 40 GB, verified, reliability >= 0.98,
      driver CUDA >= 13.0 (the image's torch is cu130), >= 12 effective CPU cores, >= 64 GB RAM, disk_bw and inet_down
-     >= 500, a direct port and room for the 80 GB disk, sorted by $/h; if none, the same filter on SXM4 80 GB;
-  2. prints the offers and the exact `vastai create instance` command: the image by digest, --disk 80, --ssh --direct,
-     the KITSUNE_* env, TZ=UTC and --onstart vast/onstart.sh;
+     >= 500, a direct port and room for the 150 GB disk, sorted by $/h; if none, the same filter on SXM4 80 GB;
+  2. prints the offers and the exact `vastai create instance` command: the image by digest, --disk 150, --ssh --direct,
+     the KITSUNE_* env, TZ=UTC and --onstart vast/onstart_stub.sh (which clones the repo and runs vast/onstart.sh);
   3. creates the instance only with --yes. Spending money is always the user's explicit step.
+The git, image and HF checks run before the offer search, so they report problems even without the vastai CLI. The HF
+check refuses a data repo whose derived data is incomplete: a train source's teacher shard without its second opinion,
+or a selection that still drops rows as no_agree (both mean training on a fraction of the planned hours).
 
 HF_TOKEN is never an argument and never part of the command: the box gets it from the vast ACCOUNT-level environment
 variables (D48a), so it does not appear in shell history, the process list or the instance config. The instance runs
@@ -32,7 +35,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 VASTAI_PIN = "vastai==1.8.0"
 IMAGE_REPO = "ghcr.io/multysquid/kitsune-train"
-DISK_GB = 80
+# the image (~12 GB unpacked, if vast counts it) + audio 23 GB + train/eval caches ~22 GB + derived data 2.3 GB + up to
+# 4 full states x 8.6 GB while rotating/uploading + ~9 weights x 1.2 GB: 80 GB fills mid-run, 150 GB leaves headroom
+DISK_GB = 150
+# traffic of one run for the cost line: ~25 GB of upstream audio down, ~30 GB of checkpoints and logs up
+EST_DOWN_GB, EST_UP_GB = 25, 30
+ONSTART = Path(__file__).resolve().parent / "onstart_stub.sh"
+ONSTART_MAX_BYTES = 4000  # the API's onstart field: vast documents 16 KB, one client SDK <= 4048 chars
 DEFAULT_MAX_DPH = 2.0
 # D45a strict filter; vast converts cpu_ram/gpu_ram GB to MB itself. rentable/verified are also CLI defaults, spelled
 # out so the printed query is the whole truth.
@@ -115,7 +124,7 @@ def offer_table(offers: list[dict], limit: int = 10) -> str:
     cols = [("id", "id", "{}"), ("gpu", "gpu_name", "{}"), ("GB", "gpu_ram", "{:.0f}"), ("$/h", "dph_total", "{:.3f}"),
             ("rel", "reliability", "{:.3f}"), ("cuda", "cuda_max_good", "{}"), ("cpu", "cpu_cores_effective", "{:.0f}"),
             ("ramGB", "cpu_ram", "{:.0f}"), ("down", "inet_down", "{:.0f}"), ("diskMB/s", "disk_bw", "{:.0f}"),
-            ("where", "geolocation", "{}")]
+            ("$/GBdn", "inet_down_cost", "{:.3f}"), ("$/GBup", "inet_up_cost", "{:.3f}"), ("where", "geolocation", "{}")]
     rows = [[h for h, _, _ in cols]]
     for o in offers[:limit]:
         row = []
@@ -172,18 +181,60 @@ def resolve_image_digest(tag: str, timeout: float = 20) -> str:
     return f"{IMAGE_REPO}@{digest}"
 
 
-def hf_preflight(data_repo: str, out_repo: str) -> tuple[str | None, list[str]]:
-    """-> (data repo commit to pin, problems). Uses the laptop's own HF login, read-only."""
-    from huggingface_hub import HfApi
+def data_problems(files: list[str], cfg: dict) -> list[str]:
+    """What the run config needs from the data repo's file list (bootstrap.sh's plan() applies the same rules on the
+    box, where a failure is already billed): the teacher/second-opinion meta, the selection, the student config, teacher
+    shards for every train source and eval set, and a second opinion for EVERY train source teacher shard.
+    make_selection drops the rows of a shard without one as no_agree, so a partial 02b pass silently shrinks the train
+    set."""
+    teacher_root, second_root = cfg.get("teacher_root", "teacher_out"), cfg.get("second_root", "second_out")
+    have = set(files)
+    problems = [f"no {f}" for f in (f"{teacher_root}/meta.json", f"{second_root}/meta.json", cfg["selection"],
+                                    f"{cfg['student'].rstrip('/')}/config.json") if f not in have]
+
+    def stems(root: str, s: str, ext: str) -> set[str]:
+        return {f.rsplit("/", 1)[1][: -len(ext)] for f in files if f.startswith(f"{root}/{s}/") and f.endswith(ext)}
+
+    sources = list(cfg.get("sources", []))
+    for s in dict.fromkeys(sources + list(cfg.get("eval_sets", []))):
+        teacher = stems(teacher_root, s, ".npz")
+        if not teacher:
+            problems.append(f"no {teacher_root}/{s}/*.npz")
+        elif s in sources and (gap := teacher - stems(second_root, s, ".jsonl")):
+            problems.append(f"{second_root}/{s}: {len(gap)} of {len(teacher)} teacher shards have no second opinion "
+                            f"(e.g. {min(gap)}): finish scripts/02b_second_opinion.py, rebuild the selection, upload")
+    return problems
+
+
+def selection_problems(path: Path, name: str) -> list[str]:
+    """A selection built before the second-opinion pass finished drops those rows as no_agree."""
+    import pandas as pd
+
+    sel = pd.read_parquet(path, columns=["source", "reason"])
+    bad = sel[sel["reason"] == "no_agree"]
+    if bad.empty:
+        return []
+    return [f"{name} drops {len(bad)} rows as no_agree ({bad['source'].value_counts().to_dict()}): rebuild it with "
+            f"scripts/make_selection.py after the second-opinion pass and upload it"]
+
+
+def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, list[str]]:
+    """-> (data repo commit to pin, problems). Uses the laptop's own HF login, read-only (the selection, ~2 MB, is
+    downloaded to a temporary dir)."""
+    import tempfile
+
+    from huggingface_hub import HfApi, hf_hub_download
 
     api, problems, rev = HfApi(), [], None
     try:
         info = api.dataset_info(data_repo)
         rev = info.sha
         files = api.list_repo_files(data_repo, repo_type="dataset", revision=rev)
-        for need in ("teacher_out/meta.json",):
-            if need not in files:
-                problems.append(f"{data_repo} has no {need}")
+        problems += [f"{data_repo}@{rev[:12]}: {p}" for p in data_problems(files, cfg)]
+        if cfg["selection"] in files:
+            with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+                local = hf_hub_download(data_repo, cfg["selection"], repo_type="dataset", revision=rev, local_dir=tmp)
+                problems += selection_problems(Path(local), cfg["selection"])
     except Exception as e:
         problems.append(f"cannot read dataset {data_repo}: {type(e).__name__}: {e}")
     try:
@@ -218,11 +269,6 @@ def main(argv: list[str] | None = None) -> int:
     will_create = args.yes and not args.dry_run
     errors: list[str] = []
 
-    exe = shutil.which("vastai")
-    if exe is None:
-        print(install_help())
-        return 2
-
     sha = args.sha or git("rev-parse", "HEAD")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise LaunchError(f"--sha must be a full 40-hex commit id, got {sha!r}")
@@ -243,8 +289,19 @@ def main(argv: list[str] | None = None) -> int:
 
     data_rev = None
     if not args.no_hf_check:
-        data_rev, problems = hf_preflight(args.data_repo, args.out_repo)
+        cfg = json.loads((ROOT / args.config).read_text(encoding="utf-8"))
+        data_rev, problems = hf_preflight(args.data_repo, args.out_repo, cfg)
         errors += problems
+    stub = ONSTART.read_bytes()
+    if len(stub) > ONSTART_MAX_BYTES:
+        errors.append(f"{ONSTART.name} is {len(stub)} bytes (> {ONSTART_MAX_BYTES}): vast may truncate the on-start "
+                      f"field, and a truncated script starts nothing, not even the watchdog")
+
+    exe = shutil.which("vastai")
+    if exe is None:
+        print("\nproblems:\n  " + "\n  ".join(errors) if errors else "git, image and HF checks passed")
+        print(install_help())
+        return 2
 
     env = {"KITSUNE_SHA": sha, "KITSUNE_CONFIG": args.config, "KITSUNE_DATA_REPO": args.data_repo,
            "KITSUNE_OUT_REPO": args.out_repo, "KITSUNE_MAX_HOURS": f"{args.max_hours:g}", "TZ": "UTC"}
@@ -266,15 +323,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if offer and isinstance(offer.get("dph_total"), (int, float)):
         env["KITSUNE_DPH"] = f"{offer['dph_total']:.4f}"  # kitsune.runlog records it for the cost estimate
-    onstart = ROOT / "vast" / "onstart.sh"
     label = f"kitsune-{Path(args.config).stem}-{sha[:7]}"
-    cargs = create_args(offer["id"] if offer else "<offer-id>", image, env, onstart, label)
+    cargs = create_args(offer["id"] if offer else "<offer-id>", image, env, ONSTART, label)
     assert not any("HF_TOKEN" in a for a in cargs), "HF_TOKEN must never be on the command line"
     print(f"\ncreate command:\n  vastai {shlex.join(cargs)}")
     print("HF_TOKEN is not passed: it must be set in vast Account -> Settings -> Environment Variables.")
     if offer:
-        print(f"expected cost: ${offer.get('dph_total', 0):.3f}/h x <= {args.max_hours:g} h (watchdog cap) "
-              f"= <= ${offer.get('dph_total', 0) * args.max_hours:.2f} plus storage/bandwidth")
+        dph = offer.get("dph_total", 0)
+        down, up = (offer.get(k) if isinstance(offer.get(k), (int, float)) else None
+                    for k in ("inet_down_cost", "inet_up_cost"))
+        bw = (f"~${EST_DOWN_GB * down + EST_UP_GB * up:.2f} (~{EST_DOWN_GB} GB down, ~{EST_UP_GB} GB up at this host's "
+              f"$/GB)" if down is not None and up is not None else "unknown (the offer lists no $/GB)")
+        print(f"expected cost: ${dph:.3f}/h (GPU + {DISK_GB} GB disk) x <= {args.max_hours:g} h (watchdog cap) "
+              f"= <= ${dph * args.max_hours:.2f}, plus bandwidth {bw}")
 
     if errors:
         print("\nproblems:\n  " + "\n  ".join(errors))

@@ -8,7 +8,8 @@ Nothing is rented until you run `launch.py --yes`.
 | file | runs where | what it does |
 |---|---|---|
 | `launch.py` | laptop | search offers with the strict filter, print the exact `vastai create instance` command, create only with `--yes` |
-| `onstart.sh` | box, every container start | env sync, limits, TensorBoard + vast portal, clone at `KITSUNE_SHA`, start watchdog, then `bootstrap.sh` + `supervise.py` |
+| `onstart_stub.sh` | box, every container start | what `--onstart` sends (kept under 4 KB): clone at `KITSUNE_SHA`, then run `onstart.sh`; stops the box if the clone fails |
+| `onstart.sh` | box, from the stub | env sync, limits, TensorBoard + vast portal, start watchdog, then `bootstrap.sh` + `supervise.py` |
 | `bootstrap.sh` | box | pull derived data from `KITSUNE_DATA_REPO`, rebuild audio with `scripts/01_prepare_data.py` (pinned upstream commits), check the id join |
 | `supervise.py` | box | run `scripts/04_distill.py`; resume once after a late crash; then `finish.py --destroy` or `--stop` |
 | `finish.py` | box | upload, verify every file in the HF output repo (path, size, hash), destroy; stop instead if anything is off |
@@ -36,12 +37,16 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    hf repos create Multy123/kitsune-data --repo-type dataset --private
    hf repos create Multy123/kitsune-runs --private
    ```
-2. Upload the derived data (~1.5 GB, most of it the student init; the audio is rebuilt on the box). From the repo
-   root:
+2. Upload the derived data (~2.3 GB, most of it the student init; the audio is rebuilt on the box). Finish the
+   second-opinion pass for every train source and rebuild the selection first: `launch.py` refuses a data repo where a
+   train source's teacher shard has no second opinion or the selection still has `no_agree` rows. From the repo root:
    ```bash
    hf upload Multy123/kitsune-data . . --repo-type dataset \
-     --include "teacher_out/meta.json" --include "teacher_out/reazon_small/*" --include "teacher_out/eval_*/*" \
-     --include "second_out/meta.json" --include "second_out/reazon_small/*" \
+     --include "teacher_out/meta.json" --include "second_out/meta.json" \
+     --include "teacher_out/reazon_small/*" --include "teacher_out/emilia_yodas/*" --include "teacher_out/galgame/*" \
+     --include "teacher_out/eval_*/*" \
+     --include "second_out/reazon_small/*" --include "second_out/emilia_yodas/*" --include "second_out/galgame/*" \
+     --include "second_out/eval_*/*" \
      --include "selection/viability.parquet" --include "students/b20x2560-d4/*"
    ```
    Re-running it after an interruption only sends what is missing. Optional, only if your uplink is fast enough: also
@@ -71,9 +76,12 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    ```bash
    python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
    ```
-   It checks the commit is pushed, resolves the image tag to a digest, checks both HF repos with your local login,
-   searches offers (verified A100 SXM4 40 GB, reliability >= 0.98, driver CUDA >= 13.0, >= 12 CPU cores, >= 64 GB RAM,
-   disk and network >= 500; falls back to SXM4 80 GB), prints a table, the exact create command and the cost cap.
+   It checks the commit is pushed, resolves the image tag to a digest, checks both HF repos with your local login
+   (including that the derived data is complete, see above), then searches offers (verified A100 SXM4 40 GB,
+   reliability >= 0.98, driver CUDA >= 13.0, >= 12 CPU cores, >= 64 GB RAM, disk and network >= 500, room for the
+   150 GB disk; falls back to SXM4 80 GB), prints a table with each host's bandwidth $/GB, the exact create command and
+   the cost cap including ~25 GB down / ~30 GB up. The checks before the search also run without the vastai CLI.
+   Offers come and go within minutes, so look again right before renting.
 3. Rent:
    ```bash
    python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --yes

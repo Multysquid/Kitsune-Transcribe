@@ -15,8 +15,10 @@
 # already on disk. Phase timings go to $KITSUNE_STATE/bootstrap_timings.jsonl.
 #
 # Env: KITSUNE_DATA_REPO (required), KITSUNE_DATA_REVISION (default main), KITSUNE_CONFIG (default
-# configs/viability.json), KITSUNE_PREP_ARGS (extra args for 01, e.g. --galgame-shards 12), KITSUNE_MIN_COVERAGE
-# (default 0.99), HF_TOKEN (vast account env; never printed).
+# configs/viability.json), KITSUNE_PREP_ARGS (extra args for 01; leave it empty for the viability data: its teacher
+# outputs cover exactly the first 6 Galgame tars and 300 h of Emilia-YODAS, which are 01's defaults, and a larger
+# --galgame-shards/--emilia-hours only downloads audio without teacher output), KITSUNE_MIN_COVERAGE (default 0.99),
+# HF_TOKEN (vast account env; never printed).
 set -euo pipefail
 
 KITSUNE_DIR="${KITSUNE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -101,6 +103,11 @@ def plan():
         required.append(f"{teacher_root}/{s}/*.npz")
     required += [f"{second_root}/{s}/*.jsonl" for s in sources]
     missing = [p for p in required if not has(p)]
+    for s in sources:  # every teacher shard needs its second opinion (the same rule as vast/launch.py data_problems)
+        teacher = {f.rsplit("/", 1)[1][:-4] for f in files if f.startswith(f"{teacher_root}/{s}/") and f.endswith(".npz")}
+        second = {f.rsplit("/", 1)[1][:-6] for f in files if f.startswith(f"{second_root}/{s}/") and f.endswith(".jsonl")}
+        if teacher - second:
+            missing.append(f"{second_root}/{s}: {len(teacher - second)} of {len(teacher)} shards without a second opinion")
     if missing:
         sys.exit(f"data repo {repo}@{rev} lacks: {missing}")
     parked = [s for s in names if has(f"{data_root}/shards/{s}/*.parquet")]
