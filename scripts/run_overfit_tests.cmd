@@ -7,10 +7,12 @@ rem relaunches it with --resume from its newest full state after a crash (this G
 rem A run that still fails does not stop the next one. Console output of
 rem all three: overfit_tests.log; start, end and exit code of each run and of each attempt: overfit_pipeline.log.
 rem Results: runs\overfit-*\ (TensorBoard: tensorboard --logdir runs). Needs the GPU to itself.
-cd /d D:\Shizu-ko-distill
+rem Runs the checkout this file is in (the parent of scripts\), not a fixed path; PY overrides the interpreter.
+rem Its data\, teacher_out\, selection\ and students\ must be there: a git worktree has none.
+cd /d "%~dp0.." || exit /b 1
 set PYTHONIOENCODING=utf-8
 set PYTHONUNBUFFERED=1
-set PY=C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe
+if not defined PY set "PY=C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe"
 echo %date% %time% START >> overfit_pipeline.log
 call :run overfit_1s
 call :run overfit_10s

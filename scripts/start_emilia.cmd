@@ -1,10 +1,12 @@
 @echo off
 rem Emilia-YODAS JA (CC BY 4.0) replacement set for the viability run: ingest ~300 h, teacher pass, free second
 rem opinion. Every step is resumable, so this is safe to re-run after a crash or reboot.
-cd /d D:\Shizu-ko-distill
+rem Runs the checkout this file is in (the parent of scripts\), not a fixed path; PY overrides the interpreter.
+rem It writes that checkout's data\, teacher_out\ and second_out\ (a git worktree has none).
+cd /d "%~dp0.." || exit /b 1
 set PYTHONIOENCODING=utf-8
 set PYTHONUNBUFFERED=1
-set PY=C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe
+if not defined PY set "PY=C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe"
 echo %date% %time% START >> emilia_pipeline.log
 "%PY%" scripts\01_prepare_data.py --sources emilia_yodas --emilia-hours 300 >> emilia_prepare.log 2>&1 || goto :fail
 echo %date% %time% ingest done >> emilia_pipeline.log
