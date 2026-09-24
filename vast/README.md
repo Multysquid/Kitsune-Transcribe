@@ -121,8 +121,8 @@ probe). The numbers to read first are in TensorBoard under `2_loss_accuracy/00_s
 `train_cer_vs_teacher_pct`, `val_loss`, `train_loss`, ...), and each eval prints one line to `kitsune.log`:
 `[full eval] step N epoch E | val CER x.x% (vs teacher y.y%) | train CER vs teacher z.z% (vs ref w.w%) | val KL ...`.
 The cost of a full eval on the A100 is an estimate until the first run measures it (`eval/wall_s`,
-`eval/greedy_full/rtf`): between ~5 and ~38 min (the `_comment` in `configs/viability.json` has the arithmetic),
-against ~10-47 min of training per epoch.
+`eval/greedy_full/rtf`): ~5-10 min (the laptop measured ~10 min for this student in batched decoding; the `_comment`
+in `configs/viability.json` has the arithmetic), against ~12-47 min of training per epoch.
 
 To stop the training by hand (it looks flat on TensorBoard, or the results are already what you need):
 ```bash
