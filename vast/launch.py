@@ -51,7 +51,9 @@ DISK_GB = 150
 # traffic of one run for the cost line: ~25 GB of upstream audio down, ~30 GB of checkpoints and logs up
 EST_DOWN_GB, EST_UP_GB = 25, 30
 ONSTART = Path(__file__).resolve().parent / "onstart_stub.sh"
-ONSTART_MAX_BYTES = 4000  # the API's onstart field: vast documents 16 KB, one client SDK <= 4048 chars
+# vast's OpenAPI create-instance doc caps the onstart field at 4048 chars (gzip+base64 beyond that), its CLI guide says
+# 16 KB, and neither says whether a longer script is truncated or rejected: stay under the smaller limit
+ONSTART_MAX_BYTES = 4000
 DEFAULT_MAX_DPH = 2.0
 # the student dir files the trainer loads (03_build_student saves them all; the trainer has no processor fallback). The
 # same list is STUDENT_FILES in vast/bootstrap.sh's helper
