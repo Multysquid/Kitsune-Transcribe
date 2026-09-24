@@ -6,7 +6,8 @@
   evals/step_<N>_mini/, `eval_mini` events, summary.json's mini_history) and never read by the early stop or the
   verdict; training itself is unchanged by it
 - eval.full_every_epochs: an eval at every N-th epoch end on the steps and wall clocks (the planner's epochs), decoding
-  the COMPLETE eval sets; every_min / every_steps are ignored then
+  the COMPLETE eval sets; every_min / every_steps are ignored then. When the loop ends at the step of one (max_steps
+  at an epoch end, an eval that runs past T), the end phase reuses it as the final eval: one decode per step
 - the headline numbers after every eval (kitsune.evaluate.headline): pooled corpus CER = sum edits / sum chars of the
   per-set numbers, gate sets only; summary/{full,mini}/<name> with <name>_pct copies; one console line per eval
 - eval.gate false: summary.json's verdict is "N/A" with the numbers
@@ -279,6 +280,20 @@ def test_full_eval_at_every_epoch_end_on_the_step_clock(steps_runs):
     ev_scal = scalar(run, "eval/epoch")
     assert sorted(ev_scal) == sorted({0, *ends, MAX_STEPS}) and all(ev_scal[e] == float(i + 1) for i, e in
                                                                      enumerate(ends))
+    # max_steps ends an epoch: the loop's complete eval at that step is the final eval, decoded once (the history
+    # would hide a second decode: it replaces a same-step record)
+    plain = steps_runs["plain"]
+    assert MAX_STEPS in epoch_ends(plain), epoch_ends(plain)
+    at = [e["at_step"] for e in events(plain, "eval")]
+    assert at == [e["at_step"] for e in events(plain, "eval_start")] == sorted({0, *epoch_ends(plain)})
+    assert not any(e["final"] for e in events(plain, "eval"))
+    assert [e["at_step"] for e in events(plain, "eval_final_reused")] == [MAX_STEPS]
+    # the crashed-and-resumed run: once per step after the resume too (its step-9 eval is replayed, legitimately)
+    after = events(run)
+    after = after[max(i for i, e in enumerate(after) if e["kind"] == "resumed"):]
+    at = [e["at_step"] for e in after if e["kind"] == "eval"]
+    assert len(at) == len(set(at)) and at[-1] == MAX_STEPS
+    assert [e["at_step"] for e in after if e["kind"] == "eval_final_reused"] == [MAX_STEPS]
 
 
 def test_mini_cadence_subsets_and_isolation(env, steps_runs):
@@ -467,3 +482,39 @@ def test_full_eval_every_other_epoch_on_the_wall_clock_and_gate_off(env, monkeyp
     (ev,) = events(run, "verdict")
     assert ev["verdict"] == "N/A" and ev["numbers"] == v["numbers"]
     assert math.isfinite(s["headline"]["val_cer"])
+
+
+def test_a_complete_eval_that_runs_past_T_is_the_final_eval(env, monkeypatch):
+    """The wall clock: the first epoch-end eval (complete eval sets) takes longer than the budget left, so the loop
+    ends at its step. The end phase reuses it as the final eval - one decode of the complete sets at that step, not
+    two - and the verdict and the summary are that eval's numbers."""
+    monkeypatch.delenv("KITSUNE_DEADLINE", raising=False)
+    monkeypatch.delenv("KITSUNE_STATE", raising=False)
+    m = load_script("04_distill")
+    real = m.run_eval
+
+    def slow(R, step, final=False, complete=None):  # the loop clock runs on during an eval: this one outlasts T
+        out = real(R, step, final=final, complete=complete)
+        if complete and not final:
+            R.st["train_s"] += float(R.cfg["schedule"]["train_hours"]) * 3600
+        return out
+
+    monkeypatch.setattr(m, "run_eval", slow)
+    path = write_config(env, "cad-past-T", {
+        "schedule": {"clock": "wall", "train_hours": 1.0, "max_steps": 10},  # max_steps: a cap only, never reached
+        "eval": {"every_steps": None, "mini": {"every_steps": None}},
+        "ckpt": {"full_every_steps": 1000},
+    })
+    assert m.main(["--config", path]) == 0
+    run = one_run(env["root"], "cad-past-T")
+    ends = epoch_ends(run)
+    s = summary(run)
+    assert ends and s["status"] == "complete" and s["steps"] == ends[0] < 10
+    assert [(e["at_step"], e["final"], e["complete"]) for e in events(run, "eval")] == [(0, False, False),
+                                                                                      (ends[0], False, True)]
+    assert [e["at_step"] for e in events(run, "eval_start")] == [0, ends[0]]
+    assert [e["at_step"] for e in events(run, "eval_final_reused")] == [ends[0]]
+    assert [r["step"] for r in s["history"]] == [0, ends[0]] and s["headline"] == s["history"][-1]["headline"]
+    d = json.loads((run / "evals" / f"step_{ends[0]}" / "summary.json").read_text(encoding="utf-8"))
+    for x in EVAL:
+        assert s["verdict"]["sets"][x]["student"] == d["greedy_full"]["sets"][x]["cer_ref_corpus"]

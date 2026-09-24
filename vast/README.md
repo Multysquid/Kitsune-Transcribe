@@ -124,8 +124,8 @@ ls /workspace/Kitsune-Transcribe/runs/                       # the run id: <run_
 touch /workspace/Kitsune-Transcribe/runs/<run_id>/STOP
 ```
 The trainer checks for the file before every optimizer step: the step under way finishes (with its eval and
-checkpoints, if due), then the normal end phase runs - final weights and full state, final eval, verdict, summary,
-uploads - and it exits 0, so the box verifies the upload and destroys itself as after a full run (`early_stop` event
+checkpoints, if due), then the normal end phase runs - final weights and full state, final eval (an epoch-end full
+eval of that same step is reused, not decoded again), verdict, summary, uploads - and it exits 0, so the box verifies the upload and destroys itself as after a full run (`early_stop` event
 with reason `stop_file`). Killing the trainer instead counts as a crash (resumed once, or the box is stopped; see below)
 and skips the final eval.
 

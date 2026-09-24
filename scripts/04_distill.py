@@ -28,8 +28,10 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
 Evals in the loop (run_eval): every eval.every_min minutes of loop clock (eval.every_steps steps when set), or at the
 end of every eval.every_epochs-th / eval.full_every_epochs-th epoch instead. An epoch ends where the planner's plan for
 it ends (StepPlanner), on every clock. A full_every_epochs eval decodes the COMPLETE eval sets greedily, like the final
-eval; the others decode the fixed greedy subset. Every one of them (step 0 and the final eval too) is a "full" eval:
-the complete eval sets teacher-forced, the probe, one record in the history the verdict and the early stop read.
+eval (when the loop ends at its step - it ran past T, max_steps or the STOP file at an epoch end, early stop - the end
+phase reuses it as the final eval instead of decoding again: an `eval_final_reused` event); the others decode the fixed
+greedy subset. Every one of them (step 0 and the final eval too) is a "full" eval: the complete eval sets
+teacher-forced, the probe, one record in the history the verdict and the early stop read.
 Mini evals (eval.mini, run_mini_eval): every mini.every_steps optimizer steps, except at step 0 and at a step with a
 full eval (in the loop, or the final one when the loop ends there), a small eval of its own on fixed seeded subsets -
 mini.val_per_set utterances of each gate set (the whole eval subset of the overfit runs) and mini.train_utts of the
@@ -86,7 +88,8 @@ fit_budget). schedule.clock "steps" makes T = schedule.max_steps optimizer steps
 ckpt.*_every_steps replace the minute cadences when set: deterministic schedules for tests and debugging.
 schedule.clock "epochs" makes T = the optimizer steps of schedule.epochs full passes over the train set (plan_epochs),
 with the warmup capped at ceil(10 %) of them; eval.every_epochs runs the eval at every N-th epoch end instead of the
-minute/step cadence (the last epoch's is the end phase's final eval).
+minute/step cadence (the last epoch's is the end phase's final eval; on the steps and wall clocks a complete-set
+eval.full_every_epochs eval at the loop's last step is reused as the final eval).
 
 Overfit sanity runs (configs/overfit_*.json, scripts/run_overfit_tests.cmd): subset.train_audio_s / eval_audio_s train
 and evaluate on seeded subsets of about that many seconds (audio_subset; logged as `subset` events with every id),
@@ -493,6 +496,9 @@ class Run:
     gen: object = None
     resumed_from: Path | None = None
     budget_s: float | None = None  # wall-clock T clipped to the instance deadline (fit_budget); None = train_hours
+    # (step, greedy summary) of the loop's newest complete-set eval (eval.full_every_epochs): the end phase reuses it as
+    # the final eval when the loop ends at that step. Not in st: a resumed run decodes again
+    last_complete: tuple | None = None
     vram_cap_gb: float | None = None  # the caching allocator's cap on Windows (cap_vram); None = no cap
     loop_t0: float | None = None
     t_start: float = field(default_factory=time.time)
@@ -2142,7 +2148,15 @@ def train(R: Run, state: dict | None) -> int:
     log.event("phase", name="end", at_step=step, train_s=round(R.clock(), 1))
     save_weights(R, step, "end")
     save_full(R, step, "end", upload="end" in cfg["ckpt"]["upload_full_at"])
-    full_sum = run_eval(R, step, final=True)
+    if R.last_complete and R.last_complete[0] == step and cfg["eval"]["final_full_greedy"]:
+        # the loop's last eval decoded the complete eval sets at this very step, with these weights (no optimizer step
+        # since; a skipped step leaves the step count too): it is the final eval, and its record is already the
+        # history's last. A second decode (an epoch-end eval running past T, max_steps or the STOP file at an epoch
+        # end, early stop) would give the same numbers and cost a whole complete eval out of the end reserve
+        full_sum = R.last_complete[1]
+        log.event("eval_final_reused", at_step=step)
+    else:
+        full_sum = run_eval(R, step, final=True)
     verdict = gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=R.st["history"])))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
@@ -2276,8 +2290,9 @@ def loop(R: Run):
                 if step >= smoke_n:
                     smoke_end(R)
             t = R.clock()
-            if per_epochs:  # epochs completed since the last eval (the planner's position, on every clock); the end
-                # phase's eval covers the last one
+            if per_epochs:  # epochs completed since the last eval (the planner's position, on every clock); on the
+                # epoch clock the end phase's eval covers the last one, on the others a complete eval at the loop's
+                # last step is reused as the final eval (train)
                 eval_now = R.planner.epoch - R.st["last_eval_epoch"] >= per_epochs and not passes_done()
             else:
                 eval_now = due(t, step, R.st["last_eval_t"], R.st["last_eval_step"], ev_cfg["every_min"],
@@ -2286,7 +2301,9 @@ def loop(R: Run):
                 t_now, T_now = R.progress()
                 eval_now = t_now < T_now
             if eval_now:
-                run_eval(R, step, complete=bool(ev_cfg["full_every_epochs"]))
+                gsum = run_eval(R, step, complete=bool(ev_cfg["full_every_epochs"]))
+                if ev_cfg["full_every_epochs"]:
+                    R.last_complete = (step, gsum)
                 R.st["last_eval_t"], R.st["last_eval_step"] = R.clock(), step
                 R.st["last_eval_epoch"] = R.planner.epoch
                 if not R.st["pre_cooldown_done"]:  # a fresher final-eval estimate (never moves T in the cooldown)
