@@ -57,6 +57,8 @@ class FakeApi:
 
     def upload_folder(self, **kw):
         self.threads.add(threading.current_thread().name)
+        if kw.get("ignore_patterns") is not None:
+            kw["ignore_patterns"] += [".git", ".git/*"]  # like huggingface_hub: extends the caller's list in place
         time.sleep(self.delay)
         if self.fail:
             self.fail -= 1
@@ -275,6 +277,7 @@ def test_sync_runs_in_background_and_excludes_checkpoints(tmp_path):
     assert "metrics/tag_map.json" in call["files"]
     log.close()
     assert len(api.calls) == 2  # the final forced sync waited for its upload
+    assert runlog.SYNC_IGNORE == ["checkpoints/*", "*.tmp"]  # each upload got a copy to extend, not the constant
     assert pd.read_parquet(run / "metrics" / "steps.parquet")["step"].tolist() == [1, 2]
     assert [e["kind"] for e in events(run)].count("sync_ok") == 2
 

@@ -1039,8 +1039,10 @@ class RunLogger:
                     api.create_repo(self.hf_repo, repo_type="model", private=((self.cfg or {}).get("hf") or {}).get("private", True),
                                     exist_ok=True)
                     self._repo_ready = True
+                # a copy: upload_folder extends the list it is given in place (`ignore_patterns +=` its defaults),
+                # which would grow the module constant by 8 patterns on every attempt
                 api.upload_folder(repo_id=self.hf_repo, repo_type="model", folder_path=str(folder),
-                                  path_in_repo=f"runs/{self.run_id}", ignore_patterns=SYNC_IGNORE,
+                                  path_in_repo=f"runs/{self.run_id}", ignore_patterns=list(SYNC_IGNORE),
                                   commit_message=f"sync {self.run_id} step {step}")
                 self.event("sync_ok", repo=self.hf_repo, attempt=attempt, upload_s=round(time.time() - t0, 1))
                 return True
