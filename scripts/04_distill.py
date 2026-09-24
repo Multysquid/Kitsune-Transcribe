@@ -78,7 +78,9 @@ Checkpoints under runs/<run_id>/checkpoints/:
                    <name>.tmp/ and renamed, so a crash never leaves a torn one.
 `--resume <full_step_N dir | run dir>` restores all of it into the same run dir and continues the same schedule and
 time budget; the config comes from the checkpoint, with this invocation's --set overrides applied on top (--config is
-then ignored).
+then ignored). optim.*, loss.* and memory.grad_ckpt among them go on top of the restored optimizer, L2-SP and memory
+choice too; a new value for a key that shapes the step plan (RESUME_FIXED: seed, mix, sources, selection, subset.*,
+batch.*) stops the resume with the key named (repeating the checkpoint's value is fine).
 
 Time: in schedule.clock "wall" (the real run) the budget T = train_hours of loop wall-clock from the first training
 step, evals and checkpoints included; the step-0 eval and the final eval are outside it. The clock continues across a
@@ -218,6 +220,10 @@ DEFAULTS = {
     "seed": 1234,
 }
 EARLY_STOP_METRICS = ("probe_kl", "heldout_kl", "train_loss")
+# config keys a resume cannot change (resume_overrides): they shape the step plan or the data it walks, and the
+# planner state it restores (the epoch position) is only valid for the plan it was saved with
+RESUME_FIXED = ("seed", "mix", "sources", "selection", "subset", "batch.step_audio_s", "batch.micro_audio_s",
+                "batch.pool_micro", "batch.max_dec_len")
 STOP_FILE = "STOP"  # runs/<run_id>/STOP: finish the step under way, then the end phase (reason "stop_file")
 
 
@@ -2100,6 +2106,29 @@ def parse_args(argv=None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def resume_overrides(saved: dict, overrides: list[tuple[str, object]]) -> tuple[dict, dict]:
+    """A resume's --set overrides split into the ones that change the checkpoint's config and the ones that repeat it
+    (scripts/supervise_distill.py passes the fresh start's --set on every attempt). Compared with the checkpoint's
+    cfg, never with st["memory"]: the memory probe halving micro_audio_s is not a change. A change to a RESUME_FIXED
+    key stops here, naming it, rather than as a planner-fingerprint error later or not at all (micro_audio_s: the
+    planner is built from the probe's saved choice, so a new value was ignored while the logs said it was applied)."""
+    changed, same = {}, {}
+    for key, value in overrides:
+        old = saved
+        for part in key.split("."):
+            old = old[part]
+        if old == value:
+            same[key] = value
+            continue
+        if any(key == f or f.startswith(key + ".") or key.startswith(f + ".") for f in RESUME_FIXED):
+            raise SystemExit(f"--set {key}={json.dumps(value, default=str)} differs from the checkpoint's "
+                             f"{json.dumps(old, default=str)}: it changes the step plan, so a resume cannot keep its "
+                             "epoch position; start a new run (optim.*, loss.* and memory.grad_ckpt can be changed on "
+                             "resume)")
+        changed[key] = value
+    return changed, same
+
+
 def build(args) -> tuple[Run, dict | None]:
     """Config, run dir and logger; the rest of the setup happens in train() so every failure is logged."""
     from kitsune.runlog import RunLogger
@@ -2109,12 +2138,13 @@ def build(args) -> tuple[Run, dict | None]:
         full = find_full_state(Path(args.resume))
         state = torch.load(full / "trainer.pt", map_location="cpu", weights_only=True)
         cfg = _merge(DEFAULTS, copy.deepcopy(state["cfg"]))  # keys added since it was written take the defaults
-        overrides = [apply_set(cfg, s) for s in args.set]
+        saved = copy.deepcopy(cfg)
+        overrides, repeated = resume_overrides(saved, [apply_set(cfg, s) for s in args.set])
         validate(cfg)
         run_dir = full.parent.parent
     else:
         cfg = load_config(args.config, args.set)
-        overrides = []
+        overrides = repeated = {}
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_dir = rpath(cfg["runs_root"]) / f"{cfg['run_name']}-{stamp}"
         n = 1
@@ -2137,7 +2167,7 @@ def build(args) -> tuple[Run, dict | None]:
     R.uploader = Uploader(api, out_repo(cfg), run_dir.name, bool(cfg["hf"]["private"]), R.log)
     if state is not None:
         R.resumed_from = full
-        R.log.event("resume", from_state=str(full), at_step=state["step"], overrides=dict(overrides),
+        R.log.event("resume", from_state=str(full), at_step=state["step"], overrides=overrides, unchanged=repeated,
                     config_arg_ignored=args.config)
     return R, state
 
@@ -2157,7 +2187,11 @@ def train(R: Run, state: dict | None) -> int:
     if state is not None:
         R.st.update(copy.deepcopy(state["st"]))
         R.st["resumes"] += 1
-    grad_ckpt = bool(R.st["memory"].get("grad_ckpt", cfg["memory"]["grad_ckpt"] is True))
+    # true/false: this config's (a resume's --set too); "auto": the memory probe's choice, saved in the full state
+    gc = cfg["memory"]["grad_ckpt"]
+    grad_ckpt = gc if isinstance(gc, bool) else bool(R.st["memory"].get("grad_ckpt"))
+    if state is not None:
+        R.st["memory"]["grad_ckpt"] = grad_ckpt  # the flops multiplier and the phase event read it there
     setup_model(R, grad_ckpt)
     setup_processing(R)
     setup_optim(R)  # L2-SP theta_0 = the student init (the full state's copy replaces it on resume)
@@ -2180,6 +2214,13 @@ def train(R: Run, state: dict | None) -> int:
         R.opt.load_state_dict(torch.load(full / "optimizer.pt", map_location="cpu" if offloaded(R) else R.device,
                                          weights_only=True))
         R.l2sp.load_state_dict(torch.load(full / "l2sp.pt", map_location="cpu", weights_only=True))
+        # both loads restore the saved hyper-parameters (the optimizer's param_groups, the L2-SP lambda): this config's
+        # go back on top, so a resume's --set optim.* / loss.l2sp_lambda takes effect (a no-op without one). lr is set
+        # every step anyway; fused/foreach only change speed
+        o = cfg["optim"]
+        for g in R.opt.param_groups:
+            g.update(betas=tuple(o["betas"]), eps=float(o["eps"]), weight_decay=float(o["weight_decay"]))
+        R.l2sp.lam = float(cfg["loss"]["l2sp_lambda"])
         R.planner.load_state_dict(state["planner"])
         _set_rng_state(state["rng"])
         plan_epochs(R)  # a no-op unless the clock was switched to "epochs" on this resume

@@ -617,3 +617,43 @@ def test_offload_matches_the_on_device_optimizer_and_resumes(env, monkeypatch):
         b = utts[(utts["step"] == step) & (utts["attempt"] == 1)].sort_values("id")
         assert a["id"].tolist() == b["id"].tolist() and len(a)
         np.testing.assert_allclose(b["kl"].to_numpy(), a["kl"].to_numpy(), rtol=1e-6, atol=1e-9)
+
+
+def test_resume_applies_optim_l2sp_and_grad_ckpt_overrides(env, monkeypatch):
+    """A resume's --set optim.betas/eps/weight_decay, loss.l2sp_lambda and memory.grad_ckpt were logged as applied
+    while the restored optimizer, L2-SP and memory choice kept the saved values: now they take effect. A new
+    batch.micro_audio_s (it shapes the step plan the resume continues) stops the resume naming the key; repeating the
+    checkpoint's value resumes as usual."""
+    m = load_script("04_distill")
+    cfg = write_config(env, "ov-sets", {
+        "optim": {"betas": [0.9, 0.98], "eps": 1e-8, "weight_decay": 0.0},
+        "loss": {"l2sp_lambda": 0.05},
+        "memory": {"grad_ckpt": False},
+        "schedule": {"warmup_steps": 3, "cooldown_frac": 0.3, "clock": "steps", "max_steps": 8},
+        "batch": {"step_audio_s": 6, "micro_audio_s": 3, "pool_micro": 4},
+        "eval": {"every_steps": 1000, "final_full_greedy": False},
+        "ckpt": {"weights_every_steps": 1000, "full_every_steps": 4, "keep_local": 5},
+        "smoke": {"enabled": False},
+    })
+    monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "6")
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        m.main(["--config", cfg])
+    monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
+    run = one_run(env["root"], "ov-sets")
+    full = str(run / "checkpoints" / "full_step_4")
+    with pytest.raises(SystemExit, match=r"batch\.micro_audio_s=2 differs from the checkpoint's 3"):
+        m.main(["--resume", full, "--set", "batch.micro_audio_s=2"])
+    sets = ["optim.betas=[0.5,0.6]", "optim.eps=0.001", "optim.weight_decay=0.1", "loss.l2sp_lambda=0.5",
+            "memory.grad_ckpt=true", "batch.micro_audio_s=3"]
+    assert m.main(["--resume", full, *[a for s in sets for a in ("--set", s)]]) == 0
+    ev = events(run)
+    res = next(e for e in ev if e["kind"] == "resume")
+    assert res["unchanged"] == {"batch.micro_audio_s": 3} and res["overrides"] == {
+        "optim.betas": [0.5, 0.6], "optim.eps": 0.001, "optim.weight_decay": 0.1, "loss.l2sp_lambda": 0.5,
+        "memory.grad_ckpt": True}
+    assert [e["grad_ckpt"] for e in ev if e["kind"] == "model"] == [False, True]
+    d = run / "checkpoints" / "full_step_8"
+    groups = torch.load(d / "optimizer.pt", map_location="cpu", weights_only=True)["param_groups"]
+    assert groups and all((tuple(g["betas"]), g["eps"], g["weight_decay"]) == ((0.5, 0.6), 0.001, 0.1) for g in groups)
+    assert torch.load(d / "l2sp.pt", map_location="cpu", weights_only=True)["lam"] == 0.5
+    assert torch.load(d / "trainer.pt", map_location="cpu", weights_only=True)["st"]["memory"]["grad_ckpt"] is True
