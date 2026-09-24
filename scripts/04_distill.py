@@ -105,7 +105,8 @@ DEFAULTS = {
     "run_name": "viability-b20x2560", "student": "students/b20x2560-d4", "data_root": "data",
     "teacher_root": "teacher_out", "second_root": "second_out", "selection": "selection/viability.parquet",
     "cache_dir": "cache", "runs_root": "runs",
-    "sources": ["reazon_small", "emilia_yodas"], "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia"], "mix": "natural",
+    "sources": ["reazon_small", "emilia_yodas", "galgame"],
+    "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia", "galgame"], "mix": "natural",
     "subset": {"train_utts": None, "eval_utts_per_set": None},  # smoke runs: seeded id subsets, small caches
     "device": "auto", "autocast": "bfloat16",  # autocast: "bfloat16" or "none" (fp32; the CPU tests)
     "loss": {"w_kl": 1.0, "w_ce": 0.8, "l2sp_lambda": 0.05},

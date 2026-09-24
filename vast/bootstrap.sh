@@ -74,6 +74,8 @@ repo = os.environ["KITSUNE_DATA_REPO"]
 rev = os.environ["KITSUNE_DATA_REVISION"]
 sources = list(cfg.get("sources", []))
 evals = list(cfg.get("eval_sets", []))
+# a source can be a train source AND an eval set (galgame keeps its hold-out in its own eval split)
+names = list(dict.fromkeys(sources + evals))
 teacher_root = cfg.get("teacher_root", "teacher_out")
 second_root = cfg.get("second_root", "second_out")
 data_root = cfg.get("data_root", "data")
@@ -94,16 +96,16 @@ def plan():
 
     patterns = [f"{teacher_root}/meta.json", f"{second_root}/meta.json", selection, f"{student}/*"]
     required = [f"{selection}", f"{student}/config.json"]
-    for s in sources + evals:
+    for s in names:
         patterns += [f"{teacher_root}/{s}/*", f"{second_root}/{s}/*"]
         required.append(f"{teacher_root}/{s}/*.npz")
     required += [f"{second_root}/{s}/*.jsonl" for s in sources]
     missing = [p for p in required if not has(p)]
     if missing:
         sys.exit(f"data repo {repo}@{rev} lacks: {missing}")
-    parked = [s for s in sources + evals if has(f"{data_root}/shards/{s}/*.parquet")]
+    parked = [s for s in names if has(f"{data_root}/shards/{s}/*.parquet")]
     patterns += [f"{data_root}/shards/{s}/*.parquet" for s in parked]
-    rebuild = [s for s in sources + evals if s not in parked]
+    rebuild = [s for s in names if s not in parked]
     out = dict(repo=repo, revision=rev, patterns=patterns, parked=parked, rebuild=rebuild, data_root=data_root,
                repo_files=len(files), wall=time.time())
     plan_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
@@ -128,7 +130,7 @@ def coverage():
 
     floor = float(os.environ.get("KITSUNE_MIN_COVERAGE", "0.99"))
     report, bad = {}, []
-    for s in sources + evals:
+    for s in names:
         tids = set()
         for npz in sorted((root / teacher_root / s).glob("*.npz")):
             with np.load(npz, allow_pickle=False) as z:

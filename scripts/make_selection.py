@@ -212,7 +212,7 @@ def main(argv: list[str] | None = None):
     print()
     for (s, sp), r in kept.iterrows():
         tot = sel[(sel["source"] == s) & (sel["split"] == sp)]["duration"].sum()
-        sub = sel[(sel["source"] == s) & (sel["in_greedy_subset"] | sel["in_probe"])]
+        sub = sel[(sel["source"] == s) & (sel["split"] == sp) & (sel["in_greedy_subset"] | sel["in_probe"])]
         print(f"{s}/{sp}: kept {int(r['size'])} utts, {r['sum'] / 3600:.2f} h of {tot / 3600:.2f} h "
               f"({r['sum'] / max(tot, 1e-9):.1%}); {'greedy subset' if sp == 'eval' else 'probe'} {len(sub)} utts, "
               f"{sub['duration'].sum() / 3600:.3f} h")
