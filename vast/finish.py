@@ -20,9 +20,10 @@ still appends to its logs, and a file handed to the Hub by path is sized when it
 (a growing file would go up as a size/hash/content mismatch). Checkpoint dirs are renamed into place complete and go
 up in place; the one later write, the trainer's end save replacing trainer.pt/.json of an existing full_step_<N> (the
 loop ended at the step of a full state), is over once the trainer has exited.
-Supervisor/watchdog/bootstrap logs are uploaded best-effort to runs/<run_id>/infra/ but not verified (they are still
-being written while this runs); on every path, --no-sync included, and once more right before the stop/destroy call,
-so the last lifecycle records (verify, stop/destroy) are off the box before its disk goes away or stays behind.
+Supervisor/watchdog/bootstrap/portal logs are uploaded best-effort to runs/<run_id>/infra/, secrets redacted (scrub),
+but not verified (they are still being written while this runs); on every path, --no-sync included, and once more
+right before the stop/destroy call, so the last lifecycle records (verify, stop/destroy) are off the box before its
+disk goes away or stays behind.
 
 Every decision is appended to $KITSUNE_STATE/events.jsonl, and a `halt` marker is written before a stop/destroy so a
 restarted container does not start a second run (vast/onstart.sh checks it).
@@ -54,6 +55,14 @@ VAST_API = "https://console.vast.ai/api/v0"
 STATE_DIR = Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state"))
 INFRA_LOGS = ["/workspace/kitsune.log", "/workspace/watchdog.log", "/workspace/portal.log", "/workspace/tensorboard.log"]
 INFRA_TIMEOUT_S = 180  # a hung infra upload must not keep a paid instance up
+# an env var whose name holds one of these is a secret: a mirror of kitsune/runlog.py's SECRET_MARKERS (finish stays
+# stdlib-only; runlog imports pyarrow)
+SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CRED", "COOKIE")
+# what the base image's portal prints in the clear into portal.log once a PORTAL_CONFIG reaches the box (the account
+# env, a template): caddy_config_manager's web credentials, open-button token and Bearer header (the password may be a
+# generated uuid that is in no env var), syncthing's API key, a token in a URL
+PRINTED_SECRET_RE = re.compile(rb"(credentials are: \S+ / |token is also valid: |Bearer |--gui-apikey=|[?&]token=)"
+                               rb"[^\s\"')]+")
 # checkpoint names written by the trainer; a directory or a single file (full_step_N.pt). In-progress writes end in
 # .tmp/.partial and never match.
 WEIGHTS_RE = re.compile(r"^step[_-]?(\d+)$")
@@ -250,12 +259,24 @@ def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_r
                           allow_patterns=ckpt, commit_message=f"finish: checkpoints {run_dir.name}")
 
 
+def scrub(data: bytes) -> bytes:
+    """data with every secret replaced by <redacted>: the value (8+ chars) of each env var with a SECRET_MARKERS part
+    in its name (WEB_PASSWORD, OPEN_BUTTON_TOKEN, HF_TOKEN, CONTAINER_API_KEY, ...), longest first so a value inside
+    another cannot leave part of the longer one, then what PRINTED_SECRET_RE matches."""
+    values = {v for k, v in os.environ.items() if len(v) >= 8 and any(m in k.upper() for m in SECRET_MARKERS)}
+    for v in sorted(values, key=len, reverse=True):
+        data = data.replace(v.encode("utf-8", "surrogateescape"), b"<redacted>")
+    return PRINTED_SECRET_RE.sub(rb"\1<redacted>", data)
+
+
 def upload_infra(api, repo: str, repo_type: str, dest: str, dry_run: bool):
-    """Best effort: supervisor/bootstrap/watchdog logs and state go next to the run for later extraction."""
+    """Best effort: supervisor/bootstrap/watchdog logs and state go next to the run for later extraction, scrubbed:
+    portal.log (the base image's boot output: its CUDA selection is recorded nowhere else) holds the portal's password
+    and tokens as soon as a PORTAL_CONFIG reaches the box, and the runs repo keeps every file in its git history."""
     from huggingface_hub import CommitOperationAdd
 
     files = [Path(p) for p in INFRA_LOGS] + (sorted(STATE_DIR.glob("*")) if STATE_DIR.is_dir() else [])
-    ops = [CommitOperationAdd(path_in_repo=f"{dest}/{f.name}", path_or_fileobj=f.read_bytes())
+    ops = [CommitOperationAdd(path_in_repo=f"{dest}/{f.name}", path_or_fileobj=scrub(f.read_bytes()))
            for f in files if f.is_file() and not f.name.endswith(".lock")]
     log(f"upload {len(ops)} infra files -> {repo}:{dest}")
     if ops and not dry_run:

@@ -1169,6 +1169,42 @@ def test_finish_stop_without_sync_still_uploads_the_infra_logs(finish_env, tmp_p
     assert b"onstart failed at line 7" in hub.committed("events.jsonl")
 
 
+def test_finish_infra_upload_redacts_the_portal_secrets(tmp_path, monkeypatch):
+    """portal.log is the base image's boot output: once a PORTAL_CONFIG reaches the box, caddy_config_manager prints
+    the web password, the open-button token and a Bearer header there (a generated uuid when no WEB_PASSWORD is set).
+    The infra upload redacts them, and every secret-looking env value in any infra or state file, and keeps the rest
+    (the CUDA selection is recorded nowhere else)."""
+    pw, obt, hf, uuid = "MyReusedPw_9876", "OBT_SECRET_abc123", "hf_FAKEtoken1234", "Zx8pQ2mK7vR4tY9w"
+    monkeypatch.setenv("WEB_PASSWORD", pw)
+    monkeypatch.setenv("OPEN_BUTTON_TOKEN", obt)
+    monkeypatch.setenv("HF_TOKEN", hf)
+    portal = tmp_path / "portal.log"
+    portal.write_text("CUDA 13.0 selected (GPU: A100, CC 8.0, Driver 580, Max CUDA 13.0, Forward Compat: no)\n"
+                      f"* Your web credentials are: vastai / {pw}\n"
+                      f"* Open button token is also valid: {obt}\n"
+                      f"* To make API requests, pass an Authorization header (Authorization: Bearer {pw})\n"
+                      f"* Your web credentials are: vastai / {uuid}\n"
+                      f"(Authorization: Bearer {uuid})\n"
+                      f"syncthing --gui-apikey={obt} --no-browser\n", encoding="utf-8")
+    kitsune = tmp_path / "kitsune.log"
+    kitsune.write_text(f"[bootstrap] pulling data\nHF_TOKEN={hf}\n[train] step 1 loss 2.5\n", encoding="utf-8")
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "events.jsonl").write_text(json.dumps({"kind": "stop", "reason": f"token {obt}"}) + "\n")
+    monkeypatch.setattr(finish, "INFRA_LOGS", [str(portal), str(kitsune)])
+    monkeypatch.setattr(finish, "STATE_DIR", state)
+    hub = FakeHub({})
+    finish.upload_infra(hub, "Multy123/kitsune-runs", "model", "runs/r/infra", dry_run=False)
+    sent = {op.path_in_repo: op.path_or_fileobj for c in hub.commits for op in c["operations"]}
+    assert set(sent) == {"runs/r/infra/portal.log", "runs/r/infra/kitsune.log", "runs/r/infra/events.jsonl"}
+    for data in sent.values():
+        assert not any(s.encode() in data for s in (pw, obt, hf, uuid)), data
+    log = sent["runs/r/infra/portal.log"].decode()
+    assert "CUDA 13.0 selected (GPU: A100, CC 8.0, Driver 580, Max CUDA 13.0, Forward Compat: no)" in log
+    assert "credentials are: vastai / <redacted>" in log and "(Authorization: Bearer <redacted>)" in log
+    assert b"[train] step 1 loss 2.5" in sent["runs/r/infra/kitsune.log"]
+
+
 def test_finish_sync_uploads_the_logs_before_the_checkpoints(finish_env, tmp_path):
     """The watchdog's --sync-only gets 10 minutes before the stop: the ~9 GB of a full state not yet on the hub came
     first and could take all of them, and a checkpoint commit that raised skipped the run's logs altogether (rc 0). The
