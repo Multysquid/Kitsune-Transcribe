@@ -52,6 +52,10 @@ def tiny_teacher(seed: int = 0, **kw) -> CohereAsrForConditionalGeneration:
             bn.running_mean.normal_(0.0, 0.5)
             bn.running_var.uniform_(0.5, 2.0)
             bn.num_batches_tracked.fill_(276000)
+        # HF zero-inits every Linear bias; the real teacher's are not (FFN |b| ~0.03, max ~0.12). Non-zero here so the
+        # FFN bias slices (and proj_out.bias) are checked by value, not as 0 == 0.
+        for lin in (x for x in m.modules() if isinstance(x, torch.nn.Linear) and x.bias is not None):
+            lin.bias.normal_(0.0, 0.1)
     return m
 
 
@@ -165,8 +169,10 @@ def test_build_student_tiny():
     ff = student.model.encoder.layers[1].feed_forward2  # student layer 1 <- teacher layer 2
     idx = keep[(2, "feed_forward2")]
     assert torch.equal(ff.linear1.weight, teacher.model.encoder.layers[2].feed_forward2.linear1.weight[idx])
+    assert torch.equal(ff.linear1.bias, teacher.model.encoder.layers[2].feed_forward2.linear1.bias[idx])
     assert torch.equal(ff.linear2.weight, teacher.model.encoder.layers[2].feed_forward2.linear2.weight[:, idx])
     assert torch.equal(ff.linear2.bias, teacher.model.encoder.layers[2].feed_forward2.linear2.bias)
+    assert ff.linear1.bias.abs().sum() > 0  # a zero bias would make the slice checks above vacuous
     bn_s, bn_t = student.model.encoder.layers[2].conv.norm, teacher.model.encoder.layers[3].conv.norm
     assert torch.equal(bn_s.running_var, bn_t.running_var) and int(bn_s.num_batches_tracked) == 276000
     assert bn_s.running_var.data_ptr() != bn_t.running_var.data_ptr()  # copied, not shared
@@ -535,9 +541,13 @@ def test_build_default_student_from_real_teacher():
     t_enc, s_enc = teacher.model.encoder.layers, student.model.encoder.layers
     for i in (0, 9, 19):
         tl = spec.enc_layers[i]
-        idx = keep[(tl, "feed_forward1")]
-        assert torch.equal(s_enc[i].feed_forward1.linear1.weight, t_enc[tl].feed_forward1.linear1.weight[idx].float())
-        assert torch.equal(s_enc[i].feed_forward1.linear2.weight, t_enc[tl].feed_forward1.linear2.weight[:, idx].float())
+        for n in S.FFN_NAMES:  # the real FFN biases are non-zero, so the bias slices are checked by value here
+            idx = keep[(tl, n)]
+            s_ff, t_ff = getattr(s_enc[i], n), getattr(t_enc[tl], n)
+            assert torch.equal(s_ff.linear1.weight, t_ff.linear1.weight[idx].float())
+            assert torch.equal(s_ff.linear1.bias, t_ff.linear1.bias[idx].float())
+            assert torch.equal(s_ff.linear2.weight, t_ff.linear2.weight[:, idx].float())
+            assert torch.equal(s_ff.linear2.bias, t_ff.linear2.bias.float())
         assert torch.equal(s_enc[i].self_attn.relative_k_proj.weight, t_enc[tl].self_attn.relative_k_proj.weight.float())
         assert torch.equal(s_enc[i].conv.norm.running_var, t_enc[tl].conv.norm.running_var.float())
     for j, tj in enumerate(spec.dec_layers):
