@@ -72,7 +72,7 @@ class FP32Head(torch.nn.Linear):
 def fp32_head(model):
     old = model.proj_out
     head = FP32Head(old.in_features, old.out_features, bias=old.bias is not None).to(old.weight.device)
-    with torch.no_grad():  # copy, do not share: proj_out is tied to the bf16 token embedding
+    with torch.no_grad():  # fp32 copy: proj_out is its own bf16 parameter (untied, though bitwise equal to embed_tokens)
         head.weight.copy_(old.weight)
         if old.bias is not None:
             head.bias.copy_(old.bias)
