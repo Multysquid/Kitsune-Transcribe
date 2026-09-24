@@ -336,7 +336,14 @@ def test_cap_vram_caps_the_allocator_on_windows_cuda_only(monkeypatch):
     gib, calls, evs = 2**30, [], []
     monkeypatch.setattr(m.torch.cuda, "mem_get_info", lambda device=None: (int(6.9 * gib), 8 * gib))
     monkeypatch.setattr(m.torch.cuda, "memory_reserved", lambda device=None: gib // 4)
-    monkeypatch.setattr(m.torch.cuda, "set_per_process_memory_fraction", lambda f, device=None: calls.append(f))
+    devices = []
+
+    def set_fraction(f, device=None):  # the real API rejects torch.device("cuda") without an index
+        devices.append(device)
+        calls.append(f)
+
+    monkeypatch.setattr(m.torch.cuda, "set_per_process_memory_fraction", set_fraction)
+    monkeypatch.setattr(m.torch.cuda, "current_device", lambda: 0)
     log = SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw)))
 
     def run(dev: str, osname: str):
@@ -349,6 +356,7 @@ def test_cap_vram_caps_the_allocator_on_windows_cuda_only(monkeypatch):
     assert run("cpu", "nt").vram_cap_gb is None and run("cuda", "posix").vram_cap_gb is None and not calls
     R = run("cuda", "nt")
     assert len(calls) == 1 and calls[0] * 8 == pytest.approx(6.9 + 0.25 - m.VRAM_MARGIN_GIB)
+    assert devices == [0] and all(isinstance(d, int) for d in devices)
     assert R.vram_cap_gb == pytest.approx(6.9 + 0.25 - m.VRAM_MARGIN_GIB, abs=0.01)
     assert evs == [("vram_cap", dict(cap_gb=R.vram_cap_gb, free_gb=6.9, held_gb=0.25, total_gb=8.0,
                                      margin_gb=m.VRAM_MARGIN_GIB, fraction=round(calls[0], 4)))]

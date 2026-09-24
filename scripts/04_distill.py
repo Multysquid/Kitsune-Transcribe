@@ -1529,10 +1529,11 @@ def cap_vram(R: Run):
     gradient checkpointing) and train_step's OOM skip would never fire. Under the cap they do. Linux has no fallback."""
     if R.device.type != "cuda" or os.name != "nt":
         return
-    free, total = torch.cuda.mem_get_info(R.device)
-    held = torch.cuda.memory_reserved(R.device)
+    idx = R.device.index if R.device.index is not None else torch.cuda.current_device()  # the API needs an index
+    free, total = torch.cuda.mem_get_info(idx)
+    held = torch.cuda.memory_reserved(idx)
     frac = min(1.0, max(0.0, (free + held - VRAM_MARGIN_GIB * 2**30) / total))
-    torch.cuda.set_per_process_memory_fraction(frac, R.device)
+    torch.cuda.set_per_process_memory_fraction(frac, idx)
     R.vram_cap_gb = round(frac * total / 2**30, 2)
     R.log.event("vram_cap", cap_gb=R.vram_cap_gb, free_gb=round(free / 2**30, 2), held_gb=round(held / 2**30, 2),
                 total_gb=round(total / 2**30, 2), margin_gb=VRAM_MARGIN_GIB, fraction=round(frac, 4))
