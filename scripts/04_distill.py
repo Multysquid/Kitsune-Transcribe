@@ -85,8 +85,8 @@ Checkpoints under runs/<run_id>/checkpoints/:
                    planner position, RNG states, logger state). Every ckpt.full_local_every_min, the newest
                    ckpt.keep_local are kept; uploaded at ckpt.upload_full_at ("pre_cooldown", "end"; a resume
                    queues the pre_cooldown one again, as a crash may have cut its upload short; one whose upload
-                   failed is kept past keep_local, UPLOAD_MARK, for vast/finish.py). Written as <name>.tmp/ and
-                   renamed, so a crash never leaves a torn one.
+                   failed is kept past keep_local, UPLOAD_MARK, for vast/finish.py). Written as <name>.tmp/, its
+                   files fsynced, then renamed, so neither a process crash nor a host crash leaves a torn one.
 `--resume <full_step_N dir | run dir>` restores all of it into the same run dir and continues the same schedule and
 time budget; the config comes from the checkpoint, with this invocation's --set overrides applied on top (--config is
 then ignored). optim.*, loss.* and memory.grad_ckpt among them go on top of the restored optimizer, L2-SP and memory
@@ -161,6 +161,7 @@ from kitsune.features import LogMel, SpecAugment  # noqa: E402
 from kitsune.kd import L2SP, kd_losses, kd_objective, module_key  # noqa: E402
 from kitsune.patches import assert_bn_frozen, patch_relpos_once_per_batch, train_mode  # noqa: E402
 from kitsune.runlog import _replace as _replace_file  # noqa: E402  (atomic file replace with the Windows retry)
+from kitsune.store import fsync_path  # noqa: E402
 
 EXIT_OK, EXIT_THROUGHPUT, EXIT_FAIL = 0, 3, 1
 # the end phase's wait for checkpoint uploads: with RunLogger's close_join_s (600 s) and END_SYNC_JOIN_S it stays
@@ -1831,6 +1832,31 @@ def _replace_dir(tmp: Path, final: Path, tries: int = 150):
             time.sleep(0.2)
 
 
+def _sync_dir(p: Path):
+    """fsync a directory, so the entries renamed into it are on disk (POSIX). Windows cannot open a directory for
+    that (PermissionError); NTFS journals the rename itself."""
+    if os.name == "nt":
+        return
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _flush_dir(tmp: Path):
+    """Every file of a just-written checkpoint dir to disk before it is renamed into place. Without it an unclean host
+    crash (power loss, kernel panic) soon after a save can leave the rename on disk but not the data: model.pt and
+    the rest empty or full of NUL bytes under the name --resume and vast/supervise.py take as the newest state. A
+    process crash cannot tear it; this costs the write-back of the save (~8.6 GB for a full state)."""
+    for f in sorted(tmp.rglob("*")):
+        if f.is_file():
+            fsync_path(f)
+        elif f.is_dir():
+            _sync_dir(f)
+    _sync_dir(tmp)
+
+
 def save_weights(R: Run, step: int, reason: str) -> Path:
     """bf16 weights (+ processor, student_meta.json with a `trained` block) -> checkpoints/step_<N>/, then upload."""
     from kitsune import student as S
@@ -1848,7 +1874,9 @@ def save_weights(R: Run, step: int, reason: str) -> Path:
                            reason=reason, time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                            init=str(R.cfg["student"]), last_objective=R.st["last_objective"])
     S.save_student(R.model, tmp, R.processor, meta)
+    _flush_dir(tmp)
     _replace_dir(tmp, d)
+    _sync_dir(R.ckpt_dir)
     R.st["weights"].append(step)
     R.log.event("checkpoint", ckpt="weights", name=name, reason=reason, save_s=round(time.time() - t0, 1),
                 gb=round(sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / 1e9, 3),
@@ -1885,7 +1913,9 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False) -> Path:
         torch.save(R.l2sp.state_dict(), tmp / "l2sp.pt")
         torch.save(trainer, tmp / "trainer.pt")
         (tmp / "trainer.json").write_text(json.dumps(brief, indent=1, default=str), encoding="utf-8")
+        _flush_dir(tmp)
         _replace_dir(tmp, d)
+        _sync_dir(R.ckpt_dir)
         R.st["fulls"] = st["fulls"]
         R.log.event("checkpoint", ckpt="full", name=name, reason=reason, save_s=round(time.time() - t0, 1),
                     gb=round(sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / 1e9, 3),
@@ -1899,7 +1929,9 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False) -> Path:
                                                                      encoding="utf-8"))):
             tmp = d / f"{fname}.tmp"
             write(tmp)
+            fsync_path(tmp)
             _replace_file(tmp, d / fname)
+        _sync_dir(d)
         R.log.event("checkpoint", ckpt="full", name=name, reason=reason, trainer_only=True,
                     save_s=round(time.time() - t0, 1))
     if upload:

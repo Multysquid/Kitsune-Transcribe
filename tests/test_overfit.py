@@ -8,8 +8,8 @@
   curves as the on-device optimizer in a full run, and an identical continuation after a crash + --resume
 - the three overfit configs resolve and validate
 - the 8 GB laptop: the memory probe holds a step's gradients when steps accumulate micro-batches, histograms
-  concatenate one module at a time, the Windows VRAM cap, checkpoint renames that wait for a scanner, and
-  scripts/supervise_distill.py (resume after a crash, give up on stalls)
+  concatenate one module at a time, the Windows VRAM cap, checkpoint renames that wait for a scanner and come after
+  the files reach the disk, and scripts/supervise_distill.py (resume after a crash, give up on stalls)
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import copy
@@ -393,6 +393,59 @@ def test_replace_dir_waits_for_a_scanner(tmp_path):
     finally:
         f.close()
     assert time.monotonic() - t0 >= 0.4 and not tmp.exists() and (final / "model.pt").read_bytes() == b"x" * 1000
+
+
+def test_checkpoints_reach_the_disk_before_their_rename(tmp_path, monkeypatch):
+    """save_full and save_weights fsync every file of <name>.tmp/ before renaming it into place and the checkpoints
+    dir after it; the end save's trainer-only rewrite fsyncs its .tmp files before each replace. Without that, an
+    unclean host crash soon after a save left the rename on disk but not the data: full_step_<N>/ with empty or
+    NUL-filled files, the state --resume and vast/supervise.py take as the newest."""
+    from kitsune import student as S
+
+    m = load_script("04_distill")
+    calls = []
+    real_fsync, real_sync, real_dir, real_file = m.fsync_path, m._sync_dir, m._replace_dir, m._replace_file
+
+    def rec(kind, real):
+        def f(*a):
+            calls.append((kind, *(Path(p).name for p in a)))
+            return real(*a)
+        return f
+
+    monkeypatch.setattr(m, "fsync_path", rec("fsync", real_fsync))
+    monkeypatch.setattr(m, "_sync_dir", rec("sync_dir", real_sync))
+    monkeypatch.setattr(m, "_replace_dir", rec("replace", real_dir))
+    monkeypatch.setattr(m, "_replace_file", rec("replace", real_file))
+
+    def fake_save_student(model, out, processor, meta):
+        out.mkdir(parents=True)
+        for f in ("model.safetensors", "config.json", "student_meta.json"):
+            (out / f).write_bytes(b"w")
+
+    monkeypatch.setattr(S, "save_student", fake_save_student)
+    run = tmp_path / "run"
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 2}, "student": "s"}, run_dir=run, ckpt_dir=run / "checkpoints",
+                        st=dict(fulls=[], weights=[], epoch_progress=0.0, last_objective=None), clock=lambda: 0.0,
+                        planner=SimpleNamespace(state_dict=dict), log=SimpleNamespace(event=lambda *a, **k: None,
+                                                                                     state_dict=dict),
+                        model=torch.nn.Linear(1, 1), opt=SimpleNamespace(state_dict=dict),
+                        l2sp=SimpleNamespace(state_dict=dict), student_meta={}, processor=None,
+                        uploader=SimpleNamespace(repo=None, submit=lambda d, n: None, busy=set))
+    R.ckpt_dir.mkdir(parents=True)
+
+    for save, name in ((m.save_full, "full_step_2"), (m.save_weights, "step_2")):
+        calls.clear()
+        d = save(R, 2, "periodic")
+        files = sorted(p.name for p in d.iterdir())
+        assert calls == [*[("fsync", f) for f in files], ("sync_dir", f"{name}.tmp"),
+                         ("replace", f"{name}.tmp", name), ("sync_dir", "checkpoints")], name
+    assert files == ["config.json", "model.safetensors", "student_meta.json"]
+
+    calls.clear()  # the end save at a step that already has a full state: only trainer.pt/.json are rewritten
+    m.save_full(R, 2, "end")
+    assert calls == [("fsync", "trainer.pt.tmp"), ("replace", "trainer.pt.tmp", "trainer.pt"),
+                     ("fsync", "trainer.json.tmp"), ("replace", "trainer.json.tmp", "trainer.json"),
+                     ("sync_dir", "full_step_2")]
 
 
 def test_resume_from_an_older_full_state_sets_the_abandoned_attempt_aside(tmp_path):
