@@ -24,6 +24,7 @@ of the whole 7 GB source.
 
 Usage:
   python scripts/03_build_student.py                                  # B20x2560 / dec 0 2 5 7 -> students/b20x2560-d4
+                                                                      # (calibrated on reazon_small emilia_yodas galgame)
   python scripts/03_build_student.py --enc-layers 4 --dec-layers 0 7  # laptop smoke student   -> students/b4x2560-d2
 """
 import argparse
@@ -47,6 +48,7 @@ sys.path.insert(0, str(ROOT))
 # does not depend on the rest of the stack.
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 EVAL_SETS = ["eval_jsut", "eval_cv8", "eval_reazon"]
+SOURCES = ["reazon_small", "emilia_yodas", "galgame"]  # configs/viability.json "sources": calibrate on what it trains on
 MAX_SECONDS = 30.0  # LogMel / HF fast path; the teacher pass skipped longer utterances anyway
 IMPORTANCE_FORMAT = 1
 
@@ -252,7 +254,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--no-tie-head", action="store_true", help="keep proj_out.weight as its own parameter")
     ap.add_argument("--calib-utts", type=int, default=1000, help="utterances for FFN importance")
     ap.add_argument("--bn-utts", type=int, default=1000, help="utterances for the BatchNorm recalibration")
-    ap.add_argument("--sources", nargs="+", default=["reazon_small"], help="train sources to calibrate on")
+    ap.add_argument("--sources", nargs="+", default=SOURCES,
+                    help="train sources to calibrate on, equal share each (default: the viability run's)")
     ap.add_argument("--out", default=None, help="student dir (default: students/b<enc>x<ffn>-d<n_dec>)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--step0-eval-utts", type=int, default=200, help="per eval set; 0 skips the step-0 eval")

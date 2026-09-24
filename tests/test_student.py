@@ -424,6 +424,15 @@ def test_build_script_help_is_light():
     assert r.stdout.strip().endswith("LIGHT")
 
 
+def test_build_script_calibrates_on_the_viability_sources_by_default():
+    """The documented plain command rebuilds students/b20x2560-d4, which was calibrated on every viability source."""
+    from fixtures import load_script
+
+    viability = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
+    args = load_script("03_build_student").parse_args([])
+    assert args.sources == viability["sources"] and args.out == ROOT / viability["student"]
+
+
 def test_build_script_end_to_end_tiny(tmp_path):
     """03 on a synthetic corpus in the real on-disk formats with a tiny saved teacher, on CPU: build, the no-op re-run,
     a forced rebuild that reuses importance.pt, and the resume of a run that died in the step-0 eval."""
