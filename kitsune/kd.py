@@ -115,14 +115,25 @@ class L2SP:
             yield self.params[start:], self.ref[start:]
 
     @torch.no_grad()
-    def apply_(self, lr: float):
-        """p -= lr*lam*(p - p0). Call right after optimizer.step() with that step's lr."""
+    def apply_(self, lr: float, value: bool = False) -> Tensor | None:
+        """p -= lr*lam*(p - p0). Call right after optimizer.step() with that step's lr. value=True also returns
+        value() of the updated weights, from the same pass over them: p' - p0 = (1 - lr*lam)(p - p0), so it equals
+        value() up to fp32 rounding (a second pass costs ~1 s for 617M params in host memory)."""
         a = lr * self.lam
-        if a == 0.0:
-            return
+        if a == 0.0 and not value:
+            return None
+        sq = []
         for ps, rs in self._chunks():
             diff = torch._foreach_sub(ps, rs)  # promotes the bf16 reference to the params' fp32
-            torch._foreach_add_(ps, diff, alpha=-a)
+            if value:
+                sq.extend(n.float().square() for n in torch._foreach_norm(diff))
+            if a != 0.0:
+                torch._foreach_add_(ps, diff, alpha=-a)
+        if not value:
+            return None
+        if not sq:
+            return torch.zeros((), dtype=torch.float32)
+        return 0.5 * self.lam * (1.0 - a) ** 2 * torch.stack(sq).sum()
 
     @torch.no_grad()
     def _sq_dists(self) -> list[Tensor]:
