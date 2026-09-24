@@ -529,6 +529,46 @@ def test_export_run(run, tmp_path):
         assert needle in readme, needle
 
 
+def test_non_finite_numbers_are_strict_json(tmp_path):
+    """JSON has no NaN: json.dumps writes a bare NaN / Infinity, and JavaScript, jq and strict loaders then reject the
+    whole file. Every JSON file of the run has null there instead, and the export keeps such a key as NaN."""
+    def strict(text):
+        def refuse(c):
+            raise ValueError(f"non-standard JSON constant {c}")
+
+        return json.loads(text, parse_constant=refuse)
+
+    run = tmp_path / "nf-run"
+    nan, inf = float("nan"), float("inf")
+    log = RunLogger(run, CFG, sync_every_min=10, capture=False, tee=False)
+    log.scalar("loss", 1.0, 10)
+    log.eval_json("summary", {"sets": {"eval_cv8": {"cer_ref_corpus": 0.1, "ratio_vs_teacher": nan,
+                                                   "kl_p1_lt_0.9": np.float64("nan")}}, "ratios": [1.0, inf]}, 10)
+    log.samples(10, [dict(id="a", ref="あ", teacher_hyp="あ", hyp="あ", cer_ref=0.0, cer_teacher=nan)])
+    log.event("eval", sets={"eval_cv8": {"ratio": nan}}, grad_norm=-inf)
+    log.close(summary={"verdict": {"per_set": {"eval_cv8": {"teacher": 0.0, "ratio": inf}}}})
+
+    s = strict((run / "evals" / "step_10" / "summary.json").read_text(encoding="utf-8"))
+    assert s == {"sets": {"eval_cv8": {"cer_ref_corpus": 0.1, "ratio_vs_teacher": None, "kl_p1_lt_0.9": None}},
+                 "ratios": [1.0, None]}
+    assert strict((run / "samples" / "step_10.jsonl").read_text(encoding="utf-8"))["cer_teacher"] is None
+    ev = [strict(line) for line in (run / "events.jsonl").read_text(encoding="utf-8").splitlines() if line]
+    e = next(r for r in ev if r["kind"] == "eval")
+    assert e["sets"] == {"eval_cv8": {"ratio": None}} and e["grad_norm"] is None
+    assert strict((run / "summary.json").read_text(encoding="utf-8"))["verdict"]["per_set"]["eval_cv8"] == {
+        "teacher": 0.0, "ratio": None}
+
+    with open(run / "events.jsonl", "a", encoding="utf-8") as f:  # a line from a run logged before the fix
+        f.write(json.dumps(dict(wall=time.time(), step=10, kind="old_eval", ratio=nan)) + "\n")
+    out = tmp_path / "export"
+    load_export().main([str(run), "--out", str(out)])
+    es = pd.read_parquet(out / "eval_summaries.parquet").set_index("key")["value"]
+    assert es["sets/eval_cv8/cer_ref_corpus"] == 0.1  # and the null keys are kept, as NaN
+    assert math.isnan(es["sets/eval_cv8/ratio_vs_teacher"]) and math.isnan(es["sets/eval_cv8/kl_p1_lt_0.9"])
+    fields = pd.read_parquet(out / "events.parquet").set_index("kind")["fields_json"]
+    assert all(strict(f) is not None for f in fields) and strict(fields["old_eval"]) == {"ratio": None}
+
+
 def test_export_keeps_infra_logs_and_restart_configs(run, tmp_path):
     """vast/finish.py puts the box's logs and state under runs/<id>/infra/; a resume writes config.<stamp>.json."""
     infra = run / "infra"

@@ -27,6 +27,7 @@ Usage:
 """
 import argparse
 import json
+import math
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -40,8 +41,8 @@ import pandas as pd  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
-from kitsune.runlog import (TB_BUCKETS, TagMapper, load_tag_map, read_scalars_jsonl, tag_map_entries,  # noqa: E402
-                            tb_inverse, tb_tag)
+from kitsune.runlog import (TB_BUCKETS, TagMapper, _finite, load_tag_map, read_scalars_jsonl,  # noqa: E402
+                            tag_map_entries, tb_inverse, tb_tag)
 
 # column descriptions for the README; anything not listed is described generically
 COLUMNS = {
@@ -99,7 +100,8 @@ FILES = {
     "hist": "histogram summaries (quantiles, moments, 64-bin counts)",
     "text": "every text() call",
     "eval_summaries": "every eval summary.json flattened (mini evals too, mini = true): one row per (step, mini, "
-                      "key); headline/<name> are the eval's headline numbers (CER as fractions)",
+                      "key); headline/<name> are the eval's headline numbers (CER as fractions); NaN: null in "
+                      "the file, a NaN or infinity (JSON has none) or a field with no value",
     "samples": "text samples written at each eval",
     "events": "lifecycle events (phases, smoke results, OOM fallbacks, checkpoints, exceptions, syncs, verdict)",
     "infra_events": "box lifecycle records from $KITSUNE_STATE/events.jsonl (sync failures, verification, stop/destroy)",
@@ -251,6 +253,8 @@ def _flatten(d: dict, prefix: str = "") -> dict:
             out.update(_flatten(v, key))
         elif isinstance(v, (int, float)) and not isinstance(v, bool):
             out[key] = float(v)
+        elif v is None:  # a non-finite number (the logger writes it as null: JSON has no NaN) or no value: NaN
+            out[key] = math.nan
     return out
 
 
@@ -368,8 +372,8 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
     infra_ev = _jsonl(run / "infra" / "events.jsonl")
     if infra_ev:
         t["infra_events"] = pd.DataFrame([{"wall": r.get("wall"), "emitter": r.get("source"), "kind": r.get("kind"),
-                                           "fields_json": json.dumps({k: v for k, v in r.items()
-                                                                      if k not in ("wall", "source", "kind")},
+                                           "fields_json": json.dumps(_finite({k: v for k, v in r.items()
+                                                                              if k not in ("wall", "source", "kind")}),
                                                                      ensure_ascii=False, default=str)}
                                           for r in infra_ev])
     timings = _jsonl(run / "infra" / "bootstrap_timings.jsonl")
@@ -379,7 +383,7 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
     if ev:  # left unmarked: a crashed launch's lifecycle events are facts, not metrics
         base = ["wall", "time", "elapsed_s", "step", "kind"]
         t["events"] = pd.DataFrame([{**{k: r.get(k) for k in base},
-                                     "fields_json": json.dumps({k: v for k, v in r.items() if k not in base},
+                                     "fields_json": json.dumps(_finite({k: v for k, v in r.items() if k not in base}),
                                                                ensure_ascii=False, default=str)} for r in ev])
     return t
 
@@ -388,7 +392,8 @@ def _csv_safe(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in out.columns:
         if out[c].dtype == object and out[c].map(lambda v: isinstance(v, (list, dict, np.ndarray))).any():
-            out[c] = out[c].map(lambda v: json.dumps(v.tolist() if isinstance(v, np.ndarray) else v, ensure_ascii=False))
+            out[c] = out[c].map(lambda v: json.dumps(_finite(v.tolist() if isinstance(v, np.ndarray) else v),
+                                                     ensure_ascii=False))
     return out
 
 

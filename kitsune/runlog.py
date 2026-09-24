@@ -26,6 +26,10 @@ Layout (relative to runs/<run_id>/):
                               exceptions with tracebacks, sync errors, verdict)
   logs/stdout.log             tee of sys.stdout / sys.stderr
   summary.json                final: verdict, best/final metrics, throughput, cost, wall times
+JSON has no NaN in any of them: in every JSON / JSONL file other than scalars.jsonl (summary.json, evals/*/*.json,
+samples/, events.jsonl, ...) a null where a number belongs is a NaN or an infinity - a ratio_vs_teacher or verdict
+ratio against a teacher CER of 0 (the teacher's value sits next to it), a confidence bucket without tokens, the
+grad_norm of a skipped non-finite step. Only scalars.jsonl says which, in its "nf" field.
 
 Sync never blocks training: the caller only flushes file handles, notes the flushed length of every append-only file
 and snapshots the in-memory tables; parquet rewrites and HfApi.upload_folder (to runs/<run_id>/, checkpoints/
@@ -130,8 +134,24 @@ def _atomic_write_bytes(path: Path, data: bytes):
     _replace(tmp, path)
 
 
+def _finite(obj):
+    """obj with every non-finite float (np.float64 is one) as None, through dicts, lists and tuples: json.dumps writes
+    a bare NaN / Infinity, which is not JSON - JavaScript, jq and strict loaders reject the whole file. Never raises
+    (event() runs in exception handlers and mid-training): what it cannot walk goes to json.dumps as it is."""
+    try:
+        if isinstance(obj, float):
+            return obj if math.isfinite(obj) else None
+        if isinstance(obj, dict):
+            return {k: _finite(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_finite(v) for v in obj]
+    except Exception:
+        pass
+    return obj
+
+
 def _atomic_json(path: Path, obj):
-    _atomic_write_bytes(path, json.dumps(obj, indent=2, ensure_ascii=False, default=str).encode("utf-8"))
+    _atomic_write_bytes(path, json.dumps(_finite(obj), indent=2, ensure_ascii=False, default=str).encode("utf-8"))
 
 
 def _atomic_parquet(table: pa.Table, path: Path):
@@ -882,7 +902,7 @@ class RunLogger:
         """samples/step_<N>.jsonl plus a TensorBoard markdown table (ref / teacher / student)."""
         with open(self.dir / "samples" / f"step_{int(step)}.jsonl", "w", encoding="utf-8") as f:
             for r in rows:
-                f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+                f.write(json.dumps(_finite(r), ensure_ascii=False, default=str) + "\n")
 
         def cell(x):
             return str(x).replace("|", "\\|").replace("\n", " ")
@@ -902,7 +922,7 @@ class RunLogger:
         """events.jsonl line, fsynced (these are the lines you want after a crash); also TensorBoard text."""
         row = dict(wall=round(time.time(), 3), time=_now_iso(), elapsed_s=round(self.elapsed(), 3), step=self.step,
                    kind=kind, **fields)
-        line = json.dumps(row, ensure_ascii=False, default=str)
+        line = json.dumps(_finite(row), ensure_ascii=False, default=str)
         with self._lock:
             with open(self.p_events, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
