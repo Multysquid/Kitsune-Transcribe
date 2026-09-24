@@ -3,7 +3,9 @@
 Sources (all streamed file-by-file from HF; each raw download is deleted after conversion):
   reazon_small  japanese-asr/whisper_transcriptions.reazonspeech.small  ~100 h TV speech, ungated parquet mirror
   galgame       litagin/Galgame_Speech_ASR_16kHz                         visual-novel voices, --galgame-shards tars (~47 h each);
-                the first GALGAME_EVAL_ROWS utterances are held out as an in-domain eval split
+                the first GALGAME_EVAL_ROWS kept keys of tar 0 are held out as an in-domain eval split. The keys are
+                sorted content hashes, so this is a random utterance sample: the same games and voices are in train,
+                i.e. a seen-speaker in-domain monitor, unlike eval_emilia, which is video-disjoint
   emilia_yodas  TTS-AGI/emilia-yodas JA/*.tar (ungated mirror of amphion/Emilia-Dataset Emilia-YODAS/JA, CC BY 4.0):
                 YouTube CC-BY in-the-wild speech, pre-cut to 3-30 s, 24 kHz MP3; text = Emilia's WhisperX (Whisper
                 medium) transcript. Tars are taken in order until --emilia-hours of kept audio. Replaces galgame for
@@ -89,7 +91,10 @@ EMOLIA_REPO = "laion/Emolia"
 _JA_SCRIPT = re.compile(r"[぀-ヿ㐀-䶿一-鿿]")
 ALL_SOURCES = ["reazon_small", "reazon_medium", "reazon_large", "galgame", "emilia_yodas", "emilia_nc", "cv", "eval",
                "eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia"]
-# ReazonSpeech tiers are nested (small is a subset of medium), so a larger tier must skip rows already ingested
+# ReazonSpeech tiers are nested (small is a subset of medium), so a larger tier must skip rows already ingested.
+# Nothing dedups training against the gate eval sets (only eval_emilia is kept video-disjoint, in ingest_emilia):
+# ~16 eval_reazon lines match a reazon_small text (re-aired broadcasts), worth <= ~0.3 pp of its CER at worst; expect
+# more with the medium/large tiers.
 DEDUP_AGAINST = {"reazon_medium": ("reazon_small",), "reazon_large": ("reazon_small", "reazon_medium")}
 MIN_FREE_GB = 30.0  # stop a download (resumably) before it would fill the data disk
 

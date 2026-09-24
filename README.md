@@ -48,6 +48,10 @@ vast/                training image, CI build and the vast.ai run scripts (see v
 | Common Voice ja (manual download from [Mozilla Data Collective](https://datacollective.mozillafoundation.org)) | read, diverse mics | optional | CC-0 |
 | `japanese-asr/ja_asr.{jsut_basic5000,common_voice_8_0,reazonspeech_test}` | eval only | ~22 | |
 
+Only the Emilia hold-out is kept disjoint from training (by video). Nothing dedups training against the gate sets, so
+the eval_reazon CER carries up to ~0.3 pp from re-aired broadcasts that are also in reazon_small. The galgame hold-out
+is a random utterance sample of the first tar, so it measures seen games and voices, not unseen games.
+
 Every upstream repo is read at a pinned commit (`REVISIONS` in `scripts/01_prepare_data.py`).
 
 ### License of the trained model
