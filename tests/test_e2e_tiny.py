@@ -359,6 +359,11 @@ def test_configs_resolve():
     assert smoke["loss"] == m.DEFAULTS["loss"]  # untouched sections keep the viability values
     with pytest.raises(SystemExit):
         m.load_config(None, ["optim.lrr=1"])
+    # a Python-style or quoted boolean is not JSON true/false: apply_set keeps the truthy string, so validate refuses it
+    for bad in ("perf.tf32=False", "eval.probe_is_train=False", 'smoke.enabled="false"'):
+        with pytest.raises(SystemExit, match="must be true or false"):
+            m.load_config(None, [bad])
+    assert m.load_config(None, ["perf.tf32=false"])["perf"]["tf32"] is False
     for key in ("sources", "eval_sets", "teacher_root", "second_root", "data_root", "selection", "student"):
         assert key in json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))  # bootstrap.sh
 

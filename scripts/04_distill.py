@@ -308,7 +308,22 @@ def load_config(path: str | None, sets: list[str]) -> dict:
     return cfg
 
 
+def _leaves(d: dict, where: str = ""):
+    """("a.b.c", value) for every non-dict value of a nested config."""
+    for k, v in d.items():
+        if isinstance(v, dict):
+            yield from _leaves(v, f"{where}{k}.")
+        else:
+            yield f"{where}{k}", v
+
+
 def validate(cfg: dict):
+    # every key whose default is a bool must stay one: --set perf.tf32=False is not JSON, so apply_set keeps the
+    # string 'False', which is truthy and would silently do the opposite of what was asked
+    flat = dict(_leaves(cfg))
+    for key, default in _leaves(DEFAULTS):
+        if isinstance(default, bool) and not isinstance(flat.get(key), bool):
+            raise SystemExit(f"{key} must be true or false, got {flat.get(key)!r}")
     if cfg["autocast"] not in ("bfloat16", "none", None):
         raise SystemExit(f"autocast must be 'bfloat16' or 'none' (fp16 would need a GradScaler), got {cfg['autocast']}")
     sch, sub, ev_cfg = cfg["schedule"], cfg["subset"], cfg["eval"]
@@ -322,8 +337,6 @@ def validate(cfg: dict):
         raise SystemExit(f"memory.grad_ckpt must be 'auto', true or false, got {cfg['memory']['grad_ckpt']}")
     if cfg["optim"]["offload"] not in ("none", "cpu"):
         raise SystemExit(f"optim.offload must be 'none' or 'cpu', got {cfg['optim']['offload']}")
-    if not isinstance(cfg["specaug"]["enabled"], bool):
-        raise SystemExit(f"specaug.enabled must be true or false, got {cfg['specaug']['enabled']}")
     if not (_number(cfg["perf"]["loader_timeout_s"]) and cfg["perf"]["loader_timeout_s"] >= 0):
         raise SystemExit(f"perf.loader_timeout_s must be a number of seconds >= 0 (0: no timeout), got "
                          f"{cfg['perf']['loader_timeout_s']}")
@@ -351,14 +364,9 @@ def validate(cfg: dict):
     for key in ("val_per_set", "train_utts"):
         if not (isinstance(mini[key], int) and not isinstance(mini[key], bool) and mini[key] >= 0):
             raise SystemExit(f"eval.mini.{key} must be an int >= 0, got {mini[key]}")
-    for key, v in (("eval.mini.greedy", mini["greedy"]), ("eval.gate", ev_cfg["gate"])):
-        if not isinstance(v, bool):
-            raise SystemExit(f"{key} must be true or false, got {v}")
     if ev_cfg["probe_is_train"] and not ev_cfg["probe"]:
         raise SystemExit("eval.probe_is_train needs eval.probe")
     es = cfg["early_stop"]
-    if not isinstance(es["enabled"], bool):
-        raise SystemExit(f"early_stop.enabled must be true or false, got {es['enabled']}")
     if es["metric"] not in EARLY_STOP_METRICS:
         raise SystemExit(f"early_stop.metric must be one of {', '.join(EARLY_STOP_METRICS)}, got {es['metric']}")
     if es["action"] not in ("stop", "cooldown"):
