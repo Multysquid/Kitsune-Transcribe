@@ -53,6 +53,9 @@ EST_DOWN_GB, EST_UP_GB = 25, 30
 ONSTART = Path(__file__).resolve().parent / "onstart_stub.sh"
 ONSTART_MAX_BYTES = 4000  # the API's onstart field: vast documents 16 KB, one client SDK <= 4048 chars
 DEFAULT_MAX_DPH = 2.0
+# the student dir files the trainer loads (03_build_student saves them all; the trainer has no processor fallback). The
+# same list is STUDENT_FILES in vast/bootstrap.sh's helper
+STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json")
 # D45a strict filter; vast converts cpu_ram/gpu_ram GB to MB itself. rentable/verified are also CLI defaults, spelled
 # out so the printed query is the whole truth.
 HOST_FILTER = [
@@ -244,14 +247,15 @@ def image_problems(image: str, sha: str) -> list[str]:
 
 def data_problems(files: list[str], cfg: dict) -> list[str]:
     """What the run config needs from the data repo's file list (bootstrap.sh's plan() applies the same rules on the
-    box, where a failure is already billed): the teacher/second-opinion meta, the selection, the student config, teacher
-    shards for every train source and eval set, and a second opinion for EVERY train source teacher shard.
-    make_selection drops the rows of a shard without one as no_agree, so a partial 02b pass silently shrinks the train
-    set."""
+    box, where a failure is already billed): the teacher/second-opinion meta, the selection, the student's weights,
+    config, processor and tokenizer (STUDENT_FILES), teacher shards for every train source and eval set, and a second
+    opinion for EVERY train source teacher shard. make_selection drops the rows of a shard without one as no_agree, so
+    a partial 02b pass silently shrinks the train set."""
     teacher_root, second_root = cfg.get("teacher_root", "teacher_out"), cfg.get("second_root", "second_out")
     have = set(files)
+    student = cfg["student"].rstrip("/")
     problems = [f"no {f}" for f in (f"{teacher_root}/meta.json", f"{second_root}/meta.json", cfg["selection"],
-                                    f"{cfg['student'].rstrip('/')}/config.json") if f not in have]
+                                    *(f"{student}/{n}" for n in STUDENT_FILES)) if f not in have]
 
     def stems(root: str, s: str, ext: str) -> set[str]:
         return {f.rsplit("/", 1)[1][: -len(ext)] for f in files if f.startswith(f"{root}/{s}/") and f.endswith(ext)}

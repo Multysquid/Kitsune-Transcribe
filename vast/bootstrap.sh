@@ -106,6 +106,8 @@ second_root = cfg.get("second_root", "second_out")
 data_root = cfg.get("data_root", "data")
 selection = cfg["selection"]
 student = cfg["student"].rstrip("/")
+# the student dir files the trainer loads (it has no processor fallback): the same list as vast/launch.py STUDENT_FILES
+STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json")
 plan_path = state / "bootstrap_plan.json"
 
 
@@ -130,7 +132,7 @@ def plan():
         return any(fnmatch.fnmatch(f, pat) for f in files)
 
     patterns = [f"{teacher_root}/meta.json", f"{second_root}/meta.json", selection, f"{student}/*"]
-    required = [f"{selection}", f"{student}/config.json"]
+    required = [f"{selection}", *(f"{student}/{n}" for n in STUDENT_FILES)]
     for s in names:
         patterns += [f"{teacher_root}/{s}/*", f"{second_root}/{s}/*"]
         required.append(f"{teacher_root}/{s}/*.npz")

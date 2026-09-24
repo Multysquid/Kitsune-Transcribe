@@ -529,6 +529,31 @@ def test_shm_cap_fits_workers_into_dev_shm(monkeypatch, tmp_path):
     assert m.shm_cap(8, 4, 400, shm=str(tmp_path / "missing")) == (8, 4, None)  # no /dev/shm (Windows)
 
 
+def test_setup_processing_has_no_teacher_tokenizer_fallback(monkeypatch, tmp_path):
+    """A student dir without its processor and tokenizer files stops the setup with that cause. The old fallback
+    loaded the gated teacher tokenizer (a 403 with the box token, in place of the real cause) and, where that worked,
+    saved every step_<N>/ without processor or tokenizer files."""
+    import types
+
+    from kitsune import evaluate as ev
+
+    m = load_script("04_distill")
+
+    def gated():
+        raise AssertionError("the gated teacher tokenizer was loaded")
+
+    monkeypatch.setattr(ev, "teacher_tokenizer", gated)
+    sdir = tmp_path / "student"
+    sdir.mkdir()
+    (sdir / "config.json").write_text("{}", encoding="utf-8")  # what bootstrap once required of the student dir
+    evs = []
+    R = types.SimpleNamespace(cfg={"student": str(sdir), "perf": {"train_exact_dither": False}, "specaug": {}},
+                              device=torch.device("cpu"), log=types.SimpleNamespace(event=lambda kind, **kw: evs.append(kind)))
+    with pytest.raises(RuntimeError, match="no loadable processor"):
+        m.setup_processing(R)
+    assert evs == []
+
+
 @pytest.fixture(scope="module")
 def crash_resume(env):
     """The run that dies at a simulated crash at step 13 (KITSUNE_CRASH_AT_STEP) and is resumed from its full state at

@@ -273,7 +273,7 @@ def test_bootstrap_pull_fails_before_the_rebuild_when_nothing_arrived(tmp_path):
     assert re.search(r'phase pull_derived retry \d+ "\$PY" "\$HELPER" pull', line)
     (tmp_path / "helper.py").write_text(re.search(r"<<'PYEOF'\n(.*?\n)PYEOF\n", text, re.S).group(1), encoding="utf-8")
     repo_files = ["README.md", "teacher_out/meta.json", "second_out/meta.json", "selection/v.parquet",
-                  "students/s/config.json", "students/s/model.safetensors", "teacher_out/src_a/s0.npz",
+                  *(f"students/s/{n}" for n in launch.STUDENT_FILES), "teacher_out/src_a/s0.npz",
                   "second_out/src_a/s0.jsonl", "teacher_out/eval_x/s0.npz", "teacher_out/other/s0.npz"]
     stub = tmp_path / "stub" / "huggingface_hub"
     stub.mkdir(parents=True)
@@ -597,7 +597,8 @@ VIAB_CFG ={"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "g
             "selection": "selection/viability.parquet", "student": "students/b20x2560-d4"}
 DATA_FILES = ["teacher_out/meta.json", "second_out/meta.json", "selection/viability.parquet",
               "students/b20x2560-d4/config.json", "students/b20x2560-d4/model.safetensors",
-              "teacher_out/reazon_small/train-00000.npz", "teacher_out/reazon_small/train-00000.jsonl",
+              "students/b20x2560-d4/processor_config.json", "students/b20x2560-d4/tokenizer.json",
+              "students/b20x2560-d4/tokenizer_config.json", "teacher_out/reazon_small/train-00000.npz", "teacher_out/reazon_small/train-00000.jsonl",
               "second_out/reazon_small/train-00000.jsonl",
               "teacher_out/galgame/train-00000.npz", "teacher_out/galgame/train-00001.npz",
               "teacher_out/galgame/eval-00000.npz", "second_out/galgame/train-00000.jsonl",
@@ -620,6 +621,18 @@ def test_data_problems_catch_a_partial_second_opinion_pass_and_missing_files():
     assert "no second_out/meta.json" in problems and "no teacher_out/eval_jsut/*.npz" in problems
     # an eval-only set needs no second opinion
     assert not any("eval_jsut: " in p and "second opinion" in p for p in problems)
+
+
+def test_data_problems_need_the_students_processor_and_tokenizer():
+    """The trainer loads the processor and tokenizer from the student dir and has no fallback (the old one read the
+    gated teacher repo, a 403 with the box token): a student uploaded without them is caught on the laptop, before any
+    money is spent, and again by bootstrap's plan, before the paid audio rebuild, with the same list."""
+    files = [f for f in DATA_FILES if f != "students/b20x2560-d4/tokenizer.json"]
+    assert launch.data_problems(files, VIAB_CFG) == ["no students/b20x2560-d4/tokenizer.json"]
+    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
+    box = re.search(r"^STUDENT_FILES = (\(.*\))$", text, re.M)
+    assert box and eval(box.group(1)) == launch.STUDENT_FILES
+    assert 'required = [f"{selection}", *(f"{student}/{n}" for n in STUDENT_FILES)]' in text
 
 
 SEL_CFG = dict(VIAB_CFG, selection_recipe={"agree_max": 0.5, "agree_max_source": ["galgame=0.4"],

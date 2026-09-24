@@ -815,24 +815,22 @@ def setup_model(R: Run, grad_ckpt: bool):
 
 def setup_processing(R: Run):
     """Featurisers, SpecAugment, processor and tokenizer, from the student dir (save_student put the teacher's
-    processor there); the defaults of the HF extractor / the teacher tokenizer if it has none."""
+    processor there, and every step_<N>/ carries it on). A student dir without a loadable processor is an error: the
+    old fallback to the teacher tokenizer read the gated teacher repo, which the box token cannot (a 403 in place of
+    the real cause), and where it worked it saved every checkpoint without processor or tokenizer files."""
     from transformers import AutoProcessor
 
     sdir = rpath(R.cfg["student"])
     try:
         R.processor = AutoProcessor.from_pretrained(str(sdir))
-        fe = R.processor.feature_extractor
-        R.feat_eval = LogMel.from_feature_extractor(fe).to(R.device)
-        R.feat_train = LogMel.from_feature_extractor(fe, exact_dither=R.cfg["perf"]["train_exact_dither"]).to(R.device)
-        R.tokenizer = R.processor.tokenizer
     except Exception as e:
-        from kitsune import evaluate as ev
-
-        R.log.event("processor_fallback", error=f"{type(e).__name__}: {e}"[:500])
-        R.processor = None
-        R.feat_eval = LogMel().to(R.device)
-        R.feat_train = LogMel(exact_dither=R.cfg["perf"]["train_exact_dither"]).to(R.device)
-        R.tokenizer = ev.teacher_tokenizer()
+        raise RuntimeError(f"{sdir}: no loadable processor (03_build_student saves processor_config.json, "
+                           f"tokenizer.json and tokenizer_config.json next to the weights): {type(e).__name__}: {e}"
+                           ) from e
+    fe = R.processor.feature_extractor
+    R.feat_eval = LogMel.from_feature_extractor(fe).to(R.device)
+    R.feat_train = LogMel.from_feature_extractor(fe, exact_dither=R.cfg["perf"]["train_exact_dither"]).to(R.device)
+    R.tokenizer = R.processor.tokenizer
     R.specaug = SpecAugment(**{k: v for k, v in R.cfg["specaug"].items() if k != "enabled"})
     R.gen = torch.Generator(device=R.device)
 
