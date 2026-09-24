@@ -44,8 +44,11 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    python scripts/make_selection.py --config configs/viability.json
    ```
    `launch.py` refuses a data repo where a train source's teacher shard has no second opinion, or where the selection
-   still has `no_agree` rows, was built with other sources / eval sets / thresholds than the config's, or keeps no rows
-   of a configured source or eval set. From the repo root:
+   still has `no_agree` rows, was built with other sources / eval sets / thresholds than the config's, keeps no rows
+   of a configured source or eval set, or keeps rows whose teacher output is not uploaded. The uploaded `teacher_out`
+   must not go beyond what the box rebuilds with `01_prepare_data.py`'s defaults (the first 6 Galgame tars, 300 h of
+   Emilia-YODAS): a teacher pass on more of the full download needs a matching rebuild extent, or the box's coverage
+   check stops the run after the paid audio rebuild. From the repo root:
    ```bash
    hf upload Multy123/kitsune-data . . --repo-type dataset \
      --include "teacher_out/meta.json" --include "second_out/meta.json" \

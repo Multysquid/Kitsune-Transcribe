@@ -444,7 +444,9 @@ DATA_FILES = ["teacher_out/meta.json", "second_out/meta.json", "selection/viabil
               "teacher_out/galgame/train-00000.npz", "teacher_out/galgame/train-00001.npz",
               "teacher_out/galgame/eval-00000.npz", "second_out/galgame/train-00000.jsonl",
               "second_out/galgame/train-00001.jsonl", "second_out/galgame/eval-00000.jsonl",
-              "teacher_out/eval_jsut/eval-00000.npz"]
+              "teacher_out/eval_jsut/eval-00000.npz", "teacher_out/galgame/train-00000.jsonl",
+              "teacher_out/galgame/train-00001.jsonl", "teacher_out/galgame/eval-00000.jsonl",
+              "teacher_out/eval_jsut/eval-00000.jsonl"]
 
 
 def test_data_problems_complete_repo_passes():
@@ -473,12 +475,15 @@ SEL_ROWS = [("reazon_small", "train", True, "kept"), ("galgame", "train", True, 
 
 
 def write_selection(path: Path, rows, args=None) -> Path:
-    """A selection parquet as make_selection.py writes it: its arguments in the metadata key b"kitsune_selection"."""
+    """A selection parquet as make_selection.py writes it: its arguments in the metadata key b"kitsune_selection";
+    each row's teacher_file is <source>/<split>-00000."""
     import pandas as pd
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    t = pa.Table.from_pandas(pd.DataFrame(rows, columns=["source", "split", "keep", "reason"]), preserve_index=False)
+    df = pd.DataFrame(rows, columns=["source", "split", "keep", "reason"])
+    df["teacher_file"] = df["source"] + "/" + df["split"] + "-00000"
+    t = pa.Table.from_pandas(df, preserve_index=False)
     if args is not None:
         t = t.replace_schema_metadata({b"kitsune_selection": json.dumps(dict(args=args, created="x")).encode()})
     pq.write_table(t, path)
@@ -491,6 +496,23 @@ def test_selection_problems_flag_no_agree_rows(tmp_path):
     problems = launch.selection_problems(path, name, SEL_CFG)
     assert len(problems) == 1 and "1 rows as no_agree ({'galgame': 1})" in problems[0]
     assert launch.selection_problems(write_selection(path, SEL_ROWS, SEL_ARGS), name, SEL_CFG) == []
+
+
+def test_selection_problems_flag_kept_rows_without_teacher_output_in_the_repo(tmp_path):
+    """data_problems only asks for some teacher npz per source (a galgame train npz also satisfies its hold-out), so a
+    kept row whose own teacher_file is not uploaded passed the preflight and build_stores raised FileNotFoundError on
+    the box, after the paid bootstrap. The selection's kept teacher_file references are checked against the repo."""
+    name = "selection/viability.parquet"
+    path = write_selection(tmp_path / "sel.parquet", SEL_ROWS, SEL_ARGS)
+    assert launch.selection_problems(path, name, SEL_CFG, set(DATA_FILES)) == []
+    files = [f for f in DATA_FILES if f != "teacher_out/galgame/eval-00000.npz"]
+    assert launch.data_problems(files, VIAB_CFG) == []  # the train npz still satisfy "teacher shards for galgame"
+    problems = launch.selection_problems(path, name, SEL_CFG, set(files))
+    assert problems == [f"{name} keeps rows whose teacher output is not in the data repo: 1 of 8 files missing (e.g. "
+                        f"teacher_out/galgame/eval-00000.npz): upload the teacher_out the selection was built from"]
+    # only kept rows count: a dropped row's teacher file may be absent
+    rows = SEL_ROWS + [("reazon_small", "eval", False, "agree>0.5")]
+    assert launch.selection_problems(write_selection(path, rows, SEL_ARGS), name, SEL_CFG, set(DATA_FILES)) == []
 
 
 def test_selection_problems_check_the_recipe_and_the_kept_rows(tmp_path):

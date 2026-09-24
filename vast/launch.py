@@ -9,9 +9,10 @@ Run this on the laptop. It
   3. creates the instance only with --yes. Spending money is always the user's explicit step.
 The git, image and HF checks run before the offer search, so they report problems even without the vastai CLI. The HF
 check refuses a data repo whose derived data is incomplete: a train source's teacher shard without its second opinion,
-or a selection that still drops rows as no_agree (both mean training on a fraction of the planned hours); and a
-selection not built from the run config's sources, eval sets and selection_recipe, or with no kept rows for one of them
-(make_selection.py --config builds the right one).
+or a selection that still drops rows as no_agree (both mean training on a fraction of the planned hours); a selection
+not built from the run config's sources, eval sets and selection_recipe, or with no kept rows for one of them
+(make_selection.py --config builds the right one); and a selection whose kept rows point at teacher output the repo
+lacks.
 
 HF_TOKEN is never an argument and never part of the command: the box gets it from the vast ACCOUNT-level environment
 variables (D48a), so it does not appear in shell history, the process list or the instance config. The instance runs
@@ -217,12 +218,15 @@ def _by_source(items) -> dict[str, float]:
     return out
 
 
-def selection_problems(path: Path, name: str, cfg: dict) -> list[str]:
+def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None = None) -> list[str]:
     """The selection must be the one the run config describes. make_selection.py records its arguments in the parquet
     (metadata b"kitsune_selection"): they must match the config's sources, eval_sets and selection_recipe (agreement
     thresholds, label-filtered hold-outs) - a rebuild with a flag forgotten would otherwise silently train on other
     rows or lose a hold-out. Every configured train source and eval set must keep rows (the trainer takes an empty one
-    in silence). And a selection built before the second-opinion pass finished drops those rows as no_agree."""
+    in silence). And a selection built before the second-opinion pass finished drops those rows as no_agree.
+    With `have` (the data repo's file list) every kept row's teacher_file must be there as .npz and .jsonl: the
+    trainer's build_stores raises on a missing one, after the paid bootstrap, and data_problems only asks for SOME
+    teacher shard per source (a train npz also satisfies the galgame hold-out)."""
     import pandas as pd
     import pyarrow.parquet as pq
 
@@ -248,7 +252,7 @@ def selection_problems(path: Path, name: str, cfg: dict) -> list[str]:
                          for x in (got[k], v)]
                 problems.append(f"{name} was built with {k} {shown[0]}, the run config says {shown[1]}: {rebuild}")
 
-    sel = pd.read_parquet(path, columns=["source", "split", "keep", "reason"])
+    sel = pd.read_parquet(path, columns=["source", "split", "keep", "reason", "teacher_file"])
     kept = sel[sel["keep"]].groupby(["source", "split"]).size()
     for split, key in (("train", "sources"), ("eval", "eval_sets")):
         empty = [s for s in cfg.get(key, []) if not kept.get((s, split), 0)]
@@ -258,6 +262,15 @@ def selection_problems(path: Path, name: str, cfg: dict) -> list[str]:
     if not bad.empty:
         problems.append(f"{name} drops {len(bad)} rows as no_agree ({bad['source'].value_counts().to_dict()}): rebuild "
                         f"it with scripts/make_selection.py after the second-opinion pass and upload it")
+    if have is not None:
+        teacher_root = cfg.get("teacher_root", "teacher_out")
+        need = sorted({f"{teacher_root}/{tf}{ext}" for tf in sel.loc[sel["keep"], "teacher_file"].unique()
+                       for ext in (".npz", ".jsonl")})
+        absent = [f for f in need if f not in have]
+        if absent:
+            problems.append(f"{name} keeps rows whose teacher output is not in the data repo: {len(absent)} of "
+                            f"{len(need)} files missing (e.g. {absent[0]}): upload the teacher_out the selection was "
+                            f"built from")
     return problems
 
 
@@ -277,7 +290,7 @@ def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, 
         if cfg["selection"] in files:
             with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
                 local = hf_hub_download(data_repo, cfg["selection"], repo_type="dataset", revision=rev, local_dir=tmp)
-                problems += selection_problems(Path(local), cfg["selection"], cfg)
+                problems += selection_problems(Path(local), cfg["selection"], cfg, set(files))
     except Exception as e:
         problems.append(f"cannot read dataset {data_repo}: {type(e).__name__}: {e}")
     try:
