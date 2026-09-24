@@ -80,12 +80,16 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
 ## Each run
 
 1. Commit and push the code you want to run (the box clones exactly that commit), and wait for the image build if
-   you changed `docker/` or `requirements-train.txt`.
+   you changed `docker/` or `requirements-train.txt`. `launch.py` reads the commit the image was built from and
+   refuses it while `requirements-train.txt` or `docker/Dockerfile` differ at the commit you run. CI builds an image
+   only for pushes that touch those files, so a branch with code changes only has no image tag of its own: add
+   `--image-tag main`.
 2. Look first (read-only, spends nothing):
    ```bash
    python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
    ```
-   It checks the commit is pushed, resolves the image tag to a digest, checks both HF repos with your local login
+   It checks the commit is pushed, resolves the image tag to a digest and checks the image was built with this
+   commit's dependencies, checks both HF repos with your local login
    (including that both are private and the derived data is complete, see above), then searches offers (verified A100 SXM4 40 GB,
    reliability >= 0.98, driver CUDA >= 13.0, >= 12 CPU cores, >= 64 GB RAM, disk and network >= 500, room for the
    150 GB disk; falls back to SXM4 80 GB), prints a table with each host's bandwidth $/GB, the exact create command and

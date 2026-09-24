@@ -435,7 +435,103 @@ def test_launch_runs_the_checks_without_vastai(monkeypatch, capsys):
     assert "must be pinned by digest" in out and "pip install vastai==" in out
 
 
-VIAB_CFG = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"],
+class FakeRegistry:
+    """urllib.request.urlopen for ghcr.io: an anonymous token, an image index (an attestation entry first, then the
+    linux/amd64 image), that image's manifest and its config blob with the given labels."""
+
+    def __init__(self, labels):
+        self.paths = []
+        self.docs = {
+            "manifests/sha256:idx": {"manifests": [
+                {"digest": "sha256:att", "platform": {"architecture": "unknown", "os": "unknown"}},
+                {"digest": "sha256:amd", "platform": {"architecture": "amd64", "os": "linux"}}]},
+            "manifests/sha256:amd": {"config": {"digest": "sha256:cfg"}},
+            "blobs/sha256:cfg": {"architecture": "amd64", "config": {"Labels": labels}},
+        }
+
+    def __call__(self, req, timeout=None):
+        import io
+
+        url = req if isinstance(req, str) else req.full_url
+        if url.startswith("https://ghcr.io/token?"):
+            return io.BytesIO(json.dumps({"token": "t"}).encode())
+        assert req.get_header("Authorization") == "Bearer t"
+        path = url.removeprefix("https://ghcr.io/v2/multysquid/kitsune-train/")
+        self.paths.append(path)
+        return io.BytesIO(json.dumps(self.docs[path]).encode())
+
+
+def test_image_revision_reads_the_build_commit_label(monkeypatch):
+    rev = "3ab6eb6f62493b195b480bebab8d6ce1be477c78"
+    reg = FakeRegistry({"org.opencontainers.image.revision": rev, "org.opencontainers.image.version": "main"})
+    monkeypatch.setattr(launch.urllib.request, "urlopen", reg)
+    assert launch.image_revision(f"{launch.IMAGE_REPO}@sha256:idx") == rev
+    assert reg.paths == ["manifests/sha256:idx", "manifests/sha256:amd", "blobs/sha256:cfg"]
+    monkeypatch.setattr(launch.urllib.request, "urlopen", FakeRegistry({}))
+    with pytest.raises(launch.LaunchError, match="no org.opencontainers.image.revision"):
+        launch.image_revision(f"{launch.IMAGE_REPO}@sha256:idx")
+
+
+def test_image_problems_refuse_an_image_built_from_other_dependencies(monkeypatch):
+    """CI moves a branch tag only after the build and its smoke test pass: while a pin bump is still building, or after
+    its smoke failed, the tag names the previous image and the box would run the new code on the old pins. The image's
+    build commit must have the same requirements-train.txt and docker/Dockerfile as the commit to run."""
+    rev, image = "f" * 40, f"{launch.IMAGE_REPO}@sha256:" + "cd" * 32
+    monkeypatch.setattr(launch, "image_revision", lambda img: rev)
+
+    def fake_git(changed="", known=True):
+        def git(*args):
+            if args[0] == "cat-file":
+                assert args[1:] == ("-e", f"{rev}^{{commit}}")
+                if not known:
+                    raise subprocess.CalledProcessError(128, args)
+                return ""
+            assert args == ("diff", "--name-only", rev, SHA, "--", *launch.IMAGE_INPUTS)
+            return changed
+        return git
+
+    monkeypatch.setattr(launch, "git", fake_git())
+    assert launch.image_problems(image, SHA) == []
+    monkeypatch.setattr(launch, "git", fake_git("requirements-train.txt\n"))
+    (p,) = launch.image_problems(image, SHA)
+    assert f"was built from {rev[:12]} but {SHA[:12]} changes ['requirements-train.txt']: wait for the image build" in p
+    monkeypatch.setattr(launch, "git", fake_git(known=False))
+    (p,) = launch.image_problems(image, SHA)
+    assert f"built from {rev[:12]}, which this clone lacks: git fetch" in p
+
+    def unreadable(img):
+        raise launch.LaunchError(f"{img} carries no org.opencontainers.image.revision label")
+
+    monkeypatch.setattr(launch, "image_revision", unreadable)
+    (p,) = launch.image_problems(image, SHA)
+    assert p.startswith(f"cannot read the commit {image} was built from (LaunchError")
+
+
+def test_launch_checks_the_image_revision_and_explains_a_missing_branch_tag(monkeypatch, capsys):
+    import urllib.error
+
+    monkeypatch.setattr(launch.shutil, "which", lambda name: None)
+    monkeypatch.setattr(launch, "git_checks", lambda sha, config: [])
+    calls = []
+    monkeypatch.setattr(launch, "image_problems", lambda image, sha: calls.append((image, sha)) or ["image is stale"])
+    no_skip = [a for a in launch_args() if a != "--skip-git-checks"]
+    assert launch.main(no_skip) == 2
+    assert calls == [(DIGEST_IMAGE, SHA)] and "image is stale" in capsys.readouterr().out
+    assert launch.main(launch_args()) == 2 and len(calls) == 1, "--skip-git-checks skips it"
+
+    def missing(tag):
+        raise urllib.error.HTTPError(f"https://ghcr.io/v2/x/manifests/{tag}", 404, "Not Found", None, None)
+
+    monkeypatch.setattr(launch, "resolve_image_digest", missing)
+    args = [a for a in no_skip if a not in ("--image", DIGEST_IMAGE)] + ["--image-tag", "audit-fixes"]
+    assert launch.main(args) == 2
+    out = capsys.readouterr().out
+    assert "cannot resolve ghcr.io/multysquid/kitsune-train:audit-fixes to a digest (HTTP Error 404" in out
+    assert "a code-only branch or a detached HEAD has none: pass --image-tag main" in out
+    assert len(calls) == 1, "an unresolved image is not checked"
+
+
+VIAB_CFG ={"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"],
             "selection": "selection/viability.parquet", "student": "students/b20x2560-d4"}
 DATA_FILES = ["teacher_out/meta.json", "second_out/meta.json", "selection/viability.parquet",
               "students/b20x2560-d4/config.json", "students/b20x2560-d4/model.safetensors",
