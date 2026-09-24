@@ -1048,9 +1048,11 @@ class RunLogger:
         self.event("sync_failed", repo=self.hf_repo, attempts=len(waits))
         return False
 
-    def wait_sync(self):
+    def wait_sync(self, timeout: float | None = None) -> bool:
+        """Wait for the running sync, at most `timeout` s (None: until it ends). True once none is running."""
         if self._sync_thread is not None:
-            self._sync_thread.join()
+            self._sync_thread.join(timeout)
+        return self._sync_thread is None or not self._sync_thread.is_alive()
 
     def _join_sync(self, until: float) -> bool:
         """Wait for the running sync until the monotonic time `until`. False, with a sync_abandoned event, if it is

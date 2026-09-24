@@ -163,9 +163,11 @@ from kitsune.patches import assert_bn_frozen, patch_relpos_once_per_batch, train
 from kitsune.runlog import _replace as _replace_file  # noqa: E402  (atomic file replace with the Windows retry)
 
 EXIT_OK, EXIT_THROUGHPUT, EXIT_FAIL = 0, 3, 1
-# the end phase's wait for checkpoint uploads: with RunLogger's close_join_s (600 s) it stays inside
-# schedule.end_reserve_min (30), so an upload that never returns cannot keep a paid instance up
+# the end phase's wait for checkpoint uploads: with RunLogger's close_join_s (600 s) and END_SYNC_JOIN_S it stays
+# inside schedule.end_reserve_min (30), so an upload that never returns cannot keep a paid instance up
 UPLOAD_WAIT_S = 600
+# the end phase's wait for a running log sync before its own one (the final eval and verdict, ahead of the uploads)
+END_SYNC_JOIN_S = 120
 # the failure path's wait for them, after the logs are closed: a crashed trainer should get to the supervisor's resume.
 # What it cuts off goes up anyway (Uploader.abandon)
 FAILED_UPLOAD_WAIT_S = 120
@@ -2418,6 +2420,11 @@ def train(R: Run, state: dict | None) -> int:
     verdict = gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=R.st["history"])))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
+    # the final eval, the verdict and the end events go up now, while the ~9 GB end state drains (up to
+    # UPLOAD_WAIT_S), not only with close()'s sync after it: on a slow Hub the watchdog stops the box meanwhile. A loop
+    # sync still running gets END_SYNC_JOIN_S to end first; a stalled one is close()'s to bound
+    if log.wait_sync(END_SYNC_JOIN_S):
+        log.sync(force=True, wait=False)
     uploads = R.uploader.wait(UPLOAD_WAIT_S)
     summary = make_summary(R, "complete", verdict=verdict, final=full_sum, uploads=uploads,
                            headline=(R.st["history"][-1] if R.st["history"] else {}).get("headline"))

@@ -806,7 +806,7 @@ def test_finish_destroys_only_when_verified(finish_env, tmp_path):
     rc, actions = go(hub, "--destroy")
     assert rc == 0 and actions == ["destroy"]
     assert json.loads((tmp_path / "state" / "halt").read_text())["action"] == "destroy"
-    ckpt, live = hub.uploads
+    live, ckpt = hub.uploads  # the logs first (sync)
     assert ckpt["path_in_repo"] == live["path_in_repo"] == f"runs/{run.name}"
     # finished checkpoints go up in place; the logs from a snapshot copy that no later append can change
     assert Path(ckpt["folder_path"]) == run and "checkpoints/full_step_200/state.pt" in ckpt["allow_patterns"]
@@ -826,6 +826,28 @@ def test_finish_stop_without_sync_still_uploads_the_infra_logs(finish_env, tmp_p
     assert rc == 0 and actions == ["stop"] and hub.uploads == []
     assert hub.commits[0]["operations"][0].path_in_repo.startswith(f"runs/{run.name}/infra/")
     assert b"onstart failed at line 7" in hub.committed("events.jsonl")
+
+
+def test_finish_sync_uploads_the_logs_before_the_checkpoints(finish_env, tmp_path):
+    """The watchdog's --sync-only gets 10 minutes before the stop: the ~9 GB of a full state not yet on the hub came
+    first and could take all of them, and a checkpoint commit that raised skipped the run's logs altogether (rc 0). The
+    logs now go first, so they reach the hub either way."""
+    run, go = finish_env
+
+    class CheckpointsFail(FakeHub):
+        def upload_folder(self, **kw):
+            if any(p.startswith("checkpoints/") for p in kw["allow_patterns"]):
+                raise RuntimeError("502 Bad Gateway")
+            super().upload_folder(**kw)
+
+    hub = CheckpointsFail({})
+    rc, actions = go(hub, "--sync-only")
+    assert rc == 0 and actions == []
+    (live,) = hub.uploads
+    assert {"config.json", "summary.json", "metrics/scalars.jsonl"} <= set(live["files"])
+    assert live["files"]["metrics/scalars.jsonl"] == (run / "metrics" / "scalars.jsonl").read_bytes()
+    kinds = [json.loads(ln)["kind"] for ln in (tmp_path / "state" / "events.jsonl").read_text().splitlines()]
+    assert kinds == ["sync_failed"]
 
 
 def test_snapshot_copies_a_growing_file_as_it_was(tmp_path):

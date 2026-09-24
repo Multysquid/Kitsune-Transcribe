@@ -370,6 +370,8 @@ def test_a_stalled_sync_is_reported_and_close_returns(tmp_path):
         assert [log.sync(), log.sync()] == [False, False]
         stalled = [e for e in events(run) if e["kind"] == "sync_stalled"]
         assert len(stalled) == 1 and stalled[0]["sync_step"] == 1 and stalled[0]["started_s_ago"] >= 0.12
+        t0 = time.monotonic()  # the trainer's end phase waits for it at most END_SYNC_JOIN_S, then goes on
+        assert log.wait_sync(0.2) is False and time.monotonic() - t0 < 2 and len(api.calls) == 1
         t0 = time.monotonic()
         log.close()
         assert time.monotonic() - t0 < 3

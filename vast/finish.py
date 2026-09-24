@@ -226,7 +226,10 @@ def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_r
     """Upload the run dir (minus local-only checkpoints) plus the checkpoints finish will verify.
 
     Re-uploading files the trainer already pushed is cheap: the hub skips content it already stores, so this mostly
-    repairs a checkpoint upload that failed and captures log lines written after the trainer's last sync."""
+    repairs a checkpoint upload that failed and captures log lines written after the trainer's last sync. The logs go
+    first: they are small, the watchdog's --sync-only has 10 minutes before the stop, which a ~9 GB full state not
+    yet on the hub can take all of (the final eval and verdict of a trainer still waiting on its end-state upload
+    are on this disk only), and a checkpoint upload that raises must not cost them."""
     expected = expected_files(run_dir, expect_full)
     rels = sorted(p[len(f"runs/{run_dir.name}/"):] for p in expected)
     ckpt = [r for r in rels if r.startswith("checkpoints/")]
@@ -235,14 +238,14 @@ def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_r
     log(f"sync {run_dir} -> {repo}:{dest} ({len(live)} files + {len(ckpt)} checkpoint files)")
     if dry_run:
         return
-    if ckpt:  # renamed into place when complete and never written again: uploaded where they are
-        api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=str(run_dir), path_in_repo=dest,
-                          allow_patterns=ckpt, commit_message=f"finish: checkpoints {run_dir.name}")
     if live:  # logs the trainer may still be writing: a consistent copy (module docstring)
         with tempfile.TemporaryDirectory(prefix="kitsune-finish-") as stage:
             snapshot(run_dir, live, Path(stage))
             api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=stage, path_in_repo=dest,
                               allow_patterns=live, commit_message=f"finish: sync {run_dir.name}")
+    if ckpt:  # renamed into place when complete and never written again: uploaded where they are
+        api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=str(run_dir), path_in_repo=dest,
+                          allow_patterns=ckpt, commit_message=f"finish: checkpoints {run_dir.name}")
 
 
 def upload_infra(api, repo: str, repo_type: str, dest: str, dry_run: bool):

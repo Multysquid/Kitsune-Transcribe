@@ -648,6 +648,8 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
     assert f"{prefix}/checkpoints/full_step_{int((1 - COOLDOWN) * MAX_STEPS)}" in uploaded  # pre-cooldown
     syncs = [f for p, f, ign in hub.folders if p == prefix]
     assert syncs and all(ign and "checkpoints/*" in ign for p, _, ign in hub.folders if p == prefix)
+    # the verdict went up before the end state's upload was waited for, not only with close()'s final sync
+    assert any(f"evals/step_{MAX_STEPS}/verdict.json" in f for f in syncs[:-1])
     assert f"{prefix}/smoke/roundtrip.json" in hub.files
 
     # ---- export (tools/ is not under scripts/, so no load_script)
