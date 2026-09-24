@@ -208,19 +208,24 @@ def coverage():
     floor = float(os.environ.get("KITSUNE_MIN_COVERAGE", "0.99"))
     report, bad = {}, []
     for s in names:
-        tids = set()
+        # per split (<split>-NNNNN in both trees), as the trainer joins them: pooled over a source's splits,
+        # galgame's 1,000-row hold-out is 0.5 % of its ids and could vanish (or trade rows with train) above the floor
+        tids, aids = {}, {}
         for npz in sorted((root / teacher_root / s).glob("*.npz")):
             with np.load(npz, allow_pickle=False) as z:
-                tids.update(str(i) for i in z["ids"])
-        aids = set()
+                tids.setdefault(npz.stem.rsplit("-", 1)[0], set()).update(str(i) for i in z["ids"])
         for shard in sorted((root / data_root / "shards" / s).glob("*.parquet")):
-            aids.update(pq.read_table(shard, columns=["id"]).column("id").to_pylist())
-        hit = len(tids & aids)
-        cov = hit / len(tids) if tids else 0.0
-        report[s] = dict(teacher_ids=len(tids), audio_ids=len(aids), joined=hit, coverage=round(cov, 5))
-        print(f"  {s:14s} teacher {len(tids):7d}  audio {len(aids):7d}  joined {hit:7d}  coverage {cov:.4f}")
-        if cov < floor:
-            bad.append(s)
+            aids.setdefault(shard.stem.rsplit("-", 1)[0], set()).update(
+                pq.read_table(shard, columns=["id"]).column("id").to_pylist())
+        for sp in sorted(tids) or [None]:  # no teacher ids at all: coverage 0
+            name = f"{s}/{sp}" if sp else s
+            t, a = tids.get(sp, set()), aids.get(sp, set())
+            hit = len(t & a)
+            cov = hit / len(t) if t else 0.0
+            report[name] = dict(teacher_ids=len(t), audio_ids=len(a), joined=hit, coverage=round(cov, 5))
+            print(f"  {name:20s} teacher {len(t):7d}  audio {len(a):7d}  joined {hit:7d}  coverage {cov:.4f}")
+            if cov < floor:
+                bad.append(name)
     (state / "bootstrap_coverage.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
     if bad:
         sys.exit(f"coverage below {floor} for {bad}: the audio does not match the teacher outputs")

@@ -316,6 +316,49 @@ def test_bootstrap_pull_fails_before_the_rebuild_when_nothing_arrived(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
 
 
+def test_bootstrap_coverage_is_checked_per_split(tmp_path):
+    """The trainer joins a split's teacher ids only against that split's audio shards (<split>-*.parquet). Pooled over
+    a source's splits, galgame's 1,000-row hold-out is 0.5 % of its ids: all of it missing (or moved into a train
+    shard by a rebuild that split the rows differently) passed the 0.99 floor, and the eval store then dropped the
+    hold-out with one printed line. The coverage check now holds every split of a source to the floor."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
+    (tmp_path / "helper.py").write_text(re.search(r"<<'PYEOF'\n(.*?\n)PYEOF\n", text, re.S).group(1), encoding="utf-8")
+    box, state = tmp_path / "box", tmp_path / "state"
+    (box / "configs").mkdir(parents=True)
+    state.mkdir()
+    (box / "configs" / "c.json").write_text(json.dumps(dict(
+        sources=["gal"], eval_sets=["gal"], data_root="data", selection="selection/v.parquet", student="students/s")),
+        encoding="utf-8")
+    train, held = [f"gal/t{i:03d}" for i in range(300)], ["gal/e0", "gal/e1"]
+    (box / "teacher_out" / "gal").mkdir(parents=True)
+    np.savez(box / "teacher_out" / "gal" / "train-00000.npz", ids=np.array(train))
+    np.savez(box / "teacher_out" / "gal" / "eval-00000.npz", ids=np.array(held))
+    shards = box / "data" / "shards" / "gal"
+    shards.mkdir(parents=True)
+    pq.write_table(pa.table({"id": train}), shards / "train-00000.parquet")
+    pq.write_table(pa.table({"id": held}), shards / "train-00001.parquet")  # the hold-out's rows landed in train
+    env = dict(os.environ, KITSUNE_DIR=str(box), STATE=str(state), CONFIG="configs/c.json", KITSUNE_DATA_REPO="u/data",
+               KITSUNE_DATA_REVISION="main", KITSUNE_MIN_COVERAGE="0.99")
+
+    def coverage():
+        r = subprocess.run([sys.executable, str(tmp_path / "helper.py"), "coverage"], capture_output=True, text=True,
+                           env=env, timeout=120)
+        return r, json.loads((state / "bootstrap_coverage.json").read_text(encoding="utf-8"))
+
+    r, report = coverage()  # pooled: 302 of 302 ids joined
+    assert r.returncode != 0 and "coverage below 0.99 for ['gal/eval']" in r.stderr, r.stdout + r.stderr
+    assert report["gal/train"]["coverage"] == 1.0 and report["gal/eval"]["joined"] == 0
+    (shards / "train-00001.parquet").unlink()
+    pq.write_table(pa.table({"id": held}), shards / "eval-00000.parquet")
+    r, report = coverage()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert set(report) == {"gal/train", "gal/eval"} and report["gal/eval"]["coverage"] == 1.0
+
+
 def test_bootstrap_plan_checks_the_box_token_on_the_output_repo(tmp_path):
     """launch.py checks the HF repos with the laptop's own (broader) login; the box HF_TOKEN's first use of the output
     repo was the trainer's hf_roundtrip, after the pull, the 10-20 min audio rebuild and the model load. plan() now

@@ -529,6 +529,39 @@ def test_shm_cap_fits_workers_into_dev_shm(monkeypatch, tmp_path):
     assert m.shm_cap(8, 4, 400, shm=str(tmp_path / "missing")) == (8, 4, None)  # no /dev/shm (Windows)
 
 
+def test_data_event_logs_the_eval_stores_dropped_rows(tmp_path):
+    """Eval rows without audio (a galgame hold-out the box rebuild lost) were counted only in a printed line and the
+    unuploaded stores.json: the 'data' event logged the train store's drops alone. It now logs the eval store's."""
+    import types
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    m = load_script("04_distill")
+    fc = make_fake_corpus(tmp_path / "corpus", sources={"src_a": (24, "train"), "gal": [(8, "eval"), (16, "train")]},
+                          dur_range=(0.4, 2.5), token_range=(256, 296), seed=5)
+    sel = make_fake_selection(fc, sources=["src_a", "gal"], eval_sets=["gal"])
+    (shard,) = (fc.data / "shards" / "gal").glob("eval-*.parquet")  # the box lost 3 hold-out clips the laptop had
+    t = pq.read_table(shard)
+    kept = set(pd.read_parquet(sel).query("source == 'gal' and split == 'eval' and keep")["id"])
+    lost = [i for i in t.column("id").to_pylist() if i in kept][:3]
+    pq.write_table(t.filter(pc.invert(pc.is_in(t.column("id"), pa.array(lost)))), shard)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "data_root": str(fc.data), "teacher_root": str(fc.teacher_out), "second_root": str(fc.second_out),
+        "selection": str(sel), "cache_dir": str(tmp_path / "cache"), "sources": ["src_a", "gal"], "eval_sets": ["gal"],
+        "device": "cpu", "autocast": "none"}), encoding="utf-8")
+    R = m.Run(cfg=m.load_config(str(path), []), run_dir=tmp_path, device=torch.device("cpu"), amp=False)
+    evs = []
+    R.log = types.SimpleNamespace(event=lambda kind, **kw: evs.append(dict(kind=kind, **kw)))
+    m.setup_data(R)
+    data = next(e for e in evs if e["kind"] == "data")
+    assert data["eval_dropped"]["no_audio"]["n"] == 3 and data["eval_dropped"]["no_audio"]["by_source"] == {"gal": 3}
+    assert sorted(data["eval_dropped"]["no_audio"]["ids"]) == sorted(lost)
+    assert data["eval_per_set"]["gal"]["utts"] == len(kept) - 3 and data["dropped"]["no_audio"]["n"] == 0
+
+
 def test_setup_processing_has_no_teacher_tokenizer_fallback(monkeypatch, tmp_path):
     """A student dir without its processor and tokenizer files stops the setup with that cause. The old fallback
     loaded the gated teacher tokenizer (a 403 with the box token, in place of the real cause) and, where that worked,

@@ -1106,7 +1106,8 @@ def setup_data(R: Run):
     log.event("data", train_utts=len(R.train), train_h=round(R.train.hours, 3),
               per_source=R.train.info.get("per_source"), dropped=R.train.info.get("dropped"),
               eval_utts=len(R.evalstore), eval_h=round(R.evalstore.hours, 3),
-              eval_per_set=R.evalstore.info.get("per_source"), probe=len(R.probe_ids), greedy=len(R.greedy_ids),
+              eval_per_set=R.evalstore.info.get("per_source"), eval_dropped=R.evalstore.info.get("dropped"),
+              probe=len(R.probe_ids), greedy=len(R.greedy_ids),
               build_s=round(time.time() - t0, 1),
               **(dict(probe_greedy=len(R.probe_greedy_ids)) if R.probe_greedy_ids else {}),
               **(dict(mini_val=len(R.mini_val_ids), mini_train=len(R.mini_train_ids))
