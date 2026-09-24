@@ -343,7 +343,8 @@ def main():
                        f"free {torch.cuda.mem_get_info()[0] / 2**30:.2f} GiB")
             if (args.force or not meta_path.exists()) and r["prompt"]:
                 meta_path.write_text(json.dumps(dict(
-                    **settings, decoder_prompt_ids=r["prompt"],
+                    **settings, model_revision=getattr(model.config, "_commit_hash", None),  # the commit `main` resolved to
+                    decoder_prompt_ids=r["prompt"],
                     decoder_prompt_tokens=processor.tokenizer.convert_ids_to_tokens(r["prompt"]),
                     eos_token_id=model.generation_config.eos_token_id, pad_token_id=model.generation_config.pad_token_id,
                     vocab_size=model.config.vocab_size, encoder_hidden_size=model.config.encoder_config.hidden_size,

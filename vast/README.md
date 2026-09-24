@@ -36,7 +36,11 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    ```bash
    hf repos create Multy123/kitsune-data --repo-type dataset --private
    hf repos create Multy123/kitsune-runs --private
+   hf upload Multy123/kitsune-runs MODEL_CARD.md README.md
    ```
+   The last line (from the repo root, once) gives the run repo its model card: HF renders only the repo-root
+   README.md, and its terms (GPL-3.0, non-commercial, trained on Galgame; the Apache-2.0 modified-from notice) are
+   the ones every checkpoint also carries as its own README.md.
 2. Upload the derived data (~2.3 GB, most of it the student init; the audio is rebuilt on the box). Finish the
    second-opinion pass for every train source and rebuild the selection first, with the run config's recipe (its
    sources, eval sets and `selection_recipe`: the agreement thresholds and the label-filtered hold-outs):

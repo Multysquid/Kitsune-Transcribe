@@ -348,6 +348,11 @@ def test_save_load_roundtrip(tmp_path):
     S.save_student(student, out, processor=None, meta=meta)
 
     assert {"config.json", "generation_config.json", "model.safetensors", "student_meta.json"} <= set(os.listdir(out))
+    # the model card (licence terms, the Apache-2.0 modified-from notice) travels with the weights
+    card = (out / "README.md").read_text(encoding="utf-8")
+    assert card == S.MODEL_CARD.read_text(encoding="utf-8")
+    assert "license: other" in card and f"base_model: {S.TEACHER_ID}" in card
+    assert "b1eacc2686a3d08ceaae5f24a88b1d519620bc09" in card and "non-commercial" in card
     with safe_open(out / "model.safetensors", "pt") as f:
         keys = set(f.keys())
         dtypes = {k: f.get_slice(k).get_dtype() for k in keys}
@@ -452,6 +457,8 @@ def test_build_script_end_to_end_tiny(tmp_path):
         meta["kept"]["ffn"]["2.feed_forward1"])
     assert 0 < meta["importance"]["kept_mass_min"] <= meta["importance"]["kept_mass_mean"] < 1
     assert meta["params"]["total"] == meta["params"]["closed_form"]
+    assert "teacher_revision" in meta and meta["teacher_revision"] is None  # a local teacher dir has no hub commit
+    assert (out / "README.md").exists()  # the model card
     assert meta["step0"]["n_per_set"] == {"eval_x": 4}
     assert meta["step0"]["greedy"]["sets"]["eval_x"]["n"] == 4
     assert "kl" in meta["step0"]["teacher_forced"]["sets"]["eval_x"]

@@ -328,6 +328,8 @@ def main(argv=None) -> int:
         print(f"[2/8] teacher {args.teacher} (bf16) -> {device}")
         teacher = CohereAsrForConditionalGeneration.from_pretrained(args.teacher, dtype=torch.bfloat16,
                                                                     attn_implementation="sdpa").to(device).eval()
+        # provenance: the teacher is read from `main`, so record which commit that was (None for a local directory)
+        meta["teacher_revision"] = getattr(teacher.config, "_commit_hash", None)
         dur["teacher_load"] = round(time.time() - t, 1)
 
         t = time.time()

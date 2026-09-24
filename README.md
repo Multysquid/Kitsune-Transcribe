@@ -52,20 +52,24 @@ Only the Emilia hold-out is kept disjoint from training (by video). Nothing dedu
 the eval_reazon CER carries up to ~0.3 pp from re-aired broadcasts that are also in reazon_small. The galgame hold-out
 is a random utterance sample of the first tar, so it measures seen games and voices, not unseen games.
 
-Every upstream repo is read at a pinned commit (`REVISIONS` in `scripts/01_prepare_data.py`).
+Every upstream dataset repo is read at a pinned commit (`REVISIONS` in `scripts/01_prepare_data.py`). The teacher
+is read from `main`; `teacher_out/meta.json` and `student_meta.json` record the commit it resolved to (the teacher
+outputs and the student built before that record was added all come from `b1eacc2`).
 
 ### License of the trained model
 
 This is a non-commercial hobby project. Because Galgame is in the training mix, the student model is
 **non-commercial** and its weights are published openly (Galgame's terms require trained models to be open-sourced),
-under a non-commercial license (e.g. CC BY-NC 4.0). The model card must credit the training data: ReazonSpeech
+under a non-commercial license (e.g. CC BY-NC 4.0). The model card, [MODEL_CARD.md](MODEL_CARD.md), which every saved
+student and checkpoint carries as its README.md, records these terms, credits the training data: ReazonSpeech
 (CDLA-Sharing-1.0), Emilia-YODAS (Amphion, CC BY 4.0, built on ESPnet's YODAS, CC BY 3.0) and Galgame_Speech_ASR
-(litagin, GPL-3 + non-commercial), and the teacher, Cohere Transcribe (Apache-2.0). Drop `galgame` from the run
-config's `sources` for a model free of the non-commercial clause. The open release is a separate public repo holding
-only a chosen `checkpoints/step_N` (weights, config, generation config, tokenizer, processor) plus the license,
-notices and model card: the run repos (`kitsune-runs`, `kitsune-data`) stay private, because they carry the datasets'
-reference transcripts (`ref` in the teacher outputs, eval tables and samples), and `vast/launch.py` refuses them if
-they are not.
+(litagin, GPL-3 + non-commercial), and says that the model is modified from the teacher, Cohere Transcribe
+(Apache-2.0). A release must also include the Apache-2.0 licence text next to that modified-from notice. Drop
+`galgame` from the run config's `sources` for a model free of the non-commercial clause. The open release is a
+separate public repo holding only a chosen `checkpoints/step_N` (weights, config, generation config, tokenizer,
+processor) plus the license, notices and model card: the run repos (`kitsune-runs`, `kitsune-data`) stay private,
+because they carry the datasets' reference transcripts (`ref` in the teacher outputs, eval tables and samples), and
+`vast/launch.py` refuses them if they are not.
 
 ### Teacher pass output
 
