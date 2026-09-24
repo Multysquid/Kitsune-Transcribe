@@ -18,7 +18,7 @@ def decode_audio(data: bytes, target_sr: int = TARGET_SR) -> np.ndarray:
     wav, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
     wav = wav.mean(axis=1)
     if sr != target_sr:
-        import librosa  # lazy: only CommonVoice (48 kHz mp3) needs this
+        import librosa  # lazy: only the non-16 kHz sources need it (Emilia 24 kHz, JSUT and CommonVoice 48 kHz)
 
         wav = librosa.resample(wav, orig_sr=sr, target_sr=target_sr, res_type="soxr_hq")
     return np.ascontiguousarray(wav, dtype=np.float32)

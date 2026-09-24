@@ -5,10 +5,12 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                open-format metrics, HF sync), the student from 03 in fp32 master weights (bf16 autocast for the body;
                the LM head in fp32 outside autocast, as in the teacher pass), rel-pos patch, BatchNorm frozen, the
                frozen decoder pos_emb, AdamW, the decoupled L2-SP anchor, train/eval stores and the step planner
-  2. smoke     (fresh runs) the memory probe first (CUDA: forward+backward on the three worst micro-batches with the
-               optimizer state's bytes reserved and, when steps accumulate several micro-batches, the gradients held;
-               on OOM halve micro_audio_s down to memory.min_micro_audio_s, then per-layer gradient checkpointing; on
-               Windows under a cap at the free VRAM, see cap_vram), then LogMel vs the HF extractor,
+  2. smoke     (fresh runs) a decode of seeded rows of every train source and eval set first (decode_preflight: a
+               whole set that fails stops the run), then the memory probe (CUDA: forward+backward on the three worst
+               micro-batches with the optimizer state's bytes reserved and, when steps accumulate several
+               micro-batches, the gradients held; on OOM halve micro_audio_s down to memory.min_micro_audio_s, then
+               per-layer gradient checkpointing; on Windows under a cap at the free VRAM, see cap_vram), then LogMel
+               vs the HF extractor,
                forward+backward on the longest padded micro-batch with finite gradients, padded rows == the same
                utterances run alone (mean KL over the shortest smoke.pad_utts; see padded_row_check), SDPA backends, a
                FLOP count for the MFU estimate and an HF upload round trip
@@ -17,9 +19,10 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                "step 0" a 100-step model)
   4. train     WSD on the loop clock (evals and checkpoints included; see wsd_lr; every switch of LR phase is an
                `lr_phase` event), L2-SP after every optimizer step,
-               gradients clipped (the pre-clip norm is logged). The first smoke.steps steps are the smoke run: finite
-               losses, the loss trend, and throughput - below smoke.min_audio_s_per_s audio-s/s the run exits with
-               code 3 (ThroughputTooLow). A full state is written right after them, and before the cooldown starts.
+               gradients clipped (the pre-clip norm is logged). The first smoke.steps steps are the smoke run: at most
+               smoke.max_dropped_frac of their rows undecodable, finite losses, the loss trend, and throughput -
+               below smoke.min_audio_s_per_s audio-s/s the run exits with code 3 (ThroughputTooLow). A full state is
+               written right after them, and before the cooldown starts.
                Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
                sets, verdict (kitsune.evaluate.verdict; "N/A" with its numbers under eval.gate false: the
@@ -215,8 +218,11 @@ DEFAULTS = {
     "log": {"layer_stats_every": 100, "hist_every": 1000, "train_utts_flush": 500, "sync_every_min": 10,
             "samples_per_eval": 8, "capture_env": True},
     "hf": {"output_repo": None, "private": True},
+    # decode_per_set: seeded rows of every train source and eval set decoded before anything else (decode_preflight;
+    # 0: skip); max_dropped_frac: the share of undecodable rows over the smoke steps that fails the smoke (smoke_end)
     "smoke": {"enabled": True, "steps": 100, "min_audio_s_per_s": 600, "pad_utts": 32, "pad_max_mean_kl": 0.05,
-              "pad_min_argmax_agree": None, "require_loss_decrease": True},
+              "pad_min_argmax_agree": None, "require_loss_decrease": True, "decode_per_set": 8,
+              "max_dropped_frac": 0.01},
     # checked after every in-loop eval (the module docstring; early_stop_update, early_stop_trigger). Off here, so a
     # config that does not mention it trains to its budget; viability.json turns it on with these values
     "early_stop": {"enabled": False, "metric": "heldout_kl", "patience": 3, "min_delta_rel": 0.005,
@@ -305,6 +311,12 @@ def validate(cfg: dict):
     if not (_number(cfg["perf"]["loader_timeout_s"]) and cfg["perf"]["loader_timeout_s"] >= 0):
         raise SystemExit(f"perf.loader_timeout_s must be a number of seconds >= 0 (0: no timeout), got "
                          f"{cfg['perf']['loader_timeout_s']}")
+    sm = cfg["smoke"]
+    if not (isinstance(sm["decode_per_set"], int) and not isinstance(sm["decode_per_set"], bool)
+            and sm["decode_per_set"] >= 0):
+        raise SystemExit(f"smoke.decode_per_set must be an int >= 0, got {sm['decode_per_set']}")
+    if not (_number(sm["max_dropped_frac"]) and 0 <= sm["max_dropped_frac"] <= 1):
+        raise SystemExit(f"smoke.max_dropped_frac must be a fraction in [0, 1], got {sm['max_dropped_frac']}")
     for a, b in (("train_audio_s", "train_utts"), ("eval_audio_s", "eval_utts_per_set")):
         if sub[a] is not None and sub[b]:
             raise SystemExit(f"subset.{a} and subset.{b} are two ways to pick the same subset: set one")
@@ -535,8 +547,9 @@ class Run:
         last_eval_t=0.0, last_eval_step=0, last_weights_t=0.0, last_weights_step=0, last_full_t=0.0,
         last_full_step=0, memory={}, flops_per_padded_s=None, history=[], nonfinite_skips=0, nonfinite_total=0,
         oom_skips=0, audio_s=0.0, tokens=0, step_time_s=0.0, smoke_losses=[], smoke_audio_s=0.0, smoke_time_s=0.0,
-        epoch=0, epoch_progress=0.0, resumes=0, weights=[], fulls=[], last_objective=None, lr_phase=None,
-        last_eval_epoch=0, total_steps=None, early_stop=early_stop_state(), mini_history=[]))
+        smoke_dropped=0, smoke_utts=0, epoch=0, epoch_progress=0.0, resumes=0, weights=[], fulls=[],
+        last_objective=None, lr_phase=None, last_eval_epoch=0, total_steps=None, early_stop=early_stop_state(),
+        mini_history=[]))
 
     def clock(self) -> float:
         """Loop clock in seconds: continues across resumes, frozen outside the training loop."""
@@ -1951,6 +1964,40 @@ def padded_row_check(R: Run) -> dict:
     return out
 
 
+def decode_preflight(R: Run):
+    """Decode smoke.decode_per_set seeded rows of every train source and every eval set in this process, through the
+    decode path the loader's workers use (Stores.wave -> kitsune.audio.decode_audio), first thing in the smoke phase.
+    The dataset drops an undecodable row and goes on, so one bad upstream file cannot end a paid run; but a failure
+    that hits a whole source - a codec, or the resampler that every 24 and 48 kHz file goes through (librosa / soxr /
+    numba), broken on a new box - would only thin the data: the run would train without that source and judge the
+    gate on the sets that are left. A set that fails on more than half its sample raises SmokeFailed with its first
+    error; every set's count is a `smoke_decode` event."""
+    n = int(R.cfg["smoke"]["decode_per_set"])
+    if n <= 0:
+        return
+    rng = np.random.default_rng([int(R.cfg["seed"]), 16])
+    sets, bad = {}, []
+    for kind, store in (("train", R.train), ("eval", R.evalstore)):
+        by_src = {}
+        for i, u in enumerate(store.utts):
+            by_src.setdefault(u.source, []).append(i)
+        for src, idx in sorted(by_src.items()):
+            pick = rng.choice(idx, size=min(n, len(idx)), replace=False)
+            failed, first = 0, None
+            for i in pick:
+                try:
+                    store.wave(int(i))
+                except Exception as e:
+                    failed += 1
+                    first = first or f"{type(e).__name__}: {e}"[:300]
+            sets[f"{kind}/{src}"] = dict(n=len(pick), failed=failed, first_error=first)
+            if 2 * failed > len(pick):
+                bad.append(f"{kind} {src} ({failed}/{len(pick)} rows: {first})")
+    R.log.event("smoke_decode", sets=sets)
+    if bad:
+        raise SmokeFailed(f"audio decode fails for whole sets: {'; '.join(bad)}")
+
+
 def smoke_checks(R: Run):
     """Checks that cost seconds and catch the failures that would otherwise burn the paid hours silently."""
     from kitsune.features import hf_reference
@@ -2089,16 +2136,25 @@ def memory_probe(R: Run) -> dict:
 
 
 def smoke_end(R: Run):
-    """After the first smoke.steps steps: finite, falling loss and enough throughput (else exit 3)."""
+    """After the first smoke.steps steps: at most smoke.max_dropped_frac of the rows undecodable (a failure only the
+    loader's worker processes hit; decode_preflight covers the main process), finite, falling loss and enough
+    throughput (else exit 3; it counts decoded audio only, so it cannot see rows that were dropped)."""
     cfg = R.cfg["smoke"]
     losses = R.st["smoke_losses"]
     q = max(1, len(losses) // 4)
     first, last = float(np.mean(losses[:q])), float(np.mean(losses[-q:]))
     rate = R.st["smoke_audio_s"] / max(R.st["smoke_time_s"], 1e-9)
     ok_loss = all(math.isfinite(x) for x in losses) and last < first
+    dropped = int(R.st["smoke_dropped"])
+    frac = dropped / max(dropped + int(R.st["smoke_utts"]), 1)
     R.log.event("smoke_steps", steps=len(losses), loss_first=first, loss_last=last, loss_decreasing=ok_loss,
-                audio_s_per_s=round(rate, 1), floor=cfg["min_audio_s_per_s"])
+                audio_s_per_s=round(rate, 1), floor=cfg["min_audio_s_per_s"], dropped=dropped,
+                dropped_frac=round(frac, 4), max_dropped_frac=cfg["max_dropped_frac"])
     R.st["smoke_done"] = True
+    if frac > float(cfg["max_dropped_frac"]):
+        raise SmokeFailed(f"{dropped} of {dropped + int(R.st['smoke_utts'])} rows had undecodable audio over the smoke "
+                          f"steps ({frac:.1%} > smoke.max_dropped_frac {cfg['max_dropped_frac']}; `dropped_audio` "
+                          "events name them)")
     if rate < float(cfg["min_audio_s_per_s"]):
         raise ThroughputTooLow(f"{rate:.0f} audio-s/s < {cfg['min_audio_s_per_s']} after {len(losses)} steps")
     if not ok_loss and cfg["require_loss_decrease"]:
@@ -2242,7 +2298,8 @@ def train(R: Run, state: dict | None) -> int:
     else:
         if cfg["smoke"]["enabled"]:
             log.event("phase", name="smoke")
-            R.st["memory"] = memory_probe(R)  # first: the checks below then run at the micro-batch size it chose
+            decode_preflight(R)  # before the probe decodes the worst micro-batches: a clear error, not an empty batch
+            R.st["memory"] = memory_probe(R)  # next: the checks below then run at the micro-batch size it chose
             smoke_checks(R)
         else:
             R.st["memory"] = dict(micro_audio_s=float(cfg["batch"]["micro_audio_s"]),
@@ -2392,6 +2449,10 @@ def loop(R: Run):
             if e != epoch_seen:
                 epoch_seen = e
                 log.event("epoch", step_in_epoch=s, **(R.planner.epoch_stats.get(e) or dict(epoch=e)))
+            if not R.st["smoke_done"] and smoke_n:  # rows the workers could not decode (smoke_end); before train_step,
+                # so a step that lost every row counts too
+                R.st["smoke_dropped"] += sum(len(mb["dropped"]) for mb in mbs)
+                R.st["smoke_utts"] += sum(len(mb["ids"]) for mb in mbs)
             out = train_step(R, step, lr, mbs, e)
             R.planner.step_done(e, s)
             if out is None:

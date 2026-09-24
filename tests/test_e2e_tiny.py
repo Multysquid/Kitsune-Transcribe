@@ -273,6 +273,51 @@ def test_padded_row_gate_fails_the_smoke(env, hub):
     assert pad["kl_bound"] == -1 and "bf16_noise_kl_mean" not in pad  # fp32: no noise floor to measure
 
 
+def test_a_source_that_cannot_be_decoded_fails_the_smoke(env, hub, monkeypatch):
+    """The dataset drops an undecodable row and goes on (one bad upstream file must not end a paid run), so a decode
+    failure that hits a whole source - a codec or the resampler broken on a new box - must stop the smoke instead of
+    thinning the data for the whole run: decode_preflight names the set before anything else in the smoke phase, and
+    a failure only the loader hits is caught by the share of dropped rows over the smoke steps."""
+    from kitsune import trainset
+
+    m = load_script("04_distill")
+    real_bytes, real_loader = trainset.AudioBatchDataset.audio_bytes, trainset.make_loader
+
+    def audio_bytes(self, i):  # src_b's bytes are no audio: decode_audio raises on every row, as on a broken codec
+        return b"not audio" if self.sources[i] == "src_b" else real_bytes(self, i)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(trainset.AudioBatchDataset, "audio_bytes", audio_bytes)
+        with pytest.raises(m.SmokeFailed, match=r"audio decode fails for whole sets: train src_b \(8/8 rows"):
+            m.main(["--config", str(env["config"]), "--set", "run_name=tiny-nodecode", "--set", "hf.output_repo=null"])
+    ev = events(next((env["root"] / "runs").glob("tiny-nodecode-*")))
+    sets = next(e for e in ev if e["kind"] == "smoke_decode")["sets"]
+    assert sets["train/src_b"]["failed"] == sets["train/src_b"]["n"] == 8 and sets["train/src_b"]["first_error"]
+    assert sets["train/src_a"] == dict(n=8, failed=0, first_error=None)
+    assert all(sets[f"eval/{s}"] == dict(n=6, failed=0, first_error=None) for s in EVAL)
+    assert "memory_probe" not in {e["kind"] for e in ev}  # first thing in the smoke phase
+
+    def lossy_loader(*a, **k):  # the workers lose a row of every micro-batch; the main process decodes fine
+        inner = real_loader(*a, **k)
+        try:
+            for key, mbs in inner:
+                for mb in mbs:
+                    mb["dropped"] = [*mb["dropped"], "src_b/fake/undecodable.flac"]
+                yield key, mbs
+        finally:
+            inner.close()
+
+    monkeypatch.setattr(trainset, "make_loader", lossy_loader)
+    with pytest.raises(m.SmokeFailed, match="had undecodable audio over the smoke steps"):
+        m.main(["--config", str(env["config"]), "--set", "run_name=tiny-lossy", "--set", "hf.output_repo=null",
+                "--set", "eval.every_steps=1000"])
+    ev = events(next((env["root"] / "runs").glob("tiny-lossy-*")))
+    smoke = next(e for e in ev if e["kind"] == "smoke_steps")
+    n_drop = sum(e["n"] for e in ev if e["kind"] == "dropped_audio")
+    assert smoke["steps"] == 4 and smoke["dropped"] == n_drop >= 4 and smoke["dropped_frac"] > 0.01
+    assert not any(e["kind"] == "checkpoint" and e.get("reason") == "after_smoke" for e in ev)
+
+
 def test_skipped_steps_and_dropped_audio_are_logged_with_ids(env, hub, monkeypatch):
     """A non-finite gradient (injected at step 2) and an undecodable file (reported at step 1) leave events that name
     the utterances, so they can be found afterwards."""

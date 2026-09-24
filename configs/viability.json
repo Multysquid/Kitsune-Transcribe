@@ -37,7 +37,7 @@
           "samples_per_eval": 8, "capture_env": true},
   "hf": {"output_repo": null, "private": true},
   "smoke": {"enabled": true, "steps": 100, "min_audio_s_per_s": 600, "pad_utts": 32, "pad_max_mean_kl": 0.05,
-            "pad_min_argmax_agree": null, "require_loss_decrease": true},
+            "pad_min_argmax_agree": null, "require_loss_decrease": true, "decode_per_set": 8, "max_dropped_frac": 0.01},
   "early_stop": {"enabled": true, "metric": "heldout_kl", "patience": 3, "min_delta_rel": 0.005, "min_delta_abs": 0.0,
                  "min_evals": 3, "floor": null, "action": "cooldown"},
   "seed": 1234
