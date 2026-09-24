@@ -1,0 +1,133 @@
+# Running the viability run on vast.ai
+
+One A100 for ~4.5 h: the box boots our image, clones this repo at a pinned commit, pulls the small derived data from a
+private HF dataset, rebuilds the audio from the public upstream datasets, trains for 4 h, uploads everything to a
+private HF model repo, verifies the upload and destroys itself. A watchdog stops it at 5.5 h whatever happens.
+Nothing is rented until you run `launch.py --yes`.
+
+| file | runs where | what it does |
+|---|---|---|
+| `launch.py` | laptop | search offers with the strict filter, print the exact `vastai create instance` command, create only with `--yes` |
+| `onstart.sh` | box, every container start | env sync, limits, TensorBoard + vast portal, clone at `KITSUNE_SHA`, start watchdog, then `bootstrap.sh` + `supervise.py` |
+| `bootstrap.sh` | box | pull derived data from `KITSUNE_DATA_REPO`, rebuild audio with `scripts/01_prepare_data.py` (pinned upstream commits), check the id join |
+| `supervise.py` | box | run `scripts/04_distill.py`; resume once after a late crash; then `finish.py --destroy` or `--stop` |
+| `finish.py` | box | upload, verify every file in the HF output repo (path, size, hash), destroy; stop instead if anything is off |
+| `watchdog.sh` | box | stop the instance 5.5 h after first boot (log sync 10 min before) |
+
+Everything on the box logs to `/workspace/kitsune.log`; lifecycle records and timings are in `/workspace/kitsune_state/`
+and get uploaded to `runs/<run_id>/infra/` in the output repo.
+
+## One-time setup
+
+### 1. The image (GitHub Actions, no home upload)
+
+Push a commit that touches `docker/**`, `requirements-train.txt` or `.github/workflows/image.yml`. The `image` workflow
+builds `ghcr.io/multysquid/kitsune-train`, smoke-tests it and tags it `sha-<short>` and `<branch>` (~15-25 min). The run
+summary shows the digest.
+
+After the **first** build, make the package public once so vast can pull it without credentials (it contains only
+code dependencies): github.com -> your profile -> Packages -> `kitsune-train` -> Package settings -> Change visibility
+-> Public.
+
+### 2. Hugging Face repos and token
+
+1. Create the two private repos (names are examples; use yours everywhere below):
+   ```bash
+   hf repos create Multy123/kitsune-data --repo-type dataset --private
+   hf repos create Multy123/kitsune-runs --private
+   ```
+2. Upload the derived data (~1.5 GB, most of it the student init; the audio is rebuilt on the box). From the repo
+   root:
+   ```bash
+   hf upload Multy123/kitsune-data . . --repo-type dataset \
+     --include "teacher_out/meta.json" --include "teacher_out/reazon_small/*" --include "teacher_out/eval_*/*" \
+     --include "second_out/meta.json" --include "second_out/reazon_small/*" \
+     --include "selection/viability.parquet" --include "students/b20x2560-d4/*"
+   ```
+   Re-running it after an interruption only sends what is missing. Optional, only if your uplink is fast enough: also
+   `--include "data/shards/<source>/*.parquet"` for a source to ship its audio instead of rebuilding it on the box
+   (bootstrap.sh uses parked shards when they are there).
+3. Create a **fine-grained** token at https://huggingface.co/settings/tokens: read access to `kitsune-data`, write
+   access to `kitsune-runs`. Nothing else.
+
+### 3. vast.ai account
+
+1. Put credit on the account.
+2. Account -> Settings -> **Environment Variables**: add `HF_TOKEN` = the token from step 2.3. vast injects it into
+   every instance you start; it is never on a command line and never in the image. (It is readable by anyone who can
+   SSH into your instances.)
+3. Install the CLI on the laptop and store your API key (you type it; it goes to `~/.config/vastai/vast_api_key`):
+   ```bash
+   pip install vastai==1.8.0
+   vastai set api-key <key from https://cloud.vast.ai/manage-keys/>
+   ```
+4. Add your SSH public key under Account -> Keys **before** renting (keys added later do not reach running instances).
+
+## Each run
+
+1. Commit and push the code you want to run (the box clones exactly that commit), and wait for the image build if
+   you changed `docker/` or `requirements-train.txt`.
+2. Look first (read-only, spends nothing):
+   ```bash
+   python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
+   ```
+   It checks the commit is pushed, resolves the image tag to a digest, checks both HF repos with your local login,
+   searches offers (verified A100 SXM4 40 GB, reliability >= 0.98, driver CUDA >= 13.0, >= 12 CPU cores, >= 64 GB RAM,
+   disk and network >= 500; falls back to SXM4 80 GB), prints a table, the exact create command and the cost cap.
+3. Rent:
+   ```bash
+   python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --yes
+   ```
+   Options: `--offer-id N` to pick another row, `--max-dph 1.0` to cap the price, `--image ...@sha256:...` to pin an
+   image by hand, `--config configs/<other>.json`.
+
+## Watching it
+
+```bash
+vastai show instance <id>          # wait for "running"
+vastai ssh-url <id>                # -> ssh://root@<ip>:<port>
+ssh -p <port> root@<ip> -L 6006:localhost:6006
+```
+Then open http://localhost:6006 for TensorBoard, and on the box `tail -f /workspace/kitsune.log`. If port 6006 was
+taken on the box, the log line `TensorBoard on 127.0.0.1:<port>` says which one to forward instead.
+
+Timeline: ~5 min boot and image pull, ~10-20 min data (derived pull + audio rebuild, see
+`/workspace/kitsune_state/bootstrap_timings.jsonl`), 10-15 min smoke phase, 4 h training with evals, ~15 min final
+eval, upload and verification. The trainer reads the watchdog's deadline and shortens the 4 h (earlier cooldown)
+when the final eval, the uploads and a 30 min reserve would not fit before it, e.g. after a crash and resume; the
+`budget` event in `events.jsonl` shows the result.
+
+## Where the results land
+
+In the output repo under `runs/<run_id>/`: `summary.json` (verdict and final metrics), `metrics/`, `evals/`, `tb/`
+(TensorBoard events), `events.jsonl`, `checkpoints/step_<N>/` (bf16 weights every 30 min), the full resume state from
+before the cooldown and at the end, and `infra/` (box logs; exported too). Convert to flat files with
+`python tools/export_run.py hf://Multy123/kitsune-runs/runs/<run_id> --out <dir>`, or run TensorBoard locally on
+a downloaded `tb/`.
+
+## How it ends
+
+| outcome | instance |
+|---|---|
+| training exits 0 and every expected file is on the Hub (path, size, sha256) | **destroyed** (billing stops) |
+| training exits 0 but verification finds a problem | **stopped** (disk kept, storage still billed) |
+| exit 3 (throughput too low), a crash before step 100, or a second crash | **stopped** |
+| first crash after step 100 with a local full state | resumed once, then as above |
+| bootstrap or on-start failure | **stopped** |
+| 5.5 h after first boot, whatever the state | **stopped** by the watchdog |
+
+A stopped instance keeps its disk. To inspect it: `vastai start instance <id>` (may wait in "scheduling" if the GPU was
+re-rented), SSH in, read `/workspace/kitsune.log` and `/workspace/kitsune_state/`. A restarted container never starts a
+second run on its own (the `halt` marker). To start a fresh run on it:
+```bash
+bash /workspace/Kitsune-Transcribe/vast/onstart.sh --rearm; tail -n 20 /workspace/kitsune.log
+```
+It moves the halt marker, the old deadline and the supervisor/finish history to `/workspace/kitsune_state/rearm-<time>/`
+and boots as on a new instance: a new 5.5 h cap from now, a new supervisor history (a new run dir; the old run dirs stay
+under `runs/` and are verified again before a destroy). Deleting only the `halt` file does not work: the old deadline
+has usually passed (the watchdog would stop the box at once) and the old history already holds a final decision.
+`--rearm` refuses (exit 1, reason in the log: the script writes only to `/workspace/kitsune.log`) while a watchdog or
+supervisor of the current container is still running; stop and start the instance first. Running the on-start script
+again during a healthy run starts nothing (the supervisor holds `kitsune_state/supervise.lock`). When done:
+`vastai destroy instance <id>`. For debugging a fresh box without it stopping itself on a bootstrap error, add
+`-e KITSUNE_NO_SELF_STOP=1` to the create command (the watchdog still applies).

@@ -1,0 +1,117 @@
+# Build the training image on a GitHub runner and push it to GHCR (D38a, D42a).
+#
+# Why here and not on the laptop: the free public-repo runner has the bandwidth (the base image is ~5.3 GB compressed)
+# and GITHUB_TOKEN can push to GHCR without a PAT; home upload is slow. The image is pushed by digest first, smoke-tested
+# (docker/smoke_import.py inside the pushed image), and only then tagged, so a tag never points at an image that failed
+# the smoke. Tags: sha-<short commit> and <branch>. vast/launch.py resolves the branch tag to a digest and rents by digest.
+# After the very first push, make the package public once (github.com/users/Multysquid/packages/container/kitsune-train
+# -> Package settings -> Change visibility) so vast pulls it without registry credentials (D39a).
+# Actions are pinned to commit SHAs (tag in the comment).
+name: image
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "docker/**"
+      - "requirements-train.txt"
+      - ".github/workflows/image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/multysquid/kitsune-train
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # the base image unpacks to ~12 GB and the runner's root disk has ~14 GB free
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.source=https://github.com/Multysquid/Kitsune-Transcribe
+            org.opencontainers.image.title=kitsune-train
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest (untagged until the smoke test passes)
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=kitsune-train
+          cache-to: type=gha,scope=kitsune-train,mode=max
+          provenance: false
+          sbom: false
+
+      # the cache is already exported; drop the builder's copy of the layers before pulling the image into dockerd
+      - name: Free the builder cache
+        run: docker buildx prune --all --force
+
+      - name: Smoke test inside the pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker pull "$IMAGE@$DIGEST"
+          docker run --rm --entrypoint /venv/main/bin/python "$IMAGE@$DIGEST" /opt/kitsune/smoke_import.py
+
+      - name: Tag the smoke-tested image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            "$IMAGE@$DIGEST"
+          docker buildx imagetools inspect "$IMAGE@$DIGEST"
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### kitsune-train"
+            echo "digest: \`$IMAGE@$DIGEST\`"
+            echo "tags:"
+            jq -r '.tags[] | "- `" + . + "`"' <<< "$DOCKER_METADATA_OUTPUT_JSON"
+            echo "rent with: \`python vast/launch.py --image $IMAGE@$DIGEST ...\`"
+          } >> "$GITHUB_STEP_SUMMARY"

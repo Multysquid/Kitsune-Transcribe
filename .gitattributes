@@ -1,0 +1,4 @@
+# the vast box runs these under bash on Linux; CRLF would break them
+*.sh text eol=lf
+# cmd.exe launchers for the Windows laptop
+*.cmd text eol=crlf
