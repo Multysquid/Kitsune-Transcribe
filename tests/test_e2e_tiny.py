@@ -166,6 +166,71 @@ def test_uploader_never_waits_forever_on_a_stalled_upload(tmp_path):
     assert not up.worker.is_alive() and up.wait(0) == {"step_1": True} and evs == ["ckpt_upload_ok"]
 
 
+def test_a_crash_closes_the_logs_before_waiting_on_uploads(tmp_path, monkeypatch):
+    """A crash with checkpoint uploads pending (the 8.6 GB pre_cooldown full state, weights): _close_failed waited for
+    all of them before the partial summary and the forced sync, and the supervisor's resume waited too. The logs now
+    close first; the uploads get FAILED_UPLOAD_WAIT_S, the queued ones are cancelled, the unfinished ones named."""
+    import copy
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    monkeypatch.setattr(m, "FAILED_UPLOAD_WAIT_S", 0.3)
+    release, order = threading.Event(), []
+
+    class StalledHub(FakeHub):
+        def upload_folder(self, **kw):
+            release.wait(30)
+            super().upload_folder(**kw)
+
+    log = SimpleNamespace(event=lambda kind, **kw: order.append((kind, kw.get("names") or kw.get("name"))),
+                          close=lambda summary: order.append(("close", summary["status"])), elapsed=lambda: 1.0)
+    R = m.Run(cfg=copy.deepcopy(m.DEFAULTS), run_dir=tmp_path / "run", device=torch.device("cpu"), amp=False, log=log)
+    R.uploader = m.Uploader(StalledHub(), "u/r", "run", True, log, retries=())
+    for name in ("full_step_7", "step_7"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "w.bin").write_bytes(b"x")
+        R.uploader.submit(tmp_path / name, name)
+    t0 = time.monotonic()
+    try:
+        m._close_failed(R, "failed", RuntimeError("CUDA error: an illegal instruction was encountered"))
+        assert time.monotonic() - t0 < 5 and R.uploader.worker.daemon
+        assert order == [("close", "failed"), ("ckpt_upload_abandoned", ["full_step_7", "step_7"])]
+    finally:
+        release.set()
+    R.uploader.worker.join(5)  # the running upload finishes; the queued one was cancelled
+    assert not R.uploader.worker.is_alive() and order[2:] == [("ckpt_upload_ok", "full_step_7")]
+
+
+def test_a_resume_sets_newer_states_aside_and_uploads_the_pre_cooldown_state_again(tmp_path, monkeypatch):
+    """--resume from an older full state moves the abandoned attempt's newer ones aside (set_aside_newer). The
+    pre_cooldown full state is uploaded only by the process that saved it (finish.py's syncs take the newest full
+    state, the post-crash one none), so a crash that cut its upload short lost it: a resume from it, or from a later
+    state, queues it again."""
+    m = load_script("04_distill")
+    hub = FakeHub()
+    monkeypatch.setattr(m, "hf_api", lambda: hub)
+    cfg = m._merge(m.DEFAULTS, {"student": str(tmp_path / "student"), "runs_root": str(tmp_path / "runs"),
+                                "device": "cpu", "hf": {"output_repo": "u/r"}, "log": {"capture_env": False}})
+    ck = tmp_path / "runs" / "run" / "checkpoints"
+    for step in (6, 8):  # 6: the pre_cooldown state (its own trainer.pt names it), 8: the attempt backed out of
+        st = m.Run(cfg=cfg, run_dir=ck.parent, device=torch.device("cpu"), amp=False).st
+        st.update(step=step, pre_cooldown_done=True, pre_cooldown_full="full_step_6")
+        (ck / f"full_step_{step}").mkdir(parents=True)
+        torch.save(dict(format=1, step=step, cfg=cfg, st=st, logger=None), ck / f"full_step_{step}" / "trainer.pt")
+    R, _ = m.build(m.parse_args(["--resume", str(ck / "full_step_6")]))
+    try:
+        assert R.uploader.wait(10) == {"full_step_6": True}
+        assert [f[0] for f in hub.folders] == ["runs/run/checkpoints/full_step_6"]
+        res = next(e for e in events(ck.parent) if e["kind"] == "resume")
+        assert res["set_aside"] == ["full_step_8"] and res["upload_again"] == "full_step_6"
+        assert m.find_full_state(ck.parent) == ck / "full_step_6"
+    finally:
+        R.uploader.shutdown(5)
+        R.log.close()
+
+
 def test_hf_roundtrip_retries_a_transient_hub_error(tmp_path):
     """The smoke round trip's create_repo and commit POSTs are sent once by the hub: one 503 must be retried (on the
     uploads' schedule) instead of stopping the paid run after its bootstrap; bad credentials fail at once."""

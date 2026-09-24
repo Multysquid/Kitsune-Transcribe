@@ -83,7 +83,8 @@ Checkpoints under runs/<run_id>/checkpoints/:
   full_step_<N>/   model.pt (fp32 state_dict), optimizer.pt (the host AdamW's under optim.offload "cpu", same
                    format), l2sp.pt (theta_0), trainer.pt (config, progress counters and clocks, eval history,
                    planner position, RNG states, logger state). Every ckpt.full_local_every_min, the newest
-                   ckpt.keep_local are kept; uploaded at ckpt.upload_full_at ("pre_cooldown", "end"). Written as
+                   ckpt.keep_local are kept; uploaded at ckpt.upload_full_at ("pre_cooldown", "end"; a resume
+                   queues the pre_cooldown one again, as a crash may have cut its upload short). Written as
                    <name>.tmp/ and renamed, so a crash never leaves a torn one.
 `--resume <full_step_N dir | run dir>` restores all of it into the same run dir and continues the same schedule and
 time budget; the config comes from the checkpoint, with this invocation's --set overrides applied on top (--config is
@@ -161,9 +162,12 @@ from kitsune.patches import assert_bn_frozen, patch_relpos_once_per_batch, train
 from kitsune.runlog import _replace as _replace_file  # noqa: E402  (atomic file replace with the Windows retry)
 
 EXIT_OK, EXIT_THROUGHPUT, EXIT_FAIL = 0, 3, 1
-# the end phase's wait for checkpoint uploads (the failure path's too): with RunLogger's close_join_s (600 s) it stays
-# inside schedule.end_reserve_min (30), so an upload that never returns cannot keep a paid instance up
+# the end phase's wait for checkpoint uploads: with RunLogger's close_join_s (600 s) it stays inside
+# schedule.end_reserve_min (30), so an upload that never returns cannot keep a paid instance up
 UPLOAD_WAIT_S = 600
+# the failure path's wait for them, after the logs are closed: a crashed trainer should get to the supervisor's resume.
+# What it cuts off goes up anyway (Uploader.abandon)
+FAILED_UPLOAD_WAIT_S = 120
 SR = 16000
 FULL_RE = re.compile(r"^full_step_(\d+)$")
 WEIGHTS_RE = re.compile(r"^step_(\d+)$")
@@ -549,7 +553,7 @@ class Run:
     loop_t0: float | None = None
     t_start: float = field(default_factory=time.time)
     st: dict = field(default_factory=lambda: dict(
-        step=0, train_s=0.0, smoke_done=False, pre_cooldown_done=False, step0_done=False,
+        step=0, train_s=0.0, smoke_done=False, pre_cooldown_done=False, pre_cooldown_full=None, step0_done=False,
         last_eval_t=0.0, last_eval_step=0, last_weights_t=0.0, last_weights_step=0, last_full_t=0.0,
         last_full_step=0, memory={}, flops_per_padded_s=None, history=[], nonfinite_skips=0, nonfinite_total=0,
         oom_skips=0, audio_s=0.0, tokens=0, step_time_s=0.0, smoke_losses=[], smoke_audio_s=0.0, smoke_time_s=0.0,
@@ -699,6 +703,17 @@ class Uploader:
         if self.worker is not None:
             self.queue.put(None)
             self.worker.join(timeout)
+
+    def abandon(self, timeout: float) -> list[str]:
+        """The failure path: wait at most `timeout` s for the pending uploads, cancel the queued ones, stop the thread;
+        returns the names of the ones that did not finish. The one running dies with the process: weights go up with
+        the supervisor's post-crash sync (vast/finish.py), a pre_cooldown full state with the resumed run (build)."""
+        pending = {p: f for p, f in self.pending.items() if not f.done()}
+        done = concurrent.futures.wait(list(pending.values()), timeout=timeout).done
+        for f in pending.values():
+            f.cancel()  # False for the running one
+        self.shutdown()
+        return [p.name for p, f in pending.items() if f not in done]
 
 
 def hf_roundtrip(R: Run) -> dict:
@@ -2278,8 +2293,16 @@ def build(args) -> tuple[Run, dict | None]:
     if state is not None:
         R.resumed_from = full
         moved = set_aside_newer(R.ckpt_dir, int(state["step"]))  # before anything is saved or rotated
+        # the pre_cooldown full state goes up only from the process that saved it (finish.py's syncs take the newest
+        # full state, the post-crash one none): one a crash may have cut short goes again, in the background (about 0
+        # bytes over the wire if it had landed: the hub dedups; busy() keeps it from rotation meanwhile)
+        pc = state["st"].get("pre_cooldown_full")
+        again = pc if (pc and out_repo(cfg) and "pre_cooldown" in cfg["ckpt"]["upload_full_at"]
+                       and (R.ckpt_dir / pc).is_dir()) else None
         R.log.event("resume", from_state=str(full), at_step=state["step"], overrides=overrides, unchanged=repeated,
-                    config_arg_ignored=args.config, set_aside=moved)
+                    config_arg_ignored=args.config, set_aside=moved, upload_again=again)
+        if again:
+            R.uploader.submit(R.ckpt_dir / again, again)
     return R, state
 
 
@@ -2476,6 +2499,7 @@ def loop(R: Run):
             t_c = R.cooldown_start(T)
             if not R.st["pre_cooldown_done"] and t >= t_c and float(sch["cooldown_frac"]) > 0:
                 R.st["pre_cooldown_done"] = True
+                R.st["pre_cooldown_full"] = f"full_step_{R.st['step']}"  # in its own trainer.pt too: build() on resume
                 log.event("phase", name="cooldown", at_step=R.st["step"], t=t, T=T)
                 save_full(R, R.st["step"], "pre_cooldown", upload="pre_cooldown" in ck["upload_full_at"])
             step = R.st["step"] + 1
@@ -2603,10 +2627,14 @@ def main(argv=None) -> int:
 
 
 def _close_failed(R: Run, status: str, exc: BaseException):
-    """Partial summary + forced sync (RunLogger.close). Never masks the original exception."""
+    """Partial summary + forced sync (RunLogger.close) first, without waiting for the checkpoint uploads (an 8.6 GB
+    pre_cooldown full state held them, and the resume, for many minutes); then at most FAILED_UPLOAD_WAIT_S for those,
+    and an event naming the ones cut off (an event after close still reaches events.jsonl, which the post-crash sync
+    uploads). Never masks the original exception."""
     try:
-        R.uploader.shutdown(UPLOAD_WAIT_S)
         R.log.close(summary=make_summary(R, status, error=f"{type(exc).__name__}: {exc}"[:2000]))
+        if left := R.uploader.abandon(FAILED_UPLOAD_WAIT_S):
+            R.log.event("ckpt_upload_abandoned", names=left, waited_s=FAILED_UPLOAD_WAIT_S)
     except Exception as e:  # noqa: BLE001
         print(f"closing the logger after a failure failed too: {e!r}", file=sys.stderr)
 
