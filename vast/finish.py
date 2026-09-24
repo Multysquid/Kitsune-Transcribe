@@ -17,7 +17,9 @@ Expected files for each run dir runs/<run_id>/ (see scripts/04_distill.py):
     pre_cooldown one, which the trainer keeps from rotation for this; the marker itself is not uploaded)
 The files outside checkpoints/ are uploaded from a snapshot copy: the watchdog's --sync-only runs while the trainer
 still appends to its logs, and a file handed to the Hub by path is sized when it is listed but hashed and read later
-(a growing file would go up as a size/hash/content mismatch). Finished checkpoint dirs never change and go up in place.
+(a growing file would go up as a size/hash/content mismatch). Checkpoint dirs are renamed into place complete and go
+up in place; the one later write, the trainer's end save replacing trainer.pt/.json of an existing full_step_<N> (the
+loop ended at the step of a full state), is over once the trainer has exited.
 Supervisor/watchdog/bootstrap logs are uploaded best-effort to runs/<run_id>/infra/ but not verified (they are still
 being written while this runs); on every path, --no-sync included, and once more right before the stop/destroy call,
 so the last lifecycle records (verify, stop/destroy) are off the box before its disk goes away or stays behind.
@@ -243,7 +245,7 @@ def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_r
             snapshot(run_dir, live, Path(stage))
             api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=stage, path_in_repo=dest,
                               allow_patterns=live, commit_message=f"finish: sync {run_dir.name}")
-    if ckpt:  # renamed into place when complete and never written again: uploaded where they are
+    if ckpt:  # renamed into place when complete (the end save may still replace trainer.pt/.json): uploaded in place
         api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=str(run_dir), path_in_repo=dest,
                           allow_patterns=ckpt, commit_message=f"finish: checkpoints {run_dir.name}")
 

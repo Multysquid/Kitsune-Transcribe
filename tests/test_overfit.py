@@ -430,7 +430,7 @@ def test_checkpoints_reach_the_disk_before_their_rename(tmp_path, monkeypatch):
                                                                                      state_dict=dict),
                         model=torch.nn.Linear(1, 1), opt=SimpleNamespace(state_dict=dict),
                         l2sp=SimpleNamespace(state_dict=dict), student_meta={}, processor=None,
-                        uploader=SimpleNamespace(repo=None, submit=lambda d, n: None, busy=set))
+                        uploader=SimpleNamespace(repo=None, submit=lambda d, n: None, busy=set, pending={}))
     R.ckpt_dir.mkdir(parents=True)
 
     for save, name in ((m.save_full, "full_step_2"), (m.save_weights, "step_2")):

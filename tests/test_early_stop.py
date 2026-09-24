@@ -566,7 +566,7 @@ def test_end_save_refreshes_the_trainer_state_of_an_existing_same_step_full(tmp_
     R = SimpleNamespace(ckpt_dir=tmp_path / "ckpt", st=st, clock=lambda: 12.0, run_dir=tmp_path / "run", cfg={},
                         planner=SimpleNamespace(state_dict=lambda: {}), log=SimpleNamespace(
                             state_dict=lambda: {}, event=lambda kind, **kw: events.append((kind, kw))),
-                        uploader=None)
+                        uploader=SimpleNamespace(pending={}))
     monkeypatch.setattr(m, "rotate_full", lambda R: None)
     m.save_full(R, 3, "end")
     brief = json.loads((d / "trainer.json").read_text(encoding="utf-8"))

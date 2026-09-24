@@ -281,6 +281,92 @@ def test_a_failed_pre_cooldown_upload_is_kept_for_finish(tmp_path, pre_upload_ok
         assert not any(p.endswith(m.UPLOAD_MARK) for p in finish.expected_files(run))
 
 
+def test_a_file_renamed_away_while_an_upload_lists_its_dir_is_a_retried_attempt(tmp_path, monkeypatch):
+    """The upload's size listing ran outside its try: one that met the end save's trainer.pt.tmp just before its
+    rename raised FileNotFoundError out of the upload's future, unlogged, or re-raised by wait() at the end of a finished
+    run. It is now an attempt like any other: logged and retried."""
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    d = tmp_path / "full_step_7"
+    d.mkdir()
+    (d / "model.pt").write_bytes(b"x" * 10)
+    real_rglob, evs = Path.rglob, []
+
+    def rglob(self, pattern):
+        if self == d and not evs:
+            raise FileNotFoundError(2, "No such file or directory", str(d / "trainer.pt.tmp"))
+        return real_rglob(self, pattern)
+
+    monkeypatch.setattr(Path, "rglob", rglob)
+    hub = SimpleNamespace(create_repo=lambda *a, **k: None, upload_folder=lambda **kw: None)
+    up = m.Uploader(hub, "u/r", "run", True, SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw))),
+                    retries=(0,))
+    try:
+        up.submit(d, "full_step_7")
+        assert up.wait(10) == {"full_step_7": True}
+    finally:
+        up.shutdown(5)
+    assert [k for k, _ in evs] == ["ckpt_upload_error", "ckpt_upload_ok"]
+    assert "trainer.pt.tmp" in evs[0][1]["error"] and evs[1][1]["gb"] == 0.0
+
+
+@pytest.mark.parametrize("started", [True, False])
+def test_the_end_save_does_not_rewrite_a_full_state_under_its_upload(tmp_path, started):
+    """The loop ended at the step of its pre_cooldown full state (a STOP file and a skipped step): the end save
+    rewrote that dir's trainer.pt while its upload was still listing and hashing it (a commit of one file's size with
+    the other's hash). A running upload of the dir now finishes before the rewrite; one still queued is cancelled and
+    queued again after it, and wait() stays clean."""
+    import threading
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+
+    class GatedHub(FakeHub):
+        def __init__(self):
+            super().__init__()
+            self.entered, self.release, self.seen = threading.Event(), threading.Event(), []
+
+        def upload_folder(self, **kw):
+            tp = Path(kw["folder_path"]) / "trainer.pt"
+            before = tp.read_bytes() if tp.exists() else None
+            self.entered.set()
+            self.release.wait(10)
+            self.seen.append((kw["path_in_repo"].rsplit("/", 1)[1], before, tp.read_bytes() if tp.exists() else None))
+            super().upload_folder(**kw)
+
+    hub, run = GatedHub(), tmp_path / "runs" / "run"
+    log = SimpleNamespace(event=lambda kind, **kw: None, state_dict=dict)
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 2}}, run_dir=run, ckpt_dir=run / "checkpoints", st=dict(fulls=[]),
+                        clock=lambda: 0.0, planner=SimpleNamespace(state_dict=dict), log=log,
+                        model=torch.nn.Linear(1, 1), opt=SimpleNamespace(state_dict=dict),
+                        l2sp=SimpleNamespace(state_dict=dict))
+    R.uploader = m.Uploader(hub, "u/r", "run", True, log, retries=())
+    R.ckpt_dir.mkdir(parents=True)
+    try:
+        if not started:  # the worker is busy with a weights upload: the pre_cooldown one waits in the queue
+            (R.ckpt_dir / "step_2").mkdir()
+            (R.ckpt_dir / "step_2" / "model.safetensors").write_bytes(b"w")
+            R.uploader.submit(R.ckpt_dir / "step_2", "step_2")
+            assert hub.entered.wait(10)
+        d = m.save_full(R, 4, "pre_cooldown", upload=True)
+        assert hub.entered.wait(10)
+        if started:  # the end save waits for it
+            threading.Timer(0.5, hub.release.set).start()
+        m.save_full(R, 4, "end")  # upload_full_at without "end": the pre_cooldown upload is the only one of the dir
+        hub.release.set()
+        uploads = R.uploader.wait(10)
+    finally:
+        hub.release.set()
+        R.uploader.shutdown(5)
+    end = (d / "trainer.pt").read_bytes()
+    assert json.loads((d / "trainer.json").read_text(encoding="utf-8"))["reason"] == "end"
+    ups = [s for s in hub.seen if s[0] == "full_step_4"]
+    assert len(ups) == 1 and ups[0][1] == ups[0][2]  # one trainer.pt from the listing to the commit
+    assert (ups[0][1] == end) is (not started)  # a running upload keeps the pre_cooldown one, a queued one the end one
+    assert uploads == ({"full_step_4": True} if started else {"step_2": True, "full_step_4": True})
+
+
 def test_hf_roundtrip_retries_a_transient_hub_error(tmp_path):
     """The smoke round trip's create_repo and commit POSTs are sent once by the hub: one 503 must be retried (on the
     uploads' schedule) instead of stopping the paid run after its bootstrap; bad credentials fail at once."""

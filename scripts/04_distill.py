@@ -697,7 +697,6 @@ class Uploader:
         return {p for p, f in self.pending.items() if not f.done()}
 
     def _upload(self, local: Path, name: str) -> bool:
-        size = sum(f.stat().st_size for f in local.rglob("*") if f.is_file())
         for attempt, wait in enumerate((0, *self.retries)):
             if wait:
                 time.sleep(wait)
@@ -710,12 +709,15 @@ class Uploader:
                                        path_in_repo=f"runs/{self.run_id}/checkpoints/{name}",
                                        commit_message=f"{self.run_id}: checkpoint {name}",
                                        ignore_patterns=[UPLOAD_MARK])
+                upload_s = round(time.time() - t0, 1)
+                # listed inside the try: a file renamed away meanwhile (the end save's trainer.pt.tmp) is a logged,
+                # retried attempt, not an exception that escapes the upload's future
+                gb = round(sum(f.stat().st_size for f in local.rglob("*") if f.is_file()) / 1e9, 3)
                 try:
                     (local / UPLOAD_MARK).unlink(missing_ok=True)  # on the Hub now: rotation may take it
                 except OSError:
                     pass  # kept a little longer, and uploaded once more by finish.py: no harm
-                self.log.event("ckpt_upload_ok", name=name, attempt=attempt, gb=round(size / 1e9, 3),
-                               upload_s=round(time.time() - t0, 1))
+                self.log.event("ckpt_upload_ok", name=name, attempt=attempt, gb=gb, upload_s=upload_s)
                 return True
             except Exception as e:
                 self.log.event("ckpt_upload_error", name=name, attempt=attempt, error=f"{type(e).__name__}: {e}"[:2000])
@@ -1922,7 +1924,15 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False) -> Path:
                     disk_free_gb=_disk_free_gb(d))
     elif reason == "end":
         # a periodic/after-smoke full state already holds this step's weights and optimizer, but its trainer state
-        # predates the stop (early_stop.stop / triggered); rewrite only trainer.pt/.json so a resume ends the run
+        # predates the stop (early_stop.stop / triggered); rewrite only trainer.pt/.json so a resume ends the run.
+        # The pre_cooldown upload of this very dir may still be pending (the loop ended at its step: a STOP file and
+        # a skipped step): one not started yet is cancelled and queued again after the rewrite, a running one gets up
+        # to UPLOAD_WAIT_S to finish first, so it does not commit one trainer.pt's size with the other's hash
+        fut = R.uploader.pending.get(d)
+        if fut is not None and fut.cancel():
+            upload = True
+        elif fut is not None:
+            concurrent.futures.wait([fut], timeout=UPLOAD_WAIT_S)  # not .result(): its error is the Uploader's to log
         trainer, brief, _ = trainer_state()
         for fname, write in (("trainer.pt", lambda f: torch.save(trainer, f)),
                              ("trainer.json", lambda f: f.write_text(json.dumps(brief, indent=1, default=str),
