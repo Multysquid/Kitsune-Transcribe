@@ -14,7 +14,9 @@ Rules for TRAIN rows, first match wins (keep = reason == "kept"):
   no_audio     id not in data/shards/<source>/*.parquet (skip with --skip-audio-check)
   kept
 EVAL rows are never filtered by label quality - the gate compares against the teacher's FULL-set CER - so only
-no_audio applies; `truncated` / `agree` are still recorded.
+no_audio applies; `truncated` / `agree` are still recorded. Exception: monitor-only hold-outs named in
+--filter-eval-sets (eval_emilia, galgame) get the train rules, so they measure clean speech (eval_emilia's last tar
+holds English talk that Whisper-medium wrote as katakana, which the teacher-vs-Whisper agreement exposes).
 
 Also marks two fixed seeded subsets (per source, drawn from kept rows sorted by id):
   in_greedy_subset   --greedy-n ids per eval set: greedy decode during training (the full sets only at the end)
@@ -28,6 +30,7 @@ Usage:
   python scripts/make_selection.py --sources reazon_small --agree-max 0.5 --out selection/viability.parquet
 """
 import argparse
+from collections.abc import Sequence
 import json
 import sys
 import time
@@ -44,7 +47,7 @@ import pyarrow.parquet as pq  # noqa: E402
 
 from kitsune.store import fsync_path  # noqa: E402
 
-EVAL_SETS = ["eval_jsut", "eval_cv8", "eval_reazon"]  # galgame's eval split is excluded from this run (D4b)
+EVAL_SETS = ["eval_jsut", "eval_cv8", "eval_reazon"]  # the pre-registered gate sets; monitor hold-outs are extra
 COLUMNS = ["id", "source", "split", "teacher_file", "duration", "n_tok", "truncated", "agree", "teacher_cer", "keep",
            "reason", "in_greedy_subset", "in_probe"]
 
@@ -105,7 +108,8 @@ def seeded_subset(ids: list[str], n: int, seed: int, tag: str) -> set[str]:
 
 def build_selection(teacher_root, second_root, data_root, sources: list[str], eval_sets: list[str] = EVAL_SETS,
                     agree_max: float = 0.5, seed: int = 1234, greedy_n: int = 500, probe_n: int = 500,
-                    audio_check: bool = True, agree_max_by_source: dict[str, float] | None = None) -> pd.DataFrame:
+                    audio_check: bool = True, agree_max_by_source: dict[str, float] | None = None,
+                    filter_eval_sets: Sequence[str] = ()) -> pd.DataFrame:
     """`agree_max_by_source` overrides `agree_max` per train source: each source's `agree` is measured against a
     different second model (whisper-large-v3 for reazon, Emilia's own Whisper-medium text for emilia_yodas), so one
     global threshold is not calibrated across sources."""
@@ -125,7 +129,7 @@ def build_selection(teacher_root, second_root, data_root, sources: list[str], ev
         have_audio = df["id"].isin(audio_ids(data_root, source, split)) if audio_check else pd.Series(True, index=df.index)
         reason = np.full(len(df), "kept", dtype=object)
         reason[~have_audio.to_numpy()] = "no_audio"  # assigned lowest-precedence first, then overwritten
-        if split == "train":
+        if split == "train" or source in filter_eval_sets:
             thr = agree_max_by_source.get(source, agree_max)
             reason[(agree > thr).to_numpy()] = f"agree>{thr:g}"
             reason[agree.isna().to_numpy()] = "no_agree"
@@ -176,6 +180,8 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--agree-max", type=float, default=0.5, help="keep train rows with agree <= this")
     ap.add_argument("--agree-max-source", action="append", default=[], metavar="SOURCE=A",
                     help="per-source override of --agree-max (repeatable), e.g. emilia_yodas=0.3")
+    ap.add_argument("--filter-eval-sets", nargs="*", default=[],
+                    help="monitor-only eval sets that get the train label rules (never the pre-registered gate sets)")
     ap.add_argument("--out", default=str(ROOT / "selection" / "viability.parquet"))
     ap.add_argument("--teacher-out", default=str(ROOT / "teacher_out"))
     ap.add_argument("--second-out", default=str(ROOT / "second_out"))
@@ -192,13 +198,16 @@ def main(argv: list[str] | None = None):
         if not val:
             ap.error(f"--agree-max-source expects SOURCE=A, got {item!r}")
         by_source[src] = float(val)
-    unknown = set(by_source) - set(args.sources)
+    if set(args.filter_eval_sets) & set(EVAL_SETS):
+        ap.error(f"the gate sets {EVAL_SETS} are never label-filtered")
+    unknown = set(by_source) - set(args.sources) - set(args.filter_eval_sets)
     if unknown:
         ap.error(f"--agree-max-source for sources not in --sources: {sorted(unknown)}")
 
     t0 = time.time()
     sel = build_selection(args.teacher_out, args.second_out, args.data, args.sources, args.eval_sets, args.agree_max,
-                          args.seed, args.greedy_n, args.probe_n, not args.skip_audio_check, by_source)
+                          args.seed, args.greedy_n, args.probe_n, not args.skip_audio_check, by_source,
+                          args.filter_eval_sets)
     summary = summarize(sel)
     kept = sel[sel["keep"]].groupby(["source", "split"])["duration"].agg(["size", "sum"])
     meta = dict(args=vars(args), created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
