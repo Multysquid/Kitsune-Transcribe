@@ -222,6 +222,42 @@ def test_build_stores_contents_and_idempotence(corpus, selection, tmp_path):
     assert "built" in logs[-1]
 
 
+def test_build_stores_rebuilds_when_teacher_output_changes_in_place(corpus, selection, tmp_path):
+    """A teacher re-run that keeps the tokens but changes the log-probs writes an npz of the same size (np.savez does
+    not compress), and a changed ref/hyp lives only in the .jsonl: both must still invalidate the cache."""
+    logs = []
+    teacher, cache = tmp_path / "teacher_out", tmp_path / "cache"
+    shutil.copytree(corpus.teacher_out, teacher)
+    st = build_stores(selection, corpus.data, teacher, cache, TRAIN, ["train"], log=logs.append)
+    lp0 = np.load(cache / "targets_topk_lp.npy")
+    uid = st.utts[0].id
+    npz = teacher / f"{pd.read_parquet(selection).set_index('id').loc[uid, 'teacher_file']}.npz"
+    with np.load(npz) as f:
+        z = dict(f)
+    size0 = npz.stat().st_size
+
+    np.savez(npz, **z)  # the same content written again: no rebuild
+    build_stores(selection, corpus.data, teacher, cache, TRAIN, ["train"], log=logs.append)
+    assert "reusing" in logs[-1]
+
+    z["topk_logprob"] = (z["topk_logprob"] - 0.5).astype(z["topk_logprob"].dtype)
+    np.savez(npz, **z)
+    assert npz.stat().st_size == size0
+    build_stores(selection, corpus.data, teacher, cache, TRAIN, ["train"], log=logs.append)
+    assert "built" in logs[-1]
+    assert not np.array_equal(np.load(cache / "targets_topk_lp.npy"), lp0)
+
+    jl = npz.with_suffix(".jsonl")
+    rows = [json.loads(line) for line in jl.read_text(encoding="utf-8").splitlines() if line.strip()]
+    for r in rows:
+        if r["id"] == uid:
+            r["hyp"] += "改"
+    jl.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    st2 = build_stores(selection, corpus.data, teacher, cache, TRAIN, ["train"], log=logs.append)
+    assert "built" in logs[-1]
+    assert st2.frame().set_index("id").loc[uid, "hyp"] == corpus.utts[uid].hyp + "改"
+
+
 def check_alignment(corpus, st, idx):
     ds = AudioBatchDataset(st)
     b = ds[idx]

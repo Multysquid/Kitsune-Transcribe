@@ -31,6 +31,7 @@ import json
 import os
 import sys
 import time
+import zipfile
 from collections import deque
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -131,6 +132,13 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _npz_members(path: Path) -> list:
+    """(name, CRC32, size) of every array in an .npz, read from the zip's central directory (no array data).
+    np.savez stores uncompressed, so a teacher re-run with the same shapes keeps the file size; the CRCs do not."""
+    with zipfile.ZipFile(path) as z:
+        return sorted((i.filename, i.CRC, i.file_size) for i in z.infolist())
+
+
 def _teacher_meta(teacher_root: Path) -> dict:
     p = Path(teacher_root) / "meta.json"
     meta = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
@@ -171,9 +179,9 @@ def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Se
     need not copy all of a source's audio.
 
     Idempotent: nothing is rebuilt if <cache_dir>/stores.json carries the same fingerprint (format version,
-    selection file hash, sources, splits, prompt, k, npz sizes) and every shard that contributed audio still has its
-    size. New shards (a download still appending to data/) only force a rebuild if the last build dropped rows for
-    missing audio. Store order is the order in which the audio was found (sources in the given order, shards sorted
+    selection file hash, sources, splits, prompt, k, the npz members' CRCs, the .jsonl hashes) and every shard that
+    contributed audio still has its size. New shards (a download still appending to data/) only force a rebuild if
+    the last build dropped rows for missing audio. Store order is the order in which the audio was found (sources in the given order, shards sorted
     by name, row order within).
     Selected rows without audio are dropped and reported in info["dropped"]; a selected row without teacher output
     is an error (the selection was made from a different teacher_out).
@@ -196,7 +204,9 @@ def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Se
     fp_src = dict(version=FORMAT_VERSION, selection=_sha256(selection_path), sources=sources, splits=splits,
                   prompt=meta["prompt"], k=meta["k"],
                   ids=None if ids is None else hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest(),
-                  npz=[(p.relative_to(teacher_root).as_posix(), p.stat().st_size) for p in npz_files])
+                  npz=[(p.relative_to(teacher_root).as_posix(), p.stat().st_size, _npz_members(p)) for p in npz_files],
+                  # ref/hyp come from the .jsonl next to each npz; small enough to hash whole
+                  jsonl=[_sha256(q) if q.exists() else None for q in (p.with_suffix(".jsonl") for p in npz_files)])
     fingerprint = hashlib.sha256(json.dumps(fp_src, sort_keys=True).encode()).hexdigest()
     shard_size = {p.relative_to(data_root).as_posix(): p.stat().st_size for p in shard_files}
     info_path = cache_dir / "stores.json"
