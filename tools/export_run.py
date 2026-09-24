@@ -112,22 +112,29 @@ FILES = {
 }
 
 
-def resolve(src: str, out: Path) -> Path:
-    """Local run dir as is; hf://<user>/<repo>/runs/<id> is downloaded (checkpoints excluded) under out/_download."""
+def resolve(src: str, out: Path) -> tuple[Path, str | None]:
+    """(run dir, Hub commit): a local run dir as is (commit None); hf://<user>/<repo>/runs/<id> is downloaded
+    (checkpoints excluded) at the repo's current commit under out/_download/<commit[:12]>.
+
+    The commit is looked up first and any Hub or auth error raises: when snapshot_download's own repo_info request
+    fails (offline, a 429/5xx, an expired token) it returns a non-empty local_dir as it is, with only a logged warning
+    (HF-X2), so a re-export into the same --out would rebuild every table from an earlier download (a mid-run look).
+    One folder per commit: a new commit's folder is empty, so there is nothing stale to fall back to."""
     if not src.startswith("hf://"):
         p = Path(src)
         if not p.is_dir():
             sys.exit(f"{p} is not a directory")
-        return p
+        return p, None
     parts = src[len("hf://"):].strip("/").split("/")
     if len(parts) < 4 or parts[2] != "runs":
         sys.exit("expected hf://<user>/<repo>/runs/<run_id>")
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import HfApi, snapshot_download
 
     repo, prefix = "/".join(parts[:2]), "/".join(parts[2:])
-    local = Path(snapshot_download(repo, repo_type="model", local_dir=out / "_download",
+    sha = HfApi().repo_info(repo, repo_type="model").sha
+    local = Path(snapshot_download(repo, repo_type="model", revision=sha, local_dir=out / "_download" / sha[:12],
                                    allow_patterns=[f"{prefix}/*"], ignore_patterns=[f"{prefix}/checkpoints/*"]))
-    return local / prefix
+    return local / prefix, sha
 
 
 def _from_tb(file_tag: str, plugin: str, inv: dict[str, dict[str, str]],
@@ -397,9 +404,10 @@ def _csv_safe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: list[str]):
+def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: list[str], commit: str | None = None):
     lines = [f"# Run export: {Path(src).name if not src.startswith('hf://') else src}", "",
-             f"Source: `{src}`  ", f"Exported: {datetime.now(timezone.utc).isoformat(timespec='seconds')}", "",
+             f"Source: `{src}`  ", *([f"Hub commit: `{commit}`  "] if commit else []),
+             f"Exported: {datetime.now(timezone.utc).isoformat(timespec='seconds')}", "",
              "Every table is a parquet file (read with `pandas.read_parquet`); a `.csv` twin exists unless noted. "
              "Losses are in nats per target token; CER values are fractions (0.083 = 8.3 %).", "",
              "## TensorBoard layout", "",
@@ -468,7 +476,7 @@ def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: l
 
 def export(src: str, out: Path, max_csv_rows: int = 2_000_000) -> dict[str, pd.DataFrame]:
     out.mkdir(parents=True, exist_ok=True)
-    run = resolve(src, out)
+    run, commit = resolve(src, out)
     opened = run_tables(run)
     # tag_map.json, completed from the open files' tags by the rules: a run without one still gets its logged tags back
     tm = tag_mapper(opened, load_tag_map(run / "metrics" / "tag_map.json"))
@@ -492,7 +500,7 @@ def export(src: str, out: Path, max_csv_rows: int = 2_000_000) -> dict[str, pd.D
         if (run / d).is_dir():
             shutil.copytree(run / d, out / d, dirs_exist_ok=True)
             copied.append(d)
-    write_readme(out, src, tables, copied)
+    write_readme(out, src, tables, copied, commit)
     return tables
 
 

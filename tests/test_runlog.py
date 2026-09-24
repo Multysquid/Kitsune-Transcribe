@@ -718,8 +718,20 @@ def test_export_attempts_of_a_resume_that_died_before_its_own_full_state():
     assert exp.discarded(tu, runs).tolist() == [True, True, False, True, False, False]
 
 
+class FakeHubRepo:
+    """Stands in for huggingface_hub.HfApi in the hf:// export: repo_info gives the repo's current commit, or raises
+    (the Hub unreachable, a 5xx, an expired token)."""
+    sha: str | None = "a" * 40
+
+    def repo_info(self, repo_id, repo_type=None, **kw):
+        if FakeHubRepo.sha is None:
+            raise OSError("simulated: the Hub cannot be reached")
+        return type("Info", (), {"sha": FakeHubRepo.sha})()
+
+
 def test_export_hf_source_is_downloaded(run, tmp_path, monkeypatch):
-    """hf://user/repo/runs/<id> -> snapshot_download of that prefix only (checkpoints excluded); mocked, no network."""
+    """hf://user/repo/runs/<id> -> snapshot_download of that prefix only (checkpoints excluded), pinned to the repo's
+    current commit, into a folder of that commit, and the commit is in the README; mocked, no network."""
     import shutil
 
     import huggingface_hub
@@ -733,9 +745,46 @@ def test_export_hf_source_is_downloaded(run, tmp_path, monkeypatch):
         return str(kw["local_dir"])
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHubRepo)
+    monkeypatch.setattr(FakeHubRepo, "sha", "a" * 40)
     exp = load_export()
     out = tmp_path / "export-hf"
     exp.main(["hf://me/kitsune-runs/runs/tiny-run", "--out", str(out)])
     assert seen["repo_id"] == "me/kitsune-runs" and seen["allow_patterns"] == ["runs/tiny-run/*"]
     assert seen["ignore_patterns"] == ["runs/tiny-run/checkpoints/*"]
+    assert seen["revision"] == "a" * 40 and Path(seen["local_dir"]) == out / "_download" / ("a" * 12)
     assert (out / "steps.parquet").is_file() and (out / "README.md").is_file()
+    assert f"Hub commit: `{'a' * 40}`" in (out / "README.md").read_text(encoding="utf-8")
+
+
+def test_export_hf_fails_when_the_hub_cannot_be_reached(run, tmp_path, monkeypatch):
+    """A re-export into the same --out while the Hub cannot be reached raises, instead of snapshot_download handing
+    back the earlier download as it is (its non-empty local_dir fallback, HF-X2) and every table being rebuilt from
+    that stale mid-run copy under a fresh README."""
+    import shutil
+
+    import huggingface_hub
+
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kw):
+        calls.append(kw)
+        dst = Path(kw["local_dir"]) / "runs" / "tiny-run"
+        if not dst.exists():
+            shutil.copytree(run, dst)
+        return str(kw["local_dir"])
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHubRepo)
+    monkeypatch.setattr(FakeHubRepo, "sha", "a" * 40)
+    exp = load_export()
+    out = tmp_path / "export-hf"
+    exp.main(["hf://me/kitsune-runs/runs/tiny-run", "--out", str(out)])  # the mid-run look fills out/_download
+    assert len(calls) == 1
+    monkeypatch.setattr(FakeHubRepo, "sha", None)
+    with pytest.raises(OSError, match="cannot be reached"):
+        exp.main(["hf://me/kitsune-runs/runs/tiny-run", "--out", str(out)])
+    assert len(calls) == 1  # never reached the download, so never its silent fallback
+    monkeypatch.setattr(FakeHubRepo, "sha", "b" * 40)  # the Hub back, at a newer commit: a fresh folder of its own
+    exp.main(["hf://me/kitsune-runs/runs/tiny-run", "--out", str(out)])
+    assert calls[-1]["revision"] == "b" * 40 and Path(calls[-1]["local_dir"]) == out / "_download" / ("b" * 12)
