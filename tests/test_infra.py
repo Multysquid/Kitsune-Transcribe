@@ -327,16 +327,65 @@ def test_data_problems_catch_a_partial_second_opinion_pass_and_missing_files():
     assert not any("eval_jsut: " in p and "second opinion" in p for p in problems)
 
 
-def test_selection_problems_flag_no_agree_rows(tmp_path):
-    import pandas as pd
+SEL_CFG = dict(VIAB_CFG, selection_recipe={"agree_max": 0.5, "agree_max_source": ["galgame=0.4"],
+                                           "filter_eval_sets": ["galgame"]})
+SEL_ARGS = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"], "agree_max": 0.5,
+            "agree_max_source": ["galgame=0.4"], "filter_eval_sets": ["galgame"], "out": "C:/laptop/sel.parquet",
+            "config": "configs/viability.json"}
+SEL_ROWS = [("reazon_small", "train", True, "kept"), ("galgame", "train", True, "kept"),
+            ("galgame", "train", False, "agree>0.4"), ("eval_jsut", "eval", True, "kept"),
+            ("galgame", "eval", True, "kept")]
 
-    path = tmp_path / "sel.parquet"
-    pd.DataFrame({"source": ["galgame", "galgame", "reazon_small"],
-                  "reason": ["kept", "no_agree", "agree>0.5"]}).to_parquet(path)
-    problems = launch.selection_problems(path, "selection/viability.parquet")
+
+def write_selection(path: Path, rows, args=None) -> Path:
+    """A selection parquet as make_selection.py writes it: its arguments in the metadata key b"kitsune_selection"."""
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    t = pa.Table.from_pandas(pd.DataFrame(rows, columns=["source", "split", "keep", "reason"]), preserve_index=False)
+    if args is not None:
+        t = t.replace_schema_metadata({b"kitsune_selection": json.dumps(dict(args=args, created="x")).encode()})
+    pq.write_table(t, path)
+    return path
+
+
+def test_selection_problems_flag_no_agree_rows(tmp_path):
+    name = "selection/viability.parquet"
+    path = write_selection(tmp_path / "sel.parquet", SEL_ROWS + [("galgame", "train", False, "no_agree")], SEL_ARGS)
+    problems = launch.selection_problems(path, name, SEL_CFG)
     assert len(problems) == 1 and "1 rows as no_agree ({'galgame': 1})" in problems[0]
-    pd.DataFrame({"source": ["galgame"], "reason": ["kept"]}).to_parquet(path)
-    assert launch.selection_problems(path, "selection/viability.parquet") == []
+    assert launch.selection_problems(write_selection(path, SEL_ROWS, SEL_ARGS), name, SEL_CFG) == []
+
+
+def test_selection_problems_check_the_recipe_and_the_kept_rows(tmp_path):
+    """A selection rebuilt with a flag forgotten (a threshold, a hold-out filter, an eval set, a source) or keeping
+    nothing of a configured source or eval set is refused before renting; the recorded paths do not matter, the order
+    of the lists and how a threshold is spelled neither."""
+    name, path = "selection/viability.parquet", tmp_path / "sel.parquet"
+    same = dict(SEL_ARGS, sources=["galgame", "reazon_small"], agree_max_source=["galgame=0.40"],
+                out="/elsewhere/x.parquet", config=None)
+    assert launch.selection_problems(write_selection(path, SEL_ROWS, same), name, SEL_CFG) == []
+    for key, value in (("agree_max_source", []), ("agree_max_source", ["galgame=0.5"]), ("agree_max", 0.3),
+                       ("filter_eval_sets", []), ("eval_sets", ["eval_jsut"]), ("sources", ["reazon_small"])):
+        problems = launch.selection_problems(write_selection(path, SEL_ROWS, dict(SEL_ARGS, **{key: value})), name,
+                                             SEL_CFG)
+        assert len(problems) == 1 and f"was built with {key} " in problems[0], (key, problems)
+    problems = launch.selection_problems(write_selection(path, SEL_ROWS), name, SEL_CFG)  # not from make_selection
+    assert len(problems) == 1 and "no record of how it was built" in problems[0]
+    rows = [r for r in SEL_ROWS if r[:2] != ("galgame", "eval")] + [("galgame", "eval", False, "agree>0.5")]
+    problems = launch.selection_problems(write_selection(path, rows, SEL_ARGS), name, SEL_CFG)
+    assert problems == [f"{name} keeps no eval rows of ['galgame'] (in the config's eval_sets): rebuild it with "
+                        f"scripts/make_selection.py --config <the run config> and upload it"]
+    rows = [r for r in SEL_ROWS if r[0] != "reazon_small"]
+    problems = launch.selection_problems(write_selection(path, rows, SEL_ARGS), name, SEL_CFG)
+    assert len(problems) == 1 and "keeps no train rows of ['reazon_small']" in problems[0]
+    problems = launch.selection_problems(write_selection(path, SEL_ROWS, SEL_ARGS), name, VIAB_CFG)
+    assert problems == ["the run config has no selection_recipe to check the selection against"]
+    # the real run config carries the recipe, spelled as make_selection.py records it
+    via = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
+    assert via["selection_recipe"] == {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "eval_emilia=0.2"],
+                                       "filter_eval_sets": ["eval_emilia", "galgame"]}
 
 
 def test_launch_help_needs_nothing():

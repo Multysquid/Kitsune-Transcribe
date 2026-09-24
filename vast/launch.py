@@ -9,7 +9,9 @@ Run this on the laptop. It
   3. creates the instance only with --yes. Spending money is always the user's explicit step.
 The git, image and HF checks run before the offer search, so they report problems even without the vastai CLI. The HF
 check refuses a data repo whose derived data is incomplete: a train source's teacher shard without its second opinion,
-or a selection that still drops rows as no_agree (both mean training on a fraction of the planned hours).
+or a selection that still drops rows as no_agree (both mean training on a fraction of the planned hours); and a
+selection not built from the run config's sources, eval sets and selection_recipe, or with no kept rows for one of them
+(make_selection.py --config builds the right one).
 
 HF_TOKEN is never an argument and never part of the command: the box gets it from the vast ACCOUNT-level environment
 variables (D48a), so it does not appear in shell history, the process list or the instance config. The instance runs
@@ -206,16 +208,57 @@ def data_problems(files: list[str], cfg: dict) -> list[str]:
     return problems
 
 
-def selection_problems(path: Path, name: str) -> list[str]:
-    """A selection built before the second-opinion pass finished drops those rows as no_agree."""
-    import pandas as pd
+def _by_source(items) -> dict[str, float]:
+    """make_selection.py's --agree-max-source values (SOURCE=A) as {source: threshold}."""
+    out = {}
+    for item in items or []:
+        src, _, val = str(item).partition("=")
+        out[src] = float(val)
+    return out
 
-    sel = pd.read_parquet(path, columns=["source", "reason"])
+
+def selection_problems(path: Path, name: str, cfg: dict) -> list[str]:
+    """The selection must be the one the run config describes. make_selection.py records its arguments in the parquet
+    (metadata b"kitsune_selection"): they must match the config's sources, eval_sets and selection_recipe (agreement
+    thresholds, label-filtered hold-outs) - a rebuild with a flag forgotten would otherwise silently train on other
+    rows or lose a hold-out. Every configured train source and eval set must keep rows (the trainer takes an empty one
+    in silence). And a selection built before the second-opinion pass finished drops those rows as no_agree."""
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    rebuild = "rebuild it with scripts/make_selection.py --config <the run config> and upload it"
+    problems = []
+    raw = (pq.ParquetFile(path).schema_arrow.metadata or {}).get(b"kitsune_selection")
+    args = json.loads(raw).get("args") if raw else None
+    recipe = cfg.get("selection_recipe")
+    if not isinstance(recipe, dict):
+        problems.append("the run config has no selection_recipe to check the selection against")
+    elif not isinstance(args, dict):
+        problems.append(f"{name} has no record of how it was built (kitsune_selection metadata): {rebuild}")
+    else:
+        got = dict(sources=set(args.get("sources") or []), eval_sets=set(args.get("eval_sets") or []),
+                   agree_max=args.get("agree_max"), agree_max_source=_by_source(args.get("agree_max_source")),
+                   filter_eval_sets=set(args.get("filter_eval_sets") or []))
+        want = dict(sources=set(cfg.get("sources", [])), eval_sets=set(cfg.get("eval_sets", [])),
+                    agree_max=float(recipe["agree_max"]), agree_max_source=_by_source(recipe["agree_max_source"]),
+                    filter_eval_sets=set(recipe["filter_eval_sets"]))
+        for k, v in want.items():
+            if got[k] != v:
+                shown = [sorted(x.items()) if isinstance(x, dict) else sorted(x) if isinstance(x, set) else x
+                         for x in (got[k], v)]
+                problems.append(f"{name} was built with {k} {shown[0]}, the run config says {shown[1]}: {rebuild}")
+
+    sel = pd.read_parquet(path, columns=["source", "split", "keep", "reason"])
+    kept = sel[sel["keep"]].groupby(["source", "split"]).size()
+    for split, key in (("train", "sources"), ("eval", "eval_sets")):
+        empty = [s for s in cfg.get(key, []) if not kept.get((s, split), 0)]
+        if empty:
+            problems.append(f"{name} keeps no {split} rows of {empty} (in the config's {key}): {rebuild}")
     bad = sel[sel["reason"] == "no_agree"]
-    if bad.empty:
-        return []
-    return [f"{name} drops {len(bad)} rows as no_agree ({bad['source'].value_counts().to_dict()}): rebuild it with "
-            f"scripts/make_selection.py after the second-opinion pass and upload it"]
+    if not bad.empty:
+        problems.append(f"{name} drops {len(bad)} rows as no_agree ({bad['source'].value_counts().to_dict()}): rebuild "
+                        f"it with scripts/make_selection.py after the second-opinion pass and upload it")
+    return problems
 
 
 def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, list[str]]:
@@ -234,7 +277,7 @@ def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, 
         if cfg["selection"] in files:
             with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
                 local = hf_hub_download(data_repo, cfg["selection"], repo_type="dataset", revision=rev, local_dir=tmp)
-                problems += selection_problems(Path(local), cfg["selection"])
+                problems += selection_problems(Path(local), cfg["selection"], cfg)
     except Exception as e:
         problems.append(f"cannot read dataset {data_repo}: {type(e).__name__}: {e}")
     try:

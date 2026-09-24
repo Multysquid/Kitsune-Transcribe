@@ -26,8 +26,14 @@ Output columns: id, source, split, teacher_file (<source>/<stem>, the npz/jsonl 
 truncated, agree (null if unknown), teacher_cer, keep, reason, in_greedy_subset, in_probe. The parquet's schema
 metadata key b"kitsune_selection" holds the arguments and the summary as JSON.
 
+The recipe of a run (its sources and eval sets, and selection_recipe: --agree-max, --agree-max-source,
+--filter-eval-sets) is written down once, in the run config: --config takes all of it from there, and vast/launch.py
+refuses a selection whose recorded arguments differ from the config (a flag forgotten on a rebuild would otherwise
+silently change the training data or drop a hold-out).
+
 Usage:
-  python scripts/make_selection.py --sources reazon_small --agree-max 0.5 --out selection/viability.parquet
+  python scripts/make_selection.py --config configs/viability.json       # the viability run's selection
+  python scripts/make_selection.py --sources reazon_small --agree-max 0.5 --out selection/reazon_only.parquet
 """
 import argparse
 from collections.abc import Sequence
@@ -175,14 +181,20 @@ def write_selection(sel: pd.DataFrame, out: Path, meta: dict):
 
 def main(argv: list[str] | None = None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sources", nargs="+", required=True, help="train sources (their teacher_out split `train`)")
-    ap.add_argument("--eval-sets", nargs="*", default=EVAL_SETS, help="eval sources (split `eval`); none: --eval-sets")
-    ap.add_argument("--agree-max", type=float, default=0.5, help="keep train rows with agree <= this")
-    ap.add_argument("--agree-max-source", action="append", default=[], metavar="SOURCE=A",
-                    help="per-source override of --agree-max (repeatable), e.g. emilia_yodas=0.3")
-    ap.add_argument("--filter-eval-sets", nargs="*", default=[],
+    ap.add_argument("--config", default=None,
+                    help="run config (e.g. configs/viability.json): --sources, --eval-sets and its selection_recipe "
+                         "(--agree-max, --agree-max-source, --filter-eval-sets) come from it, --out defaults to its "
+                         "selection; none of those flags may be given too")
+    ap.add_argument("--sources", nargs="+", default=None,
+                    help="train sources (their teacher_out split `train`); required without --config")
+    ap.add_argument("--eval-sets", nargs="*", default=None,
+                    help=f"eval sources (split `eval`; default {' '.join(EVAL_SETS)}); none: --eval-sets")
+    ap.add_argument("--agree-max", type=float, default=None, help="keep train rows with agree <= this (default 0.5)")
+    ap.add_argument("--agree-max-source", action="append", default=None, metavar="SOURCE=A",
+                    help="per-source override of --agree-max (repeatable), e.g. emilia_yodas=0.2")
+    ap.add_argument("--filter-eval-sets", nargs="*", default=None,
                     help="monitor-only eval sets that get the train label rules (never the pre-registered gate sets)")
-    ap.add_argument("--out", default=str(ROOT / "selection" / "viability.parquet"))
+    ap.add_argument("--out", default=None, help="default: the --config's selection, else selection/viability.parquet")
     ap.add_argument("--teacher-out", default=str(ROOT / "teacher_out"))
     ap.add_argument("--second-out", default=str(ROOT / "second_out"))
     ap.add_argument("--data", default=str(ROOT / "data"))
@@ -191,6 +203,27 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--probe-n", type=int, default=500, help="train probe size per train source")
     ap.add_argument("--skip-audio-check", action="store_true", help="do not look for the audio (no `no_audio` rows)")
     args = ap.parse_args(argv)
+    recipe_flags = ("sources", "eval_sets", "agree_max", "agree_max_source", "filter_eval_sets")
+    if args.config:
+        if given := [f"--{k.replace('_', '-')}" for k in recipe_flags if getattr(args, k) is not None]:
+            ap.error(f"--config sets the recipe; drop {' '.join(given)}")
+        p = Path(args.config)
+        cfg = json.loads((p if p.is_absolute() or p.exists() else ROOT / p).read_text(encoding="utf-8"))
+        recipe = cfg.get("selection_recipe")
+        if not isinstance(recipe, dict) or not cfg.get("sources") or "eval_sets" not in cfg:
+            ap.error(f"{args.config} needs sources, eval_sets and selection_recipe")
+        args.sources, args.eval_sets = list(cfg["sources"]), list(cfg["eval_sets"])
+        args.agree_max, args.agree_max_source = float(recipe["agree_max"]), list(recipe["agree_max_source"])
+        args.filter_eval_sets = list(recipe["filter_eval_sets"])
+        out = Path(cfg.get("selection", "selection/viability.parquet"))
+        args.out = args.out or str(out if out.is_absolute() else ROOT / out)
+    elif not args.sources:
+        ap.error("--sources is required (or --config)")
+    else:
+        args.eval_sets = EVAL_SETS if args.eval_sets is None else args.eval_sets
+        args.agree_max = 0.5 if args.agree_max is None else args.agree_max
+        args.agree_max_source, args.filter_eval_sets = args.agree_max_source or [], args.filter_eval_sets or []
+        args.out = args.out or str(ROOT / "selection" / "viability.parquet")
 
     by_source = {}
     for item in args.agree_max_source:

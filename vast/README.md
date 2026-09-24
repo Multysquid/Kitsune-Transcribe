@@ -38,8 +38,14 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    hf repos create Multy123/kitsune-runs --private
    ```
 2. Upload the derived data (~2.3 GB, most of it the student init; the audio is rebuilt on the box). Finish the
-   second-opinion pass for every train source and rebuild the selection first: `launch.py` refuses a data repo where a
-   train source's teacher shard has no second opinion or the selection still has `no_agree` rows. From the repo root:
+   second-opinion pass for every train source and rebuild the selection first, with the run config's recipe (its
+   sources, eval sets and `selection_recipe`: the agreement thresholds and the label-filtered hold-outs):
+   ```bash
+   python scripts/make_selection.py --config configs/viability.json
+   ```
+   `launch.py` refuses a data repo where a train source's teacher shard has no second opinion, or where the selection
+   still has `no_agree` rows, was built with other sources / eval sets / thresholds than the config's, or keeps no rows
+   of a configured source or eval set. From the repo root:
    ```bash
    hf upload Multy123/kitsune-data . . --repo-type dataset \
      --include "teacher_out/meta.json" --include "second_out/meta.json" \

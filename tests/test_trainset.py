@@ -507,3 +507,49 @@ def test_selection_filters_only_named_monitor_eval_sets(corpus, tmp_path):
         assert set(o["reason"]) <= {"kept", "no_audio"}
     with pytest.raises(SystemExit):  # the pre-registered gate sets can never be filtered
         make_fake_selection(corpus, tmp_path / "bad.parquet", extra_args=("--filter-eval-sets", "eval_jsut"))
+
+
+def test_selection_from_the_run_config_and_the_launch_check(corpus, tmp_path):
+    """--config takes the sources, the eval sets and the selection_recipe from the run config (none of those flags
+    may be given too); vast/launch.py accepts what it builds and refuses a rebuild with a flag forgotten."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("kitsune_launch", ROOT / "vast" / "launch.py")
+    launch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launch)
+    strict = TRAIN[0]
+    cfg = {"sources": TRAIN, "eval_sets": EVAL, "selection": str(tmp_path / "from_config.parquet"),
+           "selection_recipe": {"agree_max": 0.5, "agree_max_source": [f"{strict}=0.1"], "filter_eval_sets": []}}
+    cfg_path = tmp_path / "run.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    paths = ["--teacher-out", str(corpus.teacher_out), "--second-out", str(corpus.second_out), "--data",
+             str(corpus.data), "--greedy-n", "5", "--probe-n", "5"]
+    ms.main(["--config", str(cfg_path), *paths])  # --out: the config's selection
+    out = Path(cfg["selection"])
+    sel = pd.read_parquet(out)
+    assert set(sel.loc[sel["split"] == "train", "source"]) == set(TRAIN)
+    assert set(sel.loc[sel["split"] == "eval", "source"]) == set(EVAL)
+    s = sel[sel["source"] == strict]
+    assert "agree>0.1" in set(s["reason"]) and not (s["keep"] & (s["agree"] > 0.1)).any()
+    args = json.loads(pq.read_schema(out).metadata[b"kitsune_selection"])["args"]
+    assert (args["sources"], args["eval_sets"], args["agree_max"], args["agree_max_source"],
+            args["filter_eval_sets"]) == (TRAIN, EVAL, 0.5, [f"{strict}=0.1"], [])
+    # the fixture has train rows without a second opinion: only the no_agree problem, nothing about the recipe
+    problems = launch.selection_problems(out, "sel", cfg)
+    assert len(problems) == 1 and "as no_agree" in problems[0], problems
+    # the same corpus without the per-source threshold (the flag forgotten): refused
+    forgot = make_fake_selection(corpus, tmp_path / "forgot.parquet", greedy_n=5, probe_n=5)
+    problems = launch.selection_problems(forgot, "sel", cfg)
+    assert any("was built with agree_max_source [], the run config says [('src_a', 0.1)]" in p for p in problems)
+    # a hold-out filtered by the recipe that has no second opinion keeps nothing: refused as well
+    cfg2 = dict(cfg, selection=str(tmp_path / "filtered.parquet"),
+                selection_recipe=dict(cfg["selection_recipe"], filter_eval_sets=[EVAL[0]]))
+    cfg_path.write_text(json.dumps(cfg2), encoding="utf-8")
+    ms.main(["--config", str(cfg_path), *paths])
+    problems = launch.selection_problems(Path(cfg2["selection"]), "sel", cfg2)
+    assert any(f"keeps no eval rows of ['{EVAL[0]}']" in p for p in problems), problems
+    for flag in (["--sources", *TRAIN], ["--agree-max", "0.3"], ["--filter-eval-sets"]):
+        with pytest.raises(SystemExit):
+            ms.main(["--config", str(cfg_path), *flag, *paths])
+    with pytest.raises(SystemExit):  # neither --config nor --sources
+        ms.main(paths)
