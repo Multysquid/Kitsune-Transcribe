@@ -166,6 +166,47 @@ def test_uploader_never_waits_forever_on_a_stalled_upload(tmp_path):
     assert not up.worker.is_alive() and up.wait(0) == {"step_1": True} and evs == ["ckpt_upload_ok"]
 
 
+def test_hf_roundtrip_retries_a_transient_hub_error(tmp_path):
+    """The smoke round trip's create_repo and commit POSTs are sent once by the hub: one 503 must be retried (on the
+    uploads' schedule) instead of stopping the paid run after its bootstrap; bad credentials fail at once."""
+    from types import SimpleNamespace
+
+    import httpx
+    from huggingface_hub.errors import HfHubHTTPError
+
+    m = load_script("04_distill")
+
+    class FlakyHub(FakeHub):
+        def __init__(self, status):
+            super().__init__()
+            self.status, self.commits = status, 0
+
+        def upload_file(self, **kw):
+            self.commits += 1
+            if self.commits == 1:
+                resp = httpx.Response(self.status, request=httpx.Request("POST", "https://hf.invalid/commit/main"))
+                raise HfHubHTTPError(f"{self.status} from the Hub", response=resp)
+            super().upload_file(**kw)
+
+    def roundtrip(hub):
+        evs = []
+        R = SimpleNamespace(uploader=SimpleNamespace(api=hub, retries=(0, 0)), run_dir=tmp_path / "run",
+                            cfg={"hf": {"output_repo": "u/r", "private": True}},
+                            log=SimpleNamespace(event=lambda kind, **kw: evs.append(dict(kind=kind, **kw))))
+        R.run_dir.mkdir(exist_ok=True)
+        return m.hf_roundtrip(R), evs
+
+    hub = FlakyHub(503)
+    out, evs = roundtrip(hub)
+    assert out["ok"] and out["attempt"] == 1 and hub.commits == 2
+    assert [(e["kind"], e.get("attempt")) for e in evs] == [("smoke_hf_roundtrip_error", 0), ("smoke_hf_roundtrip", 1)]
+    assert "503" in evs[0]["error"]
+    hub = FlakyHub(401)
+    with pytest.raises(HfHubHTTPError):
+        roundtrip(hub)
+    assert hub.commits == 1  # no retry on bad credentials
+
+
 def test_trainer_hub_client_has_a_timeout():
     """huggingface_hub's shared client has no timeout by default: a commit POST the Hub accepted and never answered
     would keep the trainer, and a paid instance, up until the watchdog. hf_api() bounds it and keeps the hub's hook."""

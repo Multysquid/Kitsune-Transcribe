@@ -668,20 +668,34 @@ class Uploader:
 
 def hf_roundtrip(R: Run) -> dict:
     """Upload a small file into the output repo and read it back: the credentials, the repo and both directions work
-    before the paid hours start (a run whose results cannot leave the box is worthless)."""
+    before the paid hours start (a run whose results cannot leave the box is worthless). A failed attempt is retried
+    on the checkpoint uploads' schedule: the create_repo and commit POSTs are sent once by the hub, and one 5xx, 429
+    or dropped connection must not stop a paid run after its bootstrap. Bad credentials (401/403) and different bytes
+    still fail at once; a retried commit of the same bytes is a no-op."""
     api, repo = R.uploader.api, out_repo(R.cfg)
     payload = json.dumps(dict(run_id=R.run_dir.name, nonce=uuid.uuid4().hex, wall=time.time())).encode()
     rel = f"runs/{R.run_dir.name}/smoke/roundtrip.json"
     (R.run_dir / "smoke").mkdir(exist_ok=True)
     (R.run_dir / "smoke" / "roundtrip.json").write_bytes(payload)
-    t0 = time.time()
-    api.create_repo(repo, repo_type="model", private=R.cfg["hf"]["private"], exist_ok=True)
-    api.upload_file(path_or_fileobj=payload, path_in_repo=rel, repo_id=repo, repo_type="model",
-                    commit_message=f"{R.run_dir.name}: smoke round trip")
-    t1 = time.time()
-    with tempfile.TemporaryDirectory() as d:
-        got = Path(api.hf_hub_download(repo, rel, repo_type="model", local_dir=d)).read_bytes()
-    out = dict(ok=got == payload, repo=repo, path=rel, upload_s=round(t1 - t0, 2), download_s=round(time.time() - t1, 2))
+    for attempt, wait in enumerate((0, *R.uploader.retries)):
+        if wait:
+            time.sleep(wait)
+        t0 = time.time()
+        try:
+            api.create_repo(repo, repo_type="model", private=R.cfg["hf"]["private"], exist_ok=True)
+            api.upload_file(path_or_fileobj=payload, path_in_repo=rel, repo_id=repo, repo_type="model",
+                            commit_message=f"{R.run_dir.name}: smoke round trip")
+            t1 = time.time()
+            with tempfile.TemporaryDirectory() as d:
+                got = Path(api.hf_hub_download(repo, rel, repo_type="model", local_dir=d)).read_bytes()
+            break
+        except Exception as e:
+            R.log.event("smoke_hf_roundtrip_error", attempt=attempt, error=f"{type(e).__name__}: {e}"[:2000])
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if attempt == len(R.uploader.retries) or status in (401, 403):
+                raise
+    out = dict(ok=got == payload, repo=repo, path=rel, attempt=attempt, upload_s=round(t1 - t0, 2),
+               download_s=round(time.time() - t1, 2))
     R.log.event("smoke_hf_roundtrip", **out)
     if not out["ok"]:
         raise SmokeFailed(f"HF round trip to {repo} returned different bytes")
