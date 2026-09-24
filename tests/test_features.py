@@ -105,6 +105,19 @@ def test_batch_composition_invariance():
         assert (f1[0] - feats[i, :T]).abs().max().item() < 1e-5
 
 
+def test_device_dither_is_the_exact_dither_on_cpu():
+    """exact_dither=False (the box's training featuriser) draws the dither with the device's RNG, a branch no CPU run
+    of LogMel reaches. Its draw, run on CPU, must be HF's per-utterance dither bitwise: the same re-seed per
+    utterance, row order and scale (on CUDA the scheme is the same, the numbers are not)."""
+    from kitsune.features import device_dither_noise, dither_noise
+
+    ns = [16000, 0, 5555, 23456, 5555]
+    want = torch.cat([dither_noise(n, 1e-5) for n in ns if n > 0])
+    assert torch.equal(device_dither_noise(ns, 1e-5, torch.device("cpu")), want)
+    assert torch.equal(device_dither_noise([5555], 1e-5, "cpu"), dither_noise(5555))  # batch-invariant
+    assert not torch.equal(device_dither_noise(ns[::-1], 1e-5, "cpu"), want)  # the row order is kept
+
+
 def test_fp32_under_autocast():
     rng = np.random.default_rng(2)
     wave, lengths = pad_waves([(0.1 * rng.standard_normal(n)).astype(np.float32) for n in (8000, 12000)])

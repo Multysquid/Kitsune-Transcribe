@@ -281,6 +281,75 @@ def test_a_failed_pre_cooldown_upload_is_kept_for_finish(tmp_path, pre_upload_ok
         assert not any(p.endswith(m.UPLOAD_MARK) for p in finish.expected_files(run))
 
 
+@pytest.mark.parametrize("fault", [None, "no_processor", "frames_shifted", "mask", "dither_scale",
+                                   "dither_in_padding", "dither_per_batch"])
+def test_smoke_stops_on_a_featuriser_that_is_off(fault, monkeypatch):
+    """The smoke's LogMel vs HF check only logged its numbers: features other than the teacher's ran the paid hours
+    anyway. A mean |diff| above LOGMEL_MEAN_DIFF_MAX or other masks now fail the smoke (a missing processor stays a
+    logged skip), and so does a training dither of the wrong scale, in the padding, or not batch-invariant: it is
+    checked on the training device, whose dither branch no comparison with HF can judge."""
+    from types import SimpleNamespace
+
+    from kitsune import features as Fm
+
+    m = load_script("04_distill")
+    rng = np.random.default_rng(3)
+    waves = [(0.1 * rng.standard_normal(n)).astype(np.float32) for n in (16000, 5555, 23456)]
+    exact = Fm.LogMel()
+
+    class Reached(Exception):
+        pass
+
+    class Train(list):
+        def wave(self, i):
+            return self[i]
+
+    def reference(ws, path_or_repo=None):
+        if fault == "no_processor":
+            raise OSError("no preprocessor_config.json in the student dir")
+        return exact(*Fm.pad_waves(ws))  # bitwise the HF extractor on CPU (tests/test_features.py)
+
+    def feat_eval(wave, lengths):
+        f, mask = exact(wave, lengths)
+        return (torch.roll(f, 1, dims=1) if fault == "frames_shifted" else f,
+                torch.roll(mask, 1, dims=1) if fault == "mask" else mask)
+
+    class TrainFeat(Fm.LogMel):
+        def _dither(self, wave, lengths, valid):
+            if fault == "dither_scale":
+                return 10 * super()._dither(wave, lengths, valid)
+            if fault == "dither_in_padding":
+                return wave + self.dither * torch.randn_like(wave)
+            if fault == "dither_per_batch":
+                return wave + valid * self.dither * torch.randn_like(wave)
+            return super()._dither(wave, lengths, valid)
+
+    def past_the_featuriser():
+        raise Reached
+
+    evs = []
+    monkeypatch.setattr(Fm, "hf_reference", reference)
+    R = SimpleNamespace(train=Train(waves), cfg={"student": "students/x"}, feat_eval=feat_eval,
+                        feat_train=TrainFeat(exact_dither=False), device=torch.device("cpu"),
+                        log=SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw))),
+                        planner=SimpleNamespace(worst_micro_batches=past_the_featuriser))
+    if fault in (None, "no_processor"):
+        with pytest.raises(Reached):
+            m.smoke_checks(R)
+        ev = dict(evs)
+        assert ev["smoke_logmel_vs_hf"] == (dict(skipped="OSError: no preprocessor_config.json in the student dir")
+                                            if fault else dict(max_abs_diff=0.0, mean_abs_diff=0.0, masks_equal=True,
+                                                               n=3, device="cpu"))
+        dith = ev["smoke_train_dither"]
+        assert dith["ok"] and dith["padding_zero"] and dith["batch_invariant"] and dith["n"] == 3
+        assert dith["std"] == pytest.approx(1e-5, rel=0.05)
+    else:
+        with pytest.raises(m.SmokeFailed, match="dither" if fault.startswith("dither") else "HF extractor"):
+            m.smoke_checks(R)
+        if not fault.startswith("dither"):
+            assert "smoke_train_dither" not in dict(evs)
+
+
 def test_a_file_renamed_away_while_an_upload_lists_its_dir_is_a_retried_attempt(tmp_path, monkeypatch):
     """The upload's size listing ran outside its try: one that met the end save's trainer.pt.tmp just before its
     rename raised FileNotFoundError out of the upload's future, unlogged, or re-raised by wait() at the end of a finished
@@ -756,10 +825,13 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
 
     ev2 = events(run)
     kinds = [e["kind"] for e in ev2]
-    for k in ("smoke_logmel_vs_hf", "smoke_longest_fwd_bwd", "smoke_padded_row", "smoke_sdpa", "smoke_flops",
-              "smoke_hf_roundtrip", "memory_probe", "smoke_steps", "resume", "resumed", "verdict", "logger_close"):
+    for k in ("smoke_logmel_vs_hf", "smoke_train_dither", "smoke_longest_fwd_bwd", "smoke_padded_row", "smoke_sdpa",
+              "smoke_flops", "smoke_hf_roundtrip", "memory_probe", "smoke_steps", "resume", "resumed", "verdict",
+              "logger_close"):
         assert k in kinds, k
-    assert next(e for e in ev2 if e["kind"] == "smoke_logmel_vs_hf")["max_abs_diff"] == 0.0  # bitwise on CPU
+    lm = next(e for e in ev2 if e["kind"] == "smoke_logmel_vs_hf")
+    assert lm["max_abs_diff"] == lm["mean_abs_diff"] == 0.0 and lm["masks_equal"]  # bitwise on CPU
+    assert next(e for e in ev2 if e["kind"] == "smoke_train_dither")["ok"]
     pad = next(e for e in ev2 if e["kind"] == "smoke_padded_row")
     assert pad["ok"] and pad["argmax_agree"] == 1.0 and pad["kl_mean"] < 1e-6 and pad["n_utts"] == 32  # fp32: exact
     assert next(e for e in ev2 if e["kind"] == "resumed")["at_step"] == 10

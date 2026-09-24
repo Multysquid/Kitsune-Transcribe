@@ -10,7 +10,8 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                micro-batches with the optimizer state's bytes reserved and, when steps accumulate several
                micro-batches, the gradients held; on OOM halve micro_audio_s down to memory.min_micro_audio_s, then
                per-layer gradient checkpointing; on Windows under a cap at the free VRAM, see cap_vram), then LogMel
-               vs the HF extractor,
+               vs the HF extractor (a mean |diff| above LOGMEL_MEAN_DIFF_MAX or other masks stop the run), the
+               training featuriser's dither on the device (train_dither_check),
                forward+backward on the longest padded micro-batch with finite gradients, padded rows == the same
                utterances run alone (mean KL over the shortest smoke.pad_utts; see padded_row_check), SDPA backends, a
                FLOP count for the MFU estimate and an HF upload round trip
@@ -2130,6 +2131,30 @@ def decode_preflight(R: Run):
         raise SmokeFailed(f"audio decode fails for whole sets: {'; '.join(bad)}")
 
 
+# the smoke's bound on mean |LogMel - HF| over the normalised features: a real featuriser bug (a lost pre-emphasis or
+# dither scale, misaligned frames) gives 0.1 and more, FFT/TF32 rounding at most ~2.4e-4 (all-silence clips included)
+LOGMEL_MEAN_DIFF_MAX = 1e-2
+
+
+def train_dither_check(R: Run, lengths: list[int]) -> dict:
+    """The training featuriser's dither drawn on the device itself: with perf.train_exact_dither false it comes from
+    the device's RNG, a branch no CPU run reaches, and its numbers differ from HF's by design, so a comparison of
+    features cannot see a wrong scale or placement. On a zero wave the noise is all there is: exactly 0 in the
+    padding, std within 10 % of LogMel.dither on the valid samples, and each utterance drawn alone gets the noise it
+    got in the batch."""
+    feat, dev = R.feat_train, R.device
+    S = max(lengths)
+    valid = torch.arange(S, device=dev)[None, :] < torch.tensor(lengths, device=dev)[:, None]
+    noise = feat._dither(torch.zeros(len(lengths), S, device=dev), lengths, valid)
+    std = float(noise[valid].std())
+    padding_zero = bool((noise[~valid] == 0).all())
+    alone = all(torch.equal(feat._dither(torch.zeros(1, n, device=dev), [n], valid[i:i + 1, :n]), noise[i:i + 1, :n])
+                for i, n in enumerate(lengths))
+    ok = padding_zero and alone and abs(std / feat.dither - 1.0) <= 0.1
+    return dict(ok=ok, std=std, dither=feat.dither, padding_zero=padding_zero, batch_invariant=alone,
+                exact=feat.exact_dither, n=len(lengths), device=str(dev))
+
+
 def smoke_checks(R: Run):
     """Checks that cost seconds and catch the failures that would otherwise burn the paid hours silently."""
     from kitsune.features import hf_reference
@@ -2137,20 +2162,34 @@ def smoke_checks(R: Run):
 
     log = R.log
     t0 = time.time()
-    # LogMel vs the HF extractor on a few real utterances (bitwise on CPU; FFT/matmul rounding on CUDA)
+    # LogMel vs the HF extractor on a few real utterances (bitwise on CPU; FFT/matmul rounding on CUDA). The max
+    # |diff| is informational (TF32 takes it to ~0.1 on an all-silence clip); the mean and the masks fail the smoke
     idx = list(range(min(4, len(R.train))))
     waves = [R.train.wave(i) for i in idx]
+    bad = None
     try:
         ref, ref_mask = hf_reference(waves, path_or_repo=str(rpath(R.cfg["student"])))
         wave = torch.zeros(len(waves), max(len(w) for w in waves))
         for i, w in enumerate(waves):
             wave[i, :len(w)] = torch.from_numpy(w)
         got, mask = R.feat_eval(wave.to(R.device), torch.tensor([len(w) for w in waves], device=R.device))
-        diff = float((got.cpu() - ref).abs().max()) if got.shape == ref.shape else float("inf")
-        log.event("smoke_logmel_vs_hf", max_abs_diff=diff, masks_equal=bool(torch.equal(mask.cpu(), ref_mask.bool())),
+        d = (got.cpu() - ref).abs() if got.shape == ref.shape else None
+        diff, mean = (float(d.max()), float(d.mean())) if d is not None else (float("inf"), float("inf"))
+        masks_equal = bool(torch.equal(mask.cpu(), ref_mask.bool()))
+        log.event("smoke_logmel_vs_hf", max_abs_diff=diff, mean_abs_diff=mean, masks_equal=masks_equal,
                   n=len(waves), device=str(R.device))
+        if not (masks_equal and math.isfinite(mean) and mean <= LOGMEL_MEAN_DIFF_MAX):
+            bad = (f"LogMel differs from the HF extractor the teacher saw: mean |diff| {mean:.3g} (bound "
+                   f"{LOGMEL_MEAN_DIFF_MAX}), max {diff:.3g}, masks equal {masks_equal}")
     except Exception as e:  # no processor files in the student dir: informational only
         log.event("smoke_logmel_vs_hf", skipped=f"{type(e).__name__}: {e}"[:300])
+    if bad:
+        raise SmokeFailed(bad)
+    if waves and R.feat_train.dither > 0:
+        dith = train_dither_check(R, [len(w) for w in waves])
+        log.event("smoke_train_dither", **dith)
+        if not dith["ok"]:
+            raise SmokeFailed(f"the training featuriser's dither is off: {dith}")
 
     worst = R.planner.worst_micro_batches()
     mb = R.ds[worst["longest"]]
