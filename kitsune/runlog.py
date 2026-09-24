@@ -428,6 +428,70 @@ def _ram_total_gb() -> float | None:
         return None
 
 
+# The container's own cgroup (Linux; absent on Windows). psutil, os.cpu_count() and os.getloadavg() read /proc, which
+# inside a container (the vast box) is the whole host's: a 1-GPU slice of a big machine sees several times the RAM
+# and cores it may use, and the load of every tenant.
+CGROUP = Path("/sys/fs/cgroup")
+_CG_LIMITS = {2: ("memory.max", "memory.high", "memory.low", "cpu.max", "pids.max"),
+              1: ("memory/memory.limit_in_bytes", "memory/memory.soft_limit_in_bytes", "cpu/cpu.cfs_quota_us",
+                  "cpu/cpu.cfs_period_us", "pids/pids.max")}
+
+
+def _cg_version() -> int | None:
+    if (CGROUP / "memory.max").is_file():
+        return 2
+    if (CGROUP / "memory" / "memory.limit_in_bytes").is_file():
+        return 1
+    return None
+
+
+def _cg_text(rel: str) -> str | None:
+    try:
+        return (CGROUP / rel).read_text().strip()
+    except Exception:
+        return None
+
+
+def _cg_fields(rel: str) -> dict[str, int]:
+    """'key value' lines (memory.stat, memory.events, memory.oom_control) -> {key: int}."""
+    out = {}
+    for line in (_cg_text(rel) or "").splitlines():
+        k, _, v = line.partition(" ")
+        if v.strip().isdigit():
+            out[k] = int(v)
+    return out
+
+
+def _cgroup_limits() -> dict | None:
+    """The raw limit files of the container's cgroup ("max" / -1: none) and its version; None without one."""
+    v = _cg_version()
+    return None if v is None else dict(version=v, **{f: _cg_text(f) for f in _CG_LIMITS[v]})
+
+
+def _cgroup_mem() -> dict:
+    """The container's own memory in bytes, v2 else v1; {} without a cgroup, and never raises. anon: the trainer and
+    all its DataLoader workers, page cache left out (comparable to the offer's cpu_ram); shmem: /dev/shm (the workers'
+    batches); limit only when there is one; oom_kill: the cgroup's OOM-kill counter. Not memory.current: it counts the
+    page cache of the shards being read and sits near the limit on a healthy run."""
+    try:
+        v = _cg_version()
+        if v == 2:
+            stat, limit = _cg_fields("memory.stat"), _cg_text("memory.max")
+            out = dict(anon=stat.get("anon"), shmem=stat.get("shmem"),
+                       oom_kill=_cg_fields("memory.events").get("oom_kill"))
+        elif v == 1:
+            stat, limit = _cg_fields("memory/memory.stat"), _cg_text("memory/memory.limit_in_bytes")
+            out = dict(anon=stat.get("total_rss", stat.get("rss")), shmem=stat.get("total_shmem", stat.get("shmem")),
+                       oom_kill=_cg_fields("memory/memory.oom_control").get("oom_kill"))
+        else:
+            return {}
+        if limit and limit.isdigit() and int(limit) < 2**62:  # v2 "max", v1 ~2**63: no limit
+            out["limit"] = int(limit)
+        return {k: x for k, x in out.items() if x is not None}
+    except Exception:
+        return {}
+
+
 def safe_env() -> dict[str, str]:
     """Launch-relevant env vars with anything secret-looking redacted (the name stays, so its presence is visible)."""
     out = {}
@@ -456,6 +520,8 @@ def system_info() -> dict:
                 cudnn=_try(torch.backends.cudnn.version) if cuda else None, cuda_available=cuda,
                 time_utc=_now_iso(), env=safe_env())
     info["libsndfile"] = _try(lambda: __import__("soundfile").__libsndfile_version__)
+    # cpu_count and ram_gb are the host's inside a container; its own limits are here (None: not in a cgroup)
+    info["cgroup"] = _try(_cgroup_limits)
     if cuda:
         info["gpus"] = _try(lambda: [dict(name=torch.cuda.get_device_name(i),
                                           capability=list(torch.cuda.get_device_capability(i)),
@@ -532,8 +598,10 @@ def _nvml():
 
 
 def system_stats() -> dict[str, float]:
-    """GPU util/mem/power/temp/clocks via NVML, torch CUDA memory, process RSS and CPU %. Missing pieces are
-    simply absent (no pynvml, no CUDA, no psutil)."""
+    """GPU util/mem/power/temp/clocks via NVML, torch CUDA memory, process RSS and CPU %, and the container's own
+    memory under sys/cgroup/ (anon_gb, shmem_gb, limit_gb, oom_kill; see _cgroup_mem). Missing pieces are simply absent
+    (no pynvml, no CUDA, no psutil, no cgroup). sys/ram_used_pct and sys/load1 come from /proc: inside a container
+    (the vast box) they are the whole host's, not this instance's; sys/proc/rss_gb is the main process only."""
     global _PROC
     out = {}
     nv = _nvml()
@@ -585,6 +653,12 @@ def system_stats() -> dict[str, float]:
             pass
     if hasattr(os, "getloadavg"):
         out["sys/load1"] = os.getloadavg()[0]
+    cg = _cgroup_mem()
+    for k in ("anon", "shmem", "limit"):
+        if k in cg:
+            out[f"sys/cgroup/{k}_gb"] = cg[k] / 2**30
+    if "oom_kill" in cg:
+        out["sys/cgroup/oom_kill"] = float(cg["oom_kill"])
     return out
 
 

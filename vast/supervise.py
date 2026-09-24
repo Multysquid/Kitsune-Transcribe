@@ -14,10 +14,12 @@ the disk (checkpoints, logs) survives for a human to inspect.
 
 Every non-zero exit first forces a log sync (finish.py --sync-only --no-full): a hard crash (segfault, OOM kill, CUDA
 fault) skips the trainer's own final sync. The ~9 GB full state is left out there because a resume needs it only
-locally and every stop path (finish.py --stop) uploads it anyway; the GPU idles while this sync runs. The attempt
-history lives in $KITSUNE_STATE/supervise.json, so if the container restarts in the middle of an attempt (host reboot)
-the interrupted attempt counts as a failure (its run dir is found again from its start time or its --resume path) and
-the same policy applies; once a final decision is recorded the supervisor never starts another run. An exclusive lock
+locally and every stop path (finish.py --stop) uploads it anyway; the GPU idles while this sync runs. Each attempt
+records the OOM kills the container's cgroup counted while it ran (oom_kills; "(oom_kill +N)" in its exit line): the
+rc alone does not tell one that took a DataLoader worker from any other error. The attempt history lives in
+$KITSUNE_STATE/supervise.json, so if the container restarts in the middle of an attempt (host reboot) the interrupted
+attempt counts as a failure (its run dir is found again from its start time or its --resume path) and the same policy
+applies; once a final decision is recorded the supervisor never starts another run. An exclusive lock
 ($KITSUNE_STATE/supervise.lock, flock) keeps a second supervisor (vast/onstart.sh run again by hand during a healthy
 run) from treating the live attempt as interrupted.
 
@@ -57,6 +59,7 @@ SYNC_TIMEOUT_S = 1800
 FINISH_TIMEOUT_S = {"stop": 1800, "destroy": 3600}
 FALLBACK_TIMEOUT_S = 900  # finish.py --stop --no-sync: infra upload capped at 180 s, then vast REST (3 tries) and CLI
 TAIL_BYTES = 256 << 10
+CGROUP = Path("/sys/fs/cgroup")
 
 
 def log(msg: str):
@@ -125,6 +128,22 @@ def train_argv(train_cmd: list[str], config: str, out_repo: str | None, resume: 
     if resume is not None:
         argv += ["--resume", str(resume)]
     return argv
+
+
+def oom_kills(cg: Path | None = None) -> int | None:
+    """The container's OOM-kill counter (cgroup v2 memory.events, else v1 memory.oom_control); None without one. The
+    rc names an OOM kill only when it hit the trainer itself (-9): one that took a DataLoader worker ends the trainer
+    with a plain error, and the host-wide RAM numbers in its logs do not show the container's own limit."""
+    cg = cg or CGROUP
+    for rel in ("memory.events", "memory/memory.oom_control"):
+        try:
+            for line in (cg / rel).read_text().splitlines():
+                k, _, v = line.partition(" ")
+                if k == "oom_kill":
+                    return int(v)
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def run_trainer(argv: list[str], env: dict) -> int:
@@ -227,11 +246,15 @@ def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: lis
         state["attempts"].append(attempt)
         save_state(state_path, state)
         env = dict(os.environ, KITSUNE_ATTEMPT=str(len(state["attempts"])))
+        oom0 = oom_kills()
         rc = run_trainer(train_argv(train_cmd, config, out_repo, resume), env)
+        oom1 = oom_kills()
         run_dir = attempt_run_dir(attempt, runs_root)
-        attempt.update(rc=rc, t1=time.time(), run_dir=str(run_dir) if run_dir else None, step=last_step(run_dir))
+        attempt.update(rc=rc, t1=time.time(), run_dir=str(run_dir) if run_dir else None, step=last_step(run_dir),
+                       oom_kills=oom1 - oom0 if oom0 is not None and oom1 is not None else None)
         save_state(state_path, state)
-        log(f"attempt {len(state['attempts'])} exited {rc} at step {attempt['step']} after "
+        oom = f" (oom_kill +{attempt['oom_kills']})" if attempt["oom_kills"] else ""
+        log(f"attempt {len(state['attempts'])} exited {rc}{oom} at step {attempt['step']} after "
             f"{(attempt['t1'] - attempt['t0']) / 60:.1f} min (run dir {run_dir})")
         if rc != EXIT_OK:
             call_finish(["--sync-only", "--no-full", *dry], timeout=SYNC_TIMEOUT_S)

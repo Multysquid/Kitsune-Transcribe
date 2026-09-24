@@ -883,6 +883,32 @@ def test_supervise_post_crash_sync_leaves_the_full_state_to_the_stop_path(tmp_pa
     assert finishes[0] == ["--sync-only", "--no-full"] and finishes[-1][0] == "--destroy"
 
 
+def test_supervise_records_the_containers_oom_kills(tmp_path, monkeypatch, capsys):
+    """An OOM kill that takes a DataLoader worker ends the trainer with a plain error (rc 1, not -9), and the logs'
+    RAM numbers are the host's: the cgroup's counter names it, in supervise.json and in the attempt's exit line."""
+    cg = tmp_path / "cgroup"
+    cg.mkdir()
+    (cg / "memory.events").write_text("low 0\nhigh 0\nmax 4\noom 1\noom_kill 1\noom_group_kill 0\n")
+    monkeypatch.setattr(supervise, "CGROUP", cg)
+    trainer = FakeTrainer(tmp_path / "runs", [(1, 50, False)])
+
+    def killed(argv, env):
+        (cg / "memory.events").write_text("low 0\nhigh 0\nmax 9\noom 2\noom_kill 2\noom_group_kill 0\n")
+        return trainer(argv, env)
+
+    monkeypatch.setattr(supervise, "run_trainer", killed)
+    monkeypatch.setattr(supervise, "call_finish", lambda args, timeout=None: 0)
+    state_path = tmp_path / "state" / "supervise.json"
+    supervise.supervise("configs/viability.json", None, tmp_path / "runs", ["python", "04.py"], state_path)
+    assert json.loads(state_path.read_text(encoding="utf-8"))["attempts"][0]["oom_kills"] == 1
+    assert "attempt 1 exited 1 (oom_kill +1) at step 50" in capsys.readouterr().out
+    assert supervise.oom_kills(tmp_path / "nowhere") is None  # no cgroup (Windows): unknown, not 0
+    (cg / "memory").mkdir()
+    (cg / "memory" / "memory.oom_control").write_text("oom_kill_disable 0\nunder_oom 0\noom_kill 3\n")
+    (cg / "memory.events").unlink()
+    assert supervise.oom_kills(cg) == 3  # cgroup v1
+
+
 def test_supervise_never_reruns_after_final(tmp_path, monkeypatch):
     state = {"attempts": [{"t0": 0.0, "rc": 0, "step": 10}], "final": {"action": "destroy"}}
     rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [], state=state)

@@ -6,6 +6,7 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import sys
 import threading
 import time
@@ -467,6 +468,42 @@ def test_env_redacts_secrets(tmp_path, monkeypatch):
     assert not any(k.startswith("SSH_") for k in system["env"])
     assert system["env"]["HF_TOKEN"] == "<redacted>" and system["env"]["VAST_CONTAINERLABEL"] == "C.12345"
     assert system["instance_id"] == "C.12345" and system["offer_dph"] == 0.672
+
+
+def test_system_stats_read_the_containers_own_memory(tmp_path, monkeypatch):
+    """Inside a container psutil and the load average are the whole host's; the cgroup (v2, else v1) gives the
+    instance's own memory, limit and OOM kills. Not memory.current: it counts page cache and sits near the limit."""
+    cg = tmp_path / "cgroup"
+    monkeypatch.setattr(runlog, "CGROUP", cg)
+    assert runlog._cgroup_limits() is None  # no cgroup (Windows): nothing added, nothing raised
+    assert not any(k.startswith("sys/cgroup/") for k in system_stats())
+
+    files = {"memory.max": "137438953472", "memory.high": "max", "memory.low": "0", "cpu.max": "1600000 100000",
+             "pids.max": "4096", "memory.current": "136365211648",
+             "memory.stat": "anon 10737418240\nfile 125627793408\nshmem 1073741824\nfile_mapped 0\n",
+             "memory.events": "low 0\nhigh 0\nmax 7\noom 1\noom_kill 1\noom_group_kill 0\n"}
+    cg.mkdir()
+    for name, text in files.items():
+        (cg / name).write_text(text + "\n", encoding="utf-8")
+    st = {k: v for k, v in system_stats().items() if k.startswith("sys/cgroup/")}
+    assert st == {"sys/cgroup/anon_gb": 10.0, "sys/cgroup/shmem_gb": 1.0, "sys/cgroup/limit_gb": 128.0,
+                  "sys/cgroup/oom_kill": 1.0}
+    assert runlog._cgroup_limits() == {"version": 2, "memory.max": "137438953472", "memory.high": "max",
+                                       "memory.low": "0", "cpu.max": "1600000 100000", "pids.max": "4096"}
+    (cg / "memory.max").write_text("max\n", encoding="utf-8")  # no limit: no limit_gb
+    assert "sys/cgroup/limit_gb" not in system_stats() and "sys/cgroup/anon_gb" in system_stats()
+
+    shutil.rmtree(cg)
+    (cg / "memory").mkdir(parents=True)  # cgroup v1: total_* counts the whole hierarchy; ~2**63 means no limit
+    for name, text in {"memory.limit_in_bytes": "9223372036854771712",
+                       "memory.stat": "cache 5\nrss 7\nshmem 3\ntotal_cache 5\ntotal_rss 2147483648\n"
+                                      "total_shmem 536870912\n",
+                       "memory.oom_control": "oom_kill_disable 0\nunder_oom 0\noom_kill 2\n"}.items():
+        (cg / "memory" / name).write_text(text, encoding="utf-8")
+    st = {k: v for k, v in system_stats().items() if k.startswith("sys/cgroup/")}
+    assert st == {"sys/cgroup/anon_gb": 2.0, "sys/cgroup/shmem_gb": 0.5, "sys/cgroup/oom_kill": 2.0}
+    assert runlog._cgroup_limits()["version"] == 1
+    assert runlog._cgroup_limits()["memory/memory.limit_in_bytes"] == "9223372036854771712"
 
 
 def test_export_run(run, tmp_path):
