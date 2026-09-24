@@ -61,8 +61,11 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    Re-running it after an interruption only sends what is missing. Optional, only if your uplink is fast enough: also
    `--include "data/shards/<source>/*.parquet"` for a source to ship its audio instead of rebuilding it on the box
    (bootstrap.sh uses parked shards when they are there).
-3. Create a **fine-grained** token at https://huggingface.co/settings/tokens: read access to `kitsune-data`, write
-   access to `kitsune-runs`. Nothing else.
+3. Create a **fine-grained** token at https://huggingface.co/settings/tokens: `kitsune-runs` needs read AND write
+   access to its contents (the trainer reads its uploads back), `kitsune-data` needs read. If the page applies one
+   permission set to every selected repo, read + write on both is fine. No create permission is needed (both repos
+   exist), and no gated-repo access: the parked student dir carries the processor and tokenizer files, and the
+   upstream datasets are public. Bootstrap checks this token against both repos in its first minute on the box.
 
 ### 3. vast.ai account
 

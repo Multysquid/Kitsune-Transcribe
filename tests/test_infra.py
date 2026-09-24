@@ -259,6 +259,7 @@ def test_bootstrap_pull_fails_before_the_rebuild_when_nothing_arrived(tmp_path):
     (stub / "__init__.py").write_text(
         "class HfApi:\n"
         "    def whoami(self):\n        return {'name': 'u'}\n"
+        "    def auth_check(self, *a, **k):\n        pass\n"
         f"    def list_repo_files(self, *a, **k):\n        return {repo_files!r}\n"
         "def snapshot_download(*args, **kwargs):\n    pass  # the silent no-op: nothing arrives\n", encoding="utf-8")
     (stub / "utils.py").write_text(  # the real matcher (pure Python), which snapshot_download filters the tree with
@@ -274,7 +275,8 @@ def test_bootstrap_pull_fails_before_the_rebuild_when_nothing_arrived(tmp_path):
         sources=["src_a"], eval_sets=["eval_x"], data_root="data", selection="selection/v.parquet",
         student="students/s")), encoding="utf-8")
     env = dict(os.environ, KITSUNE_DIR=str(box), STATE=str(state), CONFIG="configs/c.json", KITSUNE_DATA_REPO="u/data",
-               KITSUNE_DATA_REVISION="main", PYTHONPATH=os.pathsep.join([str(tmp_path / "stub"), str(ROOT)]))
+               KITSUNE_OUT_REPO="u/runs", KITSUNE_DATA_REVISION="main",
+               PYTHONPATH=os.pathsep.join([str(tmp_path / "stub"), str(ROOT)]))
 
     def helper(cmd):
         return subprocess.run([sys.executable, str(tmp_path / "helper.py"), cmd], capture_output=True, text=True,
@@ -291,6 +293,45 @@ def test_bootstrap_pull_fails_before_the_rebuild_when_nothing_arrived(tmp_path):
         (box / f).write_bytes(b"x")
     r = helper("pull")
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_bootstrap_plan_checks_the_box_token_on_the_output_repo(tmp_path):
+    """launch.py checks the HF repos with the laptop's own (broader) login; the box HF_TOKEN's first use of the output
+    repo was the trainer's hf_roundtrip, after the pull, the 10-20 min audio rebuild and the model load. plan() now
+    asks the Hub whether the token can read and write it (auth_check: GETs, no commit) before anything is pulled, so a
+    wrongly scoped token stops the box in its first minutes."""
+    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
+    assert re.search(r'if \[ -z "\$\{KITSUNE_OUT_REPO:-\}" \]; then\n.*\n\s+exit 2\n', text)
+    (tmp_path / "helper.py").write_text(re.search(r"<<'PYEOF'\n(.*?\n)PYEOF\n", text, re.S).group(1), encoding="utf-8")
+    stub = tmp_path / "stub" / "huggingface_hub"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text(
+        "import os\n"
+        "class HfApi:\n"
+        "    def whoami(self):\n        return {'name': 'u'}\n"
+        "    def auth_check(self, repo_id, *, repo_type=None, write=False):\n"
+        "        print(f'auth_check {repo_id} {repo_type} write={write}')\n"
+        "        if write and os.environ.get('DENY_WRITE'):\n"
+        "            raise PermissionError('403 Forbidden')\n"
+        "    def list_repo_files(self, *a, **k):\n        return []\n", encoding="utf-8")
+    (stub / "utils.py").write_text("def filter_repo_objects(items, **kw):\n    return list(items)\n", encoding="utf-8")
+    box, state = tmp_path / "box", tmp_path / "state"
+    (box / "configs").mkdir(parents=True)
+    state.mkdir()
+    (box / "configs" / "c.json").write_text(json.dumps(dict(
+        sources=["src_a"], eval_sets=[], selection="selection/v.parquet", student="students/s")), encoding="utf-8")
+    env = dict(os.environ, KITSUNE_DIR=str(box), STATE=str(state), CONFIG="configs/c.json", KITSUNE_DATA_REPO="u/data",
+               KITSUNE_OUT_REPO="u/runs", KITSUNE_DATA_REVISION="main", DENY_WRITE="1",
+               PYTHONPATH=os.pathsep.join([str(tmp_path / "stub"), str(ROOT)]))
+    run = [sys.executable, str(tmp_path / "helper.py"), "plan"]
+    r = subprocess.run(run, capture_output=True, text=True, env=env, timeout=120)
+    assert r.returncode != 0 and "auth_check u/runs model write=False" in r.stdout
+    assert "HF_TOKEN cannot write u/runs (PermissionError: 403 Forbidden)" in r.stderr, r.stdout + r.stderr
+    assert not (state / "bootstrap_plan.json").exists()
+    del env["DENY_WRITE"]
+    r = subprocess.run(run, capture_output=True, text=True, env=env, timeout=120)
+    assert "auth_check u/runs model write=True" in r.stdout and "HF_TOKEN cannot" not in r.stderr
+    assert "data repo u/data@main lacks" in r.stderr, "past the token check, on to the data listing"
 
 
 def test_onstart_fits_vast_limits():

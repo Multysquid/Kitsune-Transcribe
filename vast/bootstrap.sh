@@ -14,7 +14,10 @@
 # optionally <data_root>/shards/... (paths from the run config). Idempotent: snapshot_download and 01 both skip what is
 # already on disk. Phase timings go to $KITSUNE_STATE/bootstrap_timings.jsonl.
 #
-# Env: KITSUNE_DATA_REPO (required), KITSUNE_DATA_REVISION (default main), KITSUNE_CONFIG (default
+# The plan phase also checks that HF_TOKEN can read and write $KITSUNE_OUT_REPO: launch.py checks the repos with the
+# laptop's own login, and the trainer's first upload comes only after the pull, the audio rebuild and the model load.
+#
+# Env: KITSUNE_DATA_REPO and KITSUNE_OUT_REPO (required), KITSUNE_DATA_REVISION (default main), KITSUNE_CONFIG (default
 # configs/viability.json), KITSUNE_PREP_ARGS (extra args for 01; leave it empty for the viability data: its teacher
 # outputs cover exactly the first 6 Galgame tars and 300 h of Emilia-YODAS, which are 01's defaults, and a larger
 # --galgame-shards/--emilia-hours only downloads audio without teacher output), KITSUNE_MIN_COVERAGE (default 0.99),
@@ -36,6 +39,10 @@ log() { printf '%s [bootstrap] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
 if [ -z "${KITSUNE_DATA_REPO:-}" ]; then
     log "KITSUNE_DATA_REPO is not set"
+    exit 2
+fi
+if [ -z "${KITSUNE_OUT_REPO:-}" ]; then
+    log "KITSUNE_OUT_REPO is not set (vast/launch.py passes it)"
     exit 2
 fi
 if [ -z "${HF_TOKEN:-}" ]; then
@@ -108,6 +115,15 @@ def plan():
 
     api = HfApi()
     print(f"hf user: {api.whoami()['name']}")
+    # the box token's first use of the output repo would otherwise be the trainer's hf_roundtrip, after the pull, the
+    # audio rebuild and the model load; auth_check is a GET (no commit), and the trainer reads its uploads back
+    out_repo = os.environ["KITSUNE_OUT_REPO"]
+    for write in (False, True):
+        try:
+            api.auth_check(out_repo, repo_type="model", write=write)
+        except Exception as e:
+            sys.exit(f"HF_TOKEN cannot {'write' if write else 'read'} {out_repo} ({type(e).__name__}: {e}): give the "
+                     f"fine-grained token read and write access to it (vast/README.md step 2.3)")
     files = api.list_repo_files(repo, repo_type="dataset", revision=rev)
 
     def has(pat: str) -> bool:
