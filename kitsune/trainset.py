@@ -662,7 +662,10 @@ def _cat(parts: list[np.ndarray], dtype, empty_shape: tuple) -> torch.Tensor:
 
 
 def default_num_workers() -> int:
-    """perf.num_workers = "auto": FLAC decode is ~4000x realtime per core, so a few workers keep up with any GPU."""
+    """perf.num_workers = "auto". Most of the train audio is not FLAC: measured per core on the laptop, Emilia's 24 kHz
+    MP3 (with a soxr_hq resample) decodes at ~1000-1700x realtime and galgame's OGG at ~1400-2200x (FLAC ~4000x),
+    about half that on a slow core. 8 workers then give ~8-15k audio-s/s, well above one A100 (~2.5k at 30-40 % MFU);
+    a loader cut to 1-2 workers (scripts/04_distill.py shm_cap) is not."""
     if os.name == "nt":
         return 2
     return max(1, min(8, (os.cpu_count() or 2) // 2))

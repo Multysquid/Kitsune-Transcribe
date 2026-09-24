@@ -515,8 +515,17 @@ def test_shm_cap_fits_workers_into_dev_shm(monkeypatch, tmp_path):
     monkeypatch.setattr(m.shutil, "disk_usage", usage(64 * 2**20))  # Docker's default /dev/shm
     n, p, info = m.shm_cap(8, 4, 400, shm=str(tmp_path))
     assert (n, p) == (1, 1) and info["workers"] == [8, 1] and info["prefetch"] == [4, 1]
+    # 1 worker decodes the MP3/OGG-heavy train mix at ~1k audio-s/s, below an A100: the change says so (loop warns)
+    assert info["decode_ceiling_audio_s_per_s"] == 1000
+    monkeypatch.setattr(m.shutil, "disk_usage", usage(1 * 2**30))
+    n, p, info = m.shm_cap(8, 4, 400, shm=str(tmp_path))
+    assert (n, p) == (8, 2) and "decode_ceiling_audio_s_per_s" not in info  # prefetching less costs no decode rate
+    monkeypatch.setattr(m.shutil, "disk_usage", usage(300 * 2**20))
+    n, p, info = m.shm_cap(2, 4, 400, shm=str(tmp_path))
+    assert (n, p) == (2, 2) and "decode_ceiling_audio_s_per_s" not in info  # 2 workers by config, not by the cut
     monkeypatch.setattr(m.shutil, "disk_usage", usage(16 * 2**20))
-    assert m.shm_cap(8, 4, 400, shm=str(tmp_path))[:2] == (0, 1)  # decode in-process
+    n, p, info = m.shm_cap(8, 4, 400, shm=str(tmp_path))
+    assert (n, p) == (0, 1) and info["decode_ceiling_audio_s_per_s"] == 1000  # decode in-process
     assert m.shm_cap(8, 4, 400, shm=str(tmp_path / "missing")) == (8, 4, None)  # no /dev/shm (Windows)
 
 

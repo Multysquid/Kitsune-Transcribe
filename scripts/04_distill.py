@@ -172,6 +172,9 @@ END_SYNC_JOIN_S = 120
 # What it cuts off goes up anyway (Uploader.abandon)
 FAILED_UPLOAD_WAIT_S = 120
 SR = 16000
+# shm_cap's warning: below this many loader workers the train mix (mostly MP3/OGG, ~1k audio-s/s per worker on a slow
+# core; kitsune.trainset.default_num_workers) cannot feed an A100 (~2.5k audio-s/s)
+SHM_FEW_WORKERS, DECODE_AUDIO_S_PER_WORKER = 4, 1000
 FULL_RE = re.compile(r"^full_step_(\d+)$")
 WEIGHTS_RE = re.compile(r"^step_(\d+)$")
 # an empty file in a full state meant for the Hub (ckpt.upload_full_at) until its upload succeeds: rotate_full keeps
@@ -498,7 +501,9 @@ def shm_cap(nw: int, prefetch: int, micro_audio_s: float, shm: str = "/dev/shm")
     turns that stall into a crash vast/supervise.py can resume. Up to num_workers * prefetch micro-batches of up to
     micro_audio_s padded float32 audio are in flight: keep them within half the free space (measured once, at loop
     start) by prefetching less, then using fewer workers, then decoding in-process. Returns (workers, prefetch, change
-    or None)."""
+    or None). A cut below SHM_FEW_WORKERS workers adds a rough decode ceiling to the change
+    (DECODE_AUDIO_S_PER_WORKER per worker, one for in-process decoding): the MP3/OGG-heavy train mix then feeds ~1k
+    audio-s/s per worker, below what an A100 takes, so the run trains fewer epochs than the GPU allows."""
     if nw <= 0 or not os.path.isdir(shm):
         return nw, prefetch, None
     try:
@@ -517,8 +522,11 @@ def shm_cap(nw: int, prefetch: int, micro_audio_s: float, shm: str = "/dev/shm")
         n = 0
     if (n, p) == (nw, prefetch):
         return nw, prefetch, None
-    return n, p, dict(shm_free_gb=round(free / 2**30, 3), workers=[nw, n], prefetch=[prefetch, p],
-                      micro_audio_s=micro_audio_s)
+    change = dict(shm_free_gb=round(free / 2**30, 3), workers=[nw, n], prefetch=[prefetch, p],
+                  micro_audio_s=micro_audio_s)
+    if n < min(nw, SHM_FEW_WORKERS):  # the cut, not the configured count, left too few workers
+        change["decode_ceiling_audio_s_per_s"] = max(n, 1) * DECODE_AUDIO_S_PER_WORKER
+    return n, p, change
 
 
 # ------------------------------------------------------------------------------------------------------- the run
@@ -2496,6 +2504,10 @@ def loop(R: Run):
     nw, prefetch, cap = shm_cap(nw, int(cfg["perf"]["prefetch"]), float(R.planner.micro_audio_s))
     if cap:
         log.event("shm_cap", **cap)
+        if "decode_ceiling_audio_s_per_s" in cap:  # a later ThroughputTooLow or a slow run traces back to here
+            print(f"WARNING: /dev/shm ({cap['shm_free_gb']} GiB free) cut the loader to {nw} worker(s) at prefetch "
+                  f"{prefetch}: decoding tops out near {cap['decode_ceiling_audio_s_per_s']} audio-s/s, below what the "
+                  f"GPU takes; give the container a larger /dev/shm", flush=True)
     crash_at = int(os.environ["KITSUNE_CRASH_AT_STEP"]) if os.environ.get("KITSUNE_CRASH_AT_STEP") else None
     smoke_n = int(cfg["smoke"]["steps"]) if cfg["smoke"]["enabled"] else 0
     epochs = int(sch["epochs"]) if sch["clock"] == "epochs" else None
