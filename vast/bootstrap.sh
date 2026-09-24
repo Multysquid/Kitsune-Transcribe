@@ -6,9 +6,9 @@
 # init; ~1.5 GB). The ~10 GB of audio is REBUILT here from the original public HF datasets by
 # scripts/01_prepare_data.py, which reads every upstream repo at a pinned commit, so the utterance ids match the
 # teacher outputs exactly. If the data repo also holds data/shards/<source>/*.parquet for a source, those parked
-# shards are pulled instead of rebuilding that source. The trainer joins everything by utterance id and drops (and
-# logs) rows without audio; this script already fails if coverage is below KITSUNE_MIN_COVERAGE, because a broken
-# join would waste the whole paid run.
+# shards are pulled (and listed in data/manifest.jsonl, which 01 reads) instead of rebuilding that source. The trainer
+# joins everything by utterance id and drops (and logs) rows without audio; this script already fails if coverage is
+# below KITSUNE_MIN_COVERAGE, because a broken join would waste the whole paid run.
 #
 # The repo layout mirrors the laptop's repo root: <teacher_root>/..., <second_root>/..., <selection>, <student>/...,
 # optionally <data_root>/shards/... (paths from the run config). Idempotent: snapshot_download and 01 both skip what is
@@ -135,6 +135,32 @@ def plan():
     print(f"plan: pull {len(patterns)} patterns; parked audio {parked or 'none'}; rebuild audio {rebuild or 'none'}")
 
 
+def register_parked(parked: list):
+    """List the pulled shards of the parked sources in <data_root>/manifest.jsonl, as a local ingest would have (the
+    data repo holds no manifest). 01 reads other sources' rows from the manifest - eval_emilia leaves out emilia_yodas's
+    videos ("ingest emilia_yodas first" otherwise), the reazon tiers dedup against the smaller ones - so an unlisted
+    parked source would stop the rebuild. Paths already listed are skipped, so a re-run adds nothing."""
+    if not parked:
+        return
+    import pyarrow.parquet as pq
+
+    sys.path.insert(0, str(root))  # this helper runs from a mktemp path
+    from kitsune.store import ShardInfo, append_manifest, read_manifest
+
+    droot = root / data_root
+    listed = {s.path for s in read_manifest(droot)}
+    new = []
+    for s in parked:
+        for f in sorted((droot / "shards" / s).glob("*.parquet")):
+            rel = f.relative_to(droot).as_posix()
+            if rel not in listed:
+                dur = pq.read_table(f, columns=["duration"]).column("duration").to_pylist()
+                new.append(ShardInfo(rel, s, f.name.rsplit("-", 1)[0], len(dur), sum(dur) / 3600))
+    if new:
+        append_manifest(droot, new)
+    print(f"manifest: listed {len(new)} parked shard(s) of {parked}")
+
+
 def pull():
     from huggingface_hub import snapshot_download
 
@@ -142,6 +168,7 @@ def pull():
     t0 = time.time()
     snapshot_download(repo, repo_type="dataset", revision=rev, local_dir=root, allow_patterns=p["patterns"],
                       max_workers=16)
+    register_parked(p["parked"])
     dirs = [root / d for d in (teacher_root, second_root, student, f"{data_root}/shards") if (root / d).is_dir()]
     size = sum(f.stat().st_size for d in dirs for f in d.rglob("*") if f.is_file())
     print(f"pulled in {time.time() - t0:.0f} s; derived data + parked shards on disk: {size / 1e9:.2f} GB")

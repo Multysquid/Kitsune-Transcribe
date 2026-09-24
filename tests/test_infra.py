@@ -189,6 +189,56 @@ def test_bootstrap_retries_the_audio_rebuild(tmp_path):
     assert (tmp_path / "always").read_text().strip() == "3"
 
 
+def test_bootstrap_lists_parked_shards_in_the_manifest(tmp_path, prep):
+    """A parked source's shards come from the data repo without data/manifest.jsonl, but 01 reads other sources' rows
+    from the manifest: with emilia_yodas parked, eval_emilia's rebuild stopped with "ingest emilia_yodas first" and the
+    box was stopped. The helper's pull lists the parked shards as a local ingest would; a second pull adds nothing."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from kitsune.store import SCHEMA, read_manifest
+
+    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
+    (tmp_path / "helper.py").write_text(re.search(r"<<'PYEOF'\n(.*?\n)PYEOF\n", text, re.S).group(1), encoding="utf-8")
+    stub = tmp_path / "stub" / "huggingface_hub"  # the parked shards below are what snapshot_download pulled
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text("def snapshot_download(*args, **kwargs):\n    pass\n", encoding="utf-8")
+    box, state = tmp_path / "box", tmp_path / "state"
+    (box / "configs").mkdir(parents=True)
+    state.mkdir()
+    (box / "configs" / "c.json").write_text(json.dumps(dict(
+        sources=["emilia_yodas"], eval_sets=["eval_emilia"], data_root="data", selection="selection/v.parquet",
+        student="students/s")), encoding="utf-8")
+    (state / "bootstrap_plan.json").write_text(json.dumps(dict(patterns=[], parked=["emilia_yodas"],
+                                                               rebuild=["eval_emilia"])), encoding="utf-8")
+    shards = box / "data" / "shards" / "emilia_yodas"
+    shards.mkdir(parents=True)
+    rows = [dict(id=f"emilia_yodas/JA_{v}_W{i:06d}", source="emilia_yodas", split="train", audio=b"", text="x",
+                 duration=1.5, sr=16000) for v, i in (("vid_a", 1), ("vid_a", 2), ("vid_b", 1))]
+    pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), shards / "train-00000.parquet")
+    env = dict(os.environ, KITSUNE_DIR=str(box), STATE=str(state), CONFIG="configs/c.json", KITSUNE_DATA_REPO="u/data",
+               KITSUNE_DATA_REVISION="main", PYTHONPATH=os.pathsep.join([str(tmp_path / "stub"), str(ROOT)]))
+    for _ in range(2):
+        r = subprocess.run([sys.executable, str(tmp_path / "helper.py"), "pull"], capture_output=True, text=True,
+                           env=env, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+    (sh,) = read_manifest(box / "data")
+    assert (sh.path, sh.source, sh.split, sh.rows) == ("shards/emilia_yodas/train-00000.parquet", "emilia_yodas",
+                                                       "train", 3)
+    assert sh.hours == pytest.approx(4.5 / 3600)
+
+    class Reached(Exception):
+        pass
+
+    def download(repo, filename):
+        raise Reached(filename)
+
+    ing = prep.Ingest(box / "data", tmp_path / "raw", "eval_emilia", None)
+    ing.download = download
+    with pytest.raises(Reached):  # past the "ingest emilia_yodas first" check, on to the hold-out's tar
+        prep.ingest_emilia_eval(ing, prep.EMILIA_EVAL_TAR, prep.EMILIA_EVAL_ROWS)
+
+
 def test_onstart_fits_vast_limits():
     raw = (VAST / "onstart.sh").read_bytes()
     assert len(raw) < 16 * 1024, "vast's on-start field is limited to 16 KB (it is run from the clone by the stub)"
