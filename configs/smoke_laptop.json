@@ -1,0 +1,16 @@
+{
+  "_comment": "Laptop smoke run of scripts/04_distill.py on the RTX 4070 (8 GB): the ~0.2B student from `03_build_student.py --enc-layers 4 --ffn 2560 --dec-layers 0 7`, ~6 min of training on seeded id subsets (small caches instead of copying all of reazon_small), evals every 2 min, Windows-safe workers, no HF repo. Keys not listed here take the viability defaults.",
+  "run_name": "smoke-laptop-b4x2560",
+  "student": "students/b4x2560-d2",
+  "sources": ["reazon_small", "emilia_yodas"],
+  "subset": {"train_utts": 3000, "eval_utts_per_set": 100},
+  "schedule": {"warmup_steps": 30, "cooldown_frac": 0.2, "train_hours": 0.1, "clock": "wall", "max_steps": null},
+  "batch": {"step_audio_s": 120, "micro_audio_s": 60, "pool_micro": 50, "max_dec_len": 200},
+  "memory": {"grad_ckpt": "auto", "probe_longest_bucket": true, "min_micro_audio_s": 15, "max_oom_skips": 3},
+  "perf": {"num_workers": 2, "prefetch": 2, "peak_tflops": 165.0},
+  "eval": {"every_min": 2, "greedy_subset": 20, "batch_s": 120},
+  "ckpt": {"weights_every_min": 3, "full_local_every_min": 3, "upload_full_at": []},
+  "log": {"layer_stats_every": 10, "hist_every": 50, "train_utts_flush": 50, "sync_every_min": 1},
+  "hf": {"output_repo": null},
+  "smoke": {"steps": 20, "min_audio_s_per_s": 0}
+}
