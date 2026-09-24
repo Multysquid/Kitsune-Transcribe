@@ -251,6 +251,9 @@ def test_overfit_configs_resolve():
         assert c["early_stop"] == dict(enabled=True, metric="probe_kl", patience=patience, min_delta_rel=0.02,
                                        min_delta_abs=0.001, min_evals=min_evals, floor=None, action="stop")
         assert c["eval"]["every_epochs"] == 1 and c["eval"]["probe"] and c["eval"]["probe_is_train"]
+        # no GO/NO-GO for a sanity run ("N/A" with the numbers); a mini eval every 200 steps (never at an epoch end)
+        assert c["eval"]["gate"] is False and c["eval"]["full_every_epochs"] is None
+        assert c["eval"]["mini"] == dict(every_steps=200, val_per_set=32, train_utts=64, greedy=True)
         assert c["loss"] == m.DEFAULTS["loss"] == dict(w_kl=1.0, w_ce=0.8, l2sp_lambda=0.05)
         assert {k: c["optim"][k] for k in ("lr", "betas", "clip")} == dict(lr=1e-4, betas=[0.9, 0.98], clip=1.0)
         assert c["autocast"] == "bfloat16" and c["perf"]["relpos_patch"] and c["memory"]["grad_ckpt"] == "auto"

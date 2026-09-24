@@ -136,10 +136,16 @@ def test_schedule_wsd_and_cadence():
 def test_configs_resolve():
     m = load_script("04_distill")
     via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
-    # the file spells out the defaults, and turns early stopping on (off in DEFAULTS: a config that does not mention it
-    # trains to its budget, as before early stopping existed)
+    # the file spells out the defaults, turns early stopping on (off in DEFAULTS: a config that does not mention it
+    # trains to its budget, as before early stopping existed) and sets the eval cadence: a full eval (complete eval
+    # sets) at every epoch end, a mini eval every 200 steps, a greedy decode of ~600 s of the probe for the train CER
+    # (all off in DEFAULTS: a config that does not mention them evaluates as before)
     assert not m.DEFAULTS["early_stop"]["enabled"] and via["early_stop"]["enabled"]
-    assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True))
+    ev_via = dict(m.DEFAULTS["eval"], full_every_epochs=1, probe_greedy_audio_s=600,
+                  mini=dict(every_steps=200, val_per_set=32, train_utts=64, greedy=True))
+    assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True), eval=ev_via)
+    assert via["eval"]["every_min"] == 20 and via["eval"]["gate"] is True  # every_min: the fallback cadence only
+    assert m.epoch_cadence(via) == 1 and m.DEFAULTS["eval"]["mini"]["every_steps"] is None
     smoke = m.load_config(str(ROOT / "configs" / "smoke_laptop.json"), ["hf.output_repo=u/r", "seed=7"])
     assert smoke["student"] == "students/b4x2560-d2" and smoke["schedule"]["train_hours"] == 0.1
     assert smoke["batch"]["micro_audio_s"] == 60 and smoke["batch"]["step_audio_s"] == 120

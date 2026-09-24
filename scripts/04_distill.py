@@ -22,7 +22,23 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                code 3 (ThroughputTooLow). A full state is written right after them, and before the cooldown starts.
                Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
-               sets, verdict (kitsune.evaluate.verdict), summary.json, uploads awaited, final forced sync; exit 0
+               sets, verdict (kitsune.evaluate.verdict; "N/A" with its numbers under eval.gate false: the
+               sanity/overfit runs), summary.json, uploads awaited, final forced sync; exit 0
+
+Evals in the loop (run_eval): every eval.every_min minutes of loop clock (eval.every_steps steps when set), or at the
+end of every eval.every_epochs-th / eval.full_every_epochs-th epoch instead. An epoch ends where the planner's plan for
+it ends (StepPlanner), on every clock. A full_every_epochs eval decodes the COMPLETE eval sets greedily, like the final
+eval; the others decode the fixed greedy subset. Every one of them (step 0 and the final eval too) is a "full" eval:
+the complete eval sets teacher-forced, the probe, one record in the history the verdict and the early stop read.
+Mini evals (eval.mini, run_mini_eval): every mini.every_steps optimizer steps, except at step 0 and at a step with a
+full eval (in the loop, or the final one when the loop ends there), a small eval of its own on fixed seeded subsets -
+mini.val_per_set utterances of each gate set (the whole eval subset of the overfit runs) and mini.train_utts of the
+train probe - teacher-forced and, with mini.greedy, greedy; logged under eval/mini/, evals/step_<N>_mini/ and
+`eval_mini` events, never in the verdict's history nor the early stop. After every eval, full or mini, the headline
+numbers (kitsune.evaluate.headline: val CER vs the reference and vs the teacher pooled over the gate sets, train CER
+from the greedy decode of train utterances, val/train teacher-forced KL and top-1) go to summary/full/<name> or
+summary/mini/<name> (CERs as fractions, with <name>_pct copies in percent), and one console line:
+  [full eval] step N epoch E | val CER x.x% (vs teacher y.y%) | train CER vs teacher z.z% (vs ref w.w%) | val KL ...
 
 Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and configs/overfit_*.json): after every
 eval inside the loop (never the step-0 eval, never the final one) the metric - "probe_kl" (teacher-forced KL on the
@@ -162,12 +178,16 @@ DEFAULTS = {
     "memory": {"grad_ckpt": "auto", "probe_longest_bucket": True, "min_micro_audio_s": 100, "max_oom_skips": 3},
     "perf": {"relpos_patch": True, "compile": False, "num_workers": "auto", "prefetch": 4, "tf32": True,
              "peak_tflops": 312.0, "train_exact_dither": False},
-    # every_epochs: eval at the end of every N-th epoch instead of every_min / every_steps. probe_is_train: the probe
-    # is the whole train set (a small subset) rather than its in_probe rows. probe_greedy_audio_s: also greedy-decode
-    # a seeded ~N s of the probe (null: subset.eval_audio_s; both null: no probe decode)
+    # every_epochs: eval at the end of every N-th epoch instead of every_min / every_steps. full_every_epochs: the
+    # same, but each of those evals decodes the COMPLETE eval sets greedily (as the final eval does) instead of the
+    # greedy subset; set one of the two. probe_is_train: the probe is the whole train set (a small subset) rather than
+    # its in_probe rows. probe_greedy_audio_s: also greedy-decode a seeded ~N s of the probe (null:
+    # subset.eval_audio_s; both null: no probe decode). mini: a small eval of its own every mini.every_steps steps
+    # (null: none; run_mini_eval). gate: false = no GO/NO-GO verdict (sanity/overfit runs: "N/A" + the numbers)
     "eval": {"every_min": 20, "every_steps": None, "greedy_subset": 500, "probe": True, "final_full_greedy": True,
              "batch_s": 400, "check_baselines": True, "every_epochs": None, "probe_is_train": False,
-             "probe_greedy_audio_s": None},
+             "probe_greedy_audio_s": None, "full_every_epochs": None,
+             "mini": {"every_steps": None, "val_per_set": 32, "train_utts": 64, "greedy": True}, "gate": True},
     "ckpt": {"weights_every_min": 30, "full_local_every_min": 30, "weights_every_steps": None,
              "full_every_steps": None, "keep_local": 2, "upload_full_at": ["pre_cooldown", "end"],
              "full_after_smoke": True},
@@ -264,8 +284,20 @@ def validate(cfg: dict):
                    ("eval.probe_greedy_audio_s", ev_cfg["probe_greedy_audio_s"])):
         if v is not None and not (isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0):
             raise SystemExit(f"{key} must be null or a number of seconds > 0, got {v}")
-    if ev_cfg["every_epochs"] is not None and not _pos_int(ev_cfg["every_epochs"]):
-        raise SystemExit(f"eval.every_epochs must be null or an int >= 1, got {ev_cfg['every_epochs']}")
+    for key in ("every_epochs", "full_every_epochs"):
+        if ev_cfg[key] is not None and not _pos_int(ev_cfg[key]):
+            raise SystemExit(f"eval.{key} must be null or an int >= 1, got {ev_cfg[key]}")
+    if ev_cfg["every_epochs"] and ev_cfg["full_every_epochs"]:
+        raise SystemExit("eval.every_epochs and eval.full_every_epochs are two cadences of the same eval: set one")
+    mini = ev_cfg["mini"]
+    if mini["every_steps"] is not None and not _pos_int(mini["every_steps"]):
+        raise SystemExit(f"eval.mini.every_steps must be null or an int >= 1, got {mini['every_steps']}")
+    for key in ("val_per_set", "train_utts"):
+        if not (isinstance(mini[key], int) and not isinstance(mini[key], bool) and mini[key] >= 0):
+            raise SystemExit(f"eval.mini.{key} must be an int >= 0, got {mini[key]}")
+    for key, v in (("eval.mini.greedy", mini["greedy"]), ("eval.gate", ev_cfg["gate"])):
+        if not isinstance(v, bool):
+            raise SystemExit(f"{key} must be true or false, got {v}")
     if ev_cfg["probe_is_train"] and not ev_cfg["probe"]:
         raise SystemExit("eval.probe_is_train needs eval.probe")
     es = cfg["early_stop"]
@@ -297,8 +329,17 @@ def _number(v) -> bool:
 
 
 def epoch_mode(cfg: dict) -> bool:
-    """Evals at epoch ends (the epoch clock or eval.every_epochs): eval records, events and scalars carry the epoch."""
-    return cfg["schedule"]["clock"] == "epochs" or bool(cfg["eval"]["every_epochs"])
+    """Evals at epoch ends (the epoch clock, eval.every_epochs or eval.full_every_epochs): eval records, events and
+    scalars carry the epoch."""
+    return cfg["schedule"]["clock"] == "epochs" or bool(epoch_cadence(cfg))
+
+
+def epoch_cadence(cfg: dict) -> int | None:
+    """In-loop evals at the end of every N-th epoch: eval.full_every_epochs or eval.every_epochs (None: every_min /
+    every_steps). The planner's position says where an epoch ends on every clock (StepPlanner.step_done moves it to
+    the next epoch after the last step of an epoch's plan)."""
+    ev_cfg = cfg["eval"]
+    return int(ev_cfg["full_every_epochs"] or ev_cfg["every_epochs"] or 0) or None
 
 
 def rpath(value) -> Path:
@@ -443,6 +484,9 @@ class Run:
     probe_ids: list = field(default_factory=list)
     probe_greedy_ids: list = field(default_factory=list)
     greedy_ids: list = field(default_factory=list)
+    mini_val_ids: list = field(default_factory=list)  # the mini eval's fixed subsets (mini_subsets)
+    mini_train_ids: list = field(default_factory=list)
+    mini_rows: dict = field(default_factory=dict)  # their reference / teacher text, read once (mini_teacher_rows)
     src_index: dict = field(default_factory=dict)
     uploader: object = None
     bn0: dict = field(default_factory=dict)
@@ -458,7 +502,7 @@ class Run:
         last_full_step=0, memory={}, flops_per_padded_s=None, history=[], nonfinite_skips=0, nonfinite_total=0,
         oom_skips=0, audio_s=0.0, tokens=0, step_time_s=0.0, smoke_losses=[], smoke_audio_s=0.0, smoke_time_s=0.0,
         epoch=0, epoch_progress=0.0, resumes=0, weights=[], fulls=[], last_objective=None, lr_phase=None,
-        last_eval_epoch=0, total_steps=None, early_stop=early_stop_state()))
+        last_eval_epoch=0, total_steps=None, early_stop=early_stop_state(), mini_history=[]))
 
     def clock(self) -> float:
         """Loop clock in seconds: continues across resumes, frozen outside the training loop."""
@@ -907,6 +951,7 @@ def setup_data(R: Run):
             pick = cand if len(cand) <= cfg["eval"]["greedy_subset"] else sorted(
                 rng.choice(cand, size=int(cfg["eval"]["greedy_subset"]), replace=False).tolist())
             R.greedy_ids += [R.evalstore.utts[i].id for i in pick]
+    R.mini_val_ids, R.mini_train_ids = mini_subsets(R)
     R.ds = trainset.AudioBatchDataset(R.train)
     R.src_index = {s: i for i, s in enumerate(sorted({u.source for u in R.train.utts}))}
     log.event("data", train_utts=len(R.train), train_h=round(R.train.hours, 3),
@@ -914,7 +959,45 @@ def setup_data(R: Run):
               eval_utts=len(R.evalstore), eval_h=round(R.evalstore.hours, 3),
               eval_per_set=R.evalstore.info.get("per_source"), probe=len(R.probe_ids), greedy=len(R.greedy_ids),
               build_s=round(time.time() - t0, 1),
-              **(dict(probe_greedy=len(R.probe_greedy_ids)) if R.probe_greedy_ids else {}))
+              **(dict(probe_greedy=len(R.probe_greedy_ids)) if R.probe_greedy_ids else {}),
+              **(dict(mini_val=len(R.mini_val_ids), mini_train=len(R.mini_train_ids))
+                 if cfg["eval"]["mini"]["every_steps"] else {}))
+
+
+def mini_subsets(R: Run) -> tuple[list[str], list[str]]:
+    """The mini eval's fixed subsets (eval.mini; empty when mini.every_steps is null), drawn once from the seed and the
+    data, so every mini eval of a run - resumes included - scores the same utterances:
+      val    mini.val_per_set seeded utterances of each GATE set the run evaluates (all of a smaller set; every eval set
+             if none is a gate set), or the whole eval subset when subset.eval_audio_s makes it a small pooled one
+             (the overfit runs)
+      train  mini.train_utts seeded utterances of the train probe (the train set if there is no probe)
+    Each is logged as a `subset` event (split mini_val / mini_train) with its ids."""
+    cfg, seed = R.cfg, int(R.cfg["seed"])
+    mc = cfg["eval"]["mini"]
+    if not mc["every_steps"]:
+        return [], []
+    from kitsune.evaluate import GATE_SETS
+
+    if cfg["subset"]["eval_audio_s"] is not None:
+        val = [u.id for u in R.evalstore.utts]
+    else:
+        rng = np.random.default_rng([seed, 14])
+        sets = [s for s in cfg["eval_sets"] if s in GATE_SETS] or list(cfg["eval_sets"])
+        val = []
+        for s in sets:
+            val += _seeded_ids([R.evalstore.utts[i].id for i in R.evalstore.indices(source=s)],
+                               int(mc["val_per_set"]), rng)
+    pool = R.probe_ids or [u.id for u in R.train.utts]
+    train = list(_seeded_ids(pool, int(mc["train_utts"]), np.random.default_rng([seed, 15])))
+    for split, ids, store in (("mini_val", val, R.evalstore), ("mini_train", train, R.train)):
+        chosen = set(ids)
+        utts = [u for u in store.utts if u.id in chosen]
+        per = {}
+        for u in utts:
+            per[u.source] = per.get(u.source, 0) + 1
+        R.log.event("subset", split=split, seed=seed, n=len(ids), total_s=round(sum(u.duration for u in utts), 3),
+                    per_source=per, ids=ids)
+    return val, train
 
 
 def make_planner(R: Run, micro_audio_s: float) -> trainset.StepPlanner:
@@ -1268,17 +1351,20 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
 # ---------------------------------------------------------------------------------------------------------- evals
 
 
-def run_eval(R: Run, step: int, final: bool = False) -> dict:
-    """Teacher-forced on every eval utterance and on the train probe, greedy on the fixed subsets (final: on the FULL
-    eval sets, the subset summary taken from those rows). Tables, summary, scalars and samples go to the logger; one
-    record goes to the history the verdict reads. Returns the greedy summary the verdict should judge: the full-set
-    one on the final eval (the subset one if eval.final_full_greedy is off)."""
+def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = None) -> dict:
+    """Teacher-forced on every eval utterance and on the train probe, greedy on the fixed subsets - or on the COMPLETE
+    eval sets (`complete`; default: the final eval under eval.final_full_greedy; the loop passes it for every
+    eval.full_every_epochs eval), the subset summary then taken from those rows so the history stays comparable.
+    Tables, summary, scalars, the headline numbers (summary/full/..., log_headline) and samples go to the logger; one
+    record goes to the history the verdict and the early stop read. Returns the greedy summary the verdict should
+    judge: the complete-set one when there is one (the subset one if eval.final_full_greedy is off)."""
     from kitsune import evaluate as ev
 
     cfg, log = R.cfg, R.log
     bs = float(cfg["eval"]["batch_s"])
+    complete = bool(final and cfg["eval"]["final_full_greedy"]) if complete is None else bool(complete)
     t0 = time.time()
-    log.event("eval_start", at_step=step, final=final)
+    log.event("eval_start", at_step=step, final=final, complete=complete)
     tf_sum, tf_df = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, amp=R.amp)
     probe_sum = probe_df = None
     if R.probe_ids:
@@ -1289,7 +1375,7 @@ def run_eval(R: Run, step: int, final: bool = False) -> dict:
         pg_sum, pg_df = ev.greedy_eval(R.model, R.train, R.probe_greedy_ids, R.feat_eval, R.device, bs,
                                        tokenizer=R.tokenizer, amp=R.amp)
     full_sum = None
-    if final and cfg["eval"]["final_full_greedy"]:
+    if complete:
         full_sum, gr_df = ev.greedy_eval(R.model, R.evalstore, None, R.feat_eval, R.device, bs, tokenizer=R.tokenizer,
                                          amp=R.amp)
         gr_df["in_greedy_subset"] = gr_df["id"].isin(set(R.greedy_ids))
@@ -1307,8 +1393,14 @@ def run_eval(R: Run, step: int, final: bool = False) -> dict:
         log.table("probe_greedy", pg_df, step)
     for src, g in gr_df.groupby("source", sort=True):
         log.table(f"greedy_{src}", g.reset_index(drop=True), step)
-    summary = dict(step=step, train_s=R.clock(), final=final, tf=tf_sum, probe=probe_sum, greedy=gr_sum,
-                   greedy_full=full_sum, wall_s=round(time.time() - t0, 1))
+    # val CER from the complete sets when they were decoded, else from the greedy subset (the scope says which)
+    head = ev.headline(tf=tf_sum, greedy=full_sum if full_sum is not None else gr_sum, probe=probe_sum,
+                       probe_greedy=pg_sum)
+    summary = dict(step=step, train_s=R.clock(), final=final, complete=complete, tf=tf_sum, probe=probe_sum,
+                   greedy=gr_sum, greedy_full=full_sum, wall_s=round(time.time() - t0, 1), headline=head,
+                   headline_scope=dict(val_greedy="complete" if full_sum is not None else "subset",
+                                       val_greedy_utts=(full_sum if full_sum is not None else gr_sum).get("n_utts", 0),
+                                       train_greedy_utts=len(R.probe_greedy_ids), train_tf_utts=len(R.probe_ids)))
     extra = {}  # only in the runs that use them, so the viability run's records are unchanged
     if pg_sum is not None:
         extra["probe_greedy"] = pg_sum
@@ -1333,21 +1425,24 @@ def run_eval(R: Run, step: int, final: bool = False) -> dict:
         scal["eval/epoch"] = extra["epoch"]
     scal["eval/wall_s"] = summary["wall_s"]
     log.scalars(scal, step)
+    log_headline(R, "full", head, step)
     samples = ev.pick_samples(gr_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"]))
     if pg_df is not None:  # train utterances (their source says so) after the held-out ones
         samples += ev.pick_samples(pg_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"]))
     log.samples(step, samples)
 
-    if not final:  # what fit_budget scales the final eval's duration from
+    if not final:  # what fit_budget scales the final eval's duration from (a complete decode: nothing to scale)
         R.st["eval_cost"] = dict(tf_s=float(tf_sum.get("wall_s", 0.0)),
                                  probe_s=(float(probe_sum.get("wall_s", 0.0)) if probe_sum else 0.0)
                                  + (float(pg_sum.get("wall_s", 0.0)) if pg_sum else 0.0),
-                                 greedy_s=float(gr_sum.get("wall_s", 0.0)), greedy_n=len(R.greedy_ids))
+                                 greedy_s=float(gr_sum.get("wall_s", 0.0)),
+                                 greedy_n=len(R.evalstore) if full_sum is not None else len(R.greedy_ids))
     rec = ev.eval_record(step, R.clock(), tf=tf_sum, greedy=gr_sum, probe=probe_sum)
     if pg_sum and "all" in pg_sum:
         rec["probe_greedy"] = {k: pg_sum["all"][k] for k in ("cer_teacher_corpus", "cer_ref_corpus", "n")}
     if "epoch" in extra:
         rec["epoch"] = extra["epoch"]
+    rec["headline"] = head
     hist = R.st["history"]
     if hist and hist[-1]["step"] == step:
         hist[-1] = rec
@@ -1359,10 +1454,112 @@ def run_eval(R: Run, step: int, final: bool = False) -> dict:
                                        trunc=round(d["trunc_rate"], 4))
     if pg_sum and "all" in pg_sum:
         extra["probe_cer_teacher"] = round(pg_sum["all"]["cer_teacher_corpus"], 4)
-    log.event("eval", at_step=step, final=final, wall_s=summary["wall_s"], sets=brief,
+    log.event("eval", at_step=step, final=final, complete=complete, wall_s=summary["wall_s"], sets=brief,
               probe_kl=probe_sum["all"]["kl"] if probe_sum and "all" in probe_sum else None,
+              headline={k: round(v, 5) for k, v in head.items()},
               **{k: v for k, v in extra.items() if k != "probe_greedy"})
     return full_sum if full_sum is not None else gr_sum
+
+
+def log_headline(R: Run, kind: str, head: dict, step: int):
+    """An eval's headline numbers (kitsune.evaluate.headline) in one place: the scalars summary/<kind>/<name> (kind
+    "full" or "mini"; CERs as fractions, with a <name>_pct copy in percent for TensorBoard) and one console line."""
+    from kitsune.evaluate import HEADLINE_CER
+
+    row = {f"summary/{kind}/{k}": v for k, v in head.items()}
+    row.update({f"summary/{kind}/{k}_pct": 100.0 * head[k] for k in HEADLINE_CER if k in head})
+    R.log.scalars(row, step)
+    print(headline_line(kind, step, R.st["epoch_progress"], head), flush=True)
+
+
+def headline_line(kind: str, step: int, epoch: float, head: dict) -> str:
+    """'[full eval] step N epoch E | val CER x.x% (vs teacher y.y%) | train CER vs teacher z.z% (vs ref w.w%) | val KL
+    a.aaa train KL b.bbb'; n/a for a number that eval did not measure."""
+    def pct(k):
+        return f"{100.0 * head[k]:.1f}%" if k in head else "n/a"
+
+    def kl(k):
+        return f"{head[k]:.3f}" if k in head else "n/a"
+
+    return (f"[{kind} eval] step {step} epoch {epoch:.2f} | val CER {pct('val_cer')} (vs teacher "
+            f"{pct('val_cer_vs_teacher')}) | train CER vs teacher {pct('train_cer_vs_teacher')} (vs ref "
+            f"{pct('train_cer')}) | val KL {kl('val_loss')} train KL {kl('train_loss')}")
+
+
+def mini_teacher_rows(R: Run, kind: str, store, ids: list[str]) -> dict[str, dict]:
+    """id -> the reference and teacher text greedy_eval scores a mini subset against (its teacher_rows), read from the
+    store's index once per run: without them every greedy_eval call reads the whole index.parquet (233 k rows for the
+    real train set)."""
+    if kind not in R.mini_rows:
+        pos = {u.id: i for i, u in enumerate(store.utts)}
+        sub = store.subset([pos[i] for i in ids])
+        fr = sub.frame()
+        R.mini_rows[kind] = {u.id: dict(ref=ref, hyp=hyp, cer=u.teacher_cer, truncated=u.truncated)
+                             for u, ref, hyp in zip(sub.utts, fr["ref"].tolist(), fr["hyp"].tolist())}
+    return R.mini_rows[kind]
+
+
+def mini_due(R: Run, step: int) -> bool:
+    """A mini eval is due after optimizer step `step` (the loop skips it when a full eval runs at that step, or when
+    the loop ends there and the final eval follows)."""
+    every = R.cfg["eval"]["mini"]["every_steps"]
+    return bool(every) and step > 0 and step % int(every) == 0 and bool(R.mini_val_ids or R.mini_train_ids)
+
+
+def run_mini_eval(R: Run, step: int) -> dict:
+    """The mini eval (eval.mini): teacher-forced KL / CE / top-1 and, with mini.greedy, greedy CER vs the reference and
+    vs the teacher, on the fixed mini subsets (mini_subsets: val from the gate sets, train from the probe). Its own
+    pass - its own batches, eval mode without gradients (kitsune.evaluate), BatchNorm checked frozen afterwards -
+    logged apart from the full evals: tables and summary.json under evals/step_<N>_mini/, scalars under eval/mini/
+    (its wall time eval/mini/wall_s), the headline under summary/mini/, an `eval_mini` event and a row of
+    st["mini_history"] (summary.json's mini_history). It never feeds the verdict's history, the early stop or the
+    final-eval estimate. Returns the headline."""
+    from kitsune import evaluate as ev
+
+    cfg, log = R.cfg, R.log
+    bs, greedy = float(cfg["eval"]["batch_s"]), cfg["eval"]["mini"]["greedy"]
+    t0 = time.time()
+    parts, frames = {}, {}
+    for kind, store, ids in (("tf", R.evalstore, R.mini_val_ids), ("probe", R.train, R.mini_train_ids)):
+        if not ids:
+            continue
+        parts[kind], frames[kind] = ev.teacher_forced_eval(R.model, store, R.feat_eval, R.device, bs, ids=ids,
+                                                           amp=R.amp)
+        if greedy:
+            g = "greedy" if kind == "tf" else "probe_greedy"
+            parts[g], frames[g] = ev.greedy_eval(R.model, store, ids, R.feat_eval, R.device, bs,
+                                                 tokenizer=R.tokenizer, amp=R.amp,
+                                                 teacher_rows=mini_teacher_rows(R, kind, store, ids))
+    assert_bn_frozen(R.model)
+    wall = round(time.time() - t0, 1)
+
+    for kind in ("tf", "greedy"):
+        if kind in frames:
+            for src, g in frames[kind].groupby("source", sort=True):
+                log.table(f"{kind}_{src}", g.reset_index(drop=True), step, suffix="mini")
+    for kind in ("probe", "probe_greedy"):
+        if kind in frames:
+            log.table(kind, frames[kind], step, suffix="mini")
+    head = ev.headline(tf=parts.get("tf"), greedy=parts.get("greedy"), probe=parts.get("probe"),
+                       probe_greedy=parts.get("probe_greedy"))
+    epoch = R.st["epoch_progress"]
+    log.eval_json("summary", dict(step=step, train_s=R.clock(), epoch=epoch, mini=True, wall_s=wall, headline=head,
+                                  n_val=len(R.mini_val_ids), n_train=len(R.mini_train_ids), **parts),
+                  step, suffix="mini")
+    scal = {}
+    for kind, s in parts.items():
+        scal.update(ev.flatten(s, f"eval/mini/{kind}"))
+    scal["eval/mini/wall_s"] = wall
+    log.scalars(scal, step)
+    log_headline(R, "mini", head, step)
+    R.st["mini_history"].append(dict(step=int(step), epoch=epoch, elapsed_s=R.clock(), wall_s=wall, **head))
+    brief = {s: dict(kl=round(d["kl"], 4), top1=round(d["top1"], 4))
+             for s, d in (parts.get("tf") or {}).get("sets", {}).items()}
+    for s, d in (parts.get("greedy") or {}).get("sets", {}).items():
+        brief.setdefault(s, {}).update(cer=round(d["cer_ref_corpus"], 4), cer_teacher=round(d["cer_teacher_corpus"], 4))
+    log.event("eval_mini", at_step=step, epoch=epoch, wall_s=wall, n_val=len(R.mini_val_ids),
+              n_train=len(R.mini_train_ids), sets=brief, headline={k: round(v, 5) for k, v in head.items()})
+    return head
 
 
 # ----------------------------------------------------------------------------------------------------- early stop
@@ -1509,7 +1706,7 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False) -> Path:
                        planner=R.planner.state_dict(), logger=R.log.state_dict(), rng=_rng_state(),
                        time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         brief = {k: v for k, v in trainer.items() if k not in ("rng", "st")}
-        brief["st"] = {k: v for k, v in st.items() if k not in ("history", "smoke_losses")}
+        brief["st"] = {k: v for k, v in st.items() if k not in ("history", "smoke_losses", "mini_history")}
         return trainer, brief, st
 
     if not (d.exists() and step in R.st["fulls"]):
@@ -1946,14 +2143,25 @@ def train(R: Run, state: dict | None) -> int:
     save_weights(R, step, "end")
     save_full(R, step, "end", upload="end" in cfg["ckpt"]["upload_full_at"])
     full_sum = run_eval(R, step, final=True)
-    verdict = ev.verdict(dict(final=full_sum, history=R.st["history"]))
+    verdict = gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=R.st["history"])))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
     uploads = R.uploader.wait()
-    summary = make_summary(R, "complete", verdict=verdict, final=full_sum, uploads=uploads)
+    summary = make_summary(R, "complete", verdict=verdict, final=full_sum, uploads=uploads,
+                           headline=(R.st["history"][-1] if R.st["history"] else {}).get("headline"))
     R.uploader.shutdown()
     log.close(summary=summary)
     return EXIT_OK
+
+
+def gate_verdict(cfg: dict, computed: dict) -> dict:
+    """The verdict summary.json reports: kitsune.evaluate.verdict's (GO / PROMISING / NO-GO / INCONCLUSIVE), or with
+    eval.gate false (the sanity/overfit runs, whose tiny eval subsets say nothing about the gate) "N/A" with the
+    computation's numbers - everything but its verdict and reasons."""
+    if cfg["eval"]["gate"]:
+        return computed
+    return dict(verdict="N/A", reason="gate disabled (sanity/overfit run)",
+                numbers={k: v for k, v in computed.items() if k not in ("verdict", "reasons")})
 
 
 def final_eval_estimate(R: Run) -> float:
@@ -2008,6 +2216,13 @@ def loop(R: Run):
     def passes_done() -> bool:  # clock "epochs": the planner's position is past the last epoch (skipped steps too)
         return epochs is not None and R.planner.epoch >= epochs
 
+    def ending() -> bool:  # the loop stops before another step (the final eval then runs at this step)
+        t_now, T_now = R.progress()
+        return (t_now >= T_now or bool(sch["max_steps"] and R.st["step"] >= int(sch["max_steps"])) or passes_done()
+                or (R.run_dir / STOP_FILE).exists())
+
+    per_epochs = epoch_cadence(cfg)  # evals at epoch ends (every_epochs / full_every_epochs), else every_min / _steps
+
     fit_budget(R)
     log.event("phase", name="train", at_step=R.st["step"], workers=nw, micro_audio_s=R.planner.micro_audio_s,
               grad_ckpt=R.st["memory"].get("grad_ckpt"))
@@ -2061,9 +2276,9 @@ def loop(R: Run):
                 if step >= smoke_n:
                     smoke_end(R)
             t = R.clock()
-            if ev_cfg["every_epochs"]:  # epochs completed since the last eval; the end phase's eval covers the last
-                eval_now = (R.planner.epoch - R.st["last_eval_epoch"] >= int(ev_cfg["every_epochs"])
-                            and not passes_done())
+            if per_epochs:  # epochs completed since the last eval (the planner's position, on every clock); the end
+                # phase's eval covers the last one
+                eval_now = R.planner.epoch - R.st["last_eval_epoch"] >= per_epochs and not passes_done()
             else:
                 eval_now = due(t, step, R.st["last_eval_t"], R.st["last_eval_step"], ev_cfg["every_min"],
                                ev_cfg["every_steps"])
@@ -2071,13 +2286,15 @@ def loop(R: Run):
                 t_now, T_now = R.progress()
                 eval_now = t_now < T_now
             if eval_now:
-                run_eval(R, step)
+                run_eval(R, step, complete=bool(ev_cfg["full_every_epochs"]))
                 R.st["last_eval_t"], R.st["last_eval_step"] = R.clock(), step
                 R.st["last_eval_epoch"] = R.planner.epoch
                 if not R.st["pre_cooldown_done"]:  # a fresher final-eval estimate (never moves T in the cooldown)
                     fit_budget(R)
                 if early_stop_check(R, step):  # action "stop": the end phase right after this eval
                     break
+            elif mini_due(R, step) and not ending():  # never at a step with a full eval (in the loop or the final)
+                run_mini_eval(R, step)
             if due(t, step, R.st["last_weights_t"], R.st["last_weights_step"], ck["weights_every_min"],
                    ck["weights_every_steps"]):
                 save_weights(R, step, "periodic")
@@ -2119,7 +2336,7 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         cost=dict(dph=dph, usd=round(dph * elapsed / 3600, 2) if dph else None, note="trainer process time only"),
         best=dict(greedy_cer_ratio_mean=best(cer_ratio), heldout_kl=best(lambda r: r.get("heldout_kl"))),
         stopped_early=st["early_stop"]["triggered"],  # the `early_stop` event's fields; None: no early stop triggered
-        history=hist, checkpoints=dict(weights=st["weights"], full=st["fulls"]),
+        history=hist, mini_history=st["mini_history"], checkpoints=dict(weights=st["weights"], full=st["fulls"]),
         config=R.cfg, **extra)
 
 

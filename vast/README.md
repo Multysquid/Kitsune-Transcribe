@@ -104,9 +104,19 @@ Timeline: ~5 min boot and image pull, ~10-20 min data (derived pull + audio rebu
 eval, upload and verification. The trainer reads the watchdog's deadline and shortens the 4 h (earlier cooldown)
 when the final eval, the uploads and a 30 min reserve would not fit before it, e.g. after a crash and resume; the
 `budget` event in `events.jsonl` shows the result. It also ends early when the held-out KL goes flat (`early_stop` in
-`configs/viability.json`): after 3 evals in a row (1 h) without a 0.5 % improvement it starts the cooldown at once, over
-20 % of the time trained so far, and then goes to the final eval; the `early_stop` event and `stopped_early` in
+`configs/viability.json`): after 3 evals in a row (3 epochs) without a 0.5 % improvement it starts the cooldown at once,
+over 20 % of the time trained so far, and then goes to the final eval; the `early_stop` event and `stopped_early` in
 `summary.json` say when and why.
+
+Evals (`eval` in `configs/viability.json`): a full eval at the end of every epoch - teacher-forced and greedy on the
+complete eval sets, plus the probe - and a mini eval every 200 optimizer steps (32 utterances per gate set, 64 of the
+probe). The numbers to read first are in TensorBoard under `2_loss_accuracy/00_summary/full/` and `.../mini/`
+(`val_cer_pct`: CER vs the reference pooled over JSUT / CV8 / ReazonSpeech-test, `val_cer_vs_teacher_pct`,
+`train_cer_vs_teacher_pct`, `val_loss`, `train_loss`, ...), and each eval prints one line to `kitsune.log`:
+`[full eval] step N epoch E | val CER x.x% (vs teacher y.y%) | train CER vs teacher z.z% (vs ref w.w%) | val KL ...`.
+The cost of a full eval on the A100 is an estimate until the first run measures it (`eval/wall_s`,
+`eval/greedy_full/rtf`): between ~5 and ~38 min (the `_comment` in `configs/viability.json` has the arithmetic),
+against ~10-47 min of training per epoch.
 
 To stop the training by hand (it looks flat on TensorBoard, or the results are already what you need):
 ```bash

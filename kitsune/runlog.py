@@ -20,6 +20,7 @@ Layout (relative to runs/<run_id>/):
   metrics/hist/part-*.parquet histogram summaries: quantiles, moments, 64-bin counts/edges (json)
   metrics/text.jsonl          every text() call (TensorBoard text is awkward to extract)
   evals/step_<N>/             summary.json, tf_<set>.parquet, greedy_<set>.parquet, probe.parquet (table/eval_json)
+  evals/step_<N>_mini/        the same for a mini eval (scripts/04_distill.py run_mini_eval)
   samples/step_<N>.jsonl      text samples (ref / teacher / student), also TensorBoard text
   events.jsonl                lifecycle events, fsynced one by one (phase changes, OOM fallbacks, checkpoints,
                               exceptions with tracebacks, sync errors, verdict)
@@ -39,10 +40,12 @@ append-only jsonl files keep both copies; the later wall time is the one that co
 
 TensorBoard buckets: TensorBoard groups cards by the first component of a tag, so tb/ gets every tag under one of
   1_operational     time, throughput, memory, system, data progress (tokens per source too), schedule, early-stop
-                    bookkeeping, eval cost and counts (CER denominators: ref_chars); events and config as text
-  2_loss_accuracy   train and held-out loss, accuracy (top-1 agreement, CER = characters gotten wrong), both per
-                    source and per teacher-confidence bucket, the train probe, the overfit gap, the early-stop metric
-                    and its best; the eval sample tables
+                    bookkeeping, eval cost and counts (CER denominators: ref_chars, cer_teacher_chars), the mini
+                    evals' cost under eval/mini/; events and config as text
+  2_loss_accuracy   first 00_summary/{full,mini}/: every eval's headline numbers (pooled val / train CER, loss,
+                    top-1); then train and held-out loss, accuracy (top-1 agreement, CER = characters gotten wrong),
+                    both per source and per teacher-confidence bucket, the train probe, the overfit gap, the
+                    early-stop metric and its best, the mini evals in <section>_mini/; the eval sample tables
   3_misc            per-layer stats, L2-SP distances, optimizer internals, augmentation, token diagnostics (the share
                     of tokens per confidence bucket included), every histogram, and any tag no rule matches (one
                     tb_tag_unmapped event per such tag)
@@ -193,16 +196,27 @@ TB_BUCKETS = ("1_operational", "2_loss_accuracy", "3_misc")  # names sort in thi
 TB_PLUGINS = ("scalars", "histograms", "text")
 _SPLIT = r"(_utt_mean|_p1_gt_0\.99|_p1_lt_0\.9)?"  # per-utterance mean, or one teacher-confidence bucket
 _CER = ("cer_ref_corpus|cer_ref_mean|cer_teacher_corpus|cer_teacher_mean|ratio_vs_teacher|trunc_rate|ref_edits|"
-        "n_truncated|n_empty_hyp|teacher_cer_ref_corpus|teacher_cer_ref_mean|teacher_trunc_rate")  # not ref_chars
+        "cer_teacher_edits|n_truncated|n_empty_hyp|teacher_cer_ref_corpus|teacher_cer_ref_mean|"
+        "teacher_trunc_rate")  # not the CER denominators (_CER_DEN)
+_CER_DEN = "ref_chars|cer_teacher_chars"  # characters of the reference / of the teacher's hypothesis: counts
 _EVAL_OPS = "wall_s|rtf|tok_per_s|audio_s|n_bad_audio|n_utts|n_tok|n"  # eval/<kind>/<m>: cost and counts
 _EVAL_SET_OPS = "audio_s|tok_per_s|n|n_tok|n_utts|n_missing_teacher|n_empty_ref"  # eval/<kind>/<set>/<m>
 _TOK_DIAG = (r"student_entropy_coarse|student_tail|teacher_entropy_coarse|teacher_tail|teacher_p1|frac_p1_gt_0\.99|"
              r"frac_p1_lt_0\.9")
 _SET = r"(?P<set>[^/]+)"
 # (regex, template): the first rule whose regex matches the WHOLE tag wins; the template's first component is the
-# bucket. Scalars and text; a histogram always goes to 3_misc/<tag>.
+# bucket. Scalars and text; a histogram always goes to 3_misc/<tag>. The mini evals (eval/mini/<kind>/..., scripts/
+# 04_distill.py run_mini_eval) land next to their full counterparts, in <section>_mini (1_operational/eval/mini/...).
 TB_BUCKET_RULES = (
-    # 2_loss_accuracy: loss (train, held-out) and accuracy (top-1 agreement with the teacher, CER)
+    # 2_loss_accuracy: the headline numbers of every eval first (00_ sorts before the other sections), then loss (train,
+    # held-out) and accuracy (top-1 agreement with the teacher, CER)
+    (r"summary/(?P<kind>full|mini)/(?P<m>[^/]+)", r"2_loss_accuracy/00_summary/\g<kind>/\g<m>"),
+    (rf"eval/mini/tf/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/val_loss_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/tf/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/val_accuracy_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/val_accuracy_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/probe/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/train_probe_loss_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/probe/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/train_probe_accuracy_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/probe_greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/train_probe_accuracy_mini/\g<set>/\g<m>"),
     (r"loss/(?P<m>.+)", r"2_loss_accuracy/train_loss/\g<m>"),
     (r"src/(?P<src>[^/]+)/(?P<m>kl|ce)", r"2_loss_accuracy/train_loss/by_source/\g<src>/\g<m>"),
     (r"bucket/(?P<b>[^/]+)/(?P<m>kl|ce)", r"2_loss_accuracy/train_loss/by_teacher_confidence/\g<b>/\g<m>"),
@@ -224,8 +238,15 @@ TB_BUCKET_RULES = (
     # bookkeeping (evals since the best, triggered), eval cost and counts (ref_chars: a CER denominator), lifecycle text
     (r"(?P<t>(time|perf|mem|sys|data|sched|early_stop)/.+|opt/lr|src/[^/]+/tokens)", r"1_operational/\g<t>"),
     (r"eval/epoch", r"1_operational/progress/epoch"),
-    (rf"eval/(?P<kind>greedy|greedy_full|probe_greedy)/{_SET}/ref_chars",
-     r"1_operational/eval/\g<kind>/\g<set>/ref_chars"),
+    (rf"eval/mini/(?P<kind>greedy|probe_greedy)/{_SET}/(?P<m>{_CER_DEN})",
+     r"1_operational/eval/mini/\g<kind>/\g<set>/\g<m>"),
+    (rf"eval/mini/(?P<kind>tf|greedy|probe|probe_greedy)/(?P<m>{_EVAL_OPS})",
+     r"1_operational/eval/mini/\g<kind>/\g<m>"),
+    (rf"eval/mini/(?P<kind>tf|greedy|probe|probe_greedy)/{_SET}/(?P<m>{_EVAL_SET_OPS})",
+     r"1_operational/eval/mini/\g<kind>/\g<set>/\g<m>"),
+    (r"eval/mini/wall_s", r"1_operational/eval/mini/wall_s"),
+    (rf"eval/(?P<kind>greedy|greedy_full|probe_greedy)/{_SET}/(?P<m>{_CER_DEN})",
+     r"1_operational/eval/\g<kind>/\g<set>/\g<m>"),
     (rf"eval/(?P<kind>[^/]+)/(?P<m>{_EVAL_OPS})", r"1_operational/eval/\g<kind>/\g<m>"),
     (rf"eval/(?P<kind>[^/]+)/{_SET}/(?P<m>{_EVAL_SET_OPS})", r"1_operational/eval/\g<kind>/\g<set>/\g<m>"),
     (r"eval/wall_s", r"1_operational/eval/wall_s"),
@@ -234,7 +255,7 @@ TB_BUCKET_RULES = (
     # diagnostics (tok/* except top1, each confidence bucket's share of the tokens, the eval entropy / tail /
     # teacher-confidence columns)
     (r"(?P<t>(layers|l2sp|aug|bn|tok)/.+|opt/(grad_norm|clip_coef)|bucket/[^/]+/frac)", r"3_misc/\g<t>"),
-    (rf"(?P<t>eval/(tf|probe)/[^/]+/({_TOK_DIAG}))", r"3_misc/\g<t>"),
+    (rf"(?P<t>eval/(mini/)?(tf|probe)/[^/]+/({_TOK_DIAG}))", r"3_misc/\g<t>"),
 )
 _TB_RULES = tuple((re.compile(p), t) for p, t in TB_BUCKET_RULES)
 
@@ -829,19 +850,20 @@ class RunLogger:
             self.tb.add_text(tb, s, int(step), walltime=row["wall"])
         self._save_tag_map()
 
-    def eval_dir(self, step: int) -> Path:
-        d = self.dir / "evals" / f"step_{int(step)}"
+    def eval_dir(self, step: int, suffix: str = "") -> Path:
+        """evals/step_<N>/ (suffix "mini": evals/step_<N>_mini/, a mini eval's own folder)."""
+        d = self.dir / "evals" / (f"step_{int(step)}_{suffix}" if suffix else f"step_{int(step)}")
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def table(self, name: str, df, step: int):
+    def table(self, name: str, df, step: int, suffix: str = ""):
         """evals/step_<N>/<name>.parquet (e.g. tf_eval_jsut, greedy_eval_cv8, probe) from a DataFrame or arrow table."""
         t = df if isinstance(df, pa.Table) else pa.Table.from_pandas(df, preserve_index=False)
-        _atomic_parquet(t, self.eval_dir(step) / f"{name}.parquet")
+        _atomic_parquet(t, self.eval_dir(step, suffix) / f"{name}.parquet")
 
-    def eval_json(self, name: str, obj: dict, step: int):
+    def eval_json(self, name: str, obj: dict, step: int, suffix: str = ""):
         """evals/step_<N>/<name>.json (summary.json, verdict.json ...)."""
-        _atomic_json(self.eval_dir(step) / f"{name}.json", obj)
+        _atomic_json(self.eval_dir(step, suffix) / f"{name}.json", obj)
 
     def samples(self, step: int, rows: list[dict], tag: str = "samples"):
         """samples/step_<N>.jsonl plus a TensorBoard markdown table (ref / teacher / student)."""

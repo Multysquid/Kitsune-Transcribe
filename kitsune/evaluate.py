@@ -382,6 +382,7 @@ def _greedy_summarise(g: pd.DataFrame) -> dict:
              n_empty_hyp=int((g["hyp"].map(normalize_ja) == "").sum()),
              tok_per_s=float(g["n_tok"].sum()) / max(float(g["duration"].sum()), 1e-9),
              ref_edits=ref["edits"], ref_chars=ref["ref_chars"], n_empty_ref=ref["n_empty_ref"],
+             cer_teacher_edits=imit["edits"], cer_teacher_chars=imit["ref_chars"],  # cer_teacher_corpus = their ratio
              teacher_cer_ref_corpus=teach["cer"], teacher_cer_ref_mean=float(t["teacher_cer"].mean()),
              teacher_trunc_rate=float(t["teacher_truncated"].astype(bool).mean()) if len(t) else float("nan"),
              n_missing_teacher=int(len(g) - len(t)))
@@ -420,6 +421,53 @@ def flatten(summary: dict, prefix: str) -> dict[str, float]:
     walk({k: v for k, v in summary.items() if k != "sets"}, prefix)
     for s, d in summary.get("sets", {}).items():
         walk(d, f"{prefix}/{s}")
+    return out
+
+
+HEADLINE_CER = ("val_cer", "val_cer_vs_teacher", "train_cer", "train_cer_vs_teacher")
+
+
+def _pooled(sets: dict, num: str, den: str) -> float | None:
+    """sum(num) / sum(den) over the per-set summaries in `sets` (None without a denominator)."""
+    d = sum(float(s.get(den) or 0) for s in sets.values())
+    return sum(float(s.get(num) or 0) for s in sets.values()) / d if d else None
+
+
+def _gate_sets(summary: dict | None) -> dict:
+    """The GATE sets of an eval summary's per-set results (every set if none of them is a gate set)."""
+    sets = (summary or {}).get("sets") or {}
+    gate = {s: d for s, d in sets.items() if s in GATE_SETS}
+    return gate or dict(sets)
+
+
+def headline(tf: dict | None = None, greedy: dict | None = None, probe: dict | None = None,
+             probe_greedy: dict | None = None) -> dict:
+    """The numbers to read first after an eval, in one place (the trainer logs them as summary/<full|mini>/<name>).
+    val_* pool the GATE sets that were evaluated (every evaluated set if none is a gate set), train_* every train
+    source of the train-side eval:
+      val_cer               corpus CER vs the dataset reference: sum ref_edits / sum ref_chars of the per-set greedy
+                            summaries (the gate's measure, pooled)
+      val_cer_vs_teacher    corpus CER vs the teacher's hypothesis: sum cer_teacher_edits / sum cer_teacher_chars
+      val_loss, val_top1    teacher-forced KL (nats/token) and top-1 agreement with the teacher, token-weighted over the
+                            sets (val_loss = eval_record's heldout_kl)
+      train_cer, train_cer_vs_teacher  the same CERs on the greedy decode of train utterances
+      train_loss, train_top1           teacher-forced on train utterances (the probe)
+    CERs are fractions (0.083 = 8.3 %). A number whose inputs were not evaluated is left out."""
+    out = {}
+    vg, tg = _gate_sets(greedy), dict((probe_greedy or {}).get("sets") or {})
+    for side, sets in (("val", vg), ("train", tg)):
+        for name, num, den in (("cer", "ref_edits", "ref_chars"), ("cer_vs_teacher", "cer_teacher_edits",
+                                                                  "cer_teacher_chars")):
+            v = _pooled(sets, num, den)
+            if v is not None:
+                out[f"{side}_{name}"] = v
+    vt = {s: d for s, d in _gate_sets(tf).items() if d.get("n_tok")}
+    ntok = sum(d["n_tok"] for d in vt.values())
+    if ntok:
+        out["val_loss"] = sum(d["kl"] * d["n_tok"] for d in vt.values()) / ntok
+        out["val_top1"] = sum(d["top1"] * d["n_tok"] for d in vt.values()) / ntok
+    if probe and "all" in probe:
+        out["train_loss"], out["train_top1"] = probe["all"]["kl"], probe["all"]["top1"]
     return out
 
 

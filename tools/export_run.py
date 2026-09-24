@@ -10,8 +10,9 @@ files); analysis wants one table per kind. This folds everything into export/:
     from the tags of the open files
   - metrics/*: scalars (rebuilt from scalars.jsonl, the source of truth; the parquet mirror may lag one sync),
     steps, train_utts parts, hist parts, text
-  - evals/step_<N>/*.parquet concatenated per kind with a step column (eval_tf, eval_greedy, eval_probe, ...),
-    summary.json files flattened to eval_summaries, samples/*.jsonl -> samples, events.jsonl -> events
+  - evals/step_<N>/*.parquet concatenated per kind with a step column (eval_tf, eval_greedy, eval_probe, ...), the
+    mini evals' evals/step_<N>_mini/ likewise (eval_mini_tf, eval_mini_greedy, ...), summary.json files flattened to
+    eval_summaries (a `mini` column), samples/*.jsonl -> samples, events.jsonl -> events
   - infra/ (box logs and state that vast/finish.py uploads: kitsune.log, supervise.json, bootstrap timings, the
     lifecycle events of the stop/destroy scripts) copied, its events and bootstrap timings also as tables
   - config.json (config.<stamp>.json of each restart), summary.json and env/ copied as they are
@@ -73,6 +74,7 @@ COLUMNS = {
     "tb_tag": "the tag as TensorBoard shows it (bucketed; metrics/tag_map.json)",
     "plugin": "TensorBoard plugin the tag is logged to: scalars, histograms or text",
     "unmapped": "no bucket rule matched the tag (it went to 3_misc)",
+    "mini": "the row comes from a mini eval (evals/step_<N>_mini/), not a full one",
 }
 FILES = {
     "tb_scalars": "every TensorBoard scalar (mirror of scalars; purged steps dropped)",
@@ -85,7 +87,8 @@ FILES = {
                   "restored full state occur twice: keep the rows of the larger attempt",
     "hist": "histogram summaries (quantiles, moments, 64-bin counts)",
     "text": "every text() call",
-    "eval_summaries": "every eval summary.json flattened: one row per (step, key)",
+    "eval_summaries": "every eval summary.json flattened (mini evals too, mini = true): one row per (step, mini, "
+                      "key); headline/<name> are the eval's headline numbers (CER as fractions)",
     "samples": "text samples written at each eval",
     "events": "lifecycle events (phases, smoke results, OOM fallbacks, checkpoints, exceptions, syncs, verdict)",
     "infra_events": "box lifecycle records from $KITSUNE_STATE/events.jsonl (sync failures, verification, stop/destroy)",
@@ -259,8 +262,9 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
 
     per_kind: dict[str, list[pd.DataFrame]] = {}
     summaries = []
-    for d in sorted((run / "evals").glob("step_*"), key=lambda p: int(p.name.split("_")[1])):
+    for d in sorted((run / "evals").glob("step_*"), key=lambda p: (int(p.name.split("_")[1]), p.name)):
         step = int(d.name.split("_")[1])
+        mini = d.name.endswith("_mini")  # evals/step_<N>_mini/: a mini eval (eval_mini_<kind> tables)
         for f in sorted(d.glob("*.parquet")):
             df = pd.read_parquet(f)
             kind, _, eset = f.stem.partition("_")
@@ -269,10 +273,10 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
             df.insert(0, "step", step)
             if eset:
                 df.insert(1, "set", eset)
-            per_kind.setdefault(f"eval_{kind}", []).append(df)
+            per_kind.setdefault(f"eval_{'mini_' if mini else ''}{kind}", []).append(df)
         for f in sorted(d.glob("*.json")):
             flat = _flatten(json.loads(f.read_text(encoding="utf-8")))
-            summaries += [dict(step=step, file=f.name, key=k, value=v) for k, v in flat.items()]
+            summaries += [dict(step=step, mini=mini, file=f.name, key=k, value=v) for k, v in flat.items()]
     for k, dfs in per_kind.items():
         t[k] = pd.concat(dfs, ignore_index=True)
     if summaries:
@@ -321,9 +325,12 @@ def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: l
              "TensorBoard groups cards by the first component of a tag, so the run's event files put every tag under "
              "one of three buckets: `1_operational/` (time, throughput, memory, system, data progress with the tokens "
              "per source, schedule, early-stop bookkeeping, eval cost and counts with the CER denominators "
-             "`ref_chars`; lifecycle events and the config as text), `2_loss_accuracy/` (train and held-out loss, "
+             "`ref_chars`; lifecycle events and the config as text), `2_loss_accuracy/` (first `00_summary/full/` and "
+             "`00_summary/mini/`: every eval's headline numbers, the pooled val / train CER vs the reference and vs "
+             "the teacher with `_pct` copies, val / train KL and top-1; then train and held-out loss, "
              "accuracy as top-1 agreement with the teacher and CER, both per source and per teacher-confidence "
-             "bucket, the train probe, the overfit gap, the early-stop metric and its best; the eval sample tables) "
+             "bucket, the train probe, the overfit gap, the early-stop metric and its best, the mini evals in "
+             "`<section>_mini/`; the eval sample tables) "
              "and `3_misc/` (per-layer stats, L2-SP distances, optimizer internals, augmentation, token diagnostics "
              "with each confidence bucket's share of the tokens, every histogram, and any tag no rule matched). The "
              "tables here keep the tag as logged "
@@ -341,8 +348,11 @@ def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: l
         unmapped = sorted(tm.loc[tm["unmapped"], "tag"])
         lines += ["", f"No rule matched (so in 3_misc): {', '.join(f'`{t}`' for t in unmapped) or 'none'}.", ""]
     for name, df in tables.items():
-        desc = FILES.get(name) or (f"per-utterance eval table `{name[5:]}` from every evals/step_<N>/ (step, set added)"
-                                   if name.startswith("eval_") else "")
+        desc = FILES.get(name) or (
+            f"per-utterance mini-eval table `{name[10:]}` from every evals/step_<N>_mini/ (step, set added)"
+            if name.startswith("eval_mini_") else
+            f"per-utterance eval table `{name[5:]}` from every evals/step_<N>/ (step, set added)"
+            if name.startswith("eval_") else "")
         csv = (out / f"{name}.csv").exists()
         lines += [f"## `{name}.parquet`{' / `' + name + '.csv`' if csv else ' (no CSV: too large)'}", "",
                   f"{desc}. {len(df):,} rows.", "", "| column | type | description |", "|---|---|---|"]

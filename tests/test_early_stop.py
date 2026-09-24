@@ -296,10 +296,10 @@ def test_stop_action_runs_the_end_phase_and_a_crash_after_it_resumes_there(env, 
     path = write_config(env, "es-stop", {"early_stop": rule(patience=3, min_delta_abs=FLAT)})
     orig = m.run_eval
 
-    def run_eval(R, step, final=False):
+    def run_eval(R, step, final=False, **kw):
         if final:
             raise RuntimeError("simulated crash in the final eval")
-        return orig(R, step, final)
+        return orig(R, step, final, **kw)
 
     monkeypatch.setattr(m, "run_eval", run_eval)
     with pytest.raises(RuntimeError, match="final eval"):
