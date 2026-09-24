@@ -234,7 +234,8 @@ def make_fake_corpus(root, sources: dict | None = None, *, rows_per_shard: int =
         save_progress(fc.data, source, {"finished_inputs": [], "done": True})
 
     (fc.teacher_out / "meta.json").write_text(json.dumps(dict(
-        model="fake/teacher", language="ja", punctuation=True, k=k, save_encoder=False, decoder_prompt_ids=list(prompt),
+        model="fake/teacher", model_revision="0" * 40, language="ja", punctuation=True, k=k, save_encoder=False,
+        decoder_prompt_ids=list(prompt),
         decoder_prompt_tokens=[f"<{p}>" for p in prompt], eos_token_id=eos, pad_token_id=pad, vocab_size=vocab_size,
         encoder_hidden_size=1280, decoding="greedy", lm_head_dtype="float32", model_dtype="bfloat16",
     ), indent=2), encoding="utf-8")

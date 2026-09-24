@@ -94,7 +94,7 @@ def test_fixture_matches_real_formats(corpus):
         assert first_keys(real_second) == first_keys(corpus.second_out / "src_a" / "train-00000.jsonl")
     real_meta = json.loads((ROOT / "teacher_out" / "meta.json").read_text(encoding="utf-8"))
     fake_meta = json.loads((corpus.teacher_out / "meta.json").read_text(encoding="utf-8"))
-    assert set(real_meta) == set(fake_meta)
+    assert set(real_meta) | {"model_revision"} == set(fake_meta)  # 02 back-fills it into an older meta.json on resume
     assert pq.read_schema(corpus.data / "shards" / "src_a" / "train-00000.parquet").remove_metadata().equals(SCHEMA)
     if REAL_SHARD.exists():
         assert pq.read_schema(REAL_SHARD).remove_metadata().equals(SCHEMA)

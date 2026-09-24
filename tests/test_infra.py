@@ -1297,6 +1297,57 @@ def test_downloads_use_the_pinned_revision(prep, tmp_path, monkeypatch):
     assert ("list", prep.GALGAME_REPO, prep.REVISIONS[prep.GALGAME_REPO]) in seen
 
 
+def test_second_opinion_mirror_pins_match_01(prep):
+    """02b keeps its own copy of the ReazonSpeech mirror pins; it must read the commits the audio was built from."""
+    second = load_path("second_opinion_02b", ROOT / "scripts" / "02b_second_opinion.py")
+    pins = dict(second.JOIN_SOURCES.values())
+    assert pins == {repo: prep.REVISIONS[repo] for repo in pins}
+    assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (second.MODEL2_REVISION, second.WHISPER_TOK_REVISION))
+
+
+def test_label_passes_read_the_hub_at_a_pin():
+    """Every hub read in 02 and 02b names a revision; without one it silently follows `main`."""
+    import ast
+
+    for name in ("02_teacher_pass.py", "02b_second_opinion.py"):
+        tree = ast.parse((ROOT / "scripts" / name).read_text(encoding="utf-8"))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+        reads = [c for c in calls if c.func.attr in ("from_pretrained", "list_repo_files")]
+        assert reads and all(any(k.arg == "revision" for k in c.keywords) for c in reads), name
+        for c in calls:  # HfFileSystem paths carry the revision as datasets/<repo>@<rev>/<file>
+            if c.func.attr == "open" and c.args and isinstance(c.args[0], ast.JoinedStr):
+                parts = [v.value for v in c.args[0].values if isinstance(v, ast.Constant)]
+                assert "@" in parts, name
+
+
+def test_second_opinion_launcher_watches_its_one_source():
+    """The supervisor's blocking mode runs --limit-shards <files under --watch-dir>+1, which is the stuck shard only
+    when the watch dir holds exactly the outputs of the --sources being run."""
+    line = next(ln for ln in (ROOT / "scripts" / "start_second_opinion.cmd").read_text(encoding="utf-8").splitlines()
+                if "run_teacher_pass.py" in ln)
+    argv = line.split(">>")[0].split()
+    sources = argv[argv.index("--sources") + 1:]
+    sources = sources[:next((i for i, a in enumerate(sources) if a.startswith("--")), len(sources))]
+    assert len(sources) == 1 and argv[argv.index("--watch-dir") + 1] == f"second_out\\{sources[0]}"
+
+
+def test_teacher_meta_from_before_the_pin_resumes(tmp_path):
+    """A teacher_out/meta.json written before the teacher was pinned has no model_revision: it counts as the pin, so the
+    pass resumes and the key is back-filled; a meta.json from another teacher commit still stops it."""
+    teacher_pass = load_path("teacher_pass_02", ROOT / "scripts" / "02_teacher_pass.py")
+    settings = dict(model=teacher_pass.MODEL_ID, model_revision=teacher_pass.MODEL_REVISION, language="ja",
+                    punctuation=True, k=16, save_encoder=False)
+    legacy = {key: val for key, val in settings.items() if key != "model_revision"} | dict(eos_token_id=3)
+    meta = tmp_path / "meta.json"
+    meta.write_text(json.dumps(legacy), encoding="utf-8")
+    teacher_pass.check_meta(meta, settings)
+    assert json.loads(meta.read_text(encoding="utf-8")) == legacy | {"model_revision": teacher_pass.MODEL_REVISION}
+    teacher_pass.check_meta(meta, settings)
+    meta.write_text(json.dumps(legacy | {"model_revision": "f" * 40}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="model_revision"):
+        teacher_pass.check_meta(meta, settings)
+
+
 # ------------------------------------------------------------------------------------------------------ smoke model
 
 def test_smoke_tiny_forward_backward():

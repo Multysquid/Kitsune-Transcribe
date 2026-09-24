@@ -3,7 +3,7 @@
 For each input shard  data/shards/<source>/<split>-NNNNN.parquet  this writes
   teacher_out/<source>/<split>-NNNNN.npz     packed arrays (see FORMAT below)
   teacher_out/<source>/<split>-NNNNN.jsonl   one line per utterance: id, hyp, ref, cer, duration, n_tok, truncated
-  teacher_out/meta.json                      model id, decoder prompt, k, generation settings
+  teacher_out/meta.json                      model id and pinned commit, decoder prompt, k, generation settings
 
 FORMAT (npz):
   ids           (n,)        utterance ids, same order as the jsonl
@@ -57,6 +57,8 @@ from kitsune.store import read_manifest, read_shard  # noqa: E402
 from kitsune.text import cer as cer_fn  # noqa: E402
 
 MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"
+# pinned like the datasets in 01: a teacher repo that moves between passes would mix two teachers' labels in teacher_out
+MODEL_REVISION = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
 MAX_DUR = 30.0  # feature-extractor fast path: max_audio_clip_s (35) - overlap_chunk_second (5)
 LANG = "ja"
 PUNCT = True
@@ -269,6 +271,20 @@ def shard_is_done(npz: Path, expected_rows: int, args) -> bool:
         return False  # old/partial/corrupt file -> recompute
 
 
+def check_meta(meta_path: Path, settings: dict):
+    """Exit if an existing meta.json was written with other settings. A meta.json from before the teacher was pinned
+    has no model_revision; that output all came from b1eacc2 (the only snapshot ever cached, and still `main`), so it
+    counts as the pin and the key is back-filled (meta.json is otherwise only written when missing or with --force)."""
+    old = json.loads(meta_path.read_text(encoding="utf-8"))
+    backfill = "model_revision" not in old
+    old.setdefault("model_revision", MODEL_REVISION)
+    diff = {key: (old.get(key), val) for key, val in settings.items() if old.get(key) != val}
+    if diff:
+        sys.exit(f"{meta_path} was written with different settings {diff}; use --force (recomputes everything) or a different --out")
+    if backfill:
+        meta_path.write_text(json.dumps(old, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default=str(ROOT / "data"))
@@ -301,12 +317,10 @@ def main():
     # settings must be uniform across teacher_out, otherwise the student loader gets heterogeneous shards
     out_root.mkdir(parents=True, exist_ok=True)
     meta_path = out_root / "meta.json"
-    settings = dict(model=MODEL_ID, language=LANG, punctuation=PUNCT, k=args.k, save_encoder=args.save_encoder)
+    settings = dict(model=MODEL_ID, model_revision=MODEL_REVISION, language=LANG, punctuation=PUNCT, k=args.k,
+                    save_encoder=args.save_encoder)
     if meta_path.exists() and not args.force:
-        old = json.loads(meta_path.read_text(encoding="utf-8"))
-        diff = {key: (old.get(key), val) for key, val in settings.items() if old.get(key) != val}
-        if diff:
-            sys.exit(f"{meta_path} was written with different settings {diff}; use --force (recomputes everything) or a different --out")
+        check_meta(meta_path, settings)
 
     todo = [s for s in shards if args.force or not shard_is_done(out_root / s.source / f"{Path(s.path).stem}.npz", s.rows, args)]
     print(f"output: {out_root}\n{len(todo)}/{len(shards)} shards to do, {sum(s.hours for s in todo):.1f} h audio "
@@ -319,8 +333,9 @@ def main():
     if free < 6 * 2**30:
         print("WARNING: <6 GiB free - other apps are holding VRAM; the pass may spill to shared memory and slow down 5x")
     torch.backends.cuda.matmul.allow_tf32 = True
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
-    model = CohereAsrForConditionalGeneration.from_pretrained(MODEL_ID, dtype=torch.bfloat16).to("cuda").eval()
+    processor = AutoProcessor.from_pretrained(MODEL_ID, revision=MODEL_REVISION)
+    model = CohereAsrForConditionalGeneration.from_pretrained(MODEL_ID, revision=MODEL_REVISION,
+                                                              dtype=torch.bfloat16).to("cuda").eval()
     fp32_head(model)
     print(f"teacher loaded: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B params, "
           f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB")
@@ -343,7 +358,7 @@ def main():
                        f"free {torch.cuda.mem_get_info()[0] / 2**30:.2f} GiB")
             if (args.force or not meta_path.exists()) and r["prompt"]:
                 meta_path.write_text(json.dumps(dict(
-                    **settings, model_revision=getattr(model.config, "_commit_hash", None),  # the commit `main` resolved to
+                    **settings,
                     decoder_prompt_ids=r["prompt"],
                     decoder_prompt_tokens=processor.tokenizer.convert_ids_to_tokens(r["prompt"]),
                     eos_token_id=model.generation_config.eos_token_id, pad_token_id=model.generation_config.pad_token_id,

@@ -51,7 +51,9 @@ def main():
         print(f"=== attempt {attempt}: {before} shards done, {(time.time() - t0) / 60:.0f} min elapsed"
               f"{', CUDA_LAUNCH_BLOCKING=1' if blocking else ''} ===", flush=True)
         env = dict(os.environ, CUDA_LAUNCH_BLOCKING="1") if blocking else None
-        # a blocking attempt only clears the stuck shard (shards complete in manifest order), then we go back to fast mode
+        # a blocking attempt only clears the stuck shard, then we go back to fast mode. That needs the finished outputs
+        # under the watch dir to be a prefix of the wrapped script's shard list (one source per run, watch dir = that
+        # source's output dir); otherwise <done>+1 reaches past the stuck shard and the whole remainder runs serialised
         extra = ["--limit-shards", str(before + 1)] if blocking else []
         rc = subprocess.run([sys.executable, str(script), *args, *extra], env=env).returncode
         if rc == 0 and not blocking:

@@ -52,9 +52,12 @@ Only the Emilia hold-out is kept disjoint from training (by video). Nothing dedu
 the eval_reazon CER carries up to ~0.3 pp from re-aired broadcasts that are also in reazon_small. The galgame hold-out
 is a random utterance sample of the first tar, so it measures seen games and voices, not unseen games.
 
-Every upstream dataset repo is read at a pinned commit (`REVISIONS` in `scripts/01_prepare_data.py`). The teacher
-is read from `main`; `teacher_out/meta.json` and `student_meta.json` record the commit it resolved to (the teacher
-outputs and the student built before that record was added all come from `b1eacc2`).
+Every upstream dataset repo is read at a pinned commit (`REVISIONS` in `scripts/01_prepare_data.py`). The label
+passes pin theirs too: the teacher at `b1eacc2` (`MODEL_REVISION` in `02_teacher_pass.py`, recorded in
+`teacher_out/meta.json`), and kotoba-whisper, the whisper-large-v3 tokenizer and the ReazonSpeech mirrors in
+`02b_second_opinion.py` (recorded in `second_out/meta.json`). `03_build_student.py` reads the teacher from `main`;
+`student_meta.json` records the commit it resolved to (the student built before that record was added comes from
+`b1eacc2`).
 
 ### License of the trained model
 
