@@ -94,9 +94,11 @@ TRAIN_UTT_SCHEMA = pa.schema([("step", pa.int64()), ("epoch", pa.int64()), ("id"
                               ("agree", pa.float32())])
 QUANTILES = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
 HIST_BINS = 64
-# env vars worth keeping (vast host facts, our own launch settings); anything secret-looking is redacted by name
+# env vars worth keeping (vast host facts, our own launch settings); anything secret-looking is redacted by name.
+# Not SSH_CONNECTION: a run started from an SSH shell (onstart.sh --rearm, a manual --resume) would record the
+# operator's own IP in the runs repo, and the box side is already in PUBLIC_IPADDR / VAST_TCP_PORT_*.
 ENV_PREFIXES = ("VAST", "CONTAINER", "KITSUNE", "PUBLIC_IPADDR", "GPU_", "CUDA", "NVIDIA", "HF_", "PYTORCH", "OMP_",
-                "TZ", "HOSTNAME", "SSH_CONNECTION")
+                "TZ", "HOSTNAME")
 SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CRED", "COOKIE")
 SYNC_IGNORE = ["checkpoints/*", "*.tmp"]
 

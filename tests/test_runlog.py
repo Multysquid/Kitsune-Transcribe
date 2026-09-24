@@ -456,10 +456,12 @@ def test_env_redacts_secrets(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTAINER_API_KEY", "vast_secret")
     monkeypatch.setenv("VAST_CONTAINERLABEL", "C.12345")
     monkeypatch.setenv("KITSUNE_DPH", "0.672")
+    monkeypatch.setenv("SSH_CONNECTION", "203.0.113.7 52144 10.0.0.5 22")  # a run re-armed from the operator's SSH
     runlog.capture_env(tmp_path / "env")
     text = (tmp_path / "env" / "system.json").read_text(encoding="utf-8")
-    assert "hf_supersecret" not in text and "vast_secret" not in text
+    assert "hf_supersecret" not in text and "vast_secret" not in text and "203.0.113.7" not in text
     system = json.loads(text)
+    assert not any(k.startswith("SSH_") for k in system["env"])
     assert system["env"]["HF_TOKEN"] == "<redacted>" and system["env"]["VAST_CONTAINERLABEL"] == "C.12345"
     assert system["instance_id"] == "C.12345" and system["offer_dph"] == 0.672
 
