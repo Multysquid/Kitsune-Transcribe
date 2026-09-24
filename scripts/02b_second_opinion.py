@@ -10,6 +10,9 @@ Where the second opinion comes from:
   reazon_small / reazon_medium   free - the japanese-asr mirror parquets carry a `whisper_transcript` column
                                  (openai/whisper-large-v3 token ids). Only the name+transcript columns are
                                  streamed (no audio re-download) and cached under second_out/_cache/.
+  emilia_yodas                   free - the dataset text IS an ASR transcript (Emilia-Pipe WhisperX, Whisper medium),
+                                 so hyp2 = the stored reference and no audio is touched. Weaker than large-v3, so
+                                 its agree values run higher; filter thresholds are per second-opinion model.
   everything else                kotoba-tech/kotoba-whisper-v2.0 (distil-whisper large-v3 tuned on Japanese,
                                  ~0.75B) is run over the shard audio on the GPU.
 
@@ -54,6 +57,9 @@ WHISPER_TOK = "openai/whisper-large-v3"  # tokenizer that produced the precomput
 JOIN_SOURCES = {  # sources whose mirror parquets already carry whisper-large-v3 transcripts
     "reazon_small": "japanese-asr/whisper_transcriptions.reazonspeech.small",
     "reazon_medium": "japanese-asr/whisper_transcriptions.reazonspeech.medium",
+}
+SELF_TEXT_SOURCES = {  # sources whose dataset text is itself a second-model transcript
+    "emilia_yodas": "whisper-medium (Emilia WhisperX)",
 }
 
 
@@ -238,7 +244,9 @@ def main():
         for s in tqdm(todo, desc="shards", unit="shard"):
             stem = Path(s.path).stem
             trows = read_teacher_rows(teacher_root / s.source / f"{stem}.jsonl")
-            if s.source in JOIN_SOURCES:
+            if s.source in SELF_TEXT_SOURCES:
+                rows = [second_row(r["id"], r["hyp"], r["ref"], r["ref"], SELF_TEXT_SOURCES[s.source]) for r in trows]
+            elif s.source in JOIN_SOURCES:
                 if s.source not in wmaps:
                     wmaps[s.source] = load_whisper_map(s.source, out_root / "_cache")
                 rows = process_join_shard(trows, wmaps[s.source], s.source)
