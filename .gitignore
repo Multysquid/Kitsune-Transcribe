@@ -45,3 +45,8 @@ Thumbs.db
 .claude/
 second_out/
 second_out_smoke/
+
+# --- training artifacts (parked on HF, never in git) ---
+students/
+cache/
+selection/

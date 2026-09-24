@@ -1,0 +1,41 @@
+# Training image dependencies (docker/Dockerfile installs these into the base image's /venv/main).
+# torch 2.14.0+cu130 comes from the base image (vastai/pytorch ... cu130) and is held there by a constraints file,
+# so nothing here may pull a different torch. Versions are the ones the laptop produced the teacher outputs and ran the
+# tests with (importlib.metadata, 2026-09-23); nvidia-ml-py and vastai are not installed on the laptop and are pinned
+# to the current PyPI release.
+
+# model + hub
+transformers==5.13.1
+tokenizers==0.22.2
+sentencepiece==0.2.2
+safetensors==0.8.0
+huggingface_hub==1.23.0
+hf_xet==1.5.1
+
+# data + audio
+numpy==2.5.3
+pyarrow==25.0.1
+pandas==2.3.2
+soundfile==0.14.0
+librosa==1.0.0
+soxr==1.1.0
+# librosa's compiled dependencies: numba must support the pinned numpy, so hold the combination that works locally
+numba==0.67.0
+llvmlite==0.49.0
+scipy==1.16.2
+scikit-learn==1.7.2
+
+# eval + logging
+jiwer==4.0.0
+tensorboard==2.20.0
+tqdm==4.68.4
+nvidia-ml-py==13.610.43
+# process RSS / CPU % in kitsune.runlog.system_stats (the trainer logs them every step)
+psutil==7.1.0
+pyyaml==6.0.3
+
+# tests (the smoke check and tests/ can run inside the image)
+pytest==9.1.1
+
+# self-stop / self-destroy fallback when the REST call in vast/finish.py fails
+vastai==1.8.0
