@@ -275,18 +275,25 @@ def vast_rest(action: str, timeout: float = 30) -> bool:
 
 def vast_cli(action: str) -> bool:
     """Fallback through the vastai CLI; the key goes through the environment, never argv. A hung or missing CLI is
-    a failure like any other, so the caller's destroy -> stop fallback still runs."""
+    a failure like any other, so the caller's destroy -> stop fallback still runs. Success is the CLI's own success
+    line ("destroying instance <id>." / "stopping instance <id>."), not its exit code: vastai 1.8.0 exits 0 when the
+    API refuses (success=false) or answers with an HTTP error too. A substring, not a whole line: for destroy the
+    confirmation prompt that input() prints shares the line."""
     exe, key, cid = shutil.which("vastai"), os.environ.get("CONTAINER_API_KEY"), os.environ.get("CONTAINER_ID")
     if not exe or not key or not cid:
         return False
     verb = "destroy" if action == "destroy" else "stop"
     try:
-        rc = subprocess.run([exe, verb, "instance", cid], env=dict(os.environ, VAST_API_KEY=key),
-                            input="y\n", text=True, timeout=120).returncode
+        r = subprocess.run([exe, verb, "instance", cid], env=dict(os.environ, VAST_API_KEY=key),
+                           input="y\n", capture_output=True, text=True, timeout=120)
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"vastai {verb} failed: {type(e).__name__}: {e}")
         return False
-    return rc == 0
+    done = f"{'destroying' if verb == 'destroy' else 'stopping'} instance {cid}."
+    if r.returncode == 0 and done in (r.stdout or ""):
+        return True
+    log(f"vastai {verb} failed (exit {r.returncode}): {((r.stdout or '') + (r.stderr or '')).strip()[-300:]}")
+    return False
 
 
 def instance_action(action: str, reason: str, dry_run: bool, before=None) -> bool:

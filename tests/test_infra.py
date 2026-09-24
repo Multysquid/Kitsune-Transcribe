@@ -662,6 +662,48 @@ def test_vastai_cli_timeout_still_falls_back_to_stop(tmp_path, monkeypatch):
     assert json.loads((tmp_path / "state" / "halt").read_text())["action"] == "stop"
 
 
+def _cli_env(tmp_path, monkeypatch, reply):
+    """REST down, the vastai CLI faked: reply(verb) -> (exit code, stdout, stderr)."""
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv[1])
+        return subprocess.CompletedProcess(argv, *reply(argv[1]))
+
+    monkeypatch.setattr(finish, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: False)
+    monkeypatch.setattr(finish.shutil, "which", lambda name: "/fake/vastai")
+    monkeypatch.setattr(finish.subprocess, "run", run)
+    monkeypatch.setenv("CONTAINER_API_KEY", "k")
+    monkeypatch.setenv("CONTAINER_ID", "123")
+    return calls
+
+
+def test_vastai_cli_refusal_with_exit_0_still_falls_back_to_stop(tmp_path, monkeypatch):
+    """vastai 1.8.0 exits 0 when the API refuses or errors (it prints the error and returns): only its own success line
+    counts, so a refused destroy still falls back to stop, and a refused stop is reported as failed."""
+    prompt = "Are you sure you want to destroy instance 123? This is irreversible and will delete all data. [y/N] "
+    calls = _cli_env(tmp_path, monkeypatch, lambda verb: (0, prompt if verb == "destroy" else "nope\n",
+                                                           "Failed with error 500: boom"))
+    assert finish.instance_action("destroy", "verified", dry_run=False) is False
+    assert calls == ["destroy", "stop"]
+    assert json.loads((tmp_path / "state" / "halt").read_text())["action"] == "stop"
+
+
+def test_vastai_cli_success_line_counts(tmp_path, monkeypatch):
+    prompt = "Are you sure you want to destroy instance 123? This is irreversible and will delete all data. [y/N] "
+    calls = _cli_env(tmp_path, monkeypatch, lambda verb: (0, prompt + "destroying instance 123.\n", ""))
+    assert finish.instance_action("destroy", "verified", dry_run=False) is True
+    assert calls == ["destroy"]
+    assert json.loads((tmp_path / "state" / "halt").read_text())["action"] == "destroy"
+    # a refused destroy, then a stop the API accepts: stopped, and the halt marker says so
+    calls = _cli_env(tmp_path, monkeypatch, lambda verb: (0, prompt + "nope\n", "") if verb == "destroy"
+                     else (0, "stopping instance 123.\n", ""))
+    assert finish.instance_action("destroy", "verified", dry_run=False) is True
+    assert calls == ["destroy", "stop"]
+    assert json.loads((tmp_path / "state" / "halt").read_text())["action"] == "stop"
+
+
 def test_finish_stops_when_verification_fails(finish_env):
     run, go = finish_env
     remote = remote_from_local(finish.expected_files(run))
