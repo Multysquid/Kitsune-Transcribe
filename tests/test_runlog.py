@@ -200,7 +200,7 @@ def test_tensorboard_tags_are_bucketed(run):
     acc.Reload()
     tags = acc.Tags()
     assert all(t.split("/", 1)[0] in runlog.TB_BUCKETS for k in ("scalars", "histograms", "tensors") for t in tags[k])
-    assert {"2_loss_accuracy/train_loss/total", "2_loss_accuracy/train_loss/kl/src_a", "3_misc/lr",
+    assert {"2_loss_accuracy/train_loss_incl_l2sp/total", "2_loss_accuracy/train_loss/kl/src_a", "3_misc/lr",
             "3_misc/grad_norm"} <= set(tags["scalars"])
     assert any(t.startswith("1_operational/sys/proc/") for t in tags["scalars"])
     assert set(tags["histograms"]) == {"3_misc/weights/enc0", "3_misc/grads/enc0"}
@@ -211,8 +211,8 @@ def test_tensorboard_tags_are_bucketed(run):
     assert {"loss/total", "lr", "grad_norm"} <= set(sc["tag"]) and not any(sc["tag"].str.startswith("2_loss"))
     assert set(pd.read_parquet(run / "metrics" / "steps.parquet").columns) >= {"loss/total", "lr"}
     tag_map = json.loads((run / "metrics" / "tag_map.json").read_text(encoding="utf-8"))
-    assert tag_map["loss/total"] == {"tb_tag": "2_loss_accuracy/train_loss/total", "bucket": "2_loss_accuracy",
-                                     "plugin": "scalars"}
+    assert tag_map["loss/total"] == {"tb_tag": "2_loss_accuracy/train_loss_incl_l2sp/total",
+                                     "bucket": "2_loss_accuracy", "plugin": "scalars"}
     assert tag_map["weights/enc0"] == {"tb_tag": "3_misc/weights/enc0", "bucket": "3_misc", "plugin": "histograms"}
     assert tag_map["samples"]["tb_tag"] == "2_loss_accuracy/samples"
     assert tag_map["events/logger_start"]["bucket"] == "1_operational"
@@ -522,7 +522,8 @@ def test_export_run(run, tmp_path):
     assert set(tb["tag"]) == set(sc["tag"])  # TensorBoard mirrors every scalar (the logged tags given back)
     t = tb[tb["tag"] == "loss/total"].sort_values("step")
     assert t["step"].tolist() == [1, 2, 3, 4, 5] and t["value"].tolist() == pytest.approx([2.0 / s for s in range(1, 6)])
-    assert set(t["tb_tag"]) == {"2_loss_accuracy/train_loss/total"} and set(t["bucket"]) == {"2_loss_accuracy"}
+    assert set(t["tb_tag"]) == {"2_loss_accuracy/train_loss_incl_l2sp/total"}
+    assert set(t["bucket"]) == {"2_loss_accuracy"}
     for df in (tb, sc):  # the bucket columns agree between the TensorBoard mirror and the open files
         assert list(df.columns[:3]) == ["tag", "bucket", "tb_tag"]
         assert (df["tb_tag"].str.split("/").str[0] == df["bucket"]).all()
@@ -537,7 +538,7 @@ def test_export_run(run, tmp_path):
     assert "hello **world**" in tx.set_index("tag").loc["note", "text"]
     assert tx.set_index("tag").loc["samples", "tb_tag"] == "2_loss_accuracy/samples"
     tm = pd.read_parquet(out / "tag_map.parquet").set_index(["tag", "plugin"])
-    assert tm.loc[("loss/total", "scalars"), "tb_tag"] == "2_loss_accuracy/train_loss/total"
+    assert tm.loc[("loss/total", "scalars"), "tb_tag"] == "2_loss_accuracy/train_loss_incl_l2sp/total"
     assert tm.loc[("lr", "scalars"), "unmapped"] and not tm.loc[("loss/total", "scalars"), "unmapped"]
     assert tm.loc[("events/phase", "text"), "bucket"] == "1_operational"
     assert json.loads((out / "tag_map.json").read_text(encoding="utf-8")) == json.loads(
@@ -560,7 +561,7 @@ def test_export_run(run, tmp_path):
         assert f"`{name}.parquet`" in readme, name
         for col in pd.read_parquet(out / f"{name}.parquet").columns:
             assert f"`{col}`" in readme, (name, col)
-    assert "`loss/total`" in readme and "`2_loss_accuracy/train_loss/total`" in readme  # the tag list
+    assert "`loss/total`" in readme and "`2_loss_accuracy/train_loss_incl_l2sp/total`" in readme  # the tag list
     for needle in ("## TensorBoard layout", "`1_operational/`", "`2_loss_accuracy/`", "`3_misc/`", "- `tag_map.json`:",
                    "tools/regroup_tb.py", "| `3_misc` |", "`lr`"):
         assert needle in readme, needle

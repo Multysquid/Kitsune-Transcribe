@@ -84,8 +84,8 @@ def expected_tb(tag: str, plugin: str = "scalars") -> str:
             return f"1_operational/{tag}"
         assert tag == "samples", tag
         return "2_loss_accuracy/samples"
-    if p[0] == "loss":
-        return f"2_loss_accuracy/train_loss/{rest}"
+    if p[0] == "loss":  # the total (with the L2-SP value, which climbs all run) and l2sp apart from the objective terms
+        return f"2_loss_accuracy/train_loss{'_incl_l2sp' if rest in ('total', 'l2sp') else ''}/{rest}"
     if p[0] in ("src", "bucket"):
         assert len(p) == 3, tag
         if (p[0], p[2]) == ("src", "tokens"):
@@ -213,6 +213,9 @@ SPOT = [
     ("eval/greedy/eval_cv8/cer_teacher_edits", "scalars", "2_loss_accuracy/val_accuracy/eval_cv8/cer_teacher_edits"),
     ("eval/greedy_full/all/cer_teacher_chars", "scalars", "1_operational/eval/greedy_full/all/cer_teacher_chars"),
     ("loss/kl", "scalars", "2_loss_accuracy/train_loss/kl"),
+    ("loss/objective", "scalars", "2_loss_accuracy/train_loss/objective"),
+    ("loss/total", "scalars", "2_loss_accuracy/train_loss_incl_l2sp/total"),
+    ("loss/l2sp", "scalars", "2_loss_accuracy/train_loss_incl_l2sp/l2sp"),
     ("src/galgame/kl", "scalars", "2_loss_accuracy/train_loss/by_source/galgame/kl"),
     ("src/galgame/top1", "scalars", "2_loss_accuracy/train_accuracy/by_source/galgame/top1"),
     ("src/galgame/tokens", "scalars", "1_operational/src/galgame/tokens"),

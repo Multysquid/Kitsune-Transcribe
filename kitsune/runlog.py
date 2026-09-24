@@ -246,6 +246,10 @@ TB_BUCKET_RULES = (
     (rf"eval/mini/probe/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/train_probe_loss_mini/\g<set>/\g<m>"),
     (rf"eval/mini/probe/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/train_probe_accuracy_mini/\g<set>/\g<m>"),
     (rf"eval/mini/probe_greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/train_probe_accuracy_mini/\g<set>/\g<m>"),
+    # loss/total = objective + the L2-SP value lam/2*||theta-theta0||^2, which the light decoupled pull does not hold
+    # down: it climbs all run as the weights leave the init (70 by step 600 of an overfit run whose objective fell to
+    # 0.1), so it and loss/l2sp get their own group, named for it, beside the optimised objective, kl and ce
+    (r"loss/(?P<m>total|l2sp)", r"2_loss_accuracy/train_loss_incl_l2sp/\g<m>"),
     (r"loss/(?P<m>.+)", r"2_loss_accuracy/train_loss/\g<m>"),
     (r"src/(?P<src>[^/]+)/(?P<m>kl|ce)", r"2_loss_accuracy/train_loss/by_source/\g<src>/\g<m>"),
     (r"bucket/(?P<b>[^/]+)/(?P<m>kl|ce)", r"2_loss_accuracy/train_loss/by_teacher_confidence/\g<b>/\g<m>"),
