@@ -12,7 +12,7 @@ check refuses a data repo whose derived data is incomplete: a train source's tea
 or a selection that still drops rows as no_agree (both mean training on a fraction of the planned hours); a selection
 not built from the run config's sources, eval sets and selection_recipe, or with no kept rows for one of them
 (make_selection.py --config builds the right one); and a selection whose kept rows point at teacher output the repo
-lacks.
+lacks. It also refuses a data or output repo that is not private (both carry dataset reference transcripts).
 
 HF_TOKEN is never an argument and never part of the command: the box gets it from the vast ACCOUNT-level environment
 variables (D48a), so it does not appear in shell history, the process list or the instance config. The instance runs
@@ -276,7 +276,9 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
 
 def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, list[str]]:
     """-> (data repo commit to pin, problems). Uses the laptop's own HF login, read-only (the selection, ~2 MB, is
-    downloaded to a temporary dir)."""
+    downloaded to a temporary dir). Both repos must be private: they hold dataset reference transcripts (`ref` in
+    teacher_out/*.jsonl, the eval tables and the samples) whose terms forbid republishing them, and the trainer's
+    hf.private only applies when it creates a repo, never to the existing ones launch requires."""
     import tempfile
 
     from huggingface_hub import HfApi, hf_hub_download
@@ -285,6 +287,10 @@ def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, 
     try:
         info = api.dataset_info(data_repo)
         rev = info.sha
+        if info.private is not True:
+            problems.append(f"{data_repo} is not private: teacher_out/second_out hold dataset transcripts (JSUT, CV, "
+                            f"ReazonSpeech, Galgame) that must not be republished; hf repos settings {data_repo} "
+                            f"--repo-type dataset --private")
         files = api.list_repo_files(data_repo, repo_type="dataset", revision=rev)
         problems += [f"{data_repo}@{rev[:12]}: {p}" for p in data_problems(files, cfg)]
         if cfg["selection"] in files:
@@ -294,10 +300,14 @@ def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, 
     except Exception as e:
         problems.append(f"cannot read dataset {data_repo}: {type(e).__name__}: {e}")
     try:
-        api.model_info(out_repo)
+        private = api.model_info(out_repo).private
     except Exception as e:
         problems.append(f"cannot read output model repo {out_repo} ({type(e).__name__}); create it first: "
                         f"hf repos create {out_repo} --private")
+    else:
+        if private is not True:
+            problems.append(f"{out_repo} is not private: the run uploads eval and sample tables with reference "
+                            f"transcripts; hf repos settings {out_repo} --private")
     return rev, problems
 
 

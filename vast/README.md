@@ -86,7 +86,7 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
    ```
    It checks the commit is pushed, resolves the image tag to a digest, checks both HF repos with your local login
-   (including that the derived data is complete, see above), then searches offers (verified A100 SXM4 40 GB,
+   (including that both are private and the derived data is complete, see above), then searches offers (verified A100 SXM4 40 GB,
    reliability >= 0.98, driver CUDA >= 13.0, >= 12 CPU cores, >= 64 GB RAM, disk and network >= 500, room for the
    150 GB disk; falls back to SXM4 80 GB), prints a table with each host's bandwidth $/GB, the exact create command and
    the cost cap including ~25 GB down / ~30 GB up. The checks before the search also run without the vastai CLI.

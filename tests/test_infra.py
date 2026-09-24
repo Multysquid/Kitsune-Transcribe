@@ -545,6 +545,38 @@ def test_selection_problems_check_the_recipe_and_the_kept_rows(tmp_path):
                                        "filter_eval_sets": ["eval_emilia", "galgame"]}
 
 
+class FakeHfApi:
+    """dataset_info / model_info report the visibility in `private`; the data repo lists no selection, so the preflight
+    downloads nothing."""
+    private: dict = {}
+
+    def dataset_info(self, repo):
+        return SimpleNamespace(sha="a" * 40, private=self.private[repo])
+
+    def model_info(self, repo):
+        return SimpleNamespace(sha="b" * 40, private=self.private[repo])
+
+    def list_repo_files(self, repo, **kw):
+        return []
+
+
+def test_hf_preflight_refuses_repos_that_are_not_private(monkeypatch):
+    """Both repos carry dataset reference transcripts, and the trainer's hf.private only applies to a repo it creates:
+    a public (or unknown-visibility) data or output repo is refused before renting."""
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)  # hf_preflight imports it at call time
+    monkeypatch.setattr(launch, "data_problems", lambda files, cfg: [])
+    data, out = "u/kitsune-data", "u/kitsune-runs"
+    for vis, flagged in (((True, True), []), ((False, True), [data]), ((True, None), [out]),
+                         ((False, False), [data, out])):
+        monkeypatch.setattr(FakeHfApi, "private", dict(zip((data, out), vis)))
+        rev, problems = launch.hf_preflight(data, out, VIAB_CFG)
+        assert rev == "a" * 40
+        assert [p.split(" ", 1)[0] for p in problems] == flagged, problems
+        assert all("is not private" in p and "hf repos settings" in p and "--private" in p for p in problems)
+
+
 def test_launch_help_needs_nothing():
     r = subprocess.run([sys.executable, str(VAST / "launch.py"), "--help"], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and "--yes" in r.stdout

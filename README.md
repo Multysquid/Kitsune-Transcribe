@@ -57,7 +57,11 @@ This is a non-commercial hobby project. Because Galgame is in the training mix, 
 under a non-commercial license (e.g. CC BY-NC 4.0). The model card must credit the training data: ReazonSpeech
 (CDLA-Sharing-1.0), Emilia-YODAS (Amphion, CC BY 4.0, built on ESPnet's YODAS, CC BY 3.0) and Galgame_Speech_ASR
 (litagin, GPL-3 + non-commercial), and the teacher, Cohere Transcribe (Apache-2.0). Drop `galgame` from the run
-config's `sources` for a model free of the non-commercial clause.
+config's `sources` for a model free of the non-commercial clause. The open release is a separate public repo holding
+only a chosen `checkpoints/step_N` (weights, config, generation config, tokenizer, processor) plus the license,
+notices and model card: the run repos (`kitsune-runs`, `kitsune-data`) stay private, because they carry the datasets'
+reference transcripts (`ref` in the teacher outputs, eval tables and samples), and `vast/launch.py` refuses them if
+they are not.
 
 ### Teacher pass output
 
