@@ -454,7 +454,8 @@ def test_supervisor_resumes_after_crashes_and_gives_up_on_stalls(tmp_path, monke
     """scripts/supervise_distill.py (run_overfit_tests.cmd runs every overfit config under it): this GPU faults every
     ~10-40 min under load and a fault kills the trainer, so a crash is followed by --resume of the run's newest full
     state; attempts without a newer full state escalate to CUDA_LAUNCH_BLOCKING=1 after two and give up after
-    --max-stalls; a crash before the first full state starts over; exits 0 and 3 are final."""
+    --max-stalls (--max-attempts of them in total; attempts that progressed never count); a crash before the first
+    full state starts over; exits 0 and 3 are final."""
     sup = load_script("supervise_distill")
     fake = tmp_path / "fake_trainer.py"
     fake.write_text(FAKE_TRAINER, encoding="utf-8")
@@ -488,6 +489,15 @@ def test_supervisor_resumes_after_crashes_and_gives_up_on_stalls(tmp_path, monke
     # ThroughputTooLow is final
     rc, calls, _, _ = supervise("sup-c", [{"rc": 3}, {"rc": 0}])
     assert rc == 3 and len(calls) == 1
+
+    # attempts that made progress do not count toward --max-attempts: a long run that keeps moving is never given up
+    rc, calls, lines, _ = supervise("sup-d", [{"full": 10 * (i + 1), "rc": 1} for i in range(21)] + [{"rc": 0}])
+    assert rc == 0 and len(calls) == 22 and not any("giving up" in x for x in lines)
+
+    # ... the ones without progress do, in total, even when they never come --max-stalls in a row
+    rc, calls, lines, _ = supervise("sup-e", [{"full": 2, "rc": 1}, {"rc": 1}, {"full": 4, "rc": 1}, {"rc": 1},
+                                              {"rc": 0}], "--max-attempts", "2")
+    assert rc == 1 and len(calls) == 4 and "giving up after 2 attempts without a newer full state" in lines[-1]
 
 
 # ------------------------------------------------------------------------------------------------ whole runs
