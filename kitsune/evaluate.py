@@ -45,7 +45,7 @@ from kitsune.text import normalize_ja
 from kitsune.trainset import EOS, EVAL_SETS, PAD, PROMPT, AudioBatchDataset, eval_batches
 
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
-GATE_SETS = tuple(EVAL_SETS)  # galgame is excluded from this run (D4b)
+GATE_SETS = tuple(EVAL_SETS)  # the D32a gate: JSUT / CV8 / Reazon-test; eval_emilia and galgame are monitor-only
 # D32a, pre-registered full-set teacher corpus CER (fractions). teacher_baselines() recomputes them from teacher_out
 # and refuses to proceed if they drift by more than 0.05 pp - a changed eval set would silently move every threshold.
 TEACHER_CER_PREREG = {"eval_jsut": 0.0830, "eval_cv8": 0.0407, "eval_reazon": 0.0628}
