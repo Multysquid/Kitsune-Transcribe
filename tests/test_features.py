@@ -9,15 +9,17 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
+from fixtures import REAL, need_real  # noqa: E402
 from kitsune.features import LogMel, SpecAugment, hf_reference, load_hf_processor, pad_waves  # noqa: E402
 
 TOL = 1e-4  # target on normalised features; on CPU the ops are identical, so the measured diff is 0.0
-REAL_SHARD = ROOT / "data" / "shards" / "reazon_small" / "train-00000.parquet"
+REAL_SHARD = REAL / "data" / "shards" / "reazon_small" / "train-00000.parquet"
 
 
 @pytest.fixture(scope="module")
@@ -49,12 +51,12 @@ def test_filterbank_is_the_hf_one(fe):
     assert (lm.n_fft, lm.hop_length, lm.win_length, lm.preemphasis, lm.dither) == (512, 160, 400, 0.97, 1e-5)
 
 
-@pytest.mark.skipif(not REAL_SHARD.exists(), reason="real reazon_small shard not present")
 def test_parity_real_clips(fe):
     import pyarrow.parquet as pq
 
     from kitsune.audio import decode_audio
 
+    need_real(REAL_SHARD)
     rg = pq.ParquetFile(REAL_SHARD).read_row_group(0, columns=["audio", "duration"])  # read-only, one row group
     durs = np.array(rg.column("duration").to_pylist())
     order = np.argsort(durs)

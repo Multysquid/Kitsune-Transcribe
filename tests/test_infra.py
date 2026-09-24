@@ -28,9 +28,11 @@ DIGEST_IMAGE = "ghcr.io/multysquid/kitsune-train@sha256:" + "ab" * 32
 
 sys.path.insert(0, str(VAST))
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 finish = importlib.import_module("finish")
 supervise = importlib.import_module("supervise")
 launch = importlib.import_module("launch")
+from fixtures import REAL, no_real_data  # noqa: E402
 
 
 def load_path(name: str, path: Path):
@@ -1521,7 +1523,7 @@ def test_every_upstream_repo_is_pinned(prep):
 
 def test_pins_match_the_local_download_cache(prep):
     """The pins must be the commits data/ was built from (hf_hub_download records them in refs/main)."""
-    raw = ROOT / "data" / "raw"
+    raw = REAL / "data" / "raw"
     checked = 0
     for repo, sha in prep.REVISIONS.items():
         ref = raw / f"datasets--{repo.replace('/', '--')}" / "refs" / "main"
@@ -1529,7 +1531,7 @@ def test_pins_match_the_local_download_cache(prep):
             assert ref.read_text(encoding="utf-8").strip() == sha, repo
             checked += 1
     if not checked:
-        pytest.skip("no local data/raw download cache")
+        no_real_data(f"no local download cache under {raw}")
 
 
 def test_downloads_use_the_pinned_revision(prep, tmp_path, monkeypatch):

@@ -35,11 +35,18 @@ Knobs for the real data's awkward cases (dicts are per source and apply to its f
 Other agree values: half exactly 0.0, the rest uniform in (0, 0.5], and one row per source at exactly 0.5 (the
 inclusive boundary) when there are >= 10 rows. agree is drawn, not computed from hyp2. Everything derives from
 `seed`: the same arguments give identical files.
+
+Real data. The tests that check the code and this fixture against the REAL files (teacher_out/, data/, second_out/)
+read them under REAL and call need_real(...) first. The data is gitignored, so a git worktree has none of it and those
+tests skip (SPEC: skip cleanly if absent), which shows only as 's'. To verify a change made in a worktree, point them
+at a checkout that has the data (they only read there) and turn a skip into a failure:
+    KITSUNE_REAL_DATA_ROOT=<main checkout> KITSUNE_REQUIRE_REAL_DATA=1 python -m pytest -rs tests/...
 """
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,10 +54,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+REAL = Path(os.environ.get("KITSUNE_REAL_DATA_ROOT") or ROOT)  # where the real-data tests read; code stays on ROOT
 
 import numpy as np  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
+import pytest  # noqa: E402
 import soundfile as sf  # noqa: E402
 
 from kitsune.store import SCHEMA, ShardInfo, append_manifest, save_progress  # noqa: E402
@@ -295,6 +304,23 @@ def _write_second(path: Path, rows: list[FakeUtt]):
                 r = dict(id=u.id, hyp2=hyp2, model2="whisper-large-v3", agree=u.agree,
                          cer2=round(cer_fn(hyp2, u.text), 4))
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def no_real_data(reason: str) -> None:
+    """Skip the calling test for missing real data, or FAIL it when KITSUNE_REQUIRE_REAL_DATA=1: a verification run
+    that must check the real formats cannot then pass on a skip."""
+    __tracebackhide__ = True  # report the skip/failure at the calling test's line, not here
+    if os.environ.get("KITSUNE_REQUIRE_REAL_DATA") == "1":
+        pytest.fail(f"{reason} (KITSUNE_REQUIRE_REAL_DATA=1, real data root {REAL})")
+    pytest.skip(reason)
+
+
+def need_real(*paths: Path) -> None:
+    """no_real_data unless every one of these real-data paths exists."""
+    __tracebackhide__ = True
+    missing = [str(p) for p in paths if not Path(p).exists()]
+    if missing:
+        no_real_data("real data not present: " + ", ".join(missing))
 
 
 def load_script(name: str):

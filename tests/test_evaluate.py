@@ -21,8 +21,9 @@ import torch  # noqa: E402
 from kitsune import evaluate as ev  # noqa: E402
 from kitsune.audio import decode_audio  # noqa: E402
 from kitsune.text import cer as utt_cer  # noqa: E402
+from fixtures import REAL, need_real  # noqa: E402
 
-TEACHER_OUT = ROOT / "teacher_out"
+TEACHER_OUT = REAL / "teacher_out"
 EVAL = ["eval_jsut", "eval_cv8"]  # fake corpus sources named like the real sets
 
 
@@ -181,8 +182,8 @@ def test_eval_record_and_flatten():
 # ------------------------------------------------------------------------------------------------ teacher baselines
 
 
-@pytest.mark.skipif(not all((TEACHER_OUT / s).is_dir() for s in ev.GATE_SETS), reason="real teacher_out not present")
 def test_teacher_baselines_match_preregistered():
+    need_real(*(TEACHER_OUT / s for s in ev.GATE_SETS))
     b = ev.teacher_baselines(TEACHER_OUT)  # raises if any set drifts by > 0.05 pp
     for s, want in {"eval_jsut": 0.0830, "eval_cv8": 0.0407, "eval_reazon": 0.0628}.items():
         assert abs(b[s]["cer_corpus"] - want) <= 0.0005, (s, b[s])

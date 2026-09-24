@@ -2,11 +2,13 @@
 
 Everything runs on a synthetic corpus in the repo's exact on-disk formats (tests/fixtures.py) and is checked against
 the fixture's ground truth, not against the code under test. Two tests read real files (one teacher shard, one data
-shard) and skip when they are absent. CPU only.
+shard) under fixtures.REAL and skip when they are absent (fail under KITSUNE_REQUIRE_REAL_DATA=1). CPU only.
 """
 import json
+import os
 import pickle
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,7 +20,7 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fixtures import ROOT, load_script, make_fake_corpus, make_fake_selection  # noqa: E402
+from fixtures import REAL, load_script, make_fake_corpus, make_fake_selection, need_real, no_real_data  # noqa: E402
 
 from kitsune.audio import decode_audio  # noqa: E402
 from kitsune.store import SCHEMA  # noqa: E402
@@ -27,8 +29,8 @@ from kitsune.trainset import (  # noqa: E402
 )
 
 TRAIN, EVAL = ["src_a", "src_b"], ["eval_x", "eval_y"]
-REAL_NPZ = ROOT / "teacher_out" / "reazon_small" / "train-00000.npz"
-REAL_SHARD = ROOT / "data" / "shards" / "reazon_small" / "train-00000.parquet"
+REAL_NPZ = REAL / "teacher_out" / "reazon_small" / "train-00000.npz"
+REAL_SHARD = REAL / "data" / "shards" / "reazon_small" / "train-00000.parquet"
 ms = load_script("make_selection")
 
 
@@ -79,9 +81,9 @@ def expected_reason(u) -> str:
 # ------------------------------------------------------------------------------------------------ formats / selection
 
 
-@pytest.mark.skipif(not REAL_NPZ.exists(), reason="real teacher_out not present")
 def test_fixture_matches_real_formats(corpus):
     """The fixture writes what 02/02b/01 write: same npz keys/dtypes/ranks, jsonl keys, parquet schema, meta keys."""
+    need_real(REAL_NPZ)
     real, fake = np.load(REAL_NPZ), np.load(corpus.teacher_out / "src_a" / "train-00000.npz")
     assert set(real.files) == set(fake.files)
     for key in real.files:
@@ -89,10 +91,10 @@ def test_fixture_matches_real_formats(corpus):
         if real[key].dtype.kind != "U":
             assert real[key].dtype == fake[key].dtype, key
     assert first_keys(REAL_NPZ.with_suffix(".jsonl")) == first_keys(corpus.teacher_out / "src_a" / "train-00000.jsonl")
-    real_second = ROOT / "second_out" / "reazon_small" / "train-00000.jsonl"
+    real_second = REAL / "second_out" / "reazon_small" / "train-00000.jsonl"
     if real_second.exists():
         assert first_keys(real_second) == first_keys(corpus.second_out / "src_a" / "train-00000.jsonl")
-    real_meta = json.loads((ROOT / "teacher_out" / "meta.json").read_text(encoding="utf-8"))
+    real_meta = json.loads((REAL / "teacher_out" / "meta.json").read_text(encoding="utf-8"))
     fake_meta = json.loads((corpus.teacher_out / "meta.json").read_text(encoding="utf-8"))
     assert set(real_meta) | {"model_revision"} == set(fake_meta)  # 02 back-fills it into an older meta.json on resume
     assert pq.read_schema(corpus.data / "shards" / "src_a" / "train-00000.parquet").remove_metadata().equals(SCHEMA)
@@ -533,9 +535,9 @@ def test_loader_times_out_on_a_dropped_worker_batch():
 # ---------------------------------------------------------------------------------------------------- real data
 
 
-@pytest.mark.skipif(not (REAL_NPZ.exists() and REAL_SHARD.exists()), reason="real teacher_out / data not present")
 def test_real_shard_alignment(tmp_path):
     """A tiny store from real rows: the join, offsets and decode work on the real formats (read-only on data/)."""
+    need_real(REAL_NPZ, REAL_SHARD)
     z = np.load(REAL_NPZ)
     rows = ms.read_jsonl(REAL_NPZ.with_suffix(".jsonl"))[:12]
     off = z["tok_offsets"]
@@ -545,7 +547,7 @@ def test_real_shard_alignment(tmp_path):
         agree=np.float32(0.0), teacher_cer=z["cer"][:12], keep=True, reason="kept", in_greedy_subset=False,
         in_probe=False))
     ms.write_selection(sel, tmp_path / "sel.parquet", {})
-    st = build_stores(tmp_path / "sel.parquet", ROOT / "data", ROOT / "teacher_out", tmp_path / "cache",
+    st = build_stores(tmp_path / "sel.parquet", REAL / "data", REAL / "teacher_out", tmp_path / "cache",
                       ["reazon_small"], ["train"])
     assert [u.id for u in st.utts] == sel["id"].tolist()
     ds = AudioBatchDataset(st)
@@ -561,6 +563,27 @@ def test_real_shard_alignment(tmp_path):
         assert abs(int(b["lengths"][r]) - float(z["duration"][r]) * 16000) <= 1
         n += e - s
     assert n == b["top_idx"].shape[0]
+
+
+def test_real_data_guard(tmp_path, monkeypatch):
+    """The real-data tests skip when the data is absent (a git worktree has none), but FAIL under
+    KITSUNE_REQUIRE_REAL_DATA=1, so a verification run cannot pass on an 's'; KITSUNE_REAL_DATA_ROOT moves REAL."""
+    there = tmp_path / "there"
+    there.touch()
+    monkeypatch.delenv("KITSUNE_REQUIRE_REAL_DATA", raising=False)
+    need_real(there)  # present: the test runs on
+    with pytest.raises(pytest.skip.Exception, match="gone"):
+        need_real(there, tmp_path / "gone")
+    monkeypatch.setenv("KITSUNE_REQUIRE_REAL_DATA", "1")
+    need_real(there)
+    with pytest.raises(pytest.fail.Exception, match="gone"):
+        need_real(there, tmp_path / "gone")
+    with pytest.raises(pytest.fail.Exception, match="no download cache"):
+        no_real_data("no download cache")
+    env = dict(os.environ, KITSUNE_REAL_DATA_ROOT=str(tmp_path))  # REAL is read at import: a fresh interpreter
+    out = subprocess.run([sys.executable, "-c", "import fixtures; print(fixtures.REAL)"], cwd=Path(__file__).parent,
+                         env=env, capture_output=True, text=True, check=True).stdout.strip()
+    assert Path(out) == tmp_path
 
 
 def test_selection_filters_only_named_monitor_eval_sets(corpus, tmp_path):
