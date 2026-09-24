@@ -21,7 +21,9 @@ Sources (all streamed file-by-file from HF; each raw download is deleted after c
 
 Resumable: every flushed shard is added to the manifest immediately and shards/<source>/progress.json records the
 input files that are complete, so an interrupted run continues where it stopped. A source is considered done only
-once progress.json says so. --force wipes a source (shards + manifest lines) and re-ingests it.
+once progress.json says so. --force wipes a source (shards + manifest lines) and re-ingests it. One run per data root
+at a time: a second one (another launcher started while the first still runs) exits at once instead of overwriting
+the first one's shards (kitsune.store.lock_data_root; the OS drops the lock when its holder dies).
 
 Every upstream repo is read at a pinned commit (REVISIONS): the training box rebuilds the audio shards from the
 public repos instead of downloading them from home, and the teacher outputs are joined to that audio by utterance
@@ -50,7 +52,7 @@ from tqdm import tqdm  # noqa: E402
 
 from kitsune.audio import audio_info  # noqa: E402
 from kitsune.store import (  # noqa: E402
-    ShardWriter, iter_rows, load_progress, read_manifest, remove_source, save_progress,
+    ShardWriter, iter_rows, load_progress, lock_data_root, read_manifest, remove_source, save_progress,
 )
 
 MIN_DUR, MAX_DUR = 0.3, 30.0  # teacher fast path is <=30 s; shorter than 0.3 s is noise
@@ -470,6 +472,10 @@ def main():
     root = Path(args.data) if args.data else ROOT / ("data_smoke" if args.limit_rows else "data")
     raw = root / "raw"
     raw.mkdir(parents=True, exist_ok=True)
+    lock = lock_data_root(root)  # held until main() returns: one ingest per data root (a second run clobbers shards)
+    if lock is None:
+        raise SystemExit(f"{root}: another 01_prepare_data is ingesting into this data root ({root / '.ingest.lock'}); "
+                         "wait for it to finish")
     print(f"data root: {root}")
 
     todo = []

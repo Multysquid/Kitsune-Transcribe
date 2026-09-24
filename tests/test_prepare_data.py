@@ -8,6 +8,7 @@ import json
 import shutil
 import sys
 import tarfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,7 +19,7 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixtures import load_script  # noqa: E402
 
-from kitsune.store import iter_rows, read_manifest  # noqa: E402
+from kitsune.store import iter_rows, lock_data_root, read_manifest  # noqa: E402
 
 prep = load_script("01_prepare_data")
 
@@ -119,6 +120,34 @@ def test_disk_guard_stops_before_a_download(tmp_path, fake_hub, monkeypatch):
     monkeypatch.setattr(prep.shutil, "disk_usage", lambda p: SimpleNamespace(free=int((prep.MIN_FREE_GB - 1) * 1e9)))
     with pytest.raises(SystemExit, match="GB free"):
         ingest(tmp_path / "data", "emilia_nc", prep.ingest_emilia_nc, float("inf"))
+
+
+
+def test_one_ingest_per_data_root(tmp_path, monkeypatch):
+    """Two ingests into one data root (another launcher started while the first still runs) overwrite each other's
+    shards and progress: the second exits before it touches anything, and the lock goes with its holder."""
+    root = tmp_path / "data"
+
+    def ingested(*a, **kw):
+        raise AssertionError("ingested while another run held the data root")
+
+    monkeypatch.setattr(prep, "ingest_hf_parquet", ingested)
+    monkeypatch.setattr(sys, "argv", ["01_prepare_data.py", "--data", str(root), "--sources", "eval_jsut"])
+    first = lock_data_root(root)
+    assert first is not None
+    try:
+        assert lock_data_root(root) is None  # a second handle is refused, as a second process's would be
+        with pytest.raises(SystemExit, match="another 01_prepare_data is ingesting"):
+            prep.main()
+    finally:
+        first.close()
+    for _ in range(40):  # Windows may take a moment to drop a closed handle's lock
+        again = lock_data_root(root)
+        if again is not None:
+            break
+        time.sleep(0.05)
+    assert again is not None
+    again.close()
 
 
 def test_reazon_tiers_dedup_against_every_smaller_tier():

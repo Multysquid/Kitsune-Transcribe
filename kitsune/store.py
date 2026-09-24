@@ -125,6 +125,32 @@ def save_progress(root: Path, source: str, progress: dict):
     tmp.replace(d / "progress.json")
 
 
+def lock_data_root(root: Path):
+    """Exclusive, non-blocking lock on <root>/.ingest.lock, held for as long as the returned file object stays open;
+    None if another ingest holds it. Two ingests into one root overwrite each other's shards (each numbers a new shard
+    after the files on disk and flushes it through the same .tmp), rewrite progress.json and manifest.jsonl over each
+    other and delete downloads the other still reads - per root, not per source: the manifest and the raw HF cache
+    are shared. The OS drops the lock when the process dies (crash, kill, power loss), so nothing is left to clear by
+    hand, as a pid file would be (and os.kill(pid, 0) on Windows sends Ctrl+C instead of probing)."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    f = open(root / ".ingest.lock", "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            f.seek(0)  # msvcrt locks bytes from the current position: byte 0, whatever the file holds
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
 def remove_source(root: Path, source: str):
     """Drop a source completely: its shard directory (incl. progress) and its manifest lines."""
     d = source_dir(root, source)
