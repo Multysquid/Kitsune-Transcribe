@@ -46,6 +46,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -322,7 +323,9 @@ def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S) -> bool:
 # ----------------------------------------------------------------------------------------------------------- vast
 
 def vast_rest(action: str, timeout: float = 30) -> bool:
-    """PUT {"state": "stopped"} or DELETE on /instances/<CONTAINER_ID>/ with the per-instance key."""
+    """PUT {"state": "stopped"} or DELETE on /instances/<CONTAINER_ID>/ with the per-instance key. Retried like curl
+    --retry: a 408, 429, 5xx or transport error; any other 4xx (a revoked key, no such instance) is logged with vast's
+    reply and handed to the CLI fallback at once."""
     key, cid = os.environ.get("CONTAINER_API_KEY"), os.environ.get("CONTAINER_ID")
     if not key or not cid:
         log("CONTAINER_API_KEY/CONTAINER_ID not set (not on a vast instance?)")
@@ -337,9 +340,18 @@ def vast_rest(action: str, timeout: float = 30) -> bool:
             if reply.get("success", True):
                 return True
             log(f"vast {action}: {reply.get('msg') or reply}")
+        except urllib.error.HTTPError as e:  # before URLError, its base class: the status and vast's msg say why
+            try:
+                body = e.read()[:200].decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            log(f"vast {action} attempt {attempt} failed: HTTP {e.code}: {body or e.reason}")
+            if 400 <= e.code < 500 and e.code not in (408, 429):
+                return False
         except Exception as e:  # URLError, timeouts, http.client errors, a bad reply: all mean "try again"
             log(f"vast {action} attempt {attempt} failed: {type(e).__name__}: {e}")
-        time.sleep(5 * attempt)
+        if attempt < 3:
+            time.sleep(5 * attempt)
     return False
 
 

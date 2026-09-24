@@ -6,6 +6,7 @@ scripts are only syntax-checked (plus the watchdog's --dry-run), and the Docker 
 import hashlib
 import importlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1331,6 +1333,32 @@ def test_vastai_cli_success_line_counts(tmp_path, monkeypatch):
     assert finish.instance_action("destroy", "verified", dry_run=False) is True
     assert calls == ["destroy", "stop"]
     assert json.loads((tmp_path / "state" / "halt").read_text())["action"] == "stop"
+
+
+def test_vast_rest_retries_only_what_a_retry_can_fix(monkeypatch, capsys):
+    """Like curl --retry: a 408, 429 or 5xx is tried 3 times (no sleep after the last); any other 4xx (a revoked key,
+    no such instance) does not change on a retry, so it goes to the CLI fallback at once, with vast's msg in the log
+    (it was retried for 30 s and logged as a bare "HTTP Error 403")."""
+    monkeypatch.setenv("CONTAINER_API_KEY", "k")
+    monkeypatch.setenv("CONTAINER_ID", "123")
+    calls, sleeps = [], []
+    monkeypatch.setattr(finish.time, "sleep", sleeps.append)
+
+    def answer(code):
+        def urlopen(req, timeout=None):
+            calls.append(req.get_method())
+            if code == 200:
+                return io.BytesIO(b'{"success": true}')
+            raise urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(b'{"success": false, "msg": "nope"}'))
+        return urlopen
+
+    for code, ok, tries in ((200, True, 1), (403, False, 1), (404, False, 1), (429, False, 3), (502, False, 3)):
+        calls.clear()
+        sleeps.clear()
+        monkeypatch.setattr(finish.urllib.request, "urlopen", answer(code))
+        assert finish.vast_rest("destroy") is ok, code
+        assert calls == ["DELETE"] * tries and sleeps == [5, 10][:tries - 1], code
+    assert 'HTTP 403: {"success": false, "msg": "nope"}' in capsys.readouterr().out
 
 
 def test_finish_stops_when_verification_fails(finish_env):
