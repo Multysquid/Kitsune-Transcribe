@@ -762,12 +762,12 @@ class FakeTrainer:
         return rc
 
 
-def run_supervise(tmp_path, monkeypatch, script, state=None):
+def run_supervise(tmp_path, monkeypatch, script, state=None, finish=None):
     runs = tmp_path / "runs"
     trainer = FakeTrainer(runs, script)
     finishes = []
     monkeypatch.setattr(supervise, "run_trainer", trainer)
-    monkeypatch.setattr(supervise, "call_finish", lambda args, timeout=None: finishes.append(list(args)) or 0)
+    monkeypatch.setattr(supervise, "call_finish", finish or (lambda args, timeout=None: finishes.append(list(args)) or 0))
     state_path = tmp_path / "state" / "supervise.json"
     if state is not None:
         state_path.parent.mkdir(parents=True)
@@ -865,6 +865,52 @@ def test_supervise_never_reruns_after_final(tmp_path, monkeypatch):
     state = {"attempts": [{"t0": 0.0, "rc": 0, "step": 10}], "final": {"action": "destroy"}}
     rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [], state=state)
     assert rc == 0 and trainer.argvs == [] and finishes == []
+
+
+@pytest.mark.parametrize("script,final,finish_rc,fallback", [
+    ([(3, 120, True)], "--stop", 1, True),        # the stop request failed
+    ([(0, 500, True)], "--destroy", 124, True),   # timed out (a stalled Hub call in its sync or verification)
+    ([(0, 500, True)], "--destroy", 2, False),    # verification failed and the instance was stopped
+    ([(0, 500, True)], "--destroy", 0, False),
+])
+def test_supervise_bounds_the_final_finish_and_falls_back_to_a_plain_stop(tmp_path, monkeypatch, script, final,
+                                                                           finish_rc, fallback):
+    calls = []
+
+    def finish(args, timeout=None):
+        calls.append((list(args), timeout))
+        return finish_rc if args[0] == final else 0
+
+    rc, _, _, _ = run_supervise(tmp_path, monkeypatch, script, finish=finish)
+    assert rc == script[0][0]
+    finals = [(a, t) for a, t in calls if a[0] != "--sync-only"]
+    assert finals[0][0][0] == final and finals[0][1] == supervise.FINISH_TIMEOUT_S[final[2:]]
+    if fallback:
+        assert len(finals) == 2 and finals[1][0][:2] == ["--stop", "--no-sync"]
+        assert finals[1][1] == supervise.FALLBACK_TIMEOUT_S and final in finals[1][0][3]
+    else:
+        assert len(finals) == 1
+
+
+def test_supervise_kills_a_hung_final_finish_and_stops_without_sync(tmp_path, monkeypatch):
+    # finish.py --stop hangs in its sync (a Hub request with no reply): the supervisor must not wait for the watchdog
+    calls = tmp_path / "calls.txt"
+    fake = tmp_path / "root" / "vast" / "finish.py"
+    fake.parent.mkdir(parents=True)
+    fake.write_text("import sys, time\n"
+                    f"with open({str(calls)!r}, 'a') as f:\n"
+                    "    f.write(' '.join(sys.argv[1:3]) + '\\n')\n"
+                    "if sys.argv[1] in ('--stop', '--destroy') and '--no-sync' not in sys.argv:\n"
+                    "    time.sleep(40)\n", encoding="utf-8")
+    monkeypatch.setattr(supervise, "ROOT", tmp_path / "root")
+    monkeypatch.setattr(supervise, "FINISH_TIMEOUT_S", {"stop": 4, "destroy": 4})
+    monkeypatch.setattr(supervise, "run_trainer", FakeTrainer(tmp_path / "runs", [(3, 120, False)]))
+    t0 = time.time()
+    rc = supervise.supervise("configs/viability.json", None, tmp_path / "runs", ["python", "04.py"],
+                             tmp_path / "state" / "supervise.json")
+    assert rc == 3 and time.time() - t0 < 30
+    assert calls.read_text(encoding="utf-8").splitlines() == ["--sync-only --no-full", "--stop --reason",
+                                                              "--stop --no-sync"]
 
 
 # --------------------------------------------------------------------------------------------------------- finish.py

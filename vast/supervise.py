@@ -21,6 +21,12 @@ the same policy applies; once a final decision is recorded the supervisor never 
 ($KITSUNE_STATE/supervise.lock, flock) keeps a second supervisor (vast/onstart.sh run again by hand during a healthy
 run) from treating the live attempt as interrupted.
 
+The final finish.py call is bounded too (FINISH_TIMEOUT_S): its sync and --destroy's verification talk to the Hub (the
+repo listing has no timeout, and a crawling link has none overall), and a hang there would keep the GPU billing until the
+watchdog's deadline (up to 5.5 h after boot for an early failure). When it times out or fails, `finish.py --stop
+--no-sync` follows (itself bounded: no Hub sync, the infra upload is capped); a timed-out destroy thus ends as a stop,
+which keeps the disk. vast/watchdog.sh stays the backstop for a supervisor that hangs anyway.
+
 Contract with scripts/04_distill.py: CLI `--config <json> [--set hf.output_repo=<repo>] [--resume <path>]`; exit codes
 0 ok / 3 throughput too low / anything else failure; it writes runs/<run_id>/config.json at start,
 runs/<run_id>/metrics/scalars.jsonl rows {"step": ...}, and full states as runs/<run_id>/checkpoints/full_step_<N>[.ext].
@@ -47,6 +53,9 @@ EXIT_OK, EXIT_THROUGHPUT = 0, 3
 MIN_RESUME_STEP = 100
 MAX_FAILURES = 2
 SYNC_TIMEOUT_S = 1800
+# the final --stop/--destroy; --destroy may still upload the ~9 GB full state and hashes every expected file to verify
+FINISH_TIMEOUT_S = {"stop": 1800, "destroy": 3600}
+FALLBACK_TIMEOUT_S = 900  # finish.py --stop --no-sync: infra upload capped at 180 s, then vast REST (3 tries) and CLI
 TAIL_BYTES = 256 << 10
 
 
@@ -204,8 +213,13 @@ def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: lis
             if action != "resume":
                 state["final"] = {"action": action, "reason": reason, "wall": time.time()}
                 save_state(state_path, state)
-                rc = call_finish([f"--{action}", "--reason", reason, *dry])
+                rc = call_finish([f"--{action}", "--reason", reason, *dry], timeout=FINISH_TIMEOUT_S[action])
                 log(f"finish exited {rc}")
+                if rc not in (0, 2):  # 2: --destroy's verification failed and the instance was stopped
+                    why = "timed out" if rc == 124 else f"exited {rc}"
+                    rc = call_finish(["--stop", "--no-sync", "--reason", f"finish --{action} {why} ({reason})", *dry],
+                                     timeout=FALLBACK_TIMEOUT_S)
+                    log(f"fallback stop exited {rc}")
                 return last["rc"] if last["rc"] is not None else 1
             resume = full
 
