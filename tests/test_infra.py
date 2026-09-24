@@ -1160,6 +1160,40 @@ def test_finish_destroys_only_when_verified(finish_env, tmp_path):
     assert json.loads(hub.committed("halt"))["action"] == "destroy"
 
 
+def test_finish_retries_a_transient_hub_error_on_the_listing_and_the_infra_commit(finish_env, monkeypatch):
+    """huggingface_hub retries neither the first page of list_repo_tree nor the create_commit POST: one 503 on the
+    verify listing stopped a fully uploaded run (its disk billed until a human looked), one 502 on the infra commit lost
+    the box logs with the destroyed disk. finish retries both; a listing that keeps failing still stops."""
+    run, go = finish_env
+    monkeypatch.setattr(finish, "HUB_RETRY_WAITS", (0, 0))
+
+    class Flaky(FakeHub):
+        def __init__(self, files, always=False):
+            super().__init__(files)
+            self.failed, self.always = [], always
+
+        def fail(self, what):
+            if self.always or what not in self.failed:
+                self.failed.append(what)
+                raise RuntimeError(f"{what}: 503 Service Unavailable")
+
+        def list_repo_tree(self, *a, **kw):  # a generator like the real one: its error comes while it is iterated
+            self.fail("tree")
+            yield from super().list_repo_tree(*a, **kw)
+
+        def create_commit(self, **kw):
+            self.fail("commit")
+            super().create_commit(**kw)
+
+    hub = Flaky(remote_from_local(finish.expected_files(run)))
+    rc, actions = go(hub, "--destroy")
+    assert rc == 0 and actions == ["destroy"] and sorted(hub.failed) == ["commit", "tree"]
+    assert len(hub.commits) == 1 and json.loads(hub.committed("halt"))["action"] == "destroy"
+    hub = Flaky(remote_from_local(finish.expected_files(run)), always=True)
+    rc, actions = go(hub, "--destroy", "--no-sync")
+    assert rc == 2 and actions == ["destroy", "stop"] and hub.failed.count("tree") == 3
+
+
 def test_finish_stop_without_sync_still_uploads_the_infra_logs(finish_env, tmp_path):
     run, go = finish_env
     hub = FakeHub({})

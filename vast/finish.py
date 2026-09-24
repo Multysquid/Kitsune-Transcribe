@@ -55,6 +55,7 @@ VAST_API = "https://console.vast.ai/api/v0"
 STATE_DIR = Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state"))
 INFRA_LOGS = ["/workspace/kitsune.log", "/workspace/watchdog.log", "/workspace/portal.log", "/workspace/tensorboard.log"]
 INFRA_TIMEOUT_S = 180  # a hung infra upload must not keep a paid instance up
+HUB_RETRY_WAITS = (5, 15)  # s before the 2nd and 3rd try of a hub call the library does not retry itself
 # an env var whose name holds one of these is a secret: a mirror of kitsune/runlog.py's SECRET_MARKERS (finish stays
 # stdlib-only; runlog imports pyarrow)
 SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CRED", "COOKIE")
@@ -194,6 +195,19 @@ def hf_api():
     return HfApi()
 
 
+def hub_retry(fn, what: str):
+    """Call fn, retrying twice on any error: huggingface_hub does not retry the first page of list_repo_tree or the
+    create_commit POST, so one transient 5xx/429 would stop a verified run (its disk billed until a human looks) or
+    lose the box logs with the destroyed disk. A repeated infra commit is harmless."""
+    for w in HUB_RETRY_WAITS:
+        try:
+            return fn()
+        except Exception as e:
+            log(f"{what} failed ({type(e).__name__}: {e}); retrying in {w} s")
+            time.sleep(w)
+    return fn()
+
+
 def remote_listing(api, repo: str, repo_type: str, prefix: str) -> dict:
     """repo path -> RepoFile for every file under prefix (folders are skipped: they have no size)."""
     out = {}
@@ -212,8 +226,8 @@ def verify(api, repo: str, repo_type: str, expected: dict[str, Path], check_hash
     for path, local in sorted(expected.items()):
         prefix = "/".join(path.split("/")[:2])  # runs/<run_id>
         if prefix not in listings:
-            try:
-                listings[prefix] = remote_listing(api, repo, repo_type, prefix)
+            try:  # the whole listing: list_repo_tree's error comes while its pages are iterated
+                listings[prefix] = hub_retry(lambda: remote_listing(api, repo, repo_type, prefix), f"listing {prefix}")
             except Exception as e:
                 problems.append(f"{prefix}: cannot list the repo: {type(e).__name__}: {e}")
                 listings[prefix] = {}
@@ -281,8 +295,9 @@ def upload_infra(api, repo: str, repo_type: str, dest: str, dry_run: bool):
     ops = [CommitOperationAdd(path_in_repo=f"{dest}/{f.name}", path_or_fileobj=scrub(f.read_bytes()))
            for f in files if f.is_file() and not f.name.endswith(".lock")]
     log(f"upload {len(ops)} infra files -> {repo}:{dest}")
-    if ops and not dry_run:
-        api.create_commit(repo_id=repo, repo_type=repo_type, operations=ops, commit_message="finish: infra logs")
+    if ops and not dry_run:  # retried inside best_effort's INFRA_TIMEOUT_S, which bounds every try together
+        hub_retry(lambda: api.create_commit(repo_id=repo, repo_type=repo_type, operations=ops,
+                                           commit_message="finish: infra logs"), "infra commit")
 
 
 def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S) -> bool:
