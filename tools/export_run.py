@@ -16,6 +16,9 @@ files); analysis wants one table per kind. This folds everything into export/:
   - infra/ (box logs and state that vast/finish.py uploads: kitsune.log, supervise.json, bootstrap timings, the
     lifecycle events of the stop/destroy scripts) copied, its events and bootstrap timings also as tables
   - config.json (config.<stamp>.json of each restart), summary.json and env/ copied as they are
+The open files are append-only, so after a crash and resume they keep the rows of the steps the resumed launch
+replaced, and of those it never reached (a clipped time budget): a `discarded` column marks them (the resumes are read
+from events.jsonl), so the open tables agree with TensorBoard and steps.
 CSV is written next to each parquet unless the table exceeds --max-csv-rows (list columns become JSON strings).
 
 Usage:
@@ -66,8 +69,15 @@ COLUMNS = {
     "key": "flattened summary key (set/metric)", "file": "source file inside the run dir",
     "student_entropy_coarse": "student entropy over the 17 coarse bins", "teacher_entropy_coarse": "teacher entropy over the 17 coarse bins",
     "student_tail": "student mass outside the teacher top-16", "teacher_tail": "teacher mass outside its top-16",
-    "attempt": "trainer launch that logged the row (0 = first, +1 per resume); rows of an earlier attempt with a step "
-               "after the next resume's at_step (events) come from weights a crash discarded",
+    "attempt": "trainer launch that logged the row: the restored full state's attempt + 1 (0 = first launch); rows of "
+               "an earlier attempt with a step after a later resume's restored step come from weights a crash "
+               "discarded (`discarded`)",
+    "discarded": "the row comes from weights a crash discarded: a step after the restored step of a later resume, "
+                 "logged before that resume's logger_start (events). By wall time (scalars, hist, text), by attempt "
+                 "(train_utts: a resumed launch that died before its own full state shares its attempt with the next "
+                 "launch, and their rows stay unmarked), by the eval_start / eval_mini events (eval tables, "
+                 "eval_summaries, samples: no eval at that step after the resume). TensorBoard and steps drop these "
+                 "rows",
     "emitter": "box script that wrote the record (finish, ...)", "phase": "bootstrap phase",
     "seconds": "wall time of the phase (s)", "end": "unix time the phase ended",
     "bucket": "TensorBoard bucket of the tag: 1_operational, 2_loss_accuracy or 3_misc",
@@ -80,11 +90,12 @@ FILES = {
     "tb_scalars": "every TensorBoard scalar (mirror of scalars; purged steps dropped)",
     "tb_histograms": "every TensorBoard histogram (weights, grads, activations)",
     "tb_text": "every TensorBoard text entry (config, samples, events)",
-    "scalars": "EVERY scalar ever logged, long format (from metrics/scalars.jsonl). After a resume, steps after the "
-               "restored step occur twice: keep the row with the larger wall",
+    "scalars": "EVERY scalar ever logged, long format (from metrics/scalars.jsonl). Rows with discarded = true come "
+               "from weights a crash discarded (TensorBoard hides them); the rest is what TensorBoard shows",
     "steps": "one wide row per optimizer step; NaN = not logged at that step",
-    "train_utts": "one row per utterance per time it was trained on. After a resume, the steps replayed since the "
-                  "restored full state occur twice: keep the rows of the larger attempt",
+    "train_utts": "one row per utterance per time it was trained on. Rows with discarded = true were trained on by "
+                  "weights a crash discarded; the rest has one row per (step, utterance), unless a resumed launch "
+                  "died before its own full state (see `discarded`)",
     "hist": "histogram summaries (quantiles, moments, 64-bin counts)",
     "text": "every text() call",
     "eval_summaries": "every eval summary.json flattened (mini evals too, mini = true): one row per (step, mini, "
@@ -243,8 +254,67 @@ def _flatten(d: dict, prefix: str = "") -> dict:
     return out
 
 
+def launches(ev: list[dict]) -> list[tuple[float, int | None, int]]:
+    """(wall, restored step, attempt) of every trainer launch, from its logger_start event in events.jsonl (restored
+    step None: a fresh start, attempt 0). attempt is the number the launch's train_utts rows carry: the restored full
+    state's + 1, that state written by the launch running at the last `checkpoint` event of its full_step_<S> before
+    this launch (a resumed launch that dies before its own full save leaves the next one restoring the same state, so
+    both log the same attempt); a state with no such event is taken to be the previous launch's."""
+    saves = [(r["wall"], r.get("name")) for r in ev if r.get("kind") == "checkpoint" and r.get("ckpt") == "full"]
+    out = []
+    for r in ev:
+        if r.get("kind") != "logger_start":
+            continue
+        res = r.get("resume")
+        if not (isinstance(res, dict) and "step" in res):
+            out.append((r["wall"], None, 0))
+            continue
+        s = int(res["step"])
+        at = [w for w, name in saves if name == f"full_step_{s}" and w < r["wall"]]
+        writer = [a for w, _, a in out if at and w <= at[-1]]
+        out.append((r["wall"], s, (writer[-1] if writer else out[-1][2] if out else 0) + 1))
+    return out
+
+
+def discarded(df: pd.DataFrame, runs: list[tuple[float, int | None, int]]) -> np.ndarray:
+    """Rows logged by weights a crash discarded: a step after a later resume's restored step S, logged before that
+    resume (wall < its logger_start), the rows TensorBoard's purge (purge_step S + 1) drops. The append-only files keep
+    them, also for steps the resumed launch never reaches again (the budget re-fitted to the time left), so a dedup by
+    (tag, step) cannot remove them. train_utts has no wall: its attempt tells the launch, an attempt that two launches
+    share (see launches()) is left unmarked."""
+    out = np.zeros(len(df), dtype=bool)
+    if "step" not in df.columns:
+        return out
+    step = df["step"].to_numpy(dtype=float)
+    if "wall" in df.columns:
+        wall = df["wall"].to_numpy(dtype=float)
+        for w, s, _ in runs:
+            if s is not None:
+                out |= (wall < w) & (step > s)
+    elif "attempt" in df.columns:
+        last = {a: i for i, (_, _, a) in enumerate(runs)}  # attempt -> the last launch that logs it
+        by = df["attempt"].map(last).to_numpy(dtype=float)  # NaN (never < k): an attempt no launch accounts for
+        for k, (_, s, _) in enumerate(runs):
+            if s is not None:
+                out |= (by < k) & (step > s)
+    return out
+
+
 def run_tables(run: Path) -> dict[str, pd.DataFrame]:
     t = {}
+    ev = _jsonl(run / "events.jsonl")
+    runs = launches(ev)
+    evals_at: dict[tuple[bool, int], list[float]] = {}  # (mini, step) -> walls of the eval_start / eval_mini events
+    for r in ev:
+        if r.get("kind") in ("eval_start", "eval_mini") and r.get("at_step") is not None:
+            evals_at.setdefault((r["kind"] == "eval_mini", int(r["at_step"])), []).append(r["wall"])
+
+    def stale(step: int, mini: bool) -> bool:
+        """evals/step_<N>[_mini]/ (and samples/step_<N>.jsonl) of weights a crash discarded: N after a resume's
+        restored step and no eval at N started after that resume (a re-run overwrites the files by name)."""
+        walls = evals_at.get((mini, step), [])
+        return any(s is not None and step > s and not any(x > w for x in walls) for w, s, _ in runs)
+
     m = run / "metrics"
     if (m / "scalars.jsonl").exists():
         t["scalars"] = read_scalars_jsonl(m / "scalars.jsonl").to_pandas()
@@ -259,12 +329,16 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
     text = _jsonl(m / "text.jsonl")
     if text:
         t["text"] = pd.DataFrame(text)
+    for kind in ("scalars", "train_utts", "hist", "text"):
+        if kind in t:
+            t[kind]["discarded"] = discarded(t[kind], runs)
 
     per_kind: dict[str, list[pd.DataFrame]] = {}
     summaries = []
     for d in sorted((run / "evals").glob("step_*"), key=lambda p: (int(p.name.split("_")[1]), p.name)):
         step = int(d.name.split("_")[1])
         mini = d.name.endswith("_mini")  # evals/step_<N>_mini/: a mini eval (eval_mini_<kind> tables)
+        gone = stale(step, mini)
         for f in sorted(d.glob("*.parquet")):
             df = pd.read_parquet(f)
             kind, _, eset = f.stem.partition("_")
@@ -273,10 +347,12 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
             df.insert(0, "step", step)
             if eset:
                 df.insert(1, "set", eset)
+            df["discarded"] = gone
             per_kind.setdefault(f"eval_{'mini_' if mini else ''}{kind}", []).append(df)
         for f in sorted(d.glob("*.json")):
             flat = _flatten(json.loads(f.read_text(encoding="utf-8")))
-            summaries += [dict(step=step, mini=mini, file=f.name, key=k, value=v) for k, v in flat.items()]
+            summaries += [dict(step=step, mini=mini, file=f.name, key=k, value=v, discarded=gone)
+                          for k, v in flat.items()]
     for k, dfs in per_kind.items():
         t[k] = pd.concat(dfs, ignore_index=True)
     if summaries:
@@ -284,7 +360,8 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
 
     samples = []
     for f in sorted((run / "samples").glob("step_*.jsonl"), key=lambda p: int(p.stem.split("_")[1])):
-        samples += [dict(step=int(f.stem.split("_")[1]), **r) for r in _jsonl(f)]
+        n = int(f.stem.split("_")[1])
+        samples += [dict(step=n, **r, discarded=stale(n, False)) for r in _jsonl(f)]
     if samples:
         t["samples"] = pd.DataFrame(samples)
 
@@ -299,8 +376,7 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
     if timings:
         t["infra_bootstrap_timings"] = pd.DataFrame(timings)
 
-    ev = _jsonl(run / "events.jsonl")
-    if ev:
+    if ev:  # left unmarked: a crashed launch's lifecycle events are facts, not metrics
         base = ["wall", "time", "elapsed_s", "step", "kind"]
         t["events"] = pd.DataFrame([{**{k: r.get(k) for k in base},
                                      "fields_json": json.dumps({k: v for k, v in r.items() if k not in base},

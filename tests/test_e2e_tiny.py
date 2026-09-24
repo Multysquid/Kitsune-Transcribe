@@ -613,6 +613,15 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
         assert (tmp_path / "export" / f"{name}.parquet").is_file()
     assert (tmp_path / "export" / "README.md").is_file()
     assert set(tables["tb_scalars"]["tag"]) == set(tables["scalars"]["tag"])
+    # the crashed launch's steps after the restored step 10 are marked discarded (the attempt read off events.jsonl);
+    # what is left matches TensorBoard, one row per step and utterance, and no eval is taken for a discarded one
+    sc, tb, tu = tables["scalars"], tables["tb_scalars"], tables["train_utts"]
+    kl = sc[(sc["tag"] == "loss/kl") & ~sc["discarded"]]
+    assert sorted(kl["step"]) == sorted(tb.loc[tb["tag"] == "loss/kl", "step"]) == list(range(1, MAX_STEPS + 1))
+    gone = tu[tu["discarded"]]
+    assert len(gone) and set(gone["attempt"]) == {0} and gone["step"].min() == 11
+    assert not tu[~tu["discarded"]].duplicated(["step", "id"]).any()
+    assert not tables["eval_tf"]["discarded"].any() and not tables["samples"]["discarded"].any()
 
 
 def _tool(name: str):

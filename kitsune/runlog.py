@@ -39,8 +39,11 @@ waits at most close_join_s for it and its own final sync, then logs sync_abandon
 and dies with the process; on the box vast/finish.py uploads again and verifies before a destroy).
 
 Resume: pass the dict from state_dict() (kept in the trainer's full state) as `resume=`. elapsed_s continues, steps
-after the restored step are dropped from steps.parquet and purged from TensorBoard, and are then logged again. The
-append-only jsonl files keep both copies; the later wall time is the one that counts.
+after the restored step are dropped from steps.parquet and purged from TensorBoard, and are then logged again as far as
+the resumed launch gets (a budget re-fitted to the time left may end it before the crash step). The append-only files
+(jsonl, parquet parts, evals/, samples/) keep the crashed launch's rows: a row with a step after the restored one,
+logged before the resumed launch's logger_start event, comes from weights the crash discarded, whether or not that
+step is logged again (tools/export_run.py marks these `discarded`).
 
 TensorBoard buckets: TensorBoard groups cards by the first component of a tag, so tb/ gets every tag under one of
   1_operational     time, throughput, memory, system, data progress (tokens per source too), schedule, early-stop

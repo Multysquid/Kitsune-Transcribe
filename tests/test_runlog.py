@@ -547,6 +547,92 @@ def test_export_keeps_infra_logs_and_restart_configs(run, tmp_path):
         assert needle in readme, needle
 
 
+def test_export_marks_the_rows_of_weights_a_crash_discarded(tmp_path):
+    """A crash at step 10 after the full state of step 3; the resumed launch's budget (re-fitted to the time left) ends
+    it at step 6. TensorBoard purges the first launch's steps 4-10 and steps.parquet stops at 6, but the open files keep
+    those rows, and steps 7-10 (a mini eval at 8, a full eval at 9) are never logged again, so no dedup by step removes
+    them. The export marks them discarded; the rest agrees with TensorBoard."""
+    exp = load_export()
+    run = tmp_path / "runs" / "crash"
+    tf = pd.DataFrame(dict(id=["a"], source=["eval_jsut"], kl=[0.5]))
+
+    def utt(s, attempt):
+        return [dict(step=s, epoch=0, id=f"u{s}", source="src_a", duration=1.0, n_tok=3, kl=0.1, ce=0.2, top1_acc=1.0,
+                     masked_frac=0.0, agree=0.0, attempt=attempt)]
+
+    def full_eval(log, step, cer):
+        log.event("eval_start", at_step=step, final=False, complete=False)
+        log.table("tf_eval_jsut", tf, step)
+        log.eval_json("summary", {"headline": {"val_cer": cer}}, step)
+        log.samples(step, [dict(id="a", hyp=str(cer))])
+
+    log = RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False)
+    state = None
+    for s in range(1, 11):
+        log.step_row({"loss/kl": 1.0 / s}, s)
+        log.train_utts(utt(s, 0))
+        if s == 3:
+            state = log.state_dict()
+            log.event("checkpoint", ckpt="full", name="full_step_3", reason="periodic")
+        if s == 8:
+            log.table("tf_eval_jsut", tf, 8, suffix="mini")
+            log.eval_json("summary", {"headline": {"val_cer": 0.5}}, 8, suffix="mini")
+            log.event("eval_mini", at_step=8)
+        if s == 9:
+            log.hist("w", torch.ones(10), 9)
+            full_eval(log, 9, 0.11)
+    log.close(summary={"status": "failed"})  # the trainer's crash path
+    time.sleep(0.05)
+    log = RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False, resume=state)
+    for s in range(4, 7):
+        log.step_row({"loss/kl": 10.0 / s}, s)
+        log.train_utts(utt(s, 1))
+    log.hist("w", torch.ones(10), 5)
+    full_eval(log, 6, 0.22)  # the final eval
+    log.close(summary={"status": "complete"})
+
+    t = exp.export(str(run), tmp_path / "export")
+
+    def kept(name):
+        return t[name][~t[name]["discarded"]]
+
+    sc, tb = kept("scalars"), t["tb_scalars"]
+    kl = sc[sc["tag"] == "loss/kl"].sort_values("step")
+    assert kl["step"].tolist() == sorted(tb.loc[tb["tag"] == "loss/kl", "step"]) == t["steps"]["step"].tolist() \
+        == [1, 2, 3, 4, 5, 6]
+    assert kl["value"].tolist() == pytest.approx([1.0, 0.5, 1 / 3, 10 / 4, 10 / 5, 10 / 6])
+    tu = kept("train_utts")
+    assert sorted(zip(tu["step"], tu["attempt"])) == [(1, 0), (2, 0), (3, 0), (4, 1), (5, 1), (6, 1)]
+    assert kept("hist")["step"].tolist() == [5] and t["hist"]["discarded"].sum() == 1
+    assert t["eval_mini_tf"]["step"].tolist() == [8] and t["eval_mini_tf"]["discarded"].all()
+    assert dict(zip(t["eval_tf"]["step"], t["eval_tf"]["discarded"])) == {6: False, 9: True}
+    es = kept("eval_summaries")
+    assert es.loc[~es["mini"], ["step", "value"]].values.tolist() == [[6, 0.22]] and not es["mini"].any()
+    assert dict(zip(t["samples"]["step"], t["samples"]["discarded"])) == {6: False, 9: True}
+    tx = t["text"]
+    assert dict(zip(tx.loc[tx["tag"] == "samples", "step"], tx.loc[tx["tag"] == "samples", "discarded"])) \
+        == {9: True, 6: False}
+    assert "`discarded`" in (tmp_path / "export" / "README.md").read_text(encoding="utf-8")
+
+
+def test_export_attempts_of_a_resume_that_died_before_its_own_full_state():
+    """The laptop's repeated resumes: the second launch dies before its own full save, so the third restores the same
+    state and logs the same attempt. Those two launches' train_utts rows cannot be told apart and stay unmarked (the
+    third launch's own rows must never be marked); the first launch's rows after step 3 are, and so are the third's
+    after the full state of step 6 the fourth resumes from."""
+    exp = load_export()
+    ev = [dict(kind="logger_start", wall=1.0, resume=None),
+          dict(kind="checkpoint", ckpt="full", name="full_step_3", wall=2.0),
+          dict(kind="logger_start", wall=3.0, resume={"step": 3}),
+          dict(kind="logger_start", wall=4.0, resume={"step": 3}),
+          dict(kind="checkpoint", ckpt="full", name="full_step_6", wall=5.0),
+          dict(kind="logger_start", wall=6.0, resume={"step": 6})]
+    runs = exp.launches(ev)
+    assert [a for _, _, a in runs] == [0, 1, 1, 2]
+    tu = pd.DataFrame(dict(step=[5, 9, 5, 7, 7, 8], attempt=[0, 0, 1, 1, 2, 2]))
+    assert exp.discarded(tu, runs).tolist() == [True, True, False, True, False, False]
+
+
 def test_export_hf_source_is_downloaded(run, tmp_path, monkeypatch):
     """hf://user/repo/runs/<id> -> snapshot_download of that prefix only (checkpoints excluded); mocked, no network."""
     import shutil
