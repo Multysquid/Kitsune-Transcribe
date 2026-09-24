@@ -45,10 +45,12 @@ summary/mini/<name> (CERs as fractions, with <name>_pct copies in percent), and 
 Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and configs/overfit_*.json): after every
 eval inside the loop (never the step-0 eval, never the final one) the metric - "probe_kl" (teacher-forced KL on the
 train probe), "heldout_kl" (the gate sets' pooled held-out KL, as the verdict reads it) or "train_loss" (the mean
-loss/total of the optimizer steps since the previous eval) - improves when best - value > max(min_delta_abs,
-min_delta_rel * |best|); the first in-loop eval sets the best. Once early_stop.min_evals in-loop evals are done,
-early_stop.patience evals in a row without an improvement (reason "patience") or a value <= early_stop.floor (reason
-"floor") trigger early_stop.action, once:
+loss/objective = w_kl * KL + w_ce * CE of the optimizer steps since the previous eval; not loss/total, whose decoupled
+L2-SP value is the distance from the initial weights and grows with every step, and not the headline train_loss, the
+probe's teacher-forced KL) - improves when best - value > max(min_delta_abs, min_delta_rel * |best|); the first
+in-loop eval sets the best. Once early_stop.min_evals in-loop evals are done, early_stop.patience evals in a row
+without an improvement (reason "patience") or a value <= early_stop.floor (reason "floor") trigger early_stop.action,
+once:
   stop       leave the loop right after that eval: the end phase as usual (final eval with the probe, verdict, summary,
              uploads; exit 0)
   cooldown   start the WSD cooldown now (1 - sqrt over schedule.cooldown_frac x the loop time, or steps, done so far,
@@ -396,7 +398,7 @@ def warmup_steps(sch: dict, total_steps: int | None = None) -> int:
 
 def early_stop_state() -> dict:
     """The early-stop part of the full state (Run.st["early_stop"]): the best value and its step, in-loop evals
-    checked, evals since the best, the last value, the train-loss sum and count since the previous eval (metric
+    checked, evals since the best, the last value, the loss/objective sum and count since the previous eval (metric
     "train_loss"), the trigger (the `early_stop` event's fields, or None), whether the loop must end (`stop`) and an
     early cooldown's schedule (`cooldown`: t_c and T on the run's clock, or None)."""
     return dict(best=None, best_step=None, evals=0, evals_since_best=0, value=None, loss_sum=0.0, loss_n=0,
@@ -1359,9 +1361,10 @@ def _bn_drift_check(R: Run, step: int):
 
 
 def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float, step_s: float, e: int,
-             s: int) -> tuple[float, float]:
-    """The step's row (steps.parquet, scalars, TensorBoard) and per-utterance records. Returns (objective,
-    loss/total)."""
+             s: int) -> float:
+    """The step's row (steps.parquet, scalars, TensorBoard) and per-utterance records. Returns the objective
+    (w_kl * KL + w_ce * CE, the optimised loss; loss/total adds the decoupled L2-SP value, which is not in the
+    gradient)."""
     from kitsune.runlog import system_stats
 
     cfg = R.cfg
@@ -1424,7 +1427,7 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
         R.log.scalars({f"layers/update_ratio/{k}": v for k, v in out["update_ratio"].items()}, step)
         R.log.scalars({f"l2sp/dist/{k}": v for k, v in R.l2sp.per_module_distance().items()}, step)
         R.log.scalars({f"l2sp/rel/{k}": v for k, v in R.l2sp.per_module_distance(relative=True).items()}, step)
-    return objective, row["loss/total"]
+    return objective
 
 
 # ---------------------------------------------------------------------------------------------------------- evals
@@ -1646,7 +1649,9 @@ def run_mini_eval(R: Run, step: int) -> dict:
 
 def early_stop_value(R: Run, metric: str) -> float | None:
     """The early-stop metric right after an eval: the newest eval record's probe_kl / heldout_kl (eval_record), or the
-    mean loss/total of the optimizer steps since the previous eval (None if there were none)."""
+    mean loss/objective of the optimizer steps since the previous eval (None if there were none). loss/objective, not
+    loss/total: the L2-SP value in loss/total is not in the gradient and grows with the distance from the initial
+    weights, so a window mean of loss/total rises once the objective flattens and patience would fire on a timetable."""
     es = R.st["early_stop"]
     if metric == "train_loss":
         return es["loss_sum"] / es["loss_n"] if es["loss_n"] else None
@@ -2387,9 +2392,9 @@ def loop(R: Run):
                 torch.cuda.synchronize()
             step_s = time.perf_counter() - t0
             R.st["step"] = step
-            objective, total = log_step(R, step, lr, phase, out, wait, step_s, e, s)
+            objective = log_step(R, step, lr, phase, out, wait, step_s, e, s)
             es = R.st["early_stop"]
-            es["loss_sum"], es["loss_n"] = es["loss_sum"] + float(total), es["loss_n"] + 1  # metric "train_loss"
+            es["loss_sum"], es["loss_n"] = es["loss_sum"] + float(objective), es["loss_n"] + 1  # metric "train_loss"
             if not R.st["smoke_done"] and smoke_n:
                 R.st["smoke_losses"].append(float(objective))
                 if step > max(1, smoke_n // 10):  # the first steps pay for worker start-up and kernel autotuning

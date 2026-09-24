@@ -342,22 +342,29 @@ def test_stop_action_runs_the_end_phase_and_a_crash_after_it_resumes_there(env, 
 
 
 def test_train_loss_metric_and_floor(env):
-    """metric train_loss = the mean loss/total of the steps since the previous eval (here 2 steps); a floor above every
-    value triggers at the first eval allowed by min_evals, with reason "floor"."""
+    """metric train_loss = the mean loss/objective (w_kl * KL + w_ce * CE) of the steps since the previous eval (here 2
+    steps), not the mean loss/total: the decoupled L2-SP value in loss/total grows with every step (the distance from
+    the initial weights), so a metric that included it would rise on a timetable whatever the objective does. A floor
+    above every value triggers at the first eval allowed by min_evals, with reason "floor"."""
     m = load_script("04_distill")
     path = write_config(env, "es-floor", {"eval": {"every_steps": 2},
                                           "early_stop": rule(metric="train_loss", floor=1e9, min_evals=3, patience=100)})
     assert m.main(["--config", path]) == 0
     run = one_run(env["root"], "es-floor")
-    tot = dict(zip(steps_of(run)["step"], steps_of(run)["loss/total"]))
-    assert sorted(tot) == [1, 2, 3, 4, 5, 6]
+    st = steps_of(run)
+    obj = dict(zip(st["step"], st["loss/objective"]))
+    tot = dict(zip(st["step"], st["loss/total"]))
+    assert sorted(obj) == [1, 2, 3, 4, 5, 6]
+    l2sp = dict(zip(st["step"], st["loss/l2sp"]))
+    assert 0 < l2sp[2] < l2sp[6]  # the L2-SP value grows, so loss/total and loss/objective differ here
     val = scalar(run, "early_stop/value")
     assert sorted(val) == [2, 4, 6]
     for k in (2, 4, 6):
-        assert val[k] == pytest.approx((tot[k - 1] + tot[k]) / 2, rel=1e-6)
+        assert val[k] == pytest.approx((obj[k - 1] + obj[k]) / 2, rel=1e-6)
+        assert val[k] != pytest.approx((tot[k - 1] + tot[k]) / 2, rel=1e-6)
     (es,) = events(run, "early_stop")
     assert es["reason"] == "floor" and es["at_step"] == 6 and es["metric"] == "train_loss"
-    assert es["value"] == pytest.approx((tot[5] + tot[6]) / 2, rel=1e-6)
+    assert es["value"] == pytest.approx((obj[5] + obj[6]) / 2, rel=1e-6)
     assert summary(run)["stopped_early"]["reason"] == "floor"
 
 
