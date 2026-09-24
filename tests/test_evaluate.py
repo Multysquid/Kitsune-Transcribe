@@ -134,6 +134,34 @@ def test_verdict_inconclusive_and_teacher_override():
     assert v["verdict"] == "INCONCLUSIVE" and v["trend"]["gap_widening"] is None
 
 
+def test_verdict_trends_leave_out_the_untrained_step_0_eval():
+    """Per-epoch evals leave short histories: step 0, an epoch end or two, the final eval. The untrained student's
+    step-0 record (CER ratio ~30, held-out KL ~5) must not enter the trends, or it makes every run 'improving' and hides
+    over-fitting; the verdict is the one the trained records give."""
+    steps = [0, 1126, 2252]
+    # over-fitting on the trained records: held-out KL +10 % while the probe falls, CER within 1.2x
+    for probe0 in (4.5, 5.75):  # the step-0 probe KL below or above the step-0 held-out KL
+        v = ev.verdict(dict(final=final((1.1, 1.1, 1.15)),
+                            history=history([30, 1.12, 1.10], [4.87, 0.60, 0.66], [probe0, 0.62, 0.45], steps)))
+        assert v["verdict"] == "NO-GO" and v["trend"]["overfit"], v["reasons"]
+        assert v["trend"]["window_steps"] == [1126, 2252]
+    # a flat tail with 1/3 sets within 1.5x is the pre-registered NO-GO, not 'still improving'
+    v = ev.verdict(dict(final=final((1.8, 2.0, 1.4)),
+                        history=history([30, 1.9, 1.9], [4.87, 0.50, 0.45], [4.5, 0.45, 0.40], steps)))
+    assert v["verdict"] == "NO-GO" and not v["trend"]["improving"], v["reasons"]
+    # a GO on the trained records stays GO whatever the step-0 numbers were
+    for probe0 in (4.5, 5.75):
+        v = ev.verdict(dict(final=final((1.1, 1.1, 1.15)),
+                            history=history([30, 1.25, 1.10], [4.87, 0.70, 0.60], [probe0, 0.62, 0.53], steps)))
+        assert v["verdict"] == "GO", v["reasons"]
+    # one trained record: the trend is unknown, not 'improving' (from step 0) and not 'flat'
+    for ratios in ((1.3, 1.4, 1.45), (1.8, 2.0, 1.4)):
+        v = ev.verdict(dict(final=final(ratios), history=history([30, 1.3], [4.87, 0.6], [4.5, 0.55], [0, 1126])))
+        assert v["verdict"] == "INCONCLUSIVE" and v["trend"]["cer_ratio_rel_change"] is None, v["reasons"]
+        assert v["trend"]["window_steps"] == [1126] and any("CER trend unknown" in r for r in v["reasons"])
+        assert not any("still improving" in r or "CER flat" in r for r in v["reasons"])
+
+
 def test_eval_record_and_flatten():
     tf = dict(sets={"eval_jsut": dict(kl=0.2, ce=0.3, top1=0.9, n_tok=10)}, all=dict(kl=0.2, ce=0.3, top1=0.9),
               wall_s=1.5, bad_audio=["x"])

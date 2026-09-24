@@ -521,10 +521,14 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     NO-GO      fewer than 2 sets within 1.5x and CER flat, or over-fitting (probe KL falling while held-out KL rises
                over the last 20 % of evals)
     INCONCLUSIVE  what the pre-registration does not cover (within 1.5x but flat, or beyond 1.5x but still
-               improving); `reasons` says which. It is not forced into a tier after the fact.
-    "Last 20 %" = the last max(min_points, ceil(0.2 n)) eval records by step. Trends are least-squares changes across
-    that window relative to the window mean (the gap: relative to the mean held-out KL); the thresholds are returned
-    with the verdict."""
+               improving, or the CER trend unknown: fewer than 2 evals after step 0); `reasons` says which. It is not
+               forced into a tier after the fact.
+    "Last 20 %" = the last max(min_points, ceil(0.2 n)) of the n eval records after step 0, by step. The step-0 eval
+    of the untrained student stays in the history (the curves) but never enters a trend: its numbers (CER tens of
+    times the teacher's, held-out KL ~5) would dominate any window that reaches it - every history of <= 3 records
+    with per-epoch evals - forcing "improving" and hiding over-fitting. Trends are least-squares changes across that
+    window relative to the window mean (the gap: relative to the mean held-out KL); the thresholds are returned with
+    the verdict."""
     fsets = (results.get("final") or {}).get("sets", {})
     tover = results.get("teacher") or {}
     reasons, per_set = [], {}
@@ -554,7 +558,7 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     trunc_rate = n_trunc / n_out if n_out else float("nan")
     trunc_ok = n_out > 0 and trunc_rate <= max_trunc
 
-    hist = sorted(results.get("history") or [], key=lambda r: r["step"])
+    hist = sorted((r for r in results.get("history") or [] if r["step"] > 0), key=lambda r: r["step"])  # trained only
     window = hist[len(hist) - min(len(hist), max(min_points, math.ceil(tail_frac * len(hist)))):]
 
     def series(fn):
@@ -579,9 +583,9 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     overfit = (probe_change is not None and held_change is not None
                and probe_change < -overfit_rel and held_change > overfit_rel)
     if cer_change is None:
-        reasons.append("CER trend unknown: fewer than 2 greedy evals in the window")
+        reasons.append("CER trend unknown: fewer than 2 greedy evals after step 0 in the window")
     if gap_change is None:
-        reasons.append("KL-gap trend unknown: fewer than 2 evals with both probe and held-out KL")
+        reasons.append("KL-gap trend unknown: fewer than 2 evals after step 0 with both probe and held-out KL")
 
     if overfit:
         v = "NO-GO"
@@ -592,14 +596,16 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     elif n_prom >= 2 and improving:
         v = "PROMISING"
         reasons.append(f"{n_prom}/3 sets within {promising_ratio}x teacher and CER still improving ({cer_change:+.1%})")
-    elif n_prom < 2 and not improving:
+    elif n_prom < 2 and cer_change is not None and not improving:  # flat is a measured trend, not an unknown one
         v = "NO-GO"
         reasons.append(f"only {n_prom}/3 sets within {promising_ratio}x teacher and CER flat")
     else:
         v = "INCONCLUSIVE"
+        trend = ("CER trend unknown" if cer_change is None
+                 else "CER not improving" if n_prom >= 2 else "CER still improving")
         reasons.append("outside the pre-registered tiers: " + (
-            f"within {promising_ratio}x on {n_prom}/3 sets but CER not improving" if n_prom >= 2
-            else f"only {n_prom}/3 sets within {promising_ratio}x but CER still improving"))
+            f"within {promising_ratio}x on {n_prom}/3 sets but {trend}" if n_prom >= 2
+            else f"only {n_prom}/3 sets within {promising_ratio}x but {trend}"))
     if n_go >= 2 and not trunc_ok:
         reasons.append(f"truncation {trunc_rate:.2%} > {max_trunc:.2%} blocks GO")
     if n_go >= 2 and trunc_ok and not gap_ok and not overfit:

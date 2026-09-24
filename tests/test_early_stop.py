@@ -275,12 +275,12 @@ def test_verdict_on_a_short_history():
     rec = dict(step=0, elapsed_s=0.0, heldout_kl=1.0, probe_kl=0.9,
                greedy={s: dict(cer_ref_corpus=0.2, teacher_cer_ref_corpus=0.1, trunc_rate=0.0, n=10)
                        for s in ev.GATE_SETS})
-    for n in (0, 1, 2):
+    for n in (0, 1, 2, 3):
         hist = [dict(rec, step=10 * i, heldout_kl=1.0 - 0.1 * i) for i in range(n)]
         v = ev.verdict(dict(final=fin, history=hist))
         assert v["verdict"] in ("GO", "PROMISING", "NO-GO", "INCONCLUSIVE")
-        assert v["trend"]["window_steps"] == [r["step"] for r in hist]
-        if n < 2:
+        assert v["trend"]["window_steps"] == [r["step"] for r in hist if r["step"] > 0]  # never the step-0 eval
+        if n < 3:  # fewer than 2 records after step 0
             assert any("trend unknown" in r for r in v["reasons"]) and v["trend"]["gap_rel_change"] is None
 
 
