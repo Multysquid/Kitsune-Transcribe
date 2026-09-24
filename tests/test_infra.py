@@ -209,8 +209,9 @@ def test_bootstrap_lists_parked_shards_in_the_manifest(tmp_path, prep):
     (box / "configs" / "c.json").write_text(json.dumps(dict(
         sources=["emilia_yodas"], eval_sets=["eval_emilia"], data_root="data", selection="selection/v.parquet",
         student="students/s")), encoding="utf-8")
-    (state / "bootstrap_plan.json").write_text(json.dumps(dict(patterns=[], parked=["emilia_yodas"],
-                                                               rebuild=["eval_emilia"])), encoding="utf-8")
+    (state / "bootstrap_plan.json").write_text(json.dumps(dict(
+        patterns=[], parked=["emilia_yodas"], rebuild=["eval_emilia"],
+        files=["data/shards/emilia_yodas/train-00000.parquet"])), encoding="utf-8")
     shards = box / "data" / "shards" / "emilia_yodas"
     shards.mkdir(parents=True)
     rows = [dict(id=f"emilia_yodas/JA_{v}_W{i:06d}", source="emilia_yodas", split="train", audio=b"", text="x",
@@ -237,6 +238,59 @@ def test_bootstrap_lists_parked_shards_in_the_manifest(tmp_path, prep):
     ing.download = download
     with pytest.raises(Reached):  # past the "ingest emilia_yodas first" check, on to the hold-out's tar
         prep.ingest_emilia_eval(ing, prep.EMILIA_EVAL_TAR, prep.EMILIA_EVAL_ROWS)
+
+
+def test_bootstrap_pull_fails_before_the_rebuild_when_nothing_arrived(tmp_path):
+    """When snapshot_download's one repo_info request fails (a Hub 5xx/429, a dropped connection; HF-X2) it returns the
+    checkout it was given as local_dir, never empty, with only a warning and downloads nothing: the 10-20 min audio
+    rebuild then ran and only the coverage check (no teacher ids) stopped the box. The plan now records the files the
+    pull must bring, by the Hub client's own matcher; the pull exits non-zero while one is missing, under retry()."""
+    import huggingface_hub.utils._paths as hf_paths
+
+    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if ln.lstrip().startswith("phase pull_derived"))
+    assert re.search(r'phase pull_derived retry \d+ "\$PY" "\$HELPER" pull', line)
+    (tmp_path / "helper.py").write_text(re.search(r"<<'PYEOF'\n(.*?\n)PYEOF\n", text, re.S).group(1), encoding="utf-8")
+    repo_files = ["README.md", "teacher_out/meta.json", "second_out/meta.json", "selection/v.parquet",
+                  "students/s/config.json", "students/s/model.safetensors", "teacher_out/src_a/s0.npz",
+                  "second_out/src_a/s0.jsonl", "teacher_out/eval_x/s0.npz", "teacher_out/other/s0.npz"]
+    stub = tmp_path / "stub" / "huggingface_hub"
+    stub.mkdir(parents=True)
+    (stub / "__init__.py").write_text(
+        "class HfApi:\n"
+        "    def whoami(self):\n        return {'name': 'u'}\n"
+        f"    def list_repo_files(self, *a, **k):\n        return {repo_files!r}\n"
+        "def snapshot_download(*args, **kwargs):\n    pass  # the silent no-op: nothing arrives\n", encoding="utf-8")
+    (stub / "utils.py").write_text(  # the real matcher (pure Python), which snapshot_download filters the tree with
+        "import importlib.util\n"
+        f"_s = importlib.util.spec_from_file_location('_hf_paths', {hf_paths.__file__!r})\n"
+        "_m = importlib.util.module_from_spec(_s)\n_s.loader.exec_module(_m)\n"
+        "filter_repo_objects = _m.filter_repo_objects\n", encoding="utf-8")
+    box, state = tmp_path / "box", tmp_path / "state"
+    (box / "configs").mkdir(parents=True)
+    (box / "README.md").write_text("git checkout\n", encoding="utf-8")
+    state.mkdir()
+    (box / "configs" / "c.json").write_text(json.dumps(dict(
+        sources=["src_a"], eval_sets=["eval_x"], data_root="data", selection="selection/v.parquet",
+        student="students/s")), encoding="utf-8")
+    env = dict(os.environ, KITSUNE_DIR=str(box), STATE=str(state), CONFIG="configs/c.json", KITSUNE_DATA_REPO="u/data",
+               KITSUNE_DATA_REVISION="main", PYTHONPATH=os.pathsep.join([str(tmp_path / "stub"), str(ROOT)]))
+
+    def helper(cmd):
+        return subprocess.run([sys.executable, str(tmp_path / "helper.py"), cmd], capture_output=True, text=True,
+                              env=env, timeout=120)
+
+    r = helper("plan")
+    assert r.returncode == 0, r.stdout + r.stderr
+    want = json.loads((state / "bootstrap_plan.json").read_text(encoding="utf-8"))["files"]
+    assert want == [f for f in repo_files if f not in ("README.md", "teacher_out/other/s0.npz")]
+    r = helper("pull")
+    assert r.returncode != 0 and f"pull incomplete: {len(want)} of {len(want)} planned files missing" in r.stderr
+    for f in want:  # what a pull that reached the Hub leaves
+        (box / f).parent.mkdir(parents=True, exist_ok=True)
+        (box / f).write_bytes(b"x")
+    r = helper("pull")
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
 def test_onstart_fits_vast_limits():

@@ -104,6 +104,7 @@ plan_path = state / "bootstrap_plan.json"
 
 def plan():
     from huggingface_hub import HfApi
+    from huggingface_hub.utils import filter_repo_objects
 
     api = HfApi()
     print(f"hf user: {api.whoami()['name']}")
@@ -129,8 +130,10 @@ def plan():
     parked = [s for s in names if has(f"{data_root}/shards/{s}/*.parquet")]
     patterns += [f"{data_root}/shards/{s}/*.parquet" for s in parked]
     rebuild = [s for s in names if s not in parked]
+    # the files the pull must leave on disk, by snapshot_download's own matcher (pull() checks them)
+    want = list(filter_repo_objects(files, allow_patterns=patterns))
     out = dict(repo=repo, revision=rev, patterns=patterns, parked=parked, rebuild=rebuild, data_root=data_root,
-               repo_files=len(files), wall=time.time())
+               repo_files=len(files), files=want, wall=time.time())
     plan_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
     print(f"plan: pull {len(patterns)} patterns; parked audio {parked or 'none'}; rebuild audio {rebuild or 'none'}")
 
@@ -168,6 +171,12 @@ def pull():
     t0 = time.time()
     snapshot_download(repo, repo_type="dataset", revision=rev, local_dir=root, allow_patterns=p["patterns"],
                       max_workers=16)
+    # when its one repo_info request fails (a Hub 5xx/429, a dropped connection) snapshot_download returns local_dir
+    # (the checkout, never empty) with only a warning and downloads nothing, and 01's paid audio rebuild would run
+    # before the coverage check caught it: fail here instead, so the shell's retry pulls again
+    missing = [f for f in p["files"] if not (root / f).is_file()]
+    if missing:
+        sys.exit(f"pull incomplete: {len(missing)} of {len(p['files'])} planned files missing, e.g. {missing[:3]}")
     register_parked(p["parked"])
     dirs = [root / d for d in (teacher_root, second_root, student, f"{data_root}/shards") if (root / d).is_dir()]
     size = sum(f.stat().st_size for d in dirs for f in d.rglob("*") if f.is_file())
@@ -205,7 +214,7 @@ PYEOF
 log "repo $KITSUNE_DIR at $(git -C "$KITSUNE_DIR" rev-parse --short HEAD 2>/dev/null || echo '?'), config $CONFIG, data $KITSUNE_DATA_REPO@$KITSUNE_DATA_REVISION"
 log "disk free before: $(df -h --output=avail "$KITSUNE_DIR" | tail -1 | tr -d ' ')"
 phase plan "$PY" "$HELPER" plan
-phase pull_derived "$PY" "$HELPER" pull
+phase pull_derived retry 3 "$PY" "$HELPER" pull  # snapshot_download skips what is already on disk
 
 DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["data_root"])' "$STATE/bootstrap_plan.json")"
 mapfile -t REBUILD < <("$PY" -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1]))["rebuild"]))' "$STATE/bootstrap_plan.json" | sed '/^$/d')
