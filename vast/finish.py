@@ -11,7 +11,7 @@ Expected files for each run dir runs/<run_id>/ (see scripts/04_distill.py):
   every file outside checkpoints/                      -> runs/<run_id>/<same path>   (RunLogger sync)
   every weights dir       checkpoints/step_<N>/        -> runs/<run_id>/checkpoints/step_<N>/
     (all of them, not just the newest: an earlier upload that failed would otherwise go with the destroyed disk; the
-    hub skips re-uploads of content it already has)
+    hub skips re-uploads of content it already has, though each byte is still read and hashed on the box, see sync)
   the newest full state   checkpoints/full_step_<N>/   -> runs/<run_id>/checkpoints/full_step_<N>/  (--expect-full)
   and every full state the trainer meant for the Hub whose upload has not succeeded (UPLOAD_MARK in it: the
     pre_cooldown one, which the trainer keeps from rotation for this; the marker itself is not uploaded)
@@ -236,11 +236,13 @@ def verify(api, repo: str, repo_type: str, expected: dict[str, Path], check_hash
 def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_run: bool):
     """Upload the run dir (minus local-only checkpoints) plus the checkpoints finish will verify.
 
-    Re-uploading files the trainer already pushed is cheap: the hub skips content it already stores, so this mostly
-    repairs a checkpoint upload that failed and captures log lines written after the trainer's last sync. The logs go
-    first: they are small, the watchdog's --sync-only has 10 minutes before the stop, which a ~9 GB full state not
-    yet on the hub can take all of (the final eval and verdict of a trainer still waiting on its end-state upload
-    are on this disk only), and a checkpoint upload that raises must not cost them."""
+    Re-uploading files the trainer already pushed costs no network or commit: the hub skips content it already stores.
+    hf_xet still reads and chunks every checkpoint byte locally (about 20 GB for the viability run: every weights dir
+    and the newest full state, a minute or two at the launch filter's disk_bw>=500), and verify() reads them once more
+    for sha256. This mostly repairs a checkpoint upload that failed and captures log lines written after the trainer's
+    last sync. The logs go first: they are small, the watchdog's --sync-only has 10 minutes before the stop, which a
+    ~9 GB full state not yet on the hub can take all of (the final eval and verdict of a trainer still waiting on its
+    end-state upload are on this disk only), and a checkpoint upload that raises must not cost them."""
     expected = expected_files(run_dir, expect_full)
     rels = sorted(p[len(f"runs/{run_dir.name}/"):] for p in expected)
     ckpt = [r for r in rels if r.startswith("checkpoints/")]
