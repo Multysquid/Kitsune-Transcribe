@@ -1563,15 +1563,17 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     log.eval_json("summary", summary, step)
     scal = ev.flatten(tf_sum, "eval/tf")
     scal.update(ev.flatten(gr_sum, "eval/greedy"))
+    # the over-fitting gaps pool the GATE sets on the held-out side, as the verdict's gap and the early stop do: the
+    # monitor-only sets (eval_emilia, galgame) come from training sources, and their all-sets KL is in eval/tf/all/kl
     if probe_sum:
         scal.update(ev.flatten(probe_sum, "eval/probe"))
-        if "all" in probe_sum and "all" in tf_sum:
-            scal["eval/kl_gap_heldout_minus_probe"] = tf_sum["all"]["kl"] - probe_sum["all"]["kl"]
+        if "val_loss" in head and "train_loss" in head:  # heldout_kl - probe_kl
+            scal["eval/kl_gap_heldout_minus_probe"] = head["val_loss"] - head["train_loss"]
     if pg_sum:
         scal.update(ev.flatten(pg_sum, "eval/probe_greedy"))
-        if "all" in pg_sum and "all" in gr_sum:
-            scal["eval/cer_teacher_gap_heldout_minus_probe"] = (gr_sum["all"]["cer_teacher_corpus"]
-                                                                 - pg_sum["all"]["cer_teacher_corpus"])
+        sub = ev.headline(greedy=gr_sum, probe_greedy=pg_sum)  # on the fixed greedy subset, also at a complete eval
+        if "val_cer_vs_teacher" in sub and "train_cer_vs_teacher" in sub:
+            scal["eval/cer_teacher_gap_heldout_minus_probe"] = sub["val_cer_vs_teacher"] - sub["train_cer_vs_teacher"]
     if full_sum:
         scal.update(ev.flatten(full_sum, "eval/greedy_full"))
     if "epoch" in extra:

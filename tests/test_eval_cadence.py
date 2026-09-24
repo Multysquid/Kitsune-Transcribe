@@ -187,6 +187,55 @@ def test_headline_pools_the_gate_sets():
     assert ev.headline() == {} and ev.headline(greedy=dict(sets={}), probe=dict(sets={})) == {}
 
 
+def test_overfit_gap_scalars_pool_the_gate_sets(monkeypatch):
+    """eval/kl_gap_heldout_minus_probe is the verdict's gap (heldout_kl - probe_kl, gate sets only), not the all-sets
+    KL minus the probe's: the monitor-only sets (eval_emilia, galgame) come from training sources. The CER gap pools
+    the gate sets of the fixed greedy subset likewise. run_eval itself, the evals replaced by fixed summaries."""
+    from kitsune import evaluate as ev
+
+    m = load_script("04_distill")
+    gate, monitor = EVAL, ["eval_emilia", "galgame"]
+    tf = dict(sets={**{s: dict(kl=0.5, ce=1.0, top1=0.9, n_tok=100) for s in gate},
+                    **{s: dict(kl=2.0, ce=1.0, top1=0.5, n_tok=100) for s in monitor}},
+              all=dict(kl=(0.5 * 300 + 2.0 * 200) / 500, ce=1.0, top1=0.74, n_tok=500), wall_s=1.0)
+    probe = dict(sets={"src_a": dict(kl=0.3, ce=1.0, top1=0.95, n_tok=100)},
+                 all=dict(kl=0.3, ce=1.0, top1=0.95, n_tok=100), wall_s=1.0)
+    def gset(edits, chars, n=3):
+        return dict(_greedy_set(edits, chars, edits, chars, n=n), teacher_cer_ref_corpus=0.1, ratio_vs_teacher=1.0,
+                    trunc_rate=0.0)
+
+    gr = dict(sets={**{s: gset(1, 10) for s in gate}, **{s: gset(5, 10) for s in monitor}}, all=gset(13, 50, n=15),
+              n_utts=15, wall_s=1.0)
+    pg = dict(sets={"src_a": _greedy_set(1, 20, 1, 20)}, all=_greedy_set(1, 20, 1, 20), n_utts=3, wall_s=1.0)
+    no_rows = pd.DataFrame({"source": []})
+
+    def tf_eval(model, store, feat, device, bs, ids=None, amp=None):
+        return (probe, no_rows) if ids is not None else (tf, no_rows)
+
+    def greedy_eval(model, store, ids, feat, device, bs, tokenizer=None, amp=None):
+        return (pg, no_rows) if store == "train" else (gr, no_rows)
+
+    monkeypatch.setattr(ev, "teacher_forced_eval", tf_eval)
+    monkeypatch.setattr(ev, "greedy_eval", greedy_eval)
+    monkeypatch.setattr(ev, "pick_samples", lambda *a, **k: [])
+    scal = {}
+    log = SimpleNamespace(event=lambda *a, **k: None, table=lambda *a, **k: None, eval_json=lambda *a, **k: None,
+                          samples=lambda *a, **k: None, scalars=lambda row, step: scal.update(row))
+    R = SimpleNamespace(cfg=m.load_config(None, []), log=log, model=torch.nn.Linear(1, 1), evalstore="eval",
+                        train="train", feat_eval=None, device="cpu", amp=None, tokenizer=None, probe_ids=["p"],
+                        probe_greedy_ids=["q"], greedy_ids=["g"], st=dict(history=[], epoch_progress=0.0),
+                        clock=lambda: 0.0)
+    m.run_eval(R, 0)
+    rec = R.st["history"][-1]
+    assert rec["heldout_kl"] == pytest.approx(0.5) and rec["heldout_kl_all_sets"] == pytest.approx(1.1)
+    assert scal["eval/kl_gap_heldout_minus_probe"] == pytest.approx(rec["heldout_kl"] - rec["probe_kl"])
+    assert scal["eval/kl_gap_heldout_minus_probe"] == pytest.approx(0.2)  # the all-sets gap would be 0.8
+    assert scal["eval/kl_gap_heldout_minus_probe"] == pytest.approx(scal["summary/full/val_loss"]
+                                                                    - scal["summary/full/train_loss"])
+    assert scal["eval/cer_teacher_gap_heldout_minus_probe"] == pytest.approx(0.1 - 0.05)  # all sets: 0.26 - 0.05
+    assert scal["eval/tf/all/kl"] == pytest.approx(1.1)  # the all-sets numbers stay logged
+
+
 def test_config_keys_are_validated():
     m = load_script("04_distill")
     ok = m.load_config(None, ["eval.full_every_epochs=2", "eval.mini.every_steps=200", "eval.mini.val_per_set=0",
