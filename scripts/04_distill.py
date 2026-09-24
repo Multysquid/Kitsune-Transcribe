@@ -89,7 +89,9 @@ Checkpoints under runs/<run_id>/checkpoints/:
 time budget; the config comes from the checkpoint, with this invocation's --set overrides applied on top (--config is
 then ignored). optim.*, loss.* and memory.grad_ckpt among them go on top of the restored optimizer, L2-SP and memory
 choice too; a new value for a key that shapes the step plan (RESUME_FIXED: seed, mix, sources, selection, subset.*,
-batch.*) stops the resume with the key named (repeating the checkpoint's value is fine).
+batch.*) stops the resume with the key named (repeating the checkpoint's value is fine). A resume from an older full
+state moves the abandoned attempt's newer full_step_<M>/ and step_<M>/ to checkpoints/abandoned-<UTC stamp>/
+(set_aside_newer), so rotation, a later run-dir resume and finish.py see only the resumed run's.
 
 Time: in schedule.clock "wall" (the real run) the budget T = train_hours of loop wall-clock from the first training
 step, evals and checkpoints included; the step-0 eval and the final eval are outside it. The clock continues across a
@@ -1895,6 +1897,31 @@ def find_full_state(path: Path) -> Path:
     return fulls[-1]
 
 
+def set_aside_newer(ckpt_dir: Path, step: int) -> list[str]:
+    """A resume from an older full state (backing out of a loss spike) abandons the attempt that went past it. Left in
+    place, that attempt's newer full_step_<M>/ would outrank the resumed run's own: rotate_full (the newest keep_local)
+    deletes the resumed run's states instead, and a later --resume <run dir> (find_full_state; supervise_distill.py)
+    silently continues the abandoned attempt; finish.py would upload its step_<M>/ weights next to the resumed run's.
+    So when a full_step_<M> with M > step exists, every full_step_<M>/ and step_<M>/ with M > step moves to
+    checkpoints/abandoned-<UTC stamp>/ (a rename: nothing is deleted). Every scanner of checkpoints/ (these, finish.py,
+    both supervisors) reads only its top level. A resume from the newest full state moves nothing, not even the
+    weights saved after it (the resumed run replays those steps). Returns the names moved."""
+    def newer(regex):
+        return [p for p in ckpt_dir.iterdir() if (m := regex.match(p.name)) and int(m[1]) > step]
+
+    if not newer(FULL_RE):
+        return []
+    moved = sorted(newer(FULL_RE) + newer(WEIGHTS_RE), key=lambda p: p.name)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest, n = ckpt_dir / f"abandoned-{stamp}", 1
+    while dest.exists():
+        dest, n = ckpt_dir / f"abandoned-{stamp}-{n}", n + 1
+    dest.mkdir()
+    for p in moved:
+        _replace_dir(p, dest / p.name)
+    return [p.name for p in moved]
+
+
 # ----------------------------------------------------------------------------------------------------------- smoke
 
 
@@ -2250,8 +2277,9 @@ def build(args) -> tuple[Run, dict | None]:
     R.uploader = Uploader(api, out_repo(cfg), run_dir.name, bool(cfg["hf"]["private"]), R.log)
     if state is not None:
         R.resumed_from = full
+        moved = set_aside_newer(R.ckpt_dir, int(state["step"]))  # before anything is saved or rotated
         R.log.event("resume", from_state=str(full), at_step=state["step"], overrides=overrides, unchanged=repeated,
-                    config_arg_ignored=args.config)
+                    config_arg_ignored=args.config, set_aside=moved)
     return R, state
 
 

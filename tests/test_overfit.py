@@ -395,6 +395,33 @@ def test_replace_dir_waits_for_a_scanner(tmp_path):
     assert time.monotonic() - t0 >= 0.4 and not tmp.exists() and (final / "model.pt").read_bytes() == b"x" * 1000
 
 
+def test_resume_from_an_older_full_state_sets_the_abandoned_attempt_aside(tmp_path):
+    """--resume full_step_4 while the attempt it backs out of left full_step_8: rotation kept the highest-numbered
+    states and --resume <run dir> took the newest, so the resumed run's own states were deleted and the next run-dir
+    resume (supervise_distill.py) silently continued the abandoned attempt. Its newer dirs now move under
+    abandoned-*/, where no scanner looks; a resume from the newest state moves nothing."""
+    m = load_script("04_distill")
+    run = tmp_path / "run"
+    ck = run / "checkpoints"
+    for name in ("full_step_4", "full_step_8", "step_4", "step_6", "step_9"):
+        (ck / name).mkdir(parents=True)
+        if name.startswith("full"):
+            (ck / name / "trainer.pt").write_bytes(b"x")
+    assert m.set_aside_newer(ck, 8) == [] and m.set_aside_newer(ck, 4) == ["full_step_8", "step_6", "step_9"]
+    (aside,) = [p for p in ck.iterdir() if p.name.startswith("abandoned-")]
+    assert sorted(p.name for p in aside.iterdir()) == ["full_step_8", "step_6", "step_9"]
+    assert (aside / "full_step_8" / "trainer.pt").exists() and m.find_full_state(run) == ck / "full_step_4"
+
+    evs = []
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 1}}, ckpt_dir=ck, uploader=SimpleNamespace(busy=set),
+                        log=SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw["name"]))))
+    (ck / "full_step_6").mkdir()
+    (ck / "full_step_6" / "trainer.pt").write_bytes(b"x")
+    m.rotate_full(R)  # the resumed run's first save
+    assert evs == [("checkpoint_deleted", "full_step_4")] and m.find_full_state(run) == ck / "full_step_6"
+    assert sorted(p.name for p in ck.iterdir()) == [aside.name, "full_step_6", "step_4"]
+
+
 FAKE_TRAINER = r'''
 import argparse, json, os, sys
 from pathlib import Path
