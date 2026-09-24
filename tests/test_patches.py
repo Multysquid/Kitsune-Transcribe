@@ -221,9 +221,26 @@ def test_freeze_batchnorm_survives_train():
     assert_bn_frozen(model)
 
 
-def test_sdpa_backend_report_cpu():
+def test_sdpa_backend_report_cpu(monkeypatch):
+    real = torch.nn.functional.scaled_dot_product_attention
+    masks = []
+
+    def spy(q, k, v, attn_mask=None, **kw):
+        masks.append(attn_mask.detach().clone())
+        return real(q, k, v, attn_mask=attn_mask, **kw)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", spy)
     rep = sdpa_backend_report(device="cpu", dtype=torch.float32)
     assert rep["device"] == "cpu" and set(rep["enabled"]) == {"flash", "mem_efficient", "math", "cudnn"}
-    assert rep["encoder_usable"]["math"] is True and rep["decoder_usable"]["math"] is True
+    assert rep["encoder_usable"]["math"] is True and rep["decoder_usable"]["math"] is True  # finite on masked rows
     assert "encoder_selected" in rep and "decoder_selected" in rep
+    # the encoder case has fully masked query rows, as the model's valid_q & valid_k mask does on a padded row
+    enc = [m for m in masks if m.is_floating_point()]
+    assert enc and all(bool(torch.isneginf(m).all(dim=-1).any()) for m in enc)
     print(f"  {rep}")
+
+    # a kernel that runs but gives NaN (as eager softmax does on a fully masked row) is not usable
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention",
+                        lambda q, k, v, attn_mask=None, **kw: real(q, k, v, attn_mask=attn_mask, **kw) * float("nan"))
+    rep = sdpa_backend_report(device="cpu", dtype=torch.float32)
+    assert rep["encoder_usable"]["math"] is not True and rep["decoder_usable"]["math"] is not True
