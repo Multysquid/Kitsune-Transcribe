@@ -616,7 +616,7 @@ def prep():
 
 
 def test_every_upstream_repo_is_pinned(prep):
-    repos = {r for r, _ in prep.HF_PARQUET_SOURCES.values()} | {prep.GALGAME_REPO, prep.EMILIA_REPO}
+    repos = {r for r, _ in prep.HF_PARQUET_SOURCES.values()} | {prep.GALGAME_REPO, prep.EMILIA_REPO, prep.EMOLIA_REPO}
     assert repos == set(prep.REVISIONS)
     assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in prep.REVISIONS.values())
     assert prep.REVISIONS[prep.GALGAME_REPO].startswith("3fb86654")
