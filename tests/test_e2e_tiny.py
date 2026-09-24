@@ -136,7 +136,10 @@ def test_schedule_wsd_and_cadence():
 def test_configs_resolve():
     m = load_script("04_distill")
     via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
-    assert via == m.DEFAULTS  # the file spells out the defaults
+    # the file spells out the defaults, and turns early stopping on (off in DEFAULTS: a config that does not mention it
+    # trains to its budget, as before early stopping existed)
+    assert not m.DEFAULTS["early_stop"]["enabled"] and via["early_stop"]["enabled"]
+    assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True))
     smoke = m.load_config(str(ROOT / "configs" / "smoke_laptop.json"), ["hf.output_repo=u/r", "seed=7"])
     assert smoke["student"] == "students/b4x2560-d2" and smoke["schedule"]["train_hours"] == 0.1
     assert smoke["batch"]["micro_audio_s"] == 60 and smoke["batch"]["step_audio_s"] == 120

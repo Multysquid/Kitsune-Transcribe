@@ -19,9 +19,31 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                `lr_phase` event), L2-SP after every optimizer step,
                gradients clipped (the pre-clip norm is logged). The first smoke.steps steps are the smoke run: finite
                losses, the loss trend, and throughput - below smoke.min_audio_s_per_s audio-s/s the run exits with
-               code 3 (ThroughputTooLow). A full state is written right after them, and before the cooldown starts
+               code 3 (ThroughputTooLow). A full state is written right after them, and before the cooldown starts.
+               Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
                sets, verdict (kitsune.evaluate.verdict), summary.json, uploads awaited, final forced sync; exit 0
+
+Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and configs/overfit_*.json): after every
+eval inside the loop (never the step-0 eval, never the final one) the metric - "probe_kl" (teacher-forced KL on the
+train probe), "heldout_kl" (the gate sets' pooled held-out KL, as the verdict reads it) or "train_loss" (the mean
+loss/total of the optimizer steps since the previous eval) - improves when best - value > max(min_delta_abs,
+min_delta_rel * |best|); the first in-loop eval sets the best. Once early_stop.min_evals in-loop evals are done,
+early_stop.patience evals in a row without an improvement (reason "patience") or a value <= early_stop.floor (reason
+"floor") trigger early_stop.action, once:
+  stop       leave the loop right after that eval: the end phase as usual (final eval with the probe, verdict, summary,
+             uploads; exit 0)
+  cooldown   start the WSD cooldown now (1 - sqrt over schedule.cooldown_frac x the loop time, or steps, done so far,
+             capped by what is left of the budget; on the epoch clock in steps, so the epoch plan ends early), then the
+             end phase. Already in the cooldown: the run goes on to its scheduled end
+Manual stop: create the file runs/<run_id>/STOP (on the vast box: touch
+/workspace/Kitsune-Transcribe/runs/<run_id>/STOP). It is checked before every optimizer step, whatever
+early_stop.enabled says: the step under way finishes (its eval and checkpoints included), then the "stop" path with
+reason "stop_file". Every trigger is an `early_stop` event (metric, value, best, best_step, evals_since_best, reason,
+action, at_step, epoch; `cooldown` with the new schedule) and summary.json's `stopped_early` (null if none); the
+scalars early_stop/{value,best,evals_since_best,triggered} follow every checked eval. The early-stop state is part of
+the full state: a resumed run continues the patience count, and one that had already triggered "stop" goes straight
+to the end phase (a triggered cooldown carries on to its end).
 
 Exit codes (vast/supervise.py and scripts/supervise_distill.py key on them): 0 finished, 3 throughput too low, 1
 anything else. Any exception is logged as an event with its traceback, a partial summary.json is written and the logs
@@ -101,6 +123,7 @@ from kitsune import trainset  # noqa: E402
 from kitsune.features import LogMel, SpecAugment  # noqa: E402
 from kitsune.kd import L2SP, kd_losses, kd_objective, module_key  # noqa: E402
 from kitsune.patches import assert_bn_frozen, patch_relpos_once_per_batch, train_mode  # noqa: E402
+from kitsune.runlog import _replace as _replace_file  # noqa: E402  (atomic file replace with the Windows retry)
 
 EXIT_OK, EXIT_THROUGHPUT, EXIT_FAIL = 0, 3, 1
 SR = 16000
@@ -113,7 +136,8 @@ TERM_TAGS = dict(kl="loss/kl", ce="loss/ce", top1_match="tok/top1", student_entr
                  teacher_tail="tok/tail_teacher", teacher_p1="tok/teacher_p1")
 BUCKETS = (("p1_gt_0.99", lambda p1: p1 > 0.99), ("p1_lt_0.9", lambda p1: p1 < 0.9))
 
-# Defaults = the viability run (configs/viability.json spells out the same values). Paths are relative to the repo root.
+# Defaults = the viability run (configs/viability.json spells out the same values, and turns early_stop on). Paths are
+# relative to the repo root.
 DEFAULTS = {
     "run_name": "viability-b20x2560", "student": "students/b20x2560-d4", "data_root": "data",
     "teacher_root": "teacher_out", "second_root": "second_out", "selection": "selection/viability.parquet",
@@ -152,8 +176,14 @@ DEFAULTS = {
     "hf": {"output_repo": None, "private": True},
     "smoke": {"enabled": True, "steps": 100, "min_audio_s_per_s": 600, "pad_utts": 32, "pad_max_mean_kl": 0.05,
               "pad_min_argmax_agree": None, "require_loss_decrease": True},
+    # checked after every in-loop eval (the module docstring; early_stop_update, early_stop_trigger). Off here, so a
+    # config that does not mention it trains to its budget; viability.json turns it on with these values
+    "early_stop": {"enabled": False, "metric": "heldout_kl", "patience": 3, "min_delta_rel": 0.005,
+                   "min_delta_abs": 0.0, "min_evals": 3, "floor": None, "action": "cooldown"},
     "seed": 1234,
 }
+EARLY_STOP_METRICS = ("probe_kl", "heldout_kl", "train_loss")
+STOP_FILE = "STOP"  # runs/<run_id>/STOP: finish the step under way, then the end phase (reason "stop_file")
 
 
 class ThroughputTooLow(RuntimeError):
@@ -238,10 +268,32 @@ def validate(cfg: dict):
         raise SystemExit(f"eval.every_epochs must be null or an int >= 1, got {ev_cfg['every_epochs']}")
     if ev_cfg["probe_is_train"] and not ev_cfg["probe"]:
         raise SystemExit("eval.probe_is_train needs eval.probe")
+    es = cfg["early_stop"]
+    if not isinstance(es["enabled"], bool):
+        raise SystemExit(f"early_stop.enabled must be true or false, got {es['enabled']}")
+    if es["metric"] not in EARLY_STOP_METRICS:
+        raise SystemExit(f"early_stop.metric must be one of {', '.join(EARLY_STOP_METRICS)}, got {es['metric']}")
+    if es["action"] not in ("stop", "cooldown"):
+        raise SystemExit(f"early_stop.action must be 'stop' or 'cooldown', got {es['action']}")
+    if not _pos_int(es["patience"]):
+        raise SystemExit(f"early_stop.patience must be an int >= 1, got {es['patience']}")
+    if not (isinstance(es["min_evals"], int) and not isinstance(es["min_evals"], bool) and es["min_evals"] >= 0):
+        raise SystemExit(f"early_stop.min_evals must be an int >= 0, got {es['min_evals']}")
+    for key in ("min_delta_rel", "min_delta_abs"):
+        if not (_number(es[key]) and es[key] >= 0):
+            raise SystemExit(f"early_stop.{key} must be a number >= 0, got {es[key]}")
+    if es["floor"] is not None and not _number(es["floor"]):
+        raise SystemExit(f"early_stop.floor must be null or a number, got {es['floor']}")
+    if es["enabled"] and es["metric"] == "probe_kl" and not ev_cfg["probe"]:
+        raise SystemExit("early_stop.metric 'probe_kl' needs eval.probe")
 
 
 def _pos_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 1
+
+
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def epoch_mode(cfg: dict) -> bool:
@@ -257,13 +309,14 @@ def rpath(value) -> Path:
 # -------------------------------------------------------------------------------------------------------- schedule
 
 
-def wsd_lr(peak: float, step: int, t: float, T: float, warmup_steps: int, cooldown_frac: float) -> tuple[float, int]:
+def wsd_lr(peak: float, step: int, t: float, T: float, warmup_steps: int, cooldown_frac: float,
+           t_c: float | None = None) -> tuple[float, int]:
     """Warmup-stable-decay. `step` is the 1-based optimizer step about to be taken, `t` the progress when it starts
     (loop seconds, or steps done) out of the budget `T`. Linear warmup over warmup_steps, constant until
-    t >= (1 - cooldown_frac) T, then peak * (1 - sqrt((t - t_c) / (T - t_c))). Returns (lr, phase) with phase
-    0 warmup, 1 stable, 2 cooldown."""
+    t >= t_c = (1 - cooldown_frac) T (or the given t_c: an early-stop cooldown, Run.cooldown_start), then
+    peak * (1 - sqrt((t - t_c) / (T - t_c))). Returns (lr, phase) with phase 0 warmup, 1 stable, 2 cooldown."""
     warm = min(1.0, step / warmup_steps) if warmup_steps > 0 else 1.0
-    t_c = (1.0 - cooldown_frac) * T
+    t_c = (1.0 - cooldown_frac) * T if t_c is None else t_c
     if t < t_c:
         return peak * warm, 0 if warm < 1.0 else 1
     frac = min(1.0, (t - t_c) / max(T - t_c, 1e-12))
@@ -277,6 +330,39 @@ def warmup_steps(sch: dict, total_steps: int | None = None) -> int:
     if sch["clock"] == "epochs" and total_steps:
         w = min(w, math.ceil(0.1 * total_steps))
     return w
+
+
+def early_stop_state() -> dict:
+    """The early-stop part of the full state (Run.st["early_stop"]): the best value and its step, in-loop evals
+    checked, evals since the best, the last value, the train-loss sum and count since the previous eval (metric
+    "train_loss"), the trigger (the `early_stop` event's fields, or None), whether the loop must end (`stop`) and an
+    early cooldown's schedule (`cooldown`: t_c and T on the run's clock, or None)."""
+    return dict(best=None, best_step=None, evals=0, evals_since_best=0, value=None, loss_sum=0.0, loss_n=0,
+                triggered=None, stop=False, cooldown=None)
+
+
+def early_stop_update(es: dict, ec: dict, value, step: int) -> str | None:
+    """One in-loop eval's update of the early-stop state `es` under the rule `ec` (config early_stop). The eval improves
+    when best - value > max(min_delta_abs, min_delta_rel * |best|) (strictly: a tie is no improvement; the first
+    checked eval always improves; a missing or non-finite value never does); the best moves only on an improvement.
+    Returns the trigger, never before ec["min_evals"] checked evals: "floor" (value <= ec["floor"]), "patience"
+    (ec["patience"] evals in a row without an improvement), else None."""
+    ok = value is not None and math.isfinite(float(value))
+    value = float(value) if ok else None
+    es["evals"] += 1
+    es["value"] = value
+    best = es["best"]
+    if ok and (best is None or best - value > max(float(ec["min_delta_abs"]), float(ec["min_delta_rel"]) * abs(best))):
+        es["best"], es["best_step"], es["evals_since_best"] = value, int(step), 0
+    else:
+        es["evals_since_best"] += 1
+    if es["evals"] < int(ec["min_evals"]):
+        return None
+    if ec["floor"] is not None and ok and value <= float(ec["floor"]):
+        return "floor"
+    if es["evals_since_best"] >= int(ec["patience"]):
+        return "patience"
+    return None
 
 
 def due(t: float, step: int, last_t: float, last_step: int, every_min, every_steps) -> bool:
@@ -372,19 +458,28 @@ class Run:
         last_full_step=0, memory={}, flops_per_padded_s=None, history=[], nonfinite_skips=0, nonfinite_total=0,
         oom_skips=0, audio_s=0.0, tokens=0, step_time_s=0.0, smoke_losses=[], smoke_audio_s=0.0, smoke_time_s=0.0,
         epoch=0, epoch_progress=0.0, resumes=0, weights=[], fulls=[], last_objective=None, lr_phase=None,
-        last_eval_epoch=0, total_steps=None))
+        last_eval_epoch=0, total_steps=None, early_stop=early_stop_state()))
 
     def clock(self) -> float:
         """Loop clock in seconds: continues across resumes, frozen outside the training loop."""
         return self.st["train_s"] + (time.monotonic() - self.loop_t0 if self.loop_t0 is not None else 0.0)
 
     def progress(self) -> tuple[float, float]:
+        """(t, T): loop seconds or steps done, out of the budget; T ends early under an early-stop cooldown."""
         s = self.cfg["schedule"]
         if s["clock"] == "steps":
-            return float(self.st["step"]), float(s["max_steps"])
-        if s["clock"] == "epochs":  # total_steps: plan_epochs
-            return float(self.st["step"]), float(self.st["total_steps"])
-        return self.clock(), self.budget_s if self.budget_s is not None else float(s["train_hours"]) * 3600
+            t, T = float(self.st["step"]), float(s["max_steps"])
+        elif s["clock"] == "epochs":  # total_steps: plan_epochs
+            t, T = float(self.st["step"]), float(self.st["total_steps"])
+        else:
+            t, T = self.clock(), self.budget_s if self.budget_s is not None else float(s["train_hours"]) * 3600
+        cd = self.st["early_stop"]["cooldown"]
+        return (t, min(T, cd["T"])) if cd else (t, T)
+
+    def cooldown_start(self, T: float) -> float:
+        """t_c of the WSD schedule with budget T: (1 - cooldown_frac) T, or where an early-stop cooldown began."""
+        cd = self.st["early_stop"]["cooldown"]
+        return cd["t_c"] if cd else (1.0 - float(self.cfg["schedule"]["cooldown_frac"])) * T
 
     def autocast(self):
         return torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.amp)
@@ -790,6 +885,10 @@ def setup_data(R: Run):
         R.probe_ids = [u.id for u in R.train.utts]
     else:
         R.probe_ids = [R.train.utts[i].id for i in R.train.indices(in_probe=True)] if cfg["eval"]["probe"] else []
+    es = cfg["early_stop"]
+    if es["enabled"] and es["metric"] == "probe_kl" and not R.probe_ids:  # validate() cannot see an empty probe
+        raise SystemExit("early_stop.metric probe_kl needs a non-empty probe: this selection/subset has no probe rows "
+                         "(set eval.probe_is_train, or use metric heldout_kl / train_loss)")
     pg_budget = cfg["eval"]["probe_greedy_audio_s"]
     pg_budget = sub["eval_audio_s"] if pg_budget is None else pg_budget
     R.probe_greedy_ids = []
@@ -1097,7 +1196,10 @@ def _bn_drift_check(R: Run, step: int):
 # ------------------------------------------------------------------------------------------------------- logging
 
 
-def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float, step_s: float, e: int, s: int):
+def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float, step_s: float, e: int,
+             s: int) -> tuple[float, float]:
+    """The step's row (steps.parquet, scalars, TensorBoard) and per-utterance records. Returns (objective,
+    loss/total)."""
     from kitsune.runlog import system_stats
 
     cfg = R.cfg
@@ -1160,7 +1262,7 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
         R.log.scalars({f"layers/update_ratio/{k}": v for k, v in out["update_ratio"].items()}, step)
         R.log.scalars({f"l2sp/dist/{k}": v for k, v in R.l2sp.per_module_distance().items()}, step)
         R.log.scalars({f"l2sp/rel/{k}": v for k, v in R.l2sp.per_module_distance(relative=True).items()}, step)
-    return objective
+    return objective, row["loss/total"]
 
 
 # ---------------------------------------------------------------------------------------------------------- evals
@@ -1263,6 +1365,75 @@ def run_eval(R: Run, step: int, final: bool = False) -> dict:
     return full_sum if full_sum is not None else gr_sum
 
 
+# ----------------------------------------------------------------------------------------------------- early stop
+
+
+def early_stop_value(R: Run, metric: str) -> float | None:
+    """The early-stop metric right after an eval: the newest eval record's probe_kl / heldout_kl (eval_record), or the
+    mean loss/total of the optimizer steps since the previous eval (None if there were none)."""
+    es = R.st["early_stop"]
+    if metric == "train_loss":
+        return es["loss_sum"] / es["loss_n"] if es["loss_n"] else None
+    return (R.st["history"][-1] if R.st["history"] else {}).get(metric)
+
+
+def early_stop_check(R: Run, step: int) -> bool:
+    """After every in-loop eval: with early_stop.enabled and no trigger yet, update the early-stop state
+    (early_stop_update), log it and act on a trigger (early_stop_trigger). Returns True when the loop must end now."""
+    ec, es = R.cfg["early_stop"], R.st["early_stop"]
+    value = early_stop_value(R, ec["metric"])
+    es["loss_sum"], es["loss_n"] = 0.0, 0  # the next eval's train-loss window starts here
+    if not ec["enabled"] or es["triggered"]:
+        return False
+    reason = early_stop_update(es, ec, value, step)
+    nan = float("nan")
+    row = {"early_stop/value": nan if es["value"] is None else es["value"],
+           "early_stop/best": nan if es["best"] is None else es["best"],
+           "early_stop/evals_since_best": es["evals_since_best"]}
+    if reason is None:
+        row["early_stop/triggered"] = 0.0
+    R.log.scalars(row, step)
+    return reason is not None and early_stop_trigger(R, reason, ec["action"])
+
+
+def early_stop_trigger(R: Run, reason: str, action: str) -> bool:
+    """Act on an early-stop trigger (reason "patience", "floor" or "stop_file") and log it (`early_stop` event,
+    early_stop/triggered = 1). "stop": the loop ends now. "cooldown": the WSD cooldown starts now, over
+    schedule.cooldown_frac x the loop time (or the steps; whole steps) done so far, capped by what is left of the
+    budget, and the run ends when it is over (Run.progress, Run.cooldown_start); a run already in its cooldown goes on
+    to the scheduled end. Returns True when the loop must end now."""
+    ec, es, sch = R.cfg["early_stop"], R.st["early_stop"], R.cfg["schedule"]
+    step = R.st["step"]
+    info = dict(metric=ec["metric"] if ec["enabled"] else None, value=es["value"], best=es["best"],
+                best_step=es["best_step"], evals_since_best=es["evals_since_best"], reason=reason, action=action,
+                at_step=step, epoch=R.st["epoch_progress"])
+    if es["triggered"]:  # the STOP file after an early cooldown began
+        info["previous"] = es["triggered"]
+    if action == "cooldown":
+        t, T = R.progress()
+        t_c = R.cooldown_start(T)
+        if R.st["pre_cooldown_done"] or t >= t_c or es["cooldown"]:
+            info["cooldown"] = dict(already=True, t_c=t_c, T=T, clock=sch["clock"])
+        else:
+            length = float(sch["cooldown_frac"]) * t
+            if sch["clock"] != "wall":
+                length = float(math.ceil(length))
+            es["cooldown"] = dict(t_c=t, T=t + max(0.0, min(length, T - t)), clock=sch["clock"], at_step=step)
+            info["cooldown"] = dict(es["cooldown"], already=False)
+    else:
+        es["stop"] = True
+    es["triggered"] = info
+    R.log.event("early_stop", **info)
+    R.log.scalars({"early_stop/triggered": 1.0}, step)
+    return es["stop"]
+
+
+def stop_requested(R: Run) -> bool:
+    """The manual stop: runs/<run_id>/STOP exists (one stat per optimizer step, whatever early_stop.enabled says) ->
+    the "stop" path with reason "stop_file"."""
+    return (R.run_dir / STOP_FILE).exists() and early_stop_trigger(R, "stop_file", "stop")
+
+
 # ----------------------------------------------------------------------------------------------------- checkpoints
 
 
@@ -1329,29 +1500,46 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False) -> Path:
     name = f"full_step_{step}"
     d = R.ckpt_dir / name
     t0 = time.time()
-    if not (d.exists() and step in R.st["fulls"]):
-        tmp = R.ckpt_dir / f"{name}.tmp"
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        tmp.mkdir(parents=True)
+
+    def trainer_state():
         st = copy.deepcopy(R.st)
         st["train_s"] = R.clock()
         st["fulls"] = sorted(set(st["fulls"]) | {step})
         trainer = dict(format=1, step=step, reason=reason, run_id=R.run_dir.name, cfg=R.cfg, st=st,
                        planner=R.planner.state_dict(), logger=R.log.state_dict(), rng=_rng_state(),
                        time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        brief = {k: v for k, v in trainer.items() if k not in ("rng", "st")}
+        brief["st"] = {k: v for k, v in st.items() if k not in ("history", "smoke_losses")}
+        return trainer, brief, st
+
+    if not (d.exists() and step in R.st["fulls"]):
+        tmp = R.ckpt_dir / f"{name}.tmp"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        trainer, brief, st = trainer_state()
         torch.save(R.model.state_dict(), tmp / "model.pt")
         torch.save(R.opt.state_dict(), tmp / "optimizer.pt")
         torch.save(R.l2sp.state_dict(), tmp / "l2sp.pt")
         torch.save(trainer, tmp / "trainer.pt")
-        brief = {k: v for k, v in trainer.items() if k not in ("rng", "st")}
-        brief["st"] = {k: v for k, v in st.items() if k not in ("history", "smoke_losses")}
         (tmp / "trainer.json").write_text(json.dumps(brief, indent=1, default=str), encoding="utf-8")
         _replace_dir(tmp, d)
         R.st["fulls"] = st["fulls"]
         R.log.event("checkpoint", ckpt="full", name=name, reason=reason, save_s=round(time.time() - t0, 1),
                     gb=round(sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / 1e9, 3),
                     disk_free_gb=_disk_free_gb(d))
+    elif reason == "end":
+        # a periodic/after-smoke full state already holds this step's weights and optimizer, but its trainer state
+        # predates the stop (early_stop.stop / triggered); rewrite only trainer.pt/.json so a resume ends the run
+        trainer, brief, _ = trainer_state()
+        for fname, write in (("trainer.pt", lambda f: torch.save(trainer, f)),
+                             ("trainer.json", lambda f: f.write_text(json.dumps(brief, indent=1, default=str),
+                                                                     encoding="utf-8"))):
+            tmp = d / f"{fname}.tmp"
+            write(tmp)
+            _replace_file(tmp, d / fname)
+        R.log.event("checkpoint", ckpt="full", name=name, reason=reason, trainer_only=True,
+                    save_s=round(time.time() - t0, 1))
     if upload:
         R.uploader.submit(d, name)
     rotate_full(R)
@@ -1650,7 +1838,7 @@ def build(args) -> tuple[Run, dict | None]:
     if args.resume:
         full = find_full_state(Path(args.resume))
         state = torch.load(full / "trainer.pt", map_location="cpu", weights_only=True)
-        cfg = copy.deepcopy(state["cfg"])
+        cfg = _merge(DEFAULTS, copy.deepcopy(state["cfg"]))  # keys added since it was written take the defaults
         overrides = [apply_set(cfg, s) for s in args.set]
         validate(cfg)
         run_dir = full.parent.parent
@@ -1747,7 +1935,11 @@ def train(R: Run, state: dict | None) -> int:
         run_eval(R, 0)
         R.st["step0_done"] = True
 
-    loop(R)
+    if R.st["early_stop"]["stop"]:  # resumed after an early stop had triggered: straight to the end phase
+        log.event("phase", name="train", at_step=R.st["step"], skipped="early_stop",
+                  reason=R.st["early_stop"]["triggered"]["reason"])
+    else:
+        loop(R)
 
     step = R.st["step"]
     log.event("phase", name="end", at_step=step, train_s=round(R.clock(), 1))
@@ -1827,7 +2019,9 @@ def loop(R: Run):
             t, T = R.progress()
             if t >= T or (sch["max_steps"] and R.st["step"] >= int(sch["max_steps"])) or passes_done():
                 break
-            t_c = (1.0 - float(sch["cooldown_frac"])) * T
+            if stop_requested(R):  # runs/<run_id>/STOP
+                break
+            t_c = R.cooldown_start(T)
             if not R.st["pre_cooldown_done"] and t >= t_c and float(sch["cooldown_frac"]) > 0:
                 R.st["pre_cooldown_done"] = True
                 log.event("phase", name="cooldown", at_step=R.st["step"], t=t, T=T)
@@ -1836,7 +2030,7 @@ def loop(R: Run):
             if crash_at is not None and step >= crash_at:
                 raise RuntimeError(f"KITSUNE_CRASH_AT_STEP={crash_at}: simulated crash before step {step}")
             lr, phase = wsd_lr(float(cfg["optim"]["lr"]), step, t, T, warmup_steps(sch, R.st["total_steps"]),
-                               float(sch["cooldown_frac"]))
+                               float(sch["cooldown_frac"]), t_c=t_c)
             if phase != R.st.get("lr_phase"):
                 log.event("lr_phase", at_step=step, phase=("warmup", "stable", "cooldown")[phase], lr=lr, t=t, T=T)
                 R.st["lr_phase"] = phase
@@ -1856,7 +2050,9 @@ def loop(R: Run):
                 torch.cuda.synchronize()
             step_s = time.perf_counter() - t0
             R.st["step"] = step
-            objective = log_step(R, step, lr, phase, out, wait, step_s, e, s)
+            objective, total = log_step(R, step, lr, phase, out, wait, step_s, e, s)
+            es = R.st["early_stop"]
+            es["loss_sum"], es["loss_n"] = es["loss_sum"] + float(total), es["loss_n"] + 1  # metric "train_loss"
             if not R.st["smoke_done"] and smoke_n:
                 R.st["smoke_losses"].append(float(objective))
                 if step > max(1, smoke_n // 10):  # the first steps pay for worker start-up and kernel autotuning
@@ -1871,12 +2067,17 @@ def loop(R: Run):
             else:
                 eval_now = due(t, step, R.st["last_eval_t"], R.st["last_eval_step"], ev_cfg["every_min"],
                                ev_cfg["every_steps"])
+            if eval_now and R.st["early_stop"]["cooldown"]:  # an early cooldown's last step: the final eval covers it
+                t_now, T_now = R.progress()
+                eval_now = t_now < T_now
             if eval_now:
                 run_eval(R, step)
                 R.st["last_eval_t"], R.st["last_eval_step"] = R.clock(), step
                 R.st["last_eval_epoch"] = R.planner.epoch
                 if not R.st["pre_cooldown_done"]:  # a fresher final-eval estimate (never moves T in the cooldown)
                     fit_budget(R)
+                if early_stop_check(R, step):  # action "stop": the end phase right after this eval
+                    break
             if due(t, step, R.st["last_weights_t"], R.st["last_weights_step"], ck["weights_every_min"],
                    ck["weights_every_steps"]):
                 save_weights(R, step, "periodic")
@@ -1917,6 +2118,7 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         memory=st["memory"], skipped=dict(nonfinite=st["nonfinite_total"], oom=st["oom_skips"]),
         cost=dict(dph=dph, usd=round(dph * elapsed / 3600, 2) if dph else None, note="trainer process time only"),
         best=dict(greedy_cer_ratio_mean=best(cer_ratio), heldout_kl=best(lambda r: r.get("heldout_kl"))),
+        stopped_early=st["early_stop"]["triggered"],  # the `early_stop` event's fields; None: no early stop triggered
         history=hist, checkpoints=dict(weights=st["weights"], full=st["fulls"]),
         config=R.cfg, **extra)
 

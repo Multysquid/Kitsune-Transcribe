@@ -95,7 +95,21 @@ Timeline: ~5 min boot and image pull, ~10-20 min data (derived pull + audio rebu
 `/workspace/kitsune_state/bootstrap_timings.jsonl`), 10-15 min smoke phase, 4 h training with evals, ~15 min final
 eval, upload and verification. The trainer reads the watchdog's deadline and shortens the 4 h (earlier cooldown)
 when the final eval, the uploads and a 30 min reserve would not fit before it, e.g. after a crash and resume; the
-`budget` event in `events.jsonl` shows the result.
+`budget` event in `events.jsonl` shows the result. It also ends early when the held-out KL goes flat (`early_stop` in
+`configs/viability.json`): after 3 evals in a row (1 h) without a 0.5 % improvement it starts the cooldown at once, over
+20 % of the time trained so far, and then goes to the final eval; the `early_stop` event and `stopped_early` in
+`summary.json` say when and why.
+
+To stop the training by hand (it looks flat on TensorBoard, or the results are already what you need):
+```bash
+ls /workspace/Kitsune-Transcribe/runs/                       # the run id: <run_name>-<UTC stamp>
+touch /workspace/Kitsune-Transcribe/runs/<run_id>/STOP
+```
+The trainer checks for the file before every optimizer step: the step under way finishes (with its eval and
+checkpoints, if due), then the normal end phase runs - final weights and full state, final eval, verdict, summary,
+uploads - and it exits 0, so the box verifies the upload and destroys itself as after a full run (`early_stop` event
+with reason `stop_file`). Killing the trainer instead counts as a crash (resumed once, or the box is stopped; see below)
+and skips the final eval.
 
 ## Where the results land
 

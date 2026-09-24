@@ -1,8 +1,10 @@
 @echo off
 rem Laptop overfit sanity runs of scripts/04_distill.py with the real 0.6B student, one after the other:
-rem configs/overfit_1s.json (1000 epochs), overfit_10s.json (100 epochs), overfit_1h.json (30 epochs). Each runs
-rem under scripts/supervise_distill.py, which relaunches it with --resume from its newest full state after a crash
-rem (this GPU faults now and then under load). A run that still fails does not stop the next one. Console output of
+rem configs/overfit_1s.json (1000 epochs), overfit_10s.json (100 epochs), overfit_1h.json (30 epochs), each at most:
+rem a run ends early once its probe KL is flat (early_stop in its config), or when a file STOP appears in its run dir
+rem (runs\overfit-...\STOP; the end phase follows as usual). Each runs under scripts/supervise_distill.py, which
+rem relaunches it with --resume from its newest full state after a crash (this GPU faults now and then under load).
+rem A run that still fails does not stop the next one. Console output of
 rem all three: overfit_tests.log; start, end and exit code of each run and of each attempt: overfit_pipeline.log.
 rem Results: runs\overfit-*\ (TensorBoard: tensorboard --logdir runs). Needs the GPU to itself.
 cd /d D:\Shizu-ko-distill

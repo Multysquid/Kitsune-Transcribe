@@ -1,5 +1,5 @@
 {
-  "_comment": "The viability run: one 4 h A100 run (spec section 8, run sheet D19-D52). Paths are relative to the repo root; every key can be overridden with --set a.b=value (scripts/04_distill.py). vast/bootstrap.sh reads sources, eval_sets, teacher_root, second_root, data_root, selection and student from this file.",
+  "_comment": "The viability run: one 4 h A100 run (spec section 8, run sheet D19-D52). Paths are relative to the repo root; every key can be overridden with --set a.b=value (scripts/04_distill.py). vast/bootstrap.sh reads sources, eval_sets, teacher_root, second_root, data_root, selection and student from this file. The one difference from the DEFAULTS in scripts/04_distill.py: early_stop is on. When the gate sets' pooled held-out KL (the verdict's) has not improved by 0.5 % relative for 3 in-loop evals in a row (1 h at 20-min evals; never before the 3rd eval after step 0), the WSD cooldown starts at once over 20 % of the loop time done so far (capped by the budget) and the run ends when it is over, instead of training on at a flat loss until the scheduled cooldown; already in the cooldown, the run goes on to its end. To stop by hand: touch runs/<run_id>/STOP (the end phase follows the step under way).",
   "run_name": "viability-b20x2560",
   "student": "students/b20x2560-d4",
   "data_root": "data",
@@ -35,5 +35,7 @@
   "hf": {"output_repo": null, "private": true},
   "smoke": {"enabled": true, "steps": 100, "min_audio_s_per_s": 600, "pad_utts": 32, "pad_max_mean_kl": 0.05,
             "pad_min_argmax_agree": null, "require_loss_decrease": true},
+  "early_stop": {"enabled": true, "metric": "heldout_kl", "patience": 3, "min_delta_rel": 0.005, "min_delta_abs": 0.0,
+                 "min_evals": 3, "floor": null, "action": "cooldown"},
   "seed": 1234
 }
