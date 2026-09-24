@@ -471,6 +471,12 @@ def headline(tf: dict | None = None, greedy: dict | None = None, probe: dict | N
     return out
 
 
+def headline_val_utts(greedy: dict | None) -> int:
+    """How many utterances headline()'s val CERs pool: the greedy summary's gate sets (every set if none is one). The
+    trainer logs it next to val_cer, since its full evals decode the fixed subset or the complete sets."""
+    return sum(int(d.get("n", 0)) for d in _gate_sets(greedy).values())
+
+
 def eval_record(step: int, elapsed_s: float, tf: dict | None = None, greedy: dict | None = None,
                 probe: dict | None = None) -> dict:
     """Compact per-eval record; the trainer appends one per eval to the history that verdict() reads."""

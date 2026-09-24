@@ -1,10 +1,11 @@
 """The eval cadence of scripts/04_distill.py: mini evals, a full eval at every epoch end, the headline numbers, the gate.
 
 - eval.mini: a small eval of its own every mini.every_steps optimizer steps - never at step 0, never at a step with a
-  full eval (in the loop or the final one) - on fixed seeded subsets (mini.val_per_set per gate set, mini.train_utts of
-  the probe) that stay the same across the run and a resume; teacher-forced and greedy; logged apart (eval/mini/...,
-  evals/step_<N>_mini/, `eval_mini` events, summary.json's mini_history) and never read by the early stop or the
-  verdict; training itself is unchanged by it
+  full eval in the loop, skipped when the loop is due to end at its step (the final eval follows there; on the wall
+  clock judged from the last mini's run time) - on fixed seeded subsets (mini.val_per_set per gate set,
+  mini.train_utts of the probe) that stay the same across the run and a resume; teacher-forced and greedy; logged
+  apart (eval/mini/..., evals/step_<N>_mini/, `eval_mini` events, summary.json's mini_history) and never read by
+  the early stop or the verdict; training itself is unchanged by it
 - eval.full_every_epochs: an eval at every N-th epoch end on the steps and wall clocks (the planner's epochs), decoding
   the COMPLETE eval sets; every_min / every_steps are ignored then. When the loop ends at the step of one (max_steps
   at an epoch end, an eval that runs past T), the end phase reuses it as the final eval: one decode per step
@@ -177,9 +178,12 @@ def test_headline_pools_the_gate_sets():
     assert h["val_top1"] == pytest.approx((0.5 * 10 + 0.25 * 30 + 1.0 * 60) / 100)
     assert h["train_cer"] == pytest.approx(4 / 40) and h["train_cer_vs_teacher"] == pytest.approx(1 / 30)
     assert (h["train_loss"], h["train_top1"]) == (0.25, 0.75)
+    assert ev.headline_val_utts(greedy) == 9  # the utterances val_cer pools: the gate sets' (galgame left out)
     # no gate set evaluated (a config without them): every evaluated set pools
     only = ev.headline(greedy=dict(sets=dict(galgame=_greedy_set(5, 50, 1, 10))))
     assert only == dict(val_cer=0.1, val_cer_vs_teacher=0.1)
+    assert ev.headline_val_utts(dict(sets=dict(galgame=_greedy_set(5, 50, 1, 10)))) == 3
+    assert ev.headline_val_utts(None) == 0
     assert ev.headline() == {} and ev.headline(greedy=dict(sets={}), probe=dict(sets={})) == {}
 
 
@@ -215,6 +219,10 @@ def test_mini_due_and_the_console_line():
     assert m.headline_line("full", 1126, 1.0, head) == (
         "[full eval] step 1126 epoch 1.00 | val CER 8.3% (vs teacher 2.5%) | train CER vs teacher 1.2% "
         "(vs ref 10.0%) | val KL 0.512 train KL 0.200")
+    # a full eval says what its val CER decoded: the step-0 subset and the complete sets later share the curve
+    assert m.headline_line("full", 0, 0.0, head, dict(val_greedy="subset", val_cer_utts=1500)) == (
+        "[full eval] step 0 epoch 0.00 | val CER 8.3% (vs teacher 2.5%) on 1500 utts (subset) | train CER vs teacher "
+        "1.2% (vs ref 10.0%) | val KL 0.512 train KL 0.200")
     assert m.headline_line("mini", 200, 0.18, {}) == (
         "[mini eval] step 200 epoch 0.18 | val CER n/a (vs teacher n/a) | train CER vs teacher n/a (vs ref n/a) | "
         "val KL n/a train KL n/a")
@@ -272,9 +280,11 @@ def test_full_eval_at_every_epoch_end_on_the_step_clock(steps_runs):
         d = json.loads((run / "evals" / f"step_{step}" / "summary.json").read_text(encoding="utf-8"))
         assert d["complete"] and d["greedy_full"]["n_utts"] == 3 * 6 and d["greedy"]["n_utts"] == 3 * 2
         assert d["headline_scope"]["val_greedy"] == "complete" and d["headline_scope"]["val_greedy_utts"] == 18
+        assert d["headline_scope"]["val_cer_utts"] == 18
         assert len(pd.read_parquet(run / "evals" / f"step_{step}" / "greedy_eval_jsut.parquet")) == 6
     s0 = json.loads((run / "evals" / "step_0" / "summary.json").read_text(encoding="utf-8"))
     assert not s0["complete"] and s0["greedy_full"] is None and s0["headline_scope"]["val_greedy"] == "subset"
+    assert s0["headline_scope"]["val_cer_utts"] == 3 * 2  # the greedy subset: 2 per gate set
     # the early stop reads the in-loop full evals only (never the minis, never step 0 or the final eval)
     assert sorted(scalar(run, "early_stop/value")) == ends
     ev_scal = scalar(run, "eval/epoch")
@@ -376,6 +386,9 @@ def test_headline_numbers_are_the_pooled_per_set_numbers(steps_runs):
             assert scalar(run, f"summary/full/{k}")[step] == pytest.approx(head[k], rel=1e-6), (step, k)
         for k in ("val_cer", "val_cer_vs_teacher", "train_cer", "train_cer_vs_teacher"):
             assert scalar(run, f"summary/full/{k}_pct")[step] == pytest.approx(100 * head[k], rel=1e-6)
+        # the scope of the headline val CER, next to it: the step-0 subset, then the complete sets
+        n_val = sum(g[x]["n"] for x in EVAL)
+        assert scalar(run, "summary/full/val_cer_utts")[step] == d["headline_scope"]["val_cer_utts"] == n_val
     for mrec in s["mini_history"]:
         step = mrec["step"]
         d = json.loads((run / "evals" / f"step_{step}_mini" / "summary.json").read_text(encoding="utf-8"))
@@ -394,6 +407,7 @@ def test_headline_numbers_are_the_pooled_per_set_numbers(steps_runs):
     assert summary(run)["headline"] == s["history"][-1]["headline"]
     out = (run / "logs" / "stdout.log").read_text(encoding="utf-8")
     assert "[full eval] step 0 epoch 0.00 | val CER " in out and " train KL " in out
+    assert "on 6 utts (subset) | train CER" in out and "on 18 utts (complete) | train CER" in out
     for mrec in s["mini_history"]:
         assert f"[mini eval] step {mrec['step']} epoch " in out
 
@@ -518,3 +532,33 @@ def test_a_complete_eval_that_runs_past_T_is_the_final_eval(env, monkeypatch):
     d = json.loads((run / "evals" / f"step_{ends[0]}" / "summary.json").read_text(encoding="utf-8"))
     for x in EVAL:
         assert s["verdict"]["sets"][x]["student"] == d["greedy_full"]["sets"][x]["cer_ref_corpus"]
+
+
+def test_no_mini_that_would_run_past_T(env, monkeypatch):
+    """The wall clock (T = 1 h): every mini eval takes 1000 s of loop clock. A mini whose run time, judged from the
+    last one's, would carry the clock past T is skipped - it would end the loop at its step, and the final eval would
+    then decode that same step again - so the minis stop at step 3 and the run trains on to max_steps."""
+    monkeypatch.delenv("KITSUNE_DEADLINE", raising=False)
+    monkeypatch.delenv("KITSUNE_STATE", raising=False)
+    m = load_script("04_distill")
+    real = m.run_mini_eval
+
+    def slow(R, step):  # the loop clock runs on during a mini: 1000 s, and its recorded wall time says so
+        out = real(R, step)
+        R.st["train_s"] += 1000.0
+        R.st["mini_history"][-1]["wall_s"] = 1000.0
+        return out
+
+    monkeypatch.setattr(m, "run_mini_eval", slow)
+    path = write_config(env, "cad-mini-T", {
+        "schedule": {"clock": "wall", "train_hours": 1.0, "max_steps": 6},  # max_steps: ends the run past the minis
+        "eval": {"every_steps": None, "every_min": 1e6, "full_every_epochs": None, "mini": {"every_steps": 1}},
+        "ckpt": {"full_every_steps": 1000},
+    })
+    assert m.main(["--config", path]) == 0
+    run = one_run(env["root"], "cad-mini-T")
+    s = summary(run)
+    # 1000, 2000, 3000 s after steps 1-3; at step 4, 3000 + 1000 >= 3600: skipped (without the look-ahead it ran,
+    # the clock passed T and the final eval ran at step 4, the mini's step)
+    assert [r["step"] for r in s["mini_history"]] == [1, 2, 3] and s["steps"] == 6
+    assert [(e["at_step"], e["final"]) for e in events(run, "eval")] == [(0, False), (6, True)]

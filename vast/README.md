@@ -119,7 +119,10 @@ complete eval sets, plus the probe - and a mini eval every 200 optimizer steps (
 probe). The numbers to read first are in TensorBoard under `2_loss_accuracy/00_summary/full/` and `.../mini/`
 (`val_cer_pct`: CER vs the reference pooled over JSUT / CV8 / ReazonSpeech-test, `val_cer_vs_teacher_pct`,
 `train_cer_vs_teacher_pct`, `val_loss`, `train_loss`, ...), and each eval prints one line to `kitsune.log`:
-`[full eval] step N epoch E | val CER x.x% (vs teacher y.y%) | train CER vs teacher z.z% (vs ref w.w%) | val KL ...`.
+`[full eval] step N epoch E | val CER x.x% (vs teacher y.y%) on U utts (complete) | train CER vs teacher z.z% (vs ref
+w.w%) | val KL ...`. The first point of `00_summary/full/` (step 0) decodes only the fixed 500-per-set subset (1,500
+gate utterances, "subset" in its line), every later point the complete gate sets (14,746); `val_cer_utts` next to
+`val_cer` shows which.
 The cost of a full eval on the A100 is an estimate until the first run measures it (`eval/wall_s`,
 `eval/greedy_full/rtf`): ~5-10 min (the laptop measured ~10 min for this student in batched decoding; the `_comment`
 in `configs/viability.json` has the arithmetic), against ~12-47 min of training per epoch.

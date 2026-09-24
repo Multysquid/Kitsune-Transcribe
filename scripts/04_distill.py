@@ -35,14 +35,18 @@ eval (when the loop ends at its step - it ran past T, max_steps or the STOP file
 phase reuses it as the final eval instead of decoding again: an `eval_final_reused` event); the others decode the fixed
 greedy subset. Every one of them (step 0 and the final eval too) is a "full" eval: the complete eval sets
 teacher-forced, the probe, one record in the history the verdict and the early stop read.
-Mini evals (eval.mini, run_mini_eval): every mini.every_steps optimizer steps, except at step 0 and at a step with a
-full eval (in the loop, or the final one when the loop ends there), a small eval of its own on fixed seeded subsets -
+Mini evals (eval.mini, run_mini_eval): every mini.every_steps optimizer steps, except at step 0, at a step with a full
+eval in the loop and when the loop is due to end at that step (the final eval runs there; on the wall clock judged from
+the last mini's wall time, so a first mini, a checkpoint save at that step or a STOP file can still leave one at the
+final eval's step), a small eval of its own on fixed seeded subsets -
 mini.val_per_set utterances of each gate set (the whole eval subset of the overfit runs) and mini.train_utts of the
 train probe - teacher-forced and, with mini.greedy, greedy; logged under eval/mini/, evals/step_<N>_mini/ and
 `eval_mini` events, never in the verdict's history nor the early stop. After every eval, full or mini, the headline
 numbers (kitsune.evaluate.headline: val CER vs the reference and vs the teacher pooled over the gate sets, train CER
 from the greedy decode of train utterances, val/train teacher-forced KL and top-1) go to summary/full/<name> or
-summary/mini/<name> (CERs as fractions, with <name>_pct copies in percent), and one console line:
+summary/mini/<name> (CERs as fractions, with <name>_pct copies in percent; a full eval also val_cer_utts, the gate
+utterances its val CER pools: the step-0 eval decodes the fixed subset, a full_every_epochs eval the complete sets),
+and one console line (" on U utts (subset|complete)" after the val CER of a full eval):
   [full eval] step N epoch E | val CER x.x% (vs teacher y.y%) | train CER vs teacher z.z% (vs ref w.w%) | val KL ...
 
 Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and configs/overfit_*.json): after every
@@ -1496,13 +1500,15 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
         log.table("probe_greedy", pg_df, step)
     for src, g in gr_df.groupby("source", sort=True):
         log.table(f"greedy_{src}", g.reset_index(drop=True), step)
-    # val CER from the complete sets when they were decoded, else from the greedy subset (the scope says which)
-    head = ev.headline(tf=tf_sum, greedy=full_sum if full_sum is not None else gr_sum, probe=probe_sum,
-                       probe_greedy=pg_sum)
+    # val CER from the complete sets when they were decoded, else from the greedy subset (the scope says which: the
+    # step-0 eval decodes the subset, a full_every_epochs run's later ones the complete sets, on the same curve)
+    head_gr = full_sum if full_sum is not None else gr_sum
+    head = ev.headline(tf=tf_sum, greedy=head_gr, probe=probe_sum, probe_greedy=pg_sum)
     summary = dict(step=step, train_s=R.clock(), final=final, complete=complete, tf=tf_sum, probe=probe_sum,
                    greedy=gr_sum, greedy_full=full_sum, wall_s=round(time.time() - t0, 1), headline=head,
                    headline_scope=dict(val_greedy="complete" if full_sum is not None else "subset",
-                                       val_greedy_utts=(full_sum if full_sum is not None else gr_sum).get("n_utts", 0),
+                                       val_greedy_utts=head_gr.get("n_utts", 0),
+                                       val_cer_utts=ev.headline_val_utts(head_gr),
                                        train_greedy_utts=len(R.probe_greedy_ids), train_tf_utts=len(R.probe_ids)))
     extra = {}  # only in the runs that use them, so the viability run's records are unchanged
     if pg_sum is not None:
@@ -1528,7 +1534,7 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
         scal["eval/epoch"] = extra["epoch"]
     scal["eval/wall_s"] = summary["wall_s"]
     log.scalars(scal, step)
-    log_headline(R, "full", head, step)
+    log_headline(R, "full", head, step, scope=summary["headline_scope"])
     samples = ev.pick_samples(gr_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"]))
     if pg_df is not None:  # train utterances (their source says so) after the held-out ones
         samples += ev.pick_samples(pg_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"]))
@@ -1564,28 +1570,35 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     return full_sum if full_sum is not None else gr_sum
 
 
-def log_headline(R: Run, kind: str, head: dict, step: int):
+def log_headline(R: Run, kind: str, head: dict, step: int, scope: dict | None = None):
     """An eval's headline numbers (kitsune.evaluate.headline) in one place: the scalars summary/<kind>/<name> (kind
-    "full" or "mini"; CERs as fractions, with a <name>_pct copy in percent for TensorBoard) and one console line."""
+    "full" or "mini"; CERs as fractions, with a <name>_pct copy in percent for TensorBoard) and one console line. With
+    the full eval's headline_scope, also summary/<kind>/val_cer_utts (how many gate utterances val_cer pools) and the
+    scope in the line: the step-0 point of the curve decodes the fixed subset, later ones may decode the complete
+    sets."""
     from kitsune.evaluate import HEADLINE_CER
 
     row = {f"summary/{kind}/{k}": v for k, v in head.items()}
     row.update({f"summary/{kind}/{k}_pct": 100.0 * head[k] for k in HEADLINE_CER if k in head})
+    if scope and "val_cer" in head:
+        row[f"summary/{kind}/val_cer_utts"] = float(scope["val_cer_utts"])
     R.log.scalars(row, step)
-    print(headline_line(kind, step, R.st["epoch_progress"], head), flush=True)
+    print(headline_line(kind, step, R.st["epoch_progress"], head, scope), flush=True)
 
 
-def headline_line(kind: str, step: int, epoch: float, head: dict) -> str:
+def headline_line(kind: str, step: int, epoch: float, head: dict, scope: dict | None = None) -> str:
     """'[full eval] step N epoch E | val CER x.x% (vs teacher y.y%) | train CER vs teacher z.z% (vs ref w.w%) | val KL
-    a.aaa train KL b.bbb'; n/a for a number that eval did not measure."""
+    a.aaa train KL b.bbb'; n/a for a number that eval did not measure. With a scope (run_eval's headline_scope) the val
+    CER says what it decoded: '... (vs teacher y.y%) on U utts (subset) | ...' or '(complete)'."""
     def pct(k):
         return f"{100.0 * head[k]:.1f}%" if k in head else "n/a"
 
     def kl(k):
         return f"{head[k]:.3f}" if k in head else "n/a"
 
+    on = f" on {scope['val_cer_utts']} utts ({scope['val_greedy']})" if scope and "val_cer" in head else ""
     return (f"[{kind} eval] step {step} epoch {epoch:.2f} | val CER {pct('val_cer')} (vs teacher "
-            f"{pct('val_cer_vs_teacher')}) | train CER vs teacher {pct('train_cer_vs_teacher')} (vs ref "
+            f"{pct('val_cer_vs_teacher')}){on} | train CER vs teacher {pct('train_cer_vs_teacher')} (vs ref "
             f"{pct('train_cer')}) | val KL {kl('val_loss')} train KL {kl('train_loss')}")
 
 
@@ -1604,7 +1617,8 @@ def mini_teacher_rows(R: Run, kind: str, store, ids: list[str]) -> dict[str, dic
 
 def mini_due(R: Run, step: int) -> bool:
     """A mini eval is due after optimizer step `step` (the loop skips it when a full eval runs at that step, or when
-    the loop ends there and the final eval follows)."""
+    the loop is due to end there and the final eval follows; on the wall clock that is judged from the last mini's wall
+    time, a prediction rather than a guarantee)."""
     every = R.cfg["eval"]["mini"]["every_steps"]
     return bool(every) and step > 0 and step % int(every) == 0 and bool(R.mini_val_ids or R.mini_train_ids)
 
@@ -2408,8 +2422,11 @@ def loop(R: Run):
     def passes_done() -> bool:  # clock "epochs": the planner's position is past the last epoch (skipped steps too)
         return epochs is not None and R.planner.epoch >= epochs
 
-    def ending() -> bool:  # the loop stops before another step (the final eval then runs at this step)
+    def ending(ahead: float = 0.0) -> bool:  # the loop stops before another step (the final eval then runs at this
+        # step); ahead: seconds of work still to come at this step, on the wall clock (the other clocks count steps)
         t_now, T_now = R.progress()
+        if sch["clock"] == "wall":
+            t_now += ahead
         return (t_now >= T_now or bool(sch["max_steps"] and R.st["step"] >= int(sch["max_steps"])) or passes_done()
                 or (R.run_dir / STOP_FILE).exists())
 
@@ -2492,7 +2509,10 @@ def loop(R: Run):
                     fit_budget(R)
                 if early_stop_check(R, step):  # action "stop": the end phase right after this eval
                     break
-            elif mini_due(R, step) and not ending():  # never at a step with a full eval (in the loop or the final)
+            elif mini_due(R, step) and not ending(R.st["mini_history"][-1]["wall_s"] if R.st["mini_history"] else 0.0):
+                # never at a step with a full eval in the loop, nor when the loop ends at this step (the final eval
+                # follows): on the wall clock also when the mini itself, as long as the last one took, would carry the
+                # clock past T. A first mini, the checkpoints saved after it or a STOP file can still end the loop here
                 run_mini_eval(R, step)
             if due(t, step, R.st["last_weights_t"], R.st["last_weights_step"], ck["weights_every_min"],
                    ck["weights_every_steps"]):
