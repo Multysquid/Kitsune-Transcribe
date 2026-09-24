@@ -346,6 +346,42 @@ def test_sync_errors_become_events(tmp_path):
     assert (run / "metrics" / "scalars.parquet").exists()  # local mirrors are written even when uploads fail
 
 
+def test_a_stalled_sync_is_reported_and_close_returns(tmp_path):
+    """An upload that never returns (a Hub request the server accepted and never answered) turns every later sync
+    into a skip: that becomes one sync_stalled event, and close() gives up after close_join_s (sync_abandoned) instead
+    of keeping the trainer, and a paid instance, alive."""
+    release = threading.Event()
+
+    class StalledApi(FakeApi):
+        def upload_folder(self, **kw):
+            self.calls.append(kw)
+            release.wait(30)
+
+    api = StalledApi()
+    run = tmp_path / "stall-run"
+    log = RunLogger(run, CFG, hf_repo="me/kitsune-runs", sync_every_min=0.001, api=api, capture=False, tee=False,
+                    upload_retries=(), close_join_s=0.5)
+    try:
+        log.step_row({"loss": 1.0}, 1)
+        time.sleep(0.1)  # > sync_every_min (0.06 s)
+        assert log.sync() is True
+        time.sleep(0.3)  # > 2 x sync_every_min
+        log.step_row({"loss": 0.5}, 2)
+        assert [log.sync(), log.sync()] == [False, False]
+        stalled = [e for e in events(run) if e["kind"] == "sync_stalled"]
+        assert len(stalled) == 1 and stalled[0]["sync_step"] == 1 and stalled[0]["started_s_ago"] >= 0.12
+        t0 = time.monotonic()
+        log.close()
+        assert time.monotonic() - t0 < 3
+        kinds = [e["kind"] for e in events(run)]
+        assert kinds[-2:] == ["logger_close", "sync_abandoned"] and len(api.calls) == 1  # no final sync behind it
+        assert log._sync_thread.daemon and log._sync_thread.is_alive()
+    finally:
+        release.set()
+    log._sync_thread.join(5)
+    assert events(run)[-1]["kind"] == "sync_ok"  # the abandoned thread may still log once it returns
+
+
 def test_resume_keeps_one_step_axis(tmp_path):
     run = tmp_path / "res-run"
     log = RunLogger(run, CFG, sync_every_min=0, capture=False, tee=False)

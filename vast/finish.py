@@ -151,8 +151,26 @@ def snapshot(src_root: Path, rels: list[str], dest: Path):
 
 # ------------------------------------------------------------------------------------------------------------ hub
 
+def bound_hub_http():
+    """Give huggingface_hub's shared HTTP client a timeout (as scripts/04_distill.py does): its default has none, and a
+    request the server accepted and never answered (the commit POST of a sync) would keep the instance up until the
+    watchdog. The pinned client is kept otherwise (its request hook, redirects). list_repo_tree passes timeout=None
+    itself and is not covered."""
+    import httpx
+    import huggingface_hub
+    from huggingface_hub.utils import _http
+
+    def factory():
+        c = _http.default_client_factory()
+        c.timeout = httpx.Timeout(60, read=300)  # read: well above the Hub's 60 s commit timeout on its side
+        return c
+
+    huggingface_hub.set_client_factory(factory)
+
+
 def hf_api():
     from huggingface_hub import HfApi  # imported lazily: --help and the pure helpers work without the hub
+    bound_hub_http()
     return HfApi()
 
 

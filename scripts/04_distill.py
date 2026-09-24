@@ -23,7 +23,7 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
                sets, verdict (kitsune.evaluate.verdict; "N/A" with its numbers under eval.gate false: the
-               sanity/overfit runs), summary.json, uploads awaited, final forced sync; exit 0
+               sanity/overfit runs), summary.json, uploads awaited (bounded), final forced sync; exit 0
 
 Evals in the loop (run_eval): every eval.every_min minutes of loop clock (eval.every_steps steps when set), or at the
 end of every eval.every_epochs-th / eval.full_every_epochs-th epoch instead. An epoch ends where the planner's plan for
@@ -111,19 +111,22 @@ Usage:
   python scripts/04_distill.py --config configs/viability.json --resume runs/<run_id>/checkpoints/full_step_<N>
 """
 import argparse
+import concurrent.futures
 import copy
 import hashlib
 import json
 import math
 import os
+import queue
 import random
 import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -145,6 +148,9 @@ from kitsune.patches import assert_bn_frozen, patch_relpos_once_per_batch, train
 from kitsune.runlog import _replace as _replace_file  # noqa: E402  (atomic file replace with the Windows retry)
 
 EXIT_OK, EXIT_THROUGHPUT, EXIT_FAIL = 0, 3, 1
+# the end phase's wait for checkpoint uploads (the failure path's too): with RunLogger's close_join_s (600 s) it stays
+# inside schedule.end_reserve_min (30), so an upload that never returns cannot keep a paid instance up
+UPLOAD_WAIT_S = 600
 SR = 16000
 FULL_RE = re.compile(r"^full_step_(\d+)$")
 WEIGHTS_RE = re.compile(r"^step_(\d+)$")
@@ -561,9 +567,28 @@ def out_repo(cfg: dict) -> str | None:
     return (cfg.get("hf") or {}).get("output_repo") or None
 
 
+def bound_hub_http():
+    """Give huggingface_hub's shared HTTP client a timeout. Its default client has none, and a request the
+    server accepted and never answered (create_repo, preupload, the commit POST) would block forever: the trainer
+    would never exit and a paid instance would idle until the watchdog. The pinned client (hub ==1.23.0) is kept as it
+    is otherwise (its request hook, redirects). Calls that pass timeout=None themselves (list_repo_tree, repo_info)
+    and hf_xet's own transfers are not covered; the bounded waits in RunLogger.close and Uploader are."""
+    import httpx
+    import huggingface_hub
+    from huggingface_hub.utils import _http
+
+    def factory():
+        c = _http.default_client_factory()
+        c.timeout = httpx.Timeout(60, read=300)  # read: well above the Hub's 60 s commit timeout on its side
+        return c
+
+    huggingface_hub.set_client_factory(factory)
+
+
 def hf_api():
     from huggingface_hub import HfApi  # looked up at call time: tests substitute a fake
 
+    bound_hub_http()
     return HfApi()
 
 
@@ -573,20 +598,37 @@ def hf_api():
 class Uploader:
     """Checkpoint uploads to <repo>:runs/<run_id>/checkpoints/<name>/ in one background thread, so a 1-9 GB upload
     never blocks training. Every attempt is an event; failures are retried and never raise (vast/finish.py uploads
-    again and verifies before an instance is destroyed). A directory with a pending upload is never rotated away."""
+    again and verifies before an instance is destroyed). A directory with a pending upload is never rotated away.
+    The thread is a daemon fed by a queue (not a ThreadPoolExecutor, whose worker the interpreter joins at exit): an
+    upload that never returns must not keep the trainer, and with it a paid instance, alive, so wait() and shutdown()
+    take a bound and the thread dies with the process."""
 
     def __init__(self, api, repo: str | None, run_id: str, private: bool, log, retries=(15, 60, 180)):
         self.api, self.repo, self.run_id, self.private, self.log, self.retries = api, repo, run_id, private, log, retries
-        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ckpt-upload")
+        self.queue: queue.Queue = queue.Queue()
+        self.worker: threading.Thread | None = None
         self.pending: dict[Path, Future] = {}
         self._repo_ready = False
 
     def submit(self, local: Path, name: str) -> Future | None:
         if not self.repo:
             return None
-        fut = self.pool.submit(self._upload, Path(local), name)
+        if self.worker is None:
+            self.worker = threading.Thread(target=self._work, name="ckpt-upload", daemon=True)
+            self.worker.start()
+        fut = Future()
         self.pending[Path(local)] = fut
+        self.queue.put((fut, Path(local), name))
         return fut
+
+    def _work(self):
+        while (job := self.queue.get()) is not None:
+            fut, local, name = job
+            if fut.set_running_or_notify_cancel():
+                try:
+                    fut.set_result(self._upload(local, name))
+                except BaseException as e:  # noqa: BLE001  (surfaces in wait(), as the pool's future did)
+                    fut.set_exception(e)
 
     def busy(self) -> set[Path]:
         return {p for p, f in self.pending.items() if not f.done()}
@@ -612,11 +654,16 @@ class Uploader:
         self.log.event("ckpt_upload_failed", name=name, attempts=len(self.retries) + 1)
         return False
 
-    def wait(self) -> dict[str, bool]:
-        return {p.name: f.result() for p, f in list(self.pending.items())}
+    def wait(self, timeout: float | None = None) -> dict[str, bool | None]:
+        """name -> the upload's result; None for one still running after `timeout` s (finish.py uploads it again)."""
+        done = concurrent.futures.wait(list(self.pending.values()), timeout=timeout).done
+        return {p.name: f.result() if f in done else None for p, f in list(self.pending.items())}
 
-    def shutdown(self):
-        self.pool.shutdown(wait=True)
+    def shutdown(self, timeout: float = 0.0):
+        """Stop the thread once the queued uploads are done, waiting at most `timeout` s for them."""
+        if self.worker is not None:
+            self.queue.put(None)
+            self.worker.join(timeout)
 
 
 def hf_roundtrip(R: Run) -> dict:
@@ -2166,7 +2213,7 @@ def train(R: Run, state: dict | None) -> int:
     verdict = gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=R.st["history"])))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
-    uploads = R.uploader.wait()
+    uploads = R.uploader.wait(UPLOAD_WAIT_S)
     summary = make_summary(R, "complete", verdict=verdict, final=full_sum, uploads=uploads,
                            headline=(R.st["history"][-1] if R.st["history"] else {}).get("headline"))
     R.uploader.shutdown()
@@ -2381,7 +2428,7 @@ def main(argv=None) -> int:
 def _close_failed(R: Run, status: str, exc: BaseException):
     """Partial summary + forced sync (RunLogger.close). Never masks the original exception."""
     try:
-        R.uploader.shutdown()
+        R.uploader.shutdown(UPLOAD_WAIT_S)
         R.log.close(summary=make_summary(R, status, error=f"{type(exc).__name__}: {exc}"[:2000]))
     except Exception as e:  # noqa: BLE001
         print(f"closing the logger after a failure failed too: {e!r}", file=sys.stderr)

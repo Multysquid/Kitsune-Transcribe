@@ -33,6 +33,10 @@ excluded - the trainer uploads those explicitly) run in a daemon thread. The upl
 append-only files cut at those lengths: the Hub client sizes a file when it lists the folder but hashes and reads it
 later, and the live files keep growing (and parquet mirrors get replaced) meanwhile, which would commit a pointer
 whose size, hash and content disagree. Upload errors are retried with back-off and become events, never exceptions.
+A sync that never returns (a Hub request the server accepted and never answered) is visible and bounded: later syncs
+are skipped while it runs, and once it has run for 2 x sync_every_min that becomes one sync_stalled event; close()
+waits at most close_join_s for it and its own final sync, then logs sync_abandoned and returns (the thread is a daemon
+and dies with the process; on the box vast/finish.py uploads again and verifies before a destroy).
 
 Resume: pass the dict from state_dict() (kept in the trainer's full state) as `resume=`. elapsed_s continues, steps
 after the restored step are dropped from steps.parquet and purged from TensorBoard, and are then logged again. The
@@ -602,7 +606,7 @@ class RunLogger:
     def __init__(self, run_dir, cfg: dict, hf_repo: str | None = None, sync_every_min: float = 10, *,
                  resume: dict | None = None, student_meta: dict | None = None, tee: bool = True,
                  capture: bool = True, train_utts_flush_steps: int = 500, api=None,
-                 upload_retries: tuple[float, ...] = (15, 60, 180)):
+                 upload_retries: tuple[float, ...] = (15, 60, 180), close_join_s: float = 600):
         import torch  # noqa: F401  (SummaryWriter needs it anyway; import errors surface here, not mid-run)
         from torch.utils.tensorboard import SummaryWriter
 
@@ -612,11 +616,15 @@ class RunLogger:
         self.sync_every_s = sync_every_min * 60
         self.train_utts_flush_steps = train_utts_flush_steps
         self.upload_retries = upload_retries
+        # close()'s whole wait for the sync thread(s): with the trainer's bounded checkpoint wait it stays well inside
+        # the 30 min end reserve, so a stalled upload cannot keep the process (and a paid instance) alive
+        self.close_join_s = close_join_s
         self._api = api
         self._repo_ready = False
         self._lock = threading.RLock()
         self._part_lock = threading.Lock()
         self._sync_thread: threading.Thread | None = None
+        self._sync_t0, self._sync_step, self._stall_logged = 0.0, 0, False  # the running sync: start, step, reported
         self._closed = False
         restart = (self.dir / "events.jsonl").exists()  # a previous logger ran here (resume or re-launch)
         for d in ("env", "tb", "metrics/train_utts", "metrics/hist", "evals", "samples", "logs"):
@@ -946,6 +954,12 @@ class RunLogger:
             return False
         if self._sync_thread is not None and self._sync_thread.is_alive():
             if not force:
+                # skipped, and silently so far: a sync that outlives two periods is stuck (a Hub request that is never
+                # answered), and every later sync is lost with it - say so once, the log is the only place it shows
+                running = time.monotonic() - self._sync_t0
+                if not self._stall_logged and running > 2 * self.sync_every_s:
+                    self._stall_logged = True
+                    self.event("sync_stalled", started_s_ago=round(running, 1), sync_step=self._sync_step)
                 return False
             self._sync_thread.join()
         self._last_sync = time.monotonic()
@@ -967,6 +981,7 @@ class RunLogger:
                     sizes=sizes)
         th = threading.Thread(target=self._sync_worker, args=(snap,), name="runlog-sync", daemon=True)
         self._sync_thread = th
+        self._sync_t0, self._sync_step, self._stall_logged = time.monotonic(), snap["step"], False
         th.start()
         if wait:
             th.join()
@@ -1034,17 +1049,35 @@ class RunLogger:
         if self._sync_thread is not None:
             self._sync_thread.join()
 
+    def _join_sync(self, until: float) -> bool:
+        """Wait for the running sync until the monotonic time `until`. False, with a sync_abandoned event, if it is
+        still running then: the daemon thread is left to die with the process."""
+        th = self._sync_thread
+        if th is None:
+            return True
+        th.join(max(0.0, until - time.monotonic()))
+        if th.is_alive():
+            self.event("sync_abandoned", started_s_ago=round(time.monotonic() - self._sync_t0, 1),
+                       sync_step=self._sync_step, close_join_s=self.close_join_s)
+            return False
+        return True
+
     # ------------------------------------------------------------------------------------------- close
 
     def close(self, summary: dict | None = None):
-        """Write summary.json (if given), flush everything, run a final forced sync, restore stdout/stderr."""
+        """Write summary.json (if given), flush everything, run a final forced sync, restore stdout/stderr. The wait
+        for the syncs is bounded by close_join_s: a stalled earlier sync means no final one (it would queue behind the
+        stall), and a final one that stalls is left behind too."""
         if self._closed:
             return
         if summary is not None:
             self.write_summary(summary)
         self.flush_train_utts()
         self.event("logger_close", elapsed_s_total=round(self.elapsed(), 1))
-        self.sync(force=True, wait=True)
+        until = time.monotonic() + self.close_join_s
+        if self._join_sync(until):
+            self.sync(force=True, wait=False)
+            self._join_sync(until)
         with self._lock:
             self._closed = True
             self.tb.close()

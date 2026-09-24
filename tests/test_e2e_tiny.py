@@ -133,6 +133,55 @@ def test_schedule_wsd_and_cadence():
     assert m.due(0.0, 10, 0.0, 5, 20, 5) and not m.due(9e9, 9, 0.0, 5, 20, 5)  # steps win when set
 
 
+def test_uploader_never_waits_forever_on_a_stalled_upload(tmp_path):
+    """A checkpoint upload that never returns (a Hub request the server accepted and never answered) must not hold the
+    trainer: wait() and shutdown() return after their bound, the upload is reported as None, and its thread is a
+    daemon, which the interpreter does not join at exit (a ThreadPoolExecutor's worker it does)."""
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    release, evs = threading.Event(), []
+
+    class StalledHub(FakeHub):
+        def upload_folder(self, **kw):
+            release.wait(30)
+            super().upload_folder(**kw)
+
+    up = m.Uploader(StalledHub(), "u/r", "run", True, SimpleNamespace(event=lambda kind, **kw: evs.append(kind)),
+                    retries=())
+    d = tmp_path / "step_1"
+    d.mkdir()
+    (d / "w.bin").write_bytes(b"x")
+    try:
+        up.submit(d, "step_1")
+        t0 = time.monotonic()
+        assert up.wait(0.3) == {"step_1": None} and up.busy() == {d}
+        up.shutdown(0.3)
+        assert time.monotonic() - t0 < 5 and up.worker.daemon and up.worker.is_alive()
+    finally:
+        release.set()
+    up.worker.join(5)
+    assert not up.worker.is_alive() and up.wait(0) == {"step_1": True} and evs == ["ckpt_upload_ok"]
+
+
+def test_trainer_hub_client_has_a_timeout():
+    """huggingface_hub's shared client has no timeout by default: a commit POST the Hub accepted and never answered
+    would keep the trainer, and a paid instance, up until the watchdog. hf_api() bounds it and keeps the hub's hook."""
+    import huggingface_hub
+    from huggingface_hub.utils import _http
+
+    m = load_script("04_distill")
+    try:
+        m.hf_api()
+        c = _http.get_session()
+        assert (c.timeout.connect, c.timeout.read) == (60, 300)
+        assert _http.hf_request_event_hook in c.event_hooks["request"] and c.follow_redirects
+    finally:
+        huggingface_hub.set_client_factory(_http.default_client_factory)
+
+
 def test_configs_resolve():
     m = load_script("04_distill")
     via = m.load_config(str(ROOT / "configs" / "viability.json"), [])

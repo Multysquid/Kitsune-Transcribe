@@ -777,6 +777,21 @@ def test_finish_without_repo_never_destroys(finish_env, monkeypatch, tmp_path):
     assert actions == ["stop"]
 
 
+def test_finish_hub_client_has_a_timeout():
+    """huggingface_hub's shared client has no timeout by default: a sync's commit POST the Hub accepted and never
+    answered would keep the box up until the watchdog. finish.hf_api() bounds it and keeps the hub's request hook."""
+    import huggingface_hub
+    from huggingface_hub.utils import _http
+
+    try:
+        finish.hf_api()
+        c = _http.get_session()
+        assert (c.timeout.connect, c.timeout.read) == (60, 300)
+        assert _http.hf_request_event_hook in c.event_hooks["request"] and c.follow_redirects
+    finally:
+        huggingface_hub.set_client_factory(_http.default_client_factory)
+
+
 # -------------------------------------------------------------------------------------------- 01_prepare_data pins
 
 @pytest.fixture(scope="module")
