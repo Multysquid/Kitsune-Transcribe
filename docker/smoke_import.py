@@ -100,19 +100,34 @@ def check_imports(pins: dict[str, str], skip_missing: bool = False) -> list[str]
 
 
 def audio_roundtrip() -> str:
-    """FLAC encode/decode in memory (libsndfile inside the soundfile wheel) and a soxr resample."""
+    """Every container the box decodes, encoded and decoded in memory at 24 kHz (Emilia's rate) through sf.info (the
+    01_prepare_data filter) and sf.read: FLAC, MP3 (Emilia and the CV8/Emilia eval sets, libsndfile's mpg123) and
+    OGG/Vorbis (galgame). A soundfile that loads a libsndfile without MP3 or Vorbis would pass a FLAC-only check and
+    turn every such row into bad_audio on the box. Then a soxr resample, and the 24 -> 16 kHz resample exactly as
+    kitsune/audio.py decode_audio calls it: `import librosa` alone is lazy and loads neither librosa.core.audio nor
+    numba. Returns the libsndfile version for the log (not asserted: the codec round trips are the check)."""
     import numpy as np
     import soundfile as sf
     import soxr
 
-    sr = 16000
+    sr = 24000
     wave = (0.1 * np.sin(2 * np.pi * 440 * np.arange(sr) / sr)).astype(np.float32)
-    buf = io.BytesIO()
-    sf.write(buf, wave, sr, format="FLAC")
-    back, sr2 = sf.read(io.BytesIO(buf.getvalue()), dtype="float32")
-    assert sr2 == sr and back.shape == wave.shape and np.abs(back - wave).max() < 1e-3, "FLAC round trip failed"
+    # (format, subtype, max abs error); lossy codecs get a loose bound, and up to one MP3 frame of padding is allowed
+    for fmt, subtype, tol in (("FLAC", "PCM_16", 1e-3), ("MP3", "MPEG_LAYER_III", 0.05), ("OGG", "VORBIS", 0.05)):
+        buf = io.BytesIO()
+        sf.write(buf, wave, sr, format=fmt, subtype=subtype)
+        info = sf.info(io.BytesIO(buf.getvalue()))
+        back, sr2 = sf.read(io.BytesIO(buf.getvalue()), dtype="float32")
+        n = min(len(back), len(wave))
+        assert info.samplerate == sr2 == sr and back.ndim == 1, f"{fmt}: {info.samplerate}/{sr2} Hz, {back.shape}"
+        assert abs(len(back) - len(wave)) <= 1152, f"{fmt}: decoded {len(back)} of {len(wave)} frames"
+        assert np.abs(back[:n] - wave[:n]).max() < tol, f"{fmt} round trip failed"
     up = soxr.resample(wave, sr, 48000)
-    assert abs(len(up) - 3 * len(wave)) <= 2, "soxr resample length"
+    assert abs(len(up) - 2 * len(wave)) <= 2, "soxr resample length"
+    import librosa
+
+    down = librosa.resample(wave, orig_sr=sr, target_sr=16000, res_type="soxr_hq")
+    assert len(down) == 16000 and np.isfinite(down).all(), f"librosa resample: {down.shape}"
     return sf.__libsndfile_version__
 
 

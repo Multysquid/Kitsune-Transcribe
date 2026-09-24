@@ -68,6 +68,27 @@ def test_smoke_import_covers_every_pin():
     assert set(pins) <= covered, f"not imported by smoke_import.py: {set(pins) - covered}"
 
 
+def test_smoke_audio_fails_without_a_codec_the_box_decodes(monkeypatch):
+    # a libsndfile without MP3 (soundfile's none-any wheel falls back to whatever system library it finds) must fail the
+    # CI smoke, not pass on FLAC and turn every Emilia row into bad_audio on the box
+    sf = pytest.importorskip("soundfile")
+    pytest.importorskip("soxr")
+    pytest.importorskip("librosa")
+    smoke = load_path("smoke_import", ROOT / "docker" / "smoke_import.py")
+    assert smoke.audio_roundtrip() == sf.__libsndfile_version__
+
+    class NoMp3(sf.SoundFile):
+        def __init__(self, file, mode="r", samplerate=None, channels=None, subtype=None, endian=None, format=None,
+                     *args, **kwargs):
+            if str(format).upper() == "MP3":
+                raise RuntimeError("Error opening <_io.BytesIO>: Format not recognised.")
+            super().__init__(file, mode, samplerate, channels, subtype, endian, format, *args, **kwargs)
+
+    monkeypatch.setattr(sf, "SoundFile", NoMp3)
+    with pytest.raises(RuntimeError, match="Format not recognised"):
+        smoke.audio_roundtrip()
+
+
 def test_dockerfile():
     text = (ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
     instr = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
@@ -767,7 +788,8 @@ def run_supervise(tmp_path, monkeypatch, script, state=None, finish=None):
     trainer = FakeTrainer(runs, script)
     finishes = []
     monkeypatch.setattr(supervise, "run_trainer", trainer)
-    monkeypatch.setattr(supervise, "call_finish", finish or (lambda args, timeout=None: finishes.append(list(args)) or 0))
+    monkeypatch.setattr(supervise, "call_finish",
+                        finish or (lambda args, timeout=None: finishes.append(list(args)) or 0))
     state_path = tmp_path / "state" / "supervise.json"
     if state is not None:
         state_path.parent.mkdir(parents=True)
