@@ -477,7 +477,7 @@ def test_launch_dry_run_builds_query_and_command(fake_vastai, capsys):
     assert search[:3] == ["/fake/vastai", "search", "offers"]
     query = search[3]
     for term in ("gpu_name in [A100_SXM4]", "num_gpus=1", "verified=true", "reliability>=0.98", "cuda_vers>=13.0",
-                 "cpu_cores_effective>=12", "cpu_ram>=64", "disk_bw>=500", "inet_down>=500",
+                 "cpu_cores_effective>=12", "cpu_ram>=64", "disk_bw>=500", "inet_down>=500", "inet_up>=500",
                  "direct_port_count>=1", "gpu_ram<=48"):
         assert term in query.split(" ") or term in query, term
     assert search[4:] == ["--type", "on-demand", "-o", "dph", "--storage", "150", "--raw"]

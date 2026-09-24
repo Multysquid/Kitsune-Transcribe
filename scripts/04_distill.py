@@ -27,7 +27,8 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
                sets, verdict (kitsune.evaluate.verdict; "N/A" with its numbers under eval.gate false: the
-               sanity/overfit runs), summary.json, uploads awaited (bounded), final forced sync; exit 0
+               sanity/overfit runs), summary.json (uploads "pending") and a log sync, uploads awaited (bounded),
+               summary.json with their results, final forced sync; exit 0
 
 Evals in the loop (run_eval): every eval.every_min minutes of loop clock (eval.every_steps steps when set), or at the
 end of every eval.every_epochs-th / eval.full_every_epochs-th epoch instead. An epoch ends where the planner's plan for
@@ -2520,14 +2521,16 @@ def train(R: Run, state: dict | None) -> int:
     verdict = gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=R.st["history"])))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
-    # the final eval, the verdict and the end events go up now, while the ~9 GB end state drains (up to
-    # UPLOAD_WAIT_S), not only with close()'s sync after it: on a slow Hub the watchdog stops the box meanwhile. A loop
-    # sync still running gets END_SYNC_JOIN_S to end first; a stalled one is close()'s to bound
+    headline = (R.st["history"][-1] if R.st["history"] else {}).get("headline")
+    # the final eval, the verdict, summary.json (uploads "pending" until close() rewrites it) and the end events go up
+    # now, while the ~9 GB end state drains (up to UPLOAD_WAIT_S), not only with close()'s sync after it: on a slow Hub
+    # the watchdog stops the box meanwhile. A loop sync still running gets END_SYNC_JOIN_S to end first; a stalled one
+    # is close()'s to bound
+    log.write_summary(make_summary(R, "complete", verdict=verdict, final=full_sum, uploads="pending", headline=headline))
     if log.wait_sync(END_SYNC_JOIN_S):
         log.sync(force=True, wait=False)
     uploads = R.uploader.wait(UPLOAD_WAIT_S)
-    summary = make_summary(R, "complete", verdict=verdict, final=full_sum, uploads=uploads,
-                           headline=(R.st["history"][-1] if R.st["history"] else {}).get("headline"))
+    summary = make_summary(R, "complete", verdict=verdict, final=full_sum, uploads=uploads, headline=headline)
     R.uploader.shutdown()
     log.close(summary=summary)
     return EXIT_OK

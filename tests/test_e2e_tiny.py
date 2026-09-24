@@ -749,9 +749,24 @@ def crash_resume(env):
     runs first (or alone); what the crashed launch left behind is kept here, since the resume changes it."""
     import huggingface_hub
 
+    from kitsune.runlog import RunLogger
+
     hub = FakeHub()
+    order = []  # summary.json writes (status, uploads) and forced log syncs, in call order
+
+    def write_summary(self, summary, _orig=RunLogger.write_summary):
+        order.append(("summary", summary["status"], summary.get("uploads")))
+        _orig(self, summary)
+
+    def sync(self, force=False, wait=None, _orig=RunLogger.sync):
+        if force:
+            order.append(("sync",))
+        return _orig(self, force, wait)
+
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(huggingface_hub, "HfApi", lambda *a, **k: hub)
+        mp.setattr(RunLogger, "write_summary", write_summary)
+        mp.setattr(RunLogger, "sync", sync)
         mp.setenv("KITSUNE_CRASH_AT_STEP", "13")
         with pytest.raises(RuntimeError, match="simulated crash"):
             load_script("04_distill").main(["--config", str(env["config"])])
@@ -764,7 +779,7 @@ def crash_resume(env):
                                        for p in sorted((run / "metrics" / "train_utts").glob("part-*.parquet"))]))
         mp.delenv("KITSUNE_CRASH_AT_STEP")
         rc = load_script("04_distill").main(["--config", str(env["config"]), "--resume", str(ck / "full_step_10")])
-    return dict(run=run, hub=hub, crashed=crashed, rc=rc)
+    return dict(run=run, hub=hub, crashed=crashed, rc=rc, order=order)
 
 
 def test_train_crash_resume_export(crash_resume, tmp_path):
@@ -880,6 +895,10 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
     assert syncs and all(ign and "checkpoints/*" in ign for p, _, ign in hub.folders if p == prefix)
     # the verdict went up before the end state's upload was waited for, not only with close()'s final sync
     assert any(f"evals/step_{MAX_STEPS}/verdict.json" in f for f in syncs[:-1])
+    # and summary.json with it (uploads "pending", written before that sync): a box stopped during the wait no longer
+    # leaves the Hub without one. Read off the call order: with the fake hub the wait ends before that sync copies files
+    assert crash_resume["order"][-4:] == [("summary", "complete", "pending"), ("sync",),
+                                          ("summary", "complete", summary["uploads"]), ("sync",)]
     assert f"{prefix}/smoke/roundtrip.json" in hub.files
 
     # ---- export (tools/ is not under scripts/, so no load_script)

@@ -2,8 +2,8 @@
 
 Run this on the laptop. It
   1. searches on-demand offers with the strict host filter (D45a): 1x A100 SXM4 40 GB, verified, reliability >= 0.98,
-     driver CUDA >= 13.0 (the image's torch is cu130), >= 12 effective CPU cores, >= 64 GB RAM, disk_bw and inet_down
-     >= 500, a direct port and room for the 150 GB disk, sorted by $/h; if none, the same filter on SXM4 80 GB;
+     driver CUDA >= 13.0 (the image's torch is cu130), >= 12 effective CPU cores, >= 64 GB RAM, disk_bw, inet_down and
+     inet_up >= 500, a direct port and room for the 150 GB disk, sorted by $/h; if none, the same filter on SXM4 80 GB;
   2. prints the offers and the exact `vastai create instance` command: the image by digest, --disk 150, --ssh --direct,
      the KITSUNE_* env, TZ=UTC and --onstart vast/onstart_stub.sh (which clones the repo and runs vast/onstart.sh);
   3. creates the instance only with --yes. Spending money is always the user's explicit step.
@@ -59,11 +59,13 @@ DEFAULT_MAX_DPH = 2.0
 # same list is STUDENT_FILES in vast/bootstrap.sh's helper
 STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json")
 # D45a strict filter; vast converts cpu_ram/gpu_ram GB to MB itself. rentable/verified are also CLI defaults, spelled
-# out so the printed query is the whole truth.
+# out so the printed query is the whole truth. inet_up: the end phase's ~9.9 GB of checkpoint uploads must drain inside
+# fit_budget's fixed end reserve (scripts/04_distill.py) before finish.py can destroy the box; a slow uplink overruns it
+# and the watchdog stops the box at the deadline instead.
 HOST_FILTER = [
     "num_gpus=1", "verified=true", "rentable=true", "reliability>=0.98", "cuda_vers>=13.0",
-    "cpu_cores_effective>=12", "cpu_ram>=64", "disk_bw>=500", "inet_down>=500", "direct_port_count>=1",
-    f"disk_space>={DISK_GB}",
+    "cpu_cores_effective>=12", "cpu_ram>=64", "disk_bw>=500", "inet_down>=500", "inet_up>=500",
+    "direct_port_count>=1", f"disk_space>={DISK_GB}",
 ]
 # vast names both SXM4 sizes "A100 SXM4"; gpu_ram tells them apart (40 GB cards report 39-40 GB)
 TIERS = [
@@ -138,8 +140,9 @@ def search_offers(exe: str) -> tuple[str, str, list[dict]]:
 def offer_table(offers: list[dict], limit: int = 10) -> str:
     cols = [("id", "id", "{}"), ("gpu", "gpu_name", "{}"), ("GB", "gpu_ram", "{:.0f}"), ("$/h", "dph_total", "{:.3f}"),
             ("rel", "reliability", "{:.3f}"), ("cuda", "cuda_max_good", "{}"), ("cpu", "cpu_cores_effective", "{:.0f}"),
-            ("ramGB", "cpu_ram", "{:.0f}"), ("down", "inet_down", "{:.0f}"), ("diskMB/s", "disk_bw", "{:.0f}"),
-            ("$/GBdn", "inet_down_cost", "{:.3f}"), ("$/GBup", "inet_up_cost", "{:.3f}"), ("where", "geolocation", "{}")]
+            ("ramGB", "cpu_ram", "{:.0f}"), ("down", "inet_down", "{:.0f}"), ("up", "inet_up", "{:.0f}"),
+            ("diskMB/s", "disk_bw", "{:.0f}"), ("$/GBdn", "inet_down_cost", "{:.3f}"),
+            ("$/GBup", "inet_up_cost", "{:.3f}"), ("where", "geolocation", "{}")]
     rows = [[h for h, _, _ in cols]]
     for o in offers[:limit]:
         row = []
