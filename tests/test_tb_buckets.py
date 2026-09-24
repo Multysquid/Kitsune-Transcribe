@@ -412,6 +412,18 @@ def test_regroup_refuses_a_live_run(tmp_path, monkeypatch, capsys):
     (done / "summary.json").write_text('{"status": "failed"}', encoding="utf-8")
     os.utime(done / "summary.json", (time.time() - 60, time.time() - 60))
     assert "resumed" in rg.live_reason(done)
+    # a launch that crashed just now (summary.json "failed", newer than every scalar, logger closed) is over unless
+    # it left a full state: then the supervisor relaunches it minutes later, its tb/ file opening before logger_start
+    os.utime(done / "summary.json", None)
+    assert rg.live_reason(done) is None
+    ck = done / "checkpoints" / "full_step_3"
+    ck.mkdir(parents=True)
+    (ck / "trainer.pt").write_bytes(b"")
+    assert "failed" in rg.live_reason(done)
+    with pytest.raises(SystemExit, match="looks live"):
+        rg.regroup(done)
+    assert not list((done / "tb").glob("*.bak"))
+    assert rg.live_reason(done, now=time.time() + 400) is None  # not relaunched within 5 minutes: over
     (done / "summary.json").write_bytes(summary)
     assert rg.regroup(live, force=True)["live"]  # --force
     assert rg.main(["--all", "--runs-root", str(tmp_path / "runs")]) == 0
@@ -487,6 +499,35 @@ def test_regroup_puts_back_a_file_that_grows_after_the_rename(tmp_path, monkeypa
     assert "1 being written" in capsys.readouterr().out
     monkeypatch.undo()
     assert rg.regroup(run)["unmapped"] == ["scalars:weird", "text:note"]  # once the writer is gone it goes through
+
+
+def test_regroup_backs_out_when_a_launch_opens_an_event_file_during_the_rebuild(tmp_path, monkeypatch):
+    """A relaunch that opens its tb/ event file while the rebuild runs is not hidden in a .bak with the originals: the
+    tool backs out before it renames anything, --force or not."""
+    from torch.utils.tensorboard import SummaryWriter
+
+    rg = load_tool("regroup_tb")
+    run = make_run(tmp_path / "runs" / "relaunch")
+    before, tag_map = _sizes(run), (run / "metrics" / "tag_map.json").read_bytes()
+    write, writers = rg._write, []
+
+    def write_then_relaunch(r, out_dir):
+        res = write(r, out_dir)
+        writers.append(SummaryWriter(str(run / "tb"), purge_step=4, flush_secs=3600))  # the resumed RunLogger's
+        return res
+
+    monkeypatch.setattr(rg, "_write", write_then_relaunch)
+    try:
+        with pytest.raises(rg.BeingWritten, match="appeared in tb/ during the rebuild") as e:
+            rg.regroup(run, force=True)
+        assert isinstance(e.value, SystemExit)
+        after = _sizes(run)
+        (opened,) = set(after) - set(before)
+        assert "tfevents" in opened and all(after[n] == before[n] for n in before)  # nothing renamed
+        assert not list(run.glob(".regroup-*")) and (run / "metrics" / "tag_map.json").read_bytes() == tag_map
+    finally:
+        for w in writers:
+            w.close()
 
 
 def test_regroup_with_a_real_writer_holding_the_file(tmp_path):
