@@ -68,7 +68,9 @@ Manual stop: create the file runs/<run_id>/STOP (on the vast box: touch
 /workspace/Kitsune-Transcribe/runs/<run_id>/STOP). It is checked before every optimizer step, whatever
 early_stop.enabled says: the step under way finishes (its eval and checkpoints included), then the "stop" path with
 reason "stop_file". Every trigger is an `early_stop` event (metric, value, best, best_step, evals_since_best, reason,
-action, at_step, epoch; `cooldown` with the new schedule) and summary.json's `stopped_early` (null if none); the
+action, at_step, epoch; `cooldown` with the new schedule) and summary.json's `early_stop_trigger` (null if none);
+summary.json's `stopped_early` holds it only when it shortened the run ("stop", or a cooldown begun before the
+scheduled one: null for a trigger with cooldown.already, which left the run to its scheduled end); the
 scalars early_stop/{value,best,evals_since_best,triggered} follow every checked eval. The early-stop state is part of
 the full state: a resumed run continues the patience count, and one that had already triggered "stop" goes straight
 to the end phase (a triggered cooldown carries on to its end).
@@ -2715,11 +2717,20 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         vals = [v for v in vals if v[0] is not None and not math.isnan(v[0])]
         return dict(value=min(vals)[0], step=min(vals)[1]) if vals else None
 
-    def cer_ratio(r):
+    from kitsune.evaluate import GATE_SETS
+
+    def cer_ratio(r, gate=True):
+        """Mean student / teacher corpus-CER ratio of a history record's greedy sets. gate: the gate sets only, as the
+        verdict's trend and heldout_kl read them (every set if none is one), so a monitor-only hold-out (eval_emilia,
+        galgame; teacher CER several times the gate sets') cannot move the best step; else every evaluated set."""
         g = r.get("greedy") or {}
-        v = [d["cer_ref_corpus"] / d["teacher_cer_ref_corpus"] for d in g.values() if d.get("teacher_cer_ref_corpus")]
+        if gate:
+            g = {s: d for s, d in g.items() if s in GATE_SETS} or g
+        v = [d["cer_ref_corpus"] / tc for d in g.values()
+             if (tc := d.get("teacher_cer_ref_corpus")) and not math.isnan(tc)]  # NaN: no teacher rows in that set
         return float(np.mean(v)) if v else None
 
+    trig = st["early_stop"]["triggered"]
     return dict(
         status=status, run_id=R.run_dir.name, steps=st["step"], epochs=st["epoch_progress"],
         train_s=round(st["train_s"], 1), elapsed_s_total=round(elapsed, 1), resumes=st["resumes"],
@@ -2729,8 +2740,13 @@ def make_summary(R: Run, status: str, **extra) -> dict:
                         tokens_per_s=st["tokens"] / st["step_time_s"] if st["step_time_s"] else None),
         memory=st["memory"], skipped=dict(nonfinite=st["nonfinite_total"], oom=st["oom_skips"]),
         cost=dict(dph=dph, usd=round(dph * elapsed / 3600, 2) if dph else None, note="trainer process time only"),
-        best=dict(greedy_cer_ratio_mean=best(cer_ratio), heldout_kl=best(lambda r: r.get("heldout_kl"))),
-        stopped_early=st["early_stop"]["triggered"],  # the `early_stop` event's fields; None: no early stop triggered
+        best=dict(greedy_cer_ratio_mean=best(cer_ratio),  # the gate sets, as heldout_kl (eval_record)
+                  greedy_cer_ratio_mean_all_sets=best(lambda r: cer_ratio(r, gate=False)),
+                  heldout_kl=best(lambda r: r.get("heldout_kl"))),
+        # the `early_stop` event's fields of a trigger that shortened the run ("stop", or a cooldown begun early); a
+        # trigger inside the scheduled cooldown (cooldown.already) changed nothing: only early_stop_trigger has it
+        stopped_early=trig if trig and not (trig.get("cooldown") or {}).get("already") else None,
+        early_stop_trigger=trig,  # every trigger; None: none
         history=hist, mini_history=st["mini_history"], checkpoints=dict(weights=st["weights"], full=st["fulls"]),
         config=R.cfg, **extra)
 

@@ -149,6 +149,11 @@ def test_verdict_trends_leave_out_the_untrained_step_0_eval():
     v = ev.verdict(dict(final=final((1.8, 2.0, 1.4)),
                         history=history([30, 1.9, 1.9], [4.87, 0.50, 0.45], [4.5, 0.45, 0.40], steps)))
     assert v["verdict"] == "NO-GO" and not v["trend"]["improving"], v["reasons"]
+    # ... and one with 2/3 sets within 1.5x is outside the tiers ('CER not improving'), not PROMISING
+    v = ev.verdict(dict(final=final((1.3, 1.4, 1.6)),
+                        history=history([30, 1.3, 1.3], [4.87, 0.50, 0.45], [4.5, 0.45, 0.40], steps)))
+    assert v["verdict"] == "INCONCLUSIVE" and not v["trend"]["improving"], v["reasons"]
+    assert v["trend"]["window_steps"] == [1126, 2252] and any("CER not improving" in r for r in v["reasons"])
     # a GO on the trained records stays GO whatever the step-0 numbers were
     for probe0 in (4.5, 5.75):
         v = ev.verdict(dict(final=final((1.1, 1.1, 1.15)),

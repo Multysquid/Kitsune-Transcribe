@@ -203,7 +203,7 @@ def _unit_run(m, tmp_path, sets: list[str]):
     R = m.Run(cfg=m.load_config(None, sets), run_dir=tmp_path, device=torch.device("cpu"), amp=False)
     evs, sc = [], []
     R.log = SimpleNamespace(event=lambda kind, **kw: evs.append(dict(kind=kind, **kw)),
-                            scalars=lambda values, step: sc.append((step, dict(values))))
+                            scalars=lambda values, step: sc.append((step, dict(values))), elapsed=lambda: 0.0)
     return R, evs, sc
 
 
@@ -266,8 +266,55 @@ def test_cooldown_action_moves_the_schedule_on_every_clock(tmp_path, monkeypatch
         kind="early_stop", reason="stop_file", action="stop", metric=None, at_step=3)
 
 
+def test_summary_best_step_and_stopped_early(tmp_path):
+    """summary.json's best.greedy_cer_ratio_mean pools the gate sets, as the verdict's trend and best.heldout_kl do: a
+    monitor-only hold-out (eval_emilia, galgame) improving while the gate sets drift cannot move its step (the all-sets
+    value is best.greedy_cer_ratio_mean_all_sets). stopped_early is a trigger that shortened the run; one inside the
+    scheduled cooldown (cooldown.already) left the run to its end and is only early_stop_trigger."""
+    m = load_script("04_distill")
+    from kitsune import evaluate as ev
+
+    teacher = dict(ev.TEACHER_CER_PREREG, eval_emilia=0.10, galgame=0.21)
+    sets = ["schedule.clock=steps", "schedule.max_steps=20", "schedule.cooldown_frac=0.3", "early_stop.enabled=true"]
+
+    def rec(step, gate, monitor):  # the student / teacher CER ratio on every gate set and on every monitor set
+        return dict(step=step, elapsed_s=float(step), heldout_kl=1.0,
+                    greedy={s: dict(cer_ref_corpus=(gate if s in ev.GATE_SETS else monitor) * t,
+                                    teacher_cer_ref_corpus=t, trunc_rate=0.0, n=500) for s, t in teacher.items()})
+
+    R, _, _ = _unit_run(m, tmp_path, sets)
+    R.st["history"] = [rec(0, 30.0, 20.0), rec(1126, 1.20, 1.60), rec(2252, 1.25, 1.30), rec(3378, 1.30, 1.10)]
+    s = m.make_summary(R, "complete")
+    best = s["best"]
+    assert best["greedy_cer_ratio_mean"] == dict(value=pytest.approx(1.20), step=1126)  # not the monitor sets' 3378
+    assert best["greedy_cer_ratio_mean_all_sets"] == dict(value=pytest.approx((3 * 1.30 + 2 * 1.10) / 5), step=3378)
+    assert s["stopped_early"] is None and s["early_stop_trigger"] is None
+    # no gate set evaluated: every set; a set without teacher rows (NaN teacher CER) drops out, not its whole record
+    R.st["history"] = [dict(r, greedy={k: d for k, d in r["greedy"].items() if k not in ev.GATE_SETS})
+                       for r in R.st["history"]]
+    R.st["history"][3]["greedy"]["galgame"]["teacher_cer_ref_corpus"] = float("nan")
+    assert m.make_summary(R, "complete")["best"]["greedy_cer_ratio_mean"] == dict(value=pytest.approx(1.10), step=3378)
+
+    # a trigger inside the scheduled cooldown (step 15 >= t_c 14 of 20) changes nothing: not stopped_early
+    R.st["step"] = 15
+    m.early_stop_trigger(R, "patience", "cooldown")
+    s = m.make_summary(R, "complete")
+    assert s["stopped_early"] is None and s["early_stop_trigger"]["cooldown"]["already"] is True
+    m.early_stop_trigger(R, "stop_file", "stop")  # a STOP file after it does end the run
+    s = m.make_summary(R, "complete")
+    assert s["stopped_early"]["reason"] == "stop_file" and s["stopped_early"]["previous"]["cooldown"]["already"]
+    # an early cooldown and a stop shorten the run
+    for step, action in ((7, "cooldown"), (15, "stop")):
+        R, evs, _ = _unit_run(m, tmp_path, sets)
+        R.st["step"] = step
+        m.early_stop_trigger(R, "patience", action)
+        s = m.make_summary(R, "complete")
+        assert s["stopped_early"] == s["early_stop_trigger"] == {k: v for k, v in evs[-1].items() if k != "kind"}
+
+
 def test_verdict_on_a_short_history():
-    """An early stop can leave very few eval records: verdict() must still return, with the trends unknown."""
+    """An early stop can leave very few eval records: verdict() must still return, with the trends unknown. The final
+    is within 1.2x on every set, yet step 0 plus one trained eval cannot certify a trend, so GO needs 2 trained evals."""
     from kitsune import evaluate as ev
 
     fin = dict(sets={s: dict(cer_ref_corpus=0.1, teacher_cer_ref_corpus=0.1, n=10, n_truncated=0, trunc_rate=0.0)
@@ -278,7 +325,7 @@ def test_verdict_on_a_short_history():
     for n in (0, 1, 2, 3):
         hist = [dict(rec, step=10 * i, heldout_kl=1.0 - 0.1 * i) for i in range(n)]
         v = ev.verdict(dict(final=fin, history=hist))
-        assert v["verdict"] in ("GO", "PROMISING", "NO-GO", "INCONCLUSIVE")
+        assert v["verdict"] == ("INCONCLUSIVE" if n < 3 else "GO"), (n, v["reasons"])
         assert v["trend"]["window_steps"] == [r["step"] for r in hist if r["step"] > 0]  # never the step-0 eval
         if n < 3:  # fewer than 2 records after step 0
             assert any("trend unknown" in r for r in v["reasons"]) and v["trend"]["gap_rel_change"] is None
