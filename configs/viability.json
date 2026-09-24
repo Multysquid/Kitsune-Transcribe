@@ -26,7 +26,7 @@
   "batch": {"step_audio_s": 1500, "micro_audio_s": 400, "pool_micro": 50, "max_dec_len": 200},
   "memory": {"grad_ckpt": "auto", "probe_longest_bucket": true, "min_micro_audio_s": 100, "max_oom_skips": 3},
   "perf": {"relpos_patch": true, "compile": false, "num_workers": "auto", "prefetch": 4, "tf32": true,
-           "peak_tflops": 312.0, "train_exact_dither": false},
+           "peak_tflops": 312.0, "train_exact_dither": false, "loader_timeout_s": 600},
   "eval": {"every_min": 20, "every_steps": null, "greedy_subset": 500, "probe": true, "final_full_greedy": true,
            "batch_s": 400, "check_baselines": true, "every_epochs": null, "probe_is_train": false,
            "probe_greedy_audio_s": 600, "full_every_epochs": 1,

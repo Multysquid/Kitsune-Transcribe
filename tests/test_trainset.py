@@ -426,7 +426,8 @@ def test_eval_batches():
 def test_loader_list_plan_in_process(train_store):
     ds = AudioBatchDataset(train_store)
     plan = StepPlanner(train_store.utts, step_audio_s=20, micro_audio_s=8, pool_micro=3, seed=1).epoch_plan(0)
-    got = list(make_loader(ds, plan, num_workers=0, start_step=2))
+    # timeout_s is for workers only: in-process loading (shm_cap can choose 0 workers) asserts a zero timeout
+    got = list(make_loader(ds, plan, num_workers=0, start_step=2, timeout_s=30))
     assert [k for k, _ in got] == list(range(2, len(plan)))
     for (k, mbs) in got:
         assert [m["ids"] for m in mbs] == [[train_store.utts[i].id for i in mb] for mb in plan[k]]
@@ -458,6 +459,39 @@ def test_loader_spawn_workers_across_epochs(train_store):
             for k in r:
                 if isinstance(r[k], torch.Tensor):
                     assert torch.equal(m[k], r[k]), k
+
+
+class _NoShm:
+    """Fails to pickle the way a full /dev/shm fails a worker's queue feeder (torch 2.14's message)."""
+
+    def __reduce__(self):
+        raise RuntimeError("unable to allocate shared memory(shm) for file </torch_1_2_3>: No space left on device "
+                           "(28)")
+
+
+class _FeederDropDataset(torch.utils.data.Dataset):
+    """Micro-batch [1] never reaches the trainer: the worker's feeder thread prints the error and drops it, and the
+    worker lives on (so the DataLoader sees no dead worker)."""
+
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, idx):
+        return dict(ids=list(idx), x=_NoShm() if list(idx) == [1] else 0)
+
+
+def test_loader_times_out_on_a_dropped_worker_batch():
+    """A worker micro-batch that never arrives raises "DataLoader timed out" after timeout_s instead of blocking the
+    trainer until the watchdog (the loader yields in order, so it would wait for that batch forever). The timeout
+    covers the first wait's spawn and imports too (8-11 s measured on the laptop)."""
+    loader = make_loader(_FeederDropDataset(), [[[0]], [[1]], [[2]]], num_workers=1, prefetch=2, timeout_s=30)
+    try:
+        key, mbs = next(loader)
+        assert key == 0 and mbs[0]["ids"] == [0]
+        with pytest.raises(RuntimeError, match="timed out"):
+            next(loader)
+    finally:
+        loader.close()
 
 
 # ---------------------------------------------------------------------------------------------------- real data

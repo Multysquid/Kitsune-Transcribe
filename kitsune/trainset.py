@@ -680,7 +680,7 @@ class _StepSampler:
 
 def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepPlanner", num_workers: int = 2,
                 prefetch: int = 4, *, start_step: int = 0, pin_memory: bool | None = None,
-                mp_context: str = "spawn") -> Iterator[tuple[object, list[dict]]]:
+                mp_context: str = "spawn", timeout_s: float = 0.0) -> Iterator[tuple[object, list[dict]]]:
     """Decode micro-batches in `num_workers` processes (`prefetch` micro-batches in flight per worker) and yield
     whole optimizer steps:
       plan = one epoch's list of steps    -> (step_idx, [micro-batch, ...]) for plan[start_step:]
@@ -689,6 +689,10 @@ def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepP
                                              worker-restart stall at epoch boundaries
     Workers use `spawn` on every OS, so Linux runs the same code path as the Windows smoke run. KITSUNE_SHARING
     (e.g. file_system), if set, becomes torch's sharing strategy in the main process and in the workers.
+    timeout_s > 0 (workers only; 0 = wait forever): a worker micro-batch that never arrives raises RuntimeError
+    "DataLoader timed out" after that many seconds instead of blocking the trainer for good. A full /dev/shm does not
+    kill the worker: its queue feeder prints "unable to allocate shared memory" and drops the micro-batch, and the
+    loader, which yields in order, would wait for it forever. It must cover the workers' start-up (the first wait).
     Closing the iterator (or dropping it) shuts the workers down."""
     if isinstance(plan, StepPlanner):
         steps = (((e, j), step) for e, j, step in plan.iter_steps())
@@ -704,6 +708,7 @@ def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepP
         dataset, batch_size=None, sampler=sampler, num_workers=num_workers, pin_memory=pin_memory,
         prefetch_factor=prefetch if num_workers > 0 else None, worker_init_fn=_worker_init if num_workers > 0 else None,
         multiprocessing_context=mp_context if num_workers > 0 else None, persistent_workers=False,
+        timeout=float(timeout_s) if num_workers > 0 else 0,  # in-process loading asserts timeout == 0
     )
 
     def gen():

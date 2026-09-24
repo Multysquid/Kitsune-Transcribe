@@ -265,7 +265,8 @@ def test_overfit_configs_resolve():
         assert not c["smoke"]["require_loss_decrease"] and c["ckpt"]["full_after_smoke"]
     for bad in (["schedule.clock=epochs"], ["schedule.clock=epochs", "schedule.epochs=0"], ["optim.offload=gpu"],
                 ["subset.train_audio_s=5", "subset.train_utts=10"], ["subset.eval_audio_s=-1"],
-                ["eval.every_epochs=0"], ["eval.probe=false", "eval.probe_is_train=true"], ["specaug.enabled=0"]):
+                ["eval.every_epochs=0"], ["eval.probe=false", "eval.probe_is_train=true"], ["specaug.enabled=0"],
+                ["perf.loader_timeout_s=-1"], ["perf.loader_timeout_s=10m"]):
         with pytest.raises(SystemExit):
             m.load_config(None, bad)
     via = m.load_config(str(ROOT / "configs" / "viability.json"), [])

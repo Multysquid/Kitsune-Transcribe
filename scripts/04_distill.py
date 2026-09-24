@@ -195,8 +195,10 @@ DEFAULTS = {
                  "end_reserve_min": 30, "epochs": None},
     "batch": {"step_audio_s": 1500, "micro_audio_s": 400, "pool_micro": 50, "max_dec_len": 200},
     "memory": {"grad_ckpt": "auto", "probe_longest_bucket": True, "min_micro_audio_s": 100, "max_oom_skips": 3},
+    # loader_timeout_s: seconds the loop waits for a worker micro-batch before it raises (a crash the supervisor can
+    # resume) instead of hanging until the watchdog; 0 = wait forever (trainset.make_loader)
     "perf": {"relpos_patch": True, "compile": False, "num_workers": "auto", "prefetch": 4, "tf32": True,
-             "peak_tflops": 312.0, "train_exact_dither": False},
+             "peak_tflops": 312.0, "train_exact_dither": False, "loader_timeout_s": 600},
     # every_epochs: eval at the end of every N-th epoch instead of every_min / every_steps. full_every_epochs: the
     # same, but each of those evals decodes the COMPLETE eval sets greedily (as the final eval does) instead of the
     # greedy subset; set one of the two. probe_is_train: the probe is the whole train set (a small subset) rather than
@@ -300,6 +302,9 @@ def validate(cfg: dict):
         raise SystemExit(f"optim.offload must be 'none' or 'cpu', got {cfg['optim']['offload']}")
     if not isinstance(cfg["specaug"]["enabled"], bool):
         raise SystemExit(f"specaug.enabled must be true or false, got {cfg['specaug']['enabled']}")
+    if not (_number(cfg["perf"]["loader_timeout_s"]) and cfg["perf"]["loader_timeout_s"] >= 0):
+        raise SystemExit(f"perf.loader_timeout_s must be a number of seconds >= 0 (0: no timeout), got "
+                         f"{cfg['perf']['loader_timeout_s']}")
     for a, b in (("train_audio_s", "train_utts"), ("eval_audio_s", "eval_utts_per_set")):
         if sub[a] is not None and sub[b]:
             raise SystemExit(f"subset.{a} and subset.{b} are two ways to pick the same subset: set one")
@@ -451,10 +456,13 @@ def deadline_unix() -> float | None:
 
 def shm_cap(nw: int, prefetch: int, micro_audio_s: float, shm: str = "/dev/shm") -> tuple[int, int, dict | None]:
     """Fit the DataLoader's in-flight micro-batches into /dev/shm (Linux). Worker tensors reach the trainer through
-    shared memory under every sharing strategy (file_system shm_opens too, so KITSUNE_SHARING does not help), and a
-    container left with Docker's 64 MB dies with a bus error at the first step. Up to num_workers * prefetch
-    micro-batches of up to micro_audio_s padded float32 audio are in flight: keep them within half the free space by
-    prefetching less, then using fewer workers, then decoding in-process. Returns (workers, prefetch, change or None)."""
+    shared memory under every sharing strategy (file_system shm_opens too, so KITSUNE_SHARING does not help). An
+    overflow (a container left with Docker's 64 MB) does not crash: the worker prints "unable to allocate shared
+    memory(shm) ... (28)" and drops that micro-batch, and the loader would wait for it forever; perf.loader_timeout_s
+    turns that stall into a crash vast/supervise.py can resume. Up to num_workers * prefetch micro-batches of up to
+    micro_audio_s padded float32 audio are in flight: keep them within half the free space (measured once, at loop
+    start) by prefetching less, then using fewer workers, then decoding in-process. Returns (workers, prefetch, change
+    or None)."""
     if nw <= 0 or not os.path.isdir(shm):
         return nw, prefetch, None
     try:
@@ -2353,7 +2361,7 @@ def loop(R: Run):
     fit_budget(R)
     log.event("phase", name="train", at_step=R.st["step"], workers=nw, micro_audio_s=R.planner.micro_audio_s,
               grad_ckpt=R.st["memory"].get("grad_ckpt"))
-    loader = trainset.make_loader(R.ds, R.planner, nw, prefetch)
+    loader = trainset.make_loader(R.ds, R.planner, nw, prefetch, timeout_s=float(cfg["perf"]["loader_timeout_s"]))
     R.loop_t0 = time.monotonic()
     epoch_seen = R.st["epoch"] if R.st["step"] else -1
     try:

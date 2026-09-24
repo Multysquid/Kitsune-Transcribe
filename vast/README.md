@@ -133,7 +133,9 @@ The trainer checks for the file before every optimizer step: the step under way 
 checkpoints, if due), then the normal end phase runs - final weights and full state, final eval (an epoch-end full
 eval of that same step is reused, not decoded again), verdict, summary, uploads - and it exits 0, so the box verifies the upload and destroys itself as after a full run (`early_stop` event
 with reason `stop_file`). Killing the trainer instead counts as a crash (resumed once, or the box is stopped; see below)
-and skips the final eval.
+and skips the final eval. A trainer stuck waiting for its data loader (`kitsune.log` shows `unable to allocate shared
+memory` and no new steps) never reaches the STOP check, but it gives up after `perf.loader_timeout_s` (10 min) and
+exits as a crash.
 
 ## Where the results land
 
