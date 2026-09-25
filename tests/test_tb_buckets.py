@@ -401,12 +401,14 @@ def old_purge_step(self, resume, first):
 
 
 def make_run(path: Path, *, flat: bool | str = False, monkeypatch=None, summary: dict | None = None,
-             first_start: bool | None = None) -> Path:
+             first_start: bool | None = None, combined: bool = False) -> Path:
     """A run with a resume from step 3 (steps 4-5 logged twice), histograms, text, an unmapped tag. flat=True logs the
     way the logger did before the buckets (logged tags in TensorBoard, no tag_map.json); flat="first" only the first
     launch, so the resume with the bucketed logger mixes both layouts in tb/. first_start=False (the default of a flat
     run, which is older still) opens the first launch's event file without the SessionLog.START at step 0, as every
-    logger did before RunLogger._tb_purge_step."""
+    logger did before RunLogger._tb_purge_step. combined=True also logs the combined-loss chart's train curve
+    (combined_loss/train) at every step, as the trainer does since the combined loss; without it the run is one logged
+    before that, as far as the chart goes."""
     old = not (first_start if first_start is not None else not flat)
     with monkeypatch.context() if flat or old else contextlib.nullcontext() as mp:
         if flat:
@@ -417,7 +419,8 @@ def make_run(path: Path, *, flat: bool | str = False, monkeypatch=None, summary:
         log = RunLogger(path, CFG, sync_every_min=60, capture=False, tee=False)
         state = None
         for s in range(1, 6):
-            log.step_row({"loss/kl": 1.0 / s, "opt/lr": 1e-3 * s, "layers/grad_norm/enc0": 0.1 * s, "weird": 2.0}, s)
+            log.step_row({"loss/kl": 1.0 / s, "opt/lr": 1e-3 * s, "layers/grad_norm/enc0": 0.1 * s, "weird": 2.0,
+                          **({"combined_loss/train": 1.5 / s} if combined else {})}, s)
             log.hist("weight/enc0", torch.randn(1000, generator=g), s)
             if s == 3:
                 state = log.state_dict()
@@ -428,7 +431,8 @@ def make_run(path: Path, *, flat: bool | str = False, monkeypatch=None, summary:
         time.sleep(0.05)
         log = RunLogger(path, CFG, sync_every_min=60, capture=False, tee=False, resume=state)
         for s in range(4, 7):
-            log.step_row({"loss/kl": 10.0 / s, "opt/lr": 1e-3 * s, "layers/grad_norm/enc0": 1.0 * s, "weird": 3.0}, s)
+            log.step_row({"loss/kl": 10.0 / s, "opt/lr": 1e-3 * s, "layers/grad_norm/enc0": 1.0 * s, "weird": 3.0,
+                          **({"combined_loss/train": 15.0 / s} if combined else {})}, s)
             log.hist("weight/enc0", torch.randn(1000, generator=g), s)
         log.samples(6, [dict(id="a", cer_ref=0.5, cer_teacher=0.5, ref="あい", teacher_hyp="あい", hyp="あう")])
         log.close(summary=summary if summary is not None else {"status": "complete"})
@@ -446,12 +450,13 @@ def test_regroup_a_flat_run(tmp_path, monkeypatch, capsys):
     assert rg.main([str(run)]) == 0
     out = capsys.readouterr().out
     assert "2_loss_accuracy" in out and "1 resume purge" in out and "scalars:weird" in out
-    assert "Custom Scalars charts: combined_loss: train vs val" in out
+    # logged before the combined loss (no combined_loss/* tag): no combined-loss chart, which would stay empty
+    assert "Custom Scalars charts: none (the run logged none of their curves)" in out
 
     files = sorted(p.name for p in (run / "tb").iterdir())
     assert [f for f in files if "tfevents" in f and f.endswith(".regrouped")] and len(files) == len(originals) + 1
     (rebuilt,) = [run / "tb" / f for f in files if f.endswith(".regrouped")]
-    assert tb_layouts(rebuilt) == [(0, layout_as_written())]  # the chart, once, ahead of every record
+    assert tb_layouts(rebuilt) == []
     assert sorted(f for f in files if f.endswith(".bak")) == sorted(rg.backup_name(f) for f in originals)
     assert not any("tfevents" in f for f in files if f.endswith(".bak"))  # TensorBoard skips them
     after = tb_view(run)
@@ -500,19 +505,50 @@ def test_regroup_a_bucketed_run_changes_nothing_visible(tmp_path):
 def test_every_launch_writes_the_chart_and_regroup_keeps_it(tmp_path):
     """The logger writes TB_LAYOUT into its event file once per launch (the resume opens a second file, with a purge of
     the steps after the restored one: the chart at step 0 survives it); TensorBoard's Custom Scalars tab finds it in
-    the run, and a rebuild by regroup_tb writes it into its one file again. The export's tables leave it out."""
+    the run, and a rebuild by regroup_tb of a run that logged a combined-loss curve writes it into its one file again.
+    The export's tables leave it out."""
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-    run = make_run(tmp_path / "runs" / "chart")
+    run = make_run(tmp_path / "runs" / "chart", combined=True)
     files = sorted(p for p in (run / "tb").iterdir() if "tfevents" in p.name)
     assert len(files) == 2 and all(tb_layouts(f) == [(0, layout_as_written())] for f in files)
     acc = EventAccumulator(str(run / "tb"))
     acc.Reload()
     assert LAYOUT_TAG in acc.Tags()["tensors"] and acc.Tensors(LAYOUT_TAG)[0].step == 0
     assert not any(LAYOUT_TAG in set(df["tag"]) for df in tb_view(run).values())
-    load_tool("regroup_tb").regroup(run)
+    res = load_tool("regroup_tb").regroup(run)
     (rebuilt,) = [p for p in (run / "tb").iterdir() if p.name.endswith(".regrouped")]
+    assert tb_layouts(rebuilt) == [(0, layout_as_written())] and res["charts"] == ["combined_loss: train vs val"]
+
+
+def test_regroup_writes_the_chart_only_for_a_run_that_logged_its_curves(tmp_path, capsys):
+    """Decision 8.18 (show it only if logged): a run logged before the combined loss has no combined_loss/* tag, so
+    regroup_tb leaves the combined-loss chart out of the rebuilt file - it would stay empty - though the run's own
+    event files carry it (every launch of the logger writes it, before any tag is known: a new run is unchanged). One
+    combined-loss curve is enough for the whole chart; drawn_layout picks the charts by the bucketed tags their
+    regexes match."""
+    rg = load_tool("regroup_tb")
+    old = make_run(tmp_path / "runs" / "old")
+    assert all(tb_layouts(f) == [(0, layout_as_written())] for f in (old / "tb").glob("*tfevents*"))
+    assert rg.main([str(old)]) == 0
+    assert "Custom Scalars charts: none (the run logged none of their curves)" in capsys.readouterr().out
+    (rebuilt,) = (old / "tb").glob("*.regrouped")
+    assert tb_layouts(rebuilt) == []
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    acc = EventAccumulator(str(old / "tb"))
+    acc.Reload()
+    assert LAYOUT_TAG not in acc.Tags()["tensors"]  # the originals' copies went with them into the .bak files
+
+    new = make_run(tmp_path / "runs" / "new", combined=True)
+    assert rg.main([str(new)]) == 0
+    assert "Custom Scalars charts: combined_loss: train vs val" in capsys.readouterr().out
+    (rebuilt,) = (new / "tb").glob("*.regrouped")
     assert tb_layouts(rebuilt) == [(0, layout_as_written())]
+
+    assert rg.drawn_layout([]) == {} and rg.drawn_layout(["loss/kl", "loss/objective", "summary/full/val_cer"]) == {}
+    for tag in COMBINED_LOSS_TAGS:
+        assert rg.drawn_layout(["loss/kl", tag]) == TB_LAYOUT, tag
 
 
 def starts(tb_file) -> list[int]:
@@ -756,10 +792,10 @@ def test_resume_into_a_flat_run_warns_once_and_regroup_unifies_it(tmp_path, monk
     rg.regroup(run)
     acc = EventAccumulator(str(run / "tb"))
     acc.Reload()
-    # every tag bucketed; besides them only the Custom Scalars layout, under TensorBoard's own fixed tag
-    assert all(t.split("/", 1)[0] in TB_BUCKETS for k in ("scalars", "histograms", "tensors") for t in acc.Tags()[k]
-               if t != LAYOUT_TAG)
-    assert LAYOUT_TAG in acc.Tags()["tensors"]
+    # every tag bucketed; no Custom Scalars layout (TensorBoard's own fixed tag): the resumed launch's logger wrote the
+    # combined-loss chart, but the run logged none of its curves
+    assert all(t.split("/", 1)[0] in TB_BUCKETS for k in ("scalars", "histograms", "tensors") for t in acc.Tags()[k])
+    assert LAYOUT_TAG not in acc.Tags()["tensors"]
     after = tb_view(run)
     for k in before:
         assert before[k].equals(after[k]), k
@@ -783,3 +819,29 @@ def test_export_without_tag_map_gives_back_the_logged_tags(tmp_path):
     assert not any(without[k]["tag"].str.match(r"\d_").any() for k in ("tb_scalars", "tb_histograms", "tb_text"))
     assert without["tag_map"].equals(with_map["tag_map"])
     assert not (tmp_path / "without" / "tag_map.json").exists()
+
+
+def test_export_describes_the_combined_loss_only_when_logged(tmp_path):
+    """Decision 8.18 (show it only if logged): the export writes the combined_loss table, and the README's text on the
+    overall loss chart (00_combined/, its Custom Scalars chart, the table), only for a run that logged a combined-loss
+    curve. A run logged before the combined loss gets neither, the rest of its README as before; a new run's README
+    keeps the text where it was."""
+    exp = load_tool("export_run")
+    old = exp.export(str(make_run(tmp_path / "runs" / "old")), tmp_path / "old")
+    new = exp.export(str(make_run(tmp_path / "runs" / "new", combined=True)), tmp_path / "new")
+    assert "combined_loss" not in old and not list((tmp_path / "old").glob("combined_loss.*"))
+    cl = new["combined_loss"]
+    assert set(cl["series"]) == {"train"} and cl["step"].tolist() == [1, 2, 3, 4, 5, 6]
+    # the first launch's steps 4-5 left out, as TensorBoard's purge drops them
+    assert cl["value"].tolist() == pytest.approx([1.5, 1.5 / 2, 1.5 / 3, 15 / 4, 15 / 5, 15 / 6])
+    assert (tmp_path / "new" / "combined_loss.parquet").is_file() and (tmp_path / "new" / "combined_loss.csv").is_file()
+    r_old = (tmp_path / "old" / "README.md").read_text(encoding="utf-8")
+    r_new = (tmp_path / "new" / "README.md").read_text(encoding="utf-8")
+    for phrase in ("00_combined", "combined_loss: train vs val", "the `combined_loss` table holds",
+                   "## `combined_loss.parquet`", "combined_loss/train"):
+        assert phrase not in r_old and phrase in r_new, phrase
+    assert "`2_loss_accuracy/` (first `00_summary/full/` and `00_summary/mini/`: every eval's headline numbers" in r_old
+    assert ("`2_loss_accuracy/` (first `00_combined/`: the training objective w_kl * KL + w_ce * CE per step "
+            "(`train`)") in r_new
+    assert ("overlays and the `combined_loss` table holds; then `00_summary/full/` and `00_summary/mini/`: every "
+            "eval's headline numbers") in r_new
