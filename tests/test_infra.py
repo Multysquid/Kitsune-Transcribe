@@ -1901,16 +1901,22 @@ def test_second_opinion_mirror_pins_match_01(prep):
 
 def test_student_build_reads_the_teacher_commit_the_targets_and_the_card_name():
     """03 keeps its own copy of the teacher pin: the student's init weights, tokenizer and processor must come from the
-    commit 02 computed the targets from, and the model card copied into every checkpoint names that commit."""
+    commit 02 computed the targets from, and the model card copied into every checkpoint names that commit. Any other
+    commit the card cites is a pinned dataset revision of 01_prepare_data (the Galgame card it links)."""
     import ast
 
-    tree = ast.parse((ROOT / "scripts" / "02_teacher_pass.py").read_text(encoding="utf-8"))  # no torch import
-    pin02 = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
-                 and any(isinstance(t, ast.Name) and t.id == "MODEL_REVISION" for t in n.targets))
+    def assigned(script: str, name: str):
+        tree = ast.parse((ROOT / "scripts" / script).read_text(encoding="utf-8"))  # no torch import
+        return next(n.value for n in tree.body if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == name for t in n.targets))
+
+    pin02 = assigned("02_teacher_pass.py", "MODEL_REVISION").value
+    data_pins = {v.value for v in assigned("01_prepare_data.py", "REVISIONS").values}
     build = load_path("build_student_03", ROOT / "scripts" / "03_build_student.py")
-    card = re.findall(r"\b[0-9a-f]{40}\b", (ROOT / "MODEL_CARD.md").read_text(encoding="utf-8"))
+    card = set(re.findall(r"\b[0-9a-f]{40}\b", (ROOT / "MODEL_CARD.md").read_text(encoding="utf-8")))
     assert re.fullmatch(r"[0-9a-f]{40}", pin02)
-    assert build.TEACHER_REVISION == pin02 and set(card) == {pin02}, (build.TEACHER_REVISION, pin02, card)
+    assert build.TEACHER_REVISION == pin02 and pin02 in card and card - {pin02} <= data_pins, (
+        build.TEACHER_REVISION, pin02, card - data_pins)
     assert build.parse_args([]).teacher_revision == pin02
 
 

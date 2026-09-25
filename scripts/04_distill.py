@@ -207,11 +207,12 @@ DEFAULTS = {
     "sources": ["reazon_small", "emilia_yodas", "galgame"],
     "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia", "galgame"], "mix": "natural",
     # how the selection is built from sources / eval_sets: make_selection.py's --agree-max, --agree-max-source
-    # (SOURCE=A, as that flag takes it: a list, so a config replaces it whole) and --filter-eval-sets. Read by
-    # scripts/make_selection.py --config and checked by vast/launch.py against the selection's own record; not by the
-    # trainer
+    # (SOURCE=A, as that flag takes it: a list, so a config replaces it whole), --filter-eval-sets and
+    # --partial-second-opinion (sources that train on their judged shards only, by decision: galgame for the viability
+    # run, whose 02b pass the laptop GPU could not finish). Read by scripts/make_selection.py --config and checked by
+    # vast/launch.py against the selection's own record; not by the trainer
     "selection_recipe": {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "eval_emilia=0.2"],
-                         "filter_eval_sets": ["eval_emilia", "galgame"]},
+                         "filter_eval_sets": ["eval_emilia", "galgame"], "partial_second_opinion": ["galgame"]},
     # smoke runs: seeded id subsets, small caches. *_audio_s: seeded subsets of about that many seconds of audio
     # (audio_subset; the overfit runs), the eval one pooled over eval_sets and decoded greedily in full at every eval
     "subset": {"train_utts": None, "eval_utts_per_set": None, "train_audio_s": None, "eval_audio_s": None},
