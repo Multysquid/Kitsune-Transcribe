@@ -39,11 +39,17 @@ after the label box has deleted labelled audio. For that box: --max-inputs takes
 files, --whisper-dir keeps the ReazonSpeech mirrors' whisper transcripts while each file is local, --hold-file pauses
 before the next download while the file exists, and --heartbeat is touched while the ingest makes progress.
 
+--extent-config CFG ingests the extent of a run config (its extent block, sources and eval_sets) in the canonical order
+of kitsune/extent.py, in this one process: the label box and the A100 rebuild run exactly that call, so they get the
+same ids and stems (the order changes ids: reazon_small before reazon_large, Emilia as 300 h -> eval_emilia -> the
+rest). It replaces --sources and the per-source flags, and <data>/extent_progress.json records the finished steps.
+
 Usage:
   python scripts/01_prepare_data.py --sources reazon_small galgame eval --galgame-shards 6
   python scripts/01_prepare_data.py --sources eval_cv8 --limit-rows 64      # smoke run -> writes to data_smoke/
   python scripts/01_prepare_data.py --data /workspace/Kitsune-Transcribe/data --sources reazon_small eval   # vast box
   python scripts/01_prepare_data.py --sources reazon_large emilia_nc --max-inputs reazon_large=40,emilia_nc=6
+  python scripts/01_prepare_data.py --data /workspace/Kitsune-Transcribe/data --extent-config configs/full.json
 """
 import argparse
 import csv
@@ -63,6 +69,7 @@ import pyarrow.parquet as pq  # noqa: E402
 from huggingface_hub import HfApi, hf_hub_download  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
+from kitsune import extent  # noqa: E402
 from kitsune.audio import audio_info  # noqa: E402
 from kitsune.store import (  # noqa: E402
     ShardWriter, fsync_path, iter_rows, load_progress, lock_data_root, read_ids, read_manifest, remove_source,
@@ -113,6 +120,7 @@ HOLD_POLL_S = 15  # --hold-file poll interval
 HEARTBEAT_ROWS = 1000  # touch --heartbeat every this many kept rows (one input can take minutes)
 # sources whose upstream files have a sorted listing that --max-inputs can cut (galgame: the same as --galgame-shards)
 MAX_INPUT_SOURCES = (*HF_PARQUET_SOURCES, "galgame", "emilia_yodas", "emilia_nc")
+REFUSED_EXIT = 3  # an --extent-config that is no valid extent: vast/bootstrap.sh's retry() does not repeat exit 3
 
 
 class Ingest:
@@ -203,8 +211,9 @@ class Ingest:
                              f"stopping before {filename}")
         self.beat()
         local = Path(hf_hub_download(repo, filename, repo_type="dataset", revision=REVISIONS[repo], cache_dir=self.raw))
-        if local.is_file():  # recorded for the extent record; saved with the next progress write
+        if local.is_file():  # for the extent record; saved now, as a kill before finish_input would lose it
             self.progress.setdefault("input_bytes", {})[filename] = local.stat().st_size
+            save_progress(self.root, self.source, self.progress)
         return local
 
     @staticmethod
@@ -544,6 +553,79 @@ def ingest_common_voice(ing: Ingest):
     ing.done()
 
 
+def source_repo(source: str) -> str | None:
+    """The upstream repo a source is read from (None: cv, a manual download)."""
+    if source in HF_PARQUET_SOURCES:
+        return HF_PARQUET_SOURCES[source][0]
+    return {"galgame": GALGAME_REPO, "emilia_yodas": EMILIA_REPO, "eval_emilia": EMILIA_REPO,
+            "emilia_nc": EMOLIA_REPO}.get(source)
+
+
+def ingest_source(ing: Ingest, cap: int | None, whisper_dir: Path | None = None, emilia_hours: float = 300.0,
+                  emilia_nc_hours: float = float("inf")):
+    """Ingest ing.source. `cap`: only its first N sorted upstream files (galgame: its tars); None: all of them."""
+    s = ing.source
+    if s in HF_PARQUET_SOURCES:
+        ingest_hf_parquet(ing, *HF_PARQUET_SOURCES[s], max_inputs=cap, whisper_dir=whisper_dir)
+    elif s == "galgame":
+        ingest_galgame(ing, cap)
+    elif s == "emilia_yodas":
+        ingest_emilia(ing, emilia_hours, max_inputs=cap)
+    elif s == "eval_emilia":
+        ingest_emilia_eval(ing, EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS)
+    elif s == "emilia_nc":
+        ingest_emilia_nc(ing, emilia_nc_hours, max_inputs=cap)
+    elif s == "cv":
+        ingest_common_voice(ing)
+
+
+def load_extent_config(path: Path) -> dict:
+    """The run config of --extent-config (a relative path not found here is taken from the checkout, as
+    make_selection.py --config does). One that is no valid extent exits REFUSED_EXIT: a retry cannot fix it."""
+    p = Path(path)
+    try:
+        cfg = json.loads((p if p.is_absolute() or p.exists() else ROOT / p).read_text(encoding="utf-8"))
+        problems = extent.validate(cfg) if isinstance(cfg, dict) else ["not a JSON object"]
+    except (OSError, ValueError) as e:
+        problems = [f"{type(e).__name__}: {e}"]
+    if problems:
+        print(f"{path}: not an extent config: {'; '.join(problems)}", file=sys.stderr)
+        sys.exit(REFUSED_EXIT)
+    return cfg
+
+
+def ingest_extent(root: Path, raw: Path, cfg: dict, config: Path, whisper_dir: Path | None = None,
+                  heartbeat: Path | None = None, hold_file: Path | None = None):
+    """The extent of the (valid) run config `cfg`, step by step in the canonical order (kitsune.extent.plan_steps), each
+    step an ingest of its source under the step's key, cap and Emilia budget. After each step
+    <root>/extent_progress.json lists it as completed, and a re-run skips it. Re-running a step is idempotent anyway
+    (finished inputs are skipped, the 300 h step stops at once at its budget, eval_emilia returns early), so progress
+    recorded for another plan (other caps or names) is dropped and every step of this one runs again."""
+    plan = extent.plan_steps(cfg)
+    steps = [[s.key, cap] for s, cap in plan]
+    prev = extent.read_progress(root) or {}
+    same = prev.get("canonical_version") == extent.CANONICAL_VERSION and prev.get("steps") == steps
+    completed = list(prev.get("completed", [])) if same else []
+    if prev.get("completed") and not same:
+        print(f"  {extent.PROGRESS_FILE} records another plan ({prev.get('steps')}); every step runs again")
+    repos = {s.source: source_repo(s.source) for s, _ in plan}
+    progress = dict(canonical_version=extent.CANONICAL_VERSION, config=str(config), extent=extent.extent_block(cfg),
+                    steps=steps, completed=completed, repos=repos,
+                    revisions={r: REVISIONS[r] for r in dict.fromkeys(repos.values()) if r}, tools=extent.tools())
+    extent.write_progress(root, progress)
+    name = cfg["extent"]["name"]
+    for step, cap in plan:
+        if step.key in completed:
+            print(f"== {name}: {step.key} already complete")
+            continue
+        print(f"== {name}: {step.key}" + (f" (the first {cap} inputs)" if cap is not None else ""))
+        ing = Ingest(root, raw, step.source, None, step=step.key, heartbeat=heartbeat, hold_file=hold_file)
+        ingest_source(ing, cap, whisper_dir=whisper_dir, emilia_hours=step.emilia_hours)
+        completed.append(step.key)
+        extent.write_progress(root, progress)
+    print(f"== {name}: all {len(plan)} steps complete")
+
+
 def parse_max_inputs(spec: str) -> dict[str, int]:
     """'reazon_large=40,emilia_nc=6' -> {source: N}. Comma-separated with no spaces, so that it passes the vast env."""
     out: dict[str, int] = {}
@@ -560,11 +642,14 @@ def main():
     global MIN_FREE_GB
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default=None, help=f"data root (default: {ROOT / 'data'}, or data_smoke with --limit-rows)")
-    ap.add_argument("--sources", nargs="+", default=["reazon_small", "galgame", "eval"], choices=ALL_SOURCES)
+    ap.add_argument("--sources", nargs="+", default=None, choices=ALL_SOURCES,
+                    help="sources to ingest, in this order (default: reazon_small galgame eval)")
     ap.add_argument("--galgame-shards", type=int, default=None, help="number of 0.88 GB tars (~47 h each) to take "
                     "(default 6; the same as --max-inputs galgame=N)")
-    ap.add_argument("--emilia-hours", type=float, default=300.0, help="kept hours of Emilia-YODAS JA to ingest (~1 GB tar per 36-73 h)")
-    ap.add_argument("--emilia-nc-hours", type=float, default=float("inf"), help="kept hours of Emilia non-YODAS JA (CC BY-NC)")
+    ap.add_argument("--emilia-hours", type=float, default=None,
+                    help="kept hours of Emilia-YODAS JA to ingest (default 300; ~1 GB tar per 36-73 h)")
+    ap.add_argument("--emilia-nc-hours", type=float, default=None,
+                    help="kept hours of Emilia non-YODAS JA (CC BY-NC; default: all)")
     ap.add_argument("--max-inputs", type=parse_max_inputs, action="append", default=None, metavar="SRC=N[,SRC=N]",
                     help="take only the first N of a source's sorted upstream files (parquet sources, galgame, "
                          "emilia_yodas, emilia_nc); may be repeated, each SRC once")
@@ -577,7 +662,22 @@ def main():
     ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB, help="stop before a download would leave less free")
     ap.add_argument("--limit-rows", type=int, default=None, help="debug: stop each source after N kept rows (galgame hold-out exempt)")
     ap.add_argument("--force", action="store_true", help="wipe and re-ingest sources that are already present")
+    ap.add_argument("--extent-config", type=Path, default=None, metavar="CFG",
+                    help="ingest the extent of run config CFG (extent block, sources, eval_sets) in the canonical "
+                         "order of kitsune/extent.py, as the label box and the A100 rebuild do; replaces --sources "
+                         "and the per-source flags")
     args = ap.parse_args()
+    cfg = None
+    if args.extent_config is not None:
+        # the config alone decides what is ingested: a flag next to it would silently give other ids or stems
+        given = [flag for flag, v in (("--sources", args.sources), ("--galgame-shards", args.galgame_shards),
+                                      ("--emilia-hours", args.emilia_hours),
+                                      ("--emilia-nc-hours", args.emilia_nc_hours), ("--max-inputs", args.max_inputs),
+                                      ("--limit-rows", args.limit_rows), ("--force", args.force or None))
+                 if v is not None]
+        if given:
+            ap.error(f"--extent-config defines the sources and their caps; drop {', '.join(given)}")
+        cfg = load_extent_config(args.extent_config)
     max_inputs: dict[str, int] = {}
     for caps in args.max_inputs or []:  # a repeated flag adds to the caps; it must never silently drop one
         if twice := sorted(caps.keys() & max_inputs.keys()):
@@ -598,8 +698,8 @@ def main():
                          "wait for it to finish")
     print(f"data root: {root}")
 
-    todo = []
-    for s in args.sources:
+    todo, sources = [], args.sources or ["reazon_small", "galgame", "eval"]
+    for s in [] if cfg is not None else sources:  # --extent-config: ingest_extent below
         todo += ["eval_jsut", "eval_cv8", "eval_reazon"] if s == "eval" else [s]
     for s in todo:
         if args.force:
@@ -609,19 +709,12 @@ def main():
         if prog["finished_inputs"]:
             print(f"  {s}: resuming, {len(prog['finished_inputs'])} input files already done")
         ing = Ingest(root, raw, s, args.limit_rows, heartbeat=args.heartbeat, hold_file=args.hold_file)
-        cap = max_inputs.get(s)
-        if s in HF_PARQUET_SOURCES:
-            ingest_hf_parquet(ing, *HF_PARQUET_SOURCES[s], max_inputs=cap, whisper_dir=args.whisper_dir)
-        elif s == "galgame":
-            ingest_galgame(ing, galgame_shards)
-        elif s == "emilia_yodas":
-            ingest_emilia(ing, args.emilia_hours, max_inputs=cap)
-        elif s == "eval_emilia":
-            ingest_emilia_eval(ing, EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS)
-        elif s == "emilia_nc":
-            ingest_emilia_nc(ing, args.emilia_nc_hours, max_inputs=cap)
-        elif s == "cv":
-            ingest_common_voice(ing)
+        ingest_source(ing, galgame_shards if s == "galgame" else max_inputs.get(s), whisper_dir=args.whisper_dir,
+                      emilia_hours=300.0 if args.emilia_hours is None else args.emilia_hours,
+                      emilia_nc_hours=float("inf") if args.emilia_nc_hours is None else args.emilia_nc_hours)
+    if cfg is not None:
+        ingest_extent(root, raw, cfg, args.extent_config, whisper_dir=args.whisper_dir, heartbeat=args.heartbeat,
+                      hold_file=args.hold_file)
 
     print("\n== manifest ==")
     by = {}
