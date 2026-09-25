@@ -439,7 +439,8 @@ python scripts/make_selection.py --config configs/<new>.json \
 ```
 Upload that one parquet (a new file under `labels/full/selections/`) and launch the A100 run with that config after
 the upload, so it pins the new head. The A100 box rebuilds only that subset's audio through the same canonical ingest
-order (`01_prepare_data.py --extent-config`), pulls only its label files (never `parakeet_out`), and requires the
+order (`01_prepare_data.py --extent-config`), pulls only its label files (`parakeet_out` only for a CTC student,
+`"family": "ctc"`, or with `"pull_parakeet": true`: `kitsune.extent.pull_plan`), and requires the
 rebuilt shards' ids to match `extent.json` exactly. `launch.py` sizes the disk, the rebuild timeout and the cap from
 the record:
 
@@ -449,6 +450,30 @@ the record:
 | `configs/full_sub3k.json` | ~163 GB | ~500 GB | ~2.2 h |
 
 The subset is the practical path for the remaining budget.
+
+### The size study's selection and pre-registration
+
+The size study trains every student of both families on one frozen 1,000 h list, built once on the laptop CPU from
+the sealed root (`study/data.json` is its data block; every study run config carries those keys verbatim):
+```bash
+python scripts/make_selection.py --config study/data.json --skip-audio-check   # labels/full pulled to the repo root
+python -m kitsune.prereg --write study/ --sidecar labels/full/selections/study_1000h.json   # the pre-launch commit
+```
+The selection's `selection_recipe.study` block adds, after the label box's judges (F0), the rules `not_in_parakeet`
+(rows in both label roots only), `f1a_disagree` (CER of the Cohere vs Parakeet TDT hypotheses > 0.5), `eval_dup` (a
+reference or Cohere hypothesis equal to an eval reference of >= 15 characters), `ctc_infeasible` and `not_drawn` (a
+seeded 3,600,000 s draw pooled over the sources; `keep` = drawn). Eval sets keep every row present in both roots.
+Next to `study_1000h.parquet` it writes, with no timestamp (a rebuild gives the same bytes), `study_1000h.json`
+(hours per source after each rule, the draw, `ids_sha256` of the train list, the probe and each eval set, the Galgame
+views, the teachers' baselines on the manifest rows and, per capped source, the pool had it been capped at N: the
+reazon_large cap is the smallest N whose pool holds >= 1,010 h) and `study_manifest.json` (per eval set the ordered ids
+and their sha256; the Galgame views `neutral` from the laptop's `second_out/galgame/eval-00000.jsonl`, `all` and
+`label_box`). Upload all three. `launch.py` refuses a study selection built with another recipe, any eval row without
+Parakeet labels (K6), more than 0.1 % of its train rows in `teacher_out` only (K5), or a missing sidecar or manifest.
+`kitsune/prereg.py` holds the rules (`study/PREREG.{json,md}`, committed before the study box starts; the fields that
+need the sealed labels stay `pending` until the command above fills them) and the functions the box derives its
+numbers with: `max_steps` (calibration), `choose_lr` (the edge rule) and `write_numbers` (`PREREG_numbers.json`, its
+sha256 logged before the first study step).
 
 ### HF storage
 
