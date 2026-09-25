@@ -332,6 +332,35 @@ def test_ctc_log_probs_is_normalised_and_padding_invariant():
         assert int(k[0]) == int(n[b]) and torch.allclose(alone[0], lp[b, :int(n[b])], atol=1e-4)
 
 
+def test_train_mode_with_frozen_bn_equals_eval_and_the_relpos_patch_applies():
+    """Every dropout and layerdrop is 0 and BN is frozen by kitsune.patches.train_mode, so a training forward equals
+    the eval forward; the trainer's rel-pos-once-per-batch patch finds ParakeetForCTC's encoder and keeps the
+    log-probs and the gradients."""
+    from kitsune.patches import assert_bn_frozen, patch_relpos_once_per_batch, train_mode
+
+    m = tiny_ctc_model(seed=12)
+    _, feats = hf_features()
+    f, fl = feats(waves_of([20000, 11000, 16000], seed=12))
+    mask = CS.lengths_to_mask(fl, f.shape[1])
+    with torch.no_grad():
+        ref, _ = CS.ctc_log_probs(m, f, mask)
+    train_mode(m)
+    assert m.training and assert_bn_frozen(m) == 4
+    lp, n = CS.ctc_log_probs(m, f, mask)
+    assert torch.allclose(lp, ref, atol=1e-5)  # not bitwise: sdpa picks another kernel when autograd records
+    loss = lp[CS.lengths_to_mask(n, lp.shape[1])][:, :100].sum()
+    loss.backward()
+    g_ref = {k: p.grad.clone() for k, p in m.named_parameters()}
+    m.zero_grad()
+    unpatch = patch_relpos_once_per_batch(m)
+    lp2, _ = CS.ctc_log_probs(m, f, mask)
+    assert torch.allclose(lp2, ref, atol=1e-6)
+    lp2[CS.lengths_to_mask(n, lp.shape[1])][:, :100].sum().backward()
+    for k, p in m.named_parameters():
+        assert torch.allclose(p.grad, g_ref[k], rtol=1e-4, atol=1e-6), k
+    unpatch()
+
+
 # ------------------------------------------------------------------------------------------------ decoding
 
 
@@ -408,6 +437,9 @@ def test_build_script_end_to_end_tiny(build_env):
     assert m["enc_layers"] == [0, 3] and m["ffn"] == 40 and m["init_class"] in ("pruned_kept", "pruned_lost")
     assert m["params_total"] == m["closed_form_params"] == CS.closed_form_ctc_params(2, 40, d=32, channels=8)
     assert not m["importance"]["reused"] and m["calibration"]["n"] == 12 and imp.exists()
+    cache = torch.load(imp, weights_only=True)
+    assert len(cache["ids"]) == 12 and cache["key"]["ids_sha256"] == m["calibration"]["ids_sha256"]
+    assert cache["layers"] == [0, 1, 2, 3]  # all teacher layers, whatever this student keeps
     assert sorted(m["kept"]["ffn"]) == [f"{l}.{n}" for l in (0, 3) for n in S.FFN_NAMES]
     assert all(len(v) == 40 for v in m["kept"]["ffn"].values())
     s = m["step0"]["saved"]
@@ -426,6 +458,24 @@ def test_build_script_end_to_end_tiny(build_env):
         mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(tmp / "x"), "--expect-calib-sha", "0" * 64])
 
 
+def test_build_script_golden_runs_on_the_built_and_the_saved_student(build_env, monkeypatch):
+    """--golden checks the fp32 build (the reproduction claim) and the bf16 copy (the storage rounding) separately.
+    The golden rows themselves are real JSUT audio, so the reader is stubbed here (tests/test_ctc_real.py runs it)."""
+    mod, base, tmp = build_env
+    seen = []
+
+    def fake_golden(model, feats, tokenizer, data_root):
+        seen.append((model, next(model.parameters()).dtype))
+        return dict(n=32, match=32 - len(seen) + 1, mismatches=[])
+
+    monkeypatch.setattr(mod, "golden_check", fake_golden)
+    assert mod.main(base + ["--enc-layers", "all", "--ffn", "64", "--golden", "--gate-utts", "1",
+                            "--out", str(tmp / "anchor")]) == 0
+    g = CS.load_meta(tmp / "anchor")["golden"]
+    assert g["built"]["match"] == 32 and g["saved"]["match"] == 31
+    assert len(seen) == 2 and seen[0][0] is not seen[1][0]
+
+
 def test_build_script_refuses_an_unpinned_dir_and_needs_an_init_class(build_env, monkeypatch):
     mod, base, tmp = build_env
     monkeypatch.setattr(pk, "PARAKEET_FILES", {"model.safetensors": "0" * 64})
@@ -436,10 +486,19 @@ def test_build_script_refuses_an_unpinned_dir_and_needs_an_init_class(build_env,
 
 
 def test_build_script_help_is_light():
+    """--help works without importing torch/transformers."""
     import subprocess
 
-    script = str(ROOT / "scripts" / "03c_build_ctc_student.py")
-    r = subprocess.run([sys.executable, "-X", "importtime", script, "--help"], capture_output=True, text=True,
-                       timeout=120)
-    assert r.returncode == 0 and "--enc-layers" in r.stdout
-    assert "torch" not in {line.split("|")[-1].strip() for line in r.stderr.splitlines()}
+    script = ROOT / "scripts" / "03c_build_ctc_student.py"
+    code = ("import runpy, sys\n"
+            "sys.argv = ['03c_build_ctc_student.py', '--help']\n"
+            "try:\n"
+            f"    runpy.run_path({str(script)!r}, run_name='__main__')\n"
+            "except SystemExit as e:\n"
+            "    assert e.code in (0, None), e.code\n"
+            "print('HEAVY' if {'torch', 'transformers'} & set(sys.modules) else 'LIGHT')\n")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300, encoding="utf-8",
+                       env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    assert r.returncode == 0, r.stderr
+    assert "--enc-layers" in r.stdout and "--golden" in r.stdout
+    assert r.stdout.strip().endswith("LIGHT")

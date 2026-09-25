@@ -7,10 +7,10 @@ The shape and the reasons for each step are in kitsune/ctc_student.py. The pipel
      sources, seed 1234), featurised on Parakeet's path. Cached in --importance and reused by every size: the cache
      key is the teacher files, the ids and the feature path, never the student shape.
   3. build: kept layers (evenly spaced, the last always), FFN width, the teacher's BN stats; params == closed form
-  4. step-0 gate of the built (fp32) student
+  4. step-0 gate of the built (fp32) student; --golden: the 32 golden JSUT rows through it
   5. save: bf16 weights with fp32 BN stats, Parakeet processor + tokenizer, MODEL_CARD.md (CC-BY-4.0),
      student_meta.json (stage "saved")
-  6. step-0 gate of the SAVED student (what training starts from) -> init_class; --golden: the 32 golden JSUT rows
+  6. step-0 gate of the SAVED student (what training starts from) -> init_class; --golden: the golden rows again
   7. student_meta.json stage "complete"
 
 The step-0 gate is the study's 60-utterance CPU gate (STUDY 2.2): 20 utterances of <= 15 s from the first shard of each
@@ -19,8 +19,16 @@ class is fixed in advance: "pruned_lost" when the mean per-utterance CER of the 
 teacher's is >= 90 %, else "pruned_kept". Also reported: corpus CERs, CER against the reference, the full-vocab frame
 KL, the CTC-KD objective on the teacher's own targets (kitsune.ctc_kd), argmax agreement and blank shares.
 
-`--enc-layers all --ffn 4096` must reproduce the teacher: the gate's frame log-probs equal the anchor's (max abs diff
-0, frame KL 0) and --golden gives the 32 golden CTC transcripts of kitsune/parakeet_golden.json.
+`--enc-layers all --ffn 4096` must reproduce the teacher: the built student's gate log-probs equal the anchor's (max
+abs diff 0, frame KL 0) and --golden gives the 32 golden CTC transcripts of kitsune/parakeet_golden.json. The saved
+copy is bf16, like the encoder that made the label box's targets; that rounding is reported separately (measured on
+the anchor: frame KL 0.0008, 59/60 gate hypotheses and 31/32 golden transcripts identical - the other one drops a
+Japanese comma, so its normalised CER is 0).
+
+Calibration ids. The first run's exact 1,000 ids (importance_ids_sha256 5e31cd68...) cannot be drawn again on the
+laptop: selection/viability.parquet was rewritten on 2026-09-25 and emilia_yodas / galgame gained shards after that
+build. The P students use today's draw of the same code with the same sources, seed and count; --expect-calib-sha pins
+it, and the ids are stored in the importance cache.
 
 Usage (laptop, CPU):
   python scripts/03c_build_ctc_student.py --enc-layers 16 --ffn 2560 --name P-0.3B --out D:/kitsune-students/study/p03 \
@@ -141,7 +149,8 @@ def load_or_compute_importance(anchor, feats, args, log=print):
                 created=now(), ids_sha256=key["ids_sha256"], layers=list(range(n_layers)))
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".pt.tmp")
-    torch.save(dict(format=IMPORTANCE_FORMAT, key=key, layers=list(range(n_layers)), info=info,
+    # the ids themselves travel with the cache: the draw depends on the laptop's selection and shard list
+    torch.save(dict(format=IMPORTANCE_FORMAT, key=key, layers=list(range(n_layers)), info=info, ids=ids,
                     importance=S.importance_to_state(imp)), tmp)
     tmp.replace(path)
     log(f"  importance: {info['wall_s']:.0f} s -> {path}")
@@ -312,7 +321,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--gate-max-s", type=float, default=GATE_MAX_S)
     ap.add_argument("--init-class", choices=["pruned_kept", "pruned_lost"], default=None,
                     help="only with --gate-utts 0: the init class the gate would otherwise measure")
-    ap.add_argument("--golden", action="store_true", help="also run the 32 golden JSUT rows through the saved student")
+    ap.add_argument("--golden", action="store_true",
+                    help="also run the 32 golden JSUT rows through the built and the saved student")
     ap.add_argument("--threads", type=int, default=8, help="torch CPU threads")
     ap.add_argument("--force", action="store_true", help="rebuild even if student_meta.json says complete")
     args = ap.parse_args(argv)
@@ -407,6 +417,12 @@ def main(argv=None) -> int:
                                        max_s=args.gate_max_s, ids=[u["id"] for u in gate]),
                              built=built)
         dur["gate_built"] = round(time.time() - t, 1)
+    if args.golden:
+        t = time.time()
+        meta["golden"] = dict(built=golden_check(student, feats, tokenizer, args.data))
+        print(f"  golden, built (fp32): {meta['golden']['built']['match']}/{meta['golden']['built']['n']} CTC "
+              f"transcripts equal")
+        dur["golden_built"] = round(time.time() - t, 1)
 
     t = time.time()
     print(f"[6/7] save -> {out}")
@@ -435,11 +451,12 @@ def main(argv=None) -> int:
         else:
             meta["init_class"] = args.init_class
             meta["step0"] = dict(skipped=True)
-        if args.golden:
+        if args.golden:  # bf16 storage may move a close argmax (measured: one comma in 32 on the anchor)
             t = time.time()
-            meta["golden"] = golden_check(saved, feats, tokenizer, args.data)
-            print(f"  golden: {meta['golden']['match']}/{meta['golden']['n']} CTC transcripts equal")
-            dur["golden"] = round(time.time() - t, 1)
+            meta["golden"]["saved"] = golden_check(saved, feats, tokenizer, args.data)
+            print(f"  golden, saved (bf16 weights): {meta['golden']['saved']['match']}/{meta['golden']['saved']['n']} "
+                  f"CTC transcripts equal")
+            dur["golden_saved"] = round(time.time() - t, 1)
     except Exception as e:
         meta["error"] = dict(error=repr(e), traceback=traceback.format_exc())
         S.write_meta(out, meta)  # stage "saved": the weights are there; a re-run with --force redoes everything
