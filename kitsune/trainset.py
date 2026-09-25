@@ -703,9 +703,11 @@ def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepP
     Workers use `spawn` on every OS, so Linux runs the same code path as the Windows smoke run. KITSUNE_SHARING
     (e.g. file_system), if set, becomes torch's sharing strategy in the main process and in the workers.
     timeout_s > 0 (workers only; 0 = wait forever): a worker micro-batch that never arrives raises RuntimeError
-    "DataLoader timed out" after that many seconds instead of blocking the trainer for good. A full /dev/shm does not
-    kill the worker: its queue feeder prints "unable to allocate shared memory" and drops the micro-batch, and the
-    loader, which yields in order, would wait for it forever. It must cover the workers' start-up (the first wait).
+    "DataLoader timed out" after that many seconds in total instead of blocking the trainer for good. A full /dev/shm
+    (or, on Windows, a paging-file-backed shared mapping that fails under the commit limit) does not kill the worker:
+    its queue feeder prints the error and drops the micro-batch, and the loader, which yields in order, would wait for
+    it forever. It must cover the workers' start-up (the first wait). The wait runs in 5 s slices, so torch's 5 s
+    dead-worker check (Windows' only one: no SIGCHLD handler) still reports a crashed worker within seconds.
     Closing the iterator (or dropping it) shuts the workers down."""
     if isinstance(plan, StepPlanner):
         steps = (((e, j), step) for e, j, step in plan.iter_steps())
@@ -717,23 +719,38 @@ def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepP
         torch.multiprocessing.set_sharing_strategy(strategy)
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
+    # torch looks for a dead worker only when a wait ends, and on Windows (no SIGCHLD handler) that is its only check:
+    # one timeout_s-long wait would hide a crashed worker for timeout_s. Wait in 5 s slices (torch's
+    # MP_STATUS_CHECK_INTERVAL) and give up after timeout_s in total.
+    slice_s = min(5.0, float(timeout_s)) if num_workers > 0 and timeout_s > 0 else 0
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=None, sampler=sampler, num_workers=num_workers, pin_memory=pin_memory,
         prefetch_factor=prefetch if num_workers > 0 else None, worker_init_fn=_worker_init if num_workers > 0 else None,
         multiprocessing_context=mp_context if num_workers > 0 else None, persistent_workers=False,
-        timeout=float(timeout_s) if num_workers > 0 else 0,  # in-process loading asserts timeout == 0
+        timeout=slice_s,  # in-process loading asserts timeout == 0
     )
+
+    def fetch(it):
+        t0 = time.monotonic()
+        while True:
+            try:
+                return next(it)
+            except RuntimeError as e:  # a timed-out wait leaves the iterator's state untouched: next() waits on
+                if not (slice_s and str(e).startswith("DataLoader timed out")):
+                    raise
+                if time.monotonic() - t0 >= timeout_s:
+                    raise RuntimeError(f"DataLoader timed out after {timeout_s:g} s (no micro-batch arrived)") from None
 
     def gen():
         it = iter(loader)
         try:
             while True:
                 try:
-                    first = next(it)
+                    first = fetch(it)
                 except StopIteration:
                     return
                 key, n = sampler.sizes.popleft()
-                yield key, [first] + [next(it) for _ in range(n - 1)]
+                yield key, [first] + [fetch(it) for _ in range(n - 1)]
         finally:
             shutdown = getattr(it, "_shutdown_workers", None)
             if shutdown is not None:

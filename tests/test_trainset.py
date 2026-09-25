@@ -535,6 +535,36 @@ def test_loader_times_out_on_a_dropped_worker_batch():
         loader.close()
 
 
+class _WorkerDiesDataset(torch.utils.data.Dataset):
+    """The worker process dies on micro-batch [1] without a Python exception (a native decoder crash, a kill)."""
+
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, idx):
+        if list(idx) == [1]:
+            os._exit(1)
+        return dict(ids=list(idx))
+
+
+def test_loader_reports_a_dead_worker_long_before_its_timeout():
+    """torch checks for a dead worker only when a wait ends, and on Windows that poll is the only check. One
+    timeout_s-long wait (production: 600 s) hid a crashed worker for all of it; the wait now runs in 5 s slices, so the
+    worker's death is reported within seconds while timeout_s still bounds a dropped micro-batch."""
+    import time
+
+    loader = make_loader(_WorkerDiesDataset(), [[[0]], [[1]], [[2]]], num_workers=1, prefetch=2, timeout_s=90)
+    try:
+        key, mbs = next(loader)
+        assert key == 0 and mbs[0]["ids"] == [0]
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="exited unexpectedly"):
+            next(loader)
+        assert time.monotonic() - t0 < 30
+    finally:
+        loader.close()
+
+
 # ---------------------------------------------------------------------------------------------------- real data
 
 
