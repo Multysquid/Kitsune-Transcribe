@@ -8,8 +8,8 @@
   curves as the on-device optimizer in a full run, and an identical continuation after a crash + --resume
 - the three overfit configs resolve and validate
 - the 8 GB laptop: the memory probe holds a step's gradients when steps accumulate micro-batches, histograms
-  concatenate one module at a time, the Windows VRAM cap, checkpoint renames that wait for a scanner, and
-  scripts/supervise_distill.py (resume after a crash, give up on stalls)
+  concatenate one module at a time, the Windows VRAM cap, checkpoint renames that wait for a scanner and come after
+  the files reach the disk, and scripts/supervise_distill.py (resume after a crash, give up on stalls)
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import copy
@@ -251,6 +251,9 @@ def test_overfit_configs_resolve():
         assert c["early_stop"] == dict(enabled=True, metric="probe_kl", patience=patience, min_delta_rel=0.02,
                                        min_delta_abs=0.001, min_evals=min_evals, floor=None, action="stop")
         assert c["eval"]["every_epochs"] == 1 and c["eval"]["probe"] and c["eval"]["probe_is_train"]
+        # no GO/NO-GO for a sanity run ("N/A" with the numbers); a mini eval every 200 steps (never at an epoch end)
+        assert c["eval"]["gate"] is False and c["eval"]["full_every_epochs"] is None
+        assert c["eval"]["mini"] == dict(every_steps=200, val_per_set=32, train_utts=64, greedy=True)
         assert c["loss"] == m.DEFAULTS["loss"] == dict(w_kl=1.0, w_ce=0.8, l2sp_lambda=0.05)
         assert {k: c["optim"][k] for k in ("lr", "betas", "clip")} == dict(lr=1e-4, betas=[0.9, 0.98], clip=1.0)
         assert c["autocast"] == "bfloat16" and c["perf"]["relpos_patch"] and c["memory"]["grad_ckpt"] == "auto"
@@ -262,7 +265,8 @@ def test_overfit_configs_resolve():
         assert not c["smoke"]["require_loss_decrease"] and c["ckpt"]["full_after_smoke"]
     for bad in (["schedule.clock=epochs"], ["schedule.clock=epochs", "schedule.epochs=0"], ["optim.offload=gpu"],
                 ["subset.train_audio_s=5", "subset.train_utts=10"], ["subset.eval_audio_s=-1"],
-                ["eval.every_epochs=0"], ["eval.probe=false", "eval.probe_is_train=true"], ["specaug.enabled=0"]):
+                ["eval.every_epochs=0"], ["eval.probe=false", "eval.probe_is_train=true"], ["specaug.enabled=0"],
+                ["perf.loader_timeout_s=-1"], ["perf.loader_timeout_s=10m"]):
         with pytest.raises(SystemExit):
             m.load_config(None, bad)
     via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
@@ -391,6 +395,104 @@ def test_replace_dir_waits_for_a_scanner(tmp_path):
     assert time.monotonic() - t0 >= 0.4 and not tmp.exists() and (final / "model.pt").read_bytes() == b"x" * 1000
 
 
+def test_checkpoints_reach_the_disk_before_their_rename(tmp_path, monkeypatch):
+    """save_full and save_weights fsync every file of <name>.tmp/ before renaming it into place and the checkpoints
+    dir after it; the end save's trainer-only rewrite fsyncs its .tmp files before each replace. Without that, an
+    unclean host crash soon after a save left the rename on disk but not the data: full_step_<N>/ with empty or
+    NUL-filled files, the state --resume and vast/supervise.py take as the newest."""
+    from kitsune import student as S
+
+    m = load_script("04_distill")
+    calls = []
+    real_fsync, real_sync, real_dir, real_file = m.fsync_path, m._sync_dir, m._replace_dir, m._replace_file
+
+    def rec(kind, real):
+        def f(*a):
+            calls.append((kind, *(Path(p).name for p in a)))
+            return real(*a)
+        return f
+
+    monkeypatch.setattr(m, "fsync_path", rec("fsync", real_fsync))
+    monkeypatch.setattr(m, "_sync_dir", rec("sync_dir", real_sync))
+    monkeypatch.setattr(m, "_replace_dir", rec("replace", real_dir))
+    monkeypatch.setattr(m, "_replace_file", rec("replace", real_file))
+
+    def fake_save_student(model, out, processor, meta):
+        out.mkdir(parents=True)
+        for f in ("model.safetensors", "config.json", "student_meta.json"):
+            (out / f).write_bytes(b"w")
+
+    monkeypatch.setattr(S, "save_student", fake_save_student)
+    run = tmp_path / "run"
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 2}, "student": "s"}, run_dir=run, ckpt_dir=run / "checkpoints",
+                        st=dict(fulls=[], weights=[], epoch_progress=0.0, last_objective=None), clock=lambda: 0.0,
+                        planner=SimpleNamespace(state_dict=dict), log=SimpleNamespace(event=lambda *a, **k: None,
+                                                                                     state_dict=dict),
+                        model=torch.nn.Linear(1, 1), opt=SimpleNamespace(state_dict=dict),
+                        l2sp=SimpleNamespace(state_dict=dict), student_meta={}, processor=None,
+                        uploader=SimpleNamespace(repo=None, submit=lambda d, n: None, busy=set, pending={}))
+    R.ckpt_dir.mkdir(parents=True)
+
+    for save, name in ((m.save_full, "full_step_2"), (m.save_weights, "step_2")):
+        calls.clear()
+        d = save(R, 2, "periodic")
+        files = sorted(p.name for p in d.iterdir())
+        assert calls == [*[("fsync", f) for f in files], ("sync_dir", f"{name}.tmp"),
+                         ("replace", f"{name}.tmp", name), ("sync_dir", "checkpoints")], name
+    assert files == ["config.json", "model.safetensors", "student_meta.json"]
+
+    calls.clear()  # the end save at a step that already has a full state: only trainer.pt/.json are rewritten
+    m.save_full(R, 2, "end")
+    assert calls == [("fsync", "trainer.pt.tmp"), ("replace", "trainer.pt.tmp", "trainer.pt"),
+                     ("fsync", "trainer.json.tmp"), ("replace", "trainer.json.tmp", "trainer.json"),
+                     ("sync_dir", "full_step_2")]
+
+
+def test_resume_from_an_older_full_state_sets_the_abandoned_attempt_aside(tmp_path):
+    """--resume full_step_4 while the attempt it backs out of left full_step_8: rotation kept the highest-numbered
+    states and --resume <run dir> took the newest, so the resumed run's own states were deleted and the next run-dir
+    resume (supervise_distill.py) silently continued the abandoned attempt. Its newer dirs now move under
+    abandoned-*/, where no scanner looks. A resume from the newest state moves only the weights saved after it: the
+    resumed run replays the steps, not those saves, so they would stay next to its own and go up with them."""
+    m = load_script("04_distill")
+
+    def tree(root, names):
+        ck = root / "checkpoints"
+        for name in names:
+            (ck / name).mkdir(parents=True)
+            if name.startswith("full") and not name.endswith(".tmp"):
+                (ck / name / "trainer.pt").write_bytes(b"x")
+        return ck
+
+    names = ("full_step_4", "full_step_8", "step_4", "step_6", "step_9")
+    ck8 = tree(tmp_path / "newest", names)
+    assert m.set_aside_newer(ck8, 8) == ["step_9"] and m.set_aside_newer(ck8, 8) == []
+    (aside8,) = [p for p in ck8.iterdir() if p.name.startswith("abandoned-")]
+    assert [p.name for p in aside8.iterdir()] == ["step_9"]
+    assert m.find_full_state(ck8.parent) == ck8 / "full_step_8"
+    # a crash inside the full-state save right after the same step's weights: the resume is from the full state
+    # before, and the orphaned weights move (the torn .tmp is no checkpoint any scanner takes)
+    ckt = tree(tmp_path / "torn", ("full_step_4", "step_4", "step_8", "full_step_8.tmp"))
+    assert m.find_full_state(ckt.parent) == ckt / "full_step_4" and m.set_aside_newer(ckt, 4) == ["step_8"]
+    assert (ckt / "full_step_8.tmp").is_dir()
+
+    run = tmp_path / "run"
+    ck = tree(run, names)
+    assert m.set_aside_newer(ck, 4) == ["full_step_8", "step_6", "step_9"]
+    (aside,) = [p for p in ck.iterdir() if p.name.startswith("abandoned-")]
+    assert sorted(p.name for p in aside.iterdir()) == ["full_step_8", "step_6", "step_9"]
+    assert (aside / "full_step_8" / "trainer.pt").exists() and m.find_full_state(run) == ck / "full_step_4"
+
+    evs = []
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 1}}, ckpt_dir=ck, uploader=SimpleNamespace(busy=set),
+                        log=SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw["name"]))))
+    (ck / "full_step_6").mkdir()
+    (ck / "full_step_6" / "trainer.pt").write_bytes(b"x")
+    m.rotate_full(R)  # the resumed run's first save
+    assert evs == [("checkpoint_deleted", "full_step_4")] and m.find_full_state(run) == ck / "full_step_6"
+    assert sorted(p.name for p in ck.iterdir()) == [aside.name, "full_step_6", "step_4"]
+
+
 FAKE_TRAINER = r'''
 import argparse, json, os, sys
 from pathlib import Path
@@ -423,7 +525,8 @@ def test_supervisor_resumes_after_crashes_and_gives_up_on_stalls(tmp_path, monke
     """scripts/supervise_distill.py (run_overfit_tests.cmd runs every overfit config under it): this GPU faults every
     ~10-40 min under load and a fault kills the trainer, so a crash is followed by --resume of the run's newest full
     state; attempts without a newer full state escalate to CUDA_LAUNCH_BLOCKING=1 after two and give up after
-    --max-stalls; a crash before the first full state starts over; exits 0 and 3 are final."""
+    --max-stalls (--max-attempts of them in total; attempts that progressed never count); a crash before the first
+    full state starts over; exits 0 and 3 are final."""
     sup = load_script("supervise_distill")
     fake = tmp_path / "fake_trainer.py"
     fake.write_text(FAKE_TRAINER, encoding="utf-8")
@@ -457,6 +560,15 @@ def test_supervisor_resumes_after_crashes_and_gives_up_on_stalls(tmp_path, monke
     # ThroughputTooLow is final
     rc, calls, _, _ = supervise("sup-c", [{"rc": 3}, {"rc": 0}])
     assert rc == 3 and len(calls) == 1
+
+    # attempts that made progress do not count toward --max-attempts: a long run that keeps moving is never given up
+    rc, calls, lines, _ = supervise("sup-d", [{"full": 10 * (i + 1), "rc": 1} for i in range(21)] + [{"rc": 0}])
+    assert rc == 0 and len(calls) == 22 and not any("giving up" in x for x in lines)
+
+    # ... the ones without progress do, in total, even when they never come --max-stalls in a row
+    rc, calls, lines, _ = supervise("sup-e", [{"full": 2, "rc": 1}, {"rc": 1}, {"full": 4, "rc": 1}, {"rc": 1},
+                                              {"rc": 0}], "--max-attempts", "2")
+    assert rc == 1 and len(calls) == 4 and "giving up after 2 attempts without a newer full state" in lines[-1]
 
 
 # ------------------------------------------------------------------------------------------------ whole runs
@@ -614,3 +726,43 @@ def test_offload_matches_the_on_device_optimizer_and_resumes(env, monkeypatch):
         b = utts[(utts["step"] == step) & (utts["attempt"] == 1)].sort_values("id")
         assert a["id"].tolist() == b["id"].tolist() and len(a)
         np.testing.assert_allclose(b["kl"].to_numpy(), a["kl"].to_numpy(), rtol=1e-6, atol=1e-9)
+
+
+def test_resume_applies_optim_l2sp_and_grad_ckpt_overrides(env, monkeypatch):
+    """A resume's --set optim.betas/eps/weight_decay, loss.l2sp_lambda and memory.grad_ckpt were logged as applied
+    while the restored optimizer, L2-SP and memory choice kept the saved values: now they take effect. A new
+    batch.micro_audio_s (it shapes the step plan the resume continues) stops the resume naming the key; repeating the
+    checkpoint's value resumes as usual."""
+    m = load_script("04_distill")
+    cfg = write_config(env, "ov-sets", {
+        "optim": {"betas": [0.9, 0.98], "eps": 1e-8, "weight_decay": 0.0},
+        "loss": {"l2sp_lambda": 0.05},
+        "memory": {"grad_ckpt": False},
+        "schedule": {"warmup_steps": 3, "cooldown_frac": 0.3, "clock": "steps", "max_steps": 8},
+        "batch": {"step_audio_s": 6, "micro_audio_s": 3, "pool_micro": 4},
+        "eval": {"every_steps": 1000, "final_full_greedy": False},
+        "ckpt": {"weights_every_steps": 1000, "full_every_steps": 4, "keep_local": 5},
+        "smoke": {"enabled": False},
+    })
+    monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "6")
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        m.main(["--config", cfg])
+    monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
+    run = one_run(env["root"], "ov-sets")
+    full = str(run / "checkpoints" / "full_step_4")
+    with pytest.raises(SystemExit, match=r"batch\.micro_audio_s=2 differs from the checkpoint's 3"):
+        m.main(["--resume", full, "--set", "batch.micro_audio_s=2"])
+    sets = ["optim.betas=[0.5,0.6]", "optim.eps=0.001", "optim.weight_decay=0.1", "loss.l2sp_lambda=0.5",
+            "memory.grad_ckpt=true", "batch.micro_audio_s=3"]
+    assert m.main(["--resume", full, *[a for s in sets for a in ("--set", s)]]) == 0
+    ev = events(run)
+    res = next(e for e in ev if e["kind"] == "resume")
+    assert res["unchanged"] == {"batch.micro_audio_s": 3} and res["overrides"] == {
+        "optim.betas": [0.5, 0.6], "optim.eps": 0.001, "optim.weight_decay": 0.1, "loss.l2sp_lambda": 0.5,
+        "memory.grad_ckpt": True}
+    assert [e["grad_ckpt"] for e in ev if e["kind"] == "model"] == [False, True]
+    d = run / "checkpoints" / "full_step_8"
+    groups = torch.load(d / "optimizer.pt", map_location="cpu", weights_only=True)["param_groups"]
+    assert groups and all((tuple(g["betas"]), g["eps"], g["weight_decay"]) == ((0.5, 0.6), 0.001, 0.1) for g in groups)
+    assert torch.load(d / "l2sp.pt", map_location="cpu", weights_only=True)["lam"] == 0.5
+    assert torch.load(d / "trainer.pt", map_location="cpu", weights_only=True)["st"]["memory"]["grad_ckpt"] is True

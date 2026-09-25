@@ -13,8 +13,10 @@ Policy, per attempt:
 An attempt makes progress when the run's newest full state is newer after it than before. After BLOCKING_AFTER
 attempts in a row without progress the next ones run with CUDA_LAUNCH_BLOCKING=1 (serialised launches: slower, but no
 diagnostic run of the teacher pass ever faulted that way) until one makes progress. The supervisor gives up after
---max-stalls attempts in a row without progress (a deterministic failure that needs a human) or --max-attempts in total
-and returns the last exit code (1 if it does not fit an exit code).
+--max-stalls attempts in a row without progress (a deterministic failure that needs a human) or --max-attempts without
+progress in total, and returns the last exit code (1 if it does not fit an exit code). Attempts that made progress are
+not counted: each moves the run's newest full state forward, so the run stays bounded, and a fault can cost a fast
+attempt or two before the blocking one that progresses (a total cap ended long runs that were still progressing).
 
 Every attempt's start and end go to stdout and, appended, to --log.
 
@@ -24,6 +26,7 @@ Usage: python scripts/supervise_distill.py --config configs/overfit_1s.json [--l
 import argparse
 import glob
 import importlib.util
+import itertools
 import os
 import re
 import subprocess
@@ -72,7 +75,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--config", required=True, help="04_distill.py --config of the fresh start")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="passed on to every attempt")
     ap.add_argument("--log", default=None, help="append the attempt lines to this file too")
-    ap.add_argument("--max-attempts", type=int, default=20)
+    ap.add_argument("--max-attempts", type=int, default=20, help="attempts without a newer full state, in total")
     ap.add_argument("--max-stalls", type=int, default=5, help="attempts in a row without a newer full state")
     ap.add_argument("--script", default=str(TRAINER), help="the trainer (tests substitute a fake one)")
     return ap.parse_args(argv)
@@ -83,8 +86,8 @@ def main(argv=None) -> int:
     trainer = load_trainer()
     cfg = trainer.load_config(args.config, args.set)
     runs_root, name = trainer.rpath(cfg["runs_root"]), cfg["run_name"]
-    run, rc, stalled = None, None, 0
-    for attempt in range(1, args.max_attempts + 1):
+    run, rc, stalled, idle = None, None, 0, 0
+    for attempt in itertools.count(1):
         before = newest_full(run)
         blocking = stalled >= BLOCKING_AFTER
         start = ["--resume", str(run)] if before is not None else ["--config", args.config]
@@ -106,14 +109,16 @@ def main(argv=None) -> int:
         after = newest_full(run)
         progressed = after is not None and (before is None or after > before)
         stalled = 0 if progressed else stalled + 1
+        idle += not progressed
         say(f"{name} attempt {attempt} ended (exit {rc}); run {run}; newest full state {before} -> {after}", args.log)
         if rc in (EXIT_OK, EXIT_THROUGHPUT):
             return rc
         if stalled >= args.max_stalls:
             say(f"{name}: giving up after {stalled} attempts in a row without a newer full state", args.log)
             break
-    else:
-        say(f"{name}: giving up after {args.max_attempts} attempts", args.log)
+        if idle >= args.max_attempts:
+            say(f"{name}: giving up after {idle} attempts without a newer full state", args.log)
+            break
     return rc if rc is not None and 0 <= rc < 256 else 1
 
 

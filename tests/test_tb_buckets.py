@@ -1,7 +1,8 @@
 """TensorBoard buckets: every tag the trainer logs goes to TensorBoard under 1_operational/, 2_loss_accuracy/ or 3_misc/
 (kitsune.runlog.TB_BUCKET_RULES) while the open-format files keep the logged tag, and tools/regroup_tb.py rebuilds the
 event files of an existing run in that layout from its open files. The tags of a real laptop run are frozen in
-tests/tb_tags_overfit_1s.json and must each land where the owner's table below puts them. CPU only."""
+tests/tb_tags_overfit_1s.json, with the tags the eval-cadence change (mini evals, headline summary/*) adds to that run,
+and must each land where the owner's table below puts them. CPU only."""
 import contextlib
 import importlib.util
 import json
@@ -51,12 +52,13 @@ SPLITS = ("", "_utt_mean", "_p1_gt_0.99", "_p1_lt_0.9")
 LOSS = {f"{m}{s}" for m in ("kl", "ce") for s in SPLITS}
 TOP1 = {f"top1{s}" for s in SPLITS}
 CER = {"cer_ref_corpus", "cer_ref_mean", "cer_teacher_corpus", "cer_teacher_mean", "ratio_vs_teacher", "trunc_rate",
-       "ref_edits", "n_truncated", "n_empty_hyp", "teacher_cer_ref_corpus", "teacher_cer_ref_mean",
-       "teacher_trunc_rate"}
+       "ref_edits", "cer_teacher_edits", "n_truncated", "n_empty_hyp", "teacher_cer_ref_corpus",
+       "teacher_cer_ref_mean", "teacher_trunc_rate"}
+CER_DEN = {"ref_chars", "cer_teacher_chars"}  # CER denominators: counts
 TOK_DIAG = {"student_entropy_coarse", "student_tail", "teacher_entropy_coarse", "teacher_tail", "teacher_p1",
             "frac_p1_gt_0.99", "frac_p1_lt_0.9"}
 EVAL_COST = {"wall_s", "rtf", "tok_per_s", "audio_s", "n_bad_audio", "n_utts", "n_tok", "n"}
-SET_COST = {"audio_s", "tok_per_s", "n", "n_tok", "n_utts", "n_missing_teacher", "n_empty_ref"}
+SET_COST = {"audio_s", "tok_per_s", "n", "n_tok", "n_utts", "n_missing_teacher", "n_empty_ref", "n_bad_audio"}
 SECTION = {("tf", "loss"): "val_loss", ("tf", "top1"): "val_accuracy", ("greedy", "cer"): "val_accuracy",
            ("greedy_full", "cer"): "val_accuracy_full", ("probe", "loss"): "train_probe_loss",
            ("probe", "top1"): "train_probe_accuracy", ("probe_greedy", "cer"): "train_probe_accuracy"}
@@ -67,13 +69,23 @@ def expected_tb(tag: str, plugin: str = "scalars") -> str:
     rest = "/".join(p[1:])
     if plugin == "histograms":
         return f"3_misc/{tag}"
+    if plugin == "scalars" and p[0] == "summary":  # every eval's headline numbers, first in the loss/accuracy bucket
+        assert len(p) == 3 and p[1] in ("full", "mini"), tag
+        return f"2_loss_accuracy/00_summary/{rest}"
+    if plugin == "scalars" and p[:2] == ["eval", "mini"]:  # a mini eval: where its full counterpart goes, marked mini
+        full = expected_tb("/".join(["eval", *p[2:]]))
+        bucket, section, tail = full.split("/", 2)
+        if bucket == "2_loss_accuracy":
+            return f"{bucket}/{section}_mini/{tail}"
+        assert (bucket, section) in (("1_operational", "eval"), ("3_misc", "eval")), (tag, full)
+        return f"{bucket}/eval/mini/{tail}"
     if plugin == "text":
         if tag == "config" or p[0] == "events":
             return f"1_operational/{tag}"
         assert tag == "samples", tag
         return "2_loss_accuracy/samples"
-    if p[0] == "loss":
-        return f"2_loss_accuracy/train_loss/{rest}"
+    if p[0] == "loss":  # the total (with the L2-SP value, which climbs all run) and l2sp apart from the objective terms
+        return f"2_loss_accuracy/train_loss{'_incl_l2sp' if rest in ('total', 'l2sp') else ''}/{rest}"
     if p[0] in ("src", "bucket"):
         assert len(p) == 3, tag
         if (p[0], p[2]) == ("src", "tokens"):
@@ -105,7 +117,7 @@ def expected_tb(tag: str, plugin: str = "scalars") -> str:
         assert p[2] in EVAL_COST, tag
         return f"1_operational/{tag}"
     kind, eset, m = p[1], p[2], p[3]
-    if m in SET_COST or (m == "ref_chars" and kind in ("greedy", "greedy_full", "probe_greedy")):
+    if m in SET_COST or (m in CER_DEN and kind in ("greedy", "greedy_full", "probe_greedy")):
         return f"1_operational/{tag}"
     if kind in ("tf", "probe") and m in TOK_DIAG:
         return f"3_misc/{tag}"
@@ -148,9 +160,64 @@ def test_real_run_tags_land_in_their_buckets():
         **{f"bucket/{b}/frac": f"3_misc/bucket/{b}/frac" for b in ("p1_gt_0.99", "p1_lt_0.9")}}
 
 
+def test_eval_cadence_tags_land_in_their_buckets():
+    """The tags the eval-cadence change adds to the same run (frozen next to it: the headline summary/*, the mini evals'
+    eval/mini/*, the per-set vs-teacher CER numerator / denominator) go where the owner's table puts them, mapped
+    together with the run's own tags: no rule missing, no TensorBoard tag shared."""
+    added = FIXTURE["added_scalars"]
+    assert len(added) == 215 and not set(added) & set(FIXTURE["scalars"])
+    tm = TagMapper()
+    for tag in [*FIXTURE["scalars"], *added]:
+        tb, warn = tm.resolve(tag)
+        assert tb == expected_tb(tag), (tag, tb)
+        assert not warn, tag
+    tbs = [e["tb_tag"] for e in tm.map.values()]
+    assert len(set(tbs)) == len(tbs) == len(FIXTURE["scalars"]) + len(added)
+    by_bucket = Counter(tb_tag(t)[1] for t in added)
+    assert by_bucket == {"1_operational": 59, "2_loss_accuracy": 128, "3_misc": 28}
+    summary = [t for t in added if t.startswith("summary/")]
+    assert len(summary) == 24 and all(tb_tag(t)[0].startswith("2_loss_accuracy/00_summary/") for t in summary)
+    mini = [t for t in added if t.startswith("eval/mini/")]
+    assert all(tb_tag(t)[0].split("/")[1].endswith("_mini") for t in mini if tb_tag(t)[1] == "2_loss_accuracy")
+    assert all(tb_tag(t)[0].startswith(("1_operational/eval/mini/", "3_misc/eval/mini/"))
+               for t in mini if tb_tag(t)[1] != "2_loss_accuracy")
+    # the 00_ prefix sorts the headline first among the loss/accuracy sections TensorBoard shows
+    sections = sorted({tb_tag(t)[0].split("/")[1] for t in [*FIXTURE["scalars"], *added]
+                       if tb_tag(t)[1] == "2_loss_accuracy"})
+    assert sections[0] == "00_summary"
+
+
 # one tag per rule, with the exact TensorBoard tag
 SPOT = [
+    ("summary/full/val_cer", "scalars", "2_loss_accuracy/00_summary/full/val_cer"),
+    ("summary/full/val_cer_pct", "scalars", "2_loss_accuracy/00_summary/full/val_cer_pct"),
+    ("summary/full/val_cer_utts", "scalars", "2_loss_accuracy/00_summary/full/val_cer_utts"),
+    ("summary/mini/train_cer_vs_teacher", "scalars", "2_loss_accuracy/00_summary/mini/train_cer_vs_teacher"),
+    ("summary/mini/val_loss", "scalars", "2_loss_accuracy/00_summary/mini/val_loss"),
+    ("eval/mini/tf/eval_jsut/kl", "scalars", "2_loss_accuracy/val_loss_mini/eval_jsut/kl"),
+    ("eval/mini/tf/all/ce_p1_lt_0.9", "scalars", "2_loss_accuracy/val_loss_mini/all/ce_p1_lt_0.9"),
+    ("eval/mini/tf/eval_cv8/top1", "scalars", "2_loss_accuracy/val_accuracy_mini/eval_cv8/top1"),
+    ("eval/mini/greedy/eval_reazon/cer_ref_corpus", "scalars",
+     "2_loss_accuracy/val_accuracy_mini/eval_reazon/cer_ref_corpus"),
+    ("eval/mini/greedy/all/cer_teacher_edits", "scalars", "2_loss_accuracy/val_accuracy_mini/all/cer_teacher_edits"),
+    ("eval/mini/probe/galgame/kl_utt_mean", "scalars", "2_loss_accuracy/train_probe_loss_mini/galgame/kl_utt_mean"),
+    ("eval/mini/probe/all/top1", "scalars", "2_loss_accuracy/train_probe_accuracy_mini/all/top1"),
+    ("eval/mini/probe_greedy/all/cer_teacher_corpus", "scalars",
+     "2_loss_accuracy/train_probe_accuracy_mini/all/cer_teacher_corpus"),
+    ("eval/mini/greedy/eval_jsut/ref_chars", "scalars", "1_operational/eval/mini/greedy/eval_jsut/ref_chars"),
+    ("eval/mini/probe_greedy/all/cer_teacher_chars", "scalars",
+     "1_operational/eval/mini/probe_greedy/all/cer_teacher_chars"),
+    ("eval/mini/greedy/rtf", "scalars", "1_operational/eval/mini/greedy/rtf"),
+    ("eval/mini/tf/eval_jsut/n_tok", "scalars", "1_operational/eval/mini/tf/eval_jsut/n_tok"),
+    ("eval/mini/tf/eval_cv8/n_bad_audio", "scalars", "1_operational/eval/mini/tf/eval_cv8/n_bad_audio"),
+    ("eval/mini/wall_s", "scalars", "1_operational/eval/mini/wall_s"),
+    ("eval/mini/probe/all/student_tail", "scalars", "3_misc/eval/mini/probe/all/student_tail"),
+    ("eval/greedy/eval_cv8/cer_teacher_edits", "scalars", "2_loss_accuracy/val_accuracy/eval_cv8/cer_teacher_edits"),
+    ("eval/greedy_full/all/cer_teacher_chars", "scalars", "1_operational/eval/greedy_full/all/cer_teacher_chars"),
     ("loss/kl", "scalars", "2_loss_accuracy/train_loss/kl"),
+    ("loss/objective", "scalars", "2_loss_accuracy/train_loss/objective"),
+    ("loss/total", "scalars", "2_loss_accuracy/train_loss_incl_l2sp/total"),
+    ("loss/l2sp", "scalars", "2_loss_accuracy/train_loss_incl_l2sp/l2sp"),
     ("src/galgame/kl", "scalars", "2_loss_accuracy/train_loss/by_source/galgame/kl"),
     ("src/galgame/top1", "scalars", "2_loss_accuracy/train_accuracy/by_source/galgame/top1"),
     ("src/galgame/tokens", "scalars", "1_operational/src/galgame/tokens"),
@@ -179,9 +246,14 @@ SPOT = [
     ("samples/probe", "text", "2_loss_accuracy/samples/probe"),
     ("time/step_s", "scalars", "1_operational/time/step_s"),
     ("sys/gpu0/mem_used_gb", "scalars", "1_operational/sys/gpu0/mem_used_gb"),
+    # a Linux container's own memory: never logged on a Windows laptop run, so not in the fixture
+    ("sys/cgroup/anon_gb", "scalars", "1_operational/sys/cgroup/anon_gb"),
+    ("sys/cgroup/oom_kill", "scalars", "1_operational/sys/cgroup/oom_kill"),
     ("opt/lr", "scalars", "1_operational/opt/lr"),
     ("eval/epoch", "scalars", "1_operational/progress/epoch"),
     ("eval/greedy_full/rtf", "scalars", "1_operational/eval/greedy_full/rtf"),
+    ("eval/greedy_full/eval_cv8/n_bad_audio", "scalars",
+     "1_operational/eval/greedy_full/eval_cv8/n_bad_audio"),
     ("eval/tf/eval_jsut/n_tok", "scalars", "1_operational/eval/tf/eval_jsut/n_tok"),
     ("eval/wall_s", "scalars", "1_operational/eval/wall_s"),
     ("events/oom_fallback", "text", "1_operational/events/oom_fallback"),
@@ -347,6 +419,18 @@ def test_regroup_refuses_a_live_run(tmp_path, monkeypatch, capsys):
     (done / "summary.json").write_text('{"status": "failed"}', encoding="utf-8")
     os.utime(done / "summary.json", (time.time() - 60, time.time() - 60))
     assert "resumed" in rg.live_reason(done)
+    # a launch that crashed just now (summary.json "failed", newer than every scalar, logger closed) is over unless
+    # it left a full state: then the supervisor relaunches it minutes later, its tb/ file opening before logger_start
+    os.utime(done / "summary.json", None)
+    assert rg.live_reason(done) is None
+    ck = done / "checkpoints" / "full_step_3"
+    ck.mkdir(parents=True)
+    (ck / "trainer.pt").write_bytes(b"")
+    assert "failed" in rg.live_reason(done)
+    with pytest.raises(SystemExit, match="looks live"):
+        rg.regroup(done)
+    assert not list((done / "tb").glob("*.bak"))
+    assert rg.live_reason(done, now=time.time() + 400) is None  # not relaunched within 5 minutes: over
     (done / "summary.json").write_bytes(summary)
     assert rg.regroup(live, force=True)["live"]  # --force
     assert rg.main(["--all", "--runs-root", str(tmp_path / "runs")]) == 0
@@ -422,6 +506,35 @@ def test_regroup_puts_back_a_file_that_grows_after_the_rename(tmp_path, monkeypa
     assert "1 being written" in capsys.readouterr().out
     monkeypatch.undo()
     assert rg.regroup(run)["unmapped"] == ["scalars:weird", "text:note"]  # once the writer is gone it goes through
+
+
+def test_regroup_backs_out_when_a_launch_opens_an_event_file_during_the_rebuild(tmp_path, monkeypatch):
+    """A relaunch that opens its tb/ event file while the rebuild runs is not hidden in a .bak with the originals: the
+    tool backs out before it renames anything, --force or not."""
+    from torch.utils.tensorboard import SummaryWriter
+
+    rg = load_tool("regroup_tb")
+    run = make_run(tmp_path / "runs" / "relaunch")
+    before, tag_map = _sizes(run), (run / "metrics" / "tag_map.json").read_bytes()
+    write, writers = rg._write, []
+
+    def write_then_relaunch(r, out_dir):
+        res = write(r, out_dir)
+        writers.append(SummaryWriter(str(run / "tb"), purge_step=4, flush_secs=3600))  # the resumed RunLogger's
+        return res
+
+    monkeypatch.setattr(rg, "_write", write_then_relaunch)
+    try:
+        with pytest.raises(rg.BeingWritten, match="appeared in tb/ during the rebuild") as e:
+            rg.regroup(run, force=True)
+        assert isinstance(e.value, SystemExit)
+        after = _sizes(run)
+        (opened,) = set(after) - set(before)
+        assert "tfevents" in opened and all(after[n] == before[n] for n in before)  # nothing renamed
+        assert not list(run.glob(".regroup-*")) and (run / "metrics" / "tag_map.json").read_bytes() == tag_map
+    finally:
+        for w in writers:
+            w.close()
 
 
 def test_regroup_with_a_real_writer_holding_the_file(tmp_path):

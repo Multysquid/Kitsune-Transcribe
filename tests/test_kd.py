@@ -10,15 +10,17 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
+from fixtures import REAL, need_real  # noqa: E402
 from kitsune.kd import L2SP, W_CE, W_KL, kd_losses, kd_objective, module_key  # noqa: E402
 
 V, K = 16384, 16
-REAL_NPZ = ROOT / "teacher_out" / "reazon_small" / "train-00000.npz"
+REAL_NPZ = REAL / "teacher_out" / "reazon_small" / "train-00000.npz"
 
 
 def teacher_logits(n: int, seed: int) -> torch.Tensor:
@@ -172,8 +174,8 @@ def test_objective_weights():
     assert (W_KL, W_CE) == (1.0, 0.8)
 
 
-@pytest.mark.skipif(not REAL_NPZ.exists(), reason="teacher_out shard not present")
 def test_real_teacher_rows():
+    need_real(REAL_NPZ)
     z = np.load(REAL_NPZ)  # read-only
     n = 512
     top_idx = torch.from_numpy(z["topk_idx"][:n].astype(np.int64))

@@ -2,14 +2,19 @@
 
 Run this on the laptop. It
   1. searches on-demand offers with the strict host filter (D45a): 1x A100 SXM4 40 GB, verified, reliability >= 0.98,
-     driver CUDA >= 13.0 (the image's torch is cu130), >= 12 effective CPU cores, >= 64 GB RAM, disk_bw and inet_down
-     >= 500, a direct port and room for the 150 GB disk, sorted by $/h; if none, the same filter on SXM4 80 GB;
+     driver CUDA >= 13.0 (the image's torch is cu130), >= 12 effective CPU cores, >= 64 GB RAM, disk_bw, inet_down and
+     inet_up >= 500, a direct port and room for the 150 GB disk, sorted by $/h; if none, the same filter on SXM4 80 GB;
   2. prints the offers and the exact `vastai create instance` command: the image by digest, --disk 150, --ssh --direct,
      the KITSUNE_* env, TZ=UTC and --onstart vast/onstart_stub.sh (which clones the repo and runs vast/onstart.sh);
   3. creates the instance only with --yes. Spending money is always the user's explicit step.
-The git, image and HF checks run before the offer search, so they report problems even without the vastai CLI. The HF
+The git, image and HF checks run before the offer search, so they report problems even without the vastai CLI. The
+image check reads the commit the image was built from (its org.opencontainers.image.revision label) and refuses it when
+requirements-train.txt or docker/Dockerfile differ at the commit to run (the build is still running or failed). The HF
 check refuses a data repo whose derived data is incomplete: a train source's teacher shard without its second opinion,
-or a selection that still drops rows as no_agree (both mean training on a fraction of the planned hours).
+or a selection that still drops rows as no_agree (both mean training on a fraction of the planned hours); a selection
+not built from the run config's sources, eval sets and selection_recipe, or with no kept rows for one of them
+(make_selection.py --config builds the right one); and a selection whose kept rows point at teacher output the repo
+lacks. It also refuses a data or output repo that is not private (both carry dataset reference transcripts).
 
 HF_TOKEN is never an argument and never part of the command: the box gets it from the vast ACCOUNT-level environment
 variables (D48a), so it does not appear in shell history, the process list or the instance config. The instance runs
@@ -18,6 +23,7 @@ the code at a pinned commit (KITSUNE_SHA), so this script refuses to rent for a 
 Usage:
   python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs        # look only
   python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --yes  # rent the cheapest
+Add --no-self-stop to debug a fresh box: a failed on-start or bootstrap then leaves it running (KITSUNE_NO_SELF_STOP=1).
 Needs the vastai CLI (`pip install vastai==1.8.0`, then `vastai set api-key <key>`); --help works without it.
 """
 import argparse
@@ -35,20 +41,32 @@ ROOT = Path(__file__).resolve().parents[1]
 
 VASTAI_PIN = "vastai==1.8.0"
 IMAGE_REPO = "ghcr.io/multysquid/kitsune-train"
+MANIFEST_ACCEPT = ", ".join(["application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json",
+                             "application/vnd.docker.distribution.manifest.list.v2+json",
+                             "application/vnd.docker.distribution.manifest.v2+json"])
+# what the image is built from (docker/smoke_import.py only runs in CI, never on the box)
+IMAGE_INPUTS = ("requirements-train.txt", "docker/Dockerfile")
 # the image (~12 GB unpacked, if vast counts it) + audio 23 GB + train/eval caches ~22 GB + derived data 2.3 GB + up to
 # 4 full states x 8.6 GB while rotating/uploading + ~9 weights x 1.2 GB: 80 GB fills mid-run, 150 GB leaves headroom
 DISK_GB = 150
 # traffic of one run for the cost line: ~25 GB of upstream audio down, ~30 GB of checkpoints and logs up
 EST_DOWN_GB, EST_UP_GB = 25, 30
 ONSTART = Path(__file__).resolve().parent / "onstart_stub.sh"
-ONSTART_MAX_BYTES = 4000  # the API's onstart field: vast documents 16 KB, one client SDK <= 4048 chars
+# vast's OpenAPI create-instance doc caps the onstart field at 4048 chars (gzip+base64 beyond that), its CLI guide says
+# 16 KB, and neither says whether a longer script is truncated or rejected: stay under the smaller limit
+ONSTART_MAX_BYTES = 4000
 DEFAULT_MAX_DPH = 2.0
+# the student dir files the trainer loads (03_build_student saves them all; the trainer has no processor fallback). The
+# same list is STUDENT_FILES in vast/bootstrap.sh's helper
+STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json")
 # D45a strict filter; vast converts cpu_ram/gpu_ram GB to MB itself. rentable/verified are also CLI defaults, spelled
-# out so the printed query is the whole truth.
+# out so the printed query is the whole truth. inet_up: the end phase's ~9.9 GB of checkpoint uploads must drain inside
+# fit_budget's fixed end reserve (scripts/04_distill.py) before finish.py can destroy the box; a slow uplink overruns it
+# and the watchdog stops the box at the deadline instead.
 HOST_FILTER = [
     "num_gpus=1", "verified=true", "rentable=true", "reliability>=0.98", "cuda_vers>=13.0",
-    "cpu_cores_effective>=12", "cpu_ram>=64", "disk_bw>=500", "inet_down>=500", "direct_port_count>=1",
-    f"disk_space>={DISK_GB}",
+    "cpu_cores_effective>=12", "cpu_ram>=64", "disk_bw>=500", "inet_down>=500", "inet_up>=500",
+    "direct_port_count>=1", f"disk_space>={DISK_GB}",
 ]
 # vast names both SXM4 sizes "A100 SXM4"; gpu_ram tells them apart (40 GB cards report 39-40 GB)
 TIERS = [
@@ -101,9 +119,23 @@ def parse_json(text: str):
 
 
 def vastai(exe: str, args: list[str]) -> str:
-    r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=180)
-    if r.returncode != 0:
-        raise LaunchError(f"vastai {' '.join(args[:2])} failed ({r.returncode}): {(r.stderr or r.stdout).strip()[:500]}")
+    """vastai 1.8.0 exits 0 on an API error (a 401 bad key on search, a 410 no_such_ask when the offer was taken before
+    the create): stdout stays empty and --raw puts {"error": true, ...} on stderr. Both calls here print JSON on
+    success (a search that finds nothing prints []), so an empty stdout is a failure too, reported with vast's reason.
+    A create that times out may still have rented an instance, so the error says where to look before a re-run."""
+    what = " ".join(args[:2])
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        hint = ""
+        if args[:2] == ["create", "instance"]:
+            label = args[args.index("--label") + 1] if "--label" in args else "kitsune-..."
+            hint = (f"; the instance may still have been created: check `vastai show instances` for label {label} "
+                    f"before re-running (or you may rent twice)")
+        raise LaunchError(f"vastai {what} timed out after 180 s{hint}") from None
+    if r.returncode != 0 or not r.stdout.strip() or '"error": true' in r.stderr:
+        raise LaunchError(f"vastai {what} failed ({r.returncode}): "
+                          f"{(r.stderr or r.stdout).strip()[:500] or 'no output'}")
     return r.stdout
 
 
@@ -123,8 +155,9 @@ def search_offers(exe: str) -> tuple[str, str, list[dict]]:
 def offer_table(offers: list[dict], limit: int = 10) -> str:
     cols = [("id", "id", "{}"), ("gpu", "gpu_name", "{}"), ("GB", "gpu_ram", "{:.0f}"), ("$/h", "dph_total", "{:.3f}"),
             ("rel", "reliability", "{:.3f}"), ("cuda", "cuda_max_good", "{}"), ("cpu", "cpu_cores_effective", "{:.0f}"),
-            ("ramGB", "cpu_ram", "{:.0f}"), ("down", "inet_down", "{:.0f}"), ("diskMB/s", "disk_bw", "{:.0f}"),
-            ("$/GBdn", "inet_down_cost", "{:.3f}"), ("$/GBup", "inet_up_cost", "{:.3f}"), ("where", "geolocation", "{}")]
+            ("ramGB", "cpu_ram", "{:.0f}"), ("down", "inet_down", "{:.0f}"), ("up", "inet_up", "{:.0f}"),
+            ("diskMB/s", "disk_bw", "{:.0f}"), ("$/GBdn", "inet_down_cost", "{:.3f}"),
+            ("$/GBup", "inet_up_cost", "{:.3f}"), ("where", "geolocation", "{}")]
     rows = [[h for h, _, _ in cols]]
     for o in offers[:limit]:
         row = []
@@ -143,6 +176,13 @@ def offer_table(offers: list[dict], limit: int = 10) -> str:
 
 def git(*args: str) -> str:
     return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def config_at(sha: str, config: str) -> dict:
+    """The run config the box runs: the file committed at `sha` (KITSUNE_SHA), not the working tree's, which differs
+    for a --sha other than HEAD. Read as UTF-8 bytes (git()'s text mode decodes with the locale's code page)."""
+    out = subprocess.run(["git", "-C", str(ROOT), "show", f"{sha}:{config}"], capture_output=True, check=True).stdout
+    return json.loads(out.decode("utf-8"))
 
 
 def git_checks(sha: str, config: str) -> list[str]:
@@ -164,16 +204,18 @@ def git_checks(sha: str, config: str) -> list[str]:
     return problems
 
 
+def _ghcr_token(name: str, timeout: float) -> str:
+    """Anonymous pull token for ghcr.io/<name> (the package must be public, D39a)."""
+    with urllib.request.urlopen(f"https://ghcr.io/token?scope=repository:{name}:pull&service=ghcr.io", timeout=timeout) as r:
+        return json.load(r)["token"]
+
+
 def resolve_image_digest(tag: str, timeout: float = 20) -> str:
     """Tag -> immutable `repo@sha256:...` via the anonymous GHCR registry API (the package must be public, D39a)."""
     name = IMAGE_REPO.split("/", 1)[1]
-    with urllib.request.urlopen(f"https://ghcr.io/token?scope=repository:{name}:pull&service=ghcr.io", timeout=timeout) as r:
-        token = json.load(r)["token"]
-    accept = ", ".join(["application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json",
-                        "application/vnd.docker.distribution.manifest.list.v2+json",
-                        "application/vnd.docker.distribution.manifest.v2+json"])
     req = urllib.request.Request(f"https://ghcr.io/v2/{name}/manifests/{tag}", method="HEAD",
-                                 headers={"Authorization": f"Bearer {token}", "Accept": accept})
+                                 headers={"Authorization": f"Bearer {_ghcr_token(name, timeout)}",
+                                          "Accept": MANIFEST_ACCEPT})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         digest = r.headers.get("Docker-Content-Digest")
     if not digest or not digest.startswith("sha256:"):
@@ -181,46 +223,158 @@ def resolve_image_digest(tag: str, timeout: float = 20) -> str:
     return f"{IMAGE_REPO}@{digest}"
 
 
+def image_revision(image: str, timeout: float = 20) -> str:
+    """The commit a pinned `ghcr.io/<name>@sha256:...` image was built from: the org.opencontainers.image.revision
+    label docker/metadata-action writes in image.yml, read anonymously from the image config (index -> linux/amd64
+    manifest -> config blob)."""
+    name, digest = image.split("/", 1)[1].split("@", 1)
+    auth = {"Authorization": f"Bearer {_ghcr_token(name, timeout)}"}
+
+    def get(path: str, accept: str):
+        req = urllib.request.Request(f"https://ghcr.io/v2/{name}/{path}", headers={**auth, "Accept": accept})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+
+    m = get(f"manifests/{digest}", MANIFEST_ACCEPT)
+    if "manifests" in m:  # an index: the build's image plus attestation entries (platform unknown/unknown)
+        amd64 = [x["digest"] for x in m["manifests"] if x.get("platform", {}).get("architecture") == "amd64"]
+        if not amd64:
+            raise LaunchError(f"{image} has no linux/amd64 image")
+        m = get(f"manifests/{amd64[0]}", MANIFEST_ACCEPT)
+    labels = get(f"blobs/{m['config']['digest']}", "*/*").get("config", {}).get("Labels") or {}
+    rev = labels.get("org.opencontainers.image.revision")
+    if not rev:
+        raise LaunchError(f"{image} carries no org.opencontainers.image.revision label")
+    return rev
+
+
+def image_problems(image: str, sha: str) -> list[str]:
+    """The image must hold the dependencies of the commit the box runs. CI moves a branch tag only after the build and
+    its smoke test pass, so while a requirements-train.txt / Dockerfile change is still building, or after its smoke
+    failed, the tag still names the previous image, and nothing on the box compares the pins: the new code would run
+    on the old libraries (a crash after the paid bootstrap, or results credited to pins they did not use)."""
+    try:
+        rev = image_revision(image)
+    except (OSError, LaunchError, KeyError, ValueError) as e:
+        return [f"cannot read the commit {image} was built from ({type(e).__name__}: {e}), so its dependencies cannot "
+                f"be checked against {sha[:12]}"]
+    try:
+        git("cat-file", "-e", f"{rev}^{{commit}}")
+    except (subprocess.CalledProcessError, OSError):
+        return [f"{image} was built from {rev[:12]}, which this clone lacks: git fetch, then re-run"]
+    try:
+        changed = git("diff", "--name-only", rev, sha, "--", *IMAGE_INPUTS).split()
+    except (subprocess.CalledProcessError, OSError):
+        return [f"cannot compare {IMAGE_INPUTS} between the image's build commit {rev[:12]} and {sha[:12]}"]
+    if changed:
+        return [f"{image} was built from {rev[:12]} but {sha[:12]} changes {changed}: wait for the image build (or "
+                f"check whether its smoke test failed in the Actions tab), then re-run"]
+    return []
+
+
 def data_problems(files: list[str], cfg: dict) -> list[str]:
     """What the run config needs from the data repo's file list (bootstrap.sh's plan() applies the same rules on the
-    box, where a failure is already billed): the teacher/second-opinion meta, the selection, the student config, teacher
-    shards for every train source and eval set, and a second opinion for EVERY train source teacher shard.
-    make_selection drops the rows of a shard without one as no_agree, so a partial 02b pass silently shrinks the train
-    set."""
+    box, where a failure is already billed): the teacher/second-opinion meta, the selection, the student's weights,
+    config, processor and tokenizer (STUDENT_FILES), teacher shards for every train source and eval set, and a second
+    opinion for EVERY train source teacher shard. make_selection drops the rows of a shard without one as no_agree, so
+    a partial 02b pass silently shrinks the train set. The run config's selection_recipe.partial_second_opinion lists
+    the sources that train on their judged shards only, by decision: for them one judged shard is enough (the
+    selection check makes sure the selection was built that way, with not_judged rows instead of no_agree)."""
     teacher_root, second_root = cfg.get("teacher_root", "teacher_out"), cfg.get("second_root", "second_out")
     have = set(files)
+    student = cfg["student"].rstrip("/")
     problems = [f"no {f}" for f in (f"{teacher_root}/meta.json", f"{second_root}/meta.json", cfg["selection"],
-                                    f"{cfg['student'].rstrip('/')}/config.json") if f not in have]
+                                    *(f"{student}/{n}" for n in STUDENT_FILES)) if f not in have]
 
     def stems(root: str, s: str, ext: str) -> set[str]:
         return {f.rsplit("/", 1)[1][: -len(ext)] for f in files if f.startswith(f"{root}/{s}/") and f.endswith(ext)}
 
     sources = list(cfg.get("sources", []))
+    partial = set((cfg.get("selection_recipe") or {}).get("partial_second_opinion", []))
     for s in dict.fromkeys(sources + list(cfg.get("eval_sets", []))):
         teacher = stems(teacher_root, s, ".npz")
         if not teacher:
             problems.append(f"no {teacher_root}/{s}/*.npz")
-        elif s in sources and (gap := teacher - stems(second_root, s, ".jsonl")):
+        elif s in partial and s in sources and not teacher & stems(second_root, s, ".jsonl"):
+            problems.append(f"{second_root}/{s}: none of its {len(teacher)} teacher shards has a second opinion")
+        elif s in sources and s not in partial and (gap := teacher - stems(second_root, s, ".jsonl")):
             problems.append(f"{second_root}/{s}: {len(gap)} of {len(teacher)} teacher shards have no second opinion "
                             f"(e.g. {min(gap)}): finish scripts/02b_second_opinion.py, rebuild the selection, upload")
     return problems
 
 
-def selection_problems(path: Path, name: str) -> list[str]:
-    """A selection built before the second-opinion pass finished drops those rows as no_agree."""
-    import pandas as pd
+def _by_source(items) -> dict[str, float]:
+    """make_selection.py's --agree-max-source values (SOURCE=A) as {source: threshold}."""
+    out = {}
+    for item in items or []:
+        src, _, val = str(item).partition("=")
+        out[src] = float(val)
+    return out
 
-    sel = pd.read_parquet(path, columns=["source", "reason"])
+
+def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None = None) -> list[str]:
+    """The selection must be the one the run config describes. make_selection.py records its arguments in the parquet
+    (metadata b"kitsune_selection"): they must match the config's sources, eval_sets and selection_recipe (agreement
+    thresholds, label-filtered hold-outs) - a rebuild with a flag forgotten would otherwise silently train on other
+    rows or lose a hold-out. Every configured train source and eval set must keep rows (the trainer takes an empty one
+    in silence). And a selection built before the second-opinion pass finished drops those rows as no_agree.
+    With `have` (the data repo's file list) every kept row's teacher_file must be there as .npz and .jsonl: the
+    trainer's build_stores raises on a missing one, after the paid bootstrap, and data_problems only asks for SOME
+    teacher shard per source (a train npz also satisfies the galgame hold-out)."""
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    rebuild = "rebuild it with scripts/make_selection.py --config <the run config> and upload it"
+    problems = []
+    raw = (pq.ParquetFile(path).schema_arrow.metadata or {}).get(b"kitsune_selection")
+    args = json.loads(raw).get("args") if raw else None
+    recipe = cfg.get("selection_recipe")
+    if not isinstance(recipe, dict):
+        problems.append("the run config has no selection_recipe to check the selection against")
+    elif not isinstance(args, dict):
+        problems.append(f"{name} has no record of how it was built (kitsune_selection metadata): {rebuild}")
+    else:
+        got = dict(sources=set(args.get("sources") or []), eval_sets=set(args.get("eval_sets") or []),
+                   agree_max=args.get("agree_max"), agree_max_source=_by_source(args.get("agree_max_source")),
+                   filter_eval_sets=set(args.get("filter_eval_sets") or []),
+                   partial_second_opinion=set(args.get("partial_second_opinion") or []))
+        want = dict(sources=set(cfg.get("sources", [])), eval_sets=set(cfg.get("eval_sets", [])),
+                    agree_max=float(recipe["agree_max"]), agree_max_source=_by_source(recipe["agree_max_source"]),
+                    filter_eval_sets=set(recipe["filter_eval_sets"]),
+                    partial_second_opinion=set(recipe.get("partial_second_opinion", [])))
+        for k, v in want.items():
+            if got[k] != v:
+                shown = [sorted(x.items()) if isinstance(x, dict) else sorted(x) if isinstance(x, set) else x
+                         for x in (got[k], v)]
+                problems.append(f"{name} was built with {k} {shown[0]}, the run config says {shown[1]}: {rebuild}")
+
+    sel = pd.read_parquet(path, columns=["source", "split", "keep", "reason", "teacher_file"])
+    kept = sel[sel["keep"]].groupby(["source", "split"]).size()
+    for split, key in (("train", "sources"), ("eval", "eval_sets")):
+        empty = [s for s in cfg.get(key, []) if not kept.get((s, split), 0)]
+        if empty:
+            problems.append(f"{name} keeps no {split} rows of {empty} (in the config's {key}): {rebuild}")
     bad = sel[sel["reason"] == "no_agree"]
-    if bad.empty:
-        return []
-    return [f"{name} drops {len(bad)} rows as no_agree ({bad['source'].value_counts().to_dict()}): rebuild it with "
-            f"scripts/make_selection.py after the second-opinion pass and upload it"]
+    if not bad.empty:
+        problems.append(f"{name} drops {len(bad)} rows as no_agree ({bad['source'].value_counts().to_dict()}): rebuild "
+                        f"it with scripts/make_selection.py after the second-opinion pass and upload it")
+    if have is not None:
+        teacher_root = cfg.get("teacher_root", "teacher_out")
+        need = sorted({f"{teacher_root}/{tf}{ext}" for tf in sel.loc[sel["keep"], "teacher_file"].unique()
+                       for ext in (".npz", ".jsonl")})
+        absent = [f for f in need if f not in have]
+        if absent:
+            problems.append(f"{name} keeps rows whose teacher output is not in the data repo: {len(absent)} of "
+                            f"{len(need)} files missing (e.g. {absent[0]}): upload the teacher_out the selection was "
+                            f"built from")
+    return problems
 
 
 def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, list[str]]:
     """-> (data repo commit to pin, problems). Uses the laptop's own HF login, read-only (the selection, ~2 MB, is
-    downloaded to a temporary dir)."""
+    downloaded to a temporary dir). Both repos must be private: they hold dataset reference transcripts (`ref` in
+    teacher_out/*.jsonl, the eval tables and the samples) whose terms forbid republishing them, and the trainer's
+    hf.private only applies when it creates a repo, never to the existing ones launch requires."""
     import tempfile
 
     from huggingface_hub import HfApi, hf_hub_download
@@ -229,19 +383,33 @@ def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, 
     try:
         info = api.dataset_info(data_repo)
         rev = info.sha
+        if info.private is not True:
+            problems.append(f"{data_repo} is not private: teacher_out/second_out hold dataset transcripts (JSUT, CV, "
+                            f"ReazonSpeech, Galgame) that must not be republished; hf repos settings {data_repo} "
+                            f"--repo-type dataset --private")
         files = api.list_repo_files(data_repo, repo_type="dataset", revision=rev)
         problems += [f"{data_repo}@{rev[:12]}: {p}" for p in data_problems(files, cfg)]
         if cfg["selection"] in files:
             with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
                 local = hf_hub_download(data_repo, cfg["selection"], repo_type="dataset", revision=rev, local_dir=tmp)
-                problems += selection_problems(Path(local), cfg["selection"])
+                problems += selection_problems(Path(local), cfg["selection"], cfg, set(files))
     except Exception as e:
         problems.append(f"cannot read dataset {data_repo}: {type(e).__name__}: {e}")
     try:
-        api.model_info(out_repo)
+        private = api.model_info(out_repo).private
     except Exception as e:
-        problems.append(f"cannot read output model repo {out_repo} ({type(e).__name__}); create it first: "
-                        f"hf repos create {out_repo} --private")
+        # the Hub answers 401/404 (RepositoryNotFoundError) both for a missing repo and for a private one this login
+        # cannot see; a 5xx, 429 or dropped connection is the Hub's (model_info is not retried), so re-run
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (401, 403, 404):
+            problems.append(f"cannot read output model repo {out_repo} ({type(e).__name__}: {e}): create it first "
+                            f"(hf repos create {out_repo} --private) or check the laptop's login (hf auth whoami)")
+        else:
+            problems.append(f"Hub error reading output model repo {out_repo} ({type(e).__name__}: {e}); re-run launch")
+    else:
+        if private is not True:
+            problems.append(f"{out_repo} is not private: the run uploads eval and sample tables with reference "
+                            f"transcripts; hf repos settings {out_repo} --private")
     return rev, problems
 
 
@@ -261,8 +429,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--offer-id", type=int, default=None, help="rent this offer from the search results")
     ap.add_argument("--max-dph", type=float, default=DEFAULT_MAX_DPH, help="refuse offers above this $/h")
     ap.add_argument("--max-hours", type=float, default=5.5, help="watchdog cap from first boot (KITSUNE_MAX_HOURS)")
+    ap.add_argument("--no-self-stop", action="store_true",
+                    help="debugging: the box does not stop itself when its on-start or bootstrap fails "
+                         "(KITSUNE_NO_SELF_STOP=1); the watchdog still stops it once onstart.sh has started it")
     ap.add_argument("--no-hf-check", action="store_true", help="skip the read-only HF preflight")
-    ap.add_argument("--skip-git-checks", action="store_true", help="rent even if the commit looks unpushed/dirty")
+    ap.add_argument("--skip-git-checks", action="store_true",
+                    help="rent even if the commit looks unpushed/dirty or the image was built from other dependencies")
     ap.add_argument("--dry-run", action="store_true", help="never create, even with --yes")
     ap.add_argument("--yes", action="store_true", help="actually create the instance (this spends money)")
     args = ap.parse_args(argv)
@@ -275,23 +447,34 @@ def main(argv: list[str] | None = None) -> int:
     if not args.skip_git_checks:
         errors += git_checks(sha, args.config)
 
-    image = args.image
+    image, pinned = args.image, True
     if image is None:
         tag = args.image_tag or sanitize_tag(git("rev-parse", "--abbrev-ref", "HEAD"))
         try:
             image = resolve_image_digest(tag)
         except (OSError, urllib.error.URLError, LaunchError, KeyError, ValueError) as e:
-            errors.append(f"cannot resolve {IMAGE_REPO}:{tag} to a digest ({e}); is the CI build done and the "
-                          f"package public? Or pass --image {IMAGE_REPO}@sha256:...")
-            image = f"{IMAGE_REPO}@sha256:<unresolved>"
+            errors.append(f"cannot resolve {IMAGE_REPO}:{tag} to a digest ({e}). CI tags an image only for branches "
+                          f"whose pushes touch docker/**, requirements-train.txt or .github/workflows/image.yml (after "
+                          f"its smoke test passes), so a code-only branch or a detached HEAD has none: pass --image-tag "
+                          f"main (the build-revision check then confirms its dependencies match {sha[:12]}) or --image "
+                          f"{IMAGE_REPO}@sha256:... (the package must be public)")
+            image, pinned = f"{IMAGE_REPO}@sha256:<unresolved>", False
     elif "@sha256:" not in image:
         errors.append(f"--image must be pinned by digest (...@sha256:...), got {image}")
+        pinned = False
+    if pinned and not args.skip_git_checks:
+        errors += image_problems(image, sha)
 
     data_rev = None
     if not args.no_hf_check:
-        cfg = json.loads((ROOT / args.config).read_text(encoding="utf-8"))
-        data_rev, problems = hf_preflight(args.data_repo, args.out_repo, cfg)
-        errors += problems
+        try:
+            cfg = config_at(sha, args.config)
+        except (subprocess.CalledProcessError, OSError, ValueError) as e:
+            errors.append(f"cannot read {args.config} at {sha[:12]} ({type(e).__name__}), so the HF preflight did "
+                          f"not run")
+        else:
+            data_rev, problems = hf_preflight(args.data_repo, args.out_repo, cfg)
+            errors += problems
     stub = ONSTART.read_bytes()
     if len(stub) > ONSTART_MAX_BYTES:
         errors.append(f"{ONSTART.name} is {len(stub)} bytes (> {ONSTART_MAX_BYTES}): vast may truncate the on-start "
@@ -307,6 +490,8 @@ def main(argv: list[str] | None = None) -> int:
            "KITSUNE_OUT_REPO": args.out_repo, "KITSUNE_MAX_HOURS": f"{args.max_hours:g}", "TZ": "UTC"}
     if data_rev:
         env["KITSUNE_DATA_REVISION"] = data_rev
+    if args.no_self_stop:  # inside the one --env value: vastai has no -e option, and a second --env replaces the first
+        env["KITSUNE_NO_SELF_STOP"] = "1"
 
     tier, query, offers = search_offers(exe)
     print(f"\nsearch ({tier or 'nothing found'}): vastai {shlex.join(search_args(query or build_query(TIERS[0][1])))}")

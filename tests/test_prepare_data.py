@@ -1,24 +1,34 @@
-"""Tests for the Emilia ingest paths of scripts/01_prepare_data.py (emilia_yodas, emilia_nc) and its disk guard.
+"""Tests for the ingest paths of scripts/01_prepare_data.py (emilia_yodas, emilia_nc, galgame, HF parquet) and its
+disk guard.
 
-The HF listing and downloads are faked: tars are built in tmp_path with FLAC bytes under .mp3 member names (sf.info
-sniffs the container, not the extension), so no network and no MP3 encoder are needed. CPU only.
+The HF listing and downloads are faked: tars and parquet files are built in tmp_path with FLAC bytes (under .mp3 /
+.ogg member names for the tars: sf.info sniffs the container, not the extension), so no network and no MP3 encoder
+are needed. CPU only.
+
+The box rebuilds the audio shards from scratch while the teacher outputs were made from the laptop's shards, which
+were often built by an interrupted-and-resumed ingest; the two are joined by id. So a resumed ingest must give
+exactly the ids and splits of a fresh one, and the galgame hold-out must be the first N KEPT rows.
 """
+import functools
 import io
 import json
 import shutil
 import sys
 import tarfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixtures import load_script  # noqa: E402
 
-from kitsune.store import iter_rows, read_manifest  # noqa: E402
+from kitsune.store import ShardWriter, iter_rows, lock_data_root, read_manifest  # noqa: E402
 
 prep = load_script("01_prepare_data")
 
@@ -73,6 +83,51 @@ def ids(root: Path, source: str) -> list[str]:
     return [r["id"] for sh in read_manifest(root) if sh.source == source for r in iter_rows(root / sh.path, ["id"])]
 
 
+def split_ids(root: Path, source: str) -> list[tuple[str, str]]:
+    return sorted((sh.split, r["id"]) for sh in read_manifest(root) if sh.source == source
+                  for r in iter_rows(root / sh.path, ["id"]))
+
+
+@pytest.fixture()
+def small_shards(monkeypatch):
+    """Toy shard and hold-out sizes: the real 2048 rows per shard and 1000 galgame eval rows need ~3000 clips. The
+    rows_per_shard default is bound at def time, so patching store.ROWS_PER_SHARD would do nothing."""
+    monkeypatch.setattr(prep, "ShardWriter", functools.partial(ShardWriter, rows_per_shard=4))
+    monkeypatch.setattr(prep, "GALGAME_EVAL_ROWS", 3)
+
+
+def crash_after(monkeypatch, n: int):
+    """Make Ingest.add raise after n calls (a crash mid input file); returns a function that undoes it."""
+    real, calls = prep.Ingest.add, [0]
+
+    def add(self, *a, **kw):
+        calls[0] += 1
+        if calls[0] > n:
+            raise RuntimeError("simulated crash")
+        return real(self, *a, **kw)
+    monkeypatch.setattr(prep.Ingest, "add", add)
+    return lambda: monkeypatch.setattr(prep.Ingest, "add", real)
+
+
+def make_galgame_tar(path: Path, clips: list[tuple[str, str, float]]):
+    """clips: (key, text, seconds) -> key.ogg + key.txt members, alternating which comes first (webdataset pairs
+    arrive in either order)."""
+    with tarfile.open(path, "w") as tf:
+        for j, (key, text, sec) in enumerate(clips):
+            pair = [("txt", text.encode()), ("ogg", flac(sec))]
+            for ext, data in (pair if j % 2 else pair[::-1]):
+                info = tarfile.TarInfo(f"{key}.{ext}")
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+
+def make_reazon_parquet(path: Path, names: list[str]):
+    audio_t = pa.struct([("bytes", pa.binary()), ("path", pa.string())])
+    schema = pa.schema([("audio", audio_t), ("transcription", pa.string()), ("name", pa.string())])
+    rows = [dict(audio=dict(bytes=flac(1.0), path=None), transcription="テキストです。", name=n) for n in names]
+    pq.write_table(pa.Table.from_pylist(rows, schema=schema), path)
+
+
 def test_emilia_nc_ingest_filters_budget_and_resume(tmp_path, fake_hub):
     t0, t1 = tmp_path / "JA-B000000_standard.tar.gz", tmp_path / "JA-B000001_standard.tar.gz"
     make_tar(t0, [("JA_B00000_S00000_W000000", "こんにちは、今日は。", 2.0),
@@ -121,7 +176,87 @@ def test_disk_guard_stops_before_a_download(tmp_path, fake_hub, monkeypatch):
         ingest(tmp_path / "data", "emilia_nc", prep.ingest_emilia_nc, float("inf"))
 
 
+
+def test_one_ingest_per_data_root(tmp_path, monkeypatch):
+    """Two ingests into one data root (another launcher started while the first still runs) overwrite each other's
+    shards and progress: the second exits before it touches anything, and the lock goes with its holder."""
+    root = tmp_path / "data"
+
+    def ingested(*a, **kw):
+        raise AssertionError("ingested while another run held the data root")
+
+    monkeypatch.setattr(prep, "ingest_hf_parquet", ingested)
+    monkeypatch.setattr(sys, "argv", ["01_prepare_data.py", "--data", str(root), "--sources", "eval_jsut"])
+    first = lock_data_root(root)
+    assert first is not None
+    try:
+        assert lock_data_root(root) is None  # a second handle is refused, as a second process's would be
+        with pytest.raises(SystemExit, match="another 01_prepare_data is ingesting"):
+            prep.main()
+    finally:
+        first.close()
+    for _ in range(40):  # Windows may take a moment to drop a closed handle's lock
+        again = lock_data_root(root)
+        if again is not None:
+            break
+        time.sleep(0.05)
+    assert again is not None
+    again.close()
+
+
 def test_reazon_tiers_dedup_against_every_smaller_tier():
     assert set(prep.DEDUP_AGAINST["reazon_large"]) == {"reazon_small", "reazon_medium"}
     assert prep.DEDUP_AGAINST["reazon_medium"] == ("reazon_small",)
     assert "reazon_large" in prep.HF_PARQUET_SOURCES and "emilia_nc" in prep.ALL_SOURCES
+
+
+def test_galgame_resume_matches_a_fresh_run(tmp_path, fake_hub, small_shards, monkeypatch):
+    t0, t1 = tmp_path / "a-000.tar", tmp_path / "a-001.tar"
+    make_galgame_tar(t0, [(f"k{i}", "テキストです。", 40.0 if i == 1 else 1.0) for i in range(10)])  # k1 > 30 s
+    make_galgame_tar(t1, [(f"m{i}", "テキストです。", 1.0) for i in range(3)])
+    fake_hub.update({t0.name: t0, t1.name: t1})
+    fresh = tmp_path / "fresh"
+    ingest(fresh, "galgame", prep.ingest_galgame, 2)
+    # absolute, not only fresh == resumed: the box's fresh ingest must match the laptop's frozen teacher outputs
+    want = sorted([("eval", f"galgame/k{i}") for i in (0, 2, 3)]  # the first 3 KEPT rows: k1 is too long
+                  + [("train", f"galgame/{k}") for k in [f"k{i}" for i in range(4, 10)] + ["m0", "m1", "m2"]])
+    assert split_ids(fresh, "galgame") == want
+    # crash after 8 adds (k1 rejected): train-00000 = k4..k7 is flushed while the eval rows k0, k2, k3 are still
+    # buffered, a crash inside the first tar before the eval shard is written. After 10 adds the first tar is finished
+    # (eval shard included) and the crash is in the second: the hold-out count must then come from the manifest.
+    after_crash = {8: [("train", f"galgame/k{i}") for i in range(4, 8)], 10: [x for x in want if "/m" not in x[1]]}
+    for n, dup in ((8, 4), (10, 0)):
+        resumed = tmp_path / f"resumed{n}"
+        restore = crash_after(monkeypatch, n)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            ingest(resumed, "galgame", prep.ingest_galgame, 2)
+        assert split_ids(resumed, "galgame") == after_crash[n]
+        restore()
+        ing = ingest(resumed, "galgame", prep.ingest_galgame, 2)
+        assert split_ids(resumed, "galgame") == want, f"crash after {n} adds"
+        assert ing.stats["dup"] == dup
+
+
+def test_parquet_resume_matches_a_fresh_run(tmp_path, fake_hub, small_shards, monkeypatch):
+    repo, split = prep.HF_PARQUET_SOURCES["reazon_small"]
+    sizes = (8, 3)
+    for j, n in enumerate(sizes):
+        p = tmp_path / f"train-{j}.parquet"
+        make_reazon_parquet(p, [f"f{j}r{i}" for i in range(n)])
+        fake_hub[f"data/train-{j}.parquet"] = p
+    fresh, resumed = tmp_path / "fresh", tmp_path / "resumed"
+    ingest(fresh, "reazon_small", prep.ingest_hf_parquet, repo, split)
+    want = sorted(("train", f"reazon_small/f{j}r{i}") for j, n in enumerate(sizes) for i in range(n))
+    assert split_ids(fresh, "reazon_small") == want
+    restore = crash_after(monkeypatch, 6)  # train-00000 (f0r0..f0r3) flushed; f0r4, f0r5 lost with the buffer
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split)
+    restore()
+    ing = ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split)
+    assert split_ids(resumed, "reazon_small") == want and ing.stats["dup"] == 4
+    # a larger tier skips every row already in a smaller one (DEDUP_AGAINST), by name
+    p = tmp_path / "train-2.parquet"
+    make_reazon_parquet(p, ["new0"])
+    fake_hub["data/train-2.parquet"] = p
+    ing = ingest(resumed, "reazon_medium", prep.ingest_hf_parquet, *prep.HF_PARQUET_SOURCES["reazon_medium"])
+    assert ids(resumed, "reazon_medium") == ["reazon_medium/new0"] and ing.stats["dup"] == sum(sizes)

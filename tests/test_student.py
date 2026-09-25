@@ -52,6 +52,10 @@ def tiny_teacher(seed: int = 0, **kw) -> CohereAsrForConditionalGeneration:
             bn.running_mean.normal_(0.0, 0.5)
             bn.running_var.uniform_(0.5, 2.0)
             bn.num_batches_tracked.fill_(276000)
+        # HF zero-inits every Linear bias; the real teacher's are not (FFN |b| ~0.03, max ~0.12). Non-zero here so the
+        # FFN bias slices (and proj_out.bias) are checked by value, not as 0 == 0.
+        for lin in (x for x in m.modules() if isinstance(x, torch.nn.Linear) and x.bias is not None):
+            lin.bias.normal_(0.0, 0.1)
     return m
 
 
@@ -165,8 +169,10 @@ def test_build_student_tiny():
     ff = student.model.encoder.layers[1].feed_forward2  # student layer 1 <- teacher layer 2
     idx = keep[(2, "feed_forward2")]
     assert torch.equal(ff.linear1.weight, teacher.model.encoder.layers[2].feed_forward2.linear1.weight[idx])
+    assert torch.equal(ff.linear1.bias, teacher.model.encoder.layers[2].feed_forward2.linear1.bias[idx])
     assert torch.equal(ff.linear2.weight, teacher.model.encoder.layers[2].feed_forward2.linear2.weight[:, idx])
     assert torch.equal(ff.linear2.bias, teacher.model.encoder.layers[2].feed_forward2.linear2.bias)
+    assert ff.linear1.bias.abs().sum() > 0  # a zero bias would make the slice checks above vacuous
     bn_s, bn_t = student.model.encoder.layers[2].conv.norm, teacher.model.encoder.layers[3].conv.norm
     assert torch.equal(bn_s.running_var, bn_t.running_var) and int(bn_s.num_batches_tracked) == 276000
     assert bn_s.running_var.data_ptr() != bn_t.running_var.data_ptr()  # copied, not shared
@@ -348,6 +354,14 @@ def test_save_load_roundtrip(tmp_path):
     S.save_student(student, out, processor=None, meta=meta)
 
     assert {"config.json", "generation_config.json", "model.safetensors", "student_meta.json"} <= set(os.listdir(out))
+    # the model card (licence terms, the Apache-2.0 modified-from notice) travels with the weights
+    card = (out / "README.md").read_text(encoding="utf-8")
+    assert card == S.MODEL_CARD.read_text(encoding="utf-8")
+    assert "license: other" in card and f"base_model: {S.TEACHER_ID}" in card
+    assert "b1eacc2686a3d08ceaae5f24a88b1d519620bc09" in card and "non-commercial" in card
+    # the licence texts it names (the Galgame card's own license_link points to a missing LICENSE.md)
+    assert "https://www.gnu.org/licenses/gpl-3.0.txt" in card and "3fb86654222b3f0af0f7c332ae6a0ef9752a9451" in card
+    assert all(f"https://creativecommons.org/licenses/by/{v}/" in card for v in ("4.0", "3.0"))
     with safe_open(out / "model.safetensors", "pt") as f:
         keys = set(f.keys())
         dtypes = {k: f.get_slice(k).get_dtype() for k in keys}
@@ -419,6 +433,15 @@ def test_build_script_help_is_light():
     assert r.stdout.strip().endswith("LIGHT")
 
 
+def test_build_script_calibrates_on_the_viability_sources_by_default():
+    """The documented plain command rebuilds students/b20x2560-d4, which was calibrated on every viability source."""
+    from fixtures import load_script
+
+    viability = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
+    args = load_script("03_build_student").parse_args([])
+    assert args.sources == viability["sources"] and args.out == ROOT / viability["student"]
+
+
 def test_build_script_end_to_end_tiny(tmp_path):
     """03 on a synthetic corpus in the real on-disk formats with a tiny saved teacher, on CPU: build, the no-op re-run,
     a forced rebuild that reuses importance.pt, and the resume of a run that died in the step-0 eval."""
@@ -452,6 +475,8 @@ def test_build_script_end_to_end_tiny(tmp_path):
         meta["kept"]["ffn"]["2.feed_forward1"])
     assert 0 < meta["importance"]["kept_mass_min"] <= meta["importance"]["kept_mass_mean"] < 1
     assert meta["params"]["total"] == meta["params"]["closed_form"]
+    assert "teacher_revision" in meta and meta["teacher_revision"] is None  # a local teacher dir has no hub commit
+    assert (out / "README.md").exists()  # the model card
     assert meta["step0"]["n_per_set"] == {"eval_x": 4}
     assert meta["step0"]["greedy"]["sets"]["eval_x"]["n"] == 4
     assert "kl" in meta["step0"]["teacher_forced"]["sets"]["eval_x"]
@@ -477,6 +502,55 @@ def test_build_script_end_to_end_tiny(tmp_path):
     assert mod.main(argv) == 0
     m3 = S.load_meta(out)
     assert m3["stage"] == "complete" and "resumed" in m3["timestamps"] and m3["step0"]["n_per_set"] == {"eval_x": 4}
+
+
+def test_build_script_refuses_a_teacher_commit_the_targets_did_not_come_from(tmp_path):
+    """The student's init weights and tokenizer must come from the teacher commit teacher_out/meta.json records; an
+    unknown side (a local teacher dir, a meta.json from before model_revision was recorded, none at all) passes."""
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    a, b = "a" * 40, "b" * 40
+    mod.check_teacher_matches_targets(tmp_path, a)  # no meta.json
+    (tmp_path / "meta.json").write_text(json.dumps({"model": S.TEACHER_ID}), encoding="utf-8")
+    mod.check_teacher_matches_targets(tmp_path, a)  # legacy meta.json
+    (tmp_path / "meta.json").write_text(json.dumps({"model": S.TEACHER_ID, "model_revision": a}), encoding="utf-8")
+    mod.check_teacher_matches_targets(tmp_path, a)
+    mod.check_teacher_matches_targets(tmp_path, None)  # local teacher dir
+    with pytest.raises(SystemExit, match=f"--teacher-revision {a}"):
+        mod.check_teacher_matches_targets(tmp_path, b)
+
+
+def test_importance_cache_is_keyed_on_the_teacher_commit(tmp_path, monkeypatch):
+    """importance.pt computed from one teacher commit is not reused for another, nor is one written before the key
+    held the commit: other weights rank other FFN neurons."""
+    from types import SimpleNamespace
+
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    computed = []
+
+    def fake_importance(teacher, feats, layers, device):
+        computed.append(teacher.config._commit_hash)
+        return {(l, n): torch.rand(8) for l in layers for n in S.FFN_NAMES}
+
+    monkeypatch.setattr(S, "ffn_importance", fake_importance)
+    utts = [dict(id=f"u{i}", duration=1.0, source="s", wave=None) for i in range(3)]
+    args = SimpleNamespace(teacher=S.TEACHER_ID, calib_batch_s=10.0)
+    spec = SimpleNamespace(enc_layers=[0, 2])
+
+    def reused(commit):
+        teacher = SimpleNamespace(config=SimpleNamespace(_commit_hash=commit))
+        _, info = mod.load_or_compute_importance(teacher, None, utts, args, spec, "cpu", tmp_path, log=lambda *_: None)
+        return info["reused"]
+
+    a, b = "a" * 40, "b" * 40
+    assert [reused(a), reused(a), reused(b)] == [False, True, False] and computed == [a, b]
+    c = torch.load(tmp_path / "importance.pt", weights_only=True)  # as written before the key held the commit
+    c["key"].pop("teacher_revision")
+    torch.save(c, tmp_path / "importance.pt")
+    assert reused(b) is False and computed == [a, b, b]
 
 
 def test_importance_state_roundtrip(tmp_path):
@@ -519,9 +593,13 @@ def test_build_default_student_from_real_teacher():
     t_enc, s_enc = teacher.model.encoder.layers, student.model.encoder.layers
     for i in (0, 9, 19):
         tl = spec.enc_layers[i]
-        idx = keep[(tl, "feed_forward1")]
-        assert torch.equal(s_enc[i].feed_forward1.linear1.weight, t_enc[tl].feed_forward1.linear1.weight[idx].float())
-        assert torch.equal(s_enc[i].feed_forward1.linear2.weight, t_enc[tl].feed_forward1.linear2.weight[:, idx].float())
+        for n in S.FFN_NAMES:  # the real FFN biases are non-zero, so the bias slices are checked by value here
+            idx = keep[(tl, n)]
+            s_ff, t_ff = getattr(s_enc[i], n), getattr(t_enc[tl], n)
+            assert torch.equal(s_ff.linear1.weight, t_ff.linear1.weight[idx].float())
+            assert torch.equal(s_ff.linear1.bias, t_ff.linear1.bias[idx].float())
+            assert torch.equal(s_ff.linear2.weight, t_ff.linear2.weight[:, idx].float())
+            assert torch.equal(s_ff.linear2.bias, t_ff.linear2.bias.float())
         assert torch.equal(s_enc[i].self_attn.relative_k_proj.weight, t_enc[tl].self_attn.relative_k_proj.weight.float())
         assert torch.equal(s_enc[i].conv.norm.running_var, t_enc[tl].conv.norm.running_var.float())
     for j, tj in enumerate(spec.dec_layers):

@@ -6,6 +6,7 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import sys
 import threading
 import time
@@ -57,6 +58,8 @@ class FakeApi:
 
     def upload_folder(self, **kw):
         self.threads.add(threading.current_thread().name)
+        if kw.get("ignore_patterns") is not None:
+            kw["ignore_patterns"] += [".git", ".git/*"]  # like huggingface_hub: extends the caller's list in place
         time.sleep(self.delay)
         if self.fail:
             self.fail -= 1
@@ -197,7 +200,7 @@ def test_tensorboard_tags_are_bucketed(run):
     acc.Reload()
     tags = acc.Tags()
     assert all(t.split("/", 1)[0] in runlog.TB_BUCKETS for k in ("scalars", "histograms", "tensors") for t in tags[k])
-    assert {"2_loss_accuracy/train_loss/total", "2_loss_accuracy/train_loss/kl/src_a", "3_misc/lr",
+    assert {"2_loss_accuracy/train_loss_incl_l2sp/total", "2_loss_accuracy/train_loss/kl/src_a", "3_misc/lr",
             "3_misc/grad_norm"} <= set(tags["scalars"])
     assert any(t.startswith("1_operational/sys/proc/") for t in tags["scalars"])
     assert set(tags["histograms"]) == {"3_misc/weights/enc0", "3_misc/grads/enc0"}
@@ -208,8 +211,8 @@ def test_tensorboard_tags_are_bucketed(run):
     assert {"loss/total", "lr", "grad_norm"} <= set(sc["tag"]) and not any(sc["tag"].str.startswith("2_loss"))
     assert set(pd.read_parquet(run / "metrics" / "steps.parquet").columns) >= {"loss/total", "lr"}
     tag_map = json.loads((run / "metrics" / "tag_map.json").read_text(encoding="utf-8"))
-    assert tag_map["loss/total"] == {"tb_tag": "2_loss_accuracy/train_loss/total", "bucket": "2_loss_accuracy",
-                                     "plugin": "scalars"}
+    assert tag_map["loss/total"] == {"tb_tag": "2_loss_accuracy/train_loss_incl_l2sp/total",
+                                     "bucket": "2_loss_accuracy", "plugin": "scalars"}
     assert tag_map["weights/enc0"] == {"tb_tag": "3_misc/weights/enc0", "bucket": "3_misc", "plugin": "histograms"}
     assert tag_map["samples"]["tb_tag"] == "2_loss_accuracy/samples"
     assert tag_map["events/logger_start"]["bucket"] == "1_operational"
@@ -275,6 +278,7 @@ def test_sync_runs_in_background_and_excludes_checkpoints(tmp_path):
     assert "metrics/tag_map.json" in call["files"]
     log.close()
     assert len(api.calls) == 2  # the final forced sync waited for its upload
+    assert runlog.SYNC_IGNORE == ["checkpoints/*", "*.tmp"]  # each upload got a copy to extend, not the constant
     assert pd.read_parquet(run / "metrics" / "steps.parquet")["step"].tolist() == [1, 2]
     assert [e["kind"] for e in events(run)].count("sync_ok") == 2
 
@@ -344,6 +348,44 @@ def test_sync_errors_become_events(tmp_path):
     assert events(run)[-1]["kind"] == "sync_ok" and events(run)[-1]["attempt"] == 1
     log.close()
     assert (run / "metrics" / "scalars.parquet").exists()  # local mirrors are written even when uploads fail
+
+
+def test_a_stalled_sync_is_reported_and_close_returns(tmp_path):
+    """An upload that never returns (a Hub request the server accepted and never answered) turns every later sync
+    into a skip: that becomes one sync_stalled event, and close() gives up after close_join_s (sync_abandoned) instead
+    of keeping the trainer, and a paid instance, alive."""
+    release = threading.Event()
+
+    class StalledApi(FakeApi):
+        def upload_folder(self, **kw):
+            self.calls.append(kw)
+            release.wait(30)
+
+    api = StalledApi()
+    run = tmp_path / "stall-run"
+    log = RunLogger(run, CFG, hf_repo="me/kitsune-runs", sync_every_min=0.001, api=api, capture=False, tee=False,
+                    upload_retries=(), close_join_s=0.5)
+    try:
+        log.step_row({"loss": 1.0}, 1)
+        time.sleep(0.1)  # > sync_every_min (0.06 s)
+        assert log.sync() is True
+        time.sleep(0.3)  # > 2 x sync_every_min
+        log.step_row({"loss": 0.5}, 2)
+        assert [log.sync(), log.sync()] == [False, False]
+        stalled = [e for e in events(run) if e["kind"] == "sync_stalled"]
+        assert len(stalled) == 1 and stalled[0]["sync_step"] == 1 and stalled[0]["started_s_ago"] >= 0.12
+        t0 = time.monotonic()  # the trainer's end phase waits for it at most END_SYNC_JOIN_S, then goes on
+        assert log.wait_sync(0.2) is False and time.monotonic() - t0 < 2 and len(api.calls) == 1
+        t0 = time.monotonic()
+        log.close()
+        assert time.monotonic() - t0 < 3
+        kinds = [e["kind"] for e in events(run)]
+        assert kinds[-2:] == ["logger_close", "sync_abandoned"] and len(api.calls) == 1  # no final sync behind it
+        assert log._sync_thread.daemon and log._sync_thread.is_alive()
+    finally:
+        release.set()
+    log._sync_thread.join(5)
+    assert events(run)[-1]["kind"] == "sync_ok"  # the abandoned thread may still log once it returns
 
 
 def test_resume_keeps_one_step_axis(tmp_path):
@@ -418,12 +460,50 @@ def test_env_redacts_secrets(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTAINER_API_KEY", "vast_secret")
     monkeypatch.setenv("VAST_CONTAINERLABEL", "C.12345")
     monkeypatch.setenv("KITSUNE_DPH", "0.672")
+    monkeypatch.setenv("SSH_CONNECTION", "203.0.113.7 52144 10.0.0.5 22")  # a run re-armed from the operator's SSH
     runlog.capture_env(tmp_path / "env")
     text = (tmp_path / "env" / "system.json").read_text(encoding="utf-8")
-    assert "hf_supersecret" not in text and "vast_secret" not in text
+    assert "hf_supersecret" not in text and "vast_secret" not in text and "203.0.113.7" not in text
     system = json.loads(text)
+    assert not any(k.startswith("SSH_") for k in system["env"])
     assert system["env"]["HF_TOKEN"] == "<redacted>" and system["env"]["VAST_CONTAINERLABEL"] == "C.12345"
     assert system["instance_id"] == "C.12345" and system["offer_dph"] == 0.672
+
+
+def test_system_stats_read_the_containers_own_memory(tmp_path, monkeypatch):
+    """Inside a container psutil and the load average are the whole host's; the cgroup (v2, else v1) gives the
+    instance's own memory, limit and OOM kills. Not memory.current: it counts page cache and sits near the limit."""
+    cg = tmp_path / "cgroup"
+    monkeypatch.setattr(runlog, "CGROUP", cg)
+    assert runlog._cgroup_limits() is None  # no cgroup (Windows): nothing added, nothing raised
+    assert not any(k.startswith("sys/cgroup/") for k in system_stats())
+
+    files = {"memory.max": "137438953472", "memory.high": "max", "memory.low": "0", "cpu.max": "1600000 100000",
+             "pids.max": "4096", "memory.current": "136365211648",
+             "memory.stat": "anon 10737418240\nfile 125627793408\nshmem 1073741824\nfile_mapped 0\n",
+             "memory.events": "low 0\nhigh 0\nmax 7\noom 1\noom_kill 1\noom_group_kill 0\n"}
+    cg.mkdir()
+    for name, text in files.items():
+        (cg / name).write_text(text + "\n", encoding="utf-8")
+    st = {k: v for k, v in system_stats().items() if k.startswith("sys/cgroup/")}
+    assert st == {"sys/cgroup/anon_gb": 10.0, "sys/cgroup/shmem_gb": 1.0, "sys/cgroup/limit_gb": 128.0,
+                  "sys/cgroup/oom_kill": 1.0}
+    assert runlog._cgroup_limits() == {"version": 2, "memory.max": "137438953472", "memory.high": "max",
+                                       "memory.low": "0", "cpu.max": "1600000 100000", "pids.max": "4096"}
+    (cg / "memory.max").write_text("max\n", encoding="utf-8")  # no limit: no limit_gb
+    assert "sys/cgroup/limit_gb" not in system_stats() and "sys/cgroup/anon_gb" in system_stats()
+
+    shutil.rmtree(cg)
+    (cg / "memory").mkdir(parents=True)  # cgroup v1: total_* counts the whole hierarchy; ~2**63 means no limit
+    for name, text in {"memory.limit_in_bytes": "9223372036854771712",
+                       "memory.stat": "cache 5\nrss 7\nshmem 3\ntotal_cache 5\ntotal_rss 2147483648\n"
+                                      "total_shmem 536870912\n",
+                       "memory.oom_control": "oom_kill_disable 0\nunder_oom 0\noom_kill 2\n"}.items():
+        (cg / "memory" / name).write_text(text, encoding="utf-8")
+    st = {k: v for k, v in system_stats().items() if k.startswith("sys/cgroup/")}
+    assert st == {"sys/cgroup/anon_gb": 2.0, "sys/cgroup/shmem_gb": 0.5, "sys/cgroup/oom_kill": 2.0}
+    assert runlog._cgroup_limits()["version"] == 1
+    assert runlog._cgroup_limits()["memory/memory.limit_in_bytes"] == "9223372036854771712"
 
 
 def test_export_run(run, tmp_path):
@@ -442,7 +522,8 @@ def test_export_run(run, tmp_path):
     assert set(tb["tag"]) == set(sc["tag"])  # TensorBoard mirrors every scalar (the logged tags given back)
     t = tb[tb["tag"] == "loss/total"].sort_values("step")
     assert t["step"].tolist() == [1, 2, 3, 4, 5] and t["value"].tolist() == pytest.approx([2.0 / s for s in range(1, 6)])
-    assert set(t["tb_tag"]) == {"2_loss_accuracy/train_loss/total"} and set(t["bucket"]) == {"2_loss_accuracy"}
+    assert set(t["tb_tag"]) == {"2_loss_accuracy/train_loss_incl_l2sp/total"}
+    assert set(t["bucket"]) == {"2_loss_accuracy"}
     for df in (tb, sc):  # the bucket columns agree between the TensorBoard mirror and the open files
         assert list(df.columns[:3]) == ["tag", "bucket", "tb_tag"]
         assert (df["tb_tag"].str.split("/").str[0] == df["bucket"]).all()
@@ -457,7 +538,7 @@ def test_export_run(run, tmp_path):
     assert "hello **world**" in tx.set_index("tag").loc["note", "text"]
     assert tx.set_index("tag").loc["samples", "tb_tag"] == "2_loss_accuracy/samples"
     tm = pd.read_parquet(out / "tag_map.parquet").set_index(["tag", "plugin"])
-    assert tm.loc[("loss/total", "scalars"), "tb_tag"] == "2_loss_accuracy/train_loss/total"
+    assert tm.loc[("loss/total", "scalars"), "tb_tag"] == "2_loss_accuracy/train_loss_incl_l2sp/total"
     assert tm.loc[("lr", "scalars"), "unmapped"] and not tm.loc[("loss/total", "scalars"), "unmapped"]
     assert tm.loc[("events/phase", "text"), "bucket"] == "1_operational"
     assert json.loads((out / "tag_map.json").read_text(encoding="utf-8")) == json.loads(
@@ -480,10 +561,50 @@ def test_export_run(run, tmp_path):
         assert f"`{name}.parquet`" in readme, name
         for col in pd.read_parquet(out / f"{name}.parquet").columns:
             assert f"`{col}`" in readme, (name, col)
-    assert "`loss/total`" in readme and "`2_loss_accuracy/train_loss/total`" in readme  # the tag list
+    assert "`loss/total`" in readme and "`2_loss_accuracy/train_loss_incl_l2sp/total`" in readme  # the tag list
     for needle in ("## TensorBoard layout", "`1_operational/`", "`2_loss_accuracy/`", "`3_misc/`", "- `tag_map.json`:",
                    "tools/regroup_tb.py", "| `3_misc` |", "`lr`"):
         assert needle in readme, needle
+
+
+def test_non_finite_numbers_are_strict_json(tmp_path):
+    """JSON has no NaN: json.dumps writes a bare NaN / Infinity, and JavaScript, jq and strict loaders then reject the
+    whole file. Every JSON file of the run has null there instead, and the export keeps such a key as NaN."""
+    def strict(text):
+        def refuse(c):
+            raise ValueError(f"non-standard JSON constant {c}")
+
+        return json.loads(text, parse_constant=refuse)
+
+    run = tmp_path / "nf-run"
+    nan, inf = float("nan"), float("inf")
+    log = RunLogger(run, CFG, sync_every_min=10, capture=False, tee=False)
+    log.scalar("loss", 1.0, 10)
+    log.eval_json("summary", {"sets": {"eval_cv8": {"cer_ref_corpus": 0.1, "ratio_vs_teacher": nan,
+                                                   "kl_p1_lt_0.9": np.float64("nan")}}, "ratios": [1.0, inf]}, 10)
+    log.samples(10, [dict(id="a", ref="あ", teacher_hyp="あ", hyp="あ", cer_ref=0.0, cer_teacher=nan)])
+    log.event("eval", sets={"eval_cv8": {"ratio": nan}}, grad_norm=-inf)
+    log.close(summary={"verdict": {"per_set": {"eval_cv8": {"teacher": 0.0, "ratio": inf}}}})
+
+    s = strict((run / "evals" / "step_10" / "summary.json").read_text(encoding="utf-8"))
+    assert s == {"sets": {"eval_cv8": {"cer_ref_corpus": 0.1, "ratio_vs_teacher": None, "kl_p1_lt_0.9": None}},
+                 "ratios": [1.0, None]}
+    assert strict((run / "samples" / "step_10.jsonl").read_text(encoding="utf-8"))["cer_teacher"] is None
+    ev = [strict(line) for line in (run / "events.jsonl").read_text(encoding="utf-8").splitlines() if line]
+    e = next(r for r in ev if r["kind"] == "eval")
+    assert e["sets"] == {"eval_cv8": {"ratio": None}} and e["grad_norm"] is None
+    assert strict((run / "summary.json").read_text(encoding="utf-8"))["verdict"]["per_set"]["eval_cv8"] == {
+        "teacher": 0.0, "ratio": None}
+
+    with open(run / "events.jsonl", "a", encoding="utf-8") as f:  # a line from a run logged before the fix
+        f.write(json.dumps(dict(wall=time.time(), step=10, kind="old_eval", ratio=nan)) + "\n")
+    out = tmp_path / "export"
+    load_export().main([str(run), "--out", str(out)])
+    es = pd.read_parquet(out / "eval_summaries.parquet").set_index("key")["value"]
+    assert es["sets/eval_cv8/cer_ref_corpus"] == 0.1  # and the null keys are kept, as NaN
+    assert math.isnan(es["sets/eval_cv8/ratio_vs_teacher"]) and math.isnan(es["sets/eval_cv8/kl_p1_lt_0.9"])
+    fields = pd.read_parquet(out / "events.parquet").set_index("kind")["fields_json"]
+    assert all(strict(f) is not None for f in fields) and strict(fields["old_eval"]) == {"ratio": None}
 
 
 def test_export_keeps_infra_logs_and_restart_configs(run, tmp_path):
@@ -511,8 +632,106 @@ def test_export_keeps_infra_logs_and_restart_configs(run, tmp_path):
         assert needle in readme, needle
 
 
+def test_export_marks_the_rows_of_weights_a_crash_discarded(tmp_path):
+    """A crash at step 10 after the full state of step 3; the resumed launch's budget (re-fitted to the time left) ends
+    it at step 6. TensorBoard purges the first launch's steps 4-10 and steps.parquet stops at 6, but the open files keep
+    those rows, and steps 7-10 (a mini eval at 8, a full eval at 9) are never logged again, so no dedup by step removes
+    them. The export marks them discarded; the rest agrees with TensorBoard."""
+    exp = load_export()
+    run = tmp_path / "runs" / "crash"
+    tf = pd.DataFrame(dict(id=["a"], source=["eval_jsut"], kl=[0.5]))
+
+    def utt(s, attempt):
+        return [dict(step=s, epoch=0, id=f"u{s}", source="src_a", duration=1.0, n_tok=3, kl=0.1, ce=0.2, top1_acc=1.0,
+                     masked_frac=0.0, agree=0.0, attempt=attempt)]
+
+    def full_eval(log, step, cer):
+        log.event("eval_start", at_step=step, final=False, complete=False)
+        log.table("tf_eval_jsut", tf, step)
+        log.eval_json("summary", {"headline": {"val_cer": cer}}, step)
+        log.samples(step, [dict(id="a", hyp=str(cer))])
+
+    log = RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False)
+    state = None
+    for s in range(1, 11):
+        log.step_row({"loss/kl": 1.0 / s}, s)
+        log.train_utts(utt(s, 0))
+        if s == 3:
+            state = log.state_dict()
+            log.event("checkpoint", ckpt="full", name="full_step_3", reason="periodic")
+        if s == 8:
+            log.table("tf_eval_jsut", tf, 8, suffix="mini")
+            log.eval_json("summary", {"headline": {"val_cer": 0.5}}, 8, suffix="mini")
+            log.event("eval_mini", at_step=8)
+        if s == 9:
+            log.hist("w", torch.ones(10), 9)
+            full_eval(log, 9, 0.11)
+    log.close(summary={"status": "failed"})  # the trainer's crash path
+    time.sleep(0.05)
+    log = RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False, resume=state)
+    for s in range(4, 7):
+        log.step_row({"loss/kl": 10.0 / s}, s)
+        log.train_utts(utt(s, 1))
+    log.hist("w", torch.ones(10), 5)
+    full_eval(log, 6, 0.22)  # the final eval
+    log.close(summary={"status": "complete"})
+
+    t = exp.export(str(run), tmp_path / "export")
+
+    def kept(name):
+        return t[name][~t[name]["discarded"]]
+
+    sc, tb = kept("scalars"), t["tb_scalars"]
+    kl = sc[sc["tag"] == "loss/kl"].sort_values("step")
+    assert kl["step"].tolist() == sorted(tb.loc[tb["tag"] == "loss/kl", "step"]) == t["steps"]["step"].tolist() \
+        == [1, 2, 3, 4, 5, 6]
+    assert kl["value"].tolist() == pytest.approx([1.0, 0.5, 1 / 3, 10 / 4, 10 / 5, 10 / 6])
+    tu = kept("train_utts")
+    assert sorted(zip(tu["step"], tu["attempt"])) == [(1, 0), (2, 0), (3, 0), (4, 1), (5, 1), (6, 1)]
+    assert kept("hist")["step"].tolist() == [5] and t["hist"]["discarded"].sum() == 1
+    assert t["eval_mini_tf"]["step"].tolist() == [8] and t["eval_mini_tf"]["discarded"].all()
+    assert dict(zip(t["eval_tf"]["step"], t["eval_tf"]["discarded"])) == {6: False, 9: True}
+    es = kept("eval_summaries")
+    assert es.loc[~es["mini"], ["step", "value"]].values.tolist() == [[6, 0.22]] and not es["mini"].any()
+    assert dict(zip(t["samples"]["step"], t["samples"]["discarded"])) == {6: False, 9: True}
+    tx = t["text"]
+    assert dict(zip(tx.loc[tx["tag"] == "samples", "step"], tx.loc[tx["tag"] == "samples", "discarded"])) \
+        == {9: True, 6: False}
+    assert "`discarded`" in (tmp_path / "export" / "README.md").read_text(encoding="utf-8")
+
+
+def test_export_attempts_of_a_resume_that_died_before_its_own_full_state():
+    """The laptop's repeated resumes: the second launch dies before its own full save, so the third restores the same
+    state and logs the same attempt. Those two launches' train_utts rows cannot be told apart and stay unmarked (the
+    third launch's own rows must never be marked); the first launch's rows after step 3 are, and so are the third's
+    after the full state of step 6 the fourth resumes from."""
+    exp = load_export()
+    ev = [dict(kind="logger_start", wall=1.0, resume=None),
+          dict(kind="checkpoint", ckpt="full", name="full_step_3", wall=2.0),
+          dict(kind="logger_start", wall=3.0, resume={"step": 3}),
+          dict(kind="logger_start", wall=4.0, resume={"step": 3}),
+          dict(kind="checkpoint", ckpt="full", name="full_step_6", wall=5.0),
+          dict(kind="logger_start", wall=6.0, resume={"step": 6})]
+    runs = exp.launches(ev)
+    assert [a for _, _, a in runs] == [0, 1, 1, 2]
+    tu = pd.DataFrame(dict(step=[5, 9, 5, 7, 7, 8], attempt=[0, 0, 1, 1, 2, 2]))
+    assert exp.discarded(tu, runs).tolist() == [True, True, False, True, False, False]
+
+
+class FakeHubRepo:
+    """Stands in for huggingface_hub.HfApi in the hf:// export: repo_info gives the repo's current commit, or raises
+    (the Hub unreachable, a 5xx, an expired token)."""
+    sha: str | None = "a" * 40
+
+    def repo_info(self, repo_id, repo_type=None, **kw):
+        if FakeHubRepo.sha is None:
+            raise OSError("simulated: the Hub cannot be reached")
+        return type("Info", (), {"sha": FakeHubRepo.sha})()
+
+
 def test_export_hf_source_is_downloaded(run, tmp_path, monkeypatch):
-    """hf://user/repo/runs/<id> -> snapshot_download of that prefix only (checkpoints excluded); mocked, no network."""
+    """hf://user/repo/runs/<id> -> snapshot_download of that prefix only (checkpoints excluded), pinned to the repo's
+    current commit, into a folder of that commit, and the commit is in the README; mocked, no network."""
     import shutil
 
     import huggingface_hub
@@ -526,9 +745,46 @@ def test_export_hf_source_is_downloaded(run, tmp_path, monkeypatch):
         return str(kw["local_dir"])
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHubRepo)
+    monkeypatch.setattr(FakeHubRepo, "sha", "a" * 40)
     exp = load_export()
     out = tmp_path / "export-hf"
     exp.main(["hf://me/kitsune-runs/runs/tiny-run", "--out", str(out)])
     assert seen["repo_id"] == "me/kitsune-runs" and seen["allow_patterns"] == ["runs/tiny-run/*"]
     assert seen["ignore_patterns"] == ["runs/tiny-run/checkpoints/*"]
+    assert seen["revision"] == "a" * 40 and Path(seen["local_dir"]) == out / "_download" / ("a" * 12)
     assert (out / "steps.parquet").is_file() and (out / "README.md").is_file()
+    assert f"Hub commit: `{'a' * 40}`" in (out / "README.md").read_text(encoding="utf-8")
+
+
+def test_export_hf_fails_when_the_hub_cannot_be_reached(run, tmp_path, monkeypatch):
+    """A re-export into the same --out while the Hub cannot be reached raises, instead of snapshot_download handing
+    back the earlier download as it is (its non-empty local_dir fallback, HF-X2) and every table being rebuilt from
+    that stale mid-run copy under a fresh README."""
+    import shutil
+
+    import huggingface_hub
+
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kw):
+        calls.append(kw)
+        dst = Path(kw["local_dir"]) / "runs" / "tiny-run"
+        if not dst.exists():
+            shutil.copytree(run, dst)
+        return str(kw["local_dir"])
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeHubRepo)
+    monkeypatch.setattr(FakeHubRepo, "sha", "a" * 40)
+    exp = load_export()
+    out = tmp_path / "export-hf"
+    exp.main(["hf://me/kitsune-runs/runs/tiny-run", "--out", str(out)])  # the mid-run look fills out/_download
+    assert len(calls) == 1
+    monkeypatch.setattr(FakeHubRepo, "sha", None)
+    with pytest.raises(OSError, match="cannot be reached"):
+        exp.main(["hf://me/kitsune-runs/runs/tiny-run", "--out", str(out)])
+    assert len(calls) == 1  # never reached the download, so never its silent fallback
+    monkeypatch.setattr(FakeHubRepo, "sha", "b" * 40)  # the Hub back, at a newer commit: a fresh folder of its own
+    exp.main(["hf://me/kitsune-runs/runs/tiny-run", "--out", str(out)])
+    assert calls[-1]["revision"] == "b" * 40 and Path(calls[-1]["local_dir"]) == out / "_download" / ("b" * 12)

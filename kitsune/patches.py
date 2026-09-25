@@ -136,8 +136,10 @@ def sdpa_backend_report(device: str | torch.device | None = None, dtype: torch.d
     """Which SDPA kernels are enabled, and which ones can actually run the two attention shapes this model uses.
 
     `encoder`: head_dim 160 with an additive float bias that requires grad (the rel-pos term), so flash attention
-    is expected to be unusable. `decoder`: head_dim 128, boolean causal+padding mask. Each backend is tried in
-    isolation (forward + backward, tiny shapes); `selected` is what torch's dispatcher picks with all enabled."""
+    is expected to be unusable; its padded row masks keys AND queries (valid_q & valid_k, as the model does), so it
+    has fully masked query rows, where kernels differ. `decoder`: head_dim 128, boolean causal+padding mask. Each
+    backend is tried in isolation (forward + backward, tiny shapes) and counts as usable only if the output and the
+    q/k/v/bias gradients are finite; `selected` is what torch's dispatcher picks with all enabled."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -159,6 +161,7 @@ def sdpa_backend_report(device: str | torch.device | None = None, dtype: torch.d
         if case == "encoder":
             mask = torch.randn(B, H, T, T, device=dev, dtype=dtype)
             mask[1, :, :, T // 2:] = float("-inf")  # padded keys, as in a real batch
+            mask[1, :, T // 2:, :] = float("-inf")  # padded queries: fully masked rows, as the encoder's mask gives
             mask.requires_grad_(True)
         else:
             mask = torch.ones(T, T, device=dev, dtype=torch.bool).tril()[None, None].expand(B, 1, T, T)
@@ -175,7 +178,12 @@ def sdpa_backend_report(device: str | torch.device | None = None, dtype: torch.d
                     warnings.simplefilter("ignore")
                     out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
                     out.float().sum().backward()
-                usable[name] = True
+                grads = [q.grad, k.grad, v.grad]
+                if mask.grad is not None:  # only where the bias is finite: the model's masked_fill zeroes the rest
+                    grads.append(mask.grad[mask.isfinite()])
+                finite = bool(torch.isfinite(out).all()) and all(g is not None and bool(torch.isfinite(g).all())
+                                                                 for g in grads)
+                usable[name] = True if finite else "runs, but gives a non-finite output or gradient"
             except RuntimeError as e:
                 usable[name] = str(e).splitlines()[0][:160] or False
         rep[f"{case}_usable"] = usable

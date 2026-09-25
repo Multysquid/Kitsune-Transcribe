@@ -17,18 +17,24 @@ The original event files are kept under a name TensorBoard skips. TensorBoard re
 undo, delete the *.regrouped file and rename the .bak files back. A second run deletes the *.regrouped file it wrote
 before and rebuilds from the open files again: never two copies. metrics/tag_map.json is rewritten to the mapping used.
 
-A run that looks live is refused unless --force, when either
+A run that looks live is refused unless --force, when any of
   - its last logger_start in events.jsonl has no later logger_close (or events.jsonl has none) and events.jsonl,
     logs/stdout.log, metrics/scalars.jsonl, metrics/text.jsonl or a tb/ event file changed in the last 5 minutes (a
     launch that has not logged a scalar yet, with an empty scalars.jsonl, included), or
   - its newest scalar is younger than 5 minutes and summary.json is absent, has no final status, or is older than that
-    scalar (a resumed run keeps the failed launch's summary until it ends; between a crashed launch's logger_close and
-    the supervisor's relaunch the run is idle, not over).
---force does not skip the last check: after the rename the originals are watched for 2 s, and if one grows, a writer
-still holds it open (on Linux, and on Windows when TensorFlow is installed, renaming an open event file succeeds and
-the writer goes on writing into the renamed .bak). Everything is then renamed back and the tool exits non-zero: the
-run is being written. A writer that does not flush within those 2 s is not caught by it; the checks above are the
-guard. On Windows without TensorFlow the writer's handle blocks the rename itself, with the same outcome.
+    scalar (a resumed run keeps the failed launch's summary until it ends), or
+  - summary.json says "failed", was written in the last 5 minutes, and the run has a full state to resume from
+    (checkpoints/full_step_<N>/trainer.pt). Between a crashed launch's logger_close and the relaunch's logger_start
+    the run is idle, not over: scripts/supervise_distill.py relaunches it with --resume about 2-3 minutes after the
+    crash (without a full state it starts a new run dir instead), and the relaunch opens its tb/ event file seconds
+    before its logger_start. The newest scalar's age does not tell: a crash in a long eval comes minutes after it.
+--force does not skip the checks made around the rename. An event file that appeared in tb/ while the rebuild ran (a
+launch starting; the rebuild takes seconds, more on a long run) makes the tool exit non-zero before it renames
+anything. After the rename the originals are watched for 2 s, and if one grows, a writer still holds it open (on
+Linux, and on Windows when TensorFlow is installed, renaming an open event file succeeds and the writer goes on writing
+into the renamed .bak). Everything is then renamed back and the tool exits non-zero: the run is being written. A
+writer that does not flush within those 2 s is not caught by it; the checks above are the guard. On Windows without
+TensorFlow the writer's handle blocks the rename itself, with the same outcome.
 
 A run logged before the buckets and resumed (or re-launched) with the bucketed logger has both layouts in tb/: the
 earlier launches' flat tags and the new launch's buckets, side by side in TensorBoard. The logger leaves one
@@ -66,7 +72,8 @@ SUFFIX = ".regrouped"
 
 
 class BeingWritten(SystemExit):
-    """A writer still holds an original event file open; nothing was changed (or everything was renamed back)."""
+    """A writer holds an event file in tb/ open (an original, or one a launch opened during the rebuild); nothing was
+    changed (or everything was renamed back)."""
 
 
 def backup_name(name: str) -> str:
@@ -136,20 +143,26 @@ def live_reason(run: Path, now: float | None = None) -> str | None:
     if is_open is not False and w is not None and now - w[0] < LIVE_S:
         what = "events.jsonl has no logger_start" if is_open is None else "its last logger_start has no logger_close"
         return f"{what} and {w[1]} changed {now - w[0]:.0f} s ago"
+    p, status, written = run / "summary.json", None, None
+    try:
+        written = p.stat().st_mtime
+        status = json.loads(p.read_text(encoding="utf-8")).get("status")
+    except (OSError, ValueError, AttributeError):
+        pass
+    # before the scalar-age rule: a launch can crash minutes after its last scalar (in a long eval)
+    if (status == "failed" and now - written < LIVE_S
+            and any((d / "trainer.pt").is_file() for d in (run / "checkpoints").glob("full_step_*"))):
+        return (f"its launch failed {now - written:.0f} s ago and left a full state to resume from "
+                f"(scripts/supervise_distill.py relaunches it)")
     last = last_scalar_wall(run / "metrics" / "scalars.jsonl")
     if last is None or now - last >= LIVE_S:
         return None
     age = f"its newest scalar is {now - last:.0f} s old"
-    p = run / "summary.json"
-    if not p.exists():
+    if written is None:
         return f"no summary.json and {age}"
-    try:
-        status = json.loads(p.read_text(encoding="utf-8")).get("status")
-    except (OSError, ValueError, AttributeError):
-        status = None
     if status not in FINAL_STATUS:
         return f"summary.json status {status!r} is not final and {age}"
-    if last > p.stat().st_mtime + 1:
+    if last > written + 1:
         return f"scalars were logged after summary.json (a resumed run) and {age}"
     return None
 
@@ -272,13 +285,19 @@ def regroup(run, force: bool = False, settle_s: float | None = None) -> dict:
         raise SystemExit(f"{run} looks live ({reason}); wait for it to end or pass --force")
     tb_dir = run / "tb"
     tb_dir.mkdir(exist_ok=True)
+    checked = {p.name for p in event_files(tb_dir)}  # the event files there at the live check
     stage = Path(tempfile.mkdtemp(prefix=".regroup-", dir=run))  # same drive: the move into tb/ is a rename
     try:
         tm, n, unmapped = _write(run, stage)
         (new,) = [p for p in stage.iterdir() if "tfevents" in p.name]
+        originals = event_files(tb_dir)
+        opened = [p.name for p in originals if p.name not in checked]
+        if opened:  # a launch started during the rebuild: renaming its open file would hide all it writes from now on
+            raise BeingWritten(f"{run}: run is being written: {', '.join(opened)} appeared in tb/ during the rebuild, "
+                               f"so a launch started; nothing was changed (--force does not skip this check)")
         renamed, sizes = [], {}
         try:
-            for p in event_files(tb_dir):
+            for p in originals:
                 bak = tb_dir / backup_name(p.name)
                 while bak.exists():
                     bak = bak.with_name(bak.name + ".bak")

@@ -21,8 +21,9 @@ import torch  # noqa: E402
 from kitsune import evaluate as ev  # noqa: E402
 from kitsune.audio import decode_audio  # noqa: E402
 from kitsune.text import cer as utt_cer  # noqa: E402
+from fixtures import REAL, need_real  # noqa: E402
 
-TEACHER_OUT = ROOT / "teacher_out"
+TEACHER_OUT = REAL / "teacher_out"
 EVAL = ["eval_jsut", "eval_cv8"]  # fake corpus sources named like the real sets
 
 
@@ -134,6 +135,59 @@ def test_verdict_inconclusive_and_teacher_override():
     assert v["verdict"] == "INCONCLUSIVE" and v["trend"]["gap_widening"] is None
 
 
+def test_verdict_trends_leave_out_the_untrained_step_0_eval():
+    """Per-epoch evals leave short histories: step 0, an epoch end or two, the final eval. The untrained student's
+    step-0 record (CER ratio ~30, held-out KL ~5) must not enter the trends, or it makes every run 'improving' and hides
+    over-fitting; the verdict is the one the trained records give."""
+    steps = [0, 1126, 2252]
+    # over-fitting on the trained records: held-out KL +10 % while the probe falls, CER within 1.2x
+    for probe0 in (4.5, 5.75):  # the step-0 probe KL below or above the step-0 held-out KL
+        v = ev.verdict(dict(final=final((1.1, 1.1, 1.15)),
+                            history=history([30, 1.12, 1.10], [4.87, 0.60, 0.66], [probe0, 0.62, 0.45], steps)))
+        assert v["verdict"] == "NO-GO" and v["trend"]["overfit"], v["reasons"]
+        assert v["trend"]["window_steps"] == [1126, 2252]
+    # a flat tail with 1/3 sets within 1.5x is the pre-registered NO-GO, not 'still improving'
+    v = ev.verdict(dict(final=final((1.8, 2.0, 1.4)),
+                        history=history([30, 1.9, 1.9], [4.87, 0.50, 0.45], [4.5, 0.45, 0.40], steps)))
+    assert v["verdict"] == "NO-GO" and not v["trend"]["improving"], v["reasons"]
+    # ... and one with 2/3 sets within 1.5x is outside the tiers ('CER not improving'), not PROMISING
+    v = ev.verdict(dict(final=final((1.3, 1.4, 1.6)),
+                        history=history([30, 1.3, 1.3], [4.87, 0.50, 0.45], [4.5, 0.45, 0.40], steps)))
+    assert v["verdict"] == "INCONCLUSIVE" and not v["trend"]["improving"], v["reasons"]
+    assert v["trend"]["window_steps"] == [1126, 2252] and any("CER not improving" in r for r in v["reasons"])
+    # a GO on the trained records stays GO whatever the step-0 numbers were
+    for probe0 in (4.5, 5.75):
+        v = ev.verdict(dict(final=final((1.1, 1.1, 1.15)),
+                            history=history([30, 1.25, 1.10], [4.87, 0.70, 0.60], [probe0, 0.62, 0.53], steps)))
+        assert v["verdict"] == "GO", v["reasons"]
+    # one trained record: the trend is unknown, not 'improving' (from step 0) and not 'flat'
+    for ratios in ((1.3, 1.4, 1.45), (1.8, 2.0, 1.4)):
+        v = ev.verdict(dict(final=final(ratios), history=history([30, 1.3], [4.87, 0.6], [4.5, 0.55], [0, 1126])))
+        assert v["verdict"] == "INCONCLUSIVE" and v["trend"]["cer_ratio_rel_change"] is None, v["reasons"]
+        assert v["trend"]["window_steps"] == [1126] and any("CER trend unknown" in r for r in v["reasons"])
+        assert not any("still improving" in r or "CER flat" in r for r in v["reasons"])
+
+
+def test_verdict_reports_undecodable_gate_rows():
+    """A gate set some of whose audio did not decode is judged on the rows that did (the teacher on the same ids): the
+    tier stays the same, but per_set carries n and n_bad_audio and a reason says it is not the pre-registered full set
+    (a monitor-only set's drops are not a gate matter)."""
+    fin = final((1.1, 1.15, 1.6), n=3810)
+    base = ev.verdict(dict(final=fin, history=history(FALLING, KL_DOWN, PROBE_DOWN)))
+    v = ev.verdict(dict(final=dict(fin, n_bad_audio=675, bad_audio_per_set={"eval_cv8": 673, "eval_emilia": 2}),
+                        history=history(FALLING, KL_DOWN, PROBE_DOWN)))
+    assert v["verdict"] == base["verdict"] == "GO" and v["n_sets_go"] == base["n_sets_go"]
+    assert v["sets"]["eval_cv8"]["n"] == 3810 and v["sets"]["eval_cv8"]["n_bad_audio"] == 673
+    assert v["sets"]["eval_jsut"]["n"] == 3810 and v["sets"]["eval_jsut"]["n_bad_audio"] == 0
+    assert [r for r in v["reasons"] if "undecodable" in r] == [
+        "eval_cv8: judged on 3810 decoded rows, 673 undecodable (not the pre-registered full set)"]
+    assert not any("undecodable" in r for r in base["reasons"])
+    # a gate set none of whose rows decoded has no final result at all; the reason says why
+    sets = {s: d for s, d in fin["sets"].items() if s != "eval_reazon"}
+    v = ev.verdict(dict(final=dict(sets=sets, bad_audio_per_set={"eval_reazon": 5}), history=[]))
+    assert "eval_reazon: no final greedy result (5 undecodable rows)" in v["reasons"]
+
+
 def test_eval_record_and_flatten():
     tf = dict(sets={"eval_jsut": dict(kl=0.2, ce=0.3, top1=0.9, n_tok=10)}, all=dict(kl=0.2, ce=0.3, top1=0.9),
               wall_s=1.5, bad_audio=["x"])
@@ -143,13 +197,17 @@ def test_eval_record_and_flatten():
     flat = ev.flatten(tf, "eval_tf")
     assert flat["eval_tf/eval_jsut/kl"] == 0.2 and flat["eval_tf/all/top1"] == 0.9 and flat["eval_tf/wall_s"] == 1.5
     assert not any("bad_audio" in k for k in flat)
+    # the per-set undecodable counts sit next to each set's other counts (only for a set that lost a row)
+    flat = ev.flatten(dict(tf, n_bad_audio=3, bad_audio_per_set={"eval_cv8": 3}), "eval/tf")
+    assert flat["eval/tf/n_bad_audio"] == 3.0 and flat["eval/tf/eval_cv8/n_bad_audio"] == 3.0
+    assert not any("per_set" in k for k in flat) and "eval/tf/eval_jsut/n_bad_audio" not in flat
 
 
 # ------------------------------------------------------------------------------------------------ teacher baselines
 
 
-@pytest.mark.skipif(not all((TEACHER_OUT / s).is_dir() for s in ev.GATE_SETS), reason="real teacher_out not present")
 def test_teacher_baselines_match_preregistered():
+    need_real(*(TEACHER_OUT / s for s in ev.GATE_SETS))
     b = ev.teacher_baselines(TEACHER_OUT)  # raises if any set drifts by > 0.05 pp
     for s, want in {"eval_jsut": 0.0830, "eval_cv8": 0.0407, "eval_reazon": 0.0628}.items():
         assert abs(b[s]["cer_corpus"] - want) <= 0.0005, (s, b[s])
@@ -298,6 +356,29 @@ def test_teacher_forced_self_consistency(self_store, featurizer):
     ids = [u.id for u in self_store.utts][:3]
     sub, sub_utt = ev.teacher_forced_eval(model, self_store, featurizer, "cpu", batch_s=3.0, ids=ids)
     assert sorted(sub_utt["id"]) == sorted(ids)
+
+
+def test_evals_count_undecodable_rows_per_set(self_store, featurizer, tokenizer, monkeypatch):
+    """An eval row whose audio does not decode is dropped by the dataset; both evals count it per set
+    (bad_audio_per_set, which the verdict reads for the gate sets) and score the rest."""
+    from kitsune.trainset import AudioBatchDataset
+
+    bad = next(u.id for u in self_store.utts if u.source == "eval_cv8")
+    ids = [bad, *[u.id for u in self_store.utts if u.id != bad][:3]]
+    real = AudioBatchDataset.audio_bytes
+    monkeypatch.setattr(AudioBatchDataset, "audio_bytes",
+                        lambda ds, i: b"not audio" if ds.ids[i] == bad else real(ds, i))
+    model = tiny_model(0)
+    tf, tf_utt = ev.teacher_forced_eval(model, self_store, featurizer, "cpu", batch_s=3.0, ids=ids)
+    gr, gr_utt = ev.greedy_eval(model, self_store, ids, featurizer, "cpu", batch_s=3.0, tokenizer=tokenizer)
+    for summary, per_utt in ((tf, tf_utt), (gr, gr_utt)):
+        assert summary["n_bad_audio"] == 1 and summary["bad_audio"] == [bad]
+        assert summary["bad_audio_per_set"] == {"eval_cv8": 1}
+        assert sorted(per_utt["id"]) == sorted(ids[1:])
+    assert ev.flatten(tf, "eval/tf")["eval/tf/eval_cv8/n_bad_audio"] == 1.0
+    monkeypatch.setattr(AudioBatchDataset, "audio_bytes", real)
+    clean, _ = ev.teacher_forced_eval(model, self_store, featurizer, "cpu", batch_s=3.0, ids=ids)
+    assert clean["n_bad_audio"] == 0 and clean["bad_audio_per_set"] == {}
 
 
 def manual_greedy(model, featurizer, wave, max_new, eos=3):

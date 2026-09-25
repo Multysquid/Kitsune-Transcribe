@@ -53,12 +53,15 @@ stop_now() {
     if "$PY" "$KITSUNE_DIR/vast/finish.py" --stop --no-sync --reason "watchdog: ${MAX_HOURS} h cap reached"; then
         return 0
     fi
-    # last resort without python: same REST call, key passed through curl's stdin config so it never shows in argv
+    # last resort without python: same REST call, key passed through curl's stdin config so it never shows in argv; a
+    # 2xx reply can still refuse ({"success": false}, as finish.py vast_rest reads it)
     if [ -n "${CONTAINER_API_KEY:-}" ] && [ -n "${CONTAINER_ID:-}" ]; then
-        printf 'header = "Authorization: Bearer %s"\n' "$CONTAINER_API_KEY" \
+        local r=""
+        r=$(printf 'header = "Authorization: Bearer %s"\n' "$CONTAINER_API_KEY" \
             | curl -fsS --max-time 30 --config - -X PUT -H 'Content-Type: application/json' \
-                -d '{"state": "stopped"}' "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/" >/dev/null \
-            && return 0
+                -d '{"state": "stopped"}' "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/") \
+            && ! [[ $r =~ \"success\"[[:space:]]*:[[:space:]]*false ]] && return 0
+        log "vast REST stop failed: ${r:-no reply}"
     fi
     return 1
 }

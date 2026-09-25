@@ -46,6 +46,20 @@ def dither_noise(n: int, dither: float = 1e-5) -> torch.Tensor:
     return dither * torch.randn(n, dtype=torch.float32, generator=g)
 
 
+def device_dither_noise(ns: list[int], dither: float, device) -> torch.Tensor:
+    """LogMel's dither with exact_dither=False: the same scheme drawn on `device` (one generator there, re-seeded with
+    each utterance's valid sample count), concatenated in row order, utterances of 0 samples skipped. On CUDA the
+    numbers differ from HF's; on CPU it is bitwise torch.cat([dither_noise(n, dither) for n in ns]), which is how a
+    CPU test covers the branch every training step on the box uses."""
+    g = torch.Generator(device=device)
+    parts = []
+    for n in ns:
+        if n > 0:
+            g.manual_seed(n)
+            parts.append(dither * torch.randn(n, dtype=torch.float32, device=device, generator=g))
+    return torch.cat(parts)
+
+
 def pad_waves(waves: list[np.ndarray]) -> tuple[torch.Tensor, torch.Tensor]:
     """list of 1-D float32 arrays -> (wave (B, S) zero-padded, lengths (B,) int64)."""
     lengths = torch.tensor([len(w) for w in waves], dtype=torch.int64)
@@ -105,13 +119,7 @@ class LogMel(nn.Module):
             flat = torch.cat([dither_noise(n, self.dither) for n in ns if n > 0])
             flat = flat.to(wave.device, non_blocking=True)
         else:
-            g = torch.Generator(device=wave.device)
-            parts = []
-            for n in ns:
-                if n > 0:
-                    g.manual_seed(n)
-                    parts.append(self.dither * torch.randn(n, dtype=torch.float32, device=wave.device, generator=g))
-            flat = torch.cat(parts)
+            flat = device_dither_noise(ns, self.dither, wave.device)
         # row-major boolean scatter == utterance i's first n_i samples, in order; x + 0 leaves the padding exact
         return wave + torch.zeros_like(wave).masked_scatter_(valid, flat)
 

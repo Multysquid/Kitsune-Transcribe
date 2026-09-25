@@ -9,23 +9,23 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from kitsune.features import LogMel, SpecAugment, hf_reference, load_hf_processor, pad_waves  # noqa: E402
+from fixtures import REAL, need_real, teacher_processor  # noqa: E402
+from kitsune.features import LogMel, SpecAugment, hf_reference, pad_waves  # noqa: E402
 
 TOL = 1e-4  # target on normalised features; on CPU the ops are identical, so the measured diff is 0.0
-REAL_SHARD = ROOT / "data" / "shards" / "reazon_small" / "train-00000.parquet"
+REAL_SHARD = REAL / "data" / "shards" / "reazon_small" / "train-00000.parquet"
 
 
 @pytest.fixture(scope="module")
 def fe():
-    try:
-        return load_hf_processor().feature_extractor
-    except Exception as e:  # noqa: BLE001 - not cached / offline
-        pytest.skip(f"teacher processor not available offline: {e}")
+    """Skips without the gated processor in the HF cache; fails instead under KITSUNE_REQUIRE_REAL_DATA=1."""
+    return teacher_processor().feature_extractor
 
 
 def _compare(lm: LogMel, waves: list[np.ndarray], dither: float, wave=None, lengths=None) -> float:
@@ -49,12 +49,12 @@ def test_filterbank_is_the_hf_one(fe):
     assert (lm.n_fft, lm.hop_length, lm.win_length, lm.preemphasis, lm.dither) == (512, 160, 400, 0.97, 1e-5)
 
 
-@pytest.mark.skipif(not REAL_SHARD.exists(), reason="real reazon_small shard not present")
 def test_parity_real_clips(fe):
     import pyarrow.parquet as pq
 
     from kitsune.audio import decode_audio
 
+    need_real(REAL_SHARD)
     rg = pq.ParquetFile(REAL_SHARD).read_row_group(0, columns=["audio", "duration"])  # read-only, one row group
     durs = np.array(rg.column("duration").to_pylist())
     order = np.argsort(durs)
@@ -92,6 +92,23 @@ def test_parity_synthetic(fe):
     _compare(lm, waves[:2], 1e-5, wave=wide, lengths=lengths)
 
 
+def test_missing_teacher_processor_fails_a_verification_run(monkeypatch):
+    """Without the gated processor in the HF cache the parity tests skip, and KITSUNE_REQUIRE_REAL_DATA=1 turns that
+    skip into a failure, as it does for the real data files."""
+    import kitsune.features
+
+    def offline():
+        raise OSError("not in the cached files")
+
+    monkeypatch.setattr(kitsune.features, "load_hf_processor", offline)
+    monkeypatch.delenv("KITSUNE_REQUIRE_REAL_DATA", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="teacher processor not in the local HF cache"):
+        teacher_processor()
+    monkeypatch.setenv("KITSUNE_REQUIRE_REAL_DATA", "1")
+    with pytest.raises(pytest.fail.Exception, match="teacher processor not in the local HF cache"):
+        teacher_processor()
+
+
 def test_batch_composition_invariance():
     rng = np.random.default_rng(1)
     waves = [(0.1 * rng.standard_normal(n)).astype(np.float32) for n in (16000, 5555, 23456)]
@@ -103,6 +120,19 @@ def test_batch_composition_invariance():
         assert torch.equal(m1[0], mask[i, :T]) and not mask[i, T:].any()
         # the dither is seeded by length, not batch position; only reduction order differs (measured ~1e-6)
         assert (f1[0] - feats[i, :T]).abs().max().item() < 1e-5
+
+
+def test_device_dither_is_the_exact_dither_on_cpu():
+    """exact_dither=False (the box's training featuriser) draws the dither with the device's RNG, a branch no CPU run
+    of LogMel reaches. Its draw, run on CPU, must be HF's per-utterance dither bitwise: the same re-seed per
+    utterance, row order and scale (on CUDA the scheme is the same, the numbers are not)."""
+    from kitsune.features import device_dither_noise, dither_noise
+
+    ns = [16000, 0, 5555, 23456, 5555]
+    want = torch.cat([dither_noise(n, 1e-5) for n in ns if n > 0])
+    assert torch.equal(device_dither_noise(ns, 1e-5, torch.device("cpu")), want)
+    assert torch.equal(device_dither_noise([5555], 1e-5, "cpu"), dither_noise(5555))  # batch-invariant
+    assert not torch.equal(device_dither_noise(ns[::-1], 1e-5, "cpu"), want)  # the row order is kept
 
 
 def test_fp32_under_autocast():

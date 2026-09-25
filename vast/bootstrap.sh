@@ -3,18 +3,22 @@
 #
 # Why this split: home upload is slow, so only the small DERIVED data is parked in the private HF dataset
 # $KITSUNE_DATA_REPO (teacher_out for the train sources and eval sets, second_out, the selection parquet, the student
-# init; ~1.5 GB). The ~10 GB of audio is REBUILT here from the original public HF datasets by
+# init; ~2.3 GB). The ~23 GB of audio (reazon_small ~7, Emilia-YODAS 300 h ~8, Galgame's 6 tars ~5, eval sets ~3;
+# sized in vast/launch.py's DISK_GB comment) is REBUILT here from the original public HF datasets by
 # scripts/01_prepare_data.py, which reads every upstream repo at a pinned commit, so the utterance ids match the
 # teacher outputs exactly. If the data repo also holds data/shards/<source>/*.parquet for a source, those parked
-# shards are pulled instead of rebuilding that source. The trainer joins everything by utterance id and drops (and
-# logs) rows without audio; this script already fails if coverage is below KITSUNE_MIN_COVERAGE, because a broken
-# join would waste the whole paid run.
+# shards are pulled (and listed in data/manifest.jsonl, which 01 reads) instead of rebuilding that source. The trainer
+# joins everything by utterance id and drops (and logs) rows without audio; this script already fails if coverage is
+# below KITSUNE_MIN_COVERAGE, because a broken join would waste the whole paid run.
 #
 # The repo layout mirrors the laptop's repo root: <teacher_root>/..., <second_root>/..., <selection>, <student>/...,
 # optionally <data_root>/shards/... (paths from the run config). Idempotent: snapshot_download and 01 both skip what is
 # already on disk. Phase timings go to $KITSUNE_STATE/bootstrap_timings.jsonl.
 #
-# Env: KITSUNE_DATA_REPO (required), KITSUNE_DATA_REVISION (default main), KITSUNE_CONFIG (default
+# The plan phase also checks that HF_TOKEN can read and write $KITSUNE_OUT_REPO: launch.py checks the repos with the
+# laptop's own login, and the trainer's first upload comes only after the pull, the audio rebuild and the model load.
+#
+# Env: KITSUNE_DATA_REPO and KITSUNE_OUT_REPO (required), KITSUNE_DATA_REVISION (default main), KITSUNE_CONFIG (default
 # configs/viability.json), KITSUNE_PREP_ARGS (extra args for 01; leave it empty for the viability data: its teacher
 # outputs cover exactly the first 6 Galgame tars and 300 h of Emilia-YODAS, which are 01's defaults, and a larger
 # --galgame-shards/--emilia-hours only downloads audio without teacher output), KITSUNE_MIN_COVERAGE (default 0.99),
@@ -38,6 +42,10 @@ if [ -z "${KITSUNE_DATA_REPO:-}" ]; then
     log "KITSUNE_DATA_REPO is not set"
     exit 2
 fi
+if [ -z "${KITSUNE_OUT_REPO:-}" ]; then
+    log "KITSUNE_OUT_REPO is not set (vast/launch.py passes it)"
+    exit 2
+fi
 if [ -z "${HF_TOKEN:-}" ]; then
     log "HF_TOKEN is not set: add it under vast Account -> Settings -> Environment Variables (see vast/README.md)"
     exit 2
@@ -58,6 +66,25 @@ phase() {  # phase <name> <command...>: run it and append its wall time
     printf '{"phase": "%s", "seconds": %s, "end": %s}\n' "$name" \
         "$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')" "${t1%.*}" >> "$TIMINGS"
     log "phase $name done in $(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }') s"
+}
+
+# retry <tries> <command...>: re-run a resumable network step after a failure. One Hub 5xx/429 or dropped connection
+# (01's listing calls are sent once, with no HTTP timeout) would otherwise stop the box after the paid boot; a stalled
+# call is cut by the timeout the caller puts in <command>. The exit code of the last attempt is returned. Exit 3 is a
+# refusal a retry cannot fix (the plan helper's NO_RETRY: a token or data repo the Hub refused, data it lacks) and
+# returns at once; neither 01_prepare_data.py (1, argparse 2) nor timeout (124-127, 137) exits 3.
+retry() {
+    local n=$1 i rc=0
+    shift
+    for (( i = 1; i <= n; i++ )); do
+        rc=0
+        "$@" || rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        log "attempt $i/$n of $* failed (exit $rc)"
+        if [ "$rc" -eq 3 ]; then log "exit 3 is a refusal a retry cannot fix; not retrying"; return 3; fi
+        if [ "$i" -lt "$n" ]; then sleep $(( i * 60 )); fi
+    done
+    return "$rc"
 }
 
 cat > "$HELPER" <<'PYEOF'
@@ -83,40 +110,114 @@ second_root = cfg.get("second_root", "second_out")
 data_root = cfg.get("data_root", "data")
 selection = cfg["selection"]
 student = cfg["student"].rstrip("/")
+# the student dir files the trainer loads (it has no processor fallback): the same list as vast/launch.py STUDENT_FILES
+STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json")
 plan_path = state / "bootstrap_plan.json"
+NO_RETRY = 3  # the exit code bootstrap's retry() does not repeat: the Hub would refuse again
+
+
+def refused(e: BaseException) -> bool:
+    """A refusal is the token's or the config's fault (404/401 = RepoNotFound: the Hub hides a private repo the token
+    cannot see; 404 also for a missing revision); a 5xx, 429 or dropped connection is the Hub's, and the plan phase
+    runs under retry()."""
+    return getattr(getattr(e, "response", None), "status_code", None) in (401, 403, 404)
+
+
+def refuse(msg: str):
+    print(f"{msg} (not retried)", file=sys.stderr)
+    sys.exit(NO_RETRY)
 
 
 def plan():
     from huggingface_hub import HfApi
+    from huggingface_hub.utils import filter_repo_objects
 
     api = HfApi()
-    print(f"hf user: {api.whoami()['name']}")
-    files = api.list_repo_files(repo, repo_type="dataset", revision=rev)
+    try:
+        user = api.whoami()["name"]
+    except Exception as e:
+        if refused(e):
+            refuse(f"HF_TOKEN is not a valid token ({type(e).__name__}: {e}): put a working fine-grained token in the "
+                   f"vast account env (vast/README.md step 2.3)")
+        raise
+    print(f"hf user: {user}")
+    # the box token's first use of the output repo would otherwise be the trainer's hf_roundtrip, after the pull, the
+    # audio rebuild and the model load; auth_check is a GET (no commit), and the trainer reads its uploads back
+    out_repo = os.environ["KITSUNE_OUT_REPO"]
+    for write in (False, True):
+        try:
+            api.auth_check(out_repo, repo_type="model", write=write)
+        except Exception as e:
+            if refused(e):
+                refuse(f"HF_TOKEN cannot {'write' if write else 'read'} {out_repo} ({type(e).__name__}: {e}): give "
+                       f"the fine-grained token read and write access to it (vast/README.md step 2.3)")
+            sys.exit(f"Hub error checking {out_repo} ({type(e).__name__}: {e}); bootstrap retries the plan")
+    try:
+        files = api.list_repo_files(repo, repo_type="dataset", revision=rev)
+    except Exception as e:
+        if refused(e):
+            refuse(f"HF_TOKEN cannot list {repo}@{rev} ({type(e).__name__}: {e}): check KITSUNE_DATA_REPO, "
+                   f"KITSUNE_DATA_REVISION and the token's read access to it (vast/README.md step 2.3)")
+        raise
 
     def has(pat: str) -> bool:
         return any(fnmatch.fnmatch(f, pat) for f in files)
 
     patterns = [f"{teacher_root}/meta.json", f"{second_root}/meta.json", selection, f"{student}/*"]
-    required = [f"{selection}", f"{student}/config.json"]
+    required = [f"{selection}", *(f"{student}/{n}" for n in STUDENT_FILES)]
     for s in names:
         patterns += [f"{teacher_root}/{s}/*", f"{second_root}/{s}/*"]
         required.append(f"{teacher_root}/{s}/*.npz")
     required += [f"{second_root}/{s}/*.jsonl" for s in sources]
     missing = [p for p in required if not has(p)]
-    for s in sources:  # every teacher shard needs its second opinion (the same rule as vast/launch.py data_problems)
+    # every teacher shard needs its second opinion (the same rule as vast/launch.py data_problems), except for the
+    # sources the run config's selection_recipe.partial_second_opinion trains on their judged shards only
+    partial = set((cfg.get("selection_recipe") or {}).get("partial_second_opinion", []))
+    for s in sources:
         teacher = {f.rsplit("/", 1)[1][:-4] for f in files if f.startswith(f"{teacher_root}/{s}/") and f.endswith(".npz")}
         second = {f.rsplit("/", 1)[1][:-6] for f in files if f.startswith(f"{second_root}/{s}/") and f.endswith(".jsonl")}
-        if teacher - second:
+        if s in partial:
+            if not teacher & second:
+                missing.append(f"{second_root}/{s}: none of its {len(teacher)} shards has a second opinion")
+        elif teacher - second:
             missing.append(f"{second_root}/{s}: {len(teacher - second)} of {len(teacher)} shards without a second opinion")
     if missing:
-        sys.exit(f"data repo {repo}@{rev} lacks: {missing}")
+        refuse(f"data repo {repo}@{rev} lacks: {missing}")
     parked = [s for s in names if has(f"{data_root}/shards/{s}/*.parquet")]
     patterns += [f"{data_root}/shards/{s}/*.parquet" for s in parked]
     rebuild = [s for s in names if s not in parked]
+    # the files the pull must leave on disk, by snapshot_download's own matcher (pull() checks them)
+    want = list(filter_repo_objects(files, allow_patterns=patterns))
     out = dict(repo=repo, revision=rev, patterns=patterns, parked=parked, rebuild=rebuild, data_root=data_root,
-               repo_files=len(files), wall=time.time())
+               repo_files=len(files), files=want, wall=time.time())
     plan_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
     print(f"plan: pull {len(patterns)} patterns; parked audio {parked or 'none'}; rebuild audio {rebuild or 'none'}")
+
+
+def register_parked(parked: list):
+    """List the pulled shards of the parked sources in <data_root>/manifest.jsonl, as a local ingest would have (the
+    data repo holds no manifest). 01 reads other sources' rows from the manifest - eval_emilia leaves out emilia_yodas's
+    videos ("ingest emilia_yodas first" otherwise), the reazon tiers dedup against the smaller ones - so an unlisted
+    parked source would stop the rebuild. Paths already listed are skipped, so a re-run adds nothing."""
+    if not parked:
+        return
+    import pyarrow.parquet as pq
+
+    sys.path.insert(0, str(root))  # this helper runs from a mktemp path
+    from kitsune.store import ShardInfo, append_manifest, read_manifest
+
+    droot = root / data_root
+    listed = {s.path for s in read_manifest(droot)}
+    new = []
+    for s in parked:
+        for f in sorted((droot / "shards" / s).glob("*.parquet")):
+            rel = f.relative_to(droot).as_posix()
+            if rel not in listed:
+                dur = pq.read_table(f, columns=["duration"]).column("duration").to_pylist()
+                new.append(ShardInfo(rel, s, f.name.rsplit("-", 1)[0], len(dur), sum(dur) / 3600))
+    if new:
+        append_manifest(droot, new)
+    print(f"manifest: listed {len(new)} parked shard(s) of {parked}")
 
 
 def pull():
@@ -126,6 +227,13 @@ def pull():
     t0 = time.time()
     snapshot_download(repo, repo_type="dataset", revision=rev, local_dir=root, allow_patterns=p["patterns"],
                       max_workers=16)
+    # when its one repo_info request fails (a Hub 5xx/429, a dropped connection) snapshot_download returns local_dir
+    # (the checkout, never empty) with only a warning and downloads nothing, and 01's paid audio rebuild would run
+    # before the coverage check caught it: fail here instead, so the shell's retry pulls again
+    missing = [f for f in p["files"] if not (root / f).is_file()]
+    if missing:
+        sys.exit(f"pull incomplete: {len(missing)} of {len(p['files'])} planned files missing, e.g. {missing[:3]}")
+    register_parked(p["parked"])
     dirs = [root / d for d in (teacher_root, second_root, student, f"{data_root}/shards") if (root / d).is_dir()]
     size = sum(f.stat().st_size for d in dirs for f in d.rglob("*") if f.is_file())
     print(f"pulled in {time.time() - t0:.0f} s; derived data + parked shards on disk: {size / 1e9:.2f} GB")
@@ -138,19 +246,24 @@ def coverage():
     floor = float(os.environ.get("KITSUNE_MIN_COVERAGE", "0.99"))
     report, bad = {}, []
     for s in names:
-        tids = set()
+        # per split (<split>-NNNNN in both trees), as the trainer joins them: pooled over a source's splits,
+        # galgame's 1,000-row hold-out is 0.5 % of its ids and could vanish (or trade rows with train) above the floor
+        tids, aids = {}, {}
         for npz in sorted((root / teacher_root / s).glob("*.npz")):
             with np.load(npz, allow_pickle=False) as z:
-                tids.update(str(i) for i in z["ids"])
-        aids = set()
+                tids.setdefault(npz.stem.rsplit("-", 1)[0], set()).update(str(i) for i in z["ids"])
         for shard in sorted((root / data_root / "shards" / s).glob("*.parquet")):
-            aids.update(pq.read_table(shard, columns=["id"]).column("id").to_pylist())
-        hit = len(tids & aids)
-        cov = hit / len(tids) if tids else 0.0
-        report[s] = dict(teacher_ids=len(tids), audio_ids=len(aids), joined=hit, coverage=round(cov, 5))
-        print(f"  {s:14s} teacher {len(tids):7d}  audio {len(aids):7d}  joined {hit:7d}  coverage {cov:.4f}")
-        if cov < floor:
-            bad.append(s)
+            aids.setdefault(shard.stem.rsplit("-", 1)[0], set()).update(
+                pq.read_table(shard, columns=["id"]).column("id").to_pylist())
+        for sp in sorted(tids) or [None]:  # no teacher ids at all: coverage 0
+            name = f"{s}/{sp}" if sp else s
+            t, a = tids.get(sp, set()), aids.get(sp, set())
+            hit = len(t & a)
+            cov = hit / len(t) if t else 0.0
+            report[name] = dict(teacher_ids=len(t), audio_ids=len(a), joined=hit, coverage=round(cov, 5))
+            print(f"  {name:20s} teacher {len(t):7d}  audio {len(a):7d}  joined {hit:7d}  coverage {cov:.4f}")
+            if cov < floor:
+                bad.append(name)
     (state / "bootstrap_coverage.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
     if bad:
         sys.exit(f"coverage below {floor} for {bad}: the audio does not match the teacher outputs")
@@ -161,14 +274,21 @@ PYEOF
 
 log "repo $KITSUNE_DIR at $(git -C "$KITSUNE_DIR" rev-parse --short HEAD 2>/dev/null || echo '?'), config $CONFIG, data $KITSUNE_DATA_REPO@$KITSUNE_DATA_REVISION"
 log "disk free before: $(df -h --output=avail "$KITSUNE_DIR" | tail -1 | tr -d ' ')"
-phase plan "$PY" "$HELPER" plan
-phase pull_derived "$PY" "$HELPER" pull
+# the plan only reads the Hub and rewrites bootstrap_plan.json; neither its GETs nor snapshot_download's repo_info and
+# tree listing have an HTTP timeout, so each attempt gets one. A killed pull resumes: downloads land as .incomplete
+# files renamed when done, and snapshot_download skips what is already on disk (~2.3 GB in all)
+phase plan retry 3 timeout -k 30 10m "$PY" "$HELPER" plan
+phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull
 
 DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["data_root"])' "$STATE/bootstrap_plan.json")"
 mapfile -t REBUILD < <("$PY" -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1]))["rebuild"]))' "$STATE/bootstrap_plan.json" | sed '/^$/d')
 if [ "${#REBUILD[@]}" -gt 0 ]; then
     read -r -a PREP_ARGS <<< "${KITSUNE_PREP_ARGS:-}"
-    phase rebuild_audio "$PY" scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" --sources "${REBUILD[@]}" "${PREP_ARGS[@]}"
+    # 01 resumes from its progress.json and manifest and its writes are kill-safe, so a retry, or a timeout that proves
+    # too short for a healthy rebuild, only redoes the input in progress; 3 x 60 min caps a stall well before the
+    # 5.5 h watchdog
+    phase rebuild_audio retry 3 timeout -k 60 60m "$PY" scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" \
+        --sources "${REBUILD[@]}" "${PREP_ARGS[@]}"
 else
     log "every source has parked shards; nothing to rebuild"
 fi

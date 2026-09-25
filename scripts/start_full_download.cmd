@@ -4,10 +4,12 @@ rem   galgame (all 115 tars) -> emilia_yodas (every tar but the eval_emilia hold
 rem   -> reazon_large (ReazonSpeech ~5000 h; rows already in reazon_small are skipped).
 rem Resumable: re-run after a crash, reboot or a full disk (01_prepare_data stops before any download that would
 rem leave less than 30 GB free). Each source is attempted even if an earlier one failed.
-cd /d D:\Shizu-ko-distill
+rem Runs the checkout this file is in (the parent of scripts\), not a fixed path; PY overrides the interpreter.
+rem It downloads into that checkout's data\ (a git worktree has none: it would start from scratch).
+cd /d "%~dp0.." || exit /b 1
 set PYTHONIOENCODING=utf-8
 set PYTHONUNBUFFERED=1
-set PY=C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe
+if not defined PY set "PY=C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe"
 echo %date% %time% START >> full_download_pipeline.log
 call :run galgame --galgame-shards 115
 call :run emilia_yodas --emilia-hours 100000

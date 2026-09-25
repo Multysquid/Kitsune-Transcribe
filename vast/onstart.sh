@@ -5,15 +5,16 @@
 # by itself if run on a box without the stub (clone_repo is a no-op when the checkout is already at $KITSUNE_SHA).
 #
 # Steps: sync the env to /etc/environment (SSH/tmux sessions do not inherit the container env), raise the nofile limit,
-# check /dev/shm, start TensorBoard and the vast portal, clone the repo at $KITSUNE_SHA, start vast/watchdog.sh (hard
-# cost cap), then detached: vast/bootstrap.sh (data) and vast/supervise.py (training + stop/destroy), all logging to
-# /workspace/kitsune.log.
+# check /dev/shm and the pids budget, start TensorBoard and the vast portal, clone the repo at $KITSUNE_SHA, start
+# vast/watchdog.sh (hard cost cap), then detached: vast/bootstrap.sh (data) and vast/supervise.py (training +
+# stop/destroy), all logging to /workspace/kitsune.log.
 #
 # Restarts: the watchdog deadline is fixed at first boot; a `halt` marker (written by finish.py or by a failure here)
 # means the run is over, so a restarted container only brings up the env and the portal for inspection. An interrupted
-# run is handled by supervise.py's own history. Any failure before the supervisor takes over stops the instance (not
-# destroy), unless KITSUNE_NO_SELF_STOP=1. Bootstrap + supervisor hold $KITSUNE_STATE/supervise.lock, so running this
-# script again by hand during a run starts nothing new.
+# run is handled by supervise.py's own history: a restart that finds $KITSUNE_STATE/supervise.json skips bootstrap (the
+# data passed its coverage check before the supervisor first ran) and hands straight over to it. Any failure before
+# the supervisor takes over stops the instance (not destroy), unless KITSUNE_NO_SELF_STOP=1. Bootstrap + supervisor
+# hold $KITSUNE_STATE/supervise.lock, so running this script again by hand during a run starts nothing new.
 #
 # Re-arm a halted box for a fresh run: `bash vast/onstart.sh --rearm` moves the halt marker, the deadline and the
 # supervisor/finish history to $KITSUNE_STATE/rearm-<stamp>/, then boots as if for the first time (new 5.5 h cap). It
@@ -52,11 +53,14 @@ stop_instance() {  # $1 = reason
         return 0
     fi
     if [ -n "${CONTAINER_API_KEY:-}" ] && [ -n "${CONTAINER_ID:-}" ]; then
-        # the key goes through curl's stdin config, never argv
-        printf 'header = "Authorization: Bearer %s"\n' "$CONTAINER_API_KEY" \
+        # the key goes through curl's stdin config, never argv; a 2xx reply can still refuse ({"success": false}, as
+        # finish.py vast_rest reads it)
+        local r=""
+        r=$(printf 'header = "Authorization: Bearer %s"\n' "$CONTAINER_API_KEY" \
             | curl -fsS --retry 3 --max-time 30 --config - -X PUT -H 'Content-Type: application/json' \
-                -d '{"state": "stopped"}' "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/" >/dev/null \
-            && { log "stop requested via REST"; return 0; }
+                -d '{"state": "stopped"}' "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/") \
+            && ! [[ $r =~ \"success\"[[:space:]]*:[[:space:]]*false ]] && { log "stop requested via REST"; return 0; }
+        log "vast REST stop failed: ${r:-no reply}"
     fi
     log "could not stop the instance; the watchdog (if running) will stop it at the deadline"
     return 1
@@ -74,7 +78,9 @@ fail() {  # ERR trap: record why, stop the box, keep the disk for inspection
 trap 'fail $LINENO' ERR
 
 sync_env() {
-    # rewrite only our block so repeated boots do not grow the file; values are written, never echoed
+    # rewrite only our block so repeated boots do not grow the file; values are written, never echoed. On the first
+    # boot the portal's 10-prep-env.sh (start_portal) then truncates the file and rewrites it from the env it inherited
+    # from us (our block markers go, the values stay); later boots keep its marker line, so it leaves the file alone
     local tmp k v
     tmp=$(mktemp)
     if [ -f /etc/environment ]; then
@@ -203,6 +209,20 @@ if [ "$shm_kb" -lt $(( 2 * 1024 * 1024 )) ]; then
 else
     log "/dev/shm is $(( shm_kb / 1024 )) MB"
 fi
+# the base image's 12-cpu-thread-limits.sh caps the CPU thread pools on a host whose pids budget is below 16 per
+# visible CPU (else pools sized to nproc hit EAGAIN), but only in the portal's shell, not in ours (bootstrap's hf_xet
+# downloads, the trainer and its DataLoader workers): same trigger here, before sync_env so SSH sessions get it too.
+# Every read is guarded: with errtrace a failing $(cat ...) would fire the ERR trap and stop the box
+pids_max=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo unknown)
+ncpu=$(nproc 2>/dev/null || echo 0)
+log "pids.max $pids_max, nproc $ncpu, cpu.max $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo n/a)"
+if [[ "$pids_max" =~ ^[0-9]+$ && "$ncpu" =~ ^[0-9]+$ ]] && (( pids_max < ncpu * 16 )); then
+    for v in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS RAYON_NUM_THREADS \
+        TOKIO_WORKER_THREADS; do
+        export "$v=${!v:-16}"  # a value already set wins
+    done
+    log "low pids budget: CPU thread pools capped to 16"
+fi
 sync_env
 
 if [ -f "$KITSUNE_STATE/halt" ]; then
@@ -233,9 +253,16 @@ log "watchdog started (deadline $(date -u -d "@$(cat "$KITSUNE_STATE/deadline")"
         log "a bootstrap or supervisor of this container is already running; not starting another"
         exit 0
     fi
-    log "bootstrap start"
-    bash "$KITSUNE_DIR/vast/bootstrap.sh"
-    log "bootstrap done; starting the supervisor"
+    if [ -s "$KITSUNE_STATE/supervise.json" ]; then
+        # a restart of this run: the supervisor starts only after a bootstrap that passed its coverage check and
+        # records its history before the first attempt (--rearm moves it aside), so the data is on disk; bootstrap's
+        # Hub calls would turn a Hub outage at restart time into halt + stop instead of the resume / the recorded finish
+        log "supervisor history present: bootstrap already done for this run; handing over to the supervisor"
+    else
+        log "bootstrap start"
+        bash "$KITSUNE_DIR/vast/bootstrap.sh"
+        log "bootstrap done; starting the supervisor"
+    fi
     exec 7>&-  # handed over: supervise.py takes the same lock itself for its lifetime
     exec "$PY" "$KITSUNE_DIR/vast/supervise.py"
 ) < /dev/null &

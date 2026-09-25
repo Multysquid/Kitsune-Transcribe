@@ -133,13 +133,537 @@ def test_schedule_wsd_and_cadence():
     assert m.due(0.0, 10, 0.0, 5, 20, 5) and not m.due(9e9, 9, 0.0, 5, 20, 5)  # steps win when set
 
 
+def test_uploader_never_waits_forever_on_a_stalled_upload(tmp_path):
+    """A checkpoint upload that never returns (a Hub request the server accepted and never answered) must not hold the
+    trainer: wait() and shutdown() return after their bound, the upload is reported as None, and its thread is a
+    daemon, which the interpreter does not join at exit (a ThreadPoolExecutor's worker it does)."""
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    release, evs = threading.Event(), []
+
+    class StalledHub(FakeHub):
+        def upload_folder(self, **kw):
+            release.wait(30)
+            super().upload_folder(**kw)
+
+    up = m.Uploader(StalledHub(), "u/r", "run", True, SimpleNamespace(event=lambda kind, **kw: evs.append(kind)),
+                    retries=())
+    d = tmp_path / "step_1"
+    d.mkdir()
+    (d / "w.bin").write_bytes(b"x")
+    try:
+        up.submit(d, "step_1")
+        t0 = time.monotonic()
+        assert up.wait(0.3) == {"step_1": None} and up.busy() == {d}
+        up.shutdown(0.3)
+        assert time.monotonic() - t0 < 5 and up.worker.daemon and up.worker.is_alive()
+    finally:
+        release.set()
+    up.worker.join(5)
+    assert not up.worker.is_alive() and up.wait(0) == {"step_1": True} and evs == ["ckpt_upload_ok"]
+
+
+def test_a_crash_closes_the_logs_before_waiting_on_uploads(tmp_path, monkeypatch):
+    """A crash with checkpoint uploads pending (the 8.6 GB pre_cooldown full state, weights): _close_failed waited for
+    all of them before the partial summary and the forced sync, and the supervisor's resume waited too. The logs now
+    close first; the uploads get FAILED_UPLOAD_WAIT_S, the queued ones are cancelled, the unfinished ones named."""
+    import copy
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    monkeypatch.setattr(m, "FAILED_UPLOAD_WAIT_S", 0.3)
+    release, order = threading.Event(), []
+
+    class StalledHub(FakeHub):
+        def upload_folder(self, **kw):
+            release.wait(30)
+            super().upload_folder(**kw)
+
+    log = SimpleNamespace(event=lambda kind, **kw: order.append((kind, kw.get("names") or kw.get("name"))),
+                          close=lambda summary: order.append(("close", summary["status"])), elapsed=lambda: 1.0)
+    R = m.Run(cfg=copy.deepcopy(m.DEFAULTS), run_dir=tmp_path / "run", device=torch.device("cpu"), amp=False, log=log)
+    R.uploader = m.Uploader(StalledHub(), "u/r", "run", True, log, retries=())
+    for name in ("full_step_7", "step_7"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "w.bin").write_bytes(b"x")
+        R.uploader.submit(tmp_path / name, name)
+    t0 = time.monotonic()
+    try:
+        m._close_failed(R, "failed", RuntimeError("CUDA error: an illegal instruction was encountered"))
+        assert time.monotonic() - t0 < 5 and R.uploader.worker.daemon
+        assert order == [("close", "failed"), ("ckpt_upload_abandoned", ["full_step_7", "step_7"])]
+    finally:
+        release.set()
+    R.uploader.worker.join(5)  # the running upload finishes; the queued one was cancelled
+    assert not R.uploader.worker.is_alive() and order[2:] == [("ckpt_upload_ok", "full_step_7")]
+
+
+def test_a_normal_exit_with_an_upload_running_skips_finalization(tmp_path, monkeypatch):
+    """The end phase's waits are bounded, so the trainer can return 0 with an xet upload still in a daemon thread;
+    hf_xet re-takes the GIL every 100 ms while it waits, and on CPython 3.12 that during finalization aborts the
+    process (rc -6), which the supervisor read as a crash of a finished run. main() notes the running upload and the
+    __main__ block's exit_process() then leaves by os._exit, after flushing."""
+    import threading
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    release, evs = threading.Event(), []
+
+    class StalledHub(FakeHub):
+        def upload_folder(self, **kw):
+            release.wait(30)
+            super().upload_folder(**kw)
+
+    log = SimpleNamespace(event=lambda kind, **kw: evs.append(kind), wait_sync=lambda timeout=None: True)
+    R = SimpleNamespace(uploader=m.Uploader(StalledHub(), "u/r", "run", True, log, retries=()), log=log)
+    d = tmp_path / "full_step_9"
+    d.mkdir()
+    (d / "w.bin").write_bytes(b"x")
+    monkeypatch.setattr(m, "parse_args", lambda argv: None)
+    monkeypatch.setattr(m, "build", lambda args: (R, None))
+    monkeypatch.setattr(m, "train", lambda R, state: m.EXIT_OK)
+    exits = []
+
+    class HardExit(Exception):  # os._exit never returns
+        pass
+
+    def hard_exit(rc):
+        exits.append(("os._exit", rc))
+        raise HardExit
+
+    monkeypatch.setattr(m.os, "_exit", hard_exit)
+    monkeypatch.setattr(m.sys, "exit", lambda rc: exits.append(("sys.exit", rc)))
+    try:
+        R.uploader.submit(d, "full_step_9")
+        assert m.main([]) == 0 and m._HARD_EXIT
+        with pytest.raises(HardExit):
+            m.exit_process(0)
+        log.wait_sync = lambda timeout=None: False  # a log sync still running counts too
+        release.set()
+        R.uploader.worker.join(5)
+        assert not R.uploader.busy() and m.uploads_left_running(R)
+    finally:
+        release.set()
+    log.wait_sync = lambda timeout=None: True
+    assert m.main([]) == 0 and not m._HARD_EXIT
+    m.exit_process(0)
+    assert exits == [("os._exit", 0), ("sys.exit", 0)]
+
+
+def test_a_failure_with_an_upload_running_skips_finalization_too(tmp_path, monkeypatch, capsys):
+    """main() re-raises a failure, so the __main__ block's exit_process() never ran: a crash whose checkpoint upload
+    (the 8.6 GB pre_cooldown full state) outlived FAILED_UPLOAD_WAIT_S finalized with that upload's thread in hf_xet
+    and aborted (rc -6) instead of exiting 1. main() now notes the running upload before the re-raise, and run_script
+    (the __main__ entry) prints the traceback and leaves by os._exit(EXIT_FAIL). With no upload left running the
+    exception propagates as before."""
+    import copy
+    import threading
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    monkeypatch.setattr(m, "FAILED_UPLOAD_WAIT_S", 0.3)
+    release, evs = threading.Event(), []
+
+    class StalledHub(FakeHub):
+        def upload_folder(self, **kw):
+            release.wait(30)
+            super().upload_folder(**kw)
+
+    log = SimpleNamespace(event=lambda kind, **kw: evs.append(kind), exception=lambda e: evs.append("exception"),
+                          close=lambda summary: evs.append("close"), elapsed=lambda: 1.0,
+                          wait_sync=lambda timeout=None: True)
+    R = m.Run(cfg=copy.deepcopy(m.DEFAULTS), run_dir=tmp_path / "run", device=torch.device("cpu"), amp=False, log=log)
+    R.uploader = m.Uploader(StalledHub(), "u/r", "run", True, log, retries=())
+    d = tmp_path / "full_step_9"
+    d.mkdir()
+    (d / "w.bin").write_bytes(b"x")
+
+    def crash(R, state):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(m, "parse_args", lambda argv: None)
+    monkeypatch.setattr(m, "build", lambda args: (R, None))
+    monkeypatch.setattr(m, "train", crash)
+    exits = []
+
+    class HardExit(Exception):  # os._exit never returns
+        pass
+
+    def hard_exit(rc):
+        exits.append(("os._exit", rc))
+        raise HardExit
+
+    monkeypatch.setattr(m.os, "_exit", hard_exit)
+    monkeypatch.setattr(m.sys, "exit", lambda rc: exits.append(("sys.exit", rc)))
+    try:
+        R.uploader.submit(d, "full_step_9")
+        with pytest.raises(HardExit):
+            m.run_script([])
+        assert m._HARD_EXIT and exits == [("os._exit", m.EXIT_FAIL)]
+        assert evs[:3] == ["exception", "close", "ckpt_upload_abandoned"]
+        assert "RuntimeError: CUDA error: an illegal memory access" in capsys.readouterr().err
+    finally:
+        release.set()
+    R.uploader.worker.join(5)
+    assert not R.uploader.worker.is_alive()
+    with pytest.raises(RuntimeError, match="illegal memory access"):  # the interpreter prints it and exits 1
+        m.run_script([])
+    assert not m._HARD_EXIT and exits == [("os._exit", m.EXIT_FAIL)]
+
+
+@pytest.mark.parametrize("cut_short", [True, False])
+def test_a_resume_sets_newer_states_aside_and_uploads_the_pre_cooldown_state_again(tmp_path, monkeypatch, cut_short):
+    """--resume from an older full state moves the abandoned attempt's newer ones aside (set_aside_newer). The
+    pre_cooldown full state is uploaded only by the process that saved it (finish.py's syncs take the newest full
+    state, the post-crash one none), so a crash that cut its upload short lost it: a resume from it, or from a later
+    state, queues it again while its UPLOAD_MARK says the upload has not succeeded. One already on the Hub (no mark)
+    is not queued again: hf_xet would read and hash all ~8.6 GB of it on the box for an empty commit."""
+    m = load_script("04_distill")
+    hub = FakeHub()
+    monkeypatch.setattr(m, "hf_api", lambda: hub)
+    cfg = m._merge(m.DEFAULTS, {"student": str(tmp_path / "student"), "runs_root": str(tmp_path / "runs"),
+                                "device": "cpu", "hf": {"output_repo": "u/r"}, "log": {"capture_env": False}})
+    ck = tmp_path / "runs" / "run" / "checkpoints"
+    for step in (6, 8):  # 6: the pre_cooldown state (its own trainer.pt names it), 8: the attempt backed out of
+        st = m.Run(cfg=cfg, run_dir=ck.parent, device=torch.device("cpu"), amp=False).st
+        st.update(step=step, pre_cooldown_done=True, pre_cooldown_full="full_step_6")
+        (ck / f"full_step_{step}").mkdir(parents=True)
+        torch.save(dict(format=1, step=step, cfg=cfg, st=st, logger=None), ck / f"full_step_{step}" / "trainer.pt")
+    if cut_short:
+        (ck / "full_step_6" / m.UPLOAD_MARK).touch()
+    R, _ = m.build(m.parse_args(["--resume", str(ck / "full_step_6")]))
+    try:
+        res = next(e for e in events(ck.parent) if e["kind"] == "resume")
+        assert res["set_aside"] == ["full_step_8"]
+        if cut_short:
+            assert R.uploader.wait(10) == {"full_step_6": True}
+            assert [f[0] for f in hub.folders] == ["runs/run/checkpoints/full_step_6"]
+            assert res["upload_again"] == "full_step_6"
+            assert not (ck / "full_step_6" / m.UPLOAD_MARK).exists()  # on the Hub now
+        else:
+            assert R.uploader.wait(10) == {} and hub.folders == [] and res["upload_again"] is None
+        assert m.find_full_state(ck.parent) == ck / "full_step_6"
+    finally:
+        R.uploader.shutdown(5)
+        R.log.close()
+
+
+def test_a_full_state_meant_for_the_hub_is_marked_from_the_moment_it_exists(tmp_path):
+    """save_full touched UPLOAD_MARK only after the rename and the checkpoint event: a process that died in between
+    (ENOSPC or a kill while the event is written) left a complete pre_cooldown dir with no mark, which build() on
+    resume, rotation and finish.py all take for one already on the Hub. The mark is now renamed in with the dir."""
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+
+    class Died(Exception):
+        pass
+
+    def event(kind, **kw):
+        if kind == "checkpoint":
+            raise Died  # right after the rename, before the submit
+
+    run = tmp_path / "runs" / "run"
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 2}}, run_dir=run, ckpt_dir=run / "checkpoints", st=dict(fulls=[]),
+                        clock=lambda: 0.0, planner=SimpleNamespace(state_dict=dict),
+                        log=SimpleNamespace(event=event, state_dict=dict), model=torch.nn.Linear(1, 1),
+                        opt=SimpleNamespace(state_dict=dict), l2sp=SimpleNamespace(state_dict=dict),
+                        uploader=SimpleNamespace(repo="u/r"))
+    R.ckpt_dir.mkdir(parents=True)
+    for step, upload in ((4, True), (6, False)):
+        with pytest.raises(Died):
+            m.save_full(R, step, "pre_cooldown" if upload else "periodic", upload=upload)
+        d = R.ckpt_dir / f"full_step_{step}"
+        assert (d / "trainer.pt").is_file() and (d / m.UPLOAD_MARK).is_file() == upload
+    R.uploader.repo = None  # no output repo: nothing would ever remove a mark, so none is written
+    with pytest.raises(Died):
+        m.save_full(R, 8, "pre_cooldown", upload=True)
+    assert not (R.ckpt_dir / "full_step_8" / m.UPLOAD_MARK).exists()
+
+
+@pytest.mark.parametrize("pre_upload_ok", [False, True])
+def test_a_failed_pre_cooldown_upload_is_kept_for_finish(tmp_path, pre_upload_ok):
+    """The pre_cooldown full state whose upload failed every retry counted as done, so the end save's rotation
+    (keep_local 2, a periodic full state inside the cooldown) deleted it, and finish.py, which took only the newest
+    full state, verified the run and destroyed the box: the stable-phase resume point was on no disk and no Hub. Its
+    UPLOAD_MARK now keeps it from rotation until an upload succeeds, and finish.py uploads and verifies it."""
+    import importlib.util
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    evs = []
+
+    class FlakyHub(FakeHub):
+        def upload_folder(self, **kw):
+            if kw["path_in_repo"].endswith("/full_step_4") and not pre_upload_ok:
+                raise RuntimeError("503 Service Unavailable")
+            super().upload_folder(**kw)
+
+    hub, run = FlakyHub(), tmp_path / "runs" / "run"
+    log = SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw.get("name"))), state_dict=dict)
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 2}}, run_dir=run, ckpt_dir=run / "checkpoints", st=dict(fulls=[]),
+                        clock=lambda: 0.0, planner=SimpleNamespace(state_dict=dict), log=log,
+                        model=torch.nn.Linear(1, 1), opt=SimpleNamespace(state_dict=dict),
+                        l2sp=SimpleNamespace(state_dict=dict))
+    R.uploader = m.Uploader(hub, "u/r", "run", True, log, retries=())
+    R.ckpt_dir.mkdir(parents=True)
+    try:
+        for step, reason, upload in ((2, "periodic", False), (4, "pre_cooldown", True), (6, "periodic", False),
+                                     (8, "end", True)):
+            m.save_full(R, step, reason, upload=upload)
+            R.uploader.wait(10)
+    finally:
+        R.uploader.shutdown(5)
+    left = sorted(p.name for p in R.ckpt_dir.iterdir())
+    assert ("ckpt_upload_failed", "full_step_4") in evs or pre_upload_ok
+    assert not (R.ckpt_dir / "full_step_8" / m.UPLOAD_MARK).exists()  # uploaded: nothing to keep it for
+    assert all(ign == [m.UPLOAD_MARK] for _, _, ign in hub.folders)  # the marker never leaves the box
+    spec = importlib.util.spec_from_file_location("finish", ROOT / "vast" / "finish.py")
+    finish = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(finish)
+    fulls = {p.split("/")[3] for p in finish.expected_files(run) if "/full_step_" in p}
+    if pre_upload_ok:
+        assert left == ["full_step_6", "full_step_8"] and fulls == {"full_step_8"}
+    else:
+        assert left == ["full_step_4", "full_step_6", "full_step_8"]
+        assert (R.ckpt_dir / "full_step_4" / m.UPLOAD_MARK).exists()
+        assert fulls == {"full_step_4", "full_step_8"}
+        assert not any(p.endswith(m.UPLOAD_MARK) for p in finish.expected_files(run))
+
+
+@pytest.mark.parametrize("fault", [None, "hf_error", "frames_shifted", "mask", "dither_scale",
+                                   "dither_in_padding", "dither_per_batch"])
+def test_smoke_stops_on_a_featuriser_that_is_off(fault, monkeypatch):
+    """The smoke's LogMel vs HF check only logged its numbers: features other than the teacher's ran the paid hours
+    anyway. A mean |diff| above LOGMEL_MEAN_DIFF_MAX or other masks now fail the smoke, and so does an error that keeps
+    the check from running (setup_processing already refuses a student dir without a processor, so no error here is
+    an expected skip), and a training dither of the wrong scale, in the padding, or not batch-invariant: it is
+    checked on the training device, whose dither branch no comparison with HF can judge."""
+    from types import SimpleNamespace
+
+    from kitsune import features as Fm
+
+    m = load_script("04_distill")
+    rng = np.random.default_rng(3)
+    waves = [(0.1 * rng.standard_normal(n)).astype(np.float32) for n in (16000, 5555, 23456)]
+    exact = Fm.LogMel()
+
+    class Reached(Exception):
+        pass
+
+    class Train(list):
+        def wave(self, i):
+            return self[i]
+
+    def reference(ws, path_or_repo=None):
+        if fault == "hf_error":
+            raise TypeError("__call__() got an unexpected keyword argument 'punctuation'")
+        return exact(*Fm.pad_waves(ws))  # bitwise the HF extractor on CPU (tests/test_features.py)
+
+    def feat_eval(wave, lengths):
+        f, mask = exact(wave, lengths)
+        return (torch.roll(f, 1, dims=1) if fault == "frames_shifted" else f,
+                torch.roll(mask, 1, dims=1) if fault == "mask" else mask)
+
+    class TrainFeat(Fm.LogMel):
+        def _dither(self, wave, lengths, valid):
+            if fault == "dither_scale":
+                return 10 * super()._dither(wave, lengths, valid)
+            if fault == "dither_in_padding":
+                return wave + self.dither * torch.randn_like(wave)
+            if fault == "dither_per_batch":
+                return wave + valid * self.dither * torch.randn_like(wave)
+            return super()._dither(wave, lengths, valid)
+
+    def past_the_featuriser():
+        raise Reached
+
+    evs = []
+    monkeypatch.setattr(Fm, "hf_reference", reference)
+    R = SimpleNamespace(train=Train(waves), cfg={"student": "students/x"}, feat_eval=feat_eval,
+                        feat_train=TrainFeat(exact_dither=False), device=torch.device("cpu"),
+                        log=SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw))),
+                        planner=SimpleNamespace(worst_micro_batches=past_the_featuriser))
+    if fault is None:
+        with pytest.raises(Reached):
+            m.smoke_checks(R)
+        ev = dict(evs)
+        assert ev["smoke_logmel_vs_hf"] == dict(max_abs_diff=0.0, mean_abs_diff=0.0, masks_equal=True, n=3,
+                                                device="cpu")
+        dith = ev["smoke_train_dither"]
+        assert dith["ok"] and dith["padding_zero"] and dith["batch_invariant"] and dith["n"] == 3
+        assert dith["std"] == pytest.approx(1e-5, rel=0.05)
+    else:
+        with pytest.raises(m.SmokeFailed, match="dither" if fault.startswith("dither") else "HF extractor"):
+            m.smoke_checks(R)
+        if not fault.startswith("dither"):
+            assert "smoke_train_dither" not in dict(evs)
+        if fault == "hf_error":
+            assert dict(evs)["smoke_logmel_vs_hf"] == dict(
+                error="TypeError: __call__() got an unexpected keyword argument 'punctuation'")
+
+
+def test_a_file_renamed_away_while_an_upload_lists_its_dir_is_a_retried_attempt(tmp_path, monkeypatch):
+    """The upload's size listing ran outside its try: one that met the end save's trainer.pt.tmp just before its
+    rename raised FileNotFoundError out of the upload's future, unlogged, or re-raised by wait() at the end of a finished
+    run. It is now an attempt like any other: logged and retried."""
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    d = tmp_path / "full_step_7"
+    d.mkdir()
+    (d / "model.pt").write_bytes(b"x" * 10)
+    real_rglob, evs = Path.rglob, []
+
+    def rglob(self, pattern):
+        if self == d and not evs:
+            raise FileNotFoundError(2, "No such file or directory", str(d / "trainer.pt.tmp"))
+        return real_rglob(self, pattern)
+
+    monkeypatch.setattr(Path, "rglob", rglob)
+    hub = SimpleNamespace(create_repo=lambda *a, **k: None, upload_folder=lambda **kw: None)
+    up = m.Uploader(hub, "u/r", "run", True, SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw))),
+                    retries=(0,))
+    try:
+        up.submit(d, "full_step_7")
+        assert up.wait(10) == {"full_step_7": True}
+    finally:
+        up.shutdown(5)
+    assert [k for k, _ in evs] == ["ckpt_upload_error", "ckpt_upload_ok"]
+    assert "trainer.pt.tmp" in evs[0][1]["error"] and evs[1][1]["gb"] == 0.0
+
+
+@pytest.mark.parametrize("started", [True, False])
+def test_the_end_save_does_not_rewrite_a_full_state_under_its_upload(tmp_path, started):
+    """The loop ended at the step of its pre_cooldown full state (a STOP file and a skipped step): the end save
+    rewrote that dir's trainer.pt while its upload was still listing and hashing it (a commit of one file's size with
+    the other's hash). A running upload of the dir now finishes before the rewrite; one still queued is cancelled and
+    queued again after it, and wait() stays clean."""
+    import threading
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+
+    class GatedHub(FakeHub):
+        def __init__(self):
+            super().__init__()
+            self.entered, self.release, self.seen = threading.Event(), threading.Event(), []
+
+        def upload_folder(self, **kw):
+            tp = Path(kw["folder_path"]) / "trainer.pt"
+            before = tp.read_bytes() if tp.exists() else None
+            self.entered.set()
+            self.release.wait(10)
+            self.seen.append((kw["path_in_repo"].rsplit("/", 1)[1], before, tp.read_bytes() if tp.exists() else None))
+            super().upload_folder(**kw)
+
+    hub, run = GatedHub(), tmp_path / "runs" / "run"
+    log = SimpleNamespace(event=lambda kind, **kw: None, state_dict=dict)
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 2}}, run_dir=run, ckpt_dir=run / "checkpoints", st=dict(fulls=[]),
+                        clock=lambda: 0.0, planner=SimpleNamespace(state_dict=dict), log=log,
+                        model=torch.nn.Linear(1, 1), opt=SimpleNamespace(state_dict=dict),
+                        l2sp=SimpleNamespace(state_dict=dict))
+    R.uploader = m.Uploader(hub, "u/r", "run", True, log, retries=())
+    R.ckpt_dir.mkdir(parents=True)
+    try:
+        if not started:  # the worker is busy with a weights upload: the pre_cooldown one waits in the queue
+            (R.ckpt_dir / "step_2").mkdir()
+            (R.ckpt_dir / "step_2" / "model.safetensors").write_bytes(b"w")
+            R.uploader.submit(R.ckpt_dir / "step_2", "step_2")
+            assert hub.entered.wait(10)
+        d = m.save_full(R, 4, "pre_cooldown", upload=True)
+        assert hub.entered.wait(10)
+        if started:  # the end save waits for it
+            threading.Timer(0.5, hub.release.set).start()
+        m.save_full(R, 4, "end")  # upload_full_at without "end": the pre_cooldown upload is the only one of the dir
+        hub.release.set()
+        uploads = R.uploader.wait(10)
+    finally:
+        hub.release.set()
+        R.uploader.shutdown(5)
+    end = (d / "trainer.pt").read_bytes()
+    assert json.loads((d / "trainer.json").read_text(encoding="utf-8"))["reason"] == "end"
+    ups = [s for s in hub.seen if s[0] == "full_step_4"]
+    assert len(ups) == 1 and ups[0][1] == ups[0][2]  # one trainer.pt from the listing to the commit
+    assert (ups[0][1] == end) is (not started)  # a running upload keeps the pre_cooldown one, a queued one the end one
+    assert uploads == ({"full_step_4": True} if started else {"step_2": True, "full_step_4": True})
+
+
+def test_hf_roundtrip_retries_a_transient_hub_error(tmp_path):
+    """The smoke round trip's create_repo and commit POSTs are sent once by the hub: one 503 must be retried (on the
+    uploads' schedule) instead of stopping the paid run after its bootstrap; bad credentials fail at once."""
+    from types import SimpleNamespace
+
+    import httpx
+    from huggingface_hub.errors import HfHubHTTPError
+
+    m = load_script("04_distill")
+
+    class FlakyHub(FakeHub):
+        def __init__(self, status):
+            super().__init__()
+            self.status, self.commits = status, 0
+
+        def upload_file(self, **kw):
+            self.commits += 1
+            if self.commits == 1:
+                resp = httpx.Response(self.status, request=httpx.Request("POST", "https://hf.invalid/commit/main"))
+                raise HfHubHTTPError(f"{self.status} from the Hub", response=resp)
+            super().upload_file(**kw)
+
+    def roundtrip(hub):
+        evs = []
+        R = SimpleNamespace(uploader=SimpleNamespace(api=hub, retries=(0, 0)), run_dir=tmp_path / "run",
+                            cfg={"hf": {"output_repo": "u/r", "private": True}},
+                            log=SimpleNamespace(event=lambda kind, **kw: evs.append(dict(kind=kind, **kw))))
+        R.run_dir.mkdir(exist_ok=True)
+        return m.hf_roundtrip(R), evs
+
+    hub = FlakyHub(503)
+    out, evs = roundtrip(hub)
+    assert out["ok"] and out["attempt"] == 1 and hub.commits == 2
+    assert [(e["kind"], e.get("attempt")) for e in evs] == [("smoke_hf_roundtrip_error", 0), ("smoke_hf_roundtrip", 1)]
+    assert "503" in evs[0]["error"]
+    hub = FlakyHub(401)
+    with pytest.raises(HfHubHTTPError):
+        roundtrip(hub)
+    assert hub.commits == 1  # no retry on bad credentials
+
+
+def test_trainer_hub_client_has_a_timeout():
+    """huggingface_hub's shared client has no timeout by default: a commit POST the Hub accepted and never answered
+    would keep the trainer, and a paid instance, up until the watchdog. hf_api() bounds it and keeps the hub's hook."""
+    import huggingface_hub
+    from huggingface_hub.utils import _http
+
+    m = load_script("04_distill")
+    try:
+        m.hf_api()
+        c = _http.get_session()
+        assert (c.timeout.connect, c.timeout.read) == (60, 300)
+        assert _http.hf_request_event_hook in c.event_hooks["request"] and c.follow_redirects
+    finally:
+        huggingface_hub.set_client_factory(_http.default_client_factory)
+
+
 def test_configs_resolve():
     m = load_script("04_distill")
     via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
-    # the file spells out the defaults, and turns early stopping on (off in DEFAULTS: a config that does not mention it
-    # trains to its budget, as before early stopping existed)
+    # the file spells out the defaults, turns early stopping on (off in DEFAULTS: a config that does not mention it
+    # trains to its budget, as before early stopping existed) and sets the eval cadence: a full eval (complete eval
+    # sets) at every epoch end, a mini eval every 200 steps, a greedy decode of ~600 s of the probe for the train CER
+    # (all off in DEFAULTS: a config that does not mention them evaluates as before)
     assert not m.DEFAULTS["early_stop"]["enabled"] and via["early_stop"]["enabled"]
-    assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True))
+    ev_via = dict(m.DEFAULTS["eval"], full_every_epochs=1, probe_greedy_audio_s=600,
+                  mini=dict(every_steps=200, val_per_set=32, train_utts=64, greedy=True))
+    assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True), eval=ev_via)
+    assert via["eval"]["every_min"] == 20 and via["eval"]["gate"] is True  # every_min: the fallback cadence only
+    assert m.epoch_cadence(via) == 1 and m.DEFAULTS["eval"]["mini"]["every_steps"] is None
     smoke = m.load_config(str(ROOT / "configs" / "smoke_laptop.json"), ["hf.output_repo=u/r", "seed=7"])
     assert smoke["student"] == "students/b4x2560-d2" and smoke["schedule"]["train_hours"] == 0.1
     assert smoke["batch"]["micro_audio_s"] == 60 and smoke["batch"]["step_audio_s"] == 120
@@ -148,6 +672,11 @@ def test_configs_resolve():
     assert smoke["loss"] == m.DEFAULTS["loss"]  # untouched sections keep the viability values
     with pytest.raises(SystemExit):
         m.load_config(None, ["optim.lrr=1"])
+    # a Python-style or quoted boolean is not JSON true/false: apply_set keeps the truthy string, so validate refuses it
+    for bad in ("perf.tf32=False", "eval.probe_is_train=False", 'smoke.enabled="false"'):
+        with pytest.raises(SystemExit, match="must be true or false"):
+            m.load_config(None, [bad])
+    assert m.load_config(None, ["perf.tf32=false"])["perf"]["tf32"] is False
     for key in ("sources", "eval_sets", "teacher_root", "second_root", "data_root", "selection", "student"):
         assert key in json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))  # bootstrap.sh
 
@@ -175,6 +704,77 @@ def test_padded_row_gate_fails_the_smoke(env, hub):
     pad = next(e for e in events(run) if e["kind"] == "smoke_padded_row")
     assert pad["ok"] is False and pad["n_utts"] == 32 and pad["n_tok"] > 32 and pad["kl_mean"] < 1e-6
     assert pad["kl_bound"] == -1 and "bf16_noise_kl_mean" not in pad  # fp32: no noise floor to measure
+
+
+def test_a_source_that_cannot_be_decoded_fails_the_smoke(env, hub, monkeypatch):
+    """The dataset drops an undecodable row and goes on (one bad upstream file must not end a paid run), so a decode
+    failure that hits a whole source - a codec or the resampler broken on a new box - must stop the smoke instead of
+    thinning the data for the whole run: decode_preflight names the set before anything else in the smoke phase, and
+    a failure only the loader hits is caught by the share of dropped rows over the smoke steps."""
+    from kitsune import trainset
+
+    m = load_script("04_distill")
+    real_bytes, real_loader = trainset.AudioBatchDataset.audio_bytes, trainset.make_loader
+
+    def audio_bytes(self, i):  # src_b's bytes are no audio: decode_audio raises on every row, as on a broken codec
+        return b"not audio" if self.sources[i] == "src_b" else real_bytes(self, i)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(trainset.AudioBatchDataset, "audio_bytes", audio_bytes)
+        with pytest.raises(m.SmokeFailed, match=r"audio decode fails for whole sets: train src_b \(8/8 rows"):
+            m.main(["--config", str(env["config"]), "--set", "run_name=tiny-nodecode", "--set", "hf.output_repo=null"])
+    ev = events(next((env["root"] / "runs").glob("tiny-nodecode-*")))
+    sets = next(e for e in ev if e["kind"] == "smoke_decode")["sets"]
+    assert sets["train/src_b"]["failed"] == sets["train/src_b"]["n"] == 8 and sets["train/src_b"]["first_error"]
+    assert sets["train/src_a"] == dict(n=8, failed=0, first_error=None)
+    assert all(sets[f"eval/{s}"] == dict(n=6, failed=0, first_error=None) for s in EVAL)
+    assert "memory_probe" not in {e["kind"] for e in ev}  # first thing in the smoke phase
+
+    def lossy_loader(*a, **k):  # the workers lose a row of every micro-batch; the main process decodes fine
+        inner = real_loader(*a, **k)
+        try:
+            for key, mbs in inner:
+                for mb in mbs:
+                    mb["dropped"] = [*mb["dropped"], "src_b/fake/undecodable.flac"]
+                yield key, mbs
+        finally:
+            inner.close()
+
+    monkeypatch.setattr(trainset, "make_loader", lossy_loader)
+    with pytest.raises(m.SmokeFailed, match="had undecodable audio over the smoke steps"):
+        m.main(["--config", str(env["config"]), "--set", "run_name=tiny-lossy", "--set", "hf.output_repo=null",
+                "--set", "eval.every_steps=1000"])
+    ev = events(next((env["root"] / "runs").glob("tiny-lossy-*")))
+    smoke = next(e for e in ev if e["kind"] == "smoke_steps")
+    n_drop = sum(e["n"] for e in ev if e["kind"] == "dropped_audio")
+    assert smoke["steps"] == 4 and smoke["dropped"] == n_drop >= 4 and smoke["dropped_frac"] > 0.01
+    assert not any(e["kind"] == "checkpoint" and e.get("reason") == "after_smoke" for e in ev)
+
+
+def test_undecodable_eval_rows_are_reported_and_named_in_the_verdict(env, hub, monkeypatch):
+    """An eval row the dataset cannot decode is left out of every eval (one bad file must not end a paid run), but not
+    silently: each eval that lost it writes an `eval_dropped_audio` event with the counts per set and the ids, and the
+    verdict says the gate set was judged on fewer rows than its full size."""
+    from kitsune import trainset
+
+    m = load_script("04_distill")
+    bad = min(i for i, u in env["fc"].utts.items() if u.source == "eval_cv8")
+    real_bytes = trainset.AudioBatchDataset.audio_bytes
+    monkeypatch.setattr(trainset.AudioBatchDataset, "audio_bytes",
+                        lambda self, i: b"not audio" if self.ids[i] == bad else real_bytes(self, i))
+    assert m.main(["--config", str(env["config"]), "--set", "run_name=tiny-evaldrop", "--set", "smoke.enabled=false",
+                   "--set", "schedule.max_steps=2", "--set", "eval.every_steps=1000", "--set", "hf.output_repo=null",
+                   "--set", "ckpt.weights_every_steps=1000", "--set", "ckpt.full_every_steps=1000"]) == 0
+    run = next((env["root"] / "runs").glob("tiny-evaldrop-*"))
+    drops = [e for e in events(run) if e["kind"] == "eval_dropped_audio"]
+    assert [(e["at_step"], e["final"]) for e in drops] == [(0, False), (2, True)]  # the step-0 eval, the final one
+    for e in drops:  # teacher-forced on every eval row at each eval
+        assert e["n"]["tf"] == 1 and e["per_set"]["tf"] == {"eval_cv8": 1} and e["ids"]["tf"] == [bad]
+    assert drops[-1]["per_set"]["greedy_full"] == {"eval_cv8": 1} and drops[-1]["ids"]["greedy_full"] == [bad]
+    v = json.loads((run / "summary.json").read_text(encoding="utf-8"))["verdict"]
+    assert v["sets"]["eval_cv8"]["n"] == 5 and v["sets"]["eval_cv8"]["n_bad_audio"] == 1
+    assert v["sets"]["eval_jsut"]["n"] == 6 and v["sets"]["eval_jsut"]["n_bad_audio"] == 0
+    assert "eval_cv8: judged on 5 decoded rows, 1 undecodable (not the pre-registered full set)" in v["reasons"]
 
 
 def test_skipped_steps_and_dropped_audio_are_logged_with_ids(env, hub, monkeypatch):
@@ -254,9 +854,76 @@ def test_shm_cap_fits_workers_into_dev_shm(monkeypatch, tmp_path):
     monkeypatch.setattr(m.shutil, "disk_usage", usage(64 * 2**20))  # Docker's default /dev/shm
     n, p, info = m.shm_cap(8, 4, 400, shm=str(tmp_path))
     assert (n, p) == (1, 1) and info["workers"] == [8, 1] and info["prefetch"] == [4, 1]
+    # 1 worker decodes the MP3/OGG-heavy train mix at ~1k audio-s/s, below an A100: the change says so (loop warns)
+    assert info["decode_ceiling_audio_s_per_s"] == 1000
+    monkeypatch.setattr(m.shutil, "disk_usage", usage(1 * 2**30))
+    n, p, info = m.shm_cap(8, 4, 400, shm=str(tmp_path))
+    assert (n, p) == (8, 2) and "decode_ceiling_audio_s_per_s" not in info  # prefetching less costs no decode rate
+    monkeypatch.setattr(m.shutil, "disk_usage", usage(300 * 2**20))
+    n, p, info = m.shm_cap(2, 4, 400, shm=str(tmp_path))
+    assert (n, p) == (2, 2) and "decode_ceiling_audio_s_per_s" not in info  # 2 workers by config, not by the cut
     monkeypatch.setattr(m.shutil, "disk_usage", usage(16 * 2**20))
-    assert m.shm_cap(8, 4, 400, shm=str(tmp_path))[:2] == (0, 1)  # decode in-process
+    n, p, info = m.shm_cap(8, 4, 400, shm=str(tmp_path))
+    assert (n, p) == (0, 1) and info["decode_ceiling_audio_s_per_s"] == 1000  # decode in-process
     assert m.shm_cap(8, 4, 400, shm=str(tmp_path / "missing")) == (8, 4, None)  # no /dev/shm (Windows)
+
+
+def test_data_event_logs_the_eval_stores_dropped_rows(tmp_path):
+    """Eval rows without audio (a galgame hold-out the box rebuild lost) were counted only in a printed line and the
+    unuploaded stores.json: the 'data' event logged the train store's drops alone. It now logs the eval store's."""
+    import types
+
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    m = load_script("04_distill")
+    fc = make_fake_corpus(tmp_path / "corpus", sources={"src_a": (24, "train"), "gal": [(8, "eval"), (16, "train")]},
+                          dur_range=(0.4, 2.5), token_range=(256, 296), seed=5)
+    sel = make_fake_selection(fc, sources=["src_a", "gal"], eval_sets=["gal"])
+    (shard,) = (fc.data / "shards" / "gal").glob("eval-*.parquet")  # the box lost 3 hold-out clips the laptop had
+    t = pq.read_table(shard)
+    kept = set(pd.read_parquet(sel).query("source == 'gal' and split == 'eval' and keep")["id"])
+    lost = [i for i in t.column("id").to_pylist() if i in kept][:3]
+    pq.write_table(t.filter(pc.invert(pc.is_in(t.column("id"), pa.array(lost)))), shard)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({
+        "data_root": str(fc.data), "teacher_root": str(fc.teacher_out), "second_root": str(fc.second_out),
+        "selection": str(sel), "cache_dir": str(tmp_path / "cache"), "sources": ["src_a", "gal"], "eval_sets": ["gal"],
+        "device": "cpu", "autocast": "none"}), encoding="utf-8")
+    R = m.Run(cfg=m.load_config(str(path), []), run_dir=tmp_path, device=torch.device("cpu"), amp=False)
+    evs = []
+    R.log = types.SimpleNamespace(event=lambda kind, **kw: evs.append(dict(kind=kind, **kw)))
+    m.setup_data(R)
+    data = next(e for e in evs if e["kind"] == "data")
+    assert data["eval_dropped"]["no_audio"]["n"] == 3 and data["eval_dropped"]["no_audio"]["by_source"] == {"gal": 3}
+    assert sorted(data["eval_dropped"]["no_audio"]["ids"]) == sorted(lost)
+    assert data["eval_per_set"]["gal"]["utts"] == len(kept) - 3 and data["dropped"]["no_audio"]["n"] == 0
+
+
+def test_setup_processing_has_no_teacher_tokenizer_fallback(monkeypatch, tmp_path):
+    """A student dir without its processor and tokenizer files stops the setup with that cause. The old fallback
+    loaded the gated teacher tokenizer (a 403 with the box token, in place of the real cause) and, where that worked,
+    saved every step_<N>/ without processor or tokenizer files."""
+    import types
+
+    from kitsune import evaluate as ev
+
+    m = load_script("04_distill")
+
+    def gated():
+        raise AssertionError("the gated teacher tokenizer was loaded")
+
+    monkeypatch.setattr(ev, "teacher_tokenizer", gated)
+    sdir = tmp_path / "student"
+    sdir.mkdir()
+    (sdir / "config.json").write_text("{}", encoding="utf-8")  # what bootstrap once required of the student dir
+    evs = []
+    R = types.SimpleNamespace(cfg={"student": str(sdir), "perf": {"train_exact_dither": False}, "specaug": {}},
+                              device=torch.device("cpu"), log=types.SimpleNamespace(event=lambda kind, **kw: evs.append(kind)))
+    with pytest.raises(RuntimeError, match="no loadable processor"):
+        m.setup_processing(R)
+    assert evs == []
 
 
 @pytest.fixture(scope="module")
@@ -266,9 +933,24 @@ def crash_resume(env):
     runs first (or alone); what the crashed launch left behind is kept here, since the resume changes it."""
     import huggingface_hub
 
+    from kitsune.runlog import RunLogger
+
     hub = FakeHub()
+    order = []  # summary.json writes (status, uploads) and forced log syncs, in call order
+
+    def write_summary(self, summary, _orig=RunLogger.write_summary):
+        order.append(("summary", summary["status"], summary.get("uploads")))
+        _orig(self, summary)
+
+    def sync(self, force=False, wait=None, _orig=RunLogger.sync):
+        if force:
+            order.append(("sync",))
+        return _orig(self, force, wait)
+
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(huggingface_hub, "HfApi", lambda *a, **k: hub)
+        mp.setattr(RunLogger, "write_summary", write_summary)
+        mp.setattr(RunLogger, "sync", sync)
         mp.setenv("KITSUNE_CRASH_AT_STEP", "13")
         with pytest.raises(RuntimeError, match="simulated crash"):
             load_script("04_distill").main(["--config", str(env["config"])])
@@ -281,7 +963,7 @@ def crash_resume(env):
                                        for p in sorted((run / "metrics" / "train_utts").glob("part-*.parquet"))]))
         mp.delenv("KITSUNE_CRASH_AT_STEP")
         rc = load_script("04_distill").main(["--config", str(env["config"]), "--resume", str(ck / "full_step_10")])
-    return dict(run=run, hub=hub, crashed=crashed, rc=rc)
+    return dict(run=run, hub=hub, crashed=crashed, rc=rc, order=order)
 
 
 def test_train_crash_resume_export(crash_resume, tmp_path):
@@ -342,10 +1024,13 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
 
     ev2 = events(run)
     kinds = [e["kind"] for e in ev2]
-    for k in ("smoke_logmel_vs_hf", "smoke_longest_fwd_bwd", "smoke_padded_row", "smoke_sdpa", "smoke_flops",
-              "smoke_hf_roundtrip", "memory_probe", "smoke_steps", "resume", "resumed", "verdict", "logger_close"):
+    for k in ("smoke_logmel_vs_hf", "smoke_train_dither", "smoke_longest_fwd_bwd", "smoke_padded_row", "smoke_sdpa",
+              "smoke_flops", "smoke_hf_roundtrip", "memory_probe", "smoke_steps", "resume", "resumed", "verdict",
+              "logger_close"):
         assert k in kinds, k
-    assert next(e for e in ev2 if e["kind"] == "smoke_logmel_vs_hf")["max_abs_diff"] == 0.0  # bitwise on CPU
+    lm = next(e for e in ev2 if e["kind"] == "smoke_logmel_vs_hf")
+    assert lm["max_abs_diff"] == lm["mean_abs_diff"] == 0.0 and lm["masks_equal"]  # bitwise on CPU
+    assert next(e for e in ev2 if e["kind"] == "smoke_train_dither")["ok"]
     pad = next(e for e in ev2 if e["kind"] == "smoke_padded_row")
     assert pad["ok"] and pad["argmax_agree"] == 1.0 and pad["kl_mean"] < 1e-6 and pad["n_utts"] == 32  # fp32: exact
     assert next(e for e in ev2 if e["kind"] == "resumed")["at_step"] == 10
@@ -392,6 +1077,12 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
     assert f"{prefix}/checkpoints/full_step_{int((1 - COOLDOWN) * MAX_STEPS)}" in uploaded  # pre-cooldown
     syncs = [f for p, f, ign in hub.folders if p == prefix]
     assert syncs and all(ign and "checkpoints/*" in ign for p, _, ign in hub.folders if p == prefix)
+    # the verdict went up before the end state's upload was waited for, not only with close()'s final sync
+    assert any(f"evals/step_{MAX_STEPS}/verdict.json" in f for f in syncs[:-1])
+    # and summary.json with it (uploads "pending", written before that sync): a box stopped during the wait no longer
+    # leaves the Hub without one. Read off the call order: with the fake hub the wait ends before that sync copies files
+    assert crash_resume["order"][-4:] == [("summary", "complete", "pending"), ("sync",),
+                                          ("summary", "complete", summary["uploads"]), ("sync",)]
     assert f"{prefix}/smoke/roundtrip.json" in hub.files
 
     # ---- export (tools/ is not under scripts/, so no load_script)
@@ -407,6 +1098,15 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
         assert (tmp_path / "export" / f"{name}.parquet").is_file()
     assert (tmp_path / "export" / "README.md").is_file()
     assert set(tables["tb_scalars"]["tag"]) == set(tables["scalars"]["tag"])
+    # the crashed launch's steps after the restored step 10 are marked discarded (the attempt read off events.jsonl);
+    # what is left matches TensorBoard, one row per step and utterance, and no eval is taken for a discarded one
+    sc, tb, tu = tables["scalars"], tables["tb_scalars"], tables["train_utts"]
+    kl = sc[(sc["tag"] == "loss/kl") & ~sc["discarded"]]
+    assert sorted(kl["step"]) == sorted(tb.loc[tb["tag"] == "loss/kl", "step"]) == list(range(1, MAX_STEPS + 1))
+    gone = tu[tu["discarded"]]
+    assert len(gone) and set(gone["attempt"]) == {0} and gone["step"].min() == 11
+    assert not tu[~tu["discarded"]].duplicated(["step", "id"]).any()
+    assert not tables["eval_tf"]["discarded"].any() and not tables["samples"]["discarded"].any()
 
 
 def _tool(name: str):

@@ -3,7 +3,9 @@
 Sources (all streamed file-by-file from HF; each raw download is deleted after conversion):
   reazon_small  japanese-asr/whisper_transcriptions.reazonspeech.small  ~100 h TV speech, ungated parquet mirror
   galgame       litagin/Galgame_Speech_ASR_16kHz                         visual-novel voices, --galgame-shards tars (~47 h each);
-                the first GALGAME_EVAL_ROWS utterances are held out as an in-domain eval split
+                the first GALGAME_EVAL_ROWS kept keys of tar 0 are held out as an in-domain eval split. The keys are
+                sorted content hashes, so this is a random utterance sample: the same games and voices are in train,
+                i.e. a seen-speaker in-domain monitor, unlike eval_emilia, which is video-disjoint
   emilia_yodas  TTS-AGI/emilia-yodas JA/*.tar (ungated mirror of amphion/Emilia-Dataset Emilia-YODAS/JA, CC BY 4.0):
                 YouTube CC-BY in-the-wild speech, pre-cut to 3-30 s, 24 kHz MP3; text = Emilia's WhisperX (Whisper
                 medium) transcript. Tars are taken in order until --emilia-hours of kept audio. Replaces galgame for
@@ -21,7 +23,9 @@ Sources (all streamed file-by-file from HF; each raw download is deleted after c
 
 Resumable: every flushed shard is added to the manifest immediately and shards/<source>/progress.json records the
 input files that are complete, so an interrupted run continues where it stopped. A source is considered done only
-once progress.json says so. --force wipes a source (shards + manifest lines) and re-ingests it.
+once progress.json says so. --force wipes a source (shards + manifest lines) and re-ingests it. One run per data root
+at a time: a second one (another launcher started while the first still runs) exits at once instead of overwriting
+the first one's shards (kitsune.store.lock_data_root; the OS drops the lock when its holder dies).
 
 Every upstream repo is read at a pinned commit (REVISIONS): the training box rebuilds the audio shards from the
 public repos instead of downloading them from home, and the teacher outputs are joined to that audio by utterance
@@ -50,7 +54,7 @@ from tqdm import tqdm  # noqa: E402
 
 from kitsune.audio import audio_info  # noqa: E402
 from kitsune.store import (  # noqa: E402
-    ShardWriter, iter_rows, load_progress, read_manifest, remove_source, save_progress,
+    ShardWriter, iter_rows, load_progress, lock_data_root, read_manifest, remove_source, save_progress,
 )
 
 MIN_DUR, MAX_DUR = 0.3, 30.0  # teacher fast path is <=30 s; shorter than 0.3 s is noise
@@ -87,7 +91,10 @@ EMOLIA_REPO = "laion/Emolia"
 _JA_SCRIPT = re.compile(r"[぀-ヿ㐀-䶿一-鿿]")
 ALL_SOURCES = ["reazon_small", "reazon_medium", "reazon_large", "galgame", "emilia_yodas", "emilia_nc", "cv", "eval",
                "eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia"]
-# ReazonSpeech tiers are nested (small is a subset of medium), so a larger tier must skip rows already ingested
+# ReazonSpeech tiers are nested (small is a subset of medium), so a larger tier must skip rows already ingested.
+# Nothing dedups training against the gate eval sets (only eval_emilia is kept video-disjoint, in ingest_emilia):
+# ~16 eval_reazon lines match a reazon_small text (re-aired broadcasts), worth <= ~0.3 pp of its CER at worst; expect
+# more with the medium/large tiers.
 DEDUP_AGAINST = {"reazon_medium": ("reazon_small",), "reazon_large": ("reazon_small", "reazon_medium")}
 MIN_FREE_GB = 30.0  # stop a download (resumably) before it would fill the data disk
 
@@ -470,6 +477,10 @@ def main():
     root = Path(args.data) if args.data else ROOT / ("data_smoke" if args.limit_rows else "data")
     raw = root / "raw"
     raw.mkdir(parents=True, exist_ok=True)
+    lock = lock_data_root(root)  # held until main() returns: one ingest per data root (a second run clobbers shards)
+    if lock is None:
+        raise SystemExit(f"{root}: another 01_prepare_data is ingesting into this data root ({root / '.ingest.lock'}); "
+                         "wait for it to finish")
     print(f"data root: {root}")
 
     todo = []

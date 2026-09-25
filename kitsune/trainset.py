@@ -31,6 +31,7 @@ import json
 import os
 import sys
 import time
+import zipfile
 from collections import deque
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -131,6 +132,13 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _npz_members(path: Path) -> list:
+    """(name, CRC32, size) of every array in an .npz, read from the zip's central directory (no array data).
+    np.savez stores uncompressed, so a teacher re-run with the same shapes keeps the file size; the CRCs do not."""
+    with zipfile.ZipFile(path) as z:
+        return sorted((i.filename, i.CRC, i.file_size) for i in z.infolist())
+
+
 def _teacher_meta(teacher_root: Path) -> dict:
     p = Path(teacher_root) / "meta.json"
     meta = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
@@ -171,9 +179,9 @@ def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Se
     need not copy all of a source's audio.
 
     Idempotent: nothing is rebuilt if <cache_dir>/stores.json carries the same fingerprint (format version,
-    selection file hash, sources, splits, prompt, k, npz sizes) and every shard that contributed audio still has its
-    size. New shards (a download still appending to data/) only force a rebuild if the last build dropped rows for
-    missing audio. Store order is the order in which the audio was found (sources in the given order, shards sorted
+    selection file hash, sources, splits, prompt, k, the npz members' CRCs, the .jsonl hashes) and every shard that
+    contributed audio still has its size. New shards (a download still appending to data/) only force a rebuild if
+    the last build dropped rows for missing audio. Store order is the order in which the audio was found (sources in the given order, shards sorted
     by name, row order within).
     Selected rows without audio are dropped and reported in info["dropped"]; a selected row without teacher output
     is an error (the selection was made from a different teacher_out).
@@ -196,7 +204,9 @@ def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Se
     fp_src = dict(version=FORMAT_VERSION, selection=_sha256(selection_path), sources=sources, splits=splits,
                   prompt=meta["prompt"], k=meta["k"],
                   ids=None if ids is None else hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest(),
-                  npz=[(p.relative_to(teacher_root).as_posix(), p.stat().st_size) for p in npz_files])
+                  npz=[(p.relative_to(teacher_root).as_posix(), p.stat().st_size, _npz_members(p)) for p in npz_files],
+                  # ref/hyp come from the .jsonl next to each npz; small enough to hash whole
+                  jsonl=[_sha256(q) if q.exists() else None for q in (p.with_suffix(".jsonl") for p in npz_files)])
     fingerprint = hashlib.sha256(json.dumps(fp_src, sort_keys=True).encode()).hexdigest()
     shard_size = {p.relative_to(data_root).as_posix(): p.stat().st_size for p in shard_files}
     info_path = cache_dir / "stores.json"
@@ -652,7 +662,10 @@ def _cat(parts: list[np.ndarray], dtype, empty_shape: tuple) -> torch.Tensor:
 
 
 def default_num_workers() -> int:
-    """perf.num_workers = "auto": FLAC decode is ~4000x realtime per core, so a few workers keep up with any GPU."""
+    """perf.num_workers = "auto". Most of the train audio is not FLAC: measured per core on the laptop, Emilia's 24 kHz
+    MP3 (with a soxr_hq resample) decodes at ~1000-1700x realtime and galgame's OGG at ~1400-2200x (FLAC ~4000x),
+    about half that on a slow core. 8 workers then give ~8-15k audio-s/s, well above one A100 (~2.5k at 30-40 % MFU);
+    a loader cut to 1-2 workers (scripts/04_distill.py shm_cap) is not."""
     if os.name == "nt":
         return 2
     return max(1, min(8, (os.cpu_count() or 2) // 2))
@@ -680,7 +693,7 @@ class _StepSampler:
 
 def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepPlanner", num_workers: int = 2,
                 prefetch: int = 4, *, start_step: int = 0, pin_memory: bool | None = None,
-                mp_context: str = "spawn") -> Iterator[tuple[object, list[dict]]]:
+                mp_context: str = "spawn", timeout_s: float = 0.0) -> Iterator[tuple[object, list[dict]]]:
     """Decode micro-batches in `num_workers` processes (`prefetch` micro-batches in flight per worker) and yield
     whole optimizer steps:
       plan = one epoch's list of steps    -> (step_idx, [micro-batch, ...]) for plan[start_step:]
@@ -689,6 +702,12 @@ def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepP
                                              worker-restart stall at epoch boundaries
     Workers use `spawn` on every OS, so Linux runs the same code path as the Windows smoke run. KITSUNE_SHARING
     (e.g. file_system), if set, becomes torch's sharing strategy in the main process and in the workers.
+    timeout_s > 0 (workers only; 0 = wait forever): a worker micro-batch that never arrives raises RuntimeError
+    "DataLoader timed out" after that many seconds in total instead of blocking the trainer for good. A full /dev/shm
+    (or, on Windows, a paging-file-backed shared mapping that fails under the commit limit) does not kill the worker:
+    its queue feeder prints the error and drops the micro-batch, and the loader, which yields in order, would wait for
+    it forever. It must cover the workers' start-up (the first wait). The wait runs in 5 s slices, so torch's 5 s
+    dead-worker check (Windows' only one: no SIGCHLD handler) still reports a crashed worker within seconds.
     Closing the iterator (or dropping it) shuts the workers down."""
     if isinstance(plan, StepPlanner):
         steps = (((e, j), step) for e, j, step in plan.iter_steps())
@@ -700,22 +719,38 @@ def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepP
         torch.multiprocessing.set_sharing_strategy(strategy)
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
+    # torch looks for a dead worker only when a wait ends, and on Windows (no SIGCHLD handler) that is its only check:
+    # one timeout_s-long wait would hide a crashed worker for timeout_s. Wait in 5 s slices (torch's
+    # MP_STATUS_CHECK_INTERVAL) and give up after timeout_s in total.
+    slice_s = min(5.0, float(timeout_s)) if num_workers > 0 and timeout_s > 0 else 0
     loader = torch.utils.data.DataLoader(
         dataset, batch_size=None, sampler=sampler, num_workers=num_workers, pin_memory=pin_memory,
         prefetch_factor=prefetch if num_workers > 0 else None, worker_init_fn=_worker_init if num_workers > 0 else None,
         multiprocessing_context=mp_context if num_workers > 0 else None, persistent_workers=False,
+        timeout=slice_s,  # in-process loading asserts timeout == 0
     )
+
+    def fetch(it):
+        t0 = time.monotonic()
+        while True:
+            try:
+                return next(it)
+            except RuntimeError as e:  # a timed-out wait leaves the iterator's state untouched: next() waits on
+                if not (slice_s and str(e).startswith("DataLoader timed out")):
+                    raise
+                if time.monotonic() - t0 >= timeout_s:
+                    raise RuntimeError(f"DataLoader timed out after {timeout_s:g} s (no micro-batch arrived)") from None
 
     def gen():
         it = iter(loader)
         try:
             while True:
                 try:
-                    first = next(it)
+                    first = fetch(it)
                 except StopIteration:
                     return
                 key, n = sampler.sizes.popleft()
-                yield key, [first] + [next(it) for _ in range(n - 1)]
+                yield key, [first] + [fetch(it) for _ in range(n - 1)]
         finally:
             shutdown = getattr(it, "_shutdown_workers", None)
             if shutdown is not None:

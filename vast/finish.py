@@ -11,14 +11,19 @@ Expected files for each run dir runs/<run_id>/ (see scripts/04_distill.py):
   every file outside checkpoints/                      -> runs/<run_id>/<same path>   (RunLogger sync)
   every weights dir       checkpoints/step_<N>/        -> runs/<run_id>/checkpoints/step_<N>/
     (all of them, not just the newest: an earlier upload that failed would otherwise go with the destroyed disk; the
-    hub skips re-uploads of content it already has)
+    hub skips re-uploads of content it already has, though each byte is still read and hashed on the box, see sync)
   the newest full state   checkpoints/full_step_<N>/   -> runs/<run_id>/checkpoints/full_step_<N>/  (--expect-full)
+  and every full state the trainer meant for the Hub whose upload has not succeeded (UPLOAD_MARK in it: the
+    pre_cooldown one, which the trainer keeps from rotation for this; the marker itself is not uploaded)
 The files outside checkpoints/ are uploaded from a snapshot copy: the watchdog's --sync-only runs while the trainer
 still appends to its logs, and a file handed to the Hub by path is sized when it is listed but hashed and read later
-(a growing file would go up as a size/hash/content mismatch). Finished checkpoint dirs never change and go up in place.
-Supervisor/watchdog/bootstrap logs are uploaded best-effort to runs/<run_id>/infra/ but not verified (they are still
-being written while this runs); on every path, --no-sync included, and once more right before the stop/destroy call,
-so the last lifecycle records (verify, stop/destroy) are off the box before its disk goes away or stays behind.
+(a growing file would go up as a size/hash/content mismatch). Checkpoint dirs are renamed into place complete and go
+up in place; the one later write, the trainer's end save replacing trainer.pt/.json of an existing full_step_<N> (the
+loop ended at the step of a full state), is over once the trainer has exited.
+Supervisor/watchdog/bootstrap/portal logs are uploaded best-effort to runs/<run_id>/infra/, secrets redacted (scrub),
+but not verified (they are still being written while this runs); on every path, --no-sync included, and once more
+right before the stop/destroy call, so the last lifecycle records (verify, stop/destroy) are off the box before its
+disk goes away or stays behind.
 
 Every decision is appended to $KITSUNE_STATE/events.jsonl, and a `halt` marker is written before a stop/destroy so a
 restarted container does not start a second run (vast/onstart.sh checks it).
@@ -41,6 +46,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -50,10 +56,22 @@ VAST_API = "https://console.vast.ai/api/v0"
 STATE_DIR = Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state"))
 INFRA_LOGS = ["/workspace/kitsune.log", "/workspace/watchdog.log", "/workspace/portal.log", "/workspace/tensorboard.log"]
 INFRA_TIMEOUT_S = 180  # a hung infra upload must not keep a paid instance up
+HUB_RETRY_WAITS = (5, 15)  # s before the 2nd and 3rd try of a hub call the library does not retry itself
+# an env var whose name holds one of these is a secret: a mirror of kitsune/runlog.py's SECRET_MARKERS (finish stays
+# stdlib-only; runlog imports pyarrow)
+SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CRED", "COOKIE")
+# what the base image's portal prints in the clear into portal.log once a PORTAL_CONFIG reaches the box (the account
+# env, a template): caddy_config_manager's web credentials, open-button token and Bearer header (the password may be a
+# generated uuid that is in no env var), syncthing's API key, a token in a URL
+PRINTED_SECRET_RE = re.compile(rb"(credentials are: \S+ / |token is also valid: |Bearer |--gui-apikey=|[?&]token=)"
+                               rb"[^\s\"')]+")
 # checkpoint names written by the trainer; a directory or a single file (full_step_N.pt). In-progress writes end in
 # .tmp/.partial and never match.
 WEIGHTS_RE = re.compile(r"^step[_-]?(\d+)$")
 FULL_RE = re.compile(r"^full[_-]?(?:step[_-]?)?(\d+)(?:\.(?!tmp$|partial$)[A-Za-z0-9]+)?$")
+# scripts/04_distill.py's marker in a full state meant for the Hub (ckpt.upload_full_at), removed once its upload
+# succeeded
+UPLOAD_MARK = ".upload_pending"
 HASH_CHUNK = 8 << 20
 
 
@@ -107,12 +125,16 @@ def expected_files(run_dir: Path, expect_full: bool = True) -> dict[str, Path]:
         out[f"{prefix}/{rel}"] = f
     ckpt = run_dir / "checkpoints"
     weights = sorted(p for p in ckpt.iterdir() if WEIGHTS_RE.match(p.name)) if ckpt.is_dir() else []
-    picks = weights + ([newest_checkpoint(ckpt, FULL_RE)] if expect_full else [])
+    # a full state whose trainer upload failed (the pre_cooldown one) has no other copy than this disk
+    marked = sorted(p for p in ckpt.iterdir()
+                    if FULL_RE.match(p.name) and (p / UPLOAD_MARK).is_file()) if ckpt.is_dir() else []
+    picks = weights + (marked + [newest_checkpoint(ckpt, FULL_RE)] if expect_full else [])  # a dir twice: same keys
     for pick in picks:
         if pick is None:
             continue
         for f in files_under(pick):
-            out[f"{prefix}/checkpoints/{f.relative_to(ckpt).as_posix()}"] = f
+            if f.name != UPLOAD_MARK:
+                out[f"{prefix}/checkpoints/{f.relative_to(ckpt).as_posix()}"] = f
     return out
 
 
@@ -151,9 +173,40 @@ def snapshot(src_root: Path, rels: list[str], dest: Path):
 
 # ------------------------------------------------------------------------------------------------------------ hub
 
+def bound_hub_http():
+    """Give huggingface_hub's shared HTTP client a timeout (as scripts/04_distill.py does): its default has none, and a
+    request the server accepted and never answered (the commit POST of a sync) would keep the instance up until the
+    watchdog. The pinned client is kept otherwise (its request hook, redirects). list_repo_tree passes timeout=None
+    itself and is not covered."""
+    import httpx
+    import huggingface_hub
+    from huggingface_hub.utils import _http
+
+    def factory():
+        c = _http.default_client_factory()
+        c.timeout = httpx.Timeout(60, read=300)  # read: well above the Hub's 60 s commit timeout on its side
+        return c
+
+    huggingface_hub.set_client_factory(factory)
+
+
 def hf_api():
     from huggingface_hub import HfApi  # imported lazily: --help and the pure helpers work without the hub
+    bound_hub_http()
     return HfApi()
+
+
+def hub_retry(fn, what: str):
+    """Call fn, retrying twice on any error: huggingface_hub does not retry the first page of list_repo_tree or the
+    create_commit POST, so one transient 5xx/429 would stop a verified run (its disk billed until a human looks) or
+    lose the box logs with the destroyed disk. A repeated infra commit is harmless."""
+    for w in HUB_RETRY_WAITS:
+        try:
+            return fn()
+        except Exception as e:
+            log(f"{what} failed ({type(e).__name__}: {e}); retrying in {w} s")
+            time.sleep(w)
+    return fn()
 
 
 def remote_listing(api, repo: str, repo_type: str, prefix: str) -> dict:
@@ -174,8 +227,8 @@ def verify(api, repo: str, repo_type: str, expected: dict[str, Path], check_hash
     for path, local in sorted(expected.items()):
         prefix = "/".join(path.split("/")[:2])  # runs/<run_id>
         if prefix not in listings:
-            try:
-                listings[prefix] = remote_listing(api, repo, repo_type, prefix)
+            try:  # the whole listing: list_repo_tree's error comes while its pages are iterated
+                listings[prefix] = hub_retry(lambda: remote_listing(api, repo, repo_type, prefix), f"listing {prefix}")
             except Exception as e:
                 problems.append(f"{prefix}: cannot list the repo: {type(e).__name__}: {e}")
                 listings[prefix] = {}
@@ -198,8 +251,15 @@ def verify(api, repo: str, repo_type: str, expected: dict[str, Path], check_hash
 def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_run: bool):
     """Upload the run dir (minus local-only checkpoints) plus the checkpoints finish will verify.
 
-    Re-uploading files the trainer already pushed is cheap: the hub skips content it already stores, so this mostly
-    repairs a checkpoint upload that failed and captures log lines written after the trainer's last sync."""
+    Re-uploading files the trainer already pushed costs no network or commit: the hub skips content it already stores.
+    hf_xet still reads and chunks every checkpoint byte locally (about 20 GB for the viability run: every weights dir
+    and the newest full state, a minute or two at the launch filter's disk_bw>=500), and verify() reads them once more
+    for sha256. This mostly repairs a checkpoint upload that failed and captures log lines written after the trainer's
+    last sync. The logs go first: they are small, the watchdog's --sync-only has 10 minutes before the stop, which a
+    ~9 GB full state not yet on the hub can take all of (the final eval and verdict of a trainer still waiting on its
+    end-state upload are on this disk only). Each part gets its own try, logs first: a checkpoint upload that raises
+    must not cost the logs, nor a log upload that raises (the unretried repo_info GET of an unchanged snapshot, say)
+    the checkpoints, which may be the only copy off the box. Raises after both were tried if either failed."""
     expected = expected_files(run_dir, expect_full)
     rels = sorted(p[len(f"runs/{run_dir.name}/"):] for p in expected)
     ckpt = [r for r in rels if r.startswith("checkpoints/")]
@@ -208,26 +268,52 @@ def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_r
     log(f"sync {run_dir} -> {repo}:{dest} ({len(live)} files + {len(ckpt)} checkpoint files)")
     if dry_run:
         return
-    if ckpt:  # renamed into place when complete and never written again: uploaded where they are
-        api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=str(run_dir), path_in_repo=dest,
-                          allow_patterns=ckpt, commit_message=f"finish: checkpoints {run_dir.name}")
-    if live:  # logs the trainer may still be writing: a consistent copy (module docstring)
+
+    def upload_live():  # logs the trainer may still be writing: a consistent copy (module docstring)
         with tempfile.TemporaryDirectory(prefix="kitsune-finish-") as stage:
             snapshot(run_dir, live, Path(stage))
             api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=stage, path_in_repo=dest,
                               allow_patterns=live, commit_message=f"finish: sync {run_dir.name}")
 
+    def upload_ckpt():  # renamed into place when complete (the end save may still replace trainer.pt/.json): in place
+        api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=str(run_dir), path_in_repo=dest,
+                          allow_patterns=ckpt, commit_message=f"finish: checkpoints {run_dir.name}")
+
+    failed = []
+    for what, files, upload in (("logs", live, upload_live), ("checkpoints", ckpt, upload_ckpt)):
+        if files:
+            try:
+                upload()
+            except Exception as e:  # noqa: BLE001  (main() logs the combined error and records sync_failed)
+                log(f"sync of {run_dir.name} {what} failed: {type(e).__name__}: {e}")
+                failed.append(f"{what}: {type(e).__name__}: {e}")
+    if failed:
+        raise RuntimeError("; ".join(failed))
+
+
+def scrub(data: bytes) -> bytes:
+    """data with every secret replaced by <redacted>: the value (8+ chars) of each env var with a SECRET_MARKERS part
+    in its name (WEB_PASSWORD, OPEN_BUTTON_TOKEN, HF_TOKEN, CONTAINER_API_KEY, ...), longest first so a value inside
+    another cannot leave part of the longer one, then what PRINTED_SECRET_RE matches."""
+    values = {v for k, v in os.environ.items() if len(v) >= 8 and any(m in k.upper() for m in SECRET_MARKERS)}
+    for v in sorted(values, key=len, reverse=True):
+        data = data.replace(v.encode("utf-8", "surrogateescape"), b"<redacted>")
+    return PRINTED_SECRET_RE.sub(rb"\1<redacted>", data)
+
 
 def upload_infra(api, repo: str, repo_type: str, dest: str, dry_run: bool):
-    """Best effort: supervisor/bootstrap/watchdog logs and state go next to the run for later extraction."""
+    """Best effort: supervisor/bootstrap/watchdog logs and state go next to the run for later extraction, scrubbed:
+    portal.log (the base image's boot output: its CUDA selection is recorded nowhere else) holds the portal's password
+    and tokens as soon as a PORTAL_CONFIG reaches the box, and the runs repo keeps every file in its git history."""
     from huggingface_hub import CommitOperationAdd
 
     files = [Path(p) for p in INFRA_LOGS] + (sorted(STATE_DIR.glob("*")) if STATE_DIR.is_dir() else [])
-    ops = [CommitOperationAdd(path_in_repo=f"{dest}/{f.name}", path_or_fileobj=f.read_bytes())
+    ops = [CommitOperationAdd(path_in_repo=f"{dest}/{f.name}", path_or_fileobj=scrub(f.read_bytes()))
            for f in files if f.is_file() and not f.name.endswith(".lock")]
     log(f"upload {len(ops)} infra files -> {repo}:{dest}")
-    if ops and not dry_run:
-        api.create_commit(repo_id=repo, repo_type=repo_type, operations=ops, commit_message="finish: infra logs")
+    if ops and not dry_run:  # retried inside best_effort's INFRA_TIMEOUT_S, which bounds every try together
+        hub_retry(lambda: api.create_commit(repo_id=repo, repo_type=repo_type, operations=ops,
+                                           commit_message="finish: infra logs"), "infra commit")
 
 
 def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S) -> bool:
@@ -252,7 +338,9 @@ def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S) -> bool:
 # ----------------------------------------------------------------------------------------------------------- vast
 
 def vast_rest(action: str, timeout: float = 30) -> bool:
-    """PUT {"state": "stopped"} or DELETE on /instances/<CONTAINER_ID>/ with the per-instance key."""
+    """PUT {"state": "stopped"} or DELETE on /instances/<CONTAINER_ID>/ with the per-instance key. Retried like curl
+    --retry: a 408, 429, 5xx or transport error; any other 4xx (a revoked key, no such instance) is logged with vast's
+    reply and handed to the CLI fallback at once."""
     key, cid = os.environ.get("CONTAINER_API_KEY"), os.environ.get("CONTAINER_ID")
     if not key or not cid:
         log("CONTAINER_API_KEY/CONTAINER_ID not set (not on a vast instance?)")
@@ -267,26 +355,42 @@ def vast_rest(action: str, timeout: float = 30) -> bool:
             if reply.get("success", True):
                 return True
             log(f"vast {action}: {reply.get('msg') or reply}")
+        except urllib.error.HTTPError as e:  # before URLError, its base class: the status and vast's msg say why
+            try:
+                body = e.read()[:200].decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            log(f"vast {action} attempt {attempt} failed: HTTP {e.code}: {body or e.reason}")
+            if 400 <= e.code < 500 and e.code not in (408, 429):
+                return False
         except Exception as e:  # URLError, timeouts, http.client errors, a bad reply: all mean "try again"
             log(f"vast {action} attempt {attempt} failed: {type(e).__name__}: {e}")
-        time.sleep(5 * attempt)
+        if attempt < 3:
+            time.sleep(5 * attempt)
     return False
 
 
 def vast_cli(action: str) -> bool:
     """Fallback through the vastai CLI; the key goes through the environment, never argv. A hung or missing CLI is
-    a failure like any other, so the caller's destroy -> stop fallback still runs."""
+    a failure like any other, so the caller's destroy -> stop fallback still runs. Success is the CLI's own success
+    line ("destroying instance <id>." / "stopping instance <id>."), not its exit code: vastai 1.8.0 exits 0 when the
+    API refuses (success=false) or answers with an HTTP error too. A substring, not a whole line: for destroy the
+    confirmation prompt that input() prints shares the line."""
     exe, key, cid = shutil.which("vastai"), os.environ.get("CONTAINER_API_KEY"), os.environ.get("CONTAINER_ID")
     if not exe or not key or not cid:
         return False
     verb = "destroy" if action == "destroy" else "stop"
     try:
-        rc = subprocess.run([exe, verb, "instance", cid], env=dict(os.environ, VAST_API_KEY=key),
-                            input="y\n", text=True, timeout=120).returncode
+        r = subprocess.run([exe, verb, "instance", cid], env=dict(os.environ, VAST_API_KEY=key),
+                           input="y\n", capture_output=True, text=True, timeout=120)
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"vastai {verb} failed: {type(e).__name__}: {e}")
         return False
-    return rc == 0
+    done = f"{'destroying' if verb == 'destroy' else 'stopping'} instance {cid}."
+    if r.returncode == 0 and done in (r.stdout or ""):
+        return True
+    log(f"vastai {verb} failed (exit {r.returncode}): {((r.stdout or '') + (r.stderr or '')).strip()[-300:]}")
+    return False
 
 
 def instance_action(action: str, reason: str, dry_run: bool, before=None) -> bool:
@@ -328,7 +432,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--run-dir", action="append", default=None, help="restrict to these run dirs (repeatable)")
     ap.add_argument("--no-sync", action="store_true", help="skip the upload step")
     ap.add_argument("--no-hash", action="store_true", help="compare sizes only")
-    ap.add_argument("--no-full", action="store_true", help="do not require the newest full training state in the repo")
+    ap.add_argument("--no-full", action="store_true",
+                    help="do not require the full training states in the repo (the newest, and any whose trainer "
+                         "upload failed)")
     ap.add_argument("--dry-run", action="store_true", help="print the actions; no upload, stop or destroy")
     args = ap.parse_args(argv)
 

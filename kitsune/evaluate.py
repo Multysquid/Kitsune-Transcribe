@@ -26,6 +26,7 @@ as in training and in the teacher pass (a bf16 head moves argmax on near-ties).
 import json
 import math
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import lru_cache
@@ -45,7 +46,7 @@ from kitsune.text import normalize_ja
 from kitsune.trainset import EOS, EVAL_SETS, PAD, PROMPT, AudioBatchDataset, eval_batches
 
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
-GATE_SETS = tuple(EVAL_SETS)  # galgame is excluded from this run (D4b)
+GATE_SETS = tuple(EVAL_SETS)  # the D32a gate: JSUT / CV8 / Reazon-test; eval_emilia and galgame are monitor-only
 # D32a, pre-registered full-set teacher corpus CER (fractions). teacher_baselines() recomputes them from teacher_out
 # and refuses to proceed if they drift by more than 0.05 pp - a changed eval set would silently move every threshold.
 TEACHER_CER_PREREG = {"eval_jsut": 0.0830, "eval_cv8": 0.0407, "eval_reazon": 0.0628}
@@ -137,6 +138,15 @@ def _prefetched(ds: AudioBatchDataset, batches: list[list[int]], threads: int = 
             if j + ahead < len(batches):
                 futs.append(pool.submit(ds.__getitem__, batches[j + ahead]))
             yield item
+
+
+def _bad_audio_per_set(store, dropped: list[str]) -> dict[str, int]:
+    """The undecodable utterances of an eval per source (set): the summaries' bad_audio_per_set, which the verdict
+    reports for a gate set judged on fewer rows than its full size. Only sets that lost a row appear."""
+    if not dropped:
+        return {}
+    src = {u.id: u.source for u in store.utts}
+    return dict(sorted(Counter(src.get(i, "?") for i in dropped).items()))
 
 
 def _features(featurizer, item: dict, device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -250,7 +260,8 @@ def teacher_forced_eval(model, store, featurizer, device, batch_s: float = 400.0
 
     df = pd.DataFrame(recs)
     per_utt = _tf_per_utt(df)
-    summary = dict(sets={}, n_utts=len(df), n_bad_audio=len(dropped), bad_audio=dropped[:50], wall_s=time.time() - t0)
+    summary = dict(sets={}, n_utts=len(df), n_bad_audio=len(dropped), bad_audio=dropped[:50],
+                   bad_audio_per_set=_bad_audio_per_set(store, dropped), wall_s=time.time() - t0)
     if len(df):
         for src, g in df.groupby("source", sort=True):
             summary["sets"][src] = _tf_summarise(g, per_utt.loc[g.index])
@@ -354,7 +365,8 @@ def greedy_eval(model, store, ids: Iterable[str] | None, featurizer, device, bat
     per_utt = pd.DataFrame(recs, columns=cols)
     wall = time.time() - t0
     audio_s = float(per_utt["duration"].sum()) if len(per_utt) else 0.0
-    return summarise_greedy(per_utt, n_bad_audio=len(dropped), bad_audio=dropped[:50], wall_s=wall,
+    return summarise_greedy(per_utt, n_bad_audio=len(dropped), bad_audio=dropped[:50],
+                            bad_audio_per_set=_bad_audio_per_set(store, dropped), wall_s=wall,
                             rtf=wall / audio_s if audio_s else float("nan")), per_utt
 
 
@@ -382,6 +394,7 @@ def _greedy_summarise(g: pd.DataFrame) -> dict:
              n_empty_hyp=int((g["hyp"].map(normalize_ja) == "").sum()),
              tok_per_s=float(g["n_tok"].sum()) / max(float(g["duration"].sum()), 1e-9),
              ref_edits=ref["edits"], ref_chars=ref["ref_chars"], n_empty_ref=ref["n_empty_ref"],
+             cer_teacher_edits=imit["edits"], cer_teacher_chars=imit["ref_chars"],  # cer_teacher_corpus = their ratio
              teacher_cer_ref_corpus=teach["cer"], teacher_cer_ref_mean=float(t["teacher_cer"].mean()),
              teacher_trunc_rate=float(t["teacher_truncated"].astype(bool).mean()) if len(t) else float("nan"),
              n_missing_teacher=int(len(g) - len(t)))
@@ -407,7 +420,8 @@ def pick_samples(per_utt: pd.DataFrame, n: int = 8, seed: int = 0) -> list[dict]
 
 def flatten(summary: dict, prefix: str) -> dict[str, float]:
     """Eval summary -> {"prefix/<set>/key": number, "prefix/all/key": ..., "prefix/wall_s": ...} for
-    RunLogger.scalars (non-numeric leaves such as bad_audio are dropped)."""
+    RunLogger.scalars (non-numeric leaves such as bad_audio are dropped). bad_audio_per_set becomes
+    "prefix/<set>/n_bad_audio", next to the set's other counts (only for a set that lost a row)."""
     out = {}
 
     def walk(d, p):
@@ -417,10 +431,65 @@ def flatten(summary: dict, prefix: str) -> dict[str, float]:
             elif isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
                 out[f"{p}/{k}"] = float(v)
 
-    walk({k: v for k, v in summary.items() if k != "sets"}, prefix)
+    walk({k: v for k, v in summary.items() if k not in ("sets", "bad_audio_per_set")}, prefix)
     for s, d in summary.get("sets", {}).items():
         walk(d, f"{prefix}/{s}")
+    for s, k in (summary.get("bad_audio_per_set") or {}).items():
+        out[f"{prefix}/{s}/n_bad_audio"] = float(k)
     return out
+
+
+HEADLINE_CER = ("val_cer", "val_cer_vs_teacher", "train_cer", "train_cer_vs_teacher")
+
+
+def _pooled(sets: dict, num: str, den: str) -> float | None:
+    """sum(num) / sum(den) over the per-set summaries in `sets` (None without a denominator)."""
+    d = sum(float(s.get(den) or 0) for s in sets.values())
+    return sum(float(s.get(num) or 0) for s in sets.values()) / d if d else None
+
+
+def _gate_sets(summary: dict | None) -> dict:
+    """The GATE sets of an eval summary's per-set results (every set if none of them is a gate set)."""
+    sets = (summary or {}).get("sets") or {}
+    gate = {s: d for s, d in sets.items() if s in GATE_SETS}
+    return gate or dict(sets)
+
+
+def headline(tf: dict | None = None, greedy: dict | None = None, probe: dict | None = None,
+             probe_greedy: dict | None = None) -> dict:
+    """The numbers to read first after an eval, in one place (the trainer logs them as summary/<full|mini>/<name>).
+    val_* pool the GATE sets that were evaluated (every evaluated set if none is a gate set), train_* every train
+    source of the train-side eval:
+      val_cer               corpus CER vs the dataset reference: sum ref_edits / sum ref_chars of the per-set greedy
+                            summaries (the gate's measure, pooled)
+      val_cer_vs_teacher    corpus CER vs the teacher's hypothesis: sum cer_teacher_edits / sum cer_teacher_chars
+      val_loss, val_top1    teacher-forced KL (nats/token) and top-1 agreement with the teacher, token-weighted over the
+                            sets (val_loss = eval_record's heldout_kl)
+      train_cer, train_cer_vs_teacher  the same CERs on the greedy decode of train utterances
+      train_loss, train_top1           teacher-forced on train utterances (the probe)
+    CERs are fractions (0.083 = 8.3 %). A number whose inputs were not evaluated is left out."""
+    out = {}
+    vg, tg = _gate_sets(greedy), dict((probe_greedy or {}).get("sets") or {})
+    for side, sets in (("val", vg), ("train", tg)):
+        for name, num, den in (("cer", "ref_edits", "ref_chars"), ("cer_vs_teacher", "cer_teacher_edits",
+                                                                  "cer_teacher_chars")):
+            v = _pooled(sets, num, den)
+            if v is not None:
+                out[f"{side}_{name}"] = v
+    vt = {s: d for s, d in _gate_sets(tf).items() if d.get("n_tok")}
+    ntok = sum(d["n_tok"] for d in vt.values())
+    if ntok:
+        out["val_loss"] = sum(d["kl"] * d["n_tok"] for d in vt.values()) / ntok
+        out["val_top1"] = sum(d["top1"] * d["n_tok"] for d in vt.values()) / ntok
+    if probe and "all" in probe:
+        out["train_loss"], out["train_top1"] = probe["all"]["kl"], probe["all"]["top1"]
+    return out
+
+
+def headline_val_utts(greedy: dict | None) -> int:
+    """How many utterances headline()'s val CERs pool: the greedy summary's gate sets (every set if none is one). The
+    trainer logs it next to val_cer, since its full evals decode the fixed subset or the complete sets."""
+    return sum(int(d.get("n", 0)) for d in _gate_sets(greedy).values())
 
 
 def eval_record(step: int, elapsed_s: float, tf: dict | None = None, greedy: dict | None = None,
@@ -462,7 +531,8 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
             overfit_rel: float = 0.01) -> dict:
     """Gate D32a, pre-registered.
 
-    results = {"final":   greedy_eval summary of the FULL eval sets at the end of the run,
+    results = {"final":   greedy_eval summary of the FULL eval sets at the end of the run (its bad_audio_per_set:
+                          the rows that could not be decoded, per set),
                "history": [eval_record(...), ...],
                "teacher": optional {set: teacher corpus CER} (default: teacher CER on the same ids from "final",
                           else the pre-registered numbers)}
@@ -473,18 +543,27 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     NO-GO      fewer than 2 sets within 1.5x and CER flat, or over-fitting (probe KL falling while held-out KL rises
                over the last 20 % of evals)
     INCONCLUSIVE  what the pre-registration does not cover (within 1.5x but flat, or beyond 1.5x but still
-               improving); `reasons` says which. It is not forced into a tier after the fact.
-    "Last 20 %" = the last max(min_points, ceil(0.2 n)) eval records by step. Trends are least-squares changes across
-    that window relative to the window mean (the gap: relative to the mean held-out KL); the thresholds are returned
-    with the verdict."""
-    fsets = (results.get("final") or {}).get("sets", {})
+               improving, or the CER trend unknown: fewer than 2 evals after step 0); `reasons` says which. It is not
+               forced into a tier after the fact.
+    "Last 20 %" = the last max(min_points, ceil(0.2 n)) of the n eval records after step 0, by step. The step-0 eval
+    of the untrained student stays in the history (the curves) but never enters a trend: its numbers (CER tens of
+    times the teacher's, held-out KL ~5) would dominate any window that reaches it - every history of <= 3 records
+    with per-epoch evals - forcing "improving" and hiding over-fitting. Trends are least-squares changes across that
+    window relative to the window mean (the gap: relative to the mean held-out KL); the thresholds are returned with
+    the verdict. A gate set some of whose audio could not be decoded is judged on the rows that decoded (the teacher
+    CER on the same ids by default, so the ratio stays paired); per_set carries n and n_bad_audio, and a reason says
+    it was not the pre-registered full set. The tiers do not change."""
+    fin = results.get("final") or {}
+    fsets = fin.get("sets", {})
+    bad = fin.get("bad_audio_per_set") or {}
     tover = results.get("teacher") or {}
     reasons, per_set = [], {}
     n_go = n_prom = n_out = n_trunc = 0
     for s in GATE_SETS:
         d = fsets.get(s)
+        k = int(bad.get(s, 0))
         if d is None:
-            reasons.append(f"{s}: no final greedy result")
+            reasons.append(f"{s}: no final greedy result" + (f" ({k} undecodable rows)" if k else ""))
             continue
         tc = d.get("teacher_cer_ref_corpus")
         if s in tover:
@@ -502,11 +581,15 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
         n_trunc += int(d["n_truncated"])
         per_set[s] = dict(student=student, teacher=teacher, teacher_source=src, ratio=ratio,
                           teacher_prereg=TEACHER_CER_PREREG[s], baseline_drift=teacher - TEACHER_CER_PREREG[s],
-                          threshold_go=go_ratio * teacher, threshold_promising=promising_ratio * teacher)
+                          threshold_go=go_ratio * teacher, threshold_promising=promising_ratio * teacher,
+                          n=int(d["n"]), n_bad_audio=k)
+        if k:
+            reasons.append(f"{s}: judged on {int(d['n'])} decoded rows, {k} undecodable (not the pre-registered "
+                           f"full set)")
     trunc_rate = n_trunc / n_out if n_out else float("nan")
     trunc_ok = n_out > 0 and trunc_rate <= max_trunc
 
-    hist = sorted(results.get("history") or [], key=lambda r: r["step"])
+    hist = sorted((r for r in results.get("history") or [] if r["step"] > 0), key=lambda r: r["step"])  # trained only
     window = hist[len(hist) - min(len(hist), max(min_points, math.ceil(tail_frac * len(hist)))):]
 
     def series(fn):
@@ -531,9 +614,9 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     overfit = (probe_change is not None and held_change is not None
                and probe_change < -overfit_rel and held_change > overfit_rel)
     if cer_change is None:
-        reasons.append("CER trend unknown: fewer than 2 greedy evals in the window")
+        reasons.append("CER trend unknown: fewer than 2 greedy evals after step 0 in the window")
     if gap_change is None:
-        reasons.append("KL-gap trend unknown: fewer than 2 evals with both probe and held-out KL")
+        reasons.append("KL-gap trend unknown: fewer than 2 evals after step 0 with both probe and held-out KL")
 
     if overfit:
         v = "NO-GO"
@@ -544,14 +627,16 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     elif n_prom >= 2 and improving:
         v = "PROMISING"
         reasons.append(f"{n_prom}/3 sets within {promising_ratio}x teacher and CER still improving ({cer_change:+.1%})")
-    elif n_prom < 2 and not improving:
+    elif n_prom < 2 and cer_change is not None and not improving:  # flat is a measured trend, not an unknown one
         v = "NO-GO"
         reasons.append(f"only {n_prom}/3 sets within {promising_ratio}x teacher and CER flat")
     else:
         v = "INCONCLUSIVE"
+        trend = ("CER trend unknown" if cer_change is None
+                 else "CER not improving" if n_prom >= 2 else "CER still improving")
         reasons.append("outside the pre-registered tiers: " + (
-            f"within {promising_ratio}x on {n_prom}/3 sets but CER not improving" if n_prom >= 2
-            else f"only {n_prom}/3 sets within {promising_ratio}x but CER still improving"))
+            f"within {promising_ratio}x on {n_prom}/3 sets but {trend}" if n_prom >= 2
+            else f"only {n_prom}/3 sets within {promising_ratio}x but {trend}"))
     if n_go >= 2 and not trunc_ok:
         reasons.append(f"truncation {trunc_rate:.2%} > {max_trunc:.2%} blocks GO")
     if n_go >= 2 and trunc_ok and not gap_ok and not overfit:

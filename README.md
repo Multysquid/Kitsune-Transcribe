@@ -19,8 +19,10 @@ Architecture, which drives the student design:
 | decoder | Transformer, 8 layers, d=1024, FFN 4096 | ~130M |
 | vocab | 16,384 SentencePiece tokens shared by 14 languages | |
 
-So the student prunes the **encoder depth** (the decoder is already small) and the **vocabulary** down to the
-tokens that occur in Japanese.
+So the student prunes the **encoder** (48 -> 20 layers, FFN 5120 -> 2560 by activation importance) and halves the
+**decoder** (8 -> 4 layers). It keeps the teacher's full 16,384-token vocabulary, tied head and decoder prompt, so
+token ids are unchanged: with the head tied to the embeddings, pruning the vocabulary would save at most ~15M
+parameters and no compute, and it would add id-remapping risk.
 
 ## Pipeline
 
@@ -31,7 +33,8 @@ tokens that occur in Japanese.
 make_selection.py    which utterances train / evaluate, and why -> selection/*.parquet
 03_build_student.py  prune the teacher to the student (20 enc layers, FFN 2560, 4 dec layers), init from teacher
 04_distill.py        KL on the stored top-16 + CE on the teacher tokens + L2-SP; TensorBoard (cards in three groups:
-                     1_operational, 2_loss_accuracy, 3_misc) + open-format logs
+                     1_operational, 2_loss_accuracy, 3_misc; every eval's val / train CER and KL first, under
+                     2_loss_accuracy/00_summary) + open-format logs
 tools/               export_run.py: a run -> parquet/CSV tables + README; regroup_tb.py: rebuild an older run's
                      TensorBoard files in the three groups
 vast/                training image, CI build and the vast.ai run scripts (see vast/README.md)
@@ -43,20 +46,38 @@ vast/                training image, CI build and the vast.ai run scripts (see v
 |---|---|---|---|
 | `japanese-asr/whisper_transcriptions.reazonspeech.small` (ReazonSpeech v2 mirror) | TV / broadcast | ~100 | CDLA-Sharing-1.0 (use under Japanese Copyright Act Art. 30-4) |
 | `TTS-AGI/emilia-yodas` JA (mirror of Emilia-YODAS, Amphion) | YouTube CC-BY talk, vlogs, streams | ~300 | CC BY 4.0 (from YODAS, CC BY 3.0 uploads) |
+| `laion/Emolia` JA `*_standard` (`emilia_nc`: Emilia's non-YODAS part, Amphion) | podcasts, talk shows | optional, in no config | CC BY-NC 4.0: **non-commercial** models only (the repo's cc-by-4.0 tag does not relicense it) |
 | `litagin/Galgame_Speech_ASR_16kHz`, first 6 of 115 tars | game / anime voices | ~280 | GPL-3 + **non-commercial**, trained models **must be open-sourced** |
 | Common Voice ja (manual download from [Mozilla Data Collective](https://datacollective.mozillafoundation.org)) | read, diverse mics | optional | CC-0 |
-| `japanese-asr/ja_asr.{jsut_basic5000,common_voice_8_0,reazonspeech_test}` | eval only | ~22 | |
+| `japanese-asr/ja_asr.{jsut_basic5000,common_voice_8_0,reazonspeech_test}` | eval only | ~22 | JSUT: text CC BY-SA 4.0, audio not redistributable; CV8: CC-0, but Mozilla asks that it not be mirrored; ReazonSpeech test: CDLA-Sharing-1.0 (Art. 30-4). Eval only, so no term on the model; keep refs and samples private |
 
-Every upstream repo is read at a pinned commit (`REVISIONS` in `scripts/01_prepare_data.py`).
+Only the Emilia hold-out is kept disjoint from training (by video). Nothing dedups training against the gate sets, so
+the eval_reazon CER carries up to ~0.3 pp from re-aired broadcasts that are also in reazon_small. The galgame hold-out
+is a random utterance sample of the first tar, so it measures seen games and voices, not unseen games.
+
+Every upstream dataset repo is read at a pinned commit (`REVISIONS` in `scripts/01_prepare_data.py`). The label
+passes pin theirs too: the teacher at `b1eacc2` (`MODEL_REVISION` in `02_teacher_pass.py`, recorded in
+`teacher_out/meta.json`), and kotoba-whisper, the whisper-large-v3 tokenizer and the ReazonSpeech mirrors in
+`02b_second_opinion.py` (recorded in `second_out/meta.json`). `03_build_student.py` reads the teacher at the same
+pin (`TEACHER_REVISION`, `--teacher-revision`), keys its FFN-importance cache on that commit, refuses a teacher commit
+other than the one `teacher_out/meta.json` records, and writes the commit to `student_meta.json` (the student built
+before that record was added comes from `b1eacc2` too).
 
 ### License of the trained model
 
 This is a non-commercial hobby project. Because Galgame is in the training mix, the student model is
 **non-commercial** and its weights are published openly (Galgame's terms require trained models to be open-sourced),
-under a non-commercial license (e.g. CC BY-NC 4.0). The model card must credit the training data: ReazonSpeech
+under a non-commercial license (e.g. CC BY-NC 4.0). The model card, [MODEL_CARD.md](MODEL_CARD.md), which every saved
+student and checkpoint carries as its README.md, records these terms, credits the training data: ReazonSpeech
 (CDLA-Sharing-1.0), Emilia-YODAS (Amphion, CC BY 4.0, built on ESPnet's YODAS, CC BY 3.0) and Galgame_Speech_ASR
-(litagin, GPL-3 + non-commercial), and the teacher, Cohere Transcribe (Apache-2.0). Drop `galgame` from the run
-config's `sources` for a model free of the non-commercial clause.
+(litagin, [GPL-3](https://www.gnu.org/licenses/gpl-3.0.txt) + non-commercial; the dataset's own `license_link` points
+to a missing file), and says that the model is modified from the teacher, Cohere Transcribe (Apache-2.0). A release
+must also include the Apache-2.0 licence text next to that modified-from notice. Drop `galgame` (and keep `emilia_nc`
+out) of the run config's `sources` for a model free of non-commercial terms. The open release is a separate public
+repo holding only a chosen `checkpoints/step_N` (weights, config, generation config, tokenizer, processor) plus the
+license, notices and model card: the run repos (`kitsune-runs`, `kitsune-data`) stay private, because they carry the
+datasets' reference transcripts (`ref` in the teacher outputs, eval tables and samples), and `vast/launch.py` refuses
+them if they are not.
 
 ### Teacher pass output
 

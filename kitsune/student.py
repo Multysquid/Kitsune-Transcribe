@@ -27,6 +27,7 @@ import copy
 import json
 import math
 import re
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -44,6 +45,7 @@ TEACHER_DEC_LAYERS = 8
 DECODER_START, EOS, PAD = 13764, 3, 2
 FFN_NAMES = ("feed_forward1", "feed_forward2")
 EXPECTED_DEFAULT_PARAMS = 616_963_328  # closed form for B20x2560 / dec4 / V16384 tied (report_model.md section 2)
+MODEL_CARD = Path(__file__).resolve().parents[1] / "MODEL_CARD.md"  # save_student copies it next to the weights
 
 _BN = nn.modules.batchnorm._BatchNorm
 
@@ -440,8 +442,8 @@ def write_meta(out_dir, meta: dict):
 
 def save_student(student: CohereAsrForConditionalGeneration, out_dir, processor, meta: dict):
     """save_pretrained (safetensors, HF key names) with bf16 weights and fp32 BN stats, the processor (feature
-    extractor + tokenizer files), a generation_config with the teacher's special ids, and student_meta.json.
-    `processor` may be None (tests). student_meta.json is written last."""
+    extractor + tokenizer files), a generation_config with the teacher's special ids, the model card as README.md,
+    and student_meta.json. `processor` may be None (tests). student_meta.json is written last."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     gc = student.generation_config
@@ -459,6 +461,10 @@ def save_student(student: CohereAsrForConditionalGeneration, out_dir, processor,
     cfg_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if processor is not None:
         processor.save_pretrained(out)
+    # the model card (licence terms, the Apache-2.0 modified-from notice, data credits) travels with every copy of the
+    # weights: the student init, each step_<N>/ and any checkpoint later promoted or copied out of the run repo
+    if MODEL_CARD.exists():
+        shutil.copyfile(MODEL_CARD, out / "README.md")
     write_meta(out, meta)
 
 

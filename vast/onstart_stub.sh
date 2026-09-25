@@ -14,15 +14,17 @@ exec >>"$L" 2>&1
 
 log() { printf '%s [stub] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
-stop_box() {  # $1 = reason; the key goes through curl's stdin config, never argv
+stop_box() {  # $1 = reason; the key goes through curl's stdin config, never argv; a 2xx {"success": false} refuses
+    local r=""
     log "$1"
     if [ "${KITSUNE_NO_SELF_STOP:-0}" = 1 ]; then
         log "KITSUNE_NO_SELF_STOP=1: leaving the instance running"
     elif [ -n "${CONTAINER_API_KEY:-}" ] && [ -n "${CONTAINER_ID:-}" ]; then
-        printf 'header = "Authorization: Bearer %s"\n' "$CONTAINER_API_KEY" \
+        r=$(printf 'header = "Authorization: Bearer %s"\n' "$CONTAINER_API_KEY" \
             | curl -fsS --retry 3 --max-time 30 --config - -X PUT -H 'Content-Type: application/json' \
-                -d '{"state": "stopped"}' "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/" >/dev/null \
-            && log "stop requested via REST" || log "stop request FAILED: destroy the instance by hand"
+                -d '{"state": "stopped"}' "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/") \
+            && ! [[ $r =~ \"success\"[[:space:]]*:[[:space:]]*false ]] && log "stop requested via REST" \
+            || log "stop request FAILED (${r:-no reply}): destroy the instance by hand"
     else
         log "no per-instance vast key in the env: destroy the instance by hand"
     fi
@@ -45,5 +47,5 @@ if [ "$(git -C "$D" rev-parse HEAD 2>/dev/null)" != "${KITSUNE_SHA:-}" ]; then
         || stop_box "could not clone $URL at $KITSUNE_SHA"
     log "cloned $URL at $KITSUNE_SHA"
 fi
-[ -f "$D/vast/onstart.sh" ] || stop_box "$D/vast/onstart.sh missing at $KITSUNE_SHA"
+[ -f "$D/vast/onstart.sh" ] || stop_box "$D/vast/onstart.sh missing at ${KITSUNE_SHA:-}"
 exec bash "$D/vast/onstart.sh" "$@"

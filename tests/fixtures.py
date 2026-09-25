@@ -35,11 +35,20 @@ Knobs for the real data's awkward cases (dicts are per source and apply to its f
 Other agree values: half exactly 0.0, the rest uniform in (0, 0.5], and one row per source at exactly 0.5 (the
 inclusive boundary) when there are >= 10 rows. agree is drawn, not computed from hyp2. Everything derives from
 `seed`: the same arguments give identical files.
+
+Real data. The tests that check the code and this fixture against the REAL files (teacher_out/, data/, second_out/)
+read them under REAL and call need_real(...) first. The data is gitignored, so a git worktree has none of it and those
+tests skip (SPEC: skip cleanly if absent), which shows only as 's'. To verify a change made in a worktree, point them
+at a checkout that has the data (they only read there) and turn a skip into a failure:
+    KITSUNE_REAL_DATA_ROOT=<main checkout> KITSUNE_REQUIRE_REAL_DATA=1 python -m pytest -rs tests/...
+The gated teacher processor in the local HF cache counts as real data too (teacher_processor()): the override fails
+a test that would skip without it. KITSUNE_REAL_DATA_ROOT does not move it; HF_HOME does.
 """
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,10 +56,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+REAL = Path(os.environ.get("KITSUNE_REAL_DATA_ROOT") or ROOT)  # where the real-data tests read; code stays on ROOT
 
 import numpy as np  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
+import pytest  # noqa: E402
 import soundfile as sf  # noqa: E402
 
 from kitsune.store import SCHEMA, ShardInfo, append_manifest, save_progress  # noqa: E402
@@ -234,7 +245,8 @@ def make_fake_corpus(root, sources: dict | None = None, *, rows_per_shard: int =
         save_progress(fc.data, source, {"finished_inputs": [], "done": True})
 
     (fc.teacher_out / "meta.json").write_text(json.dumps(dict(
-        model="fake/teacher", language="ja", punctuation=True, k=k, save_encoder=False, decoder_prompt_ids=list(prompt),
+        model="fake/teacher", model_revision="0" * 40, language="ja", punctuation=True, k=k, save_encoder=False,
+        decoder_prompt_ids=list(prompt),
         decoder_prompt_tokens=[f"<{p}>" for p in prompt], eos_token_id=eos, pad_token_id=pad, vocab_size=vocab_size,
         encoder_hidden_size=1280, decoding="greedy", lm_head_dtype="float32", model_dtype="bfloat16",
     ), indent=2), encoding="utf-8")
@@ -294,6 +306,34 @@ def _write_second(path: Path, rows: list[FakeUtt]):
                 r = dict(id=u.id, hyp2=hyp2, model2="whisper-large-v3", agree=u.agree,
                          cer2=round(cer_fn(hyp2, u.text), 4))
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def no_real_data(reason: str) -> None:
+    """Skip the calling test for missing real data, or FAIL it when KITSUNE_REQUIRE_REAL_DATA=1: a verification run
+    that must check the real formats cannot then pass on a skip."""
+    __tracebackhide__ = True  # report the skip/failure at the calling test's line, not here
+    if os.environ.get("KITSUNE_REQUIRE_REAL_DATA") == "1":
+        pytest.fail(f"{reason} (KITSUNE_REQUIRE_REAL_DATA=1, real data root {REAL})")
+    pytest.skip(reason)
+
+
+def need_real(*paths: Path) -> None:
+    """no_real_data unless every one of these real-data paths exists."""
+    __tracebackhide__ = True
+    missing = [str(p) for p in paths if not Path(p).exists()]
+    if missing:
+        no_real_data("real data not present: " + ", ".join(missing))
+
+
+def teacher_processor():
+    """The gated teacher's processor from the local HF cache (the tests run with HF_HUB_OFFLINE=1), or no_real_data."""
+    __tracebackhide__ = True
+    from kitsune.features import load_hf_processor
+
+    try:
+        return load_hf_processor()
+    except Exception as e:  # noqa: BLE001 - not cached / offline
+        no_real_data(f"teacher processor not in the local HF cache (HF_HOME): {type(e).__name__}: {e}")
 
 
 def load_script(name: str):

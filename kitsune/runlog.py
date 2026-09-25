@@ -20,11 +20,16 @@ Layout (relative to runs/<run_id>/):
   metrics/hist/part-*.parquet histogram summaries: quantiles, moments, 64-bin counts/edges (json)
   metrics/text.jsonl          every text() call (TensorBoard text is awkward to extract)
   evals/step_<N>/             summary.json, tf_<set>.parquet, greedy_<set>.parquet, probe.parquet (table/eval_json)
+  evals/step_<N>_mini/        the same for a mini eval (scripts/04_distill.py run_mini_eval)
   samples/step_<N>.jsonl      text samples (ref / teacher / student), also TensorBoard text
   events.jsonl                lifecycle events, fsynced one by one (phase changes, OOM fallbacks, checkpoints,
                               exceptions with tracebacks, sync errors, verdict)
   logs/stdout.log             tee of sys.stdout / sys.stderr
   summary.json                final: verdict, best/final metrics, throughput, cost, wall times
+JSON has no NaN in any of them: in every JSON / JSONL file other than scalars.jsonl (summary.json, evals/*/*.json,
+samples/, events.jsonl, ...) a null where a number belongs is a NaN or an infinity - a ratio_vs_teacher or verdict
+ratio against a teacher CER of 0 (the teacher's value sits next to it), a confidence bucket without tokens, the
+grad_norm of a skipped non-finite step. Only scalars.jsonl says which, in its "nf" field.
 
 Sync never blocks training: the caller only flushes file handles, notes the flushed length of every append-only file
 and snapshots the in-memory tables; parquet rewrites and HfApi.upload_folder (to runs/<run_id>/, checkpoints/
@@ -32,17 +37,26 @@ excluded - the trainer uploads those explicitly) run in a daemon thread. The upl
 append-only files cut at those lengths: the Hub client sizes a file when it lists the folder but hashes and reads it
 later, and the live files keep growing (and parquet mirrors get replaced) meanwhile, which would commit a pointer
 whose size, hash and content disagree. Upload errors are retried with back-off and become events, never exceptions.
+A sync that never returns (a Hub request the server accepted and never answered) is visible and bounded: later syncs
+are skipped while it runs, and once it has run for 2 x sync_every_min that becomes one sync_stalled event; close()
+waits at most close_join_s for it and its own final sync, then logs sync_abandoned and returns (the thread is a daemon
+and dies with the process; on the box vast/finish.py uploads again and verifies before a destroy).
 
 Resume: pass the dict from state_dict() (kept in the trainer's full state) as `resume=`. elapsed_s continues, steps
-after the restored step are dropped from steps.parquet and purged from TensorBoard, and are then logged again. The
-append-only jsonl files keep both copies; the later wall time is the one that counts.
+after the restored step are dropped from steps.parquet and purged from TensorBoard, and are then logged again as far as
+the resumed launch gets (a budget re-fitted to the time left may end it before the crash step). The append-only files
+(jsonl, parquet parts, evals/, samples/) keep the crashed launch's rows: a row with a step after the restored one,
+logged before the resumed launch's logger_start event, comes from weights the crash discarded, whether or not that
+step is logged again (tools/export_run.py marks these `discarded`).
 
 TensorBoard buckets: TensorBoard groups cards by the first component of a tag, so tb/ gets every tag under one of
   1_operational     time, throughput, memory, system, data progress (tokens per source too), schedule, early-stop
-                    bookkeeping, eval cost and counts (CER denominators: ref_chars); events and config as text
-  2_loss_accuracy   train and held-out loss, accuracy (top-1 agreement, CER = characters gotten wrong), both per
-                    source and per teacher-confidence bucket, the train probe, the overfit gap, the early-stop metric
-                    and its best; the eval sample tables
+                    bookkeeping, eval cost and counts (CER denominators: ref_chars, cer_teacher_chars), the mini
+                    evals' cost under eval/mini/; events and config as text
+  2_loss_accuracy   first 00_summary/{full,mini}/: every eval's headline numbers (pooled val / train CER, loss,
+                    top-1); then train and held-out loss, accuracy (top-1 agreement, CER = characters gotten wrong),
+                    both per source and per teacher-confidence bucket, the train probe, the overfit gap, the
+                    early-stop metric and its best, the mini evals in <section>_mini/; the eval sample tables
   3_misc            per-layer stats, L2-SP distances, optimizer internals, augmentation, token diagnostics (the share
                     of tokens per confidence bucket included), every histogram, and any tag no rule matches (one
                     tb_tag_unmapped event per such tag)
@@ -84,9 +98,11 @@ TRAIN_UTT_SCHEMA = pa.schema([("step", pa.int64()), ("epoch", pa.int64()), ("id"
                               ("agree", pa.float32())])
 QUANTILES = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
 HIST_BINS = 64
-# env vars worth keeping (vast host facts, our own launch settings); anything secret-looking is redacted by name
+# env vars worth keeping (vast host facts, our own launch settings); anything secret-looking is redacted by name.
+# Not SSH_CONNECTION: a run started from an SSH shell (onstart.sh --rearm, a manual --resume) would record the
+# operator's own IP in the runs repo, and the box side is already in PUBLIC_IPADDR / VAST_TCP_PORT_*.
 ENV_PREFIXES = ("VAST", "CONTAINER", "KITSUNE", "PUBLIC_IPADDR", "GPU_", "CUDA", "NVIDIA", "HF_", "PYTORCH", "OMP_",
-                "TZ", "HOSTNAME", "SSH_CONNECTION")
+                "TZ", "HOSTNAME")
 SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CRED", "COOKIE")
 SYNC_IGNORE = ["checkpoints/*", "*.tmp"]
 
@@ -118,8 +134,24 @@ def _atomic_write_bytes(path: Path, data: bytes):
     _replace(tmp, path)
 
 
+def _finite(obj):
+    """obj with every non-finite float (np.float64 is one) as None, through dicts, lists and tuples: json.dumps writes
+    a bare NaN / Infinity, which is not JSON - JavaScript, jq and strict loaders reject the whole file. Never raises
+    (event() runs in exception handlers and mid-training): what it cannot walk goes to json.dumps as it is."""
+    try:
+        if isinstance(obj, float):
+            return obj if math.isfinite(obj) else None
+        if isinstance(obj, dict):
+            return {k: _finite(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_finite(v) for v in obj]
+    except Exception:
+        pass
+    return obj
+
+
 def _atomic_json(path: Path, obj):
-    _atomic_write_bytes(path, json.dumps(obj, indent=2, ensure_ascii=False, default=str).encode("utf-8"))
+    _atomic_write_bytes(path, json.dumps(_finite(obj), indent=2, ensure_ascii=False, default=str).encode("utf-8"))
 
 
 def _atomic_parquet(table: pa.Table, path: Path):
@@ -193,16 +225,32 @@ TB_BUCKETS = ("1_operational", "2_loss_accuracy", "3_misc")  # names sort in thi
 TB_PLUGINS = ("scalars", "histograms", "text")
 _SPLIT = r"(_utt_mean|_p1_gt_0\.99|_p1_lt_0\.9)?"  # per-utterance mean, or one teacher-confidence bucket
 _CER = ("cer_ref_corpus|cer_ref_mean|cer_teacher_corpus|cer_teacher_mean|ratio_vs_teacher|trunc_rate|ref_edits|"
-        "n_truncated|n_empty_hyp|teacher_cer_ref_corpus|teacher_cer_ref_mean|teacher_trunc_rate")  # not ref_chars
+        "cer_teacher_edits|n_truncated|n_empty_hyp|teacher_cer_ref_corpus|teacher_cer_ref_mean|"
+        "teacher_trunc_rate")  # not the CER denominators (_CER_DEN)
+_CER_DEN = "ref_chars|cer_teacher_chars"  # characters of the reference / of the teacher's hypothesis: counts
 _EVAL_OPS = "wall_s|rtf|tok_per_s|audio_s|n_bad_audio|n_utts|n_tok|n"  # eval/<kind>/<m>: cost and counts
-_EVAL_SET_OPS = "audio_s|tok_per_s|n|n_tok|n_utts|n_missing_teacher|n_empty_ref"  # eval/<kind>/<set>/<m>
+# eval/<kind>/<set>/<m> (n_bad_audio: a set's undecodable rows, evaluate.flatten's bad_audio_per_set)
+_EVAL_SET_OPS = "audio_s|tok_per_s|n|n_tok|n_utts|n_missing_teacher|n_empty_ref|n_bad_audio"
 _TOK_DIAG = (r"student_entropy_coarse|student_tail|teacher_entropy_coarse|teacher_tail|teacher_p1|frac_p1_gt_0\.99|"
              r"frac_p1_lt_0\.9")
 _SET = r"(?P<set>[^/]+)"
 # (regex, template): the first rule whose regex matches the WHOLE tag wins; the template's first component is the
-# bucket. Scalars and text; a histogram always goes to 3_misc/<tag>.
+# bucket. Scalars and text; a histogram always goes to 3_misc/<tag>. The mini evals (eval/mini/<kind>/..., scripts/
+# 04_distill.py run_mini_eval) land next to their full counterparts, in <section>_mini (1_operational/eval/mini/...).
 TB_BUCKET_RULES = (
-    # 2_loss_accuracy: loss (train, held-out) and accuracy (top-1 agreement with the teacher, CER)
+    # 2_loss_accuracy: the headline numbers of every eval first (00_ sorts before the other sections), then loss (train,
+    # held-out) and accuracy (top-1 agreement with the teacher, CER)
+    (r"summary/(?P<kind>full|mini)/(?P<m>[^/]+)", r"2_loss_accuracy/00_summary/\g<kind>/\g<m>"),
+    (rf"eval/mini/tf/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/val_loss_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/tf/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/val_accuracy_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/val_accuracy_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/probe/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/train_probe_loss_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/probe/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/train_probe_accuracy_mini/\g<set>/\g<m>"),
+    (rf"eval/mini/probe_greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/train_probe_accuracy_mini/\g<set>/\g<m>"),
+    # loss/total = objective + the L2-SP value lam/2*||theta-theta0||^2, which the light decoupled pull does not hold
+    # down: it climbs all run as the weights leave the init (70 by step 600 of an overfit run whose objective fell to
+    # 0.1), so it and loss/l2sp get their own group, named for it, beside the optimised objective, kl and ce
+    (r"loss/(?P<m>total|l2sp)", r"2_loss_accuracy/train_loss_incl_l2sp/\g<m>"),
     (r"loss/(?P<m>.+)", r"2_loss_accuracy/train_loss/\g<m>"),
     (r"src/(?P<src>[^/]+)/(?P<m>kl|ce)", r"2_loss_accuracy/train_loss/by_source/\g<src>/\g<m>"),
     (r"bucket/(?P<b>[^/]+)/(?P<m>kl|ce)", r"2_loss_accuracy/train_loss/by_teacher_confidence/\g<b>/\g<m>"),
@@ -224,8 +272,15 @@ TB_BUCKET_RULES = (
     # bookkeeping (evals since the best, triggered), eval cost and counts (ref_chars: a CER denominator), lifecycle text
     (r"(?P<t>(time|perf|mem|sys|data|sched|early_stop)/.+|opt/lr|src/[^/]+/tokens)", r"1_operational/\g<t>"),
     (r"eval/epoch", r"1_operational/progress/epoch"),
-    (rf"eval/(?P<kind>greedy|greedy_full|probe_greedy)/{_SET}/ref_chars",
-     r"1_operational/eval/\g<kind>/\g<set>/ref_chars"),
+    (rf"eval/mini/(?P<kind>greedy|probe_greedy)/{_SET}/(?P<m>{_CER_DEN})",
+     r"1_operational/eval/mini/\g<kind>/\g<set>/\g<m>"),
+    (rf"eval/mini/(?P<kind>tf|greedy|probe|probe_greedy)/(?P<m>{_EVAL_OPS})",
+     r"1_operational/eval/mini/\g<kind>/\g<m>"),
+    (rf"eval/mini/(?P<kind>tf|greedy|probe|probe_greedy)/{_SET}/(?P<m>{_EVAL_SET_OPS})",
+     r"1_operational/eval/mini/\g<kind>/\g<set>/\g<m>"),
+    (r"eval/mini/wall_s", r"1_operational/eval/mini/wall_s"),
+    (rf"eval/(?P<kind>greedy|greedy_full|probe_greedy)/{_SET}/(?P<m>{_CER_DEN})",
+     r"1_operational/eval/\g<kind>/\g<set>/\g<m>"),
     (rf"eval/(?P<kind>[^/]+)/(?P<m>{_EVAL_OPS})", r"1_operational/eval/\g<kind>/\g<m>"),
     (rf"eval/(?P<kind>[^/]+)/{_SET}/(?P<m>{_EVAL_SET_OPS})", r"1_operational/eval/\g<kind>/\g<set>/\g<m>"),
     (r"eval/wall_s", r"1_operational/eval/wall_s"),
@@ -234,7 +289,7 @@ TB_BUCKET_RULES = (
     # diagnostics (tok/* except top1, each confidence bucket's share of the tokens, the eval entropy / tail /
     # teacher-confidence columns)
     (r"(?P<t>(layers|l2sp|aug|bn|tok)/.+|opt/(grad_norm|clip_coef)|bucket/[^/]+/frac)", r"3_misc/\g<t>"),
-    (rf"(?P<t>eval/(tf|probe)/[^/]+/({_TOK_DIAG}))", r"3_misc/\g<t>"),
+    (rf"(?P<t>eval/(mini/)?(tf|probe)/[^/]+/({_TOK_DIAG}))", r"3_misc/\g<t>"),
 )
 _TB_RULES = tuple((re.compile(p), t) for p, t in TB_BUCKET_RULES)
 
@@ -378,6 +433,70 @@ def _ram_total_gb() -> float | None:
         return None
 
 
+# The container's own cgroup (Linux; absent on Windows). psutil, os.cpu_count() and os.getloadavg() read /proc, which
+# inside a container (the vast box) is the whole host's: a 1-GPU slice of a big machine sees several times the RAM
+# and cores it may use, and the load of every tenant.
+CGROUP = Path("/sys/fs/cgroup")
+_CG_LIMITS = {2: ("memory.max", "memory.high", "memory.low", "cpu.max", "pids.max"),
+              1: ("memory/memory.limit_in_bytes", "memory/memory.soft_limit_in_bytes", "cpu/cpu.cfs_quota_us",
+                  "cpu/cpu.cfs_period_us", "pids/pids.max")}
+
+
+def _cg_version() -> int | None:
+    if (CGROUP / "memory.max").is_file():
+        return 2
+    if (CGROUP / "memory" / "memory.limit_in_bytes").is_file():
+        return 1
+    return None
+
+
+def _cg_text(rel: str) -> str | None:
+    try:
+        return (CGROUP / rel).read_text().strip()
+    except Exception:
+        return None
+
+
+def _cg_fields(rel: str) -> dict[str, int]:
+    """'key value' lines (memory.stat, memory.events, memory.oom_control) -> {key: int}."""
+    out = {}
+    for line in (_cg_text(rel) or "").splitlines():
+        k, _, v = line.partition(" ")
+        if v.strip().isdigit():
+            out[k] = int(v)
+    return out
+
+
+def _cgroup_limits() -> dict | None:
+    """The raw limit files of the container's cgroup ("max" / -1: none) and its version; None without one."""
+    v = _cg_version()
+    return None if v is None else dict(version=v, **{f: _cg_text(f) for f in _CG_LIMITS[v]})
+
+
+def _cgroup_mem() -> dict:
+    """The container's own memory in bytes, v2 else v1; {} without a cgroup, and never raises. anon: the trainer and
+    all its DataLoader workers, page cache left out (comparable to the offer's cpu_ram); shmem: /dev/shm (the workers'
+    batches); limit only when there is one; oom_kill: the cgroup's OOM-kill counter. Not memory.current: it counts the
+    page cache of the shards being read and sits near the limit on a healthy run."""
+    try:
+        v = _cg_version()
+        if v == 2:
+            stat, limit = _cg_fields("memory.stat"), _cg_text("memory.max")
+            out = dict(anon=stat.get("anon"), shmem=stat.get("shmem"),
+                       oom_kill=_cg_fields("memory.events").get("oom_kill"))
+        elif v == 1:
+            stat, limit = _cg_fields("memory/memory.stat"), _cg_text("memory/memory.limit_in_bytes")
+            out = dict(anon=stat.get("total_rss", stat.get("rss")), shmem=stat.get("total_shmem", stat.get("shmem")),
+                       oom_kill=_cg_fields("memory/memory.oom_control").get("oom_kill"))
+        else:
+            return {}
+        if limit and limit.isdigit() and int(limit) < 2**62:  # v2 "max", v1 ~2**63: no limit
+            out["limit"] = int(limit)
+        return {k: x for k, x in out.items() if x is not None}
+    except Exception:
+        return {}
+
+
 def safe_env() -> dict[str, str]:
     """Launch-relevant env vars with anything secret-looking redacted (the name stays, so its presence is visible)."""
     out = {}
@@ -406,6 +525,8 @@ def system_info() -> dict:
                 cudnn=_try(torch.backends.cudnn.version) if cuda else None, cuda_available=cuda,
                 time_utc=_now_iso(), env=safe_env())
     info["libsndfile"] = _try(lambda: __import__("soundfile").__libsndfile_version__)
+    # cpu_count and ram_gb are the host's inside a container; its own limits are here (None: not in a cgroup)
+    info["cgroup"] = _try(_cgroup_limits)
     if cuda:
         info["gpus"] = _try(lambda: [dict(name=torch.cuda.get_device_name(i),
                                           capability=list(torch.cuda.get_device_capability(i)),
@@ -482,8 +603,10 @@ def _nvml():
 
 
 def system_stats() -> dict[str, float]:
-    """GPU util/mem/power/temp/clocks via NVML, torch CUDA memory, process RSS and CPU %. Missing pieces are
-    simply absent (no pynvml, no CUDA, no psutil)."""
+    """GPU util/mem/power/temp/clocks via NVML, torch CUDA memory, process RSS and CPU %, and the container's own
+    memory under sys/cgroup/ (anon_gb, shmem_gb, limit_gb, oom_kill; see _cgroup_mem). Missing pieces are simply absent
+    (no pynvml, no CUDA, no psutil, no cgroup). sys/ram_used_pct and sys/load1 come from /proc: inside a container
+    (the vast box) they are the whole host's, not this instance's; sys/proc/rss_gb is the main process only."""
     global _PROC
     out = {}
     nv = _nvml()
@@ -535,6 +658,12 @@ def system_stats() -> dict[str, float]:
             pass
     if hasattr(os, "getloadavg"):
         out["sys/load1"] = os.getloadavg()[0]
+    cg = _cgroup_mem()
+    for k in ("anon", "shmem", "limit"):
+        if k in cg:
+            out[f"sys/cgroup/{k}_gb"] = cg[k] / 2**30
+    if "oom_kill" in cg:
+        out["sys/cgroup/oom_kill"] = float(cg["oom_kill"])
     return out
 
 
@@ -581,7 +710,7 @@ class RunLogger:
     def __init__(self, run_dir, cfg: dict, hf_repo: str | None = None, sync_every_min: float = 10, *,
                  resume: dict | None = None, student_meta: dict | None = None, tee: bool = True,
                  capture: bool = True, train_utts_flush_steps: int = 500, api=None,
-                 upload_retries: tuple[float, ...] = (15, 60, 180)):
+                 upload_retries: tuple[float, ...] = (15, 60, 180), close_join_s: float = 600):
         import torch  # noqa: F401  (SummaryWriter needs it anyway; import errors surface here, not mid-run)
         from torch.utils.tensorboard import SummaryWriter
 
@@ -591,11 +720,16 @@ class RunLogger:
         self.sync_every_s = sync_every_min * 60
         self.train_utts_flush_steps = train_utts_flush_steps
         self.upload_retries = upload_retries
+        # close()'s whole wait for the sync thread(s), bounded like the trainer's checkpoint waits so a stalled upload
+        # cannot keep the process alive. On a stalled Hub the end phase's waits together can outlast the 30 min end
+        # reserve; the watchdog's deadline stop is the backstop (scripts/04_distill.py UPLOAD_WAIT_S)
+        self.close_join_s = close_join_s
         self._api = api
         self._repo_ready = False
         self._lock = threading.RLock()
         self._part_lock = threading.Lock()
         self._sync_thread: threading.Thread | None = None
+        self._sync_t0, self._sync_step, self._stall_logged = 0.0, 0, False  # the running sync: start, step, reported
         self._closed = False
         restart = (self.dir / "events.jsonl").exists()  # a previous logger ran here (resume or re-launch)
         for d in ("env", "tb", "metrics/train_utts", "metrics/hist", "evals", "samples", "logs"):
@@ -829,25 +963,26 @@ class RunLogger:
             self.tb.add_text(tb, s, int(step), walltime=row["wall"])
         self._save_tag_map()
 
-    def eval_dir(self, step: int) -> Path:
-        d = self.dir / "evals" / f"step_{int(step)}"
+    def eval_dir(self, step: int, suffix: str = "") -> Path:
+        """evals/step_<N>/ (suffix "mini": evals/step_<N>_mini/, a mini eval's own folder)."""
+        d = self.dir / "evals" / (f"step_{int(step)}_{suffix}" if suffix else f"step_{int(step)}")
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def table(self, name: str, df, step: int):
+    def table(self, name: str, df, step: int, suffix: str = ""):
         """evals/step_<N>/<name>.parquet (e.g. tf_eval_jsut, greedy_eval_cv8, probe) from a DataFrame or arrow table."""
         t = df if isinstance(df, pa.Table) else pa.Table.from_pandas(df, preserve_index=False)
-        _atomic_parquet(t, self.eval_dir(step) / f"{name}.parquet")
+        _atomic_parquet(t, self.eval_dir(step, suffix) / f"{name}.parquet")
 
-    def eval_json(self, name: str, obj: dict, step: int):
+    def eval_json(self, name: str, obj: dict, step: int, suffix: str = ""):
         """evals/step_<N>/<name>.json (summary.json, verdict.json ...)."""
-        _atomic_json(self.eval_dir(step) / f"{name}.json", obj)
+        _atomic_json(self.eval_dir(step, suffix) / f"{name}.json", obj)
 
     def samples(self, step: int, rows: list[dict], tag: str = "samples"):
         """samples/step_<N>.jsonl plus a TensorBoard markdown table (ref / teacher / student)."""
         with open(self.dir / "samples" / f"step_{int(step)}.jsonl", "w", encoding="utf-8") as f:
             for r in rows:
-                f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+                f.write(json.dumps(_finite(r), ensure_ascii=False, default=str) + "\n")
 
         def cell(x):
             return str(x).replace("|", "\\|").replace("\n", " ")
@@ -867,7 +1002,7 @@ class RunLogger:
         """events.jsonl line, fsynced (these are the lines you want after a crash); also TensorBoard text."""
         row = dict(wall=round(time.time(), 3), time=_now_iso(), elapsed_s=round(self.elapsed(), 3), step=self.step,
                    kind=kind, **fields)
-        line = json.dumps(row, ensure_ascii=False, default=str)
+        line = json.dumps(_finite(row), ensure_ascii=False, default=str)
         with self._lock:
             with open(self.p_events, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -924,6 +1059,12 @@ class RunLogger:
             return False
         if self._sync_thread is not None and self._sync_thread.is_alive():
             if not force:
+                # skipped, and silently so far: a sync that outlives two periods is stuck (a Hub request that is never
+                # answered), and every later sync is lost with it - say so once, the log is the only place it shows
+                running = time.monotonic() - self._sync_t0
+                if not self._stall_logged and running > 2 * self.sync_every_s:
+                    self._stall_logged = True
+                    self.event("sync_stalled", started_s_ago=round(running, 1), sync_step=self._sync_step)
                 return False
             self._sync_thread.join()
         self._last_sync = time.monotonic()
@@ -945,6 +1086,7 @@ class RunLogger:
                     sizes=sizes)
         th = threading.Thread(target=self._sync_worker, args=(snap,), name="runlog-sync", daemon=True)
         self._sync_thread = th
+        self._sync_t0, self._sync_step, self._stall_logged = time.monotonic(), snap["step"], False
         th.start()
         if wait:
             th.join()
@@ -997,8 +1139,10 @@ class RunLogger:
                     api.create_repo(self.hf_repo, repo_type="model", private=((self.cfg or {}).get("hf") or {}).get("private", True),
                                     exist_ok=True)
                     self._repo_ready = True
+                # a copy: upload_folder extends the list it is given in place (`ignore_patterns +=` its defaults),
+                # which would grow the module constant by 8 patterns on every attempt
                 api.upload_folder(repo_id=self.hf_repo, repo_type="model", folder_path=str(folder),
-                                  path_in_repo=f"runs/{self.run_id}", ignore_patterns=SYNC_IGNORE,
+                                  path_in_repo=f"runs/{self.run_id}", ignore_patterns=list(SYNC_IGNORE),
                                   commit_message=f"sync {self.run_id} step {step}")
                 self.event("sync_ok", repo=self.hf_repo, attempt=attempt, upload_s=round(time.time() - t0, 1))
                 return True
@@ -1008,21 +1152,41 @@ class RunLogger:
         self.event("sync_failed", repo=self.hf_repo, attempts=len(waits))
         return False
 
-    def wait_sync(self):
+    def wait_sync(self, timeout: float | None = None) -> bool:
+        """Wait for the running sync, at most `timeout` s (None: until it ends). True once none is running."""
         if self._sync_thread is not None:
-            self._sync_thread.join()
+            self._sync_thread.join(timeout)
+        return self._sync_thread is None or not self._sync_thread.is_alive()
+
+    def _join_sync(self, until: float) -> bool:
+        """Wait for the running sync until the monotonic time `until`. False, with a sync_abandoned event, if it is
+        still running then: the daemon thread is left to die with the process."""
+        th = self._sync_thread
+        if th is None:
+            return True
+        th.join(max(0.0, until - time.monotonic()))
+        if th.is_alive():
+            self.event("sync_abandoned", started_s_ago=round(time.monotonic() - self._sync_t0, 1),
+                       sync_step=self._sync_step, close_join_s=self.close_join_s)
+            return False
+        return True
 
     # ------------------------------------------------------------------------------------------- close
 
     def close(self, summary: dict | None = None):
-        """Write summary.json (if given), flush everything, run a final forced sync, restore stdout/stderr."""
+        """Write summary.json (if given), flush everything, run a final forced sync, restore stdout/stderr. The wait
+        for the syncs is bounded by close_join_s: a stalled earlier sync means no final one (it would queue behind the
+        stall), and a final one that stalls is left behind too."""
         if self._closed:
             return
         if summary is not None:
             self.write_summary(summary)
         self.flush_train_utts()
         self.event("logger_close", elapsed_s_total=round(self.elapsed(), 1))
-        self.sync(force=True, wait=True)
+        until = time.monotonic() + self.close_join_s
+        if self._join_sync(until):
+            self.sync(force=True, wait=False)
+            self._join_sync(until)
         with self._lock:
             self._closed = True
             self.tb.close()

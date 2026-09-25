@@ -22,8 +22,10 @@ For each teacher shard  teacher_out/<source>/<stem>.jsonl  this writes  second_o
     agree  CER(teacher hyp vs hyp2), normalised - the label-quality gate for distillation
     cer2   CER(hyp2 vs dataset text) - for statistics
 Shards are processed in manifest order, output is atomic per shard and existing outputs are skipped, so the
-script is resumable and safe under scripts/run_teacher_pass.py:
-  python scripts/run_teacher_pass.py --script scripts/02b_second_opinion.py --watch-dir second_out --done-suffix .jsonl
+script is resumable and safe under scripts/run_teacher_pass.py, one source per run (see the --limit-shards note in
+main), e.g. as scripts/start_second_opinion.cmd runs it:
+  python scripts/run_teacher_pass.py --script scripts/02b_second_opinion.py --done-suffix .jsonl --batch 24
+      --watch-dir second_out/galgame --sources galgame
 
 Usage:
   python scripts/02b_second_opinion.py                     # everything with teacher output
@@ -52,12 +54,16 @@ from kitsune.generation import RepetitionStop  # noqa: E402
 from kitsune.store import fsync_path, read_manifest, read_shard  # noqa: E402
 from kitsune.text import cer as cer_fn  # noqa: E402
 
+# every hub read is pinned, like the datasets in 01: a repo that moves between passes would mix two second opinions
 MODEL2 = "kotoba-tech/kotoba-whisper-v2.0"
+MODEL2_REVISION = "7eb575277d18909a4af8a24e3ae8cce2e99794ae"
 WHISPER_TOK = "openai/whisper-large-v3"  # tokenizer that produced the precomputed transcripts
-JOIN_SOURCES = {  # sources whose mirror parquets already carry whisper-large-v3 transcripts
-    "reazon_small": "japanese-asr/whisper_transcriptions.reazonspeech.small",
-    "reazon_medium": "japanese-asr/whisper_transcriptions.reazonspeech.medium",
-    "reazon_large": "japanese-asr/whisper_transcriptions.reazonspeech.large",
+WHISPER_TOK_REVISION = "06f233fe06e710322aca913c1bc4249a0d71fce1"
+JOIN_SOURCES = {  # sources whose mirror parquets already carry whisper-large-v3 transcripts: (repo, commit), the
+    # commits 01_prepare_data.py pins in REVISIONS (tests/test_infra.py checks that the two copies agree)
+    "reazon_small": ("japanese-asr/whisper_transcriptions.reazonspeech.small", "c74b52fc164cf7b64936ca62aee4336eac626739"),
+    "reazon_medium": ("japanese-asr/whisper_transcriptions.reazonspeech.medium", "c801154945d5cf756f727e06afbef472d60fed37"),
+    "reazon_large": ("japanese-asr/whisper_transcriptions.reazonspeech.large", "4ad8d64a13594f0ce1f0622627a18ef99b42b5e8"),
 }
 SELF_TEXT_SOURCES = {  # sources whose dataset text is itself a second-model transcript
     "emilia_yodas": "whisper-medium (Emilia WhisperX)",
@@ -66,7 +72,7 @@ SELF_TEXT_SOURCES = {  # sources whose dataset text is itself a second-model tra
 }
 
 
-def build_whisper_cache(source: str, repo: str, cache_dir: Path) -> Path:
+def build_whisper_cache(source: str, repo: str, revision: str, cache_dir: Path) -> Path:
     """Stream name + whisper_transcript columns from the mirror and cache the decoded text locally.
     One atomically-written part per mirror file, so a network failure only costs the file in flight."""
     part_dir = cache_dir / f"whisper_{source}"
@@ -74,14 +80,14 @@ def build_whisper_cache(source: str, repo: str, cache_dir: Path) -> Path:
     from huggingface_hub import HfApi, HfFileSystem
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(WHISPER_TOK)
-    files = sorted(f for f in HfApi().list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet"))
+    tok = AutoTokenizer.from_pretrained(WHISPER_TOK, revision=WHISPER_TOK_REVISION)
+    files = sorted(f for f in HfApi().list_repo_files(repo, repo_type="dataset", revision=revision) if f.endswith(".parquet"))
     fs = HfFileSystem()
     for f in tqdm(files, desc=f"whisper cache {source}", unit="file"):
         part = part_dir / Path(f).name
         if part.exists():
             continue
-        with fs.open(f"datasets/{repo}/{f}", "rb") as fh:
+        with fs.open(f"datasets/{repo}@{revision}/{f}", "rb") as fh:
             t = pq.read_table(fh, columns=["name", "whisper_transcript"])
         texts = tok.batch_decode(t.column("whisper_transcript").to_pylist(), skip_special_tokens=True)
         tmp = part.with_suffix(".parquet.tmp")
@@ -92,7 +98,8 @@ def build_whisper_cache(source: str, repo: str, cache_dir: Path) -> Path:
 
 
 def load_whisper_map(source: str, cache_dir: Path) -> dict[str, str]:
-    part_dir = build_whisper_cache(source, JOIN_SOURCES[source], cache_dir)
+    repo, revision = JOIN_SOURCES[source]
+    part_dir = build_whisper_cache(source, repo, revision, cache_dir)
     out: dict[str, str] = {}
     for part in sorted(part_dir.glob("*.parquet")):
         t = pq.read_table(part)
@@ -140,8 +147,9 @@ class Kotoba:
 
         self.torch = torch
         self.batch = batch
-        self.processor = AutoProcessor.from_pretrained(MODEL2)
-        self.model = WhisperForConditionalGeneration.from_pretrained(MODEL2, dtype=torch.float16).to("cuda").eval()
+        self.processor = AutoProcessor.from_pretrained(MODEL2, revision=MODEL2_REVISION)
+        self.model = WhisperForConditionalGeneration.from_pretrained(MODEL2, revision=MODEL2_REVISION,
+                                                                     dtype=torch.float16).to("cuda").eval()
         print(f"{MODEL2} loaded: {sum(p.numel() for p in self.model.parameters()) / 1e9:.2f}B params, "
               f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
 
@@ -223,7 +231,10 @@ def main():
         shards = [s for s in shards if s.source in args.sources]
 
     # --limit-shards slices the ELIGIBLE list (shards with teacher output), so the supervisor's blocking-mode
-    # "--limit-shards <done>+1" always reaches exactly the stuck shard even when teacher coverage has gaps
+    # "--limit-shards <done>+1" reaches exactly the stuck shard even when teacher coverage has gaps - but only when the
+    # outputs it counts under --watch-dir are a prefix of this list, i.e. --watch-dir second_out/<source> with
+    # --sources <source>. Counting all of second_out also counts sources finished out of manifest order (emilia_yodas
+    # after galgame), and the "one shard" blocking attempt then runs everything left, serialised.
     eligible = [s for s in shards if (teacher_root / s.source / f"{Path(s.path).stem}.jsonl").exists()]
     no_teacher = len(shards) - len(eligible)
     if args.limit_shards:
@@ -236,7 +247,9 @@ def main():
         return
 
     out_root.mkdir(parents=True, exist_ok=True)
-    meta = dict(join_model="whisper-large-v3 (precomputed)", gpu_model=MODEL2, tokenizer=WHISPER_TOK,
+    meta = dict(join_model="whisper-large-v3 (precomputed)", gpu_model=MODEL2, gpu_model_revision=MODEL2_REVISION,
+                tokenizer=WHISPER_TOK, tokenizer_revision=WHISPER_TOK_REVISION,
+                join_revisions=dict(JOIN_SOURCES.values()),
                 agree="cer(teacher_hyp, hyp2)", cer2="cer(hyp2, dataset_text)")
     (out_root / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 

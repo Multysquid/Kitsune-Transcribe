@@ -2,11 +2,13 @@
 
 Everything runs on a synthetic corpus in the repo's exact on-disk formats (tests/fixtures.py) and is checked against
 the fixture's ground truth, not against the code under test. Two tests read real files (one teacher shard, one data
-shard) and skip when they are absent. CPU only.
+shard) under fixtures.REAL and skip when they are absent (fail under KITSUNE_REQUIRE_REAL_DATA=1). CPU only.
 """
 import json
+import os
 import pickle
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,7 +20,9 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fixtures import ROOT, load_script, make_fake_corpus, make_fake_selection  # noqa: E402
+from fixtures import (  # noqa: E402
+    REAL, ROOT, load_script, make_fake_corpus, make_fake_selection, need_real, no_real_data,
+)
 
 from kitsune.audio import decode_audio  # noqa: E402
 from kitsune.store import SCHEMA  # noqa: E402
@@ -27,8 +31,8 @@ from kitsune.trainset import (  # noqa: E402
 )
 
 TRAIN, EVAL = ["src_a", "src_b"], ["eval_x", "eval_y"]
-REAL_NPZ = ROOT / "teacher_out" / "reazon_small" / "train-00000.npz"
-REAL_SHARD = ROOT / "data" / "shards" / "reazon_small" / "train-00000.parquet"
+REAL_NPZ = REAL / "teacher_out" / "reazon_small" / "train-00000.npz"
+REAL_SHARD = REAL / "data" / "shards" / "reazon_small" / "train-00000.parquet"
 ms = load_script("make_selection")
 
 
@@ -79,9 +83,9 @@ def expected_reason(u) -> str:
 # ------------------------------------------------------------------------------------------------ formats / selection
 
 
-@pytest.mark.skipif(not REAL_NPZ.exists(), reason="real teacher_out not present")
 def test_fixture_matches_real_formats(corpus):
     """The fixture writes what 02/02b/01 write: same npz keys/dtypes/ranks, jsonl keys, parquet schema, meta keys."""
+    need_real(REAL_NPZ)
     real, fake = np.load(REAL_NPZ), np.load(corpus.teacher_out / "src_a" / "train-00000.npz")
     assert set(real.files) == set(fake.files)
     for key in real.files:
@@ -89,12 +93,12 @@ def test_fixture_matches_real_formats(corpus):
         if real[key].dtype.kind != "U":
             assert real[key].dtype == fake[key].dtype, key
     assert first_keys(REAL_NPZ.with_suffix(".jsonl")) == first_keys(corpus.teacher_out / "src_a" / "train-00000.jsonl")
-    real_second = ROOT / "second_out" / "reazon_small" / "train-00000.jsonl"
+    real_second = REAL / "second_out" / "reazon_small" / "train-00000.jsonl"
     if real_second.exists():
         assert first_keys(real_second) == first_keys(corpus.second_out / "src_a" / "train-00000.jsonl")
-    real_meta = json.loads((ROOT / "teacher_out" / "meta.json").read_text(encoding="utf-8"))
+    real_meta = json.loads((REAL / "teacher_out" / "meta.json").read_text(encoding="utf-8"))
     fake_meta = json.loads((corpus.teacher_out / "meta.json").read_text(encoding="utf-8"))
-    assert set(real_meta) == set(fake_meta)
+    assert set(real_meta) | {"model_revision"} == set(fake_meta)  # 02 back-fills it into an older meta.json on resume
     assert pq.read_schema(corpus.data / "shards" / "src_a" / "train-00000.parquet").remove_metadata().equals(SCHEMA)
     if REAL_SHARD.exists():
         assert pq.read_schema(REAL_SHARD).remove_metadata().equals(SCHEMA)
@@ -150,6 +154,34 @@ def test_selection_cli_output(corpus, tmp_path, capsys):
     assert t.column_names == ms.COLUMNS
     meta = json.loads(t.schema.metadata[b"kitsune_selection"])
     assert meta["args"]["agree_max"] == 0.3 and meta["kept"]
+
+
+def test_selection_partial_second_opinion(corpus, tmp_path):
+    """A source in partial_second_opinion trains on its judged shards only: the rows of a shard with no second-opinion
+    file are not_judged (the run's decision) instead of no_agree; nothing else changes, and the CLI records the list
+    (vast/launch.py compares it with the run config)."""
+    src = TRAIN[0]
+    second = tmp_path / "second_out"
+    shutil.copytree(corpus.second_out, second)
+    shard = sorted((second / src).glob("train-*.jsonl"))[0]
+    shard.unlink()
+    args = (corpus.teacher_out, second, corpus.data, TRAIN, EVAL, 0.5)
+    plain = ms.build_selection(*args, greedy_n=10, probe_n=12)
+    part = ms.build_selection(*args, greedy_n=10, probe_n=12, partial_second_opinion=[src])
+    unjudged = (part["teacher_file"] == f"{src}/{shard.stem}").to_numpy()
+    live = unjudged & ~part["truncated"].to_numpy()
+    assert live.any()
+    assert set(plain["reason"][live]) == {"no_agree"} and set(part["reason"][live]) == {"not_judged"}
+    assert not part["keep"][unjudged].any()
+    assert (part["reason"][~unjudged] == plain["reason"][~unjudged]).all()
+    out = tmp_path / "sel.parquet"
+    ms.main(["--sources", *TRAIN, "--eval-sets", *EVAL, "--partial-second-opinion", src, "--teacher-out",
+             str(corpus.teacher_out), "--second-out", str(second), "--data", str(corpus.data), "--out", str(out)])
+    meta = json.loads(pq.read_schema(out).metadata[b"kitsune_selection"])
+    assert meta["args"]["partial_second_opinion"] == [src]
+    assert "not_judged" in set(pd.read_parquet(out)["reason"])
+    with pytest.raises(SystemExit):
+        ms.main(["--sources", *TRAIN, "--partial-second-opinion", "nope", "--out", str(tmp_path / "bad.parquet")])
 
 
 def test_selection_per_source_agree_threshold(corpus, tmp_path, capsys):
@@ -220,6 +252,42 @@ def test_build_stores_contents_and_idempotence(corpus, selection, tmp_path):
     shutil.copy(data / "shards" / "src_b" / "train-00000.parquet", data / "shards" / "src_a" / "train-00000.parquet")
     build_stores(selection, data, corpus.teacher_out, cache, TRAIN, ["train"], log=logs.append)
     assert "built" in logs[-1]
+
+
+def test_build_stores_rebuilds_when_teacher_output_changes_in_place(corpus, selection, tmp_path):
+    """A teacher re-run that keeps the tokens but changes the log-probs writes an npz of the same size (np.savez does
+    not compress), and a changed ref/hyp lives only in the .jsonl: both must still invalidate the cache."""
+    logs = []
+    teacher, cache = tmp_path / "teacher_out", tmp_path / "cache"
+    shutil.copytree(corpus.teacher_out, teacher)
+    st = build_stores(selection, corpus.data, teacher, cache, TRAIN, ["train"], log=logs.append)
+    lp0 = np.load(cache / "targets_topk_lp.npy")
+    uid = st.utts[0].id
+    npz = teacher / f"{pd.read_parquet(selection).set_index('id').loc[uid, 'teacher_file']}.npz"
+    with np.load(npz) as f:
+        z = dict(f)
+    size0 = npz.stat().st_size
+
+    np.savez(npz, **z)  # the same content written again: no rebuild
+    build_stores(selection, corpus.data, teacher, cache, TRAIN, ["train"], log=logs.append)
+    assert "reusing" in logs[-1]
+
+    z["topk_logprob"] = (z["topk_logprob"] - 0.5).astype(z["topk_logprob"].dtype)
+    np.savez(npz, **z)
+    assert npz.stat().st_size == size0
+    build_stores(selection, corpus.data, teacher, cache, TRAIN, ["train"], log=logs.append)
+    assert "built" in logs[-1]
+    assert not np.array_equal(np.load(cache / "targets_topk_lp.npy"), lp0)
+
+    jl = npz.with_suffix(".jsonl")
+    rows = [json.loads(line) for line in jl.read_text(encoding="utf-8").splitlines() if line.strip()]
+    for r in rows:
+        if r["id"] == uid:
+            r["hyp"] += "改"
+    jl.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+    st2 = build_stores(selection, corpus.data, teacher, cache, TRAIN, ["train"], log=logs.append)
+    assert "built" in logs[-1]
+    assert st2.frame().set_index("id").loc[uid, "hyp"] == corpus.utts[uid].hyp + "改"
 
 
 def check_alignment(corpus, st, idx):
@@ -426,7 +494,8 @@ def test_eval_batches():
 def test_loader_list_plan_in_process(train_store):
     ds = AudioBatchDataset(train_store)
     plan = StepPlanner(train_store.utts, step_audio_s=20, micro_audio_s=8, pool_micro=3, seed=1).epoch_plan(0)
-    got = list(make_loader(ds, plan, num_workers=0, start_step=2))
+    # timeout_s is for workers only: in-process loading (shm_cap can choose 0 workers) asserts a zero timeout
+    got = list(make_loader(ds, plan, num_workers=0, start_step=2, timeout_s=30))
     assert [k for k, _ in got] == list(range(2, len(plan)))
     for (k, mbs) in got:
         assert [m["ids"] for m in mbs] == [[train_store.utts[i].id for i in mb] for mb in plan[k]]
@@ -460,12 +529,78 @@ def test_loader_spawn_workers_across_epochs(train_store):
                     assert torch.equal(m[k], r[k]), k
 
 
+class _NoShm:
+    """Fails to pickle the way a full /dev/shm fails a worker's queue feeder (torch 2.14's message)."""
+
+    def __reduce__(self):
+        raise RuntimeError("unable to allocate shared memory(shm) for file </torch_1_2_3>: No space left on device "
+                           "(28)")
+
+
+class _FeederDropDataset(torch.utils.data.Dataset):
+    """Micro-batch [1] never reaches the trainer: the worker's feeder thread prints the error and drops it, and the
+    worker lives on (so the DataLoader sees no dead worker)."""
+
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, idx):
+        return dict(ids=list(idx), x=_NoShm() if list(idx) == [1] else 0)
+
+
+def test_loader_times_out_on_a_dropped_worker_batch():
+    """A worker micro-batch that never arrives raises "DataLoader timed out" after timeout_s instead of blocking the
+    trainer until the watchdog (the loader yields in order, so it would wait for that batch forever). The timeout
+    covers the first wait's spawn and imports too: 8-11 s measured on an idle laptop, ~26 s beside a live training
+    run and over 30 s late in the full suite there, so 90 s (production: perf.loader_timeout_s = 600)."""
+    loader = make_loader(_FeederDropDataset(), [[[0]], [[1]], [[2]]], num_workers=1, prefetch=2, timeout_s=90)
+    try:
+        key, mbs = next(loader)
+        assert key == 0 and mbs[0]["ids"] == [0]
+        with pytest.raises(RuntimeError, match="timed out"):
+            next(loader)
+    finally:
+        loader.close()
+
+
+class _WorkerDiesDataset(torch.utils.data.Dataset):
+    """The worker process dies on micro-batch [1] without a Python exception (a native decoder crash, a kill)."""
+
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, idx):
+        if list(idx) == [1]:
+            os._exit(1)
+        return dict(ids=list(idx))
+
+
+def test_loader_reports_a_dead_worker_long_before_its_timeout():
+    """torch checks for a dead worker only when a wait ends, and on Windows that poll is the only check. One
+    timeout_s-long wait (production: 600 s) hid a crashed worker for all of it; the wait now runs in 5 s slices, so the
+    worker's death is reported within seconds while timeout_s still bounds a dropped micro-batch. prefetch=1: the
+    worker gets micro-batch [1] only after [0] has arrived; with more in flight its os._exit could land before [0] left
+    its queue's feeder thread, and the death would surface one next() early (seen under full-suite load)."""
+    import time
+
+    loader = make_loader(_WorkerDiesDataset(), [[[0]], [[1]], [[2]]], num_workers=1, prefetch=1, timeout_s=90)
+    try:
+        key, mbs = next(loader)
+        assert key == 0 and mbs[0]["ids"] == [0]
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="exited unexpectedly"):
+            next(loader)
+        assert time.monotonic() - t0 < 30
+    finally:
+        loader.close()
+
+
 # ---------------------------------------------------------------------------------------------------- real data
 
 
-@pytest.mark.skipif(not (REAL_NPZ.exists() and REAL_SHARD.exists()), reason="real teacher_out / data not present")
 def test_real_shard_alignment(tmp_path):
     """A tiny store from real rows: the join, offsets and decode work on the real formats (read-only on data/)."""
+    need_real(REAL_NPZ, REAL_SHARD)
     z = np.load(REAL_NPZ)
     rows = ms.read_jsonl(REAL_NPZ.with_suffix(".jsonl"))[:12]
     off = z["tok_offsets"]
@@ -475,7 +610,7 @@ def test_real_shard_alignment(tmp_path):
         agree=np.float32(0.0), teacher_cer=z["cer"][:12], keep=True, reason="kept", in_greedy_subset=False,
         in_probe=False))
     ms.write_selection(sel, tmp_path / "sel.parquet", {})
-    st = build_stores(tmp_path / "sel.parquet", ROOT / "data", ROOT / "teacher_out", tmp_path / "cache",
+    st = build_stores(tmp_path / "sel.parquet", REAL / "data", REAL / "teacher_out", tmp_path / "cache",
                       ["reazon_small"], ["train"])
     assert [u.id for u in st.utts] == sel["id"].tolist()
     ds = AudioBatchDataset(st)
@@ -493,6 +628,27 @@ def test_real_shard_alignment(tmp_path):
     assert n == b["top_idx"].shape[0]
 
 
+def test_real_data_guard(tmp_path, monkeypatch):
+    """The real-data tests skip when the data is absent (a git worktree has none), but FAIL under
+    KITSUNE_REQUIRE_REAL_DATA=1, so a verification run cannot pass on an 's'; KITSUNE_REAL_DATA_ROOT moves REAL."""
+    there = tmp_path / "there"
+    there.touch()
+    monkeypatch.delenv("KITSUNE_REQUIRE_REAL_DATA", raising=False)
+    need_real(there)  # present: the test runs on
+    with pytest.raises(pytest.skip.Exception, match="gone"):
+        need_real(there, tmp_path / "gone")
+    monkeypatch.setenv("KITSUNE_REQUIRE_REAL_DATA", "1")
+    need_real(there)
+    with pytest.raises(pytest.fail.Exception, match="gone"):
+        need_real(there, tmp_path / "gone")
+    with pytest.raises(pytest.fail.Exception, match="no download cache"):
+        no_real_data("no download cache")
+    env = dict(os.environ, KITSUNE_REAL_DATA_ROOT=str(tmp_path))  # REAL is read at import: a fresh interpreter
+    out = subprocess.run([sys.executable, "-c", "import fixtures; print(fixtures.REAL)"], cwd=Path(__file__).parent,
+                         env=env, capture_output=True, text=True, check=True).stdout.strip()
+    assert Path(out) == tmp_path
+
+
 def test_selection_filters_only_named_monitor_eval_sets(corpus, tmp_path):
     """--filter-eval-sets gives a monitor-only hold-out the train label rules; other eval sets stay unfiltered."""
     ev = EVAL[0]
@@ -507,3 +663,49 @@ def test_selection_filters_only_named_monitor_eval_sets(corpus, tmp_path):
         assert set(o["reason"]) <= {"kept", "no_audio"}
     with pytest.raises(SystemExit):  # the pre-registered gate sets can never be filtered
         make_fake_selection(corpus, tmp_path / "bad.parquet", extra_args=("--filter-eval-sets", "eval_jsut"))
+
+
+def test_selection_from_the_run_config_and_the_launch_check(corpus, tmp_path):
+    """--config takes the sources, the eval sets and the selection_recipe from the run config (none of those flags
+    may be given too); vast/launch.py accepts what it builds and refuses a rebuild with a flag forgotten."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("kitsune_launch", ROOT / "vast" / "launch.py")
+    launch = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(launch)
+    strict = TRAIN[0]
+    cfg = {"sources": TRAIN, "eval_sets": EVAL, "selection": str(tmp_path / "from_config.parquet"),
+           "selection_recipe": {"agree_max": 0.5, "agree_max_source": [f"{strict}=0.1"], "filter_eval_sets": []}}
+    cfg_path = tmp_path / "run.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    paths = ["--teacher-out", str(corpus.teacher_out), "--second-out", str(corpus.second_out), "--data",
+             str(corpus.data), "--greedy-n", "5", "--probe-n", "5"]
+    ms.main(["--config", str(cfg_path), *paths])  # --out: the config's selection
+    out = Path(cfg["selection"])
+    sel = pd.read_parquet(out)
+    assert set(sel.loc[sel["split"] == "train", "source"]) == set(TRAIN)
+    assert set(sel.loc[sel["split"] == "eval", "source"]) == set(EVAL)
+    s = sel[sel["source"] == strict]
+    assert "agree>0.1" in set(s["reason"]) and not (s["keep"] & (s["agree"] > 0.1)).any()
+    args = json.loads(pq.read_schema(out).metadata[b"kitsune_selection"])["args"]
+    assert (args["sources"], args["eval_sets"], args["agree_max"], args["agree_max_source"],
+            args["filter_eval_sets"]) == (TRAIN, EVAL, 0.5, [f"{strict}=0.1"], [])
+    # the fixture has train rows without a second opinion: only the no_agree problem, nothing about the recipe
+    problems = launch.selection_problems(out, "sel", cfg)
+    assert len(problems) == 1 and "as no_agree" in problems[0], problems
+    # the same corpus without the per-source threshold (the flag forgotten): refused
+    forgot = make_fake_selection(corpus, tmp_path / "forgot.parquet", greedy_n=5, probe_n=5)
+    problems = launch.selection_problems(forgot, "sel", cfg)
+    assert any("was built with agree_max_source [], the run config says [('src_a', 0.1)]" in p for p in problems)
+    # a hold-out filtered by the recipe that has no second opinion keeps nothing: refused as well
+    cfg2 = dict(cfg, selection=str(tmp_path / "filtered.parquet"),
+                selection_recipe=dict(cfg["selection_recipe"], filter_eval_sets=[EVAL[0]]))
+    cfg_path.write_text(json.dumps(cfg2), encoding="utf-8")
+    ms.main(["--config", str(cfg_path), *paths])
+    problems = launch.selection_problems(Path(cfg2["selection"]), "sel", cfg2)
+    assert any(f"keeps no eval rows of ['{EVAL[0]}']" in p for p in problems), problems
+    for flag in (["--sources", *TRAIN], ["--agree-max", "0.3"], ["--filter-eval-sets"]):
+        with pytest.raises(SystemExit):
+            ms.main(["--config", str(cfg_path), *flag, *paths])
+    with pytest.raises(SystemExit):  # neither --config nor --sources
+        ms.main(paths)
