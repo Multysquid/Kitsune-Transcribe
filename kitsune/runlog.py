@@ -719,8 +719,9 @@ class RunLogger:
         self.sync_every_s = sync_every_min * 60
         self.train_utts_flush_steps = train_utts_flush_steps
         self.upload_retries = upload_retries
-        # close()'s whole wait for the sync thread(s): with the trainer's bounded checkpoint wait it stays well inside
-        # the 30 min end reserve, so a stalled upload cannot keep the process (and a paid instance) alive
+        # close()'s whole wait for the sync thread(s), bounded like the trainer's checkpoint waits so a stalled upload
+        # cannot keep the process alive. On a stalled Hub the end phase's waits together can outlast the 30 min end
+        # reserve; the watchdog's deadline stop is the backstop (scripts/04_distill.py UPLOAD_WAIT_S)
         self.close_join_s = close_join_s
         self._api = api
         self._repo_ready = False

@@ -17,8 +17,9 @@ datasets:
 A Japanese-only speech-to-text model distilled from Cohere Transcribe by
 [Kitsune-Transcribe](https://github.com/Multysquid/Kitsune-Transcribe).
 
-**This is a private viability checkpoint, not a release.** Whether and under which licence the weights are published
-is decided later. Until then the terms below apply to every copy of these files.
+**Status.** The checkpoints a training run keeps, locally and in its private run repo, are working copies. As
+Galgame's terms require (see Terms), the checkpoint chosen for release is published openly under a non-commercial
+licence; the exact licence is fixed at release. The terms below apply to every copy of these files, private or public.
 
 ## Terms
 

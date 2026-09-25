@@ -191,6 +191,7 @@ def test_eval_cadence_tags_land_in_their_buckets():
 SPOT = [
     ("summary/full/val_cer", "scalars", "2_loss_accuracy/00_summary/full/val_cer"),
     ("summary/full/val_cer_pct", "scalars", "2_loss_accuracy/00_summary/full/val_cer_pct"),
+    ("summary/full/val_cer_utts", "scalars", "2_loss_accuracy/00_summary/full/val_cer_utts"),
     ("summary/mini/train_cer_vs_teacher", "scalars", "2_loss_accuracy/00_summary/mini/train_cer_vs_teacher"),
     ("summary/mini/val_loss", "scalars", "2_loss_accuracy/00_summary/mini/val_loss"),
     ("eval/mini/tf/eval_jsut/kl", "scalars", "2_loss_accuracy/val_loss_mini/eval_jsut/kl"),
@@ -244,6 +245,9 @@ SPOT = [
     ("samples/probe", "text", "2_loss_accuracy/samples/probe"),
     ("time/step_s", "scalars", "1_operational/time/step_s"),
     ("sys/gpu0/mem_used_gb", "scalars", "1_operational/sys/gpu0/mem_used_gb"),
+    # a Linux container's own memory: never logged on a Windows laptop run, so not in the fixture
+    ("sys/cgroup/anon_gb", "scalars", "1_operational/sys/cgroup/anon_gb"),
+    ("sys/cgroup/oom_kill", "scalars", "1_operational/sys/cgroup/oom_kill"),
     ("opt/lr", "scalars", "1_operational/opt/lr"),
     ("eval/epoch", "scalars", "1_operational/progress/epoch"),
     ("eval/greedy_full/rtf", "scalars", "1_operational/eval/greedy_full/rtf"),

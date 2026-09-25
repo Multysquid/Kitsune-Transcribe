@@ -168,8 +168,12 @@ from kitsune.runlog import _replace as _replace_file  # noqa: E402  (atomic file
 from kitsune.store import fsync_path  # noqa: E402
 
 EXIT_OK, EXIT_THROUGHPUT, EXIT_FAIL = 0, 3, 1
-# the end phase's wait for checkpoint uploads: with RunLogger's close_join_s (600 s) and END_SYNC_JOIN_S it stays
-# inside schedule.end_reserve_min (30), so an upload that never returns cannot keep a paid instance up
+# the end phase's bound on each wait for checkpoint uploads, so an upload that never returns cannot keep the trainer
+# (and the GPU) running. On a hung Hub connection (no HTTP timeout) the waits after the final eval add up to 22 min:
+# this, END_SYNC_JOIN_S and RunLogger's close_join_s (600 s); 32 min when save_full's end rewrite first waits this long
+# for a running upload of its own dir. schedule.end_reserve_min (30) must also hold finish.py's sync and verification
+# and the watchdog's 10 min sync lead (vast/watchdog.sh), so such a run can reach the deadline: the watchdog then stops
+# the box (disk kept) instead of finish.py destroying it
 UPLOAD_WAIT_S = 600
 # the end phase's wait for a running log sync before its own one (the final eval and verdict, ahead of the uploads)
 END_SYNC_JOIN_S = 120
