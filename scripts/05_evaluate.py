@@ -29,15 +29,25 @@ Output (--out; the layout of runs/<run_id>/evals/step_<N>/):
                   from the complete decode), greedy_full, wall_s, headline, headline_scope, probe_greedy, epoch (epoch
                   mode), combined_loss; step / train_s / epoch from the checkpoint's student_meta.json "trained" block,
                   final = the checkpoint is the run's end one. It covers every set in --out
-  verdict.json    when the three gate sets are in --out: gate_verdict of kitsune.evaluate.verdict, the trends read from
-                  the run's history before this step (--history: default the summary.json of the run the checkpoint
-                  sits in) and this eval
+  verdict.json    when the three gate sets are in --out and so is the train probe, if the config has one (eval.probe:
+                  pass --probe): gate_verdict of kitsune.evaluate.verdict, the trends read from the run's history
+                  before this step (--history: default the summary.json of the run the checkpoint sits in) and this
+                  eval. The trainer's record of this eval holds the probe's KL, which the probe-KL and gap trends read,
+                  so without the probe the verdict would not be the trainer's: none is written (a verdict_skipped
+                  event says why) and an older one goes
   evaluator.json  every invocation: arguments, checkpoint, config, versions, sets, chunks, thermal pauses, status
   events.jsonl    one JSON line per event (store builds, chunks, thermal pauses, the summary)
-  .parts/, .work/ the resume state (per-set raw teacher-forced rows, chunk results of an unfinished pass)
-Resumable: a set whose outputs exist is skipped (--force evaluates the named sets again). The pass over the other sets
-is cut into chunks of whole batches (--chunk-s seconds of audio), each saved when done, so a crash loses at most the
-chunk under way and the same command continues where it stopped; the pass's per-set outputs are written when it ends.
+  .parts/, .work/ the resume state (per-set raw teacher-forced rows, chunk results of an unfinished pass, the --force
+                  record)
+Resumable: a set whose outputs exist is skipped. The pass over the other sets is cut into chunks of whole batches
+(--chunk-s seconds of audio), each saved when done, so a crash loses at most the chunk under way and the same command
+continues where it stopped. The pass's per-set outputs are written when it ends; a stop while they are written is
+finished from its chunks by the next run, whatever sets it names, so every set keeps the pass's batches. The resume
+state is fsynced before it is renamed into place, and a file of it that cannot be read (a host crash can tear one) is
+evaluated again, never trusted. --force evaluates the named sets (and, with --probe, the probe) again: its first run
+deletes their outputs and the unfinished passes that hold them, and records what it forces (.parts/force.json); the
+same forced command after a stop finds the record and continues where it stopped, like any other. The record goes
+once everything it names is done (delete it to start a stopped forced run over).
 A set evaluated in a later pass than the others was batched with its own pass's sets only (comparable, not bitwise
 the trainer's). --out refuses results of other weights or other eval settings (batch_s, autocast, device, data): use a
 new --out for those.
@@ -50,9 +60,12 @@ takes a trainer config (configs/*.json) or a run's config.json (the resolved con
 GPU safety (the laptop GPU is unstable under long loads): before every batch the GPU temperature is read (nvidia-ml-py
 if importable, else nvidia-smi at most every NVSMI_EVERY_S); at --max-temp or above the eval waits, polling every
 --poll-s, until it is down to --resume-temp (a thermal_pause and a thermal_resume event each; --max-temp 0: no guard).
-No readable temperature on CUDA stops the eval before it starts. --vram-frac caps the CUDA caching allocator
-(04_distill.cap_vram: at most that fraction of the card and the free VRAM less a margin). An out-of-memory error stops
-with a pointer to --batch-s (a smaller one needs a new --out; its batches are no longer the trainer's).
+No readable temperature on CUDA stops the eval before it starts, and BLIND_READS failed reads in a row stop it later,
+paused or not (the finished chunks are kept). The CUDA caching allocator is capped as the trainer caps it
+(04_distill.cap_vram): on Windows at the free VRAM less a margin, since the driver would otherwise serve a batch that
+does not fit from shared system memory, several times slower, instead of failing it; --vram-frac also caps it at that
+fraction of the card, on any OS. An out-of-memory error stops with a pointer to --batch-s (a smaller one needs a new
+--out; its batches are no longer the trainer's).
 
 Usage:
   python scripts/05_evaluate.py --root D:/Shizu-ko-distill --config configs/viability.json \
@@ -81,17 +94,21 @@ sys.path.insert(0, str(ROOT))
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pyarrow as pa  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
 import torch  # noqa: E402
 
 from kitsune import trainset  # noqa: E402
-from kitsune.runlog import _atomic_json, _atomic_parquet, _finite, _replace  # noqa: E402
+from kitsune.runlog import _finite, _replace  # noqa: E402
+from kitsune.store import fsync_path  # noqa: E402
 
 DEFAULT_CONFIG = "configs/viability.json"
 # config keys holding paths, resolved against --root when relative (cache_dir is replaced by --cache-dir)
 PATH_KEYS = ("student", "data_root", "teacher_root", "second_root", "selection", "runs_root")
 NVSMI_EVERY_S = 5.0  # nvidia-smi is a process start per read: at most one read per this many seconds
-BLIND_POLLS = 30  # a pause whose temperature cannot be read for this many polls in a row stops the eval
+BLIND_READS = 30  # this many failed temperature reads in a row stop the eval, paused or not
 PARTS, WORK = ".parts", ".work"
+MANIFEST = "manifest.json"  # in a pass's work dir: its sets and number of chunks
+FORCE = "force.json"  # in .parts: what an unfinished --force run evaluates again
 
 
 def _now() -> str:
@@ -106,20 +123,60 @@ def load_trainer():
     return mod
 
 
+def _durable(tmp: Path, path: Path):
+    """tmp -> path with its data on disk first (fsync, then rename, as the trainer saves its checkpoints): after an
+    unflushed rename a host crash can leave the new name empty or zero-filled on NTFS, and this laptop's GPU faults can
+    take the machine down."""
+    fsync_path(tmp)
+    _replace(tmp, path)
+
+
 def _write_json(path: Path, obj):
-    """Atomic JSON that keeps NaN / Infinity (the resume state: summaries must come back exactly as computed)."""
+    """Durable JSON that keeps NaN / Infinity (the resume state: summaries must come back exactly as computed)."""
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(obj, indent=1, ensure_ascii=False, default=str), encoding="utf-8")
-    _replace(tmp, path)
+    _durable(tmp, path)
+
+
+def _write_output_json(path: Path, obj):
+    """Durable strict JSON (non-finite floats as null), as RunLogger.eval_json writes summary.json and verdict.json."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(json.dumps(_finite(obj), indent=2, ensure_ascii=False, default=str).encode("utf-8"))
+    _durable(tmp, path)
 
 
 def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _load_json(path: Path):
+    """path's JSON, or None when it is missing or cannot be read (torn: evaluated again, never trusted)."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _rows(path: Path) -> int | None:
+    """A parquet file's row count from its footer, or None when it is missing or cannot be read (torn)."""
+    try:
+        return pq.read_metadata(path).num_rows
+    except Exception:  # noqa: BLE001 - OSError, ArrowInvalid (no parquet footer)
+        return None
+
+
 def _table(df: pd.DataFrame, path: Path):
-    """A per-utterance table as RunLogger.table writes it (zstd parquet, no index)."""
-    _atomic_parquet(pa.Table.from_pandas(df, preserve_index=False), path)
+    """A per-utterance table as RunLogger.table writes it (zstd parquet, no index), durable."""
+    tmp = path.with_name(path.name + ".tmp")
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), tmp, compression="zstd")
+    _durable(tmp, path)
+
+
+def _rmdir_if_empty(p: Path):
+    try:
+        p.rmdir()
+    except OSError:  # not empty, or not there
+        pass
 
 
 # ------------------------------------------------------------------------------------------------------ logging
@@ -146,8 +203,9 @@ class EvalLog:
 class ThermalGuard:
     """check() before every batch: read the GPU temperature (at most every min_interval_s) and, at max_temp or above,
     wait (polling every poll_s) until it is down to resume_temp. Each pause is a thermal_pause and a thermal_resume
-    event and a row of `pauses`. A failed read is an event (the first and every 100th) and lets the batch run; a pause
-    that cannot read the temperature for BLIND_POLLS polls in a row raises, since the GPU was last seen hot."""
+    event and a row of `pauses`. A failed read is an event (the first and every 100th) and lets the batch run (or the
+    pause go on), but BLIND_READS failed reads in a row raise, paused or not: an unreadable GPU is an unguarded one
+    (and in a pause it was last seen hot), as at the start, where no reading means no eval."""
 
     def __init__(self, read, max_temp: float, resume_temp: float, poll_s: float, log, *, min_interval_s: float = 0.0,
                  source: str = "?", sleep=time.sleep, clock=time.monotonic):
@@ -158,19 +216,30 @@ class ThermalGuard:
         self.last_read = -math.inf
         self.max_seen = None
         self.checks = self.reads = self.read_errors = 0
+        self.blind = 0  # failed reads in a row
         self.pauses: list[dict] = []
 
     def _read(self) -> float | None:
         self.reads += 1
         try:
             t = float(self.read())
-        except Exception as e:  # noqa: BLE001 - a flaky reader must not end a long eval by itself
+        except Exception as e:  # noqa: BLE001 - one flaky read must not end a long eval by itself
             self.read_errors += 1
+            self.blind += 1
             if self.read_errors == 1 or self.read_errors % 100 == 0:
-                self.log.event("thermal_read_error", error=f"{type(e).__name__}: {e}"[:300], n=self.read_errors)
+                self.log.event("thermal_read_error", error=f"{type(e).__name__}: {e}"[:300], n=self.read_errors,
+                               in_a_row=self.blind)
             return None
+        self.blind = 0
         self.max_seen = t if self.max_seen is None else max(self.max_seen, t)
         return t
+
+    def _stop_if_blind(self, paused_at: float | None):
+        if self.blind < BLIND_READS:
+            return
+        where = f"while paused at {paused_at} C" if paused_at is not None else "between batches"
+        raise RuntimeError(f"thermal guard: no GPU temperature for {self.blind} reads in a row {where}; stopping (the "
+                           "finished chunks are kept: run the same command again)")
 
     def check(self):
         self.checks += 1
@@ -179,21 +248,20 @@ class ThermalGuard:
             return
         self.last_read = now
         t = self._read()
-        if t is None or t < self.max_temp:
+        if t is None:
+            self._stop_if_blind(None)
+            return
+        if t < self.max_temp:
             return
         self.log.event("thermal_pause", temp_c=t, max_temp=self.max_temp, resume_temp=self.resume_temp,
                        poll_s=self.poll_s)
-        blind, cur = 0, None
+        cur = None
         while True:
             self.sleep(self.poll_s)
             cur = self._read()
             if cur is None:
-                blind += 1
-                if blind >= BLIND_POLLS:
-                    raise RuntimeError(f"thermal guard: no GPU temperature for {blind} polls while paused at {t} C; "
-                                       "stopping (the finished chunks are kept: run the same command again)")
+                self._stop_if_blind(t)
                 continue
-            blind = 0
             if cur <= self.resume_temp:
                 break
         waited = round(self.clock() - now, 1)
@@ -349,7 +417,10 @@ def check_identity(out: Path, identity: dict):
     (out / PARTS).mkdir(parents=True, exist_ok=True)
     p = out / PARTS / "identity.json"
     if p.exists():
-        old = _read_json(p)
+        old = _load_json(p)
+        if not isinstance(old, dict):
+            raise SystemExit(f"{p} cannot be read, so whose results {out} holds is unknown: use a new --out (or delete "
+                             "that file if they are this checkpoint's with these settings)")
         diff = sorted(k for k in set(old) | set(identity) if old.get(k) != identity.get(k))
         if diff:
             raise SystemExit(f"{out} holds results of other weights or eval settings ({', '.join(diff)}: "
@@ -397,6 +468,7 @@ class Ctx:
     feat: object = None
     guard: ThermalGuard | None = None
     passes: list = field(default_factory=list)
+    probe_empty: bool = False  # --probe found no probe rows: the trainer has no probe numbers either
 
     @property
     def bs(self) -> float:
@@ -410,7 +482,11 @@ def set_files(out: Path, s: str) -> list[Path]:
 
 
 def set_done(out: Path, s: str) -> bool:
-    return all(p.exists() for p in set_files(out, s))
+    """The set's outputs are there and readable, with the rows its part record counts."""
+    rec = _load_json(out / PARTS / f"{s}.json")
+    return (isinstance(rec, dict) and _rows(out / PARTS / f"{s}.tf_raw.parquet") == rec.get("n_tf")
+            and _rows(out / f"greedy_{s}.parquet") == rec.get("n_greedy")
+            and _rows(out / f"tf_{s}.parquet") is not None)
 
 
 def probe_files(out: Path) -> list[Path]:
@@ -419,7 +495,89 @@ def probe_files(out: Path) -> list[Path]:
 
 
 def probe_done(out: Path) -> bool:
-    return (out / "probe.parquet").exists() and (out / PARTS / "probe.json").exists()
+    rec = _load_json(out / PARTS / "probe.json")
+    return (isinstance(rec, dict) and _rows(out / "probe.parquet") is not None
+            and (rec.get("probe_greedy") is None or _rows(out / "probe_greedy.parquet") is not None))
+
+
+def chunk_meta(work: Path, k: int) -> dict | None:
+    """Chunk k's record when the chunk is done (the record and its tables readable, with the rows it counts), else
+    None: the chunk is evaluated again."""
+    meta = _load_json(work / f"chunk_{k:05d}.json")
+    if not isinstance(meta, dict) or "n_tf" not in meta or "n_greedy" not in meta:
+        return None
+    for kind in ("tf", "greedy"):
+        n = meta[f"n_{kind}"]
+        if n and _rows(work / f"chunk_{k:05d}.{kind}.parquet") != n:
+            return None
+    return meta
+
+
+def _work_dirs(out: Path) -> list[Path]:
+    root = out / WORK
+    return sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+
+
+def start_force(ctx: Ctx, sets: list[str], probe: bool):
+    """--force. Its first run deletes the named sets' outputs (and the probe's), and the unfinished passes that hold
+    any of those sets, and records what it forces (.parts/force.json). The same forced command after a stop finds that
+    record and deletes nothing, so it continues the chunks done since, as any command does (end_force drops it)."""
+    out = ctx.out
+    want = dict(sets=list(sets), probe=bool(probe))
+    old = _load_json(out / PARTS / FORCE)
+    if isinstance(old, dict) and {k: old.get(k) for k in want} == want:
+        ctx.log.event("force_continue", since=old.get("time_utc"), **want)
+        return
+    for s in sets:
+        for p in set_files(out, s):
+            p.unlink(missing_ok=True)
+    if probe:
+        for p in probe_files(out):
+            p.unlink(missing_ok=True)
+    for work in _work_dirs(out):
+        man = _load_json(work / MANIFEST)
+        if not isinstance(man, dict) or set(man.get("sets") or ()) & set(sets):
+            shutil.rmtree(work, ignore_errors=True)
+    _write_json(out / PARTS / FORCE, dict(want, time_utc=_now()))
+    ctx.log.event("force", **want)
+
+
+def end_force(ctx: Ctx):
+    """The --force record goes once everything it names is done, by the forced command or any other."""
+    p = ctx.out / PARTS / FORCE
+    if not p.exists():
+        return
+    rec = _load_json(p)
+    if isinstance(rec, dict):  # an unreadable record is of no use: it goes
+        if not all(set_done(ctx.out, s) or not ctx.store.indices(source=s) for s in rec.get("sets") or ()):
+            return
+        if rec.get("probe") and not (probe_done(ctx.out) or ctx.probe_empty):
+            return
+    p.unlink(missing_ok=True)
+    ctx.log.event("force_done", sets=(rec or {}).get("sets"), probe=(rec or {}).get("probe"))
+
+
+def sweep_work(ctx: Ctx):
+    """The passes earlier runs left in .work. One whose chunks are all done stopped while its per-set outputs were
+    being written: they are written now, from its chunks (whatever sets this run names), so its sets keep the pass's
+    batches. One that holds a set done since can never continue (no later pass batches a done set again) and goes, as
+    does one of other weights or settings. The rest stay for the command that continues them."""
+    for work in _work_dirs(ctx.out):
+        man = _load_json(work / MANIFEST)
+        if not isinstance(man, dict) or "sets" not in man or "chunks" not in man:
+            continue  # the pass of that fingerprint writes it again
+        sets, n = list(man["sets"]), int(man["chunks"])
+        if man.get("identity") != ctx.identity_key:
+            shutil.rmtree(work, ignore_errors=True)
+        elif all(chunk_meta(work, k) is not None for k in range(n)):
+            ctx.log.event("pass_finish", sets=sets, chunks=n, work=str(work),
+                          note="its chunks were all done: the sets' outputs are written from them")
+            finish_pass(ctx, sets, n, work)
+            ctx.passes.append(dict(sets=sets, chunks=n, chunks_resumed=n, finished_from_chunks=True))
+        elif any(set_done(ctx.out, s) for s in sets):
+            ctx.log.event("pass_dropped", sets=sets, work=str(work), note="it holds a set done since")
+            shutil.rmtree(work, ignore_errors=True)
+    _rmdir_if_empty(ctx.out / WORK)
 
 
 def chunk_plan(plan: list[list[int]], dur: np.ndarray, chunk_s: float) -> list[list[list[int]]]:
@@ -456,16 +614,19 @@ def run_pass(ctx: Ctx, sets: list[str]):
     fp = hashlib.sha256(json.dumps(dict(identity=ctx.identity_key, sets=sets, chunks=ids_of)).encode()).hexdigest()
     work = ctx.out / WORK / f"pass-{fp[:16]}"
     work.mkdir(parents=True, exist_ok=True)
+    manifest = dict(sets=sets, chunks=len(chunks), identity=ctx.identity_key)
+    if _load_json(work / MANIFEST) != manifest:
+        _write_json(work / MANIFEST, manifest)
     total_s = float(dur[idx].sum())
-    done = [k for k in range(len(chunks)) if (work / f"chunk_{k:05d}.json").exists()]
+    done = {k for k in range(len(chunks)) if chunk_meta(work, k) is not None}
     ctx.log.event("pass", sets=sets, utts=len(idx), audio_h=round(total_s / 3600, 3), batches=len(plan),
                   chunks=len(chunks), chunks_done=len(done), batch_s=ctx.bs, work=str(work))
     t_start, audio_now = time.time(), 0.0
     left_s = total_s - sum(float(dur[[i for b in chunks[k] for i in b]].sum()) for k in done)
     for k, ch in enumerate(chunks):
-        meta_p = work / f"chunk_{k:05d}.json"
-        if meta_p.exists():
+        if k in done:
             continue
+        meta_p = work / f"chunk_{k:05d}.json"
         ids = ids_of[k]
         members = [i for b in ch for i in b]
         set_audio: dict[str, float] = {}
@@ -488,7 +649,8 @@ def run_pass(ctx: Ctx, sets: list[str]):
         if len(gdf):
             _table(gdf, work / f"chunk_{k:05d}.greedy.parquet")
         audio = float(sum(set_audio.values()))
-        _write_json(meta_p, dict(k=k, n=len(ids), audio_s=audio, set_audio=set_audio, dropped_tf=dropped_tf,
+        _write_json(meta_p, dict(k=k, n=len(ids), n_tf=len(raw), n_greedy=len(gdf), audio_s=audio,
+                                 set_audio=set_audio, dropped_tf=dropped_tf,
                                  dropped_greedy=dropped_g, tf_wall_s=t1 - t0, greedy_wall_s=t2 - t1,
                                  temp_max_c=ctx.guard.max_seen if ctx.guard else None, time_utc=_now()))
         audio_now += audio
@@ -506,11 +668,14 @@ def run_pass(ctx: Ctx, sets: list[str]):
 def finish_pass(ctx: Ctx, sets: list[str], n_chunks: int, work: Path):
     """The pass's per-set outputs from its chunks, in plan order: the raw teacher-forced rows (.parts, for the
     summary), tf_<set> and greedy_<set> tables as the trainer writes them, and the set's record (dropped rows, its
-    share of the wall time) last. Then the chunks go."""
+    share of the wall time) last. Then the pass's chunks go (the work dir is kept until every set is written, so a stop
+    in here is finished by the next run: sweep_work)."""
     ev, out = ctx.ev, ctx.out
-    metas = [_read_json(work / f"chunk_{k:05d}.json") for k in range(n_chunks)]
-    raws = [pd.read_parquet(p) for k in range(n_chunks) if (p := work / f"chunk_{k:05d}.tf.parquet").exists()]
-    gdfs = [pd.read_parquet(p) for k in range(n_chunks) if (p := work / f"chunk_{k:05d}.greedy.parquet").exists()]
+    metas = [chunk_meta(work, k) for k in range(n_chunks)]
+    if any(m is None for m in metas):
+        raise RuntimeError(f"{work}: chunks {[k for k, m in enumerate(metas) if m is None]} are not done")
+    raws = [pd.read_parquet(work / f"chunk_{k:05d}.tf.parquet") for k, m in enumerate(metas) if m["n_tf"]]
+    gdfs = [pd.read_parquet(work / f"chunk_{k:05d}.greedy.parquet") for k, m in enumerate(metas) if m["n_greedy"]]
     raw = pd.concat(raws, ignore_index=True) if raws else pd.DataFrame(columns=["id", "source"])
     gdf = pd.concat(gdfs, ignore_index=True) if gdfs else pd.DataFrame(columns=["id", "source"])
     src = {u.id: u.source for u in ctx.store.utts}
@@ -534,7 +699,8 @@ def finish_pass(ctx: Ctx, sets: list[str], n_chunks: int, work: Path):
             tf_wall_s=share("tf_wall_s"), greedy_wall_s=share("greedy_wall_s"), pass_sets=sets,
             batch_s=ctx.bs, chunks=n_chunks, time_utc=_now()))
         ctx.log.event("set_done", set=s, utts=len(g_s), undecodable=len(d_gr))
-    shutil.rmtree(out / WORK, ignore_errors=True)
+    shutil.rmtree(work, ignore_errors=True)
+    _rmdir_if_empty(out / WORK)
 
 
 def probe_store(ctx: Ctx):
@@ -569,6 +735,7 @@ def run_probe(ctx: Ctx):
     t0 = time.time()
     st, probe_ids = probe_store(ctx)
     if not probe_ids:
+        ctx.probe_empty = True
         ctx.log.event("probe_empty", note="the selection has no probe rows for these sources")
         return
     pg_ids = ctx.D.probe_greedy_subset(ctx.cfg, probe_ids, {u.id: u.duration for u in st.utts}, ctx.log)
@@ -599,8 +766,9 @@ def run_probe(ctx: Ctx):
 
 def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None:
     """summary.json over every set in --out (and the probe, if it was evaluated), as run_eval writes it, and
-    verdict.json when the three gate sets are among them. The rows are put in the order of the trainer's batches over
-    those sets, so a set of sets evaluated in one pass gives the trainer's numbers to the bit."""
+    verdict.json when the three gate sets are among them and so is the probe, if the config has one. The rows are put
+    in the order of the trainer's batches over those sets, so a set of sets evaluated in one pass gives the trainer's
+    numbers to the bit."""
     D, ev, cfg, out, store = ctx.D, ctx.ev, ctx.cfg, ctx.out, ctx.store
     present = [s for s in cfg["eval_sets"] if set_done(out, s)]
     if not present:
@@ -646,20 +814,26 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
     summary = D.eval_summary(step, train_s, trained.get("reason") == "end", True, tf_sum, probe_sum, gr_sum, full_sum,
                              pg_sum, round(tf_wall + gr_wall + probe_wall, 1), n_probe_greedy=n_pg, n_probe=n_probe,
                              epoch=epoch, combined=combined)
-    _atomic_json(out / "summary.json", summary)
+    _write_output_json(out / "summary.json", summary)
     print(D.headline_line("full", step, epoch or 0.0, summary["headline"], summary["headline_scope"]), flush=True)
     ctx.log.event("summary", sets=present, probe=probe_sum is not None, headline=summary["headline"],
                   combined_loss={k: v["value"] for k, v in combined.items()})
 
     missing = [s for s in ev.GATE_SETS if s not in present]
-    if missing:
-        ctx.log.event("verdict_skipped", missing_gate_sets=missing)
+    # the trainer's record of this eval holds the probe's KL (unless the probe has no rows), which the verdict's
+    # probe-KL and gap trends read: a verdict without it would not be the trainer's
+    no_probe = bool(cfg["eval"]["probe"]) and probe_sum is None and not ctx.probe_empty
+    if missing or no_probe:
+        (out / "verdict.json").unlink(missing_ok=True)  # an earlier verdict does not go with this summary
+        ctx.log.event("verdict_skipped", **({"missing_gate_sets": missing} if missing else {}),
+                      **({"probe_missing": True, "note": "the config has the train probe (eval.probe): pass --probe"}
+                         if no_probe else {}))
         return summary
     hist, src = load_history(ctx.args.history, ckpt, trained)
     rec = D.eval_history_record(step, train_s, tf_sum, gr_sum, probe_sum, pg_sum, summary["headline"], epoch=epoch)
     history = sorted((r for r in hist if int(r["step"]) < step), key=lambda r: int(r["step"])) + [rec]
     verdict = D.gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=history)))
-    _atomic_json(out / "verdict.json", verdict)
+    _write_output_json(out / "verdict.json", verdict)
     ctx.log.event("verdict", verdict=verdict.get("verdict"), reasons=verdict.get("reasons"), history=src,
                   history_steps=[int(r["step"]) for r in history])
     return summary
@@ -692,7 +866,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="the eval history for the verdict's trends: auto (the checkpoint's run), none, or a run dir / "
                          "summary.json")
     ap.add_argument("--step", type=int, default=None, help="the step to report (default: the checkpoint's)")
-    ap.add_argument("--force", action="store_true", help="evaluate the named sets (and --probe) again")
+    ap.add_argument("--force", action="store_true",
+                    help="evaluate the named sets (and --probe) again; after a stop, the same command continues")
     ap.add_argument("--max-temp", type=float, default=80.0,
                     help="pause before a batch at this GPU temperature (C) or above; 0: no thermal guard "
                          "(default %(default)s)")
@@ -701,7 +876,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--poll-s", type=float, default=10.0,
                     help="seconds between temperature reads while paused (default %(default)s)")
     ap.add_argument("--vram-frac", type=float, default=None,
-                    help="cap the CUDA allocator at this fraction of the card (and the free VRAM less a margin)")
+                    help="also cap the CUDA allocator at this fraction of the card (on Windows it is capped at the "
+                         "free VRAM less a margin in any case, as the trainer's)")
     args = ap.parse_args(argv)
     if args.max_temp and not args.resume_temp < args.max_temp:
         ap.error("--resume-temp must be below --max-temp")
@@ -786,23 +962,18 @@ def main(argv=None) -> int:
         check_identity(out, identity)
         ctx = Ctx(D=D, ev=ev, cfg=cfg, args=args, out=out, log=log, store=store, greedy_ids=set(greedy_ids),
                   identity_key=hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest())
+        want_probe = args.probe and bool(cfg["eval"]["probe"])
+        if args.probe and not cfg["eval"]["probe"]:
+            log.event("probe_off", note="the config has eval.probe false: no probe to evaluate")
+        sweep_work(ctx)  # a pass stopped while its outputs were written: finished from its chunks
         if args.force:
-            for s in sets:
-                for p in set_files(out, s):
-                    p.unlink(missing_ok=True)
-            if args.probe:
-                for p in probe_files(out):
-                    p.unlink(missing_ok=True)
-            shutil.rmtree(out / WORK, ignore_errors=True)
+            start_force(ctx, sets, want_probe)
         todo = [s for s in sets if not set_done(out, s)]
         empty = [s for s in todo if not store.indices(source=s)]
         if empty:
             log.event("sets_empty", sets=empty, note="no kept rows with audio in the eval store")
             todo = [s for s in todo if s not in empty]
         skipped = [s for s in sets if s not in todo and s not in empty]
-        want_probe = args.probe and bool(cfg["eval"]["probe"])
-        if args.probe and not cfg["eval"]["probe"]:
-            log.event("probe_off", note="the config has eval.probe false: no probe to evaluate")
         do_probe = want_probe and not probe_done(out)
         log.event("todo", sets=todo, skipped_done=skipped, probe=do_probe)
         inv.update(evaluated=todo, skipped=skipped)
@@ -810,8 +981,9 @@ def main(argv=None) -> int:
             R = D.Run(cfg=cfg, run_dir=out, device=device, amp=cfg["autocast"] == "bfloat16")
             R.log = log
             ctx.guard = make_guard(device, args, log)
-            if args.vram_frac is not None:
-                D.cap_vram(R, max_frac=args.vram_frac)
+            # as the trainer: on Windows CUDA always (the driver's sysmem fallback would serve an oversized batch from
+            # shared memory instead of raising OOM), --vram-frac on any OS; a no-op otherwise
+            D.cap_vram(R, max_frac=args.vram_frac)
             D.setup_model(R, grad_ckpt=False)
             D.setup_processing(R)
             ctx.R = R
@@ -820,6 +992,8 @@ def main(argv=None) -> int:
                 run_pass(ctx, todo)
             if do_probe:
                 run_probe(ctx)
+        end_force(ctx)
+        sweep_work(ctx)  # passes that hold a set done now can never continue
         summary = write_summary(ctx, step, trained, ckpt)
         inv.update(status="complete", headline=(summary or {}).get("headline"))
         return 0
@@ -836,9 +1010,13 @@ def main(argv=None) -> int:
                 inv["vram_cap_gb"] = ctx.R.vram_cap_gb
         try:
             p = out / "evaluator.json"
-            rec = _read_json(p) if p.exists() else dict(invocations=[])
+            rec = _load_json(p)
+            if not (isinstance(rec, dict) and isinstance(rec.get("invocations"), list)):
+                if p.exists():  # unreadable (torn): kept aside, a new record starts
+                    _replace(p, p.with_name(f"evaluator.unreadable-{int(time.time())}.json"))
+                rec = dict(invocations=[])
             rec["invocations"].append(inv)
-            _atomic_json(p, rec)
+            _write_output_json(p, rec)
         except Exception as e2:  # noqa: BLE001 - never masks the eval's own outcome
             print(f"could not update evaluator.json: {e2!r}", file=sys.stderr)
         log.event("evaluate_end", status=inv["status"], wall_s=inv["wall_s"])

@@ -3,9 +3,11 @@
 A tiny trainer run on CPU with lr 0 ends with the trainer's own complete eval (evals/step_1/) of weights that are
 exactly the bf16 values its checkpoint step_1/ holds (the student init is saved in bf16 and no update moves them).
 05_evaluate on that checkpoint must give the same per-utterance tables, summary.json (timings aside) and verdict.json,
-to the bit: evaluated in chunks, from a config with relative paths under --root or from the run's config.json, and
-after a crash in the middle of its pass. Also: sets already done are skipped, --force evaluates them again, an --out
-of other eval settings is refused, and the thermal guard runs before every batch and waits for the GPU to cool.
+to the bit: evaluated in chunks, from a config with relative paths under --root or from the run's config.json, after a
+crash in the middle of its pass (forced or not), after a stop while the pass's outputs were being written, and after a
+host crash tore a file of its resume state. Also: sets already done are skipped, --force evaluates them again, an --out
+of other eval settings is refused, no verdict without the probe the config has, the resume state is fsynced, and the
+thermal guard runs before every batch, waits for the GPU to cool and stops when it can no longer read it.
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import json
@@ -154,10 +156,20 @@ def test_the_trainers_complete_eval_to_the_bit(env, tmp_path, monkeypatch):
 
     guard = CountingGuard()
     monkeypatch.setattr(m05, "make_guard", lambda device, args, log: guard)
+    real_load, caps = m05.load_trainer, []
+
+    def load_trainer():  # records the VRAM caps asked for (a no-op on CPU)
+        D = real_load()
+        cap = D.cap_vram
+        D.cap_vram = lambda R, max_frac=None: caps.append(max_frac) or cap(R, max_frac=max_frac)
+        return D
+
+    monkeypatch.setattr(m05, "load_trainer", load_trainer)
     out = tmp_path / "out"
     assert m05.main(["--root", str(env["root"]), "--config", str(env["relative"]), "--ckpt", str(env["ckpt"]),
                      "--out", str(out), "--probe", "--chunk-s", "5"]) == 0
     assert_the_trainers(env, out)
+    assert caps == [None]  # the trainer's cap (Windows CUDA) without --vram-frac too, not only with it
     (pas,) = events(out, "pass")
     assert pas["sets"] == SETS and pas["chunks"] >= 3 and len(events(out, "chunk")) == pas["chunks"]
     assert not (out / ".work").exists()  # the finished pass's chunks are gone
@@ -210,10 +222,135 @@ def test_a_crash_mid_pass_resumes_to_the_same_results(env, tmp_path, monkeypatch
     assert [i["status"] for i in load(out / "evaluator.json")["invocations"]] == ["failed", "complete", "complete"]
 
 
+def fault_at(fn, n: int):
+    """fn, raising a GPU fault on its n-th call."""
+    calls = []
+
+    def faulty(*a, **k):
+        calls.append(1)
+        if len(calls) == n:
+            raise RuntimeError("CUDA error: an illegal instruction was encountered")
+        return fn(*a, **k)
+
+    return faulty
+
+
+def tear(p: Path):
+    """What an unflushed rename can leave after a host crash on NTFS: the file's size, all zeros."""
+    p.write_bytes(b"\x00" * p.stat().st_size)
+
+
+def test_a_forced_run_that_stops_continues_with_the_same_command(env, tmp_path, monkeypatch):
+    """--force deletes the named sets' results once: after a GPU fault in its third chunk the same forced command keeps
+    the two chunks done since and continues, to the trainer's results. The next forced command starts over."""
+    from kitsune import evaluate as ev
+
+    m05 = load_script("05_evaluate")
+    out = tmp_path / "out"
+    argv = ["--config", str(env["run"] / "config.json"), "--ckpt", str(env["ckpt"]), "--out", str(out), "--probe",
+            "--chunk-s", "5"]
+    assert m05.main(argv) == 0
+    forced = argv + ["--force"]
+    with monkeypatch.context() as mp:
+        mp.setattr(ev, "greedy_eval", fault_at(ev.greedy_eval, 3))
+        with pytest.raises(RuntimeError, match="illegal instruction"):
+            m05.main(forced)
+    assert not list(out.glob("*.parquet")) and (out / ".parts" / "force.json").exists()
+    assert len(list((out / ".work").rglob("chunk_*.json"))) == 2
+    assert m05.main(forced) == 0
+    assert events(out, "force_continue") and events(out, "pass")[-1]["chunks_done"] == 2
+    assert events(out, "force_done") and not (out / ".parts" / "force.json").exists()
+    assert_the_trainers(env, out)
+    assert m05.main(forced) == 0  # a new forced command: from scratch
+    assert len(events(out, "force")) == 2 and events(out, "pass")[-1]["chunks_done"] == 0
+    assert_the_trainers(env, out)
+
+
+def test_a_stop_while_the_outputs_are_written_is_finished_from_the_chunks(env, tmp_path, monkeypatch):
+    """A stop while the pass's per-set outputs are written (disk full after the first set and part of the second):
+    the next run writes the rest from the pass's chunks instead of evaluating the other sets in a pass of their own
+    (other batches), so the results are still the trainer's."""
+    m05 = load_script("05_evaluate")
+    out = tmp_path / "out"
+    argv = ["--config", str(env["run"] / "config.json"), "--ckpt", str(env["ckpt"]), "--out", str(out), "--probe",
+            "--chunk-s", "5"]
+    real_table, greedy = m05._table, []
+
+    def table(df, path):
+        real_table(df, path)
+        if path.name.startswith("greedy_"):
+            greedy.append(path.name)
+            if len(greedy) == 2:
+                raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(m05, "_table", table)
+        with pytest.raises(OSError, match="No space"):
+            m05.main(argv)
+    assert [s for s in SETS if m05.set_done(out, s)] == SETS[:1] and (out / f"greedy_{SETS[1]}.parquet").exists()
+    n_pass = len(events(out, "pass"))
+    assert m05.main(argv) == 0
+    (fin,) = events(out, "pass_finish")
+    assert fin["sets"] == SETS and len(events(out, "pass")) == n_pass and not (out / ".work").exists()
+    assert_the_trainers(env, out)
+
+
+def test_a_torn_file_of_the_resume_state_is_evaluated_again(env, tmp_path, monkeypatch):
+    """A host crash can leave a renamed file zero-filled: a chunk, a set or the probe whose record or table cannot be
+    read counts as not done and is evaluated again, instead of failing every later run."""
+    from kitsune import evaluate as ev
+
+    m05 = load_script("05_evaluate")
+    out = tmp_path / "out"
+    argv = ["--config", str(env["run"] / "config.json"), "--ckpt", str(env["ckpt"]), "--out", str(out), "--probe",
+            "--chunk-s", "5"]
+    with monkeypatch.context() as mp:
+        mp.setattr(ev, "greedy_eval", fault_at(ev.greedy_eval, 4))
+        with pytest.raises(RuntimeError, match="illegal instruction"):
+            m05.main(argv)
+    (work,) = (out / ".work").iterdir()
+    tear(work / "chunk_00001.json")
+    tear(work / "chunk_00002.greedy.parquet")
+    assert m05.main(argv) == 0
+    assert events(out, "pass")[-1]["chunks_done"] == 1  # chunk 0 kept, chunks 1 and 2 evaluated again
+    assert_the_trainers(env, out)
+    tear(out / ".parts" / "eval_emilia.json")
+    tear(out / "greedy_eval_cv8.parquet")
+    tear(out / ".parts" / "probe.json")
+    assert m05.main(argv) == 0
+    todo = events(out, "todo")[-1]
+    assert todo["sets"] == ["eval_cv8", "eval_emilia"] and todo["probe"] is True
+    assert sorted(load(out / "summary.json")["greedy_full"]["sets"]) == sorted(SETS)
+    assert (out / "verdict.json").exists()
+
+
+def test_the_resume_state_is_fsynced_before_it_is_renamed(tmp_path, monkeypatch):
+    """Every file 05 writes goes to disk before it takes its name; a torn one reads as missing."""
+    m05 = load_script("05_evaluate")
+    synced = []
+
+    def fsync(p):
+        p = Path(p)
+        assert p.name.endswith(".tmp") and p.stat().st_size and not p.with_name(p.name[:-4]).exists()
+        synced.append(p.name)
+
+    monkeypatch.setattr(m05, "fsync_path", fsync)
+    m05._write_json(tmp_path / "part.json", dict(kl=float("nan")))
+    m05._table(pd.DataFrame(dict(id=["u1", "u2"], kl=[0.5, 0.25])), tmp_path / "t.parquet")
+    m05._write_output_json(tmp_path / "summary.json", dict(kl=float("inf")))
+    assert synced == ["part.json.tmp", "t.parquet.tmp", "summary.json.tmp"]
+    assert np.isnan(m05._load_json(tmp_path / "part.json")["kl"]) and load(tmp_path / "summary.json") == {"kl": None}
+    assert m05._rows(tmp_path / "t.parquet") == 2
+    tear(tmp_path / "part.json")
+    tear(tmp_path / "t.parquet")
+    assert m05._load_json(tmp_path / "part.json") is None and m05._load_json(tmp_path / "none.json") is None
+    assert m05._rows(tmp_path / "t.parquet") is None and m05._rows(tmp_path / "none.parquet") is None
+
+
 def test_sets_done_are_skipped_forced_again_and_an_out_keeps_one_setting(env, tmp_path):
     """--sets evaluates those only (no verdict without the three gate sets); the next run adds the rest in a pass of
-    their own and the summary covers all of them; --force evaluates a set again; another batch size, other weights or
-    a set the config does not have are refused."""
+    their own and the summary covers all of them, but the verdict waits for the probe the config has (--probe);
+    --force evaluates a set again; another batch size, other weights or a set the config does not have are refused."""
     m05 = load_script("05_evaluate")
     out = tmp_path / "out"
     base = ["--root", str(env["root"]), "--config", str(env["relative"]), "--ckpt", str(env["ckpt"]), "--out", str(out)]
@@ -226,7 +363,12 @@ def test_sets_done_are_skipped_forced_again_and_an_out_keeps_one_setting(env, tm
     todo = events(out, "todo")[-1]
     assert todo["sets"] == ["eval_cv8", "eval_reazon"] and todo["skipped_done"] == ["eval_jsut", "eval_emilia"]
     s = load(out / "summary.json")
-    assert sorted(s["greedy_full"]["sets"]) == sorted(SETS) and (out / "verdict.json").exists()
+    assert sorted(s["greedy_full"]["sets"]) == sorted(SETS) and s["probe"] is None
+    # the trainer's record of this eval holds the probe's KL, which the verdict's trends read: no verdict without it
+    assert not (out / "verdict.json").exists() and events(out, "verdict_skipped")[-1]["probe_missing"] is True
+    assert m05.main(base + ["--probe"]) == 0
+    todo = events(out, "todo")[-1]
+    assert todo["sets"] == [] and todo["probe"] is True and (out / "verdict.json").exists()
     # two passes batch their own sets together: the same rows and numbers within float noise of the trainer's pass
     ref = env["run"] / "evals" / "step_1"
     for name in [f"tf_{x}.parquet" for x in SETS]:
@@ -248,8 +390,8 @@ def test_sets_done_are_skipped_forced_again_and_an_out_keeps_one_setting(env, tm
 
 def test_the_thermal_guard_waits_for_the_gpu_to_cool(monkeypatch):
     """At --max-temp or above the eval waits, polling, until the GPU is down to --resume-temp; a failed read neither
-    stops nor unblocks it, and a pause that never reads a temperature again stops the eval. nvidia-smi is read at most
-    every NVSMI_EVERY_S. The guard sits in front of the featuriser, which the eval calls once per batch."""
+    stops nor unblocks it, but BLIND_READS of them in a row stop the eval, in a pause or between batches. nvidia-smi is
+    read at most every NVSMI_EVERY_S. The guard sits in front of the featuriser, which the eval calls once per batch."""
     m05 = load_script("05_evaluate")
     temps = iter([70.0, 81.0, 79.0, None, 72.0, 70.0, 75.0])
     now, slept, evs = [0.0], [], []
@@ -296,6 +438,23 @@ def test_the_thermal_guard_waits_for_the_gpu_to_cool(monkeypatch):
 
     with pytest.raises(RuntimeError, match="no GPU temperature"):
         m05.ThermalGuard(lost, 80, 70, 1, log, sleep=sleep, clock=lambda: now[0]).check()
+
+    # a reader lost between batches: BLIND_READS failed reads in a row stop the eval too (a good read resets the count)
+    n = m05.BLIND_READS
+    flaky_temps = iter([None] * (n - 1) + [60.0] + [None] * n)
+
+    def flaky():
+        t = next(flaky_temps)
+        if t is None:
+            raise RuntimeError("NVML_ERROR_GPU_IS_LOST")
+        return t
+
+    unread = m05.ThermalGuard(flaky, 80, 70, 10, log, sleep=sleep, clock=lambda: now[0])
+    for _ in range(2 * n - 1):
+        unread.check()
+    with pytest.raises(RuntimeError, match=f"no GPU temperature for {n} reads in a row between batches"):
+        unread.check()
+    assert unread.read_errors == 2 * n - 1 and unread.pauses == []
     with pytest.raises(ValueError):
         m05.ThermalGuard(read, 70, 70, 10, log)
 
