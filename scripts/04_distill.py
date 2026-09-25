@@ -87,9 +87,10 @@ Checkpoints under runs/<run_id>/checkpoints/:
   full_step_<N>/   model.pt (fp32 state_dict), optimizer.pt (the host AdamW's under optim.offload "cpu", same
                    format), l2sp.pt (theta_0), trainer.pt (config, progress counters and clocks, eval history,
                    planner position, RNG states, logger state). Every ckpt.full_local_every_min, the newest
-                   ckpt.keep_local are kept; uploaded at ckpt.upload_full_at ("pre_cooldown", "end"; a resume
-                   queues the pre_cooldown one again, as a crash may have cut its upload short; one whose upload
-                   failed is kept past keep_local, UPLOAD_MARK, for vast/finish.py). Written as <name>.tmp/, its
+                   ckpt.keep_local are kept; uploaded at ckpt.upload_full_at ("pre_cooldown", "end"; one meant for
+                   the Hub carries UPLOAD_MARK from its creation until its upload succeeds: a resume queues the
+                   pre_cooldown one again while it is marked, as a crash may have cut its upload short, and one whose
+                   upload failed is kept past keep_local for vast/finish.py). Written as <name>.tmp/, its
                    files fsynced, then renamed, so neither a process crash nor a host crash leaves a torn one.
 `--resume <full_step_N dir | run dir>` restores all of it into the same run dir and continues the same schedule and
 time budget; the config comes from the checkpoint, with this invocation's --set overrides applied on top (--config is
@@ -1932,6 +1933,8 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False) -> Path:
         torch.save(R.l2sp.state_dict(), tmp / "l2sp.pt")
         torch.save(trainer, tmp / "trainer.pt")
         (tmp / "trainer.json").write_text(json.dumps(brief, indent=1, default=str), encoding="utf-8")
+        if upload and R.uploader.repo:  # renamed in with the dir: none meant for the Hub is ever there unmarked, so
+            (tmp / UPLOAD_MARK).touch()  # a crash before the submit below still leaves build() the mark to go by
         _flush_dir(tmp)
         _replace_dir(tmp, d)
         _sync_dir(R.ckpt_dir)
@@ -2429,11 +2432,12 @@ def build(args) -> tuple[Run, dict | None]:
         R.resumed_from = full
         moved = set_aside_newer(R.ckpt_dir, int(state["step"]))  # before anything is saved or rotated
         # the pre_cooldown full state goes up only from the process that saved it (finish.py's syncs take the newest
-        # full state, the post-crash one none): one a crash may have cut short goes again, in the background (about 0
-        # bytes over the wire if it had landed: the hub dedups; busy() keeps it from rotation meanwhile)
+        # full state, the post-crash one none): one whose upload has not succeeded (UPLOAD_MARK: a crash cut it short,
+        # or every retry failed) goes again, in the background (busy() keeps it from rotation meanwhile). One already
+        # on the Hub does not: the hub dedups only the wire, hf_xet still reads and hashes all ~8.6 GB on the box
         pc = state["st"].get("pre_cooldown_full")
         again = pc if (pc and out_repo(cfg) and "pre_cooldown" in cfg["ckpt"]["upload_full_at"]
-                       and (R.ckpt_dir / pc).is_dir()) else None
+                       and (R.ckpt_dir / pc / UPLOAD_MARK).is_file()) else None
         R.log.event("resume", from_state=str(full), at_step=state["step"], overrides=overrides, unchanged=repeated,
                     config_arg_ignored=args.config, set_aside=moved, upload_again=again)
         if again:

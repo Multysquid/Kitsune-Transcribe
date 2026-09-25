@@ -316,11 +316,13 @@ def test_a_failure_with_an_upload_running_skips_finalization_too(tmp_path, monke
     assert not m._HARD_EXIT and exits == [("os._exit", m.EXIT_FAIL)]
 
 
-def test_a_resume_sets_newer_states_aside_and_uploads_the_pre_cooldown_state_again(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cut_short", [True, False])
+def test_a_resume_sets_newer_states_aside_and_uploads_the_pre_cooldown_state_again(tmp_path, monkeypatch, cut_short):
     """--resume from an older full state moves the abandoned attempt's newer ones aside (set_aside_newer). The
     pre_cooldown full state is uploaded only by the process that saved it (finish.py's syncs take the newest full
     state, the post-crash one none), so a crash that cut its upload short lost it: a resume from it, or from a later
-    state, queues it again."""
+    state, queues it again while its UPLOAD_MARK says the upload has not succeeded. One already on the Hub (no mark)
+    is not queued again: hf_xet would read and hash all ~8.6 GB of it on the box for an empty commit."""
     m = load_script("04_distill")
     hub = FakeHub()
     monkeypatch.setattr(m, "hf_api", lambda: hub)
@@ -332,16 +334,56 @@ def test_a_resume_sets_newer_states_aside_and_uploads_the_pre_cooldown_state_aga
         st.update(step=step, pre_cooldown_done=True, pre_cooldown_full="full_step_6")
         (ck / f"full_step_{step}").mkdir(parents=True)
         torch.save(dict(format=1, step=step, cfg=cfg, st=st, logger=None), ck / f"full_step_{step}" / "trainer.pt")
+    if cut_short:
+        (ck / "full_step_6" / m.UPLOAD_MARK).touch()
     R, _ = m.build(m.parse_args(["--resume", str(ck / "full_step_6")]))
     try:
-        assert R.uploader.wait(10) == {"full_step_6": True}
-        assert [f[0] for f in hub.folders] == ["runs/run/checkpoints/full_step_6"]
         res = next(e for e in events(ck.parent) if e["kind"] == "resume")
-        assert res["set_aside"] == ["full_step_8"] and res["upload_again"] == "full_step_6"
+        assert res["set_aside"] == ["full_step_8"]
+        if cut_short:
+            assert R.uploader.wait(10) == {"full_step_6": True}
+            assert [f[0] for f in hub.folders] == ["runs/run/checkpoints/full_step_6"]
+            assert res["upload_again"] == "full_step_6"
+            assert not (ck / "full_step_6" / m.UPLOAD_MARK).exists()  # on the Hub now
+        else:
+            assert R.uploader.wait(10) == {} and hub.folders == [] and res["upload_again"] is None
         assert m.find_full_state(ck.parent) == ck / "full_step_6"
     finally:
         R.uploader.shutdown(5)
         R.log.close()
+
+
+def test_a_full_state_meant_for_the_hub_is_marked_from_the_moment_it_exists(tmp_path):
+    """save_full touched UPLOAD_MARK only after the rename and the checkpoint event: a process that died in between
+    (ENOSPC or a kill while the event is written) left a complete pre_cooldown dir with no mark, which build() on
+    resume, rotation and finish.py all take for one already on the Hub. The mark is now renamed in with the dir."""
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+
+    class Died(Exception):
+        pass
+
+    def event(kind, **kw):
+        if kind == "checkpoint":
+            raise Died  # right after the rename, before the submit
+
+    run = tmp_path / "runs" / "run"
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 2}}, run_dir=run, ckpt_dir=run / "checkpoints", st=dict(fulls=[]),
+                        clock=lambda: 0.0, planner=SimpleNamespace(state_dict=dict),
+                        log=SimpleNamespace(event=event, state_dict=dict), model=torch.nn.Linear(1, 1),
+                        opt=SimpleNamespace(state_dict=dict), l2sp=SimpleNamespace(state_dict=dict),
+                        uploader=SimpleNamespace(repo="u/r"))
+    R.ckpt_dir.mkdir(parents=True)
+    for step, upload in ((4, True), (6, False)):
+        with pytest.raises(Died):
+            m.save_full(R, step, "pre_cooldown" if upload else "periodic", upload=upload)
+        d = R.ckpt_dir / f"full_step_{step}"
+        assert (d / "trainer.pt").is_file() and (d / m.UPLOAD_MARK).is_file() == upload
+    R.uploader.repo = None  # no output repo: nothing would ever remove a mark, so none is written
+    with pytest.raises(Died):
+        m.save_full(R, 8, "pre_cooldown", upload=True)
+    assert not (R.ckpt_dir / "full_step_8" / m.UPLOAD_MARK).exists()
 
 
 @pytest.mark.parametrize("pre_upload_ok", [False, True])
