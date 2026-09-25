@@ -245,8 +245,8 @@ Shapes:
 - **recipe**
   - **agree_max**: 0.5
   - **agree_max_source**: emilia_yodas=0.2, emilia_nc=0.2
-  - **filter_eval_sets**: 
-  - **partial_second_opinion**: 
+  - **filter_eval_sets**: []
+  - **partial_second_opinion**: []
   - **study**
     - **f1a_max**: 0.5
     - **dedup_min_chars**: 15

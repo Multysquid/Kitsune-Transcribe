@@ -481,7 +481,7 @@ def _fmt(v) -> str:
     if isinstance(v, int):
         return f"{v:,}" if abs(v) >= 10000 else str(v)
     if isinstance(v, list) and all(not isinstance(x, (dict, list)) for x in v):
-        return ", ".join(_fmt(x) for x in v)
+        return ", ".join(_fmt(x) for x in v) if v else "[]"
     return str(v)
 
 
