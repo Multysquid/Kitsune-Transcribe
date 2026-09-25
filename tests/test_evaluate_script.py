@@ -222,6 +222,63 @@ def test_a_crash_mid_pass_resumes_to_the_same_results(env, tmp_path, monkeypatch
     assert [i["status"] for i in load(out / "evaluator.json")["invocations"]] == ["failed", "complete", "complete"]
 
 
+def test_verdict_v2_is_the_trainers_too(env, tmp_path):
+    """Under eval.verdict_version 2, with a reference model (eval.reference), the evaluator's verdict.json is still
+    the trainer's: its record of the checkpoint carries the LR phase of the checkpoint's last step (from the
+    checkpoint's trained block) and the complete sets' numbers, as the trainer's final record does, and it reads the
+    same reference file. The same run under v1 (the fixture's) keeps the v1 verdict."""
+    from kitsune import student as S
+
+    m, m05 = load_script("04_distill"), load_script("05_evaluate")
+    cfg = json.loads((env["root"] / "trainer.json").read_text(encoding="utf-8"))
+    ref = tmp_path / "reference.json"
+    ref.write_text(json.dumps(dict(name="ref", cer=dict(eval_jsut=0.3, eval_cv8=0.4))), encoding="utf-8")
+    cfg.update(run_name="tiny-eval-v2", eval=dict(cfg["eval"], verdict_version=2, reference=dict(path=str(ref))))
+    path = tmp_path / "v2.json"
+    path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    assert m.main(["--config", str(path)]) == 0
+    (run,) = list((env["root"] / "runs").glob("tiny-eval-v2-*"))
+    ckpt = run / "checkpoints" / "step_1"
+    assert S.load_meta(ckpt)["trained"]["lr_phase"] == "stable"  # warmup_steps 1: step 1 is at the peak LR
+    got = load(run / "evals" / "step_1" / "verdict.json")
+    assert got["version"] == 2 and "version" not in load(env["run"] / "evals" / "step_1" / "verdict.json")
+    assert summary_history(run)[-1]["lr_phase"] == "stable" and "greedy_full" in summary_history(run)[-1]
+    out = tmp_path / "out"
+    assert m05.main(["--config", str(path), "--ckpt", str(ckpt), "--out", str(out), "--probe"]) == 0
+    assert load(out / "verdict.json") == got and got["reference"]["not_compared"] == ["eval_reazon"]
+    assert events(out, "reference")[-1]["cer"] == dict(eval_jsut=0.3, eval_cv8=0.4)
+
+
+def summary_history(run: Path) -> list[dict]:
+    return load(run / "summary.json")["history"]
+
+
+def test_backfill_history_completes_an_older_runs_records(tmp_path):
+    """A history written before the trainer recorded the LR phase and the complete sets' numbers gets them from the
+    run's own files: the lr_phase events of events.jsonl, and each complete eval's evals/step_<N>/summary.json
+    greedy_full (never a subset eval's). What a record has, it keeps; without the files nothing changes."""
+    m05 = load_script("05_evaluate")
+    run = tmp_path / "run"
+    lines = [dict(kind="lr_phase", at_step=1, phase="warmup"), dict(kind="eval", at_step=4),
+             dict(kind="lr_phase", at_step=3, phase="stable"), dict(kind="lr_phase", at_step=8, phase="cooldown")]
+    (run / "evals").mkdir(parents=True)
+    (run / "events.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+    full = dict(sets={"eval_jsut": dict(cer_ref_corpus=0.1, teacher_cer_ref_corpus=0.08, trunc_rate=0.0, n=9,
+                                        ref_edits=3, ref_chars=30)})
+    for step, gf in ((0, None), (5, full), (6, None), (9, full)):
+        (run / "evals" / f"step_{step}").mkdir()
+        (run / "evals" / f"step_{step}" / "summary.json").write_text(json.dumps(dict(greedy_full=gf)),
+                                                                     encoding="utf-8")
+    hist = [dict(step=0), dict(step=5), dict(step=6), dict(step=9, lr_phase="own", greedy_full={"x": 1})]
+    got = m05.backfill_history(hist, str(run / "summary.json"))
+    assert [r.get("lr_phase") for r in got] == [None, "stable", "stable", "own"]
+    brief = dict(eval_jsut=dict(cer_ref_corpus=0.1, teacher_cer_ref_corpus=0.08, trunc_rate=0.0, n=9))
+    assert [r.get("greedy_full") for r in got] == [None, brief, None, {"x": 1}]
+    assert hist[1] == dict(step=5)  # the input records are not changed
+    assert m05.backfill_history(hist, None) == hist
+    assert m05.backfill_history(hist, str(tmp_path / "elsewhere" / "summary.json")) == hist
+
+
 def fault_at(fn, n: int):
     """fn, raising a GPU fault on its n-th call."""
     calls = []

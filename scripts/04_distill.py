@@ -22,12 +22,16 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                `lr_phase` event), L2-SP after every optimizer step,
                gradients clipped (the pre-clip norm is logged). The first smoke.steps steps are the smoke run: at most
                smoke.max_dropped_frac of their rows undecodable, finite losses, the loss trend, and throughput -
-               below smoke.min_audio_s_per_s audio-s/s the run exits with code 3 (ThroughputTooLow). A full state is
-               written right after them, and before the cooldown starts.
+               below smoke.min_audio_s_per_s audio-s/s the run exits with code 3 (ThroughputTooLow). ~20 of them run
+               under torch.profiler (perf.profile_smoke, on under CUDA: smoke_profiler; runs/<run_id>/smoke/profile/,
+               left out of the throughput check). A full state is written right after them, and before the cooldown
+               starts.
                Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
-               sets, verdict (kitsune.evaluate.verdict; "N/A" with its numbers under eval.gate false: the
-               sanity/overfit runs), summary.json (uploads "pending") and a log sync, uploads awaited (bounded),
+               sets, verdict (kitsune.evaluate.verdict with eval.verdict_version's trend definition, verdict_options,
+               and eval.reference's model next to the teacher gate, reported only; "N/A" with its numbers under
+               eval.gate false: the sanity/overfit runs), summary.json (uploads "pending") and a log sync, uploads
+               awaited (bounded),
                summary.json with their results, final forced sync; exit 0
 
 Evals in the loop (run_eval): every eval.every_min minutes of loop clock (eval.every_steps steps when set), or at the
@@ -246,20 +250,31 @@ DEFAULTS = {
     "batch": {"step_audio_s": 1500, "micro_audio_s": 400, "pool_micro": 50, "max_dec_len": 200},
     "memory": {"grad_ckpt": "auto", "probe_longest_bucket": True, "min_micro_audio_s": 100, "max_oom_skips": 3},
     # loader_timeout_s: seconds the loop waits for a worker micro-batch before it raises (a crash the supervisor can
-    # resume) instead of hanging until the watchdog; 0 = wait forever (trainset.make_loader)
+    # resume) instead of hanging until the watchdog; 0 = wait forever (trainset.make_loader). profile_smoke: a
+    # torch.profiler record of ~20 smoke steps into runs/<run_id>/smoke/profile/ (kitsune.profiling, smoke_profiler);
+    # "auto" = on under CUDA, off on CPU; it does not change what the steps compute, but it costs a few minutes of
+    # host time (kitsune.profiling: cost), which on the wall clock comes out of the loop's training time
     "perf": {"relpos_patch": True, "compile": False, "num_workers": "auto", "prefetch": 4, "tf32": True,
-             "peak_tflops": 312.0, "train_exact_dither": False, "loader_timeout_s": 600},
+             "peak_tflops": 312.0, "train_exact_dither": False, "loader_timeout_s": 600, "profile_smoke": "auto"},
     # every_epochs: eval at the end of every N-th epoch instead of every_min / every_steps. full_every_epochs: the
     # same, but each of those evals decodes the COMPLETE eval sets greedily (as the final eval does) instead of the
     # greedy subset; set one of the two. probe_is_train: the probe is the whole train set (a small subset) rather than
     # its in_probe rows. probe_greedy_audio_s: also greedy-decode a seeded ~N s of the probe (null:
     # subset.eval_audio_s; both null: no probe decode). mini: a small eval of its own every mini.every_steps steps
     # (null: none, and no combined_loss/val curve; run_mini_eval). gate: false = no GO/NO-GO verdict (sanity/overfit
-    # runs: "N/A" + the numbers)
+    # runs: "N/A" + the numbers). verdict_version: which pre-registered trend definition the verdict uses
+    # (kitsune.evaluate.verdict): 1, the one the first A100 run was judged by (kept here and in every config written
+    # before v2, so its INCONCLUSIVE reproduces), or 2 (the CER trend on the pre-cooldown evals, complete-set numbers
+    # when every eval in its window has them, de-duplicated end points, the cooldown gain and the pre-cooldown slope
+    # reported); verdict_min_epoch_gap: v2's de-duplication, in epochs (verdict_options). reference: null, or
+    # {"name": ..., "path": <JSON file, relative to the repo root>} - a reference model's corpus CER on the complete
+    # gate sets (kitsune.evaluate.load_reference has the file format), which the verdict reports next to the teacher
+    # gate, per set and pooled, without any effect on the tier (reference_model)
     "eval": {"every_min": 20, "every_steps": None, "greedy_subset": 500, "probe": True, "final_full_greedy": True,
              "batch_s": 400, "check_baselines": True, "every_epochs": None, "probe_is_train": False,
              "probe_greedy_audio_s": None, "full_every_epochs": None,
-             "mini": {"every_steps": None, "val_per_set": 32, "train_utts": 64, "greedy": True}, "gate": True},
+             "mini": {"every_steps": None, "val_per_set": 32, "train_utts": 64, "greedy": True}, "gate": True,
+             "verdict_version": 1, "verdict_min_epoch_gap": 0.25, "reference": None},
     "ckpt": {"weights_every_min": 30, "full_local_every_min": 30, "weights_every_steps": None,
              "full_every_steps": None, "keep_local": 2, "upload_full_at": ["pre_cooldown", "end"],
              "full_after_smoke": True},
@@ -372,6 +387,8 @@ def validate(cfg: dict):
     if not (_number(cfg["perf"]["loader_timeout_s"]) and cfg["perf"]["loader_timeout_s"] >= 0):
         raise SystemExit(f"perf.loader_timeout_s must be a number of seconds >= 0 (0: no timeout), got "
                          f"{cfg['perf']['loader_timeout_s']}")
+    if not (cfg["perf"]["profile_smoke"] == "auto" or isinstance(cfg["perf"]["profile_smoke"], bool)):
+        raise SystemExit(f"perf.profile_smoke must be 'auto', true or false, got {cfg['perf']['profile_smoke']!r}")
     sm = cfg["smoke"]
     if not (isinstance(sm["decode_per_set"], int) and not isinstance(sm["decode_per_set"], bool)
             and sm["decode_per_set"] >= 0):
@@ -398,6 +415,16 @@ def validate(cfg: dict):
             raise SystemExit(f"eval.mini.{key} must be an int >= 0, got {mini[key]}")
     if ev_cfg["probe_is_train"] and not ev_cfg["probe"]:
         raise SystemExit("eval.probe_is_train needs eval.probe")
+    if not (_pos_int(ev_cfg["verdict_version"]) and ev_cfg["verdict_version"] in (1, 2)):
+        raise SystemExit(f"eval.verdict_version must be 1 or 2, got {ev_cfg['verdict_version']!r}")
+    if not (_number(ev_cfg["verdict_min_epoch_gap"]) and ev_cfg["verdict_min_epoch_gap"] >= 0):
+        raise SystemExit(f"eval.verdict_min_epoch_gap must be a number of epochs >= 0, got "
+                         f"{ev_cfg['verdict_min_epoch_gap']!r}")
+    ref = ev_cfg["reference"]
+    if ref is not None and not (isinstance(ref, dict) and set(ref) <= {"name", "path"}
+                                and isinstance(ref.get("path"), str) and ref["path"]
+                                and (ref.get("name") is None or isinstance(ref["name"], str))):
+        raise SystemExit(f"eval.reference must be null or {{\"name\": <label>, \"path\": <JSON file>}}, got {ref!r}")
     es = cfg["early_stop"]
     if es["metric"] not in EARLY_STOP_METRICS:
         raise SystemExit(f"early_stop.metric must be one of {', '.join(EARLY_STOP_METRICS)}, got {es['metric']}")
@@ -601,6 +628,7 @@ class Run:
     # the final eval when the loop ends at that step. Not in st: a resumed run decodes again
     last_complete: tuple | None = None
     vram_cap_gb: float | None = None  # the caching allocator's cap on Windows (cap_vram); None = no cap
+    reference: dict | None = None  # eval.reference's per-set CER, read at setup (reference_model); None = none
     loop_t0: float | None = None
     t_start: float = field(default_factory=time.time)
     st: dict = field(default_factory=lambda: dict(
@@ -1607,12 +1635,16 @@ def eval_summary(step: int, train_s: float, final: bool, complete: bool, tf_sum:
 
 
 def eval_history_record(step: int, elapsed_s: float, tf_sum: dict, gr_sum: dict, probe_sum: dict | None,
-                        pg_sum: dict | None, head: dict, epoch: float | None = None) -> dict:
-    """A full eval's record in the history the verdict and the early stop read (kitsune.evaluate.eval_record, the
-    probe's greedy CERs, the epoch in epoch mode and the headline)."""
+                        pg_sum: dict | None, head: dict, epoch: float | None = None, full_sum: dict | None = None,
+                        lr_phase: str | None = None) -> dict:
+    """A full eval's record in the history the verdict and the early stop read (kitsune.evaluate.eval_record: the
+    fixed subset's greedy numbers, and next to them the complete sets' at a complete eval (full_sum) and the LR phase
+    of the last step, which verdict v2 reads; the probe's greedy CERs, the epoch in epoch mode (and under verdict v2)
+    and the headline). The early stop reads heldout_kl / probe_kl only, so the added numbers change nothing there."""
     from kitsune import evaluate as ev
 
-    rec = ev.eval_record(step, elapsed_s, tf=tf_sum, greedy=gr_sum, probe=probe_sum)
+    rec = ev.eval_record(step, elapsed_s, tf=tf_sum, greedy=gr_sum, probe=probe_sum, greedy_full=full_sum,
+                         lr_phase=lr_phase)
     if pg_sum and "all" in pg_sum:
         rec["probe_greedy"] = {k: pg_sum["all"][k] for k in ("cer_teacher_corpus", "cer_ref_corpus", "n")}
     if epoch is not None:
@@ -1645,7 +1677,8 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     eval sets (`complete`; default: the final eval under eval.final_full_greedy; the loop passes it for every
     eval.full_every_epochs eval), the subset summary then taken from those rows so the history stays comparable.
     Tables, summary, scalars, the headline numbers (summary/full/..., log_headline) and samples go to the logger; one
-    record goes to the history the verdict and the early stop read (the subset's greedy numbers). The `eval` event's
+    record goes to the history the verdict and the early stop read (the subset's greedy numbers, and at a complete eval
+    the complete sets' next to them as greedy_full: eval_history_record). The `eval` event's
     per-set CERs are those of the headline's scope, named in its greedy_scope (eval_event_sets). Returns the greedy
     summary the verdict should judge: the complete-set one when there is one (the subset one if
     eval.final_full_greedy is off).
@@ -1750,7 +1783,10 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
                                  + (float(pg_sum.get("wall_s", 0.0)) if pg_sum else 0.0),
                                  greedy_s=float(gr_sum.get("wall_s", 0.0)),
                                  greedy_n=len(R.evalstore) if full_sum is not None else len(R.greedy_ids))
-    rec = eval_history_record(step, R.clock(), tf_sum, gr_sum, probe_sum, pg_sum, head, epoch=extra.get("epoch"))
+    # verdict v2 de-duplicates its trend window by epochs: its records carry the epoch outside epoch mode too
+    rec_epoch = extra.get("epoch", R.st["epoch_progress"] if verdict_options(cfg) else None)
+    rec = eval_history_record(step, R.clock(), tf_sum, gr_sum, probe_sum, pg_sum, head, epoch=rec_epoch,
+                              full_sum=full_sum, lr_phase=lr_phase_name(R.st.get("lr_phase")))
     hist = R.st["history"]
     if hist and hist[-1]["step"] == step:
         hist[-1] = rec
@@ -2030,9 +2066,12 @@ def save_weights(R: Run, step: int, reason: str) -> Path:
     if tmp.exists():
         shutil.rmtree(tmp)
     meta = dict(R.student_meta)
+    # lr_phase: the phase of the last step, which scripts/05_evaluate.py puts in its history record of this checkpoint
+    # (verdict v2 reads it)
     meta["trained"] = dict(run_id=R.run_dir.name, step=step, train_s=round(R.clock(), 1), epoch=R.st["epoch_progress"],
                            reason=reason, time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                           init=str(R.cfg["student"]), last_objective=R.st["last_objective"])
+                           init=str(R.cfg["student"]), last_objective=R.st["last_objective"],
+                           lr_phase=lr_phase_name(R.st.get("lr_phase")))
     S.save_student(R.model, tmp, R.processor, meta)
     _flush_dir(tmp)
     _replace_dir(tmp, d)
@@ -2477,6 +2516,28 @@ def memory_probe(R: Run) -> dict:
             raise torch.OutOfMemoryError(f"OOM even at micro_audio_s={micro} with grad_ckpt={ckpt}: {err}")
 
 
+def smoke_profiler(R: Run, smoke_n: int):
+    """perf.profile_smoke ("auto": on under CUDA only): a kitsune.profiling.SmokeProfiler over ~20 real training steps
+    of the smoke phase (profiling.profile_window: after its warm-up steps, inside smoke.steps), writing under
+    runs/<run_id>/smoke/profile/ and logging `smoke_profile` events - the evidence for where the first A100 run's fixed
+    cost per micro-batch goes, before any change for speed. It costs a few minutes of host time on the A100
+    (extrapolated; profiling's docstring, "cost"), paid in the loop: summary.json's wall_s and cycles[].process_s say
+    how many. CPU runs record CPU activities only. None when it is off, the smoke phase is off or too short to record
+    a step (a `smoke_profile` event says so), or this launch starts past the window (a resume)."""
+    ps = R.cfg["perf"]["profile_smoke"]
+    if not (R.device.type == "cuda" if ps == "auto" else ps) or not smoke_n or R.st["smoke_done"]:
+        return None
+    from kitsune import profiling
+
+    win = profiling.profile_window(smoke_n)
+    if win is None:
+        R.log.event("smoke_profile", skipped=f"smoke.steps {smoke_n} is too few to record a step after the warm-up")
+        return None
+    if R.st["step"] >= win[0]:
+        return None
+    return profiling.SmokeProfiler(R.run_dir / "smoke" / "profile", R.device, *win, emit=R.log.event)
+
+
 def smoke_end(R: Run):
     """After the first smoke.steps steps: at most smoke.max_dropped_frac of the rows undecodable (a failure only the
     loader's worker processes hit; decode_preflight covers the main process), finite, falling loss and enough
@@ -2623,6 +2684,9 @@ def train(R: Run, state: dict | None) -> int:
         log.event("teacher_baselines", sets=base)
     except FileNotFoundError as e:
         log.event("teacher_baselines", skipped=str(e))
+    R.reference = reference_model(cfg)  # a missing or malformed file stops the run here, not at its verdict
+    if R.reference:
+        log.event("reference", **R.reference)
     from kitsune import student as S
 
     log.event("model", params=S.param_report(R.model), trainable=sum(p.numel() for p in R.params),
@@ -2687,9 +2751,12 @@ def train(R: Run, state: dict | None) -> int:
         log.event("eval_final_reused", at_step=step)
     else:
         full_sum = run_eval(R, step, final=True)
-    verdict = gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=R.st["history"])))
+    verdict = gate_verdict(cfg, ev.verdict(verdict_results(full_sum, R.st["history"], R.reference),
+                                           **verdict_options(cfg)))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
+    if line := reference_line((verdict.get("numbers") or verdict).get("reference")):
+        print(line, flush=True)
     headline = (R.st["history"][-1] if R.st["history"] else {}).get("headline")
     # the final eval, the verdict, summary.json (uploads "pending" until close() rewrites it) and the end events go up
     # now, while the ~9 GB end state drains (up to UPLOAD_WAIT_S), not only with close()'s sync after it: on a slow Hub
@@ -2703,6 +2770,61 @@ def train(R: Run, state: dict | None) -> int:
     R.uploader.shutdown()
     log.close(summary=summary)
     return EXIT_OK
+
+
+def lr_phase_name(phase: int | None) -> str | None:
+    """st["lr_phase"] (wsd_lr's phase of the last optimizer step: 0, 1, 2; None before the first) as the name the
+    `lr_phase` events and the history records use (kitsune.evaluate.LR_PHASES)."""
+    from kitsune.evaluate import LR_PHASES
+
+    return None if phase is None else LR_PHASES[int(phase)]
+
+
+def verdict_options(cfg: dict) -> dict:
+    """kitsune.evaluate.verdict's keyword options for this config: none under eval.verdict_version 1 - the very call
+    the first A100 run was judged with, so its verdict reproduces - and version / min_epoch_gap under 2 (verdict()'s
+    docstring defines what v2 computes)."""
+    ev_cfg = cfg["eval"]
+    if int(ev_cfg["verdict_version"]) == 1:
+        return {}
+    return dict(version=int(ev_cfg["verdict_version"]), min_epoch_gap=float(ev_cfg["verdict_min_epoch_gap"]))
+
+
+def reference_model(cfg: dict) -> dict | None:
+    """eval.reference's per-set corpus CER (kitsune.evaluate.load_reference; its path relative to the repo root, the
+    code checkout, as the student path is), or None without one. The trainer reads it at setup and
+    scripts/05_evaluate.py before its eval, so a missing or malformed file stops them before any paid work."""
+    ref = cfg["eval"]["reference"]
+    if not ref:
+        return None
+    from kitsune import evaluate as ev
+
+    try:
+        return ev.load_reference(rpath(ref["path"]), ref.get("name"))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"eval.reference: {e}") from e
+
+
+def verdict_results(final: dict, history: list[dict], reference: dict | None = None) -> dict:
+    """kitsune.evaluate.verdict's results: the final eval's greedy summary, the history and, when the config has one,
+    the reference model's CER (the verdict's "reference", reported only)."""
+    return dict(final=final, history=history, **({"reference": reference} if reference else {}))
+
+
+def reference_line(bar: dict | None) -> str | None:
+    """The console line of the verdict's reference bar (kitsune.evaluate.reference_bar): '[reference] <name> |
+    eval_jsut 12.65% vs 7.30% (1.73x) | ... | pooled 12.15% vs 7.44% (1.63x)' - student CER vs the reference's,
+    student / reference; None without a reference."""
+    if not bar:
+        return None
+
+    def cell(label, d):
+        return f"{label} {100 * d['student']:.2f}% vs {100 * d['reference']:.2f}% ({d['ratio']:.2f}x)"
+
+    parts = [cell(s, d) for s, d in bar["sets"].items()]
+    if bar.get("pooled"):
+        parts.append(cell("pooled", bar["pooled"]))
+    return f"[reference] {bar['name']} (not a gate) | " + " | ".join(parts)
 
 
 def gate_verdict(cfg: dict, computed: dict) -> dict:
@@ -2780,6 +2902,7 @@ def loop(R: Run):
                 or (R.run_dir / STOP_FILE).exists())
 
     per_epochs = epoch_cadence(cfg)  # evals at epoch ends (every_epochs / full_every_epochs), else every_min / _steps
+    prof = smoke_profiler(R, smoke_n)  # perf.profile_smoke: ~20 steps of the smoke phase under torch.profiler
 
     fit_budget(R)
     log.event("phase", name="train", at_step=R.st["step"], workers=nw, micro_audio_s=R.planner.micro_audio_s,
@@ -2808,6 +2931,7 @@ def loop(R: Run):
             if phase != R.st.get("lr_phase"):
                 log.event("lr_phase", at_step=step, phase=("warmup", "stable", "cooldown")[phase], lr=lr, t=t, T=T)
                 R.st["lr_phase"] = phase
+            profiled = prof is not None and prof.begin(step)  # this step runs under the smoke profiler
             t0 = time.perf_counter()
             if R.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
@@ -2823,17 +2947,22 @@ def loop(R: Run):
             out = train_step(R, step, lr, mbs, e)
             R.planner.step_done(e, s)
             if out is None:
+                if profiled:  # the profiler saw the skipped step too: it counts as one of its steps
+                    prof.end(step, wait, None, len(mbs))
                 continue
             if R.device.type == "cuda":
                 torch.cuda.synchronize()
             step_s = time.perf_counter() - t0
             R.st["step"] = step
             objective = log_step(R, step, lr, phase, out, wait, step_s, e, s)
+            if profiled:  # after the step's logging, part of its per-step cost; the summary is written at the last
+                prof.end(step, wait, step_s, out["n_micro"])
             es = R.st["early_stop"]
             es["loss_sum"], es["loss_n"] = es["loss_sum"] + float(objective), es["loss_n"] + 1  # metric "train_loss"
             if not R.st["smoke_done"] and smoke_n:
                 R.st["smoke_losses"].append(float(objective))
-                if step > max(1, smoke_n // 10):  # the first steps pay for worker start-up and kernel autotuning
+                # the first steps pay for worker start-up and kernel autotuning, the profiled ones for the profiler
+                if step > max(1, smoke_n // 10) and not profiled:
                     R.st["smoke_audio_s"] += out["audio_real"]
                     R.st["smoke_time_s"] += step_s
                 if step >= smoke_n:
@@ -2874,6 +3003,8 @@ def loop(R: Run):
                 save_full(R, step, "periodic")
             log.sync()
     finally:
+        if prof is not None:  # the loop ended (or failed) inside the profiled window: what it recorded, never raises
+            prof.close()
         R.st["train_s"] = R.clock()
         R.loop_t0 = None
         loader.close()

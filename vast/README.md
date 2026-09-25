@@ -114,6 +114,33 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    Options: `--offer-id N` to pick another row, `--max-dph 1.0` to cap the price, `--image ...@sha256:...` to pin an
    image by hand, `--config configs/<other>.json`, `--no-self-stop` to debug a box (see "How it ends").
 
+## The next runs: `configs/next_run_template.json`
+
+`configs/viability.json` (the default `--config`) is the first A100 run's config and stays as it was run; the rest of
+this README describes it. The scaling study's configs combine two files: the DATA block (`teacher_root`,
+`second_root`, `parakeet_root`, `extent`, `student`, `sources`, `eval_sets`, `selection`, `selection_recipe`) from the
+label box's extent config (`configs/full_sub3k.json` or a subset derived from it, see "The label box" below) and the
+TRAINER settings from `configs/next_run_template.json`; then set `run_name` and `schedule.epochs` and rent with
+`--config configs/<study>.json`. The template is viability.json with the first run's report recommendations (its
+`_comment` has the details and the arithmetic):
+
+| key | viability.json (first run) | template | why |
+|---|---|---|---|
+| `batch.micro_audio_s` | 400 | 600, the memory probe's first choice (it halves on OOM) | ~0.14 s fixed cost per micro-batch: ~+18 % audio-s/s at ~29-30 GiB (estimated) |
+| `schedule.clock` / `epochs` | wall, 4 h | epochs, 8 | the cooldown counts steps, so evals cost it no LR; the last epoch's eval is the final eval |
+| `eval.full_every_epochs` | 1 | 2 (mini evals every 500 steps in between) | complete evals took 13 % of the loop |
+| `eval.verdict_version` | 1 | 2 | the CER trend on the pre-cooldown evals, complete sets, de-duplicated end points; cooldown gain and pre-cooldown slope reported |
+| `perf.profile_smoke` | "auto" (the default: on under CUDA; the first run had no profiler) | true | the profiler record of the smoke steps (below) |
+| `eval.reference` | none | null until Parakeet 0.6B ja's complete-set CER is in a file | the reference model next to the gate (below) |
+
+On the epochs clock the trainer does not shorten the run to the watchdog's deadline (it does so on the wall clock
+only), so size `schedule.epochs` to fit well inside `--max-hours`: steps per epoch (the `plan` event; 1,216 for the
+viability data) x ~1.05-1.25 s, plus ~4 min per complete eval, ~5 min for the smoke profile (estimated) and ~15 min
+of box overhead. Verdict v2 needs at least 3 complete evals before the cooldown: with a complete eval every 2 epochs
+and a 20 % cooldown that means 8 epochs or more (epochs 2, 4 and 6 before the cooldown at 6.4); with fewer it reports
+"trend: insufficient pre-cooldown evals". So runs under 8 epochs set `eval.full_every_epochs` 1 (the owner's decision
+for the scaling study: 4 epochs then give epochs 1-3 before the cooldown, for ~6 % more loop time).
+
 ## Watching it
 
 ```bash
@@ -157,6 +184,18 @@ The cost of a full eval on the A100 is an estimate until the first run measures 
 `eval/greedy_full/rtf`): ~5-10 min (the laptop measured ~10 min for this student in batched decoding; the `_comment`
 in `configs/viability.json` has the arithmetic), against ~12-47 min of training per epoch.
 
+A reference model next to the gate (optional, off by default): `"reference": {"name": "<label>", "path":
+"configs/reference/<model>.json"}` under `eval` in the run config makes the verdict report, per gate set and pooled,
+the student's final CER next to that model's and the ratio student / reference (`verdict.reference` in `summary.json`
+and `verdict.json`, and one `[reference] ...` line in `kitsune.log`). It never changes the tier. The file is read
+from the repo clone at setup, so commit it with the code; a missing or malformed one stops the run before it trains.
+Its format (the numbers only show the format; each model's come from scoring its transcripts of the complete gate
+sets with the gate's own corpus CER, `kitsune.evaluate.corpus_cer`):
+```json
+{"name": "parakeet-tdt-0.6b-ja", "scope": "complete gate sets, corpus CER under kitsune.text.normalize_ja",
+ "cer": {"eval_jsut": 0.0731, "eval_cv8": 0.0795, "eval_reazon": 0.0718}}
+```
+
 To stop the training by hand (it looks flat on TensorBoard, or the results are already what you need):
 ```bash
 ls /workspace/Kitsune-Transcribe/runs/                       # the run id: <run_name>-<UTC stamp>
@@ -174,7 +213,14 @@ gives up after `perf.loader_timeout_s` (10 min) and exits as a crash.
 
 In the output repo under `runs/<run_id>/`: `summary.json` (verdict and final metrics), `metrics/`, `evals/`, `tb/`
 (TensorBoard events), `events.jsonl`, `checkpoints/step_<N>/` (bf16 weights every 30 min), the full resume state from
-before the cooldown and at the end, and `infra/` (box logs; exported too). Convert to flat files with
+before the cooldown and at the end, and `infra/` (box logs; exported too). `smoke/profile/` holds a torch.profiler
+record of ~20 of the smoke steps (steps 22-41 of the 100; `perf.profile_smoke`, on under CUDA; it does not change what
+the steps compute, but it costs a few minutes - ~4-5 min extrapolated from the laptop CPU, not measured on a GPU -
+which on the wall clock come out of the training time; `summary.json`'s `wall_s` and `cycles[].process_s` have the
+measured cost): `summary.json` - per step the data-wait and GPU-kernel-time shares, kernel launches and aten ops per
+micro-batch, device syncs and the host scalar reads behind them, the top ops by self CUDA and self CPU time - and the
+first two recorded steps' raw trace, `trace_steps_<a>-<b>.json.gz` (gzip, dropped
+above 32 MB; open it in https://ui.perfetto.dev or chrome://tracing). The `smoke_profile` event has the headline. Convert to flat files with
 `python tools/export_run.py hf://Multy123/kitsune-runs/runs/<run_id> --out <dir>`, or run TensorBoard locally on
 a downloaded `tb/` (`python -m tensorboard.main --logdir <dir> --samples_per_plugin scalars=30000`, to see every step
 as on the box; the export's `combined_loss` table and `metrics/steps.parquet` hold every step too).
