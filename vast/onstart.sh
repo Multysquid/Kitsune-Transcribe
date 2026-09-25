@@ -52,11 +52,14 @@ stop_instance() {  # $1 = reason
         return 0
     fi
     if [ -n "${CONTAINER_API_KEY:-}" ] && [ -n "${CONTAINER_ID:-}" ]; then
-        # the key goes through curl's stdin config, never argv
-        printf 'header = "Authorization: Bearer %s"\n' "$CONTAINER_API_KEY" \
+        # the key goes through curl's stdin config, never argv; a 2xx reply can still refuse ({"success": false}, as
+        # finish.py vast_rest reads it)
+        local r=""
+        r=$(printf 'header = "Authorization: Bearer %s"\n' "$CONTAINER_API_KEY" \
             | curl -fsS --retry 3 --max-time 30 --config - -X PUT -H 'Content-Type: application/json' \
-                -d '{"state": "stopped"}' "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/" >/dev/null \
-            && { log "stop requested via REST"; return 0; }
+                -d '{"state": "stopped"}' "https://console.vast.ai/api/v0/instances/${CONTAINER_ID}/") \
+            && ! [[ $r =~ \"success\"[[:space:]]*:[[:space:]]*false ]] && { log "stop requested via REST"; return 0; }
+        log "vast REST stop failed: ${r:-no reply}"
     fi
     log "could not stop the instance; the watchdog (if running) will stop it at the deadline"
     return 1

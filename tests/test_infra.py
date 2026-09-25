@@ -183,6 +183,66 @@ def test_onstart_stub_stops_the_box_when_the_clone_fails(tmp_path):
     assert "full 40-hex" in text and "KITSUNE_NO_SELF_STOP=1" in text
 
 
+# vast's stop reply as curl -f leaves it: the body of a 2xx on stdout, nothing and exit 22 on an HTTP error. An exported
+# bash function stands in for curl (no PATH games on Windows); it swallows the key config curl reads from stdin.
+FAKE_CURL = '() { cat >/dev/null; [ "${FAKE_CURL_RC:-0}" = 0 ] || return "$FAKE_CURL_RC"; printf %s "$FAKE_CURL_REPLY"; }'
+STOP_REPLIES = [('{"success": false, "msg": "nope"}', "0", False), ('{"success":false,"msg":"nope"}', "0", False),
+                ('{"success": true}', "0", True), ("", "22", False)]
+
+
+def curl_env(reply: str, rc: str, **kw) -> dict:
+    env = dict(os.environ, CONTAINER_API_KEY="secret-key-123", CONTAINER_ID="7", FAKE_CURL_REPLY=reply,
+               FAKE_CURL_RC=rc, **kw)
+    env["BASH_FUNC_curl%%"] = FAKE_CURL
+    env.pop("KITSUNE_NO_SELF_STOP", None)
+    return env
+
+
+@pytest.mark.parametrize("reply,rc,ok", STOP_REPLIES, ids=["refused", "refused-compact", "ok", "http-error"])
+def test_onstart_stub_counts_a_refused_stop_as_failed(tmp_path, reply, rc, ok):
+    """vast can answer the stop with a 2xx whose body says {"success": false} (finish.py vast_rest reads it so); the
+    stub, with no watchdog yet, must not log that the box was stopped then."""
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    log = tmp_path / "kitsune.log"
+    env = curl_env(reply, rc, KITSUNE_DIR=(tmp_path / "repo").as_posix(), KITSUNE_LOG=log.as_posix(),
+                   KITSUNE_SHA="not-a-sha")
+    r = subprocess.run([bash, str(VAST / "onstart_stub.sh")], capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 1
+    text = log.read_text(encoding="utf-8")
+    assert "full 40-hex" in text and "secret-key-123" not in text
+    if ok:
+        assert "stop requested via REST" in text and "FAILED" not in text, text
+    else:
+        assert "stop requested via REST" not in text and "stop request FAILED" in text, text
+        assert ("nope" if reply else "(no reply)") in text, text
+
+
+@pytest.mark.parametrize("reply,rc,ok", STOP_REPLIES, ids=["refused", "refused-compact", "ok", "http-error"])
+def test_onstart_and_watchdog_curl_stops_read_the_reply(tmp_path, reply, rc, ok):
+    """The same for the curl fallbacks behind finish.py --stop: onstart.sh stop_instance and watchdog.sh stop_now return
+    0 only for a stop vast accepted, and log vast's reply otherwise."""
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    for script, func, call in (("onstart.sh", "stop_instance", 'stop_instance "why"'), ("watchdog.sh", "stop_now",
+                                                                                          "stop_now")):
+        text = (VAST / script).read_text(encoding="utf-8")
+        body = re.search(rf"^{func}\(\) \{{[^\n]*\n.*?^\}}\n", text, re.M | re.S).group(0)
+        test = tmp_path / f"{func}.sh"
+        test.write_text("\n".join([
+            "set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }",
+            f'KITSUNE_DIR="{tmp_path.as_posix()}"', "PY=false", "MAX_HOURS=5.5",  # finish.py is missing or fails
+            body, f'{call} && echo "rc=0" || echo "rc=$?"', ""]), encoding="utf-8", newline="\n")
+        r = subprocess.run([bash, str(test)], capture_output=True, text=True, env=curl_env(reply, rc), timeout=60)
+        out = r.stdout
+        assert r.returncode == 0 and ("rc=0" in out) == ok and "secret-key-123" not in out, (script, out, r.stderr)
+        if not ok:
+            assert "rc=1" in out and "vast REST stop failed: " + (reply or "no reply") in out, (script, out)
+            assert "stop requested via REST" not in out, (script, out)
+
+
 def test_bootstrap_retries_the_audio_rebuild(tmp_path):
     """One transient Hub error in 01's listing calls (sent once, with no HTTP timeout) must not stop the box after the
     paid boot: the rebuild runs through retry() with a timeout. retry() returns 0 once an attempt passes, and after
