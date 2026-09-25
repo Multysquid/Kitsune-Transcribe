@@ -10,8 +10,8 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                micro-batches with the optimizer state's bytes reserved and, when steps accumulate several
                micro-batches, the gradients held; on OOM halve micro_audio_s down to memory.min_micro_audio_s, then
                per-layer gradient checkpointing; on Windows under a cap at the free VRAM, see cap_vram), then LogMel
-               vs the HF extractor (a mean |diff| above LOGMEL_MEAN_DIFF_MAX or other masks stop the run), the
-               training featuriser's dither on the device (train_dither_check),
+               vs the HF extractor (a mean |diff| above LOGMEL_MEAN_DIFF_MAX, other masks or an error in the check
+               stop the run), the training featuriser's dither on the device (train_dither_check),
                forward+backward on the longest padded micro-batch with finite gradients, padded rows == the same
                utterances run alone (mean KL over the shortest smoke.pad_utts; see padded_row_check), SDPA backends, a
                FLOP count for the MFU estimate and an HF upload round trip
@@ -2186,7 +2186,8 @@ def smoke_checks(R: Run):
     log = R.log
     t0 = time.time()
     # LogMel vs the HF extractor on a few real utterances (bitwise on CPU; FFT/matmul rounding on CUDA). The max
-    # |diff| is informational (TF32 takes it to ~0.1 on an all-silence clip); the mean and the masks fail the smoke
+    # |diff| is informational (TF32 takes it to ~0.1 on an all-silence clip); the mean and the masks fail the smoke,
+    # and so does an error that keeps the check from running
     idx = list(range(min(4, len(R.train))))
     waves = [R.train.wave(i) for i in idx]
     bad = None
@@ -2204,8 +2205,10 @@ def smoke_checks(R: Run):
         if not (masks_equal and math.isfinite(mean) and mean <= LOGMEL_MEAN_DIFF_MAX):
             bad = (f"LogMel differs from the HF extractor the teacher saw: mean |diff| {mean:.3g} (bound "
                    f"{LOGMEL_MEAN_DIFF_MAX}), max {diff:.3g}, masks equal {masks_equal}")
-    except Exception as e:  # no processor files in the student dir: informational only
-        log.event("smoke_logmel_vs_hf", skipped=f"{type(e).__name__}: {e}"[:300])
+    except Exception as e:  # setup_processing already loaded this processor: the check could not run, not a skip
+        err = f"{type(e).__name__}: {e}"[:300]
+        log.event("smoke_logmel_vs_hf", error=err)
+        bad = f"LogMel vs the HF extractor the teacher saw could not run: {err}"
     if bad:
         raise SmokeFailed(bad)
     if waves and R.feat_train.dither > 0:

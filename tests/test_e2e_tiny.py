@@ -436,12 +436,13 @@ def test_a_failed_pre_cooldown_upload_is_kept_for_finish(tmp_path, pre_upload_ok
         assert not any(p.endswith(m.UPLOAD_MARK) for p in finish.expected_files(run))
 
 
-@pytest.mark.parametrize("fault", [None, "no_processor", "frames_shifted", "mask", "dither_scale",
+@pytest.mark.parametrize("fault", [None, "hf_error", "frames_shifted", "mask", "dither_scale",
                                    "dither_in_padding", "dither_per_batch"])
 def test_smoke_stops_on_a_featuriser_that_is_off(fault, monkeypatch):
     """The smoke's LogMel vs HF check only logged its numbers: features other than the teacher's ran the paid hours
-    anyway. A mean |diff| above LOGMEL_MEAN_DIFF_MAX or other masks now fail the smoke (a missing processor stays a
-    logged skip), and so does a training dither of the wrong scale, in the padding, or not batch-invariant: it is
+    anyway. A mean |diff| above LOGMEL_MEAN_DIFF_MAX or other masks now fail the smoke, and so does an error that keeps
+    the check from running (setup_processing already refuses a student dir without a processor, so no error here is
+    an expected skip), and a training dither of the wrong scale, in the padding, or not batch-invariant: it is
     checked on the training device, whose dither branch no comparison with HF can judge."""
     from types import SimpleNamespace
 
@@ -460,8 +461,8 @@ def test_smoke_stops_on_a_featuriser_that_is_off(fault, monkeypatch):
             return self[i]
 
     def reference(ws, path_or_repo=None):
-        if fault == "no_processor":
-            raise OSError("no preprocessor_config.json in the student dir")
+        if fault == "hf_error":
+            raise TypeError("__call__() got an unexpected keyword argument 'punctuation'")
         return exact(*Fm.pad_waves(ws))  # bitwise the HF extractor on CPU (tests/test_features.py)
 
     def feat_eval(wave, lengths):
@@ -488,13 +489,12 @@ def test_smoke_stops_on_a_featuriser_that_is_off(fault, monkeypatch):
                         feat_train=TrainFeat(exact_dither=False), device=torch.device("cpu"),
                         log=SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw))),
                         planner=SimpleNamespace(worst_micro_batches=past_the_featuriser))
-    if fault in (None, "no_processor"):
+    if fault is None:
         with pytest.raises(Reached):
             m.smoke_checks(R)
         ev = dict(evs)
-        assert ev["smoke_logmel_vs_hf"] == (dict(skipped="OSError: no preprocessor_config.json in the student dir")
-                                            if fault else dict(max_abs_diff=0.0, mean_abs_diff=0.0, masks_equal=True,
-                                                               n=3, device="cpu"))
+        assert ev["smoke_logmel_vs_hf"] == dict(max_abs_diff=0.0, mean_abs_diff=0.0, masks_equal=True, n=3,
+                                                device="cpu")
         dith = ev["smoke_train_dither"]
         assert dith["ok"] and dith["padding_zero"] and dith["batch_invariant"] and dith["n"] == 3
         assert dith["std"] == pytest.approx(1e-5, rel=0.05)
@@ -503,6 +503,9 @@ def test_smoke_stops_on_a_featuriser_that_is_off(fault, monkeypatch):
             m.smoke_checks(R)
         if not fault.startswith("dither"):
             assert "smoke_train_dither" not in dict(evs)
+        if fault == "hf_error":
+            assert dict(evs)["smoke_logmel_vs_hf"] == dict(
+                error="TypeError: __call__() got an unexpected keyword argument 'punctuation'")
 
 
 def test_a_file_renamed_away_while_an_upload_lists_its_dir_is_a_retried_attempt(tmp_path, monkeypatch):
