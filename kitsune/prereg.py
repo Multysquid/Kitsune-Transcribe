@@ -621,6 +621,9 @@ def max_steps(calib: dict, t_ref_run: str = T_REF_RUN, ref_steps: int = REF_STEP
     return out
 
 
+_derive_max_steps = max_steps  # write_numbers' parameter of the same name (the contract's) shadows the function
+
+
 def _key(lr) -> float:
     """An LR key (a float, or a tag like "1e-3" as JSON stores it) as a float rounded to 12 significant digits, so
     that 2 x 1e-3 and "2e-3" are one grid point."""
@@ -694,15 +697,17 @@ def file_sha256(path) -> str:
     return h.hexdigest()
 
 
-def write_numbers(path, calibration: dict, probes: dict, lrs: dict, max_steps_: dict, *, rules_path=None,
+def write_numbers(path, calibration: dict, probes: dict, lrs: dict, max_steps: dict, *, rules_path=None,
                   host: str | None = None, allow_pending: bool = False) -> str:
     """PREREG_numbers.json (atomic); returns its sha256. Keys: calibration {run: {t_step_s, micro_audio_s,
     data_wait_frac, steps_measured}}, max_steps {run: int}, lr_probes {class: {lr tag: objective}}, lr {run: float},
-    rules_sha256 (of the committed study/PREREG.json, `rules_path`), written_utc, host.
+    rules_sha256 (rules_sha256 of the committed study/PREREG.json, `rules_path`), written_utc, host (default the
+    machine's node name).
 
-    Mechanical by construction: it raises ValueError if the calibration has problems, if `max_steps_` is not
-    max_steps(calibration), if `lrs` is not run_lrs(choose_lr(probes)) (so every class must be "chosen"), or if the
-    rules still have a pending field (allow_pending=True only for dry runs)."""
+    Mechanical by construction: it raises ValueError if the calibration has problems, if `max_steps` is not what
+    max_steps() derives from the calibration, if `lrs` is not run_lrs(choose_lr(probes)) (so every class must be
+    "chosen"), or if the rules still have a pending field (allow_pending=True only for dry runs)."""
+    max_steps_given, max_steps = max_steps, _derive_max_steps  # the parameter keeps the contract's name
     rules_path = Path(rules_path) if rules_path is not None else REPO / "study" / RULES_JSON
     if not allow_pending and (left := pending(json.loads(rules_path.read_text(encoding="utf-8")))):
         raise ValueError(f"{rules_path} still has {len(left)} pending field(s), e.g. {left[:3]}: commit the filled "
@@ -710,8 +715,8 @@ def write_numbers(path, calibration: dict, probes: dict, lrs: dict, max_steps_: 
     if problems := calibration_problems(calibration):
         raise ValueError("calibration: " + "; ".join(problems))
     want_steps = max_steps(calibration)
-    if {k: int(v) for k, v in max_steps_.items()} != want_steps:
-        raise ValueError(f"max_steps {max_steps_} is not the calibrated {want_steps}")
+    if {k: int(v) for k, v in max_steps_given.items()} != want_steps:
+        raise ValueError(f"max_steps {max_steps_given} is not the calibrated {want_steps}")
     want_lr = run_lrs(choose_lr(probes))
     if {k: float(v) for k, v in lrs.items()} != want_lr:
         raise ValueError(f"lr {lrs} is not the probes' choice {want_lr}")

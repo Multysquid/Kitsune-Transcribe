@@ -487,7 +487,7 @@ def build_study_selection(teacher_root, second_root, parakeet_root, data_root, s
     hours["total"] = {k: _utts_hours(sel[train & m]) for k, m in [("teacher_out", train), *stage.items()]}
 
     # the eval sets, the Galgame views and the teachers' baselines on them
-    sets, texts = {}, {}
+    sets = {}
     for s in eval_sets:
         m = (sel["source"] == s).to_numpy() & ~train & keep
         sets[s] = dict(sel=m, ids=sel["id"][m].tolist())

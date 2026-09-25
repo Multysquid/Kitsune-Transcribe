@@ -72,7 +72,7 @@ def test_the_rules_carry_the_contract_and_the_design():
     assert r["runs"]["study-t06"]["params_total"] == 616_963_328 and r["runs"]["study-p005"]["params_total"] == \
         52_190_209
     assert set(r["lr_probes"]["classes"]) == {"scratch", "bridge", "lost", "kept-t03", "kept-p03"}
-    for c, p in r["lr_probes"]["classes"].items():
+    for p in r["lr_probes"]["classes"].values():
         assert p["warmup"] + p["stable"] + p["cooldown"] == p["max_steps"]
         assert p["cooldown"] == round(0.2 * p["max_steps"]) and p["warmup"] < p["max_steps"] - p["cooldown"]
     assert r["lr_probes"]["classes"]["kept-t03"]["runs"] == ["study-t03", "study-t06"]
@@ -234,6 +234,9 @@ def test_write_numbers(tmp_path):
     assert n["rules_sha256"] == prereg.rules_sha256(rules_path)
     assert n["lr_probes"]["kept-t03"] == {"5e-5": 1.3, "1e-4": 1.2, "2e-4": 1.25}
     assert n["calibration"]["study-t06"] == c["study-t06"]
+    # the contract's parameter names work as keywords
+    assert prereg.write_numbers(path=out, calibration=c, probes=probes, lrs=lrs, max_steps=steps,
+                                rules_path=rules_path, host="box-1") == prereg.file_sha256(out)
     with pytest.raises(ValueError, match="is not the calibrated"):
         prereg.write_numbers(out, c, probes, lrs, dict(steps, **{"study-t03": 1}), rules_path=rules_path)
     with pytest.raises(ValueError, match="is not the probes' choice"):
