@@ -911,7 +911,7 @@ def run_supervise(tmp_path, monkeypatch, script, state=None, finish=None):
                         finish or (lambda args, timeout=None: finishes.append(list(args)) or 0))
     state_path = tmp_path / "state" / "supervise.json"
     if state is not None:
-        state_path.parent.mkdir(parents=True)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(state), encoding="utf-8")
     rc = supervise.supervise("configs/viability.json", "Multy123/kitsune-runs", runs, ["python", "04.py"], state_path)
     return rc, trainer, finishes, json.loads(state_path.read_text(encoding="utf-8"))
@@ -1058,8 +1058,23 @@ def test_supervise_records_the_containers_oom_kills(tmp_path, monkeypatch, capsy
 
 def test_supervise_never_reruns_after_final(tmp_path, monkeypatch):
     state = {"attempts": [{"t0": 0.0, "rc": 0, "step": 10}], "final": {"action": "destroy"}}
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "halt").write_text("{}", encoding="utf-8")  # finish.py got as far as acting
     rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [], state=state)
     assert rc == 0 and trainer.argvs == [] and finishes == []
+
+
+def test_supervise_reruns_an_interrupted_final_finish(tmp_path, monkeypatch):
+    """A host reboot during finish --destroy's upload leaves the recorded decision but no halt marker (finish.py writes
+    it only once it acts): the rebooted supervisor runs that finish again, bounded, and never the trainer; without it
+    the box idled until the watchdog's deadline, which only stops it."""
+    state = {"attempts": [{"t0": 0.0, "rc": 0, "step": 900}],
+             "final": {"action": "destroy", "reason": "trainer finished (exit 0)", "wall": 0.0}}
+    calls = []
+    rc, trainer, _, after = run_supervise(tmp_path, monkeypatch, [], state=state,
+                                          finish=lambda args, timeout=None: calls.append((list(args), timeout)) or 0)
+    assert rc == 0 and trainer.argvs == [] and after["final"] == state["final"]
+    assert calls == [(["--destroy", "--reason", "trainer finished (exit 0)"], supervise.FINISH_TIMEOUT_S["destroy"])]
 
 
 @pytest.mark.parametrize("script,final,finish_rc,fallback", [

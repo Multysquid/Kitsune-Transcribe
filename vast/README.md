@@ -184,7 +184,8 @@ bash /workspace/Kitsune-Transcribe/vast/onstart.sh --rearm; tail -n 20 /workspac
 It moves the halt marker, the old deadline and the supervisor/finish history to `/workspace/kitsune_state/rearm-<time>/`
 and boots as on a new instance: a new 5.5 h cap from now, a new supervisor history (a new run dir; the old run dirs stay
 under `runs/` and are verified again before a destroy). Deleting only the `halt` file does not work: the old deadline
-has usually passed (the watchdog would stop the box at once) and the old history already holds a final decision.
+has usually passed (the watchdog would stop the box at once) and the old history already holds a final decision, which
+the supervisor then carries out again (a decision with no marker reads as a finish cut short by a restart).
 `--rearm` refuses (exit 1, reason in the log: the script writes only to `/workspace/kitsune.log`) while a watchdog or
 supervisor of the current container is still running; stop and start the instance first. Running the on-start script
 again during a healthy run starts nothing (the supervisor holds `kitsune_state/supervise.lock`). When done:

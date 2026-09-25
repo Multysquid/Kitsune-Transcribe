@@ -19,7 +19,11 @@ records the OOM kills the container's cgroup counted while it ran (oom_kills; "(
 rc alone does not tell one that took a DataLoader worker from any other error. The attempt history lives in
 $KITSUNE_STATE/supervise.json, so if the container restarts in the middle of an attempt (host reboot) the interrupted
 attempt counts as a failure (its run dir is found again from its start time or its --resume path) and the same policy
-applies; once a final decision is recorded the supervisor never starts another run. An exclusive lock
+applies; once a final decision is recorded the supervisor never starts another run. finish.py writes its halt marker
+($KITSUNE_STATE/halt) only when it acts, after its sync and --destroy's verification, so a restart in between (a host
+reboot during the minutes-long upload) leaves a recorded decision and no marker; onstart.sh then boots the supervisor
+again, which runs that finish once more (it is idempotent: the Hub skips what it already has, then verify and act)
+instead of idling until the watchdog's deadline, which only stops the box. An exclusive lock
 ($KITSUNE_STATE/supervise.lock, flock) keeps a second supervisor (vast/onstart.sh run again by hand during a healthy
 run) from treating the live attempt as interrupted.
 
@@ -163,6 +167,17 @@ def call_finish(args: list[str], timeout: float | None = None) -> int:
         return 124
 
 
+def final_finish(action: str, reason: str, dry: list[str]):
+    """The final finish.py --stop/--destroy, bounded; `finish.py --stop --no-sync` after a timeout or failure."""
+    rc = call_finish([f"--{action}", "--reason", reason, *dry], timeout=FINISH_TIMEOUT_S[action])
+    log(f"finish exited {rc}")
+    if rc not in (0, 2):  # 2: --destroy's verification failed and the instance was stopped
+        why = "timed out" if rc == 124 else f"exited {rc}"
+        rc = call_finish(["--stop", "--no-sync", "--reason", f"finish --{action} {why} ({reason})", *dry],
+                         timeout=FALLBACK_TIMEOUT_S)
+        log(f"fallback stop exited {rc}")
+
+
 def load_state(path: Path) -> dict:
     if path.exists():
         try:
@@ -213,14 +228,18 @@ def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: lis
         log(f"another supervisor holds {state_path.with_suffix('.lock')}; not starting a second one")
         return 0
     state = load_state(state_path)
-    if state.get("final"):
-        log(f"a final decision is already recorded ({state['final']}); not starting another run")
+    dry = ["--dry-run"] if dry_run else []
+    final = state.get("final")
+    if final:
+        log(f"a final decision is already recorded ({final}); not starting another run")
+        if not state_path.with_name("halt").exists():  # $KITSUNE_STATE/halt in production, as finish.py writes it
+            log("no halt marker: the container restarted before finish acted on that decision; running it again")
+            final_finish(final["action"], final.get("reason", ""), dry)
         return 0
     for a in state["attempts"]:
         if "rc" not in a:  # the container died while this attempt was running
             rd = attempt_run_dir(a, runs_root)
             a.update(rc=None, interrupted=True, run_dir=str(rd) if rd else None, step=last_step(rd))
-    dry = ["--dry-run"] if dry_run else []
 
     while True:
         resume = None
@@ -234,13 +253,7 @@ def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: lis
             if action != "resume":
                 state["final"] = {"action": action, "reason": reason, "wall": time.time()}
                 save_state(state_path, state)
-                rc = call_finish([f"--{action}", "--reason", reason, *dry], timeout=FINISH_TIMEOUT_S[action])
-                log(f"finish exited {rc}")
-                if rc not in (0, 2):  # 2: --destroy's verification failed and the instance was stopped
-                    why = "timed out" if rc == 124 else f"exited {rc}"
-                    rc = call_finish(["--stop", "--no-sync", "--reason", f"finish --{action} {why} ({reason})", *dry],
-                                     timeout=FALLBACK_TIMEOUT_S)
-                    log(f"fallback stop exited {rc}")
+                final_finish(action, reason, dry)
                 return last["rc"] if last["rc"] is not None else 1
             resume = full
 
