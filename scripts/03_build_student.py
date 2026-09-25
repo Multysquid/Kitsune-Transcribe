@@ -2,7 +2,7 @@
 
 The shape and the reasons for it are in kitsune/student.py. This script runs the pipeline end to end:
   1. seeded calibration sample of the selection's kept TRAIN rows (all --sources, equal share each), audio read by id
-  2. load the teacher in bf16 on --device
+  2. load the teacher in bf16 on --device, at --teacher-revision (the commit 02_teacher_pass read)
   3. FFN importance over --calib-utts utterances, log-mels computed on the device (kitsune.features.LogMel)
   4. build the student on CPU (fresh model, strict remapped state_dict)
   5. free the teacher
@@ -12,7 +12,7 @@ The shape and the reasons for it are in kitsune/student.py. This script runs the
   9. student_meta.json rewritten with stage "complete"
 
 It is resumable, because the laptop GPU throws intermittent CUDA illegal-instruction faults:
-  <out>/importance.pt   written after step 3; reused if it covers the same teacher, layers and calibration ids
+  <out>/importance.pt   written after step 3; reused if it covers the same teacher commit, layers and calibration ids
   student_meta.json     stage "saved": a re-run skips 1-7 and only redoes the step-0 eval; stage "complete": nothing
                         to do (--force rebuilds; a matching importance.pt is still reused - delete it to recompute)
 The step-0 eval runs after the save (the spec lists it before), so a fault there cannot lose the built student. If
@@ -47,6 +47,9 @@ sys.path.insert(0, str(ROOT))
 # torch / transformers / the kitsune training modules are imported inside the functions, so --help is instant and
 # does not depend on the rest of the stack.
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
+# the teacher commit read, the one the targets came from: must equal 02_teacher_pass.MODEL_REVISION (and the commit
+# MODEL_CARD.md names); without a pin every hub read silently follows `main`
+TEACHER_REVISION = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
 EVAL_SETS = ["eval_jsut", "eval_cv8", "eval_reazon"]
 SOURCES = ["reazon_small", "emilia_yodas", "galgame"]  # configs/viability.json "sources": calibrate on what it trains on
 MAX_SECONDS = 30.0  # LogMel / HF fast path; the teacher pass skipped longer utterances anyway
@@ -167,6 +170,19 @@ def feature_batches(utts: list[dict], featurizer, device, batch_s: float, desc: 
 # ------------------------------------------------------------------------------------------------ stages
 
 
+def check_teacher_matches_targets(teacher_root: Path, commit: str | None) -> None:
+    """Exit if <teacher_root>/meta.json names another teacher commit than the one just loaded: the student would start
+    from other weights (and ship another tokenizer) than the ones its distillation targets came from. Skipped when
+    either side is unknown (a local teacher dir; a teacher_out/meta.json from before 02 recorded model_revision)."""
+    path = Path(teacher_root) / "meta.json"
+    if commit is None or not path.exists():
+        return
+    targets = json.loads(path.read_text(encoding="utf-8")).get("model_revision")
+    if targets is not None and targets != commit:
+        sys.exit(f"teacher commit {commit} is not the one {path} was computed from ({targets}); pass "
+                 f"--teacher-revision {targets}, or recompute the targets with 02_teacher_pass.py")
+
+
 def load_or_compute_importance(teacher, featurizer, utts: list[dict], args, spec, device, out: Path, log=print):
     """Stage 3, cached in <out>/importance.pt (atomic). Returns (importance dict, info dict)."""
     import torch
@@ -174,7 +190,9 @@ def load_or_compute_importance(teacher, featurizer, utts: list[dict], args, spec
     from kitsune import student as S
 
     path = out / "importance.pt"
-    key = dict(teacher=args.teacher, ids_sha256=ids_sha([u["id"] for u in utts]), n_utts=len(utts))
+    # the resolved commit (None for a local dir): importance from other teacher weights is recomputed, not reused
+    key = dict(teacher=args.teacher, teacher_revision=getattr(teacher.config, "_commit_hash", None),
+               ids_sha256=ids_sha([u["id"] for u in utts]), n_utts=len(utts))
     if path.exists():
         try:
             c = torch.load(path, map_location="cpu", weights_only=True)
@@ -261,6 +279,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--step0-eval-utts", type=int, default=200, help="per eval set; 0 skips the step-0 eval")
     ap.add_argument("--eval-sets", nargs="+", default=EVAL_SETS)
     ap.add_argument("--teacher", default=TEACHER_ID, help="HF repo id or local dir of the teacher")
+    ap.add_argument("--teacher-revision", default=TEACHER_REVISION,
+                    help="commit of --teacher to read (default: the pin 02_teacher_pass read); ignored for a local dir")
     ap.add_argument("--selection", default=str(ROOT / "selection" / "viability.parquet"))
     ap.add_argument("--data", default=str(ROOT / "data"))
     ap.add_argument("--teacher-root", default=str(ROOT / "teacher_out"))
@@ -287,7 +307,8 @@ def main(argv=None) -> int:
     from kitsune.features import LogMel
 
     out = args.out
-    n_teacher_layers = AutoConfig.from_pretrained(args.teacher).encoder_config.num_hidden_layers  # 48 for the real one
+    teacher_cfg = AutoConfig.from_pretrained(args.teacher, revision=args.teacher_revision)
+    n_teacher_layers = teacher_cfg.encoder_config.num_hidden_layers  # 48 for the real one
     spec = S.StudentSpec(enc_layers=S.evenly_spaced(args.enc_layers, n_teacher_layers), ffn_dim=args.ffn,
                          dec_layers=sorted(args.dec_layers), tie_head=not args.no_tie_head)
     old = S.load_meta(out)
@@ -305,7 +326,7 @@ def main(argv=None) -> int:
         print(f"GPU free: {free / 2**30:.2f} of {total / 2**30:.1f} GiB")
     print(f"student: enc {spec.enc_layers} ffn {spec.ffn_dim} dec {spec.dec_layers} tied={spec.tie_head} -> {out}")
 
-    processor = AutoProcessor.from_pretrained(args.teacher)
+    processor = AutoProcessor.from_pretrained(args.teacher, revision=args.teacher_revision)
     featurizer = LogMel.from_feature_extractor(processor.feature_extractor).to(device)
     t_start = time.time()
 
@@ -329,10 +350,13 @@ def main(argv=None) -> int:
 
         t = time.time()
         print(f"[2/8] teacher {args.teacher} (bf16) -> {device}")
-        teacher = CohereAsrForConditionalGeneration.from_pretrained(args.teacher, dtype=torch.bfloat16,
+        teacher = CohereAsrForConditionalGeneration.from_pretrained(args.teacher, revision=args.teacher_revision,
+                                                                    dtype=torch.bfloat16,
                                                                     attn_implementation="sdpa").to(device).eval()
-        # provenance: the teacher is read from `main`, so record which commit that was (None for a local directory)
+        # provenance: the commit --teacher-revision resolved to (None for a local directory); it must be the one the
+        # teacher_out targets came from
         meta["teacher_revision"] = getattr(teacher.config, "_commit_hash", None)
+        check_teacher_matches_targets(args.teacher_root, meta["teacher_revision"])
         dur["teacher_load"] = round(time.time() - t, 1)
 
         t = time.time()

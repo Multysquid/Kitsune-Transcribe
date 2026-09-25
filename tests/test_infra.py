@@ -1744,11 +1744,26 @@ def test_second_opinion_mirror_pins_match_01(prep):
     assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (second.MODEL2_REVISION, second.WHISPER_TOK_REVISION))
 
 
-def test_label_passes_read_the_hub_at_a_pin():
-    """Every hub read in 02 and 02b names a revision; without one it silently follows `main`."""
+def test_student_build_reads_the_teacher_commit_the_targets_and_the_card_name():
+    """03 keeps its own copy of the teacher pin: the student's init weights, tokenizer and processor must come from the
+    commit 02 computed the targets from, and the model card copied into every checkpoint names that commit."""
     import ast
 
-    for name in ("02_teacher_pass.py", "02b_second_opinion.py"):
+    tree = ast.parse((ROOT / "scripts" / "02_teacher_pass.py").read_text(encoding="utf-8"))  # no torch import
+    pin02 = next(n.value.value for n in tree.body if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "MODEL_REVISION" for t in n.targets))
+    build = load_path("build_student_03", ROOT / "scripts" / "03_build_student.py")
+    card = re.findall(r"\b[0-9a-f]{40}\b", (ROOT / "MODEL_CARD.md").read_text(encoding="utf-8"))
+    assert re.fullmatch(r"[0-9a-f]{40}", pin02)
+    assert build.TEACHER_REVISION == pin02 and set(card) == {pin02}, (build.TEACHER_REVISION, pin02, card)
+    assert build.parse_args([]).teacher_revision == pin02
+
+
+def test_label_passes_read_the_hub_at_a_pin():
+    """Every hub read in 02, 02b and 03 names a revision; without one it silently follows `main`."""
+    import ast
+
+    for name in ("02_teacher_pass.py", "02b_second_opinion.py", "03_build_student.py"):
         tree = ast.parse((ROOT / "scripts" / name).read_text(encoding="utf-8"))
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
         reads = [c for c in calls if c.func.attr in ("from_pretrained", "list_repo_files")]

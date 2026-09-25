@@ -501,6 +501,55 @@ def test_build_script_end_to_end_tiny(tmp_path):
     assert m3["stage"] == "complete" and "resumed" in m3["timestamps"] and m3["step0"]["n_per_set"] == {"eval_x": 4}
 
 
+def test_build_script_refuses_a_teacher_commit_the_targets_did_not_come_from(tmp_path):
+    """The student's init weights and tokenizer must come from the teacher commit teacher_out/meta.json records; an
+    unknown side (a local teacher dir, a meta.json from before model_revision was recorded, none at all) passes."""
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    a, b = "a" * 40, "b" * 40
+    mod.check_teacher_matches_targets(tmp_path, a)  # no meta.json
+    (tmp_path / "meta.json").write_text(json.dumps({"model": S.TEACHER_ID}), encoding="utf-8")
+    mod.check_teacher_matches_targets(tmp_path, a)  # legacy meta.json
+    (tmp_path / "meta.json").write_text(json.dumps({"model": S.TEACHER_ID, "model_revision": a}), encoding="utf-8")
+    mod.check_teacher_matches_targets(tmp_path, a)
+    mod.check_teacher_matches_targets(tmp_path, None)  # local teacher dir
+    with pytest.raises(SystemExit, match=f"--teacher-revision {a}"):
+        mod.check_teacher_matches_targets(tmp_path, b)
+
+
+def test_importance_cache_is_keyed_on_the_teacher_commit(tmp_path, monkeypatch):
+    """importance.pt computed from one teacher commit is not reused for another, nor is one written before the key
+    held the commit: other weights rank other FFN neurons."""
+    from types import SimpleNamespace
+
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    computed = []
+
+    def fake_importance(teacher, feats, layers, device):
+        computed.append(teacher.config._commit_hash)
+        return {(l, n): torch.rand(8) for l in layers for n in S.FFN_NAMES}
+
+    monkeypatch.setattr(S, "ffn_importance", fake_importance)
+    utts = [dict(id=f"u{i}", duration=1.0, source="s", wave=None) for i in range(3)]
+    args = SimpleNamespace(teacher=S.TEACHER_ID, calib_batch_s=10.0)
+    spec = SimpleNamespace(enc_layers=[0, 2])
+
+    def reused(commit):
+        teacher = SimpleNamespace(config=SimpleNamespace(_commit_hash=commit))
+        _, info = mod.load_or_compute_importance(teacher, None, utts, args, spec, "cpu", tmp_path, log=lambda *_: None)
+        return info["reused"]
+
+    a, b = "a" * 40, "b" * 40
+    assert [reused(a), reused(a), reused(b)] == [False, True, False] and computed == [a, b]
+    c = torch.load(tmp_path / "importance.pt", weights_only=True)  # as written before the key held the commit
+    c["key"].pop("teacher_revision")
+    torch.save(c, tmp_path / "importance.pt")
+    assert reused(b) is False and computed == [a, b, b]
+
+
 def test_importance_state_roundtrip(tmp_path):
     imp = rand_importance([0, 16, 47], 5120)
     torch.save(S.importance_to_state(imp), tmp_path / "importance.pt")

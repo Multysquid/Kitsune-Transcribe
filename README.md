@@ -58,9 +58,10 @@ is a random utterance sample of the first tar, so it measures seen games and voi
 Every upstream dataset repo is read at a pinned commit (`REVISIONS` in `scripts/01_prepare_data.py`). The label
 passes pin theirs too: the teacher at `b1eacc2` (`MODEL_REVISION` in `02_teacher_pass.py`, recorded in
 `teacher_out/meta.json`), and kotoba-whisper, the whisper-large-v3 tokenizer and the ReazonSpeech mirrors in
-`02b_second_opinion.py` (recorded in `second_out/meta.json`). `03_build_student.py` reads the teacher from `main`;
-`student_meta.json` records the commit it resolved to (the student built before that record was added comes from
-`b1eacc2`).
+`02b_second_opinion.py` (recorded in `second_out/meta.json`). `03_build_student.py` reads the teacher at the same
+pin (`TEACHER_REVISION`, `--teacher-revision`), keys its FFN-importance cache on that commit, refuses a teacher commit
+other than the one `teacher_out/meta.json` records, and writes the commit to `student_meta.json` (the student built
+before that record was added comes from `b1eacc2` too).
 
 ### License of the trained model
 
