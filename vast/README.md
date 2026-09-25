@@ -151,10 +151,10 @@ touch /workspace/Kitsune-Transcribe/runs/<run_id>/STOP
 The trainer checks for the file before every optimizer step: the step under way finishes (with its eval and
 checkpoints, if due), then the normal end phase runs - final weights and full state, final eval (an epoch-end full
 eval of that same step is reused, not decoded again), verdict, summary, uploads - and it exits 0, so the box verifies the upload and destroys itself as after a full run (`early_stop` event
-with reason `stop_file`). Killing the trainer instead counts as a crash (resumed once, or the box is stopped; see below)
-and skips the final eval. A trainer stuck waiting for its data loader (`kitsune.log` shows `unable to allocate shared
-memory` and no new steps) never reaches the STOP check, but it gives up after `perf.loader_timeout_s` (10 min) and
-exits as a crash.
+with reason `stop_file`). Killing the trainer instead, before its `summary.json` is complete, counts as a crash
+(resumed once, or the box is stopped; see below) and skips the final eval. A trainer stuck waiting for its data
+loader (`kitsune.log` shows `unable to allocate shared memory` and no new steps) never reaches the STOP check, but it
+gives up after `perf.loader_timeout_s` (10 min) and exits as a crash.
 
 ## Where the results land
 
@@ -170,8 +170,9 @@ a downloaded `tb/`.
 |---|---|
 | training exits 0 and every expected file is on the Hub (path, size, sha256) | **destroyed** (billing stops) |
 | training exits 0 but verification finds a problem | **stopped** (disk kept, storage still billed) |
+| any other exit but 3, or a container restart, after `summary.json` says `complete` (a crash in teardown, a kill while the end state uploads), even a second crash | as for exit 0: **destroyed** once verified, otherwise **stopped**; no resume and no post-crash sync (`--destroy` uploads everything) |
 | exit 3 (throughput too low), a crash before step 100, or a second crash | **stopped** |
-| first crash after step 100 with a local full state | resumed once, then as above |
+| first crash after step 100 with a local full state (and no complete `summary.json`) | resumed once, then as above |
 | bootstrap or on-start failure | **stopped** |
 | 5.5 h after first boot, whatever the state | **stopped** by the watchdog |
 

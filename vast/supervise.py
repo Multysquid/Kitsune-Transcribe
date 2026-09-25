@@ -12,11 +12,13 @@ Policy (decide()):
 Why: after the smoke phase (100 steps) the code path is proven on this host, so a later crash is most likely transient
 (a host hiccup, a NaN spike) and one resume costs minutes. A trainer that dies after its complete summary (a crash in
 the interpreter's teardown, a kill while its end-state upload drains) has nothing left to train: a resume would only
-run the end phase and the final eval again, and finish.py --destroy uploads what is missing and verifies it first. A failure before step 100 is a code or hardware problem that
-a restart would only repeat on the meter, and a second failure means the same. Stop, not destroy, on every failure path:
-the disk (checkpoints, logs) survives for a human to inspect.
+run the end phase and the final eval again, and finish.py --destroy uploads what is missing and verifies it first. A
+failure before step 100 is a code or hardware problem that a restart would only repeat on the meter, and a second
+failure means the same. Stop, not destroy, on every other failure path: the disk (checkpoints, logs) survives for a
+human to inspect.
 
-Every non-zero exit first forces a log sync (finish.py --sync-only --no-full): a hard crash (segfault, OOM kill, CUDA
+Every non-zero exit of a run whose summary.json is not complete first forces a log sync (finish.py --sync-only
+--no-full; a finished run's finish.py --destroy uploads everything anyway): a hard crash (segfault, OOM kill, CUDA
 fault) skips the trainer's own final sync. The ~9 GB full state is left out there because a resume needs it only
 locally and every stop path (finish.py --stop) uploads it anyway; the GPU idles while this sync runs. Each attempt
 records the OOM kills the container's cgroup counted while it ran (oom_kills; "(oom_kill +N)" in its exit line): the
