@@ -14,14 +14,35 @@ Why each step is done the way it is:
   The kept neurons are sorted by original index, so each slice keeps the teacher's order.
 - The head is tied (proj_out.weight IS embed_tokens.weight; it keeps its own bias). In the teacher checkpoint the two
   are bitwise equal, so this costs nothing and saves V x 1024 parameters. The tied value is taken from embed_tokens.
-- BatchNorm (one per conv module) is recalibrated after pruning. The teacher's running stats describe inputs that
-  28 dropped layers and half of every FFN used to shape. Recalibration uses batch size 1, so padded frames never
-  enter the statistics, and momentum=None, which gives a cumulative average rather than an EMA biased to the last
-  batches. BN then stays frozen in eval mode for all of training (kitsune.patches.freeze_batchnorm).
+- BatchNorm (one per conv module) is either recalibrated after pruning (the first run: `recalibrate_batchnorm`) or
+  keeps the teacher's running stats (the size study, decision 16: `scripts/03_build_student.py --bn keep`). The
+  recalibration's argument: the teacher's stats describe inputs that 28 dropped layers and half of every FFN used to
+  shape. Against it: the same recalibration moves even the UNPRUNED teacher away from itself (greedy CER vs its own
+  transcript 119 % on a CPU check), because per-utterance batch-size-1 statistics are not the pooled statistics the
+  teacher was trained with. Recalibration uses batch size 1, so padded frames never enter the statistics, and
+  momentum=None, which gives a cumulative average rather than an EMA biased to the last batches. Either way BN then
+  stays frozen in eval mode for all of training (kitsune.patches.freeze_batchnorm).
 - The checkpoint is saved with bf16 weights but fp32 BN running stats. Those stats are never trained again, and bf16
   would quantise the variances that every normalised frame is divided by.
 
 The decoder prompt, EOS, PAD and vocab are the teacher's (decoder_start_token_id 13764, see teacher_out/meta.json).
+
+From-scratch students (the size study's T-0.1B, T-0.05B, the replicate and the bridge; `build_scratch_student`) are
+the teacher's architecture at other widths and depths, randomly initialised. Each trap below was measured once:
+- The config starts from `student_config(teacher_config, ...)`, never from the raw teacher config: that one has
+  `tie_word_embeddings: False` and would add a second V x D matrix (+8 % at T-0.1B, +12 % at T-0.05B).
+- `head_dim = D / heads` and `num_key_value_heads = heads` are set explicitly, in the encoder and the decoder. The
+  teacher config serialises `head_dim: 128` (T-0.1B would silently get 1024-wide attention projections) and
+  `num_key_value_heads: 8` (6 heads with 8 kv heads gives `num_key_value_groups = 0`).
+- The decoder's pos_emb is an nn.Embedding that HF initialises N(0, 0.02); the teacher's is a fixed sinusoid table
+  divided by sqrt(D), which the trainer freezes. It is written in exactly the teacher's form (`sinusoid_pos_emb`).
+- The subsampling Conv2d layers are re-initialised with the PyTorch default (kaiming-uniform). HF's N(0, 0.02) makes
+  five stacked convs shrink the signal to an output RMS of ~8e-6, with a gradient norm of 361-1157 at init; the
+  default gives ~0.05 and ~3.5.
+- BatchNorm is fresh (running mean 0, var 1, no batches tracked) and trains; generation ids, the processor and
+  `scale_input: False` are the teacher's; dropout and layerdrop are 0.
+- The build is seeded (its own RNG fork) and asserts its parameter count equals `closed_form_params` and, for the
+  named shapes, the count the study pre-registered (SCRATCH_EXPECTED_PARAMS).
 """
 import copy
 import json
@@ -42,9 +63,15 @@ from kitsune.patches import unfreeze_batchnorm
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 TEACHER_ENC_LAYERS = 48
 TEACHER_DEC_LAYERS = 8
-DECODER_START, EOS, PAD = 13764, 3, 2
+DECODER_START, EOS, PAD, BOS = 13764, 3, 2, 4
 FFN_NAMES = ("feed_forward1", "feed_forward2")
 EXPECTED_DEFAULT_PARAMS = 616_963_328  # closed form for B20x2560 / dec4 / V16384 tied (report_model.md section 2)
+# The size study's pruned shapes, (kept encoder layers, FFN width, kept decoder layers) -> total parameters (STUDY.md
+# 1.1). 03_build_student.py asserts a build of one of these shapes from the 48-layer teacher lands on its count.
+PRUNED_EXPECTED_PARAMS = {
+    (20, 2560, (0, 2, 5, 7)): EXPECTED_DEFAULT_PARAMS,  # T-0.6B, the first run's student
+    (10, 2560, (0, 7)): 320_752_384,  # T-0.3B
+}
 MODEL_CARD = Path(__file__).resolve().parents[1] / "MODEL_CARD.md"  # save_student copies it next to the weights
 
 _BN = nn.modules.batchnorm._BatchNorm
@@ -176,6 +203,22 @@ def param_report(model: CohereAsrForConditionalGeneration) -> dict:
     return rep
 
 
+def non_embedding_params(model: CohereAsrForConditionalGeneration) -> int:
+    """STUDY.md 1.1's size measure: the total minus the vocabulary-sized matrices (the token embedding, and the head
+    weight if it is not tied to it) and the frozen pos_emb table. The head's V-sized bias stays in."""
+    dec = model.model.decoder
+    n = sum(p.numel() for p in model.parameters()) - dec.embed_tokens.weight.numel() - dec.pos_emb.weight.numel()
+    if model.proj_out.weight is not dec.embed_tokens.weight:
+        n -= model.proj_out.weight.numel()
+    return n
+
+
+def count_fields(model: CohereAsrForConditionalGeneration) -> dict:
+    """The count fields every study student's student_meta.json carries (the build asserts total == closed form)."""
+    return dict(params_total=sum(p.numel() for p in model.parameters()),
+                params_non_embedding=non_embedding_params(model), closed_form_params=closed_form_params(model.config))
+
+
 # ------------------------------------------------------------------------------------------------ FFN importance
 
 
@@ -255,6 +298,33 @@ def select_ffn_neurons(importance: dict | None, enc_layers: list[int], ffn_dim: 
     return keep
 
 
+def check_keep(keep: dict, spec: StudentSpec, teacher_ffn: int) -> dict[tuple[int, str], torch.Tensor]:
+    """A given FFN selection (e.g. another student's, see keep_from_meta) restricted to spec's layers, validated: every
+    kept FFN of spec has exactly spec.ffn_dim strictly ascending neuron indices inside the teacher's width."""
+    if spec.ffn_dim == teacher_ffn:
+        return {}
+    out = {}
+    for l in spec.enc_layers:
+        for n in FFN_NAMES:
+            if (l, n) not in keep:
+                raise ValueError(f"the given FFN selection has no entry for teacher layer {l} {n}")
+            idx = torch.as_tensor(keep[(l, n)], dtype=torch.int64).flatten()
+            if len(idx) != spec.ffn_dim or not bool((idx[1:] > idx[:-1]).all()) or int(idx[0]) < 0 or \
+                    int(idx[-1]) >= teacher_ffn:
+                raise ValueError(f"FFN selection {l}.{n}: need {spec.ffn_dim} ascending indices in [0, {teacher_ffn})")
+            out[(l, n)] = idx
+    return out
+
+
+def keep_from_meta(meta: dict) -> dict[tuple[int, str], torch.Tensor]:
+    """The FFN selection a built student recorded in its student_meta.json (`kept.ffn`, keys 'layer.ffn_name')."""
+    ffn = (meta.get("kept") or {}).get("ffn")
+    if not ffn:
+        raise ValueError("student_meta.json has no kept.ffn (was that student FFN-pruned?)")
+    return {(int(k.split(".", 1)[0]), k.split(".", 1)[1]): torch.as_tensor(v, dtype=torch.int64)
+            for k, v in ffn.items()}
+
+
 def importance_summary(importance: dict, keep: dict) -> dict:
     """How much activation mass each pruned FFN keeps, for student_meta.json."""
     per = {}
@@ -303,13 +373,19 @@ def _remap(teacher_sd: dict, student_keys: list[str], spec: StudentSpec, keep: d
 
 
 @torch.no_grad()
-def build_student(teacher: CohereAsrForConditionalGeneration, spec: StudentSpec,
-                  importance: dict | None) -> CohereAsrForConditionalGeneration:
+def build_student(teacher: CohereAsrForConditionalGeneration, spec: StudentSpec, importance: dict | None,
+                  keep: dict | None = None) -> CohereAsrForConditionalGeneration:
     """Fresh fp32 student on CPU, every tensor loaded (strict=True) from the teacher: layers renumbered, FFNs sliced
     to the top-`spec.ffn_dim` neurons by `importance` (sorted by original index), head tied to embed_tokens.
+    `keep` = a ready FFN selection instead ({(teacher_layer, ffn_name): indices}, e.g. keep_from_meta of another
+    student); `importance` is then ignored. BN running stats are the teacher's (recalibrate_batchnorm replaces them).
     The teacher may be on any device and in any dtype; it is not modified. Returned in eval mode."""
     cfg = student_config(teacher.config, spec)
-    keep = select_ffn_neurons(importance, spec.enc_layers, spec.ffn_dim, teacher.config.encoder_config.intermediate_size)
+    teacher_ffn = teacher.config.encoder_config.intermediate_size
+    if keep is None:
+        keep = select_ffn_neurons(importance, spec.enc_layers, spec.ffn_dim, teacher_ffn)
+    else:
+        keep = check_keep(keep, spec, teacher_ffn)
     student = CohereAsrForConditionalGeneration(cfg)
     if spec.tie_head and student.proj_out.weight is not student.model.decoder.embed_tokens.weight:
         student.tie_weights()
@@ -322,6 +398,128 @@ def build_student(teacher: CohereAsrForConditionalGeneration, spec: StudentSpec,
     gc = student.generation_config
     gc.decoder_start_token_id, gc.eos_token_id, gc.pad_token_id = DECODER_START, EOS, PAD
     gc.bos_token_id = teacher.generation_config.bos_token_id
+    return student.eval()
+
+
+# ------------------------------------------------------------------------------------------------ from scratch
+
+
+@dataclass(frozen=True)
+class ScratchShape:
+    """A from-scratch student: the teacher's architecture (conformer encoder, transformer decoder, tied V=16384 head,
+    128 mels, 8x subsampling with 256 channels) at these widths and depths. Head width = hidden / heads."""
+    enc_hidden: int
+    enc_layers: int
+    enc_heads: int
+    enc_ffn: int
+    dec_hidden: int
+    dec_layers: int
+    dec_heads: int
+    dec_ffn: int
+    conv_kernel: int = 9
+
+    def __post_init__(self):
+        for name in ("enc_hidden", "enc_layers", "enc_heads", "enc_ffn", "dec_hidden", "dec_layers", "dec_heads",
+                     "dec_ffn", "conv_kernel"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be >= 1: {self}")
+        if self.enc_hidden % self.enc_heads or self.dec_hidden % self.dec_heads:
+            raise ValueError(f"hidden sizes must be divisible by the head counts: {self}")
+        if self.conv_kernel % 2 == 0:
+            raise ValueError(f"the depthwise conv kernel must be odd ('same' padding): {self}")
+
+
+# STUDY.md 1.1 (decision 18, shapes W). The bridge is the T-0.3B shape (B10x2560 + decoder {0,7}) from scratch: the
+# teacher's widths, 10 encoder and 2 decoder layers.
+SCRATCH_SHAPES = {
+    "t01": ScratchShape(512, 12, 8, 2048, 512, 4, 8, 2048),
+    "t005": ScratchShape(384, 10, 6, 1536, 384, 3, 6, 1536),
+    "bridge": ScratchShape(1280, 10, 8, 2560, 1024, 2, 8, 4096),
+}
+SCRATCH_EXPECTED_PARAMS = {"t01": 103_996_416, "t005": 51_209_600, "bridge": 320_752_384}
+
+
+def scratch_config(teacher_config: CohereAsrConfig, shape: ScratchShape) -> CohereAsrConfig:
+    """student_config (NeMo extras dropped, tied head, decoder start, fp32, sdpa) with the shape's widths and depths.
+
+    head_dim and num_key_value_heads are set explicitly in both stacks: the teacher config serialises head_dim 128 and
+    8 kv heads, which a width change alone would silently keep. Dropout, layerdrop and scale_input are pinned to the
+    teacher's 0 / False as well, so the config says what the study trains with."""
+    t_enc = teacher_config.encoder_config
+    # the layer choice is irrelevant here (no teacher tensor is copied); this spec only has to be valid for the teacher
+    cfg = student_config(teacher_config, StudentSpec(enc_layers=[0], ffn_dim=t_enc.intermediate_size, dec_layers=[0]))
+    e = cfg.encoder_config
+    e.num_hidden_layers, e.hidden_size, e.intermediate_size = shape.enc_layers, shape.enc_hidden, shape.enc_ffn
+    e.num_attention_heads = e.num_key_value_heads = shape.enc_heads
+    e.conv_kernel_size = shape.conv_kernel
+    e.scale_input = False
+    for k in ("dropout", "dropout_positions", "layerdrop", "activation_dropout", "attention_dropout"):
+        setattr(e, k, 0.0)
+    if hasattr(e, "head_dim"):  # the encoder derives it from hidden/heads; a stale explicit value would win
+        delattr(e, "head_dim")
+    cfg.num_hidden_layers, cfg.hidden_size, cfg.intermediate_size = shape.dec_layers, shape.dec_hidden, shape.dec_ffn
+    cfg.num_attention_heads = cfg.num_key_value_heads = shape.dec_heads
+    cfg.head_dim = shape.dec_hidden // shape.dec_heads
+    cfg.attention_dropout = 0.0
+    return cfg
+
+
+def sinusoid_pos_emb(n_pos: int, dim: int) -> torch.Tensor:
+    """The teacher decoder's fixed position table (NeMo FixedPositionalEncoding): sin on even and cos on odd features
+    of pos / 10000^(2i/dim), divided by sqrt(dim), computed in fp32 in NeMo's order. Equal to the checkpoint's
+    pos_enc up to its bf16 rounding."""
+    pos = torch.arange(0.0, n_pos, dtype=torch.float32)[:, None]
+    div = torch.exp((-math.log(10000.0) / dim) * torch.arange(0.0, dim, 2, dtype=torch.float32))
+    pe = torch.zeros(n_pos, dim, dtype=torch.float32)
+    pe[:, 0::2] = torch.sin(pos * div)
+    pe[:, 1::2] = torch.cos(pos * div)[:, : dim // 2]
+    return pe.div_(math.sqrt(dim))
+
+
+def _subsampling_convs(model: CohereAsrForConditionalGeneration) -> list[nn.Conv2d]:
+    return [m for m in model.model.encoder.subsampling.modules() if isinstance(m, nn.Conv2d)]
+
+
+@torch.no_grad()
+def build_scratch_student(teacher_config: CohereAsrConfig, shape: ScratchShape, seed: int,
+                          name: str | None = None) -> CohereAsrForConditionalGeneration:
+    """A randomly initialised fp32 student on CPU in eval mode (STUDY.md 1.2, the from-scratch steps 1-9):
+
+    1. config = scratch_config(teacher_config, shape): student_config first, then the widths; 2. head_dim = D/heads and
+    kv heads = heads, explicitly; 3. a fresh model with HF's default init; 4. pos_emb = sinusoid/sqrt(D), the
+    teacher's form; 5. the subsampling Conv2d layers re-initialised with the PyTorch default; 6. fresh BatchNorm;
+    7. the teacher's generation ids (start 13764, EOS 3, PAD 2, BOS 4) and scale_input False; 8. every random draw
+    from a torch RNG fork seeded with `seed` (the caller's RNG state is untouched, the build is reproducible); 9. the
+    count is asserted: total == closed_form_params, and == SCRATCH_EXPECTED_PARAMS[name] for a named study shape."""
+    cfg = scratch_config(teacher_config, shape)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(seed))
+        student = CohereAsrForConditionalGeneration(cfg)
+        for conv in _subsampling_convs(student):
+            conv.reset_parameters()  # kaiming-uniform(a=sqrt(5)) weight, U(+-1/sqrt(fan_in)) bias
+    if student.proj_out.weight is not student.model.decoder.embed_tokens.weight:
+        student.tie_weights()
+    assert student.proj_out.weight is student.model.decoder.embed_tokens.weight, "head not tied"
+    dec = student.model.decoder
+    dec.pos_emb.weight.copy_(sinusoid_pos_emb(cfg.max_position_embeddings, cfg.hidden_size))
+    for _, bn in _batchnorms(student):
+        bn.reset_parameters()  # running mean 0, var 1, num_batches_tracked 0, weight 1, bias 0
+    gc = student.generation_config
+    gc.decoder_start_token_id, gc.eos_token_id, gc.pad_token_id, gc.bos_token_id = DECODER_START, EOS, PAD, BOS
+
+    # the traps, checked on the built modules rather than on the config
+    enc = student.model.encoder
+    assert enc.input_scale == 1.0, "scale_input must be False (the teacher's)"
+    for layer in enc.layers:
+        a = layer.self_attn
+        assert (a.head_dim, a.num_key_value_groups) == (shape.enc_hidden // shape.enc_heads, 1), (a.head_dim, shape)
+    for layer in dec.layers:
+        for a in (layer.self_attn, layer.encoder_attn):
+            assert (a.head_dim, a.num_key_value_groups) == (shape.dec_hidden // shape.dec_heads, 1), (a.head_dim, shape)
+    total = sum(p.numel() for p in student.parameters())
+    assert total == closed_form_params(cfg), (total, closed_form_params(cfg))
+    if name in SCRATCH_EXPECTED_PARAMS:
+        assert total == SCRATCH_EXPECTED_PARAMS[name], (name, total, SCRATCH_EXPECTED_PARAMS[name])
     return student.eval()
 
 
