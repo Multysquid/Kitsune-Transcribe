@@ -229,7 +229,8 @@ _CER = ("cer_ref_corpus|cer_ref_mean|cer_teacher_corpus|cer_teacher_mean|ratio_v
         "teacher_trunc_rate")  # not the CER denominators (_CER_DEN)
 _CER_DEN = "ref_chars|cer_teacher_chars"  # characters of the reference / of the teacher's hypothesis: counts
 _EVAL_OPS = "wall_s|rtf|tok_per_s|audio_s|n_bad_audio|n_utts|n_tok|n"  # eval/<kind>/<m>: cost and counts
-_EVAL_SET_OPS = "audio_s|tok_per_s|n|n_tok|n_utts|n_missing_teacher|n_empty_ref"  # eval/<kind>/<set>/<m>
+# eval/<kind>/<set>/<m> (n_bad_audio: a set's undecodable rows, evaluate.flatten's bad_audio_per_set)
+_EVAL_SET_OPS = "audio_s|tok_per_s|n|n_tok|n_utts|n_missing_teacher|n_empty_ref|n_bad_audio"
 _TOK_DIAG = (r"student_entropy_coarse|student_tail|teacher_entropy_coarse|teacher_tail|teacher_p1|frac_p1_gt_0\.99|"
              r"frac_p1_lt_0\.9")
 _SET = r"(?P<set>[^/]+)"

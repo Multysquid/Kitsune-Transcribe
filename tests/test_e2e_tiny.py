@@ -645,6 +645,32 @@ def test_a_source_that_cannot_be_decoded_fails_the_smoke(env, hub, monkeypatch):
     assert not any(e["kind"] == "checkpoint" and e.get("reason") == "after_smoke" for e in ev)
 
 
+def test_undecodable_eval_rows_are_reported_and_named_in_the_verdict(env, hub, monkeypatch):
+    """An eval row the dataset cannot decode is left out of every eval (one bad file must not end a paid run), but not
+    silently: each eval that lost it writes an `eval_dropped_audio` event with the counts per set and the ids, and the
+    verdict says the gate set was judged on fewer rows than its full size."""
+    from kitsune import trainset
+
+    m = load_script("04_distill")
+    bad = min(i for i, u in env["fc"].utts.items() if u.source == "eval_cv8")
+    real_bytes = trainset.AudioBatchDataset.audio_bytes
+    monkeypatch.setattr(trainset.AudioBatchDataset, "audio_bytes",
+                        lambda self, i: b"not audio" if self.ids[i] == bad else real_bytes(self, i))
+    assert m.main(["--config", str(env["config"]), "--set", "run_name=tiny-evaldrop", "--set", "smoke.enabled=false",
+                   "--set", "schedule.max_steps=2", "--set", "eval.every_steps=1000", "--set", "hf.output_repo=null",
+                   "--set", "ckpt.weights_every_steps=1000", "--set", "ckpt.full_every_steps=1000"]) == 0
+    run = next((env["root"] / "runs").glob("tiny-evaldrop-*"))
+    drops = [e for e in events(run) if e["kind"] == "eval_dropped_audio"]
+    assert [(e["at_step"], e["final"]) for e in drops] == [(0, False), (2, True)]  # the step-0 eval, the final one
+    for e in drops:  # teacher-forced on every eval row at each eval
+        assert e["n"]["tf"] == 1 and e["per_set"]["tf"] == {"eval_cv8": 1} and e["ids"]["tf"] == [bad]
+    assert drops[-1]["per_set"]["greedy_full"] == {"eval_cv8": 1} and drops[-1]["ids"]["greedy_full"] == [bad]
+    v = json.loads((run / "summary.json").read_text(encoding="utf-8"))["verdict"]
+    assert v["sets"]["eval_cv8"]["n"] == 5 and v["sets"]["eval_cv8"]["n_bad_audio"] == 1
+    assert v["sets"]["eval_jsut"]["n"] == 6 and v["sets"]["eval_jsut"]["n_bad_audio"] == 0
+    assert "eval_cv8: judged on 5 decoded rows, 1 undecodable (not the pre-registered full set)" in v["reasons"]
+
+
 def test_skipped_steps_and_dropped_audio_are_logged_with_ids(env, hub, monkeypatch):
     """A non-finite gradient (injected at step 2) and an undecodable file (reported at step 1) leave events that name
     the utterances, so they can be found afterwards."""

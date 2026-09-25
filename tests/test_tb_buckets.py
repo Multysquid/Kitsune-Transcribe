@@ -58,7 +58,7 @@ CER_DEN = {"ref_chars", "cer_teacher_chars"}  # CER denominators: counts
 TOK_DIAG = {"student_entropy_coarse", "student_tail", "teacher_entropy_coarse", "teacher_tail", "teacher_p1",
             "frac_p1_gt_0.99", "frac_p1_lt_0.9"}
 EVAL_COST = {"wall_s", "rtf", "tok_per_s", "audio_s", "n_bad_audio", "n_utts", "n_tok", "n"}
-SET_COST = {"audio_s", "tok_per_s", "n", "n_tok", "n_utts", "n_missing_teacher", "n_empty_ref"}
+SET_COST = {"audio_s", "tok_per_s", "n", "n_tok", "n_utts", "n_missing_teacher", "n_empty_ref", "n_bad_audio"}
 SECTION = {("tf", "loss"): "val_loss", ("tf", "top1"): "val_accuracy", ("greedy", "cer"): "val_accuracy",
            ("greedy_full", "cer"): "val_accuracy_full", ("probe", "loss"): "train_probe_loss",
            ("probe", "top1"): "train_probe_accuracy", ("probe_greedy", "cer"): "train_probe_accuracy"}
@@ -209,6 +209,7 @@ SPOT = [
      "1_operational/eval/mini/probe_greedy/all/cer_teacher_chars"),
     ("eval/mini/greedy/rtf", "scalars", "1_operational/eval/mini/greedy/rtf"),
     ("eval/mini/tf/eval_jsut/n_tok", "scalars", "1_operational/eval/mini/tf/eval_jsut/n_tok"),
+    ("eval/mini/tf/eval_cv8/n_bad_audio", "scalars", "1_operational/eval/mini/tf/eval_cv8/n_bad_audio"),
     ("eval/mini/wall_s", "scalars", "1_operational/eval/mini/wall_s"),
     ("eval/mini/probe/all/student_tail", "scalars", "3_misc/eval/mini/probe/all/student_tail"),
     ("eval/greedy/eval_cv8/cer_teacher_edits", "scalars", "2_loss_accuracy/val_accuracy/eval_cv8/cer_teacher_edits"),
@@ -251,6 +252,8 @@ SPOT = [
     ("opt/lr", "scalars", "1_operational/opt/lr"),
     ("eval/epoch", "scalars", "1_operational/progress/epoch"),
     ("eval/greedy_full/rtf", "scalars", "1_operational/eval/greedy_full/rtf"),
+    ("eval/greedy_full/eval_cv8/n_bad_audio", "scalars",
+     "1_operational/eval/greedy_full/eval_cv8/n_bad_audio"),
     ("eval/tf/eval_jsut/n_tok", "scalars", "1_operational/eval/tf/eval_jsut/n_tok"),
     ("eval/wall_s", "scalars", "1_operational/eval/wall_s"),
     ("events/oom_fallback", "text", "1_operational/events/oom_fallback"),

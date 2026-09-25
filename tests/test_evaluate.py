@@ -168,6 +168,26 @@ def test_verdict_trends_leave_out_the_untrained_step_0_eval():
         assert not any("still improving" in r or "CER flat" in r for r in v["reasons"])
 
 
+def test_verdict_reports_undecodable_gate_rows():
+    """A gate set some of whose audio did not decode is judged on the rows that did (the teacher on the same ids): the
+    tier stays the same, but per_set carries n and n_bad_audio and a reason says it is not the pre-registered full set
+    (a monitor-only set's drops are not a gate matter)."""
+    fin = final((1.1, 1.15, 1.6), n=3810)
+    base = ev.verdict(dict(final=fin, history=history(FALLING, KL_DOWN, PROBE_DOWN)))
+    v = ev.verdict(dict(final=dict(fin, n_bad_audio=675, bad_audio_per_set={"eval_cv8": 673, "eval_emilia": 2}),
+                        history=history(FALLING, KL_DOWN, PROBE_DOWN)))
+    assert v["verdict"] == base["verdict"] == "GO" and v["n_sets_go"] == base["n_sets_go"]
+    assert v["sets"]["eval_cv8"]["n"] == 3810 and v["sets"]["eval_cv8"]["n_bad_audio"] == 673
+    assert v["sets"]["eval_jsut"]["n"] == 3810 and v["sets"]["eval_jsut"]["n_bad_audio"] == 0
+    assert [r for r in v["reasons"] if "undecodable" in r] == [
+        "eval_cv8: judged on 3810 decoded rows, 673 undecodable (not the pre-registered full set)"]
+    assert not any("undecodable" in r for r in base["reasons"])
+    # a gate set none of whose rows decoded has no final result at all; the reason says why
+    sets = {s: d for s, d in fin["sets"].items() if s != "eval_reazon"}
+    v = ev.verdict(dict(final=dict(sets=sets, bad_audio_per_set={"eval_reazon": 5}), history=[]))
+    assert "eval_reazon: no final greedy result (5 undecodable rows)" in v["reasons"]
+
+
 def test_eval_record_and_flatten():
     tf = dict(sets={"eval_jsut": dict(kl=0.2, ce=0.3, top1=0.9, n_tok=10)}, all=dict(kl=0.2, ce=0.3, top1=0.9),
               wall_s=1.5, bad_audio=["x"])
@@ -177,6 +197,10 @@ def test_eval_record_and_flatten():
     flat = ev.flatten(tf, "eval_tf")
     assert flat["eval_tf/eval_jsut/kl"] == 0.2 and flat["eval_tf/all/top1"] == 0.9 and flat["eval_tf/wall_s"] == 1.5
     assert not any("bad_audio" in k for k in flat)
+    # the per-set undecodable counts sit next to each set's other counts (only for a set that lost a row)
+    flat = ev.flatten(dict(tf, n_bad_audio=3, bad_audio_per_set={"eval_cv8": 3}), "eval/tf")
+    assert flat["eval/tf/n_bad_audio"] == 3.0 and flat["eval/tf/eval_cv8/n_bad_audio"] == 3.0
+    assert not any("per_set" in k for k in flat) and "eval/tf/eval_jsut/n_bad_audio" not in flat
 
 
 # ------------------------------------------------------------------------------------------------ teacher baselines
@@ -332,6 +356,29 @@ def test_teacher_forced_self_consistency(self_store, featurizer):
     ids = [u.id for u in self_store.utts][:3]
     sub, sub_utt = ev.teacher_forced_eval(model, self_store, featurizer, "cpu", batch_s=3.0, ids=ids)
     assert sorted(sub_utt["id"]) == sorted(ids)
+
+
+def test_evals_count_undecodable_rows_per_set(self_store, featurizer, tokenizer, monkeypatch):
+    """An eval row whose audio does not decode is dropped by the dataset; both evals count it per set
+    (bad_audio_per_set, which the verdict reads for the gate sets) and score the rest."""
+    from kitsune.trainset import AudioBatchDataset
+
+    bad = next(u.id for u in self_store.utts if u.source == "eval_cv8")
+    ids = [bad, *[u.id for u in self_store.utts if u.id != bad][:3]]
+    real = AudioBatchDataset.audio_bytes
+    monkeypatch.setattr(AudioBatchDataset, "audio_bytes",
+                        lambda ds, i: b"not audio" if ds.ids[i] == bad else real(ds, i))
+    model = tiny_model(0)
+    tf, tf_utt = ev.teacher_forced_eval(model, self_store, featurizer, "cpu", batch_s=3.0, ids=ids)
+    gr, gr_utt = ev.greedy_eval(model, self_store, ids, featurizer, "cpu", batch_s=3.0, tokenizer=tokenizer)
+    for summary, per_utt in ((tf, tf_utt), (gr, gr_utt)):
+        assert summary["n_bad_audio"] == 1 and summary["bad_audio"] == [bad]
+        assert summary["bad_audio_per_set"] == {"eval_cv8": 1}
+        assert sorted(per_utt["id"]) == sorted(ids[1:])
+    assert ev.flatten(tf, "eval/tf")["eval/tf/eval_cv8/n_bad_audio"] == 1.0
+    monkeypatch.setattr(AudioBatchDataset, "audio_bytes", real)
+    clean, _ = ev.teacher_forced_eval(model, self_store, featurizer, "cpu", batch_s=3.0, ids=ids)
+    assert clean["n_bad_audio"] == 0 and clean["bad_audio_per_set"] == {}
 
 
 def manual_greedy(model, featurizer, wave, max_new, eos=3):

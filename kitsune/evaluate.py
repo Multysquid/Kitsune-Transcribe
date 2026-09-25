@@ -26,6 +26,7 @@ as in training and in the teacher pass (a bf16 head moves argmax on near-ties).
 import json
 import math
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from functools import lru_cache
@@ -139,6 +140,15 @@ def _prefetched(ds: AudioBatchDataset, batches: list[list[int]], threads: int = 
             yield item
 
 
+def _bad_audio_per_set(store, dropped: list[str]) -> dict[str, int]:
+    """The undecodable utterances of an eval per source (set): the summaries' bad_audio_per_set, which the verdict
+    reports for a gate set judged on fewer rows than its full size. Only sets that lost a row appear."""
+    if not dropped:
+        return {}
+    src = {u.id: u.source for u in store.utts}
+    return dict(sorted(Counter(src.get(i, "?") for i in dropped).items()))
+
+
 def _features(featurizer, item: dict, device) -> tuple[torch.Tensor, torch.Tensor]:
     wave = item["wave"].to(device, non_blocking=True)
     lengths = item["lengths"].to(device)
@@ -250,7 +260,8 @@ def teacher_forced_eval(model, store, featurizer, device, batch_s: float = 400.0
 
     df = pd.DataFrame(recs)
     per_utt = _tf_per_utt(df)
-    summary = dict(sets={}, n_utts=len(df), n_bad_audio=len(dropped), bad_audio=dropped[:50], wall_s=time.time() - t0)
+    summary = dict(sets={}, n_utts=len(df), n_bad_audio=len(dropped), bad_audio=dropped[:50],
+                   bad_audio_per_set=_bad_audio_per_set(store, dropped), wall_s=time.time() - t0)
     if len(df):
         for src, g in df.groupby("source", sort=True):
             summary["sets"][src] = _tf_summarise(g, per_utt.loc[g.index])
@@ -354,7 +365,8 @@ def greedy_eval(model, store, ids: Iterable[str] | None, featurizer, device, bat
     per_utt = pd.DataFrame(recs, columns=cols)
     wall = time.time() - t0
     audio_s = float(per_utt["duration"].sum()) if len(per_utt) else 0.0
-    return summarise_greedy(per_utt, n_bad_audio=len(dropped), bad_audio=dropped[:50], wall_s=wall,
+    return summarise_greedy(per_utt, n_bad_audio=len(dropped), bad_audio=dropped[:50],
+                            bad_audio_per_set=_bad_audio_per_set(store, dropped), wall_s=wall,
                             rtf=wall / audio_s if audio_s else float("nan")), per_utt
 
 
@@ -408,7 +420,8 @@ def pick_samples(per_utt: pd.DataFrame, n: int = 8, seed: int = 0) -> list[dict]
 
 def flatten(summary: dict, prefix: str) -> dict[str, float]:
     """Eval summary -> {"prefix/<set>/key": number, "prefix/all/key": ..., "prefix/wall_s": ...} for
-    RunLogger.scalars (non-numeric leaves such as bad_audio are dropped)."""
+    RunLogger.scalars (non-numeric leaves such as bad_audio are dropped). bad_audio_per_set becomes
+    "prefix/<set>/n_bad_audio", next to the set's other counts (only for a set that lost a row)."""
     out = {}
 
     def walk(d, p):
@@ -418,9 +431,11 @@ def flatten(summary: dict, prefix: str) -> dict[str, float]:
             elif isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
                 out[f"{p}/{k}"] = float(v)
 
-    walk({k: v for k, v in summary.items() if k != "sets"}, prefix)
+    walk({k: v for k, v in summary.items() if k not in ("sets", "bad_audio_per_set")}, prefix)
     for s, d in summary.get("sets", {}).items():
         walk(d, f"{prefix}/{s}")
+    for s, k in (summary.get("bad_audio_per_set") or {}).items():
+        out[f"{prefix}/{s}/n_bad_audio"] = float(k)
     return out
 
 
@@ -516,7 +531,8 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
             overfit_rel: float = 0.01) -> dict:
     """Gate D32a, pre-registered.
 
-    results = {"final":   greedy_eval summary of the FULL eval sets at the end of the run,
+    results = {"final":   greedy_eval summary of the FULL eval sets at the end of the run (its bad_audio_per_set:
+                          the rows that could not be decoded, per set),
                "history": [eval_record(...), ...],
                "teacher": optional {set: teacher corpus CER} (default: teacher CER on the same ids from "final",
                           else the pre-registered numbers)}
@@ -534,15 +550,20 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     times the teacher's, held-out KL ~5) would dominate any window that reaches it - every history of <= 3 records
     with per-epoch evals - forcing "improving" and hiding over-fitting. Trends are least-squares changes across that
     window relative to the window mean (the gap: relative to the mean held-out KL); the thresholds are returned with
-    the verdict."""
-    fsets = (results.get("final") or {}).get("sets", {})
+    the verdict. A gate set some of whose audio could not be decoded is judged on the rows that decoded (the teacher
+    CER on the same ids by default, so the ratio stays paired); per_set carries n and n_bad_audio, and a reason says
+    it was not the pre-registered full set. The tiers do not change."""
+    fin = results.get("final") or {}
+    fsets = fin.get("sets", {})
+    bad = fin.get("bad_audio_per_set") or {}
     tover = results.get("teacher") or {}
     reasons, per_set = [], {}
     n_go = n_prom = n_out = n_trunc = 0
     for s in GATE_SETS:
         d = fsets.get(s)
+        k = int(bad.get(s, 0))
         if d is None:
-            reasons.append(f"{s}: no final greedy result")
+            reasons.append(f"{s}: no final greedy result" + (f" ({k} undecodable rows)" if k else ""))
             continue
         tc = d.get("teacher_cer_ref_corpus")
         if s in tover:
@@ -560,7 +581,11 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
         n_trunc += int(d["n_truncated"])
         per_set[s] = dict(student=student, teacher=teacher, teacher_source=src, ratio=ratio,
                           teacher_prereg=TEACHER_CER_PREREG[s], baseline_drift=teacher - TEACHER_CER_PREREG[s],
-                          threshold_go=go_ratio * teacher, threshold_promising=promising_ratio * teacher)
+                          threshold_go=go_ratio * teacher, threshold_promising=promising_ratio * teacher,
+                          n=int(d["n"]), n_bad_audio=k)
+        if k:
+            reasons.append(f"{s}: judged on {int(d['n'])} decoded rows, {k} undecodable (not the pre-registered "
+                           f"full set)")
     trunc_rate = n_trunc / n_out if n_out else float("nan")
     trunc_ok = n_out > 0 and trunc_rate <= max_trunc
 

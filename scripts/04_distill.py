@@ -1546,6 +1546,14 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
         gr_sum, gr_df = ev.greedy_eval(R.model, R.evalstore, R.greedy_ids, R.feat_eval, R.device, bs,
                                        tokenizer=R.tokenizer, amp=R.amp)
     assert_bn_frozen(R.model)
+    # rows the dataset could not decode are left out of these numbers (and of the verdict's gate sets, which says
+    # so): the eval-side twin of train_step's `dropped_audio` event
+    bad = {k: s for k, s in (("tf", tf_sum), ("probe", probe_sum), ("greedy", gr_sum), ("greedy_full", full_sum),
+                             ("probe_greedy", pg_sum)) if s and s.get("n_bad_audio")}
+    if bad:
+        log.event("eval_dropped_audio", at_step=step, final=final, n={k: int(s["n_bad_audio"]) for k, s in bad.items()},
+                  per_set={k: s.get("bad_audio_per_set", {}) for k, s in bad.items()},
+                  ids={k: s.get("bad_audio", []) for k, s in bad.items()})
 
     for src, g in tf_df.groupby("source", sort=True):
         log.table(f"tf_{src}", g.reset_index(drop=True), step)
