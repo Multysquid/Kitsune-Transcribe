@@ -463,17 +463,25 @@ The selection's `selection_recipe.study` block adds, after the label box's judge
 (rows in both label roots only), `f1a_disagree` (CER of the Cohere vs Parakeet TDT hypotheses > 0.5), `eval_dup` (a
 reference or Cohere hypothesis equal to an eval reference of >= 15 characters), `ctc_infeasible` and `not_drawn` (a
 seeded 3,600,000 s draw pooled over the sources; `keep` = drawn). Eval sets keep every row present in both roots.
-Next to `study_1000h.parquet` it writes, with no timestamp (a rebuild gives the same bytes), `study_1000h.json`
-(hours per source after each rule, the draw, `ids_sha256` of the train list, the probe and each eval set, the Galgame
-views, the teachers' baselines on the manifest rows and, per capped source, the pool had it been capped at N: the
-reazon_large cap is the smallest N whose pool holds >= 1,010 h) and `study_manifest.json` (per eval set the ordered ids
-and their sha256; the Galgame views `neutral` from the laptop's `second_out/galgame/eval-00000.jsonl`, `all` and
-`label_box`). Upload all three. `launch.py` refuses a study selection built with another recipe, any eval row without
-Parakeet labels (K6), more than 0.1 % of its train rows in `teacher_out` only (K5), or a missing sidecar or manifest.
+Next to `study_1000h.parquet` it writes, with no timestamp and no machine path (a rebuild from any checkout or output
+directory gives the same bytes with the same pyarrow; the parquet records the config's own roots and the content
+hashes of the extent record and the kotoba file), `study_1000h.json` (hours per source after each rule, the draw,
+`ids_sha256` of the train list, the probe and each eval set, the Galgame views, the teachers' baselines `cohere`,
+`parakeet-ctc` and `parakeet-tdt` per scoring stratum and M4, and the pool had reazon_large been capped at N, with the
+cap rule's readout: the smallest N whose pool holds >= 1,010 h) and `study_manifest.json` (per eval set the ordered
+ids and their sha256; the Galgame views `neutral` from the laptop's `second_out/galgame/eval-00000.jsonl`, `all` and
+`label_box`). If the build reports that the configured reazon_large cap is not the rule's, set
+`extent.inputs.reazon_large` in `study/data.json` to the rule's N and build again. Upload all three; the study box
+pulls all three (`pull_plan`). `launch.py` refuses a study selection built with another recipe or seed than the
+pre-registered ones, any eval row without Parakeet labels (K6), more than 0.1 % of its train rows in `teacher_out`
+only (K5), or a missing sidecar or manifest.
 `kitsune/prereg.py` holds the rules (`study/PREREG.{json,md}`, committed before the study box starts; the fields that
-need the sealed labels stay `pending` until the command above fills them) and the functions the box derives its
-numbers with: `max_steps` (calibration), `choose_lr` (the edge rule) and `write_numbers` (`PREREG_numbers.json`, its
-sha256 logged before the first study step).
+need the sealed labels stay `pending` until the command above fills them, and the fill refuses a sidecar whose
+sources, eval sets, recipe, seed, extent or reazon_large cap are not the registered ones) and the functions the box
+derives its numbers with: `max_steps` (calibration; the replicate takes study-t01's), `choose_lr` (the edge rule) and
+`write_numbers` (`PREREG_numbers.json`, strict JSON, its sha256 logged before the first study step). The rules'
+`analysis`, `manifest` and `baselines` blocks are the form `kitsune.study_stats` reads
+(`tools/study_report.py --prereg study/PREREG.json`).
 
 ### HF storage
 
