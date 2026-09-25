@@ -954,6 +954,34 @@ def test_supervise_early_failure_stops_without_resume(tmp_path, monkeypatch):
     assert "before step 100" in state["final"]["reason"]
 
 
+def test_supervise_never_credits_a_rearmed_attempt_with_the_old_run(tmp_path, monkeypatch):
+    """After --rearm the old run dir (step 5000, a full state) stays under runs/ while supervise.json starts afresh; a
+    new trainer that dies before writing its config.json failed before step 100, it is not the old run to resume."""
+    old = tmp_path / "runs" / "viability-b20x2560-20260923T000000Z"
+    (old / "metrics").mkdir(parents=True)
+    (old / "config.json").write_text("{}", encoding="utf-8")
+    (old / "metrics" / "scalars.jsonl").write_text(json.dumps({"step": 5000, "tag": "x", "value": 0}) + "\n")
+    (old / "checkpoints" / "full_step_5000").mkdir(parents=True)
+    day_ago = time.time() - 86400
+    for p in (old / "config.json", old):
+        os.utime(p, (day_ago, day_ago))
+    calls, finishes = [], []
+
+    def dies_at_import(argv, env):
+        calls.append(list(argv))
+        (tmp_path / "runs" / "viability-b20x2560-20260925T000000Z").mkdir()  # build() mkdirs before RunLogger
+        return 1
+
+    monkeypatch.setattr(supervise, "run_trainer", dies_at_import)
+    monkeypatch.setattr(supervise, "call_finish", lambda args, timeout=None: finishes.append(list(args)) or 0)
+    state_path = tmp_path / "state" / "supervise.json"
+    supervise.supervise("configs/viability.json", None, tmp_path / "runs", ["python", "04.py"], state_path)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(calls) == 1 and [f[0] for f in finishes] == ["--sync-only", "--stop"]
+    assert state["attempts"][0]["run_dir"] is None and state["attempts"][0]["step"] == 0
+    assert "before step 100" in state["final"]["reason"]
+
+
 def test_supervise_late_failure_without_full_state_stops(tmp_path, monkeypatch):
     rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [(1, 400, False)])
     assert len(trainer.argvs) == 1 and finishes[-1][0] == "--stop"

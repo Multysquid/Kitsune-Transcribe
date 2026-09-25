@@ -83,11 +83,13 @@ def decide(rc: int | None, step: int, n_failures: int, full_state: Path | None) 
 
 
 def find_run_dir(runs_root: Path, since: float) -> Path | None:
-    """The run dir the trainer created or touched since `since` (newest config.json wins)."""
+    """The run dir the trainer created or touched since `since` (newest config.json wins), else None. Never an older
+    one: after --rearm the previous run's dirs (and full states) stay under runs/, and a fresh attempt that died
+    before writing its config.json would otherwise be credited with the old run's step and resumed from its state."""
     if not runs_root.is_dir():
         return None
     cands = [d for d in runs_root.iterdir() if d.is_dir() and (d / "config.json").exists()]
-    cands = [d for d in cands if max((d / "config.json").stat().st_mtime, d.stat().st_mtime) >= since - 5] or cands
+    cands = [d for d in cands if max((d / "config.json").stat().st_mtime, d.stat().st_mtime) >= since - 5]
     return max(cands, key=lambda d: (d / "config.json").stat().st_mtime) if cands else None
 
 
