@@ -22,8 +22,10 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                `lr_phase` event), L2-SP after every optimizer step,
                gradients clipped (the pre-clip norm is logged). The first smoke.steps steps are the smoke run: at most
                smoke.max_dropped_frac of their rows undecodable, finite losses, the loss trend, and throughput -
-               below smoke.min_audio_s_per_s audio-s/s the run exits with code 3 (ThroughputTooLow). A full state is
-               written right after them, and before the cooldown starts.
+               below smoke.min_audio_s_per_s audio-s/s the run exits with code 3 (ThroughputTooLow). ~20 of them run
+               under torch.profiler (perf.profile_smoke, on under CUDA: smoke_profiler; runs/<run_id>/smoke/profile/,
+               left out of the throughput check). A full state is written right after them, and before the cooldown
+               starts.
                Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
                sets, verdict (kitsune.evaluate.verdict with eval.verdict_version's trend definition, verdict_options,
@@ -248,9 +250,11 @@ DEFAULTS = {
     "batch": {"step_audio_s": 1500, "micro_audio_s": 400, "pool_micro": 50, "max_dec_len": 200},
     "memory": {"grad_ckpt": "auto", "probe_longest_bucket": True, "min_micro_audio_s": 100, "max_oom_skips": 3},
     # loader_timeout_s: seconds the loop waits for a worker micro-batch before it raises (a crash the supervisor can
-    # resume) instead of hanging until the watchdog; 0 = wait forever (trainset.make_loader)
+    # resume) instead of hanging until the watchdog; 0 = wait forever (trainset.make_loader). profile_smoke: a
+    # torch.profiler record of ~20 smoke steps into runs/<run_id>/smoke/profile/ (kitsune.profiling, smoke_profiler);
+    # "auto" = on under CUDA, off on CPU; it does not change what the run trains
     "perf": {"relpos_patch": True, "compile": False, "num_workers": "auto", "prefetch": 4, "tf32": True,
-             "peak_tflops": 312.0, "train_exact_dither": False, "loader_timeout_s": 600},
+             "peak_tflops": 312.0, "train_exact_dither": False, "loader_timeout_s": 600, "profile_smoke": "auto"},
     # every_epochs: eval at the end of every N-th epoch instead of every_min / every_steps. full_every_epochs: the
     # same, but each of those evals decodes the COMPLETE eval sets greedily (as the final eval does) instead of the
     # greedy subset; set one of the two. probe_is_train: the probe is the whole train set (a small subset) rather than
@@ -382,6 +386,8 @@ def validate(cfg: dict):
     if not (_number(cfg["perf"]["loader_timeout_s"]) and cfg["perf"]["loader_timeout_s"] >= 0):
         raise SystemExit(f"perf.loader_timeout_s must be a number of seconds >= 0 (0: no timeout), got "
                          f"{cfg['perf']['loader_timeout_s']}")
+    if not (cfg["perf"]["profile_smoke"] == "auto" or isinstance(cfg["perf"]["profile_smoke"], bool)):
+        raise SystemExit(f"perf.profile_smoke must be 'auto', true or false, got {cfg['perf']['profile_smoke']!r}")
     sm = cfg["smoke"]
     if not (isinstance(sm["decode_per_set"], int) and not isinstance(sm["decode_per_set"], bool)
             and sm["decode_per_set"] >= 0):
@@ -2509,6 +2515,27 @@ def memory_probe(R: Run) -> dict:
             raise torch.OutOfMemoryError(f"OOM even at micro_audio_s={micro} with grad_ckpt={ckpt}: {err}")
 
 
+def smoke_profiler(R: Run, smoke_n: int):
+    """perf.profile_smoke ("auto": on under CUDA only): a kitsune.profiling.SmokeProfiler over ~20 real training steps
+    of the smoke phase (profiling.profile_window: after its warm-up steps, inside smoke.steps), writing under
+    runs/<run_id>/smoke/profile/ and logging `smoke_profile` events - the evidence for where the first A100 run's fixed
+    cost per micro-batch goes, before any change for speed. CPU runs record CPU activities only. None when it is off,
+    the smoke phase is off or too short to record a step (a `smoke_profile` event says so), or this launch starts
+    past the window (a resume)."""
+    ps = R.cfg["perf"]["profile_smoke"]
+    if not (R.device.type == "cuda" if ps == "auto" else ps) or not smoke_n or R.st["smoke_done"]:
+        return None
+    from kitsune import profiling
+
+    win = profiling.profile_window(smoke_n)
+    if win is None:
+        R.log.event("smoke_profile", skipped=f"smoke.steps {smoke_n} is too few to record a step after the warm-up")
+        return None
+    if R.st["step"] >= win[0]:
+        return None
+    return profiling.SmokeProfiler(R.run_dir / "smoke" / "profile", R.device, *win, emit=R.log.event)
+
+
 def smoke_end(R: Run):
     """After the first smoke.steps steps: at most smoke.max_dropped_frac of the rows undecodable (a failure only the
     loader's worker processes hit; decode_preflight covers the main process), finite, falling loss and enough
@@ -2873,6 +2900,7 @@ def loop(R: Run):
                 or (R.run_dir / STOP_FILE).exists())
 
     per_epochs = epoch_cadence(cfg)  # evals at epoch ends (every_epochs / full_every_epochs), else every_min / _steps
+    prof = smoke_profiler(R, smoke_n)  # perf.profile_smoke: ~20 steps of the smoke phase under torch.profiler
 
     fit_budget(R)
     log.event("phase", name="train", at_step=R.st["step"], workers=nw, micro_audio_s=R.planner.micro_audio_s,
@@ -2901,6 +2929,7 @@ def loop(R: Run):
             if phase != R.st.get("lr_phase"):
                 log.event("lr_phase", at_step=step, phase=("warmup", "stable", "cooldown")[phase], lr=lr, t=t, T=T)
                 R.st["lr_phase"] = phase
+            profiled = prof is not None and prof.begin(step)  # this step runs under the smoke profiler
             t0 = time.perf_counter()
             if R.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
@@ -2916,17 +2945,22 @@ def loop(R: Run):
             out = train_step(R, step, lr, mbs, e)
             R.planner.step_done(e, s)
             if out is None:
+                if profiled:  # the profiler saw the skipped step too: it counts as one of its steps
+                    prof.end(step, wait, None, len(mbs))
                 continue
             if R.device.type == "cuda":
                 torch.cuda.synchronize()
             step_s = time.perf_counter() - t0
             R.st["step"] = step
             objective = log_step(R, step, lr, phase, out, wait, step_s, e, s)
+            if profiled:  # after the step's logging, part of its per-step cost; the summary is written at the last
+                prof.end(step, wait, step_s, out["n_micro"])
             es = R.st["early_stop"]
             es["loss_sum"], es["loss_n"] = es["loss_sum"] + float(objective), es["loss_n"] + 1  # metric "train_loss"
             if not R.st["smoke_done"] and smoke_n:
                 R.st["smoke_losses"].append(float(objective))
-                if step > max(1, smoke_n // 10):  # the first steps pay for worker start-up and kernel autotuning
+                # the first steps pay for worker start-up and kernel autotuning, the profiled ones for the profiler
+                if step > max(1, smoke_n // 10) and not profiled:
                     R.st["smoke_audio_s"] += out["audio_real"]
                     R.st["smoke_time_s"] += step_s
                 if step >= smoke_n:
@@ -2967,6 +3001,8 @@ def loop(R: Run):
                 save_full(R, step, "periodic")
             log.sync()
     finally:
+        if prof is not None:  # the loop ended (or failed) inside the profiled window: what it recorded, never raises
+            prof.close()
         R.st["train_s"] = R.clock()
         R.loop_t0 = None
         loader.close()

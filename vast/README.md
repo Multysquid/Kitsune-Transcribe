@@ -186,7 +186,12 @@ gives up after `perf.loader_timeout_s` (10 min) and exits as a crash.
 
 In the output repo under `runs/<run_id>/`: `summary.json` (verdict and final metrics), `metrics/`, `evals/`, `tb/`
 (TensorBoard events), `events.jsonl`, `checkpoints/step_<N>/` (bf16 weights every 30 min), the full resume state from
-before the cooldown and at the end, and `infra/` (box logs; exported too). Convert to flat files with
+before the cooldown and at the end, and `infra/` (box logs; exported too). `smoke/profile/` holds a torch.profiler
+record of ~20 of the smoke steps (steps 22-41 of the 100; `perf.profile_smoke`, on under CUDA; it does not change what
+the run trains, and it costs about a minute): `summary.json` - per step the data-wait and GPU-kernel-time shares,
+kernel launches and aten ops per micro-batch, device syncs and the host scalar reads behind them, the top ops by self
+CUDA and self CPU time - and the first two recorded steps' raw trace, `trace_steps_<a>-<b>.json.gz` (gzip, dropped
+above 32 MB; open it in https://ui.perfetto.dev or chrome://tracing). The `smoke_profile` event has the headline. Convert to flat files with
 `python tools/export_run.py hf://Multy123/kitsune-runs/runs/<run_id> --out <dir>`, or run TensorBoard locally on
 a downloaded `tb/` (`python -m tensorboard.main --logdir <dir> --samples_per_plugin scalars=30000`, to see every step
 as on the box; the export's `combined_loss` table and `metrics/steps.parquet` hold every step too).
