@@ -1010,7 +1010,7 @@ def test_the_next_run_template_is_viability_with_the_reports_changes():
     raw = json.loads((ROOT / "configs" / "next_run_template.json").read_text(encoding="utf-8"))
     assert set(raw) == set(json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8")))
     c = raw["_comment"]
-    for words in ("template for the scaling study", "eval.verdict_version 2", "lr_phase stable",
+    for words in ("template for the scaling study", "TRAINER PART", "RUNS UNDER 8 EPOCHS", "eval.verdict_version 2", "lr_phase stable",
                   "trend: insufficient pre-cooldown evals", "cooldown_gain", "pre_cooldown_slope",
                   "taken before the de-duplication",
                   "eval.verdict_min_epoch_gap (0.25)", "batch.micro_audio_s 600", "does NOT shorten",

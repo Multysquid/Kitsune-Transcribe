@@ -117,10 +117,12 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
 ## The next runs: `configs/next_run_template.json`
 
 `configs/viability.json` (the default `--config`) is the first A100 run's config and stays as it was run; the rest of
-this README describes it. The scaling study's configs start from `configs/next_run_template.json`: copy it to
-`configs/<study>.json`, set `run_name`, the data (`student`, `sources`, `eval_sets`, `selection`, `selection_recipe`)
-and `schedule.epochs`, and rent with `--config configs/<study>.json`. It is viability.json with the first run's report
-recommendations (its `_comment` has the details and the arithmetic):
+this README describes it. The scaling study's configs combine two files: the DATA block (`teacher_root`,
+`second_root`, `parakeet_root`, `extent`, `student`, `sources`, `eval_sets`, `selection`, `selection_recipe`) from the
+label box's extent config (`configs/full_sub3k.json` or a subset derived from it, see "The label box" below) and the
+TRAINER settings from `configs/next_run_template.json`; then set `run_name` and `schedule.epochs` and rent with
+`--config configs/<study>.json`. The template is viability.json with the first run's report recommendations (its
+`_comment` has the details and the arithmetic):
 
 | key | viability.json (first run) | template | why |
 |---|---|---|---|
@@ -136,7 +138,8 @@ only), so size `schedule.epochs` to fit well inside `--max-hours`: steps per epo
 viability data) x ~1.05-1.25 s, plus ~4 min per complete eval, ~5 min for the smoke profile (estimated) and ~15 min
 of box overhead. Verdict v2 needs at least 3 complete evals before the cooldown: with a complete eval every 2 epochs
 and a 20 % cooldown that means 8 epochs or more (epochs 2, 4 and 6 before the cooldown at 6.4); with fewer it reports
-"trend: insufficient pre-cooldown evals".
+"trend: insufficient pre-cooldown evals". So runs under 8 epochs set `eval.full_every_epochs` 1 (the owner's decision
+for the scaling study: 4 epochs then give epochs 1-3 before the cooldown, for ~6 % more loop time).
 
 ## Watching it
 
