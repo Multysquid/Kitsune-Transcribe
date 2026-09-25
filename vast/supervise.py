@@ -23,7 +23,9 @@ records the OOM kills the container's cgroup counted while it ran (oom_kills; "(
 rc alone does not tell one that took a DataLoader worker from any other error. The attempt history lives in
 $KITSUNE_STATE/supervise.json, so if the container restarts in the middle of an attempt (host reboot) the interrupted
 attempt counts as a failure (its run dir is found again from its start time or its --resume path) and the same policy
-applies; once a final decision is recorded the supervisor never starts another run. finish.py writes its halt marker
+applies; once a final decision is recorded the supervisor never starts another run. The file is written with fsyncs
+(save_state), and one that does not read as a history anyway is moved aside and ends in a recorded stop, as the history
+it held (a final decision, a resume already used) is unknown. finish.py writes its halt marker
 ($KITSUNE_STATE/halt) only when it acts, after its sync and --destroy's verification, so a restart in between (a host
 reboot during the minutes-long upload) leaves a recorded decision and no marker; onstart.sh then boots the supervisor
 again, which runs that finish once more (it is idempotent: the Hub skips what it already has, then verify and act)
@@ -199,19 +201,49 @@ def final_finish(action: str, reason: str, dry: list[str]):
 
 
 def load_state(path: Path) -> dict:
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            log(f"{path} is corrupt; starting a fresh history")
-    return {"attempts": [], "final": None}
+    """The attempt history (none yet: a fresh one). A file that is not one - empty or NUL-filled after an unclean host
+    crash, torn bytes, a disk fault, a bad hand edit - is moved aside to <name>.corrupt-<unix time> and flagged
+    ("corrupt": where it went): the history it held is unknown (a final decision? a resume already used?), so
+    supervise() stops the box instead of starting a fresh run."""
+    if not path.exists():
+        return {"attempts": [], "final": None}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        why = None if isinstance(state, dict) and isinstance(state.get("attempts"), list) else "not an attempt history"
+    except ValueError as e:  # JSONDecodeError, and UnicodeDecodeError for bytes that are not UTF-8
+        why = f"{type(e).__name__}: {e}"
+    if why is None:
+        return state
+    aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+    path.replace(aside)
+    log(f"{path} is unreadable ({why[:200]}); moved to {aside}")
+    return {"attempts": [], "final": None, "corrupt": str(aside)}
+
+
+def _sync_dir(p: Path):
+    """fsync a directory, so a rename into it is on disk (POSIX; as scripts/04_distill.py _sync_dir). Windows cannot
+    open a directory for that (PermissionError); NTFS journals the rename itself."""
+    if os.name == "nt":
+        return
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def save_state(path: Path, state: dict):
+    """Written to a .tmp file, fsynced, renamed over supervise.json, the directory fsynced: an unclean host crash
+    right after a save leaves the old or the new history, never the empty or NUL-filled file a rename-over without
+    them can leave (kitsune/store.py fsync_path)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(state, indent=1))
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)
+    _sync_dir(path.parent)
 
 
 def acquire_lock(path: Path):
@@ -249,6 +281,14 @@ def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: lis
         return 0
     state = load_state(state_path)
     dry = ["--dry-run"] if dry_run else []
+    aside = state.pop("corrupt", None)
+    if aside:  # the history is unknown: stop (the disk stays for a human), never a fresh run
+        reason = f"supervise.json unreadable (moved to {aside}); attempt history unknown"
+        state["final"] = {"action": "stop", "reason": reason, "wall": time.time(), "corrupt_state": aside}
+        save_state(state_path, state)  # before acting: a restart replays this stop instead of finding no history
+        log(f"decision: stop ({reason})")
+        final_finish("stop", reason, dry)
+        return 1
     final = state.get("final")
     if final:
         log(f"a final decision is already recorded ({final}); not starting another run")

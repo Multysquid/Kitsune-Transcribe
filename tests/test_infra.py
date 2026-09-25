@@ -1130,6 +1130,37 @@ def test_supervise_never_reruns_after_final(tmp_path, monkeypatch):
     assert rc == 0 and trainer.argvs == [] and finishes == []
 
 
+@pytest.mark.parametrize("raw", [b"", b"\0" * 300, b'\xff\xfe{"att', b"null", b'{"final": null}'],
+                         ids=["empty", "nul", "not-utf8", "null", "no-attempts"])
+def test_supervise_unreadable_state_stops_instead_of_starting_a_fresh_run(tmp_path, monkeypatch, raw):
+    """A supervise.json that is not an attempt history (empty or NUL-filled after an unclean host crash, torn bytes,
+    other JSON) may have held a final decision or a used-up resume. It used to start a fresh run from step 0 (or, for
+    bytes that are not UTF-8, crash the supervisor); now it is moved aside, a stop is recorded before finish runs, and
+    a restart replays that stop without a trainer."""
+    state_path = tmp_path / "state" / "supervise.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_bytes(raw)
+    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(0, 500, True)])
+    assert rc == 1 and trainer.argvs == [] and [f[0] for f in finishes] == ["--stop"]
+    (aside,) = state_path.parent.glob("supervise.json.corrupt-*")
+    assert aside.read_bytes() == raw
+    assert state["attempts"] == [] and state["final"]["action"] == "stop" and "corrupt" not in state
+    assert state["final"]["corrupt_state"] == str(aside) and "unreadable" in state["final"]["reason"]
+    # a restart before finish wrote its halt marker runs that stop again, still no trainer
+    rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [(0, 500, True)])
+    assert rc == 0 and trainer.argvs == [] and [f[0] for f in finishes] == ["--stop"]
+
+
+def test_supervise_state_is_fsynced(tmp_path, monkeypatch):
+    """save_state fsyncs the file before the rename and (POSIX) the directory after it; Windows skips the directory."""
+    real, calls = os.fsync, []
+    monkeypatch.setattr(os, "fsync", lambda fd: calls.append(fd) or real(fd))
+    path = tmp_path / "state" / "supervise.json"
+    supervise.save_state(path, {"attempts": [], "final": None})
+    assert supervise.load_state(path) == {"attempts": [], "final": None}
+    assert len(calls) == (1 if os.name == "nt" else 2) and not path.with_suffix(".json.tmp").exists()
+
+
 def test_supervise_reruns_an_interrupted_final_finish(tmp_path, monkeypatch):
     """A host reboot during finish --destroy's upload leaves the recorded decision but no halt marker (finish.py writes
     it only once it acts): the rebooted supervisor runs that finish again, bounded, and never the trainer; without it
