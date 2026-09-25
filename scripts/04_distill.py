@@ -1055,12 +1055,13 @@ def _subset_dir(prefix: str, budget_s: float, seed: int, ids: list[str]) -> str:
     return f"{prefix}_{budget_s:g}s_s{seed}_{hashlib.sha256(chr(10).join(sorted(ids)).encode()).hexdigest()[:8]}"
 
 
-def setup_data(R: Run):
-    """Train/eval stores (cached under cache_dir, shared with 03's eval cache), probe and greedy ids, planner."""
-    cfg, log = R.cfg, R.log
-    sel, data, teach, cache = rpath(cfg["selection"]), rpath(cfg["data_root"]), rpath(cfg["teacher_root"]), rpath(cfg["cache_dir"])
+def train_store_spec(cfg: dict, log) -> tuple[str, list[str] | None]:
+    """The train store setup_data builds: its cache dir name under cache_dir and the ids it holds (None: every kept
+    train row of cfg["sources"]). subset.train_audio_s draws a seeded duration subset (a `subset` event with every
+    id), subset.train_utts a seeded one that starts with probe rows. scripts/05_evaluate.py takes its probe rows from
+    the same ids."""
+    sel, teach = rpath(cfg["selection"]), rpath(cfg["teacher_root"])
     sub, seed = cfg["subset"], int(cfg["seed"])
-    t0 = time.time()
     if sub["train_audio_s"] is not None:
         rows = trainset.read_selection(sel, cfg["sources"], ["train"])
         prompt_len = len(trainset._teacher_meta(teach)["prompt"])
@@ -1068,26 +1069,32 @@ def setup_data(R: Run):
         ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["train_audio_s"]),
                                 np.random.default_rng([seed, 11]))
         log.event("subset", split="train", sources=cfg["sources"], seed=seed, pool=len(rows), **rec)
-        R.train = trainset.build_stores(sel, data, teach, cache / _subset_dir("train", rec["budget_s"], seed, ids),
-                                        cfg["sources"], ["train"], ids=ids, log=print)
-    elif sub["train_utts"]:
+        return _subset_dir("train", rec["budget_s"], seed, ids), ids
+    if sub["train_utts"]:
         n = int(sub["train_utts"])
         rows = trainset.read_selection(sel, cfg["sources"], ["train"])
         rng = np.random.default_rng([seed, 1])
         probe = rows["id"][rows["in_probe"]].tolist()[: max(1, n // 4)]
         rest = _seeded_ids(rows["id"][~rows["id"].isin(probe)].tolist(), n - len(probe), rng)
-        R.train = trainset.build_stores(sel, data, teach, cache / f"train_sub{n}_s{seed}", cfg["sources"], ["train"],
-                                        ids=probe + rest, log=print)
-    else:
-        R.train = trainset.build_stores(sel, data, teach, cache / "train", cfg["sources"], ["train"], log=print)
+        return f"train_sub{n}_s{seed}", probe + rest
+    return "train", None
+
+
+def build_eval_store(cfg: dict, log) -> trainset.Stores:
+    """The eval store of cfg["eval_sets"] (cached under cache_dir, shared with 03's eval cache): every kept eval row,
+    or the seeded subset subset.eval_audio_s (pooled over the sets; a `subset` event) or subset.eval_utts_per_set
+    asks for. setup_data's, and scripts/05_evaluate.py's."""
+    sel, data, teach, cache = (rpath(cfg["selection"]), rpath(cfg["data_root"]), rpath(cfg["teacher_root"]),
+                               rpath(cfg["cache_dir"]))
+    sub, seed = cfg["subset"], int(cfg["seed"])
     if sub["eval_audio_s"] is not None:  # pooled over the eval sets
         rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
         ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["eval_audio_s"]),
                                 np.random.default_rng([seed, 12]))
         log.event("subset", split="eval", sources=cfg["eval_sets"], seed=seed, pool=len(rows), **rec)
-        R.evalstore = trainset.build_stores(sel, data, teach, cache / _subset_dir("eval", rec["budget_s"], seed, ids),
-                                            cfg["eval_sets"], ["eval"], ids=ids, log=print)
-    elif sub["eval_utts_per_set"]:
+        return trainset.build_stores(sel, data, teach, cache / _subset_dir("eval", rec["budget_s"], seed, ids),
+                                     cfg["eval_sets"], ["eval"], ids=ids, log=print)
+    if sub["eval_utts_per_set"]:
         n = int(sub["eval_utts_per_set"])
         rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
         rng = np.random.default_rng([seed, 2])
@@ -1096,10 +1103,50 @@ def setup_data(R: Run):
             r = rows[rows["source"] == s]
             greedy = _seeded_ids(r["id"][r["in_greedy_subset"]].tolist(), min(n, int(cfg["eval"]["greedy_subset"])), rng)
             ids += greedy + _seeded_ids(r["id"][~r["id"].isin(greedy)].tolist(), max(0, n - len(greedy)), rng)
-        R.evalstore = trainset.build_stores(sel, data, teach, cache / f"eval_sub{n}_s{seed}", cfg["eval_sets"],
-                                            ["eval"], ids=ids, log=print)
-    else:
-        R.evalstore = trainset.eval_store(sel, data, teach, cache / "eval", cfg["eval_sets"], log=print)
+        return trainset.build_stores(sel, data, teach, cache / f"eval_sub{n}_s{seed}", cfg["eval_sets"], ["eval"],
+                                     ids=ids, log=print)
+    return trainset.eval_store(sel, data, teach, cache / "eval", cfg["eval_sets"], log=print)
+
+
+def probe_greedy_subset(cfg: dict, probe_ids: list[str], duration: dict[str, float], log) -> list[str]:
+    """The probe rows greedy-decoded at every full eval (eval.probe_greedy_audio_s, else subset.eval_audio_s: a
+    seeded ~N s of the probe; none if both are null or the probe is empty), logged as a `subset` event. duration: id ->
+    seconds of every probe row."""
+    pg_budget = cfg["eval"]["probe_greedy_audio_s"]
+    pg_budget = cfg["subset"]["eval_audio_s"] if pg_budget is None else pg_budget
+    if pg_budget is None or not probe_ids:
+        return []
+    seed = int(cfg["seed"])
+    ids, rec = audio_subset(probe_ids, [duration[i] for i in probe_ids], float(pg_budget),
+                            np.random.default_rng([seed, 13]))
+    log.event("subset", split="probe_greedy", seed=seed, pool=len(probe_ids), **rec)
+    return ids
+
+
+def greedy_subset_ids(cfg: dict, evalstore) -> list[str]:
+    """The fixed greedy subset every full eval decodes (the complete-set evals take its summary from their rows): per
+    eval set its in_greedy_subset rows (all of a set without them), a seeded eval.greedy_subset of them if more; the
+    whole eval subset under subset.eval_audio_s."""
+    if cfg["subset"]["eval_audio_s"] is not None:
+        return [u.id for u in evalstore.utts]  # the whole (small) eval subset, at every eval
+    rng = np.random.default_rng([int(cfg["seed"]), 3])
+    ids = []
+    for s in cfg["eval_sets"]:
+        cand = evalstore.indices(source=s, in_greedy_subset=True) or evalstore.indices(source=s)
+        pick = cand if len(cand) <= cfg["eval"]["greedy_subset"] else sorted(
+            rng.choice(cand, size=int(cfg["eval"]["greedy_subset"]), replace=False).tolist())
+        ids += [evalstore.utts[i].id for i in pick]
+    return ids
+
+
+def setup_data(R: Run):
+    """Train/eval stores (cached under cache_dir, shared with 03's eval cache), probe and greedy ids, planner."""
+    cfg, log = R.cfg, R.log
+    sel, data, teach, cache = rpath(cfg["selection"]), rpath(cfg["data_root"]), rpath(cfg["teacher_root"]), rpath(cfg["cache_dir"])
+    t0 = time.time()
+    name, ids = train_store_spec(cfg, log)
+    R.train = trainset.build_stores(sel, data, teach, cache / name, cfg["sources"], ["train"], ids=ids, log=print)
+    R.evalstore = build_eval_store(cfg, log)
 
     if cfg["eval"]["probe"] and cfg["eval"]["probe_is_train"]:
         R.probe_ids = [u.id for u in R.train.utts]
@@ -1109,24 +1156,9 @@ def setup_data(R: Run):
     if es["enabled"] and es["metric"] == "probe_kl" and not R.probe_ids:  # validate() cannot see an empty probe
         raise SystemExit("early_stop.metric probe_kl needs a non-empty probe: this selection/subset has no probe rows "
                          "(set eval.probe_is_train, or use metric heldout_kl / train_loss)")
-    pg_budget = cfg["eval"]["probe_greedy_audio_s"]
-    pg_budget = sub["eval_audio_s"] if pg_budget is None else pg_budget
-    R.probe_greedy_ids = []
-    if pg_budget is not None and R.probe_ids:  # greedy CER on the train data itself, next to the held-out one
-        dur = {u.id: u.duration for u in R.train.utts}
-        R.probe_greedy_ids, rec = audio_subset(R.probe_ids, [dur[i] for i in R.probe_ids], float(pg_budget),
-                                               np.random.default_rng([seed, 13]))
-        log.event("subset", split="probe_greedy", seed=seed, pool=len(R.probe_ids), **rec)
-    if sub["eval_audio_s"] is not None:
-        R.greedy_ids = [u.id for u in R.evalstore.utts]  # the whole (small) eval subset, at every eval
-    else:
-        rng = np.random.default_rng([seed, 3])
-        R.greedy_ids = []
-        for s in cfg["eval_sets"]:
-            cand = R.evalstore.indices(source=s, in_greedy_subset=True) or R.evalstore.indices(source=s)
-            pick = cand if len(cand) <= cfg["eval"]["greedy_subset"] else sorted(
-                rng.choice(cand, size=int(cfg["eval"]["greedy_subset"]), replace=False).tolist())
-            R.greedy_ids += [R.evalstore.utts[i].id for i in pick]
+    # greedy CER on the train data itself, next to the held-out one
+    R.probe_greedy_ids = probe_greedy_subset(cfg, R.probe_ids, {u.id: u.duration for u in R.train.utts}, log)
+    R.greedy_ids = greedy_subset_ids(cfg, R.evalstore)
     R.mini_val_ids, R.mini_train_ids = mini_subsets(R)
     R.ds = trainset.AudioBatchDataset(R.train)
     R.src_index = {s: i for i, s in enumerate(sorted({u.source for u in R.train.utts}))}
@@ -1534,6 +1566,57 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
 # ---------------------------------------------------------------------------------------------------------- evals
 
 
+def combined_val_full(cfg: dict, tf_sum: dict) -> dict | None:
+    """combined_loss/val_full's record of a complete-set eval (kitsune.evaluate.combined_loss over the gate sets of its
+    teacher-forced pass, with scope "complete"), None without a token."""
+    from kitsune import evaluate as ev
+
+    c = ev.combined_loss(tf_sum, cfg["loss"]["w_kl"], cfg["loss"]["w_ce"])
+    return dict(c, scope="complete") if c else None
+
+
+def eval_summary(step: int, train_s: float, final: bool, complete: bool, tf_sum: dict, probe_sum: dict | None,
+                 gr_sum: dict, full_sum: dict | None, pg_sum: dict | None, wall_s: float, *, n_probe_greedy: int,
+                 n_probe: int, epoch: float | None = None, combined: dict | None = None) -> dict:
+    """A full eval's evals/step_<N>/summary.json (run_eval; scripts/05_evaluate.py writes the same for a checkpoint).
+    The headline pools the complete sets' greedy numbers when they were decoded (full_sum), else the greedy subset's
+    (the scope says which: the step-0 eval decodes the subset, a full_every_epochs run's later ones the complete sets,
+    on the same curve). probe_greedy / epoch / combined_loss only when given, so the runs without them keep their
+    records unchanged."""
+    from kitsune import evaluate as ev
+
+    head_gr = full_sum if full_sum is not None else gr_sum
+    head = ev.headline(tf=tf_sum, greedy=head_gr, probe=probe_sum, probe_greedy=pg_sum)
+    summary = dict(step=step, train_s=train_s, final=final, complete=complete, tf=tf_sum, probe=probe_sum,
+                   greedy=gr_sum, greedy_full=full_sum, wall_s=wall_s, headline=head,
+                   headline_scope=dict(val_greedy="complete" if full_sum is not None else "subset",
+                                       val_greedy_utts=head_gr.get("n_utts", 0),
+                                       val_cer_utts=ev.headline_val_utts(head_gr),
+                                       train_greedy_utts=n_probe_greedy, train_tf_utts=n_probe))
+    if pg_sum is not None:
+        summary["probe_greedy"] = pg_sum
+    if epoch is not None:
+        summary["epoch"] = epoch
+    if combined:
+        summary["combined_loss"] = combined
+    return summary
+
+
+def eval_history_record(step: int, elapsed_s: float, tf_sum: dict, gr_sum: dict, probe_sum: dict | None,
+                        pg_sum: dict | None, head: dict, epoch: float | None = None) -> dict:
+    """A full eval's record in the history the verdict and the early stop read (kitsune.evaluate.eval_record, the
+    probe's greedy CERs, the epoch in epoch mode and the headline)."""
+    from kitsune import evaluate as ev
+
+    rec = ev.eval_record(step, elapsed_s, tf=tf_sum, greedy=gr_sum, probe=probe_sum)
+    if pg_sum and "all" in pg_sum:
+        rec["probe_greedy"] = {k: pg_sum["all"][k] for k in ("cer_teacher_corpus", "cer_ref_corpus", "n")}
+    if epoch is not None:
+        rec["epoch"] = epoch
+    rec["headline"] = head
+    return rec
+
+
 def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = None, mini_val: bool = False) -> dict:
     """Teacher-forced on every eval utterance and on the train probe, greedy on the fixed subsets - or on the COMPLETE
     eval sets (`complete`; default: the final eval under eval.final_full_greedy; the loop passes it for every
@@ -1558,8 +1641,8 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     tf_sum, tf_df = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, amp=R.amp)
     w_kl, w_ce = cfg["loss"]["w_kl"], cfg["loss"]["w_ce"]
     combined = {}  # series -> its combined_loss record, the scope it pooled next to the numbers
-    if complete and (c := ev.combined_loss(tf_sum, w_kl, w_ce)):
-        combined["val_full"] = dict(c, scope="complete")
+    if complete and (c := combined_val_full(cfg, tf_sum)):
+        combined["val_full"] = c
     if mini_val and R.mini_val_ids:
         mini_tf, _ = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, ids=R.mini_val_ids,
                                             amp=R.amp)
@@ -1600,24 +1683,15 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
         log.table("probe_greedy", pg_df, step)
     for src, g in gr_df.groupby("source", sort=True):
         log.table(f"greedy_{src}", g.reset_index(drop=True), step)
-    # val CER from the complete sets when they were decoded, else from the greedy subset (the scope says which: the
-    # step-0 eval decodes the subset, a full_every_epochs run's later ones the complete sets, on the same curve)
-    head_gr = full_sum if full_sum is not None else gr_sum
-    head = ev.headline(tf=tf_sum, greedy=head_gr, probe=probe_sum, probe_greedy=pg_sum)
-    summary = dict(step=step, train_s=R.clock(), final=final, complete=complete, tf=tf_sum, probe=probe_sum,
-                   greedy=gr_sum, greedy_full=full_sum, wall_s=round(time.time() - t0, 1), headline=head,
-                   headline_scope=dict(val_greedy="complete" if full_sum is not None else "subset",
-                                       val_greedy_utts=head_gr.get("n_utts", 0),
-                                       val_cer_utts=ev.headline_val_utts(head_gr),
-                                       train_greedy_utts=len(R.probe_greedy_ids), train_tf_utts=len(R.probe_ids)))
     extra = {}  # only in the runs that use them, so the viability run's records are unchanged
     if pg_sum is not None:
         extra["probe_greedy"] = pg_sum
     if epoch_mode(cfg):
         extra["epoch"] = R.st["epoch_progress"]  # epochs done: 0 at step 0, e + 1 at the end of epoch e
-    summary.update(extra)
-    if combined:
-        summary["combined_loss"] = combined
+    summary = eval_summary(step, R.clock(), final, complete, tf_sum, probe_sum, gr_sum, full_sum, pg_sum,
+                           round(time.time() - t0, 1), n_probe_greedy=len(R.probe_greedy_ids),
+                           n_probe=len(R.probe_ids), epoch=extra.get("epoch"), combined=combined)
+    head = summary["headline"]
     log.eval_json("summary", summary, step)
     scal = ev.flatten(tf_sum, "eval/tf")
     scal.update(ev.flatten(gr_sum, "eval/greedy"))
@@ -1651,12 +1725,7 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
                                  + (float(pg_sum.get("wall_s", 0.0)) if pg_sum else 0.0),
                                  greedy_s=float(gr_sum.get("wall_s", 0.0)),
                                  greedy_n=len(R.evalstore) if full_sum is not None else len(R.greedy_ids))
-    rec = ev.eval_record(step, R.clock(), tf=tf_sum, greedy=gr_sum, probe=probe_sum)
-    if pg_sum and "all" in pg_sum:
-        rec["probe_greedy"] = {k: pg_sum["all"][k] for k in ("cer_teacher_corpus", "cer_ref_corpus", "n")}
-    if "epoch" in extra:
-        rec["epoch"] = extra["epoch"]
-    rec["headline"] = head
+    rec = eval_history_record(step, R.clock(), tf_sum, gr_sum, probe_sum, pg_sum, head, epoch=extra.get("epoch"))
     hist = R.st["history"]
     if hist and hist[-1]["step"] == step:
         hist[-1] = rec
@@ -2289,22 +2358,27 @@ def smoke_checks(R: Run):
 VRAM_MARGIN_GIB = 0.5  # left outside the Windows VRAM cap: cuBLAS/cuDNN kernels and handles load outside the allocator
 
 
-def cap_vram(R: Run):
+def cap_vram(R: Run, max_frac: float | None = None):
     """Windows + CUDA: cap PyTorch's caching allocator, for the whole process, at the VRAM free now (plus what it
     already holds) minus VRAM_MARGIN_GIB. The Windows driver's sysmem fallback (on by default) serves an allocation that
     no longer fits the card from shared system memory instead of failing it, so an oversized micro-batch would run
     several times slower instead of raising OutOfMemoryError, and the memory probe's fallbacks (halve micro_audio_s,
-    gradient checkpointing) and train_step's OOM skip would never fire. Under the cap they do. Linux has no fallback."""
-    if R.device.type != "cuda" or os.name != "nt":
+    gradient checkpointing) and train_step's OOM skip would never fire. Under the cap they do. Linux has no fallback.
+    max_frac (scripts/05_evaluate.py --vram-frac; the trainer passes none): also at most that fraction of the card, on
+    any OS."""
+    if R.device.type != "cuda" or (os.name != "nt" and max_frac is None):
         return
     idx = R.device.index if R.device.index is not None else torch.cuda.current_device()  # the API needs an index
     free, total = torch.cuda.mem_get_info(idx)
     held = torch.cuda.memory_reserved(idx)
     frac = min(1.0, max(0.0, (free + held - VRAM_MARGIN_GIB * 2**30) / total))
+    if max_frac is not None:
+        frac = min(frac, float(max_frac))
     torch.cuda.set_per_process_memory_fraction(frac, idx)
     R.vram_cap_gb = round(frac * total / 2**30, 2)
     R.log.event("vram_cap", cap_gb=R.vram_cap_gb, free_gb=round(free / 2**30, 2), held_gb=round(held / 2**30, 2),
-                total_gb=round(total / 2**30, 2), margin_gb=VRAM_MARGIN_GIB, fraction=round(frac, 4))
+                total_gb=round(total / 2**30, 2), margin_gb=VRAM_MARGIN_GIB, fraction=round(frac, 4),
+                **({"max_frac": float(max_frac)} if max_frac is not None else {}))
 
 
 def probe_passes(R: Run, planner: trainset.StepPlanner, rec: dict):
