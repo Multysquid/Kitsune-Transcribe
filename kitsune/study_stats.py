@@ -224,6 +224,12 @@ def params_of(system: str, params: Mapping[str, int] | None = None) -> int | Non
 # ------------------------------------------------------------------------------------------------ utterance scoring
 
 
+def _text(x) -> str:
+    """A table's text cell as a string: None or a NaN (a missing value read back from parquet) is the empty string,
+    never "nan"."""
+    return x if isinstance(x, str) else ""
+
+
 def score_utterances(refs: Sequence[str], hyps: Sequence[str]) -> pd.DataFrame:
     """Per-utterance edits (S + D + I), ref_len, sub, del, ins and hyp_len on normalize_ja strings, from ONE jiwer
     alignment of all rows, exactly as kitsune.evaluate.corpus_cer counts them (its corpus edits = the sum of these).
@@ -232,8 +238,8 @@ def score_utterances(refs: Sequence[str], hyps: Sequence[str]) -> pd.DataFrame:
     from kitsune.text import normalize_ja
     import jiwer
 
-    R = [normalize_ja(r or "") for r in refs]
-    H = [normalize_ja(h or "") for h in hyps]
+    R = [normalize_ja(_text(r)) for r in refs]
+    H = [normalize_ja(_text(h)) for h in hyps]
     n = len(R)
     sub, dele, ins = np.zeros(n, np.int64), np.zeros(n, np.int64), np.zeros(n, np.int64)
     keep = [i for i in range(n) if R[i]]
@@ -267,7 +273,7 @@ def ensure_scored(df: pd.DataFrame) -> pd.DataFrame:
     elif "hyp" in df.columns and "hyp_len" not in df.columns:
         from kitsune.text import normalize_ja
 
-        df = df.assign(hyp_len=[len(normalize_ja(h or "")) for h in df["hyp"].tolist()])
+        df = df.assign(hyp_len=[len(normalize_ja(_text(h))) for h in df["hyp"].tolist()])
     if "edits_nostyle" not in df.columns and "hyp_nostyle" in df.columns and "ref" in df.columns:
         df = df.assign(edits_nostyle=score_utterances(df["ref"].tolist(), df["hyp_nostyle"].tolist())["edits"])
     return df
@@ -444,7 +450,7 @@ def build_corpus(tables: Mapping[str, pd.DataFrame], manifest: Manifest | Mappin
                 d["n_truncated"] = int(t["truncated"].to_numpy()[keep].astype(bool).sum())
             desc[x][name] = d
             if "hyp" in t.columns:
-                hyps[x][name] = [str(h or "") for h in t["hyp"].to_numpy()[keep]]
+                hyps[x][name] = [_text(h) for h in t["hyp"].to_numpy()[keep]]
         keep = ref > 0
         strata[name] = Stratum(name=name, ids=[i for i, k in zip(ids, keep) if k], ref_len=ref[keep],
                                edits=E[keep], nostyle=N[keep], n_empty_ref=int((~keep).sum()))
@@ -731,6 +737,10 @@ class Study:
 
     # -- 4.7 practical bars, cross-family, Pareto
     def bars(self) -> dict:
+        """4.7's practical bars over the seven students (the controls are not candidates), smallest by total
+        parameters: the Parakeet TDT bar - JSUT + Galgame-neutral CI upper end at or below TDT's (student vs a fixed
+        model: v_boot + sigma_run^2) - and the own-teacher bars 1.2x / 1.5x on M4, both by the point ratio and by the
+        CI's upper end (the call WITHIN at delta = bar - 1)."""
         students = [s for s in STUDENTS if self.has(s)]
         by_size = sorted(students, key=lambda s: self.params.get(s) or math.inf)
         tdt = {}
@@ -757,8 +767,8 @@ class Study:
                     teacher=dict(metric="m4", per_student=teacher, smallest=smallest))
 
     def cross_family(self) -> dict:
-        """JSUT + Galgame-neutral, raw and no-style, per system, and the paired comparisons at equal size (0.3B,
-        0.1B, 0.05B) and against Parakeet TDT: descriptive only, no threshold is ever applied (4.3)."""
+        """JSUT + Galgame-neutral, raw and no-style, per system, and the paired comparisons T vs P at equal size
+        (0.3B, 0.1B, 0.05B): descriptive only, no threshold is ever applied (4.3). The Parakeet TDT bar is bars()'."""
         rows = {s: dict(jg=self.value(s, "jg"), jg_nostyle=self.value(s, "jg_nostyle"))
                 for s in system_order(self.corpus.systems)}
         pairs = []

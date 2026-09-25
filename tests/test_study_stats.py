@@ -80,6 +80,9 @@ def test_score_utterances_sums_to_corpus_cer():
     assert (sc["sub"] + sc["del"] + sc["ins"] == sc["edits"]).all()
     assert int((~kept).sum()) == c["n_empty_ref"]
     assert (sc.loc[~kept, "ins"] == sc.loc[~kept, "hyp_len"]).all()
+    # a missing hypothesis (None, or NaN as parquet gives it back) is an empty output, never the text "nan"
+    miss = ss.score_utterances(["あいう", "えお"], [None, float("nan")])
+    assert miss["edits"].tolist() == [3, 2] and miss["del"].tolist() == [3, 2] and miss["hyp_len"].tolist() == [0, 0]
 
 
 # ------------------------------------------------------------------------------------------------ planted calls
