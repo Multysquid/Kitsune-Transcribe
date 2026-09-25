@@ -578,10 +578,12 @@ class _WorkerDiesDataset(torch.utils.data.Dataset):
 def test_loader_reports_a_dead_worker_long_before_its_timeout():
     """torch checks for a dead worker only when a wait ends, and on Windows that poll is the only check. One
     timeout_s-long wait (production: 600 s) hid a crashed worker for all of it; the wait now runs in 5 s slices, so the
-    worker's death is reported within seconds while timeout_s still bounds a dropped micro-batch."""
+    worker's death is reported within seconds while timeout_s still bounds a dropped micro-batch. prefetch=1: the
+    worker gets micro-batch [1] only after [0] has arrived; with more in flight its os._exit could land before [0] left
+    its queue's feeder thread, and the death would surface one next() early (seen under full-suite load)."""
     import time
 
-    loader = make_loader(_WorkerDiesDataset(), [[[0]], [[1]], [[2]]], num_workers=1, prefetch=2, timeout_s=90)
+    loader = make_loader(_WorkerDiesDataset(), [[[0]], [[1]], [[2]]], num_workers=1, prefetch=1, timeout_s=90)
     try:
         key, mbs = next(loader)
         assert key == 0 and mbs[0]["ids"] == [0]
