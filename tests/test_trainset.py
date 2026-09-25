@@ -156,6 +156,34 @@ def test_selection_cli_output(corpus, tmp_path, capsys):
     assert meta["args"]["agree_max"] == 0.3 and meta["kept"]
 
 
+def test_selection_partial_second_opinion(corpus, tmp_path):
+    """A source in partial_second_opinion trains on its judged shards only: the rows of a shard with no second-opinion
+    file are not_judged (the run's decision) instead of no_agree; nothing else changes, and the CLI records the list
+    (vast/launch.py compares it with the run config)."""
+    src = TRAIN[0]
+    second = tmp_path / "second_out"
+    shutil.copytree(corpus.second_out, second)
+    shard = sorted((second / src).glob("train-*.jsonl"))[0]
+    shard.unlink()
+    args = (corpus.teacher_out, second, corpus.data, TRAIN, EVAL, 0.5)
+    plain = ms.build_selection(*args, greedy_n=10, probe_n=12)
+    part = ms.build_selection(*args, greedy_n=10, probe_n=12, partial_second_opinion=[src])
+    unjudged = (part["teacher_file"] == f"{src}/{shard.stem}").to_numpy()
+    live = unjudged & ~part["truncated"].to_numpy()
+    assert live.any()
+    assert set(plain["reason"][live]) == {"no_agree"} and set(part["reason"][live]) == {"not_judged"}
+    assert not part["keep"][unjudged].any()
+    assert (part["reason"][~unjudged] == plain["reason"][~unjudged]).all()
+    out = tmp_path / "sel.parquet"
+    ms.main(["--sources", *TRAIN, "--eval-sets", *EVAL, "--partial-second-opinion", src, "--teacher-out",
+             str(corpus.teacher_out), "--second-out", str(second), "--data", str(corpus.data), "--out", str(out)])
+    meta = json.loads(pq.read_schema(out).metadata[b"kitsune_selection"])
+    assert meta["args"]["partial_second_opinion"] == [src]
+    assert "not_judged" in set(pd.read_parquet(out)["reason"])
+    with pytest.raises(SystemExit):
+        ms.main(["--sources", *TRAIN, "--partial-second-opinion", "nope", "--out", str(tmp_path / "bad.parquet")])
+
+
 def test_selection_per_source_agree_threshold(corpus, tmp_path, capsys):
     """Each source's agree comes from a different second model, so the threshold can differ per source."""
     assert len(TRAIN) >= 2

@@ -277,7 +277,9 @@ def data_problems(files: list[str], cfg: dict) -> list[str]:
     box, where a failure is already billed): the teacher/second-opinion meta, the selection, the student's weights,
     config, processor and tokenizer (STUDENT_FILES), teacher shards for every train source and eval set, and a second
     opinion for EVERY train source teacher shard. make_selection drops the rows of a shard without one as no_agree, so
-    a partial 02b pass silently shrinks the train set."""
+    a partial 02b pass silently shrinks the train set. The run config's selection_recipe.partial_second_opinion lists
+    the sources that train on their judged shards only, by decision: for them one judged shard is enough (the
+    selection check makes sure the selection was built that way, with not_judged rows instead of no_agree)."""
     teacher_root, second_root = cfg.get("teacher_root", "teacher_out"), cfg.get("second_root", "second_out")
     have = set(files)
     student = cfg["student"].rstrip("/")
@@ -288,11 +290,14 @@ def data_problems(files: list[str], cfg: dict) -> list[str]:
         return {f.rsplit("/", 1)[1][: -len(ext)] for f in files if f.startswith(f"{root}/{s}/") and f.endswith(ext)}
 
     sources = list(cfg.get("sources", []))
+    partial = set((cfg.get("selection_recipe") or {}).get("partial_second_opinion", []))
     for s in dict.fromkeys(sources + list(cfg.get("eval_sets", []))):
         teacher = stems(teacher_root, s, ".npz")
         if not teacher:
             problems.append(f"no {teacher_root}/{s}/*.npz")
-        elif s in sources and (gap := teacher - stems(second_root, s, ".jsonl")):
+        elif s in partial and s in sources and not teacher & stems(second_root, s, ".jsonl"):
+            problems.append(f"{second_root}/{s}: none of its {len(teacher)} teacher shards has a second opinion")
+        elif s in sources and s not in partial and (gap := teacher - stems(second_root, s, ".jsonl")):
             problems.append(f"{second_root}/{s}: {len(gap)} of {len(teacher)} teacher shards have no second opinion "
                             f"(e.g. {min(gap)}): finish scripts/02b_second_opinion.py, rebuild the selection, upload")
     return problems
@@ -331,10 +336,12 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
     else:
         got = dict(sources=set(args.get("sources") or []), eval_sets=set(args.get("eval_sets") or []),
                    agree_max=args.get("agree_max"), agree_max_source=_by_source(args.get("agree_max_source")),
-                   filter_eval_sets=set(args.get("filter_eval_sets") or []))
+                   filter_eval_sets=set(args.get("filter_eval_sets") or []),
+                   partial_second_opinion=set(args.get("partial_second_opinion") or []))
         want = dict(sources=set(cfg.get("sources", [])), eval_sets=set(cfg.get("eval_sets", [])),
                     agree_max=float(recipe["agree_max"]), agree_max_source=_by_source(recipe["agree_max_source"]),
-                    filter_eval_sets=set(recipe["filter_eval_sets"]))
+                    filter_eval_sets=set(recipe["filter_eval_sets"]),
+                    partial_second_opinion=set(recipe.get("partial_second_opinion", [])))
         for k, v in want.items():
             if got[k] != v:
                 shown = [sorted(x.items()) if isinstance(x, dict) else sorted(x) if isinstance(x, set) else x

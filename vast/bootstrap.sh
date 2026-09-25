@@ -170,10 +170,16 @@ def plan():
         required.append(f"{teacher_root}/{s}/*.npz")
     required += [f"{second_root}/{s}/*.jsonl" for s in sources]
     missing = [p for p in required if not has(p)]
-    for s in sources:  # every teacher shard needs its second opinion (the same rule as vast/launch.py data_problems)
+    # every teacher shard needs its second opinion (the same rule as vast/launch.py data_problems), except for the
+    # sources the run config's selection_recipe.partial_second_opinion trains on their judged shards only
+    partial = set((cfg.get("selection_recipe") or {}).get("partial_second_opinion", []))
+    for s in sources:
         teacher = {f.rsplit("/", 1)[1][:-4] for f in files if f.startswith(f"{teacher_root}/{s}/") and f.endswith(".npz")}
         second = {f.rsplit("/", 1)[1][:-6] for f in files if f.startswith(f"{second_root}/{s}/") and f.endswith(".jsonl")}
-        if teacher - second:
+        if s in partial:
+            if not teacher & second:
+                missing.append(f"{second_root}/{s}: none of its {len(teacher)} shards has a second opinion")
+        elif teacher - second:
             missing.append(f"{second_root}/{s}: {len(teacher - second)} of {len(teacher)} shards without a second opinion")
     if missing:
         refuse(f"data repo {repo}@{rev} lacks: {missing}")

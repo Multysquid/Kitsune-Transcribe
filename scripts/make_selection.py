@@ -9,6 +9,8 @@ teacher has not labelled). Train sources use split `train`; eval sets use split 
 
 Rules for TRAIN rows, first match wins (keep = reason == "kept"):
   truncated    the teacher never emitted EOS (repetition or length cut): its labels are garbage (median agree 0.9-3)
+  not_judged   (--partial-second-opinion sources only) the row's teacher shard has no second-opinion file at all:
+               02b was deliberately not run on it, so the source trains on its judged shards only
   no_agree     no second opinion for the row (02b not run on its shard, or hyp2 null): the gate cannot be evaluated
   agree>A      CER(teacher hyp, second opinion) > --agree-max: the two models disagree, so the label is suspect
   no_audio     id not in data/shards/<source>/*.parquet (skip with --skip-audio-check)
@@ -27,7 +29,7 @@ truncated, agree (null if unknown), teacher_cer, keep, reason, in_greedy_subset,
 metadata key b"kitsune_selection" holds the arguments and the summary as JSON.
 
 The recipe of a run (its sources and eval sets, and selection_recipe: --agree-max, --agree-max-source,
---filter-eval-sets) is written down once, in the run config: --config takes all of it from there, and vast/launch.py
+--filter-eval-sets, --partial-second-opinion) is written down once, in the run config: --config takes all of it from there, and vast/launch.py
 refuses a selection whose recorded arguments differ from the config (a flag forgotten on a rebuild would otherwise
 silently change the training data or drop a hold-out).
 
@@ -89,6 +91,11 @@ def teacher_rows(teacher_root: Path, source: str, split: str, eos: int) -> pd.Da
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=COLUMNS)
 
 
+def judged_stems(second_root: Path, source: str) -> set[str]:
+    """Teacher shard stems that have a second-opinion file (02b writes second_out/<source>/<stem>.jsonl per shard)."""
+    return {p.stem for p in (second_root / source).glob("*.jsonl")}
+
+
 def agree_map(second_root: Path, source: str) -> dict[str, float | None]:
     out: dict[str, float | None] = {}
     for p in sorted((second_root / source).glob("*.jsonl")):
@@ -115,10 +122,12 @@ def seeded_subset(ids: list[str], n: int, seed: int, tag: str) -> set[str]:
 def build_selection(teacher_root, second_root, data_root, sources: list[str], eval_sets: list[str] = EVAL_SETS,
                     agree_max: float = 0.5, seed: int = 1234, greedy_n: int = 500, probe_n: int = 500,
                     audio_check: bool = True, agree_max_by_source: dict[str, float] | None = None,
-                    filter_eval_sets: Sequence[str] = ()) -> pd.DataFrame:
+                    filter_eval_sets: Sequence[str] = (), partial_second_opinion: Sequence[str] = ()) -> pd.DataFrame:
     """`agree_max_by_source` overrides `agree_max` per train source: each source's `agree` is measured against a
     different second model (whisper-large-v3 for reazon, Emilia's own Whisper-medium text for emilia_yodas), so one
-    global threshold is not calibrated across sources."""
+    global threshold is not calibrated across sources. For the sources in `partial_second_opinion` a row whose whole
+    teacher shard has no second-opinion file is `not_judged` instead of `no_agree`: the partial coverage is the run's
+    decision (vast/launch.py accepts it only for these sources), not a pass that has yet to finish."""
     teacher_root, second_root, data_root = Path(teacher_root), Path(second_root), Path(data_root)
     meta_p = teacher_root / "meta.json"
     eos = int(json.loads(meta_p.read_text(encoding="utf-8")).get("eos_token_id", 3)) if meta_p.exists() else 3
@@ -139,6 +148,9 @@ def build_selection(teacher_root, second_root, data_root, sources: list[str], ev
             thr = agree_max_by_source.get(source, agree_max)
             reason[(agree > thr).to_numpy()] = f"agree>{thr:g}"
             reason[agree.isna().to_numpy()] = "no_agree"
+            if source in partial_second_opinion:
+                stems = df["teacher_file"].str.rsplit("/", n=1).str[1]
+                reason[(agree.isna() & ~stems.isin(judged_stems(second_root, source))).to_numpy()] = "not_judged"
             reason[df["truncated"].to_numpy()] = "truncated"
         df["reason"] = reason
         df["keep"] = df["reason"] == "kept"
@@ -194,6 +206,9 @@ def main(argv: list[str] | None = None):
                     help="per-source override of --agree-max (repeatable), e.g. emilia_yodas=0.2")
     ap.add_argument("--filter-eval-sets", nargs="*", default=None,
                     help="monitor-only eval sets that get the train label rules (never the pre-registered gate sets)")
+    ap.add_argument("--partial-second-opinion", nargs="*", default=None, metavar="SOURCE",
+                    help="sources that deliberately train on their judged shards only: rows of a shard without a "
+                         "second-opinion file are not_judged, not no_agree")
     ap.add_argument("--out", default=None, help="default: the --config's selection, else selection/viability.parquet")
     ap.add_argument("--teacher-out", default=str(ROOT / "teacher_out"))
     ap.add_argument("--second-out", default=str(ROOT / "second_out"))
@@ -203,7 +218,8 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--probe-n", type=int, default=500, help="train probe size per train source")
     ap.add_argument("--skip-audio-check", action="store_true", help="do not look for the audio (no `no_audio` rows)")
     args = ap.parse_args(argv)
-    recipe_flags = ("sources", "eval_sets", "agree_max", "agree_max_source", "filter_eval_sets")
+    recipe_flags = ("sources", "eval_sets", "agree_max", "agree_max_source", "filter_eval_sets",
+                    "partial_second_opinion")
     if args.config:
         if given := [f"--{k.replace('_', '-')}" for k in recipe_flags if getattr(args, k) is not None]:
             ap.error(f"--config sets the recipe; drop {' '.join(given)}")
@@ -215,6 +231,7 @@ def main(argv: list[str] | None = None):
         args.sources, args.eval_sets = list(cfg["sources"]), list(cfg["eval_sets"])
         args.agree_max, args.agree_max_source = float(recipe["agree_max"]), list(recipe["agree_max_source"])
         args.filter_eval_sets = list(recipe["filter_eval_sets"])
+        args.partial_second_opinion = list(recipe.get("partial_second_opinion", []))
         out = Path(cfg.get("selection", "selection/viability.parquet"))
         args.out = args.out or str(out if out.is_absolute() else ROOT / out)
     elif not args.sources:
@@ -223,6 +240,7 @@ def main(argv: list[str] | None = None):
         args.eval_sets = EVAL_SETS if args.eval_sets is None else args.eval_sets
         args.agree_max = 0.5 if args.agree_max is None else args.agree_max
         args.agree_max_source, args.filter_eval_sets = args.agree_max_source or [], args.filter_eval_sets or []
+        args.partial_second_opinion = args.partial_second_opinion or []
         args.out = args.out or str(ROOT / "selection" / "viability.parquet")
 
     by_source = {}
@@ -236,11 +254,13 @@ def main(argv: list[str] | None = None):
     unknown = set(by_source) - set(args.sources) - set(args.filter_eval_sets)
     if unknown:
         ap.error(f"--agree-max-source for sources not in --sources: {sorted(unknown)}")
+    if stray := set(args.partial_second_opinion) - set(args.sources) - set(args.filter_eval_sets):
+        ap.error(f"--partial-second-opinion for sources not in --sources: {sorted(stray)}")
 
     t0 = time.time()
     sel = build_selection(args.teacher_out, args.second_out, args.data, args.sources, args.eval_sets, args.agree_max,
                           args.seed, args.greedy_n, args.probe_n, not args.skip_audio_check, by_source,
-                          args.filter_eval_sets)
+                          args.filter_eval_sets, args.partial_second_opinion)
     summary = summarize(sel)
     kept = sel[sel["keep"]].groupby(["source", "split"])["duration"].agg(["size", "sum"])
     meta = dict(args=vars(args), created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

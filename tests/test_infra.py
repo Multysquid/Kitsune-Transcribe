@@ -904,6 +904,19 @@ def test_data_problems_catch_a_partial_second_opinion_pass_and_missing_files():
     assert not any("eval_jsut: " in p and "second opinion" in p for p in problems)
 
 
+def test_data_problems_accept_a_deliberate_partial_second_opinion():
+    """A source in selection_recipe.partial_second_opinion trains on its judged shards only (the owner's decision for
+    galgame): launch and bootstrap's plan accept its unjudged shards, but not a source with no judged shard at all."""
+    cfg = dict(VIAB_CFG, selection_recipe={"partial_second_opinion": ["galgame"]})
+    files = [f for f in DATA_FILES if f != "second_out/galgame/train-00001.jsonl"]
+    assert launch.data_problems(files, cfg) == []
+    assert any("1 of 3 teacher shards have no second opinion" in p for p in launch.data_problems(files, VIAB_CFG))
+    none = [f for f in DATA_FILES if not f.startswith("second_out/galgame/")]
+    assert launch.data_problems(none, cfg) == ["second_out/galgame: none of its 3 teacher shards has a second opinion"]
+    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
+    assert 'partial = set((cfg.get("selection_recipe") or {}).get("partial_second_opinion", []))' in text
+
+
 def test_data_problems_need_the_students_processor_and_tokenizer():
     """The trainer loads the processor and tokenizer from the student dir and has no fallback (the old one read the
     gated teacher repo, a 403 with the box token): a student uploaded without them is caught on the laptop, before any
@@ -940,6 +953,20 @@ def write_selection(path: Path, rows, args=None) -> Path:
         t = t.replace_schema_metadata({b"kitsune_selection": json.dumps(dict(args=args, created="x")).encode()})
     pq.write_table(t, path)
     return path
+
+
+def test_selection_problems_accept_not_judged_rows_only_as_recorded(tmp_path):
+    """not_judged rows (a deliberate partial second opinion) are fine when the selection was built with the config's
+    partial_second_opinion list; a selection built without it, or with another list, is refused."""
+    name, path = "selection/viability.parquet", tmp_path / "sel.parquet"
+    cfg = dict(SEL_CFG, selection_recipe=dict(SEL_CFG["selection_recipe"], partial_second_opinion=["galgame"]))
+    rows = SEL_ROWS + [("galgame", "train", False, "not_judged")]
+    args = dict(SEL_ARGS, partial_second_opinion=["galgame"])
+    assert launch.selection_problems(write_selection(path, rows, args), name, cfg) == []
+    problems = launch.selection_problems(write_selection(path, rows, SEL_ARGS), name, cfg)
+    assert len(problems) == 1 and "was built with partial_second_opinion [], " in problems[0], problems
+    problems = launch.selection_problems(write_selection(path, rows, args), name, SEL_CFG)
+    assert len(problems) == 1 and "was built with partial_second_opinion ['galgame']" in problems[0], problems
 
 
 def test_selection_problems_flag_no_agree_rows(tmp_path):
@@ -994,7 +1021,8 @@ def test_selection_problems_check_the_recipe_and_the_kept_rows(tmp_path):
     # the real run config carries the recipe, spelled as make_selection.py records it
     via = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
     assert via["selection_recipe"] == {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "eval_emilia=0.2"],
-                                       "filter_eval_sets": ["eval_emilia", "galgame"]}
+                                       "filter_eval_sets": ["eval_emilia", "galgame"],
+                                       "partial_second_opinion": ["galgame"]}
 
 
 class FakeHfApi:
