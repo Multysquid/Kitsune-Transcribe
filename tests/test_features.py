@@ -15,8 +15,8 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from fixtures import REAL, need_real  # noqa: E402
-from kitsune.features import LogMel, SpecAugment, hf_reference, load_hf_processor, pad_waves  # noqa: E402
+from fixtures import REAL, need_real, teacher_processor  # noqa: E402
+from kitsune.features import LogMel, SpecAugment, hf_reference, pad_waves  # noqa: E402
 
 TOL = 1e-4  # target on normalised features; on CPU the ops are identical, so the measured diff is 0.0
 REAL_SHARD = REAL / "data" / "shards" / "reazon_small" / "train-00000.parquet"
@@ -24,10 +24,8 @@ REAL_SHARD = REAL / "data" / "shards" / "reazon_small" / "train-00000.parquet"
 
 @pytest.fixture(scope="module")
 def fe():
-    try:
-        return load_hf_processor().feature_extractor
-    except Exception as e:  # noqa: BLE001 - not cached / offline
-        pytest.skip(f"teacher processor not available offline: {e}")
+    """Skips without the gated processor in the HF cache; fails instead under KITSUNE_REQUIRE_REAL_DATA=1."""
+    return teacher_processor().feature_extractor
 
 
 def _compare(lm: LogMel, waves: list[np.ndarray], dither: float, wave=None, lengths=None) -> float:
@@ -92,6 +90,23 @@ def test_parity_synthetic(fe):
     wide[:, : wave.shape[1]] = wave
     wide[1, lengths[1]:] = 3.0
     _compare(lm, waves[:2], 1e-5, wave=wide, lengths=lengths)
+
+
+def test_missing_teacher_processor_fails_a_verification_run(monkeypatch):
+    """Without the gated processor in the HF cache the parity tests skip, and KITSUNE_REQUIRE_REAL_DATA=1 turns that
+    skip into a failure, as it does for the real data files."""
+    import kitsune.features
+
+    def offline():
+        raise OSError("not in the cached files")
+
+    monkeypatch.setattr(kitsune.features, "load_hf_processor", offline)
+    monkeypatch.delenv("KITSUNE_REQUIRE_REAL_DATA", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="teacher processor not in the local HF cache"):
+        teacher_processor()
+    monkeypatch.setenv("KITSUNE_REQUIRE_REAL_DATA", "1")
+    with pytest.raises(pytest.fail.Exception, match="teacher processor not in the local HF cache"):
+        teacher_processor()
 
 
 def test_batch_composition_invariance():

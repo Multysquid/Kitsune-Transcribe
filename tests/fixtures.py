@@ -41,6 +41,8 @@ read them under REAL and call need_real(...) first. The data is gitignored, so a
 tests skip (SPEC: skip cleanly if absent), which shows only as 's'. To verify a change made in a worktree, point them
 at a checkout that has the data (they only read there) and turn a skip into a failure:
     KITSUNE_REAL_DATA_ROOT=<main checkout> KITSUNE_REQUIRE_REAL_DATA=1 python -m pytest -rs tests/...
+The gated teacher processor in the local HF cache counts as real data too (teacher_processor()): the override fails
+a test that would skip without it. KITSUNE_REAL_DATA_ROOT does not move it; HF_HOME does.
 """
 import hashlib
 import importlib.util
@@ -321,6 +323,17 @@ def need_real(*paths: Path) -> None:
     missing = [str(p) for p in paths if not Path(p).exists()]
     if missing:
         no_real_data("real data not present: " + ", ".join(missing))
+
+
+def teacher_processor():
+    """The gated teacher's processor from the local HF cache (the tests run with HF_HUB_OFFLINE=1), or no_real_data."""
+    __tracebackhide__ = True
+    from kitsune.features import load_hf_processor
+
+    try:
+        return load_hf_processor()
+    except Exception as e:  # noqa: BLE001 - not cached / offline
+        no_real_data(f"teacher processor not in the local HF cache (HF_HOME): {type(e).__name__}: {e}")
 
 
 def load_script(name: str):
