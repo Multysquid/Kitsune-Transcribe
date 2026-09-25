@@ -1,14 +1,17 @@
 """The size study's trainer keys in scripts/04_distill.py (STUDY.md 2.1-2.5, CONTRACT.md section 2):
 
 - bn.mode "train": BatchNorm trains (running stats move in the training forward, evals use them), every train_mode()
-  call and BN check follows the mode, bn/max_abs_drift is reported instead of asserted, and the memory probe never
-  falls back to gradient checkpointing; "frozen" (the default) still asserts
+  call and BN check follows the mode, bn/max_abs_drift is reported instead of asserted, the memory probe never
+  falls back to gradient checkpointing, and a skipped step leaves the running stats as they were; "frozen" (the
+  default) still asserts
 - loss.aux_ctc_weight: the training-only aux-CTC head (blank = V) on the encoder output, finite, in the optimizer and
   the full state (aux_ctc.pt), never in the exported weights, and a crash + resume reproduces the uninterrupted run
-- optim.weight_decay: decay on the parameters of 2+ dimensions only (two param groups)
+  (optimizer on the device or offloaded)
+- optim.weight_decay: decay on the parameters of 2+ dimensions only, never on a bias (two param groups)
 - the steps clock's warm-up check, and the LR curves of the three LR-probe lengths
 - eval.full_at_fracs, ckpt.full_at_fracs / weights_at_fracs / upload_full_at "frac:<f>" (kept through rotation)
-- branch: the T/2 branch reproduces the WSD schedule, the weights and the data order of a run with budget T/2
+- branch: the T/2 branch reproduces the WSD schedule, the weights and the data order of a run with budget T/2, and
+  runs none of its parent's fraction evals or checkpoints
 - specaug.seed: the masks are a pure function of (seed, step, micro-batch index), identical across a resume
 - lr_probe: metrics only, and the lr_probe_result on the complete gate sets
 
@@ -324,6 +327,33 @@ def test_bn_train_never_uses_gradient_checkpointing():
     assert m.load_config(None, ["bn.momentum=0.3"])["bn"]["momentum"] == 0.3
 
 
+def test_a_skipped_step_leaves_the_bn_running_stats_as_they_were(env, monkeypatch):
+    """bn.mode "train": a step whose forward goes non-finite (NaN audio at step 3) is skipped, and so is its update of
+    the BN running stats - kept, it would leave NaN statistics to every later eval while training on batch statistics
+    goes on. The stats stay finite, and so does the final eval that uses them."""
+    m = load_script("04_distill")
+    orig, done = m.train_step, []
+
+    def train_step(R, step, lr, mbs, epoch):
+        if step == 3 and not done:  # once: a skipped step leaves the step count, so step 3 comes again
+            done.append(step)
+            for mb in mbs:
+                mb["wave"] = mb["wave"] * float("nan")
+        return orig(R, step, lr, mbs, epoch)
+
+    monkeypatch.setattr(m, "train_step", train_step)
+    over = {"bn": {"mode": "train"}, "schedule": {"max_steps": 5}}
+    assert m.main(["--config", write_config(env, "bn-skip", over)]) == 0
+    run = one_run(env["root"], "bn-skip")
+    skip = events(run, "nonfinite_grad_skipped")
+    assert [(e["at_step"], e["bn_stats_restored"]) for e in skip] == [(3, True)] and skip[0]["nonfinite_ids"]
+    sd = torch.load(run / "checkpoints" / "full_step_5" / "model.pt", weights_only=True)
+    stats = [v for k, v in sd.items() if k.endswith(("running_mean", "running_var"))]
+    assert stats and all(bool(torch.isfinite(v).all()) for v in stats)
+    final = next(e for e in events(run, "eval") if e["final"])
+    assert all(math.isfinite(s["kl"]) for s in final["sets"].values())
+
+
 def test_setup_model_honours_the_bn_mode_and_momentum(env):
     """setup_model puts BN in the mode it is given (the trainer passes bn.mode, with or without gradient
     checkpointing; scripts/05_evaluate.py keeps the default "frozen"), and bn.momentum reaches every BN module."""
@@ -404,27 +434,29 @@ def test_memory_probe_includes_the_aux_ctc_logits(monkeypatch):
             assert float(planner.dur[seen[-1]].max()) * len(seen[-1]) == most
 
 
-def test_aux_ctc_run_trains_saves_and_resumes_exactly(env, monkeypatch):
+@pytest.mark.parametrize("offload", ["none", "cpu"])
+def test_aux_ctc_run_trains_saves_and_resumes_exactly(env, monkeypatch, offload):
     """A from-scratch student's settings on a tiny CPU run - bn.mode train, aux CTC 0.3, weight decay 1e-3: finite
     loss/aux_ctc every step (in loss/total, not in the objective), the BN running stats move (bn/max_abs_drift > 0, no
     assertion), two param groups; the head is in the optimizer and the full state (aux_ctc.pt) but not in the exported
     weights, which load as a student. A crash at step 10 resumed from full_step_8 ends with exactly the uninterrupted
-    run's weights, head and SpecAugment masks."""
+    run's weights, head and SpecAugment masks - with the optimizer on the device and under optim.offload "cpu", whose
+    host masters are rebuilt from the device weights when its state loads, so the head must be loaded before it."""
     from safetensors import safe_open
 
     from kitsune import student as S
 
     m = load_script("04_distill")
     over = {"bn": {"mode": "train"}, "loss": {"aux_ctc_weight": 0.3, "l2sp_lambda": 0.0},
-            "optim": {"weight_decay": 1e-3}, "schedule": {"max_steps": 12},
+            "optim": {"weight_decay": 1e-3, "offload": offload}, "schedule": {"max_steps": 12},
             "ckpt": {"full_every_steps": 4, "keep_local": 5}, "log": {"hist_every": 4, "layer_stats_every": 4}}
-    assert m.main(["--config", write_config(env, "aux-ref", over)]) == 0
-    ref = one_run(env["root"], "aux-ref")
+    assert m.main(["--config", write_config(env, f"aux-ref-{offload}", over)]) == 0
+    ref = one_run(env["root"], f"aux-ref-{offload}")
     monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "10")
     with pytest.raises(RuntimeError, match="simulated crash"):
-        m.main(["--config", write_config(env, "aux-crash", over)])
+        m.main(["--config", write_config(env, f"aux-crash-{offload}", over)])
     monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
-    crash = one_run(env["root"], "aux-crash")
+    crash = one_run(env["root"], f"aux-crash-{offload}")
     assert m.main(["--resume", str(crash / "checkpoints" / "full_step_8")]) == 0
 
     st = steps_of(ref)
@@ -494,11 +526,17 @@ def test_resume_cannot_change_the_study_keys(env):
 @pytest.mark.parametrize("offload", ["none", "cpu"])
 def test_weight_decay_only_on_matrices(offload):
     """optim.weight_decay > 0: two param groups, the decay on the parameters of 2+ dimensions only (matrices,
-    embeddings, conv kernels); biases and norm affine never decay. 0 keeps the one group of before. A resume's
-    --set optim.weight_decay moves the decaying group's value only."""
+    embeddings, conv kernels); biases - the 2-dim attention biases bias_u / bias_v too - and norm affine never decay.
+    0 keeps the one group of before. A resume's --set optim.weight_decay moves the decaying group's value only."""
     m = load_script("04_distill")
     torch.manual_seed(0)
-    model = nn.Sequential(nn.Linear(4, 3), nn.LayerNorm(3), nn.Conv1d(3, 2, 3), nn.BatchNorm1d(2))
+
+    class RelPosBias(nn.Module):  # the conformer attention's (heads, head_dim) biases
+        def __init__(self):
+            super().__init__()
+            self.bias_u, self.bias_v = nn.Parameter(torch.randn(2, 3)), nn.Parameter(torch.randn(2, 3))
+
+    model = nn.Sequential(nn.Linear(4, 3), nn.LayerNorm(3), nn.Conv1d(3, 2, 3), nn.BatchNorm1d(2), RelPosBias())
     names = [n for n, _ in model.named_parameters()]
     params = [p for _, p in model.named_parameters()]
 
@@ -513,7 +551,7 @@ def test_weight_decay_only_on_matrices(offload):
     R = make(0.1)
     assert R.st["optim_groups"] == "ndim"
     groups = R.opt.param_groups
-    assert [(g["decay"], g["weight_decay"], len(g["params"])) for g in groups] == [(True, 0.1, 2), (False, 0.0, 6)]
+    assert [(g["decay"], g["weight_decay"], len(g["params"])) for g in groups] == [(True, 0.1, 2), (False, 0.0, 8)]
     before = [p.detach().clone() for p in params]
     for p in params:
         p.grad = torch.zeros_like(p)
@@ -523,7 +561,7 @@ def test_weight_decay_only_on_matrices(offload):
     if offload == "cpu":
         R.opt.push()
     for n, p, b in zip(names, params, before):  # zero gradients: AdamW's step is the decay alone
-        want = b * (1 - 0.5 * 0.1) if p.ndim >= 2 else b
+        want = b * (1 - 0.5 * 0.1) if n in ("0.weight", "2.weight") else b
         torch.testing.assert_close(p.detach(), want, msg=n)
     R.cfg["optim"]["weight_decay"] = 0.2  # a resume's --set
     m.apply_optim_hparams(R)
@@ -712,6 +750,36 @@ def test_branch_is_the_t_half_run(env):
                 ["branch.parent=runs/x"]):  # the wall clock
         with pytest.raises(SystemExit):
             m.load_config(None, bad)
+
+
+def test_branch_ignores_the_parents_fraction_schedules(env):
+    """A branch config that is its parent's plus branch.parent keeps the parent's eval.full_at_fracs and
+    ckpt.*_at_fracs. The branch runs none of them: its one eval is the final one. At M = 23 they would otherwise fire
+    one step after the resume: resume step round(0.4 x 23) = 9, end step round(0.5 x 23) = 12, and 0.8 x 12 rounds
+    to 10."""
+    m = load_script("04_distill")
+    over = {"schedule": {"max_steps": 23}, "eval": {"full_at_fracs": [0.2, 0.4, 0.6, 0.8]},
+            "ckpt": {"full_at_fracs": [0.4, 0.8], "weights_at_fracs": [0.4, 0.8], "keep_local": 1}}
+    assert m.main(["--config", write_config(env, "par23", over)]) == 0
+    parent = one_run(env["root"], "par23")
+    assert (parent / "checkpoints" / "full_step_9").is_dir()
+    path = env["root"] / "par23-branch.json"
+    path.write_text(json.dumps(merged(env["base"], dict(over, run_name="par23", branch={"parent": str(parent)})),
+                               indent=1), encoding="utf-8")
+    assert m.main(["--config", str(path)]) == 0
+    branch = one_run(env["root"], "par23-half")
+
+    ev = events(branch)
+    b = next(e for e in ev if e["kind"] == "branch")
+    assert (b["resume_step"], b["end_step"], b["t_c"]) == (9, 12, 9.0)
+    assert b["fracs_ignored"] == {"eval.full_at_fracs": [0.2, 0.4, 0.6, 0.8], "ckpt.full_at_fracs": [0.4, 0.8],
+                                  "ckpt.weights_at_fracs": [0.4, 0.8]}
+    assert [(e["at_step"], e["complete"], e["final"]) for e in ev if e["kind"] == "eval"] == [(12, True, True)]
+    ck = branch / "checkpoints"
+    assert sorted(p.name for p in ck.glob("full_step_*")) == ["full_step_12"]
+    assert sorted(p.name for p in ck.glob("step_*")) == ["step_12"]
+    s = json.loads((branch / "summary.json").read_text(encoding="utf-8"))
+    assert s["steps"] == 12 and [r["step"] for r in s["history"] if r["step"] > 9] == [12]
 
 
 # ---------------------------------------------------------------------------------------------------- SpecAugment

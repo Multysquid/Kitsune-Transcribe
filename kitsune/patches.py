@@ -141,6 +141,13 @@ def train_mode(model: nn.Module, bn: str = "frozen") -> nn.Module:
     return model
 
 
+def bn_running_stats(model: nn.Module) -> list[torch.Tensor]:
+    """The running statistics of every BatchNorm (running_mean, running_var, num_batches_tracked, those it keeps): the
+    buffers a training forward updates under the "train" mode."""
+    return [b for m in _batchnorms(model) for b in (m.running_mean, m.running_var, m.num_batches_tracked)
+            if b is not None]
+
+
 def assert_bn_frozen(model: nn.Module) -> int:
     """Raise if any BatchNorm is in train mode. Returns the number of BN modules checked."""
     bns = _batchnorms(model)

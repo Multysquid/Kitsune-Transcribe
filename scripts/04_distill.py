@@ -141,15 +141,17 @@ The size study (every default below is the trainer as it was before them; the st
                     trained from scratch: BN trains in the training forward and updates its running stats, which the
                     evals and greedy decodes use through eval mode; every train_mode() call and BN check follows the
                     mode (kitsune.patches.train_mode / assert_bn_mode), bn/max_abs_drift is reported instead of
-                    asserted 0, and gradient checkpointing is never turned on - the memory probe halves the micro-batch
-                    down to memory.min_micro_audio_s instead). bn.momentum: null = the modules' own
+                    asserted 0, gradient checkpointing is never turned on - the memory probe halves the micro-batch
+                    down to memory.min_micro_audio_s instead - and a skipped step (non-finite, OOM) puts the running
+                    stats back as they were before it). bn.momentum: null = the modules' own
   loss.aux_ctc_weight  > 0: a training-only aux-CTC head (setup_aux_ctc) on the encoder output, d_enc -> V + 1 with the
                     blank V, on the teacher's greedy ids (no prompt, no EOS), its summed CTC loss divided by the step's
                     target tokens and weighted into the gradient; loss/aux_ctc per token, loss/total includes it,
                     loss/objective (and the combined-loss curves, the early stop) does not. In the optimizer and the
                     full state (aux_ctc.pt), never in the exported weights; the memory probe includes its logits
-  optim.weight_decay   > 0: AdamW's decoupled decay on the parameters of 2+ dimensions only, a second group without it
-                    (setup_optim; a run started at 0 keeps its single group)
+  optim.weight_decay   > 0: AdamW's decoupled decay on the parameters of 2+ dimensions only, never on a bias (the 2-dim
+                    attention biases bias_u / bias_v included), a second group without it (decays, setup_optim; a run
+                    started at 0 keeps its single group)
   schedule          on the steps clock the warm-up is not capped, so validate() rejects warmup_steps >= (1 -
                     cooldown_frac) x max_steps: a warm-up still running at the cooldown never reaches the peak LR
   eval.full_at_fracs   a complete eval (as full_every_epochs: teacher-forced and greedy on the complete eval sets, the
@@ -162,8 +164,11 @@ The size study (every default below is the trainer as it was before them; the st
                     it) - weights, optimizer, aux head, counters, RNG and the planner's position, so the data order goes
                     on - under a config equal to the parent's but for BRANCH_FREE, to round(end_frac x M) with the
                     cooldown from the resume step: warm-up and stable LR are the parent's, the cooldown the last 20 %
-                    of a T/2 budget, exactly the WSD schedule of a run with max_steps round(end_frac x M). Then one
-                    complete final eval. A new run dir <parent run_name>-half-<stamp> (unless run_name differs from
+                    of a T/2 budget, the WSD schedule of a run with max_steps round(end_frac x M) (exactly for M a
+                    multiple of 10 at the default fractions; else the rounding moves the cooldown's start by up to 0.8
+                    of a step). Then one complete final eval, and no other: the branch ignores eval.full_at_fracs and
+                    ckpt.*_at_fracs (a config copied from the parent's carries them; the `branch` event lists them
+                    under fracs_ignored). A new run dir <parent run_name>-half-<stamp> (unless run_name differs from
                     the parent's); a `branch` event and summary.json's `branch` carry parent_run_id, resume_step,
                     end_step and t_c; a crash resumes it like any run
   specaug.seed      null = the run's seed: every micro-batch's masks from (seed, step, micro-batch index)
@@ -224,6 +229,7 @@ from kitsune.patches import (  # noqa: E402  (assert_bn_frozen: scripts/05_evalu
     BN_MODES,
     assert_bn_frozen,
     assert_bn_mode,
+    bn_running_stats,
     patch_relpos_once_per_batch,
     train_mode,
 )
@@ -297,7 +303,8 @@ DEFAULTS = {
     # offload "cpu": AdamW and fp32 master weights in host memory (CpuOffloadAdamW), for a GPU that holds the weights
     # and gradients but not the AdamW state; offload_fused: torch's fused CPU AdamW kernel there instead of foreach.
     # `fused` is the on-device (CUDA) optimizer's flag. weight_decay: AdamW's decoupled decay, on the parameters of 2 or
-    # more dimensions only (a second param group without decay for biases, norm and BN affine; setup_optim)
+    # more dimensions only (a second param group without decay for biases - bias_u / bias_v too -, norm and BN affine;
+    # decays, setup_optim)
     "optim": {"lr": 1e-4, "betas": [0.9, 0.98], "eps": 1e-8, "weight_decay": 0.0, "clip": 1.0, "fused": True,
               "max_nonfinite_skips": 3, "offload": "none", "offload_fused": False},
     # clock "steps": warmup_steps must end before the cooldown starts (validate), and is not capped
@@ -353,7 +360,8 @@ DEFAULTS = {
                    "min_delta_abs": 0.0, "min_evals": 3, "floor": None, "action": "cooldown"},
     # the T/2 branch (steps clock; the module docstring): parent = a local run dir whose full state at
     # round(resume_frac x its max_steps) this run continues, to round(end_frac x max_steps) with the cooldown from the
-    # resume step: the WSD schedule of a run with budget end_frac x T. null: an ordinary run
+    # resume step: the WSD schedule of a run with budget end_frac x T, and one eval, the final one (it ignores
+    # eval.full_at_fracs and ckpt.*_at_fracs). null: an ordinary run
     "branch": {"parent": None, "resume_frac": 0.4, "end_frac": 0.5},
     # the LR probe (steps clock; the module docstring): metrics only, and at the end the training objective
     # teacher-forced on the complete gate sets (lr_probe_eval)
@@ -654,6 +662,16 @@ def frac_step(frac: float, max_steps: int) -> int:
 def frac_steps(fracs, max_steps: int | None) -> dict[int, float]:
     """step -> fraction for eval.full_at_fracs / ckpt.*_at_fracs (None or empty: none; so without a step count)."""
     return {frac_step(f, max_steps): float(f) for f in fracs or ()} if max_steps else {}
+
+
+def branch_fracs(cfg: dict) -> dict:
+    """The fraction schedules a T/2 branch's config sets and the branch ignores (loop(); its `branch` event lists
+    them): a branch config copied from its parent's carries the parent's eval.full_at_fracs and ckpt.*_at_fracs."""
+    ck = cfg["ckpt"]
+    got = {"eval.full_at_fracs": cfg["eval"]["full_at_fracs"], "ckpt.full_at_fracs": ck["full_at_fracs"],
+           "ckpt.weights_at_fracs": ck["weights_at_fracs"],
+           "ckpt.upload_full_at": [u for u in ck["upload_full_at"] if upload_frac(u) is not None]}
+    return {k: v for k, v in got.items() if v}
 
 
 def specaug_seed(cfg: dict, step: int, micro: int) -> int:
@@ -1275,11 +1293,17 @@ def _weights(R: Run) -> list[torch.Tensor]:
     return R.opt.master if offloaded(R) else R.params
 
 
+def decays(name: str, p: torch.Tensor) -> bool:
+    """Whether optim.weight_decay decays parameter `name`: 2 or more dimensions (matrices, embeddings, convolution
+    kernels) and not a bias - the conformer attention's relative-position biases bias_u / bias_v are (heads, head_dim)
+    but biases all the same. The rest (1-dim biases, LayerNorm and BatchNorm affine) never decays."""
+    return p.ndim >= 2 and not name.rsplit(".", 1)[-1].startswith("bias")
+
+
 def decay_groups(params: list[torch.Tensor], decay: list[bool], weight_decay: float) -> list[dict]:
-    """AdamW param groups for optim.weight_decay: {"decay": True} with the decay over the parameters of 2 or more
-    dimensions (matrices, embeddings, convolution kernels), {"decay": False} at 0 over the rest (biases, LayerNorm and
-    BatchNorm affine), each only if it has parameters. The "decay" key goes into the optimizer's state_dict with its
-    group, so a resume's --set optim.weight_decay reaches the right one."""
+    """AdamW param groups for optim.weight_decay: {"decay": True} with the decay over the parameters `decays` picks,
+    {"decay": False} at 0 over the rest, each only if it has parameters. The "decay" key goes into the optimizer's
+    state_dict with its group, so a resume's --set optim.weight_decay reaches the right one."""
     out = [dict(params=[p for p, d in zip(params, decay) if d], weight_decay=float(weight_decay), decay=True),
            dict(params=[p for p, d in zip(params, decay) if not d], weight_decay=0.0, decay=False)]
     return [g for g in out if g["params"]]
@@ -1294,7 +1318,7 @@ def setup_optim(R: Run):
     o = R.cfg["optim"]
     layout = R.st.get("optim_groups") or ("ndim" if float(o["weight_decay"]) > 0 else "single")
     R.st["optim_groups"] = layout
-    decay = [p.ndim >= 2 for p in R.params] if layout == "ndim" else None
+    decay = [decays(n, p) for n, p in zip(R.param_names, R.params)] if layout == "ndim" else None
     exclude = (AUX_CTC_PREFIX,)
     if o["offload"] == "cpu":
         R.opt = CpuOffloadAdamW(R.params, lr=o["lr"], betas=tuple(o["betas"]), eps=o["eps"],
@@ -1627,6 +1651,13 @@ def _grad_sq_by_module(R: Run) -> dict[str, float]:
                                     for p in R.params]))
 
 
+@torch.no_grad()
+def _put_back(saved: list[tuple[torch.Tensor, torch.Tensor]]):
+    """Copy each saved tensor back into its buffer (train_step's BN running stats, when it skips a step)."""
+    for buf, keep in saved:
+        buf.copy_(keep)
+
+
 def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dict | None:
     """One optimizer step over its micro-batches. Returns the step's CPU statistics, or None if it was skipped
     (non-finite gradient norm or OOM; the planner position still moves on)."""
@@ -1644,6 +1675,10 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
         return None
     for g in R.opt.param_groups:
         g["lr"] = lr
+    # bn.mode "train": every forward updates the BN running stats, and a skipped step must not keep that (a non-finite
+    # forward would leave NaN statistics to every later eval, while training on batch statistics goes on unaware):
+    # copied here, put back if the step is skipped
+    bn_keep = [(b, b.clone()) for b in bn_running_stats(R.model)] if bn_mode(cfg) == "train" else []
     w_aux = aux_ctc_weight(cfg) if getattr(R, "aux_ctc", None) is not None else 0.0
     aux_sum = torch.zeros((), device=dev)  # the step's aux-CTC loss, summed over its rows
     stats_step = lg["layer_stats_every"] and step % int(lg["layer_stats_every"]) == 0
@@ -1703,13 +1738,15 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
         per_utt.clear()
         meta.clear()
         R.opt.zero_grad(set_to_none=True)
+        _put_back(bn_keep)
         if dev.type == "cuda":
             torch.cuda.empty_cache()
         R.st["oom_skips"] += 1
         R.log.event("oom_step_skipped", at_step=step, n_micro=len(mbs), at_micro=j, audio_pad_s=round(audio_pad, 1),
                     count=R.st["oom_skips"], error=oom, ids=[mb["ids"] for mb in mbs],
                     padded_s=[round(float(mb["lengths"].max()) * len(mb["ids"]) / SR, 1) for mb in mbs],
-                    dec_len=[int(mb["dec_mask"].shape[1]) for mb in mbs])
+                    dec_len=[int(mb["dec_mask"].shape[1]) for mb in mbs],
+                    **({"bn_stats_restored": True} if bn_keep else {}))
         if R.st["oom_skips"] > int(cfg["memory"]["max_oom_skips"]):
             raise torch.OutOfMemoryError(f"{R.st['oom_skips']} steps skipped for OOM (limit "
                                          f"{cfg['memory']['max_oom_skips']}); last: {oom}")
@@ -1726,6 +1763,7 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
     gnorm = float(gnorm)
     if not math.isfinite(gnorm):
         R.opt.zero_grad(set_to_none=True)
+        _put_back(bn_keep)
         R.st["nonfinite_skips"] += 1
         R.st["nonfinite_total"] += 1
         # everything needed to find the culprit afterwards: the step's ids per micro-batch, each micro-batch's loss
@@ -1736,7 +1774,8 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
         R.log.event("nonfinite_grad_skipped", at_step=step, grad_norm=gnorm, consecutive=R.st["nonfinite_skips"],
                     nonfinite_ids=bad, ids=[mb["ids"] for mb in mbs],
                     mb_n_tok=[int(mb["top_idx"].shape[0]) for mb in mbs],
-                    mb_kl_sum=[float(pu[:, 0].sum()) for pu in pus], mb_ce_sum=[float(pu[:, 1].sum()) for pu in pus])
+                    mb_kl_sum=[float(pu[:, 0].sum()) for pu in pus], mb_ce_sum=[float(pu[:, 1].sum()) for pu in pus],
+                    **({"bn_stats_restored": True} if bn_keep else {}))
         if R.st["nonfinite_skips"] > int(cfg["optim"]["max_nonfinite_skips"]):
             raise FloatingPointError(f"{R.st['nonfinite_skips']} consecutive steps with a non-finite gradient norm")
         return None
@@ -3133,14 +3172,16 @@ def train(R: Run, state: dict | None) -> int:
     if state is not None:  # a resume, or a T/2 branch's start from its parent's state (the same restore)
         full = R.resumed_from
         R.model.load_state_dict(torch.load(full / "model.pt", map_location=R.device, weights_only=True))
-        # offload: the AdamW state stays in host memory, and the masters are rebuilt from the weights just loaded
-        R.opt.load_state_dict(torch.load(full / "optimizer.pt", map_location="cpu" if offloaded(R) else R.device,
-                                         weights_only=True))
-        R.l2sp.load_state_dict(torch.load(full / "l2sp.pt", map_location="cpu", weights_only=True))
         if R.aux_ctc is not None:  # loss.aux_ctc_weight is RESUME_FIXED: a state of such a run always has the head
             if not (full / "aux_ctc.pt").is_file():
                 raise SystemExit(f"{full}: no aux_ctc.pt, although loss.aux_ctc_weight is {aux_ctc_weight(cfg)}")
             R.aux_ctc.load_state_dict(torch.load(full / "aux_ctc.pt", map_location=R.device, weights_only=True))
+        # offload: the AdamW state stays in host memory, and the masters are rebuilt from the weights just loaded -
+        # the aux head's too, so it loads first (after it, the masters would keep the fresh head and the first push()
+        # would write that back over the loaded one)
+        R.opt.load_state_dict(torch.load(full / "optimizer.pt", map_location="cpu" if offloaded(R) else R.device,
+                                         weights_only=True))
+        R.l2sp.load_state_dict(torch.load(full / "l2sp.pt", map_location="cpu", weights_only=True))
         # both loads restore the saved hyper-parameters (the optimizer's param_groups, the L2-SP lambda): this config's
         # go back on top, so a resume's --set optim.* / loss.l2sp_lambda takes effect (a no-op without one). lr is set
         # every step anyway; fused/foreach only change speed
@@ -3151,9 +3192,11 @@ def train(R: Run, state: dict | None) -> int:
         plan_epochs(R)  # a no-op unless the clock was switched to "epochs" on this resume
         if R.branch_start:
             br = R.st["branch"]
+            ignored = branch_fracs(cfg)
             log.event("branch", **{k: br[k] for k in ("parent_run_id", "resume_step", "end_step", "t_c")},
                       parent_state=br["parent_state"], parent_max_steps=br["parent_max_steps"],
-                      train_s=round(R.st["train_s"], 1), epoch=R.st["epoch_progress"], planner=state["planner"])
+                      train_s=round(R.st["train_s"], 1), epoch=R.st["epoch_progress"], planner=state["planner"],
+                      **({"fracs_ignored": ignored} if ignored else {}))
         else:
             log.event("resumed", at_step=R.st["step"], train_s=round(R.st["train_s"], 1),
                       epoch=R.st["epoch_progress"], planner=state["planner"])
@@ -3410,10 +3453,15 @@ def loop(R: Run):
     epochs = int(sch["epochs"]) if sch["clock"] == "epochs" else None
     max_steps = R.max_steps()  # schedule.max_steps, or a T/2 branch's end step
     probe = lr_probe_on(cfg)  # metrics only: no evals, minis or weights in the loop, no checkpoint uploads
-    # the fraction evals and checkpoints (steps clock): step -> fraction, of max_steps (a branch's: of its end step)
-    frac_eval = {} if probe else frac_steps(ev_cfg["full_at_fracs"], max_steps)
-    frac_weights = {} if probe else frac_steps(ck["weights_at_fracs"], max_steps)
-    frac_full = frac_steps(ck["full_at_fracs"], max_steps)
+    # the fraction evals and checkpoints (steps clock): step -> fraction of max_steps. An LR probe keeps only the local
+    # full states (for a resume). A T/2 branch has none (branch_fracs lists what it ignores): its one eval is the
+    # final one, and its fractions of its end step round(end_frac x M) fall before its resume step round(resume_frac
+    # x M) - but for the rounding, which puts round(0.8 x round(0.5 M)) at round(0.4 M) + 1, its first step, for
+    # about 1 M in 10
+    no_fracs = bool(R.st.get("branch"))
+    frac_eval = {} if probe or no_fracs else frac_steps(ev_cfg["full_at_fracs"], max_steps)
+    frac_weights = {} if probe or no_fracs else frac_steps(ck["weights_at_fracs"], max_steps)
+    frac_full = {} if no_fracs else frac_steps(ck["full_at_fracs"], max_steps)
     upload_at = set() if probe else set(ck["upload_full_at"])
 
     def passes_done() -> bool:  # clock "epochs": the planner's position is past the last epoch (skipped steps too)
