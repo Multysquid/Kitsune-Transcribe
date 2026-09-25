@@ -336,6 +336,23 @@ def teacher_processor():
         no_real_data(f"teacher processor not in the local HF cache (HF_HOME): {type(e).__name__}: {e}")
 
 
+def tb_layouts(tb_file) -> list[tuple[int, dict]]:
+    """The Custom Scalars layouts in one TensorBoard event file (tag custom_scalars__config__, what
+    SummaryWriter.add_custom_scalars writes), each as (step, {category: {chart: [its multiline tag regexes]}})."""
+    from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
+    from tensorboard.plugins.custom_scalar import layout_pb2
+
+    out = []
+    for e in EventFileLoader(str(tb_file)).Load():
+        for v in e.summary.value:
+            if v.tag == "custom_scalars__config__":
+                lay = layout_pb2.Layout()
+                lay.ParseFromString(v.tensor.string_val[0])
+                out.append((e.step, {c.title: {ch.title: list(ch.multiline.tag) for ch in c.chart}
+                                     for c in lay.category}))
+    return out
+
+
 def load_script(name: str):
     """Import scripts/<name>.py as a module (works for names starting with a digit, e.g. "02_teacher_pass")."""
     spec = importlib.util.spec_from_file_location(f"kitsune_script_{name}", ROOT / "scripts" / f"{name}.py")

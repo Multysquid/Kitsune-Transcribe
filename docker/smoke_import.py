@@ -1,9 +1,11 @@
-"""Import every training dependency and run a tiny CPU forward/backward of a random CohereAsr model.
+"""Import every training dependency, load the TensorBoard server and run a tiny CPU forward/backward of a random
+CohereAsr model.
 
 Why: CI runs this inside the freshly built image before the image is tagged (.github/workflows/image.yml), so a
 broken wheel, an ABI mismatch (numpy vs numba, torch vs transformers) or a pin that did not stick is caught for free
 on a GitHub runner instead of on a rented A100. It needs no GPU, no network and no data, and it exercises the exact
-call path the trainer uses: `model.model(...)` with sdpa attention on a padded batch, then the LM head in fp32.
+call path the trainer uses: `model.model(...)` with sdpa attention on a padded batch, then the LM head in fp32; and
+the viewer's import path the box starts (tensorboard.main, which needs pkg_resources from the pinned setuptools).
 
 Usage (inside the image; the base image's ENTRYPOINT must be bypassed):
   docker run --rm --entrypoint /venv/main/bin/python <image> /opt/kitsune/smoke_import.py
@@ -41,6 +43,7 @@ MODULES = {
     "scikit-learn": "sklearn",
     "jiwer": "jiwer",
     "tensorboard": "tensorboard",
+    "setuptools": "pkg_resources",  # pinned for the TensorBoard server, which imports this (tensorboard_server)
     "tqdm": "tqdm",
     "nvidia-ml-py": "pynvml",
     "psutil": "psutil",
@@ -131,6 +134,27 @@ def audio_roundtrip() -> str:
     return sf.__libsndfile_version__
 
 
+def tensorboard_server() -> dict:
+    """The TensorBoard the box serves (vast/onstart.sh runs `python -m tensorboard.main`), not only the SummaryWriter
+    the trainer logs with: tensorboard 2.20.0's default.py imports pkg_resources, which setuptools 82.0.0 removed.
+    The first A100 box had setuptools 84.0.0, so its TensorBoard died at boot with ModuleNotFoundError while `import
+    tensorboard` and every SummaryWriter worked. Imports the server's modules, lists the plugins it loads (the
+    first-party ones and the entry-point ones pkg_resources finds) and parses the box's flags (vast/onstart.sh's, its
+    scalars sampling included); no port is opened."""
+    import tempfile
+
+    import tensorboard.default as default
+    import tensorboard.main  # noqa: F401  (python -m tensorboard.main imports it first)
+    from tensorboard import program
+
+    plugins = default.get_plugins() + default.get_dynamic_plugins()
+    with tempfile.TemporaryDirectory() as logdir:
+        tb = program.TensorBoard(plugins=default.get_plugins())
+        tb.configure(argv=[None, "--logdir", logdir, "--host", "127.0.0.1", "--port", "6006",
+                           "--samples_per_plugin", "scalars=30000"])
+    return {"plugins": len(plugins), "samples_per_plugin": tb.flags.samples_per_plugin}
+
+
 def tiny_forward_backward(seed: int = 0) -> dict:
     """Random tiny CohereAsr (real 16384 vocab and prompt ids), padded batch of 2, sdpa, fp32 head, CE backward."""
     import torch
@@ -203,7 +227,7 @@ def main() -> int:
     import torch
     print(f"torch {torch.__version__}  cuda built {torch.version.cuda}  arch {torch.cuda.get_arch_list()}  "
           f"cuda available {torch.cuda.is_available()}")
-    for name, fn in (("audio", audio_roundtrip), ("model", tiny_forward_backward)):
+    for name, fn in (("audio", audio_roundtrip), ("tensorboard", tensorboard_server), ("model", tiny_forward_backward)):
         try:
             print(f"  {name}: {fn()}")
         except Exception as e:

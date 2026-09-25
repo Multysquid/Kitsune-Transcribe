@@ -3,13 +3,17 @@
 Why: the run dir is written for crash-safety (append-only jsonl, parquet parts, per-eval folders, TensorBoard event
 files); analysis wants one table per kind. This folds everything into export/:
   - TensorBoard events (EventAccumulator: scalars, histograms, text) -> tb_*.parquet/csv. A resumed run's purged steps
-    are dropped by the accumulator, exactly as TensorBoard shows them. TensorBoard files the tags under three buckets
+    are dropped by the accumulator, as TensorBoard shows them. (This reader purges on every SessionLog.START, the
+    server only from a run's second one on: a run whose first event file opens without one, logged before
+    kitsune.runlog.RunLogger._tb_purge_step, shows the discarded steps in the server until tools/regroup_tb.py
+    rebuilds it.) TensorBoard files the tags under three buckets
     (1_operational/, 2_loss_accuracy/, 3_misc/); the tables give back the logged tag (`tag`) with `bucket` and
     `tb_tag` next to it, from metrics/tag_map.json (copied as tag_map.json, and as the tag_map table); a tag the map
     lacks (no tag_map.json: a run logged before the buckets, or a copy without the file) is mapped by the same rules
     from the tags of the open files
   - metrics/*: scalars (rebuilt from scalars.jsonl, the source of truth; the parquet mirror may lag one sync),
-    steps, train_utts parts, hist parts, text
+    steps, train_utts parts, hist parts, text; the combined-loss chart's three curves (combined_loss/train, val,
+    val_full) also as one table of their own, combined_loss
   - evals/step_<N>/*.parquet concatenated per kind with a step column (eval_tf, eval_greedy, eval_probe, ...), the
     mini evals' evals/step_<N>_mini/ likewise (eval_mini_tf, eval_mini_greedy, ...), summary.json files flattened to
     eval_summaries (a `mini` column; the eval's final and complete flags and its val-CER scope as columns),
@@ -42,8 +46,8 @@ import pandas as pd  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
-from kitsune.runlog import (TB_BUCKETS, TagMapper, _finite, load_tag_map, read_scalars_jsonl,  # noqa: E402
-                            tag_map_entries, tb_inverse, tb_tag)
+from kitsune.runlog import (COMBINED_LOSS_TAGS, TB_BUCKETS, TagMapper, _finite, load_tag_map,  # noqa: E402
+                            read_scalars_jsonl, tag_map_entries, tb_inverse, tb_tag)
 
 # column descriptions for the README; anything not listed is described generically
 COLUMNS = {
@@ -95,14 +99,22 @@ COLUMNS = {
     "scope": "what the eval's headline/val_cer* pools (summary.json headline_scope.val_greedy): complete = the "
              "complete eval sets, subset = the fixed greedy subset (e.g. the step-0 eval of a full_every_epochs run); "
              "empty for a mini eval",
+    "series": "combined-loss curve: train (every optimizer step, = loss/objective, on augmented audio), val (the "
+              "mini evals' gate subsets and the step-0 point on them), val_full (the complete gate sets at every "
+              "complete-set eval)",
 }
 FILES = {
     "tb_scalars": "every TensorBoard scalar (mirror of scalars; purged steps dropped)",
     "tb_histograms": "every TensorBoard histogram (weights, grads, activations)",
     "tb_text": "every TensorBoard text entry (config, samples, events)",
     "scalars": "EVERY scalar ever logged, long format (from metrics/scalars.jsonl). Rows with discarded = true come "
-               "from weights a crash discarded (TensorBoard hides them); the rest is what TensorBoard shows",
+               "from weights a crash discarded (TensorBoard's purge drops them); the rest is what TensorBoard shows",
     "steps": "one wide row per optimizer step; NaN = not logged at that step",
+    "combined_loss": "the run's overall loss chart (TensorBoard: 2_loss_accuracy/00_combined/ and the Custom Scalars "
+                     "chart \"combined_loss: train vs val\"): the training objective w_kl * KL + w_ce * CE per target "
+                     "token, without the L2-SP term, one row per (series, step), from the scalars combined_loss/"
+                     "<series>; rows from weights a crash discarded left out, as TensorBoard's purge drops them "
+                     "from the chart",
     "train_utts": "one row per utterance per time it was trained on. Rows with discarded = true were trained on by "
                   "weights a crash discarded; the rest has one row per (step, utterance), unless a resumed launch "
                   "died before its own full state (see `discarded`)",
@@ -322,6 +334,24 @@ def discarded(df: pd.DataFrame, runs: list[tuple[float, int | None, int]]) -> np
     return out
 
 
+def combined_table(scalars: pd.DataFrame | None) -> pd.DataFrame | None:
+    """The combined-loss curves (kitsune.runlog.COMBINED_LOSS_TAGS) from the scalars table as one long table: series
+    (train, val, val_full), step, value, wall, elapsed_s, in that series order and by step. Rows from weights a crash
+    discarded (`discarded`) are left out, as TensorBoard's purge leaves them out of the chart. None without such a
+    tag."""
+    if scalars is None or "tag" not in scalars.columns:
+        return None
+    df = scalars[scalars["tag"].isin(COMBINED_LOSS_TAGS)]
+    if "discarded" in df.columns:
+        df = df[~df["discarded"]]
+    if not len(df):
+        return None
+    order = {t.split("/", 1)[1]: i for i, t in enumerate(COMBINED_LOSS_TAGS)}
+    out = df.assign(series=df["tag"].str.split("/", n=1).str[1])[["series", "step", "value", "wall", "elapsed_s"]]
+    return (out.assign(_order=out["series"].map(order)).sort_values(["_order", "step", "wall"], kind="stable")
+            .drop(columns="_order").reset_index(drop=True))
+
+
 def run_tables(run: Path) -> dict[str, pd.DataFrame]:
     t = {}
     ev = _jsonl(run / "events.jsonl")
@@ -354,6 +384,9 @@ def run_tables(run: Path) -> dict[str, pd.DataFrame]:
     for kind in ("scalars", "train_utts", "hist", "text"):
         if kind in t:
             t[kind]["discarded"] = discarded(t[kind], runs)
+    combined = combined_table(t.get("scalars"))
+    if combined is not None:
+        t["combined_loss"] = combined
 
     per_kind: dict[str, list[pd.DataFrame]] = {}
     summaries = []
@@ -431,7 +464,10 @@ def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: l
              "TensorBoard groups cards by the first component of a tag, so the run's event files put every tag under "
              "one of three buckets: `1_operational/` (time, throughput, memory, system, data progress with the tokens "
              "per source, schedule, early-stop bookkeeping, eval cost and counts with the CER denominators "
-             "`ref_chars`; lifecycle events and the config as text), `2_loss_accuracy/` (first `00_summary/full/` and "
+             "`ref_chars`; lifecycle events and the config as text), `2_loss_accuracy/` (first `00_combined/`: the "
+             "training objective w_kl * KL + w_ce * CE per step (`train`) and on the gate sets (`val`: the mini "
+             "evals' subsets and their step-0 point; `val_full`: the complete sets), which the Custom Scalars chart "
+             "`combined_loss: train vs val` overlays and the `combined_loss` table holds; then `00_summary/full/` and "
              "`00_summary/mini/`: every eval's headline numbers, the pooled val / train CER vs the reference and vs "
              "the teacher with `_pct` copies, val / train KL and top-1; then train and held-out loss (the train "
              "total and the L2-SP value under `train_loss_incl_l2sp/`: the value climbs all run as the weights "

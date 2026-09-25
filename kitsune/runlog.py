@@ -9,7 +9,8 @@ Layout (relative to runs/<run_id>/):
   env/                        git_sha.txt, git_status.txt, git_diff.patch, pip_freeze.txt, nvidia_smi.txt,
                               system.json, sdpa_backends.json      (env/restart-<stamp>/ on a restart)
   tb/                         TensorBoard event files (mirror of everything below), every tag under one of three
-                              buckets: 1_operational/, 2_loss_accuracy/, 3_misc/ (TB_BUCKET_RULES)
+                              buckets: 1_operational/, 2_loss_accuracy/, 3_misc/ (TB_BUCKET_RULES), and in each file
+                              the Custom Scalars chart TB_LAYOUT (combined_loss: train vs val)
   metrics/tag_map.json        {logged tag: {"tb_tag", "bucket", "plugin"}}: where TensorBoard shows each tag; the
                               files below keep the tag as logged
   metrics/scalars.jsonl       EVERY scalar: {"step","wall","elapsed_s","tag","value"}; a non-finite value is written
@@ -43,17 +44,21 @@ waits at most close_join_s for it and its own final sync, then logs sync_abandon
 and dies with the process; on the box vast/finish.py uploads again and verifies before a destroy).
 
 Resume: pass the dict from state_dict() (kept in the trainer's full state) as `resume=`. elapsed_s continues, steps
-after the restored step are dropped from steps.parquet and purged from TensorBoard, and are then logged again as far as
-the resumed launch gets (a budget re-fitted to the time left may end it before the crash step). The append-only files
-(jsonl, parquet parts, evals/, samples/) keep the crashed launch's rows: a row with a step after the restored one,
-logged before the resumed launch's logger_start event, comes from weights the crash discarded, whether or not that
-step is logged again (tools/export_run.py marks these `discarded`).
+after the restored step are dropped from steps.parquet and purged from TensorBoard (a SessionLog.START at the restored
+step + 1; the run's first event file opens with one at step 0, since TensorBoard's server ignores a run's first START:
+RunLogger._tb_purge_step), and are then logged again as far as the resumed launch gets (a budget re-fitted to the
+time left may end it before the crash step). The append-only files (jsonl, parquet parts, evals/, samples/) keep the
+crashed launch's rows: a row with a step after the restored one, logged before the resumed launch's logger_start
+event, comes from weights the crash discarded, whether or not that step is logged again (tools/export_run.py marks
+these `discarded`).
 
 TensorBoard buckets: TensorBoard groups cards by the first component of a tag, so tb/ gets every tag under one of
   1_operational     time, throughput, memory, system, data progress (tokens per source too), schedule, early-stop
                     bookkeeping, eval cost and counts (CER denominators: ref_chars, cer_teacher_chars), the mini
                     evals' cost under eval/mini/; events and config as text
-  2_loss_accuracy   first 00_summary/{full,mini}/: every eval's headline numbers (pooled val / train CER, loss,
+  2_loss_accuracy   first 00_combined/{train,val,val_full}: the training objective w_kl * KL + w_ce * CE per step
+                    and on the gate sets (COMBINED_LOSS_TAGS; TB_LAYOUT overlays the three in one Custom Scalars
+                    chart), then 00_summary/{full,mini}/: every eval's headline numbers (pooled val / train CER, loss,
                     top-1); then train and held-out loss, accuracy (top-1 agreement, CER = characters gotten wrong),
                     both per source and per teacher-confidence bucket, the train probe, the overfit gap, the
                     early-stop metric and its best, the mini evals in <section>_mini/; the eval sample tables
@@ -61,9 +66,9 @@ TensorBoard buckets: TensorBoard groups cards by the first component of a tag, s
                     of tokens per confidence bucket included), every histogram, and any tag no rule matches (one
                     tb_tag_unmapped event per such tag)
 by TB_BUCKET_RULES. Only TensorBoard sees the new names. tools/regroup_tb.py rebuilds tb/ of an existing run in this
-layout from the open files. A restart into a run logged before the buckets (event files in tb/, no
-metrics/tag_map.json) leaves one tb_layout_mixed event: TensorBoard then shows the earlier launches under the flat tags
-and this one under the buckets until tools/regroup_tb.py is run on the finished run.
+layout from the open files, the TB_LAYOUT chart included. A restart into a run logged before the buckets (event files
+in tb/, no metrics/tag_map.json) leaves one tb_layout_mixed event: TensorBoard then shows the earlier launches under
+the flat tags and this one under the buckets until tools/regroup_tb.py is run on the finished run.
 """
 import io
 import json
@@ -238,8 +243,10 @@ _SET = r"(?P<set>[^/]+)"
 # bucket. Scalars and text; a histogram always goes to 3_misc/<tag>. The mini evals (eval/mini/<kind>/..., scripts/
 # 04_distill.py run_mini_eval) land next to their full counterparts, in <section>_mini (1_operational/eval/mini/...).
 TB_BUCKET_RULES = (
-    # 2_loss_accuracy: the headline numbers of every eval first (00_ sorts before the other sections), then loss (train,
-    # held-out) and accuracy (top-1 agreement with the teacher, CER)
+    # 2_loss_accuracy: the training objective per step and on held-out data first (00_combined, the curves of the
+    # Custom Scalars chart TB_LAYOUT), then the headline numbers of every eval (00_ sorts before the other sections),
+    # then loss (train, held-out) and accuracy (top-1 agreement with the teacher, CER)
+    (r"combined_loss/(?P<m>train|val|val_full)", r"2_loss_accuracy/00_combined/\g<m>"),
     (r"summary/(?P<kind>full|mini)/(?P<m>[^/]+)", r"2_loss_accuracy/00_summary/\g<kind>/\g<m>"),
     (rf"eval/mini/tf/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/val_loss_mini/\g<set>/\g<m>"),
     (rf"eval/mini/tf/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/val_accuracy_mini/\g<set>/\g<m>"),
@@ -309,6 +316,19 @@ def tb_tag(tag: str, plugin: str = "scalars") -> tuple[str, str]:
     """Logged tag -> (TensorBoard tag, bucket) by TB_BUCKET_RULES; plugin is "scalars", "histograms" or "text"."""
     tb, _ = _tb_match(tag, plugin)
     return tb, tb.split("/", 1)[0]
+
+
+# The training objective w_kl * KL + w_ce * CE as one quantity for the run's overall loss chart (scripts/04_distill.py):
+# train at every optimizer step (= loss/objective), val on the mini evals' gate subsets (every mini eval, and its
+# step-0 point), val_full on the complete gate sets at every complete-set eval (epoch ends, the final eval)
+COMBINED_LOSS_TAGS = ("combined_loss/train", "combined_loss/val", "combined_loss/val_full")
+# TensorBoard's Custom Scalars dashboard (SummaryWriter.add_custom_scalars; its own tab, not the Scalars one): one
+# Multiline chart overlaying the three curves. Its entries are regexes that TensorBoard matches (re.match, so from the
+# start of the tag) against the tags in the event files - the bucketed ones (TB_BUCKET_RULES), not the logged ones -
+# hence built from tb_tag and anchored at both ends: ".../val" alone would draw val_full a second time. Written into
+# every event file: RunLogger at each logger start (a resume writes a new file), tools/regroup_tb.py when it rebuilds
+TB_LAYOUT = {"combined_loss": {"combined_loss: train vs val": [
+    "Multiline", [f"^{re.escape(tb_tag(t)[0])}$" for t in COMBINED_LOSS_TAGS]]}}
 
 
 def load_tag_map(path) -> dict:
@@ -740,9 +760,9 @@ class RunLogger:
             _repair_tail(p)
         self.p_tag_map = m / "tag_map.json"
         self._tags = TagMapper(load_tag_map(self.p_tag_map))  # a restart keeps the tags of the earlier launches
+        tb_files = sorted(p.name for p in (self.dir / "tb").iterdir() if p.is_file() and "tfevents" in p.name)
         # event files but no tag map: the earlier launches logged flat tags (before the buckets), this one will not
-        flat_tb = [] if self.p_tag_map.exists() else sorted(
-            p.name for p in (self.dir / "tb").iterdir() if p.is_file() and "tfevents" in p.name)
+        flat_tb = [] if self.p_tag_map.exists() else tb_files
 
         self._t0 = time.monotonic()
         self._elapsed0 = float(resume["elapsed_s"]) if resume else 0.0
@@ -770,8 +790,11 @@ class RunLogger:
                 t = _Tee(orig, self._f_log, self._lock)
                 setattr(sys, name, t)
                 self._tees.append((name, orig, t))
-        self.tb = SummaryWriter(log_dir=str(self.dir / "tb"), purge_step=self.step + 1 if resume else None,
+        self.tb = SummaryWriter(log_dir=str(self.dir / "tb"), purge_step=self._tb_purge_step(resume, not tb_files),
                                 max_queue=1000, flush_secs=60)
+        # the Custom Scalars chart, once per event file (torch allows one call per writer): at step 0, which a resume's
+        # purge (the steps after the restored one) never drops
+        self.tb.add_custom_scalars(TB_LAYOUT)
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         if student_meta is None:
@@ -793,6 +816,19 @@ class RunLogger:
                             f"{self.dir.as_posix()} rebuilds tb/ in the bucketed layout from the open files")
 
     # ------------------------------------------------------------------------------------------ helpers
+
+    def _tb_purge_step(self, resume: dict | None, first: bool) -> int | None:
+        """The step of the SessionLog.START the SummaryWriter opens its event file with (purge_step), which drops the
+        run's points from that step on. A resume's: the restored step + 1 (the steps after it came from weights the
+        crash discarded, and are logged again). The first launch into an empty tb/: step 0, where it drops nothing.
+        That one is needed: TensorBoard's server (plugin_event_accumulator, what `tensorboard --logdir` serves) takes a
+        run's first START for its start and purges only on a later one, so a run whose first file had none kept a
+        resume's discarded steps in every chart, the combined-loss curve doubling back at the restored step (the
+        EventAccumulator of tools/export_run.py purges on every START and never showed it). A re-launch without resume
+        into a used tb/ (not the trainer's way: a fresh start gets a new run dir) writes none, as before."""
+        if resume:
+            return self.step + 1
+        return 0 if first else None
 
     @staticmethod
     def _find_student_meta(cfg: dict) -> dict | None:
