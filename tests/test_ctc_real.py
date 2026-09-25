@@ -17,7 +17,7 @@ import torch  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from fixtures import REAL, need_real  # noqa: E402
+from fixtures import REAL, need_real, no_real_data  # noqa: E402
 
 from kitsune import ctc_kd  # noqa: E402
 from kitsune import ctc_student as CS  # noqa: E402
@@ -44,14 +44,17 @@ def tools():
     return CS.ctc_features(MODEL_DIR), AutoTokenizer.from_pretrained(str(MODEL_DIR), local_files_only=True)
 
 
-def read_rows(shard: Path, n: int | None = None):
+def read_rows(shard: Path, n: int | None = None, want=None):
+    """(ids, waves) of the shard's first n rows, or of its first n rows whose id is in `want`. Only those rows are
+    decoded (a box-size shard holds ~2,000 rows)."""
     import pyarrow.parquet as pq
 
     from kitsune.audio import decode_audio
 
-    t = pq.read_table(shard, columns=["id", "audio"])
-    t = t.slice(0, n) if n else t
-    return t.column("id").to_pylist(), [decode_audio(a) for a in t.column("audio").to_pylist()]
+    ids = pq.read_table(shard, columns=["id"]).column("id").to_pylist()
+    idx = [i for i, x in enumerate(ids) if want is None or x in want][:n]
+    audio = pq.read_table(shard, columns=["audio"]).column("audio").take(idx).to_pylist()
+    return [ids[i] for i in idx], [decode_audio(a) for a in audio]
 
 
 def run(model, feats, waves, batch=8):
@@ -104,31 +107,105 @@ def test_real_student_shapes(anchor, n, ffn, total):
     assert layers[-1] == 23 and torch.equal(st.ctc_head.weight, anchor.ctc_head.weight)
 
 
+ROWS_PER_SOURCE = 64
+
+
 def test_anchor_matches_stored_parakeet_targets(anchor, tools):
     """The anchor on the audio of stored parakeet_out rows: the same frame count and greedy CTC path, and a KD loss
-    against its own stored targets that is only the fp16 rounding plus the rest bucket. (Targets from the box ran a
-    bf16 encoder on CUDA, so a few greedy paths may differ there; on laptop CPU fp32 shards they are identical.)"""
+    against its own stored targets that is only storage rounding and the encoder's precision. Bounded for a full box
+    parakeet_out: ROWS_PER_SOURCE rows of eval_jsut and of reazon_small, from each source's first shards in name order.
+
+    Measured on these 128 rows. Laptop CPU fp32 shards (scripts/02p): 128/128 paths, KL 2.4e-6 per frame. Label-box
+    shards (bf16 encoder on CUDA; labels/full rev 211b767): 127/128 paths, KL 4.8e-3 per frame, but the median
+    utterance is at 4e-5 per frame; a few utterances sit at 0.05-0.2 per frame with identical paths. That is the bf16
+    encoder's own noise: a CPU bf16 encoder is as far from the box targets (eval_jsut 7.6e-3 per frame for either).
+    A misaligned or mis-binned target costs O(1) per frame, so the bounds below still catch those."""
     feats, _ = tools
-    npzs = sorted(PARAKEET_OUT.glob("eval_jsut/*.npz")) + sorted(PARAKEET_OUT.glob("reazon_small/*.npz"))
-    shards = [REAL / "data" / "shards" / p.parent.name / f"{p.stem}.parquet" for p in npzs]
-    need_real(PARAKEET_OUT / "meta.json", *shards)
-    if not npzs:
-        pytest.skip(f"no eval_jsut / reazon_small shards under {PARAKEET_OUT}")
+    need_real(PARAKEET_OUT / "meta.json")
+    by_source = {s: sorted(PARAKEET_OUT.glob(f"{s}/*.npz")) for s in ("eval_jsut", "reazon_small")}
+    if not any(by_source.values()):
+        no_real_data(f"no eval_jsut / reazon_small shards under {PARAKEET_OUT}")
     same = rows = 0
     kl = frames = 0.0
-    for npz in npzs:
-        targets = load_ctc_targets(npz)
-        ids, waves = read_rows(REAL / "data" / "shards" / npz.parent.name / f"{npz.stem}.parquet", None)
-        keep = [i for i, x in enumerate(ids) if x in targets][:64]
-        outs = run(anchor, feats, [waves[i] for i in keep])
-        for i, (lp, n) in zip(keep, outs):
-            t = targets[ids[i]]
-            assert n == t.n_frames, ids[i]
-            same += CS.greedy_ctc_ids(lp[None], torch.tensor([n]))[0] == t.ctc_ids.tolist()
-            rows += 1
-            loss = ctc_kd.ctc_kd_losses(lp[None], collate_frame_targets([t]))
-            kl += float(loss["kl_dense"] + loss["kl_blank"])
-            frames += n
-    print(f"\n{rows} stored rows: greedy path identical on {same}; KD KL {kl / frames:.2e} per frame")
-    assert same >= 0.98 * rows and kl / frames < 2e-3
+    per_utt = []
+    for source, npzs in by_source.items():
+        left = ROWS_PER_SOURCE
+        for npz in npzs:
+            if left <= 0:
+                break
+            shard = REAL / "data" / "shards" / source / f"{npz.stem}.parquet"
+            need_real(shard)
+            targets = load_ctc_targets(npz)
+            ids, waves = read_rows(shard, left, want=targets)
+            left -= len(ids)
+            for uid, (lp, n) in zip(ids, run(anchor, feats, waves)):
+                t = targets[uid]
+                assert n == t.n_frames, uid
+                same += CS.greedy_ctc_ids(lp[None], torch.tensor([n]))[0] == t.ctc_ids.tolist()
+                rows += 1
+                loss = ctc_kd.ctc_kd_losses(lp[None], collate_frame_targets([t]))
+                kl += float(loss["kl_dense"] + loss["kl_blank"])
+                frames += n
+                per_utt.append(float(loss["kl_dense"] + loss["kl_blank"]) / max(n, 1))
+    assert rows > 0, f"no stored row of {PARAKEET_OUT} is in the data shards under {REAL / 'data' / 'shards'}"
+    med = float(np.median(per_utt))
+    print(f"\n{rows} stored rows: greedy path identical on {same}; KD KL {kl / frames:.2e} per frame (median "
+          f"utterance {med:.2e}, max {max(per_utt):.2e})")
+    assert same >= 0.98 * rows and kl / frames < 2e-2 and med < 1e-3
     assert np.isfinite(kl)
+
+
+def test_lost_student_overfits_real_stored_targets(anchor, tools):
+    """A P-0.05B-shaped pruned student (FFN kept by a random ranking: the mechanics, not the init, are under test)
+    learns 8 real JSUT rows from their stored parakeet_out targets with the study's CTC-KD objective on CPU: AdamW
+    1e-3, BN frozen at the teacher's stats, clip 1. Starts at the "lost" class (all-blank output) and must reach the
+    targets' greedy text. Measured on the label box's eval_jsut targets: objective 25.3 -> 0.088, CER vs the targets
+    1.0 -> 0.005 (68 s on 4 threads); the saved P-0.05B on 10 rows went 29.2 -> 0.05 and CER 1.0 -> 0 by step 30."""
+    from kitsune.patches import freeze_batchnorm
+    from kitsune.text import cer
+
+    feats, tok = tools
+    need_real(PARAKEET_OUT / "meta.json")
+    npzs = sorted(PARAKEET_OUT.glob("eval_jsut/*.npz"))
+    if not npzs:
+        no_real_data(f"no eval_jsut shard under {PARAKEET_OUT}")
+    shard = REAL / "data" / "shards" / "eval_jsut" / f"{npzs[0].stem}.parquet"
+    need_real(shard)
+    targets = load_ctc_targets(npzs[0])
+    ids, waves = read_rows(shard, 8, want=targets)
+    assert len(ids) == 8
+    tg = [targets[i] for i in ids]
+    want = [CS.decode_ids(tok, t.ctc_ids) for t in tg]
+    g = torch.Generator().manual_seed(4)
+    imp = {(l, name): torch.rand(4096, generator=g) for l in range(24) for name in S.FFN_NAMES}
+    torch.manual_seed(0)
+    model = CS.build_ctc_student(anchor, CS.resolve_layers(4), 768, imp)
+    freeze_batchnorm(model)
+    f, fl = feats(waves)
+    mask = CS.lengths_to_mask(fl, f.shape[1])
+    batch = collate_frame_targets(tg)
+
+    def evaluate():
+        model.eval()
+        with torch.no_grad():
+            lp, n = CS.ctc_log_probs(model, f, mask)
+            losses = ctc_kd.ctc_kd_losses(lp, batch)
+            obj = float(ctc_kd.ctc_kd_objective(losses, losses["n_tokens"]))
+        hyp = [CS.decode_ids(tok, h) for h in CS.greedy_ctc_ids(lp, n)]
+        return obj, float(np.mean([cer(h, w) for h, w in zip(hyp, want)]))
+
+    obj0, cer0 = evaluate()
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.98), weight_decay=0.0)
+    for _ in range(30):
+        model.train()
+        lp, n = CS.ctc_log_probs(model, f, mask)
+        assert n.tolist() == [t.n_frames for t in tg]
+        losses = ctc_kd.ctc_kd_losses(lp, batch)
+        loss = ctc_kd.ctc_kd_objective(losses, losses["n_tokens"])
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+    obj, err = evaluate()
+    print(f"\noverfit 8 real rows, 30 steps: objective {obj0:.3f} -> {obj:.4f}, CER vs targets {cer0:.3f} -> {err:.4f}")
+    assert cer0 >= 0.9 and obj < 0.05 * obj0 and err <= 0.05

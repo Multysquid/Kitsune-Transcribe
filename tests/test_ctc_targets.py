@@ -48,6 +48,22 @@ def test_fixture_shards_are_in_the_label_pass_format(fake):
     for npz in npzs:
         stem_rows = [u for u in fc.utts.values() if u.source == npz.parent.name and u.stem == npz.stem]
         assert pt.check_shard(npz, meta, [u.id for u in stem_rows]) == []
+    assert stems(po.root) == stems(fc.teacher_out)
+
+
+def stems(root: Path) -> set[str]:
+    return {f"{p.parent.name}/{p.stem}" for p in root.glob("*/*.npz")}
+
+
+def test_fixture_covers_the_teacher_passs_extent_only(tmp_path):
+    """A data shard added after the label run (extra_shard_rows) has no teacher_out, so no parakeet_out either: on the
+    label box both passes read the same extent."""
+    fc = make_fake_corpus(tmp_path / "corpus", sources={"src_a": (40, "train")}, extra_shard_rows={"src_a": 5})
+    po = make_fake_parakeet_out(fc, seed=1)
+    assert sorted(p.stem for p in (fc.data / "shards" / "src_a").glob("*.parquet")) == \
+        ["train-00000", "train-00001", "train-00002"]
+    assert stems(po.root) == stems(fc.teacher_out) == {"src_a/train-00000", "src_a/train-00001"}
+    assert set(po.targets) == set(fc.ids())
 
 
 def test_load_ctc_targets_reads_what_was_written(fake):
@@ -152,13 +168,17 @@ def test_infeasible():
 # ------------------------------------------------------------------------------------------------ real shards
 
 
+REAL_NPZ_PER_SOURCE = 4
+
+
 def _real_parakeet_out() -> Path:
     return Path(os.environ.get("KITSUNE_PARAKEET_OUT") or REAL / "parakeet_out")
 
 
 def test_real_shards_ctc_path_equals_ctc_hyp_and_frames_equal_the_audio():
-    """On stored parakeet_out shards: decode(ctc_ids) == jsonl ctc_hyp on every row (K3), and, where the data shard
-    is on this machine, expected_n_frames(audio) == the stored n_frames on every row (K4's arithmetic)."""
+    """On stored parakeet_out shards (each source's first REAL_NPZ_PER_SOURCE): decode(ctc_ids) == jsonl ctc_hyp on
+    every row (K3), and, where the data shard is on this machine, expected_n_frames(audio) == the stored n_frames on
+    every row found in it by id (K4's arithmetic)."""
     root = _real_parakeet_out()
     model_dir = Path(os.environ.get("KITSUNE_PARAKEET_DIR") or REAL / "cache" / "parakeet-tdt_ctc-0.6b-ja-hf")
     need_real(root / "meta.json", model_dir / "tokenizer.json")
@@ -169,7 +189,9 @@ def test_real_shards_ctc_path_equals_ctc_hyp_and_frames_equal_the_audio():
 
     tok = AutoTokenizer.from_pretrained(str(model_dir), local_files_only=True)
     n_rows = n_audio = 0
-    for npz in sorted(root.glob("*/*.npz")):
+    # bounded for a full box pull: each source's first REAL_NPZ_PER_SOURCE shards in name order
+    sources = sorted(d for d in root.iterdir() if d.is_dir())
+    for npz in [p for d in sources for p in sorted(d.glob("*.npz"))[:REAL_NPZ_PER_SOURCE]]:
         rows = jsonl_rows(npz)
         targets = load_ctc_targets(npz)
         for uid, ft in targets.items():

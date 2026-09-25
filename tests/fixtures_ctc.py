@@ -199,7 +199,8 @@ class FakeParakeetOut:
 
 def make_fake_parakeet_out(fc, root=None, *, seed: int = 0, sources=None, k: int = 8) -> FakeParakeetOut:
     """parakeet_out for every teacher-labelled row of a fixtures.FakeCorpus (label-time shard = all rows of the chunk,
-    so n_scanned / shard_ids_sha256 describe the shard the label box read). meta.json = build_meta(SETTINGS)."""
+    so n_scanned / shard_ids_sha256 describe the shard the label box read). Shards come only for the stems teacher_out
+    has, as on the label box, which runs both passes over the same extent. meta.json = build_meta(SETTINGS)."""
     import soundfile as sf
 
     from kitsune.store import ids_sha256
@@ -214,6 +215,8 @@ def make_fake_parakeet_out(fc, root=None, *, seed: int = 0, sources=None, k: int
         if sources is None or u.source in sources:
             by_shard.setdefault((u.source, u.stem), []).append(u)
     for (source, stem), chunk in sorted(by_shard.items()):
+        if not (fc.teacher_out / source / f"{stem}.npz").exists():
+            continue  # a data shard the label box never read (extra_shard_rows): no label pass covers it
         utts, rows = [], []
         for u in chunk:
             if not u.has_teacher:
