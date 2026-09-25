@@ -935,6 +935,39 @@ def test_hf_preflight_refuses_repos_that_are_not_private(monkeypatch):
         assert all("is not private" in p and "hf repos settings" in p and "--private" in p for p in problems)
 
 
+def test_hf_preflight_blames_a_missing_output_repo_only_on_a_4xx(monkeypatch):
+    """A 5xx, 429 or dropped connection reading the output repo is the Hub's (model_info is not retried): the operator is
+    told to re-run, not to create a repo that exists. A 401/404 (missing, or private and unseen by this login) is."""
+    import httpx
+    import huggingface_hub
+    from huggingface_hub.utils import hf_raise_for_status
+
+    def hub_error(status, **headers):
+        url = "https://huggingface.co/api/models/u/kitsune-runs"
+        try:
+            hf_raise_for_status(httpx.Response(status, headers=headers, request=httpx.Request("GET", url)))
+        except Exception as e:  # the exception the installed huggingface_hub raises for this reply
+            return e
+        raise AssertionError(status)
+
+    class FailingModelInfo(FakeHfApi):
+        error: Exception = None
+
+        def model_info(self, repo):
+            raise self.error
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FailingModelInfo)
+    monkeypatch.setattr(launch, "data_problems", lambda files, cfg: [])
+    monkeypatch.setattr(FakeHfApi, "private", {"u/kitsune-data": True})
+    for error, missing in ((hub_error(404, **{"X-Error-Code": "RepoNotFound"}), True), (hub_error(401), True),
+                           (hub_error(503), False), (hub_error(429), False), (httpx.ConnectError("timed out"), False)):
+        monkeypatch.setattr(FailingModelInfo, "error", error)
+        _, problems = launch.hf_preflight("u/kitsune-data", "u/kitsune-runs", VIAB_CFG)
+        assert len(problems) == 1 and str(error).splitlines()[0] in problems[0], (error, problems)
+        assert ("hf repos create u/kitsune-runs --private" in problems[0]) == missing, problems
+        assert ("re-run launch" in problems[0]) != missing, problems
+
+
 def test_launch_help_needs_nothing():
     r = subprocess.run([sys.executable, str(VAST / "launch.py"), "--help"], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and "--yes" in r.stdout

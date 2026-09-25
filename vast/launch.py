@@ -384,8 +384,14 @@ def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, 
     try:
         private = api.model_info(out_repo).private
     except Exception as e:
-        problems.append(f"cannot read output model repo {out_repo} ({type(e).__name__}); create it first: "
-                        f"hf repos create {out_repo} --private")
+        # the Hub answers 401/404 (RepositoryNotFoundError) both for a missing repo and for a private one this login
+        # cannot see; a 5xx, 429 or dropped connection is the Hub's (model_info is not retried), so re-run
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status in (401, 403, 404):
+            problems.append(f"cannot read output model repo {out_repo} ({type(e).__name__}: {e}): create it first "
+                            f"(hf repos create {out_repo} --private) or check the laptop's login (hf auth whoami)")
+        else:
+            problems.append(f"Hub error reading output model repo {out_repo} ({type(e).__name__}: {e}); re-run launch")
     else:
         if private is not True:
             problems.append(f"{out_repo} is not private: the run uploads eval and sample tables with reference "
