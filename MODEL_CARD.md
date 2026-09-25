@@ -23,8 +23,12 @@ licence; the exact licence is fixed at release. The terms below apply to every c
 
 ## Terms
 
-The model is trained on Galgame_Speech_ASR ([litagin/Galgame_Speech_ASR_16kHz](https://huggingface.co/datasets/litagin/Galgame_Speech_ASR_16kHz)),
-which is GPL-3.0 with two added conditions that carry over to models trained on it:
+The model is trained on Galgame_Speech_ASR
+([litagin/Galgame_Speech_ASR_16kHz](https://huggingface.co/datasets/litagin/Galgame_Speech_ASR_16kHz) at commit
+`3fb86654222b3f0af0f7c332ae6a0ef9752a9451`), which is [GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.txt) with two added
+conditions that carry over to models trained on it. The dataset's rules are in the IMPORTANT box of
+[its card at that commit](https://huggingface.co/datasets/litagin/Galgame_Speech_ASR_16kHz/blob/3fb86654222b3f0af0f7c332ae6a0ef9752a9451/README.md);
+that card's own `license_link` (LICENSE.md) points to a file the dataset repo does not have. In short:
 
 - **non-commercial**: no commercial use of this model;
 - **open source**: models trained on the dataset must be open-sourced.
@@ -41,10 +45,12 @@ unmodified. `student_meta.json` records the exact layers and FFN neurons kept.
 
 ## Training data
 
-- Galgame_Speech_ASR (litagin): GPL-3.0, non-commercial, trained models must be open-sourced (see Terms).
+- Galgame_Speech_ASR (litagin): [GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.txt), non-commercial, trained models must be
+  open-sourced (see Terms).
 - Emilia-YODAS, Japanese part ([TTS-AGI/emilia-yodas](https://huggingface.co/datasets/TTS-AGI/emilia-yodas), a mirror
-  of [amphion/Emilia-Dataset](https://huggingface.co/datasets/amphion/Emilia-Dataset) Emilia-YODAS): CC BY 4.0, built
-  from [espnet/yodas2](https://huggingface.co/datasets/espnet/yodas2) (CC BY 3.0).
+  of [amphion/Emilia-Dataset](https://huggingface.co/datasets/amphion/Emilia-Dataset) Emilia-YODAS):
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), built from
+  [espnet/yodas2](https://huggingface.co/datasets/espnet/yodas2) ([CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)).
 - ReazonSpeech ([japanese-asr/whisper_transcriptions.reazonspeech.small](https://huggingface.co/datasets/japanese-asr/whisper_transcriptions.reazonspeech.small),
   a mirror of [reazon-research/reazonspeech](https://huggingface.co/datasets/reazon-research/reazonspeech)):
   CDLA-Sharing-1.0, used for training under Article 30-4 of the Japanese Copyright Act.

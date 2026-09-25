@@ -359,6 +359,9 @@ def test_save_load_roundtrip(tmp_path):
     assert card == S.MODEL_CARD.read_text(encoding="utf-8")
     assert "license: other" in card and f"base_model: {S.TEACHER_ID}" in card
     assert "b1eacc2686a3d08ceaae5f24a88b1d519620bc09" in card and "non-commercial" in card
+    # the licence texts it names (the Galgame card's own license_link points to a missing LICENSE.md)
+    assert "https://www.gnu.org/licenses/gpl-3.0.txt" in card and "3fb86654222b3f0af0f7c332ae6a0ef9752a9451" in card
+    assert all(f"https://creativecommons.org/licenses/by/{v}/" in card for v in ("4.0", "3.0"))
     with safe_open(out / "model.safetensors", "pt") as f:
         keys = set(f.keys())
         dtypes = {k: f.get_slice(k).get_dtype() for k in keys}
