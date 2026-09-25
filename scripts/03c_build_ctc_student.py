@@ -7,7 +7,8 @@ The shape and the reasons for each step are in kitsune/ctc_student.py. The pipel
      sources, seed 1234), featurised on Parakeet's path. Cached in --importance and reused by every size: the cache
      key is the teacher files, the ids and the feature path, never the student shape.
   3. build: kept layers (evenly spaced, the last always), FFN width, the teacher's BN stats; params == closed form
-  4. step-0 gate of the built (fp32) student; --golden: the 32 golden JSUT rows through it
+  4. step-0 gate of the built (fp32) student; --golden: the 32 golden JSUT rows through it; for the unpruned shape
+     the reproduction check below (a failure exits non-zero before anything is saved)
   5. save: bf16 weights with fp32 BN stats, Parakeet processor + tokenizer, MODEL_CARD.md (CC-BY-4.0),
      student_meta.json (stage "saved")
   6. step-0 gate of the SAVED student (what training starts from) -> init_class; --golden: the golden rows again
@@ -20,7 +21,10 @@ teacher's is >= 90 %, else "pruned_kept". Also reported: corpus CERs, CER agains
 KL, the CTC-KD objective on the teacher's own targets (kitsune.ctc_kd), argmax agreement and blank shares.
 
 `--enc-layers all --ffn 4096` must reproduce the teacher: the built student's gate log-probs equal the anchor's (max
-abs diff 0, frame KL 0) and --golden gives the 32 golden CTC transcripts of kitsune/parakeet_golden.json. The saved
+abs diff 0, frame KL 0) and --golden gives the 32 golden CTC transcripts of kitsune/parakeet_golden.json. The script
+enforces it (anchor_problems: also every tensor equal to the anchor's): if any of these fails, student_meta.json gets
+stage "failed" with the problems, no weights are written and the exit code is non-zero. Only the golden transcripts
+catch a change in the forward code itself (the anchor runs the same modules), so run the check with --golden. The saved
 copy is bf16, like the encoder that made the label box's targets; that rounding is reported separately (measured on
 the anchor: frame KL 0.0008, 59/60 gate hypotheses and 31/32 golden transcripts identical - the other one drops a
 Japanese comma, so its normalised CER is 0).
@@ -293,6 +297,32 @@ def golden_check(model, feats, tokenizer, data_root: Path) -> dict:
     return dict(n=n, match=n - len(bad), mismatches=bad)
 
 
+def anchor_problems(student, anchor, meta: dict) -> list[str]:
+    """Why the fp32 build of the unpruned shape is not the teacher ([] = it is). Checked: every tensor equals the
+    anchor's; with the gate, the gate log-probs are identical (max abs diff 0, frame KL 0); with --golden, all golden
+    CTC transcripts match. The tensors alone cannot catch a forward-code change (both run the same modules); the golden
+    transcripts can, which is why the reproduction check is run with --golden."""
+    import torch
+
+    problems = []
+    s_sd, a_sd = student.state_dict(), anchor.state_dict()
+    if s_sd.keys() != a_sd.keys():
+        problems.append(f"state_dict keys differ: {sorted(s_sd.keys() ^ a_sd.keys())[:8]}")
+    else:
+        diff = [k for k in s_sd if s_sd[k].dtype != a_sd[k].dtype or not torch.equal(s_sd[k], a_sd[k])]
+        if diff:
+            problems.append(f"{len(diff)} tensors differ from the anchor's, e.g. {diff[:4]}")
+    built = meta.get("step0", {}).get("built")
+    if built is not None and (built["max_abs_diff_log_probs"] != 0.0 or built["frame_kl"] != 0.0):
+        problems.append(f"gate log-probs differ: max |dlogp| {built['max_abs_diff_log_probs']:.3g}, frame KL "
+                        f"{built['frame_kl']:.3g} (both must be 0)")
+    golden = meta.get("golden", {}).get("built")
+    if golden is not None and golden["match"] != golden["n"]:
+        problems.append(f"golden: {golden['match']}/{golden['n']} CTC transcripts equal, e.g. "
+                        f"{golden['mismatches'][:2]}")
+    return problems
+
+
 # ------------------------------------------------------------------------------------------------ main
 
 
@@ -423,6 +453,18 @@ def main(argv=None) -> int:
         print(f"  golden, built (fp32): {meta['golden']['built']['match']}/{meta['golden']['built']['n']} CTC "
               f"transcripts equal")
         dur["golden_built"] = round(time.time() - t, 1)
+    if layers == list(range(n_teacher)) and args.ffn == t_ffn:
+        # the unpruned build IS the reproduction check: a failed one must not end as a "complete" student dir
+        problems = anchor_problems(student, anchor, meta)
+        meta["anchor_check"] = dict(ok=not problems, problems=problems)
+        if problems:
+            meta.update(stage="failed", error=dict(error="the unpruned build does not reproduce the teacher",
+                                                   problems=problems))
+            meta["timestamps"]["failed"] = now()
+            out.mkdir(parents=True, exist_ok=True)
+            S.write_meta(out, meta)
+            sys.exit("the unpruned build does not reproduce the teacher (nothing saved):\n  " + "\n  ".join(problems))
+        print("  anchor check: the unpruned build reproduces the teacher")
 
     t = time.time()
     print(f"[6/7] save -> {out}")

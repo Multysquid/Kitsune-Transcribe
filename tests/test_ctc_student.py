@@ -422,6 +422,7 @@ def test_build_script_end_to_end_tiny(build_env):
     assert m["stage"] == "complete" and m["init_class"] == "pruned_kept"
     built = m["step0"]["built"]
     assert built["max_abs_diff_log_probs"] == 0.0 and built["frame_kl"] == 0.0 and built["cer_vs_teacher"] == 0.0
+    assert m["anchor_check"] == {"ok": True, "problems": []}
     assert m["importance"]["skipped"] and m["enc_layers"] == [0, 1, 2, 3] and m["ffn"] == 64
     assert len(m["step0"]["gate"]["ids"]) == 9 and m["step0"]["saved"]["n"] == 9
 
@@ -442,6 +443,7 @@ def test_build_script_end_to_end_tiny(build_env):
     assert cache["layers"] == [0, 1, 2, 3]  # all teacher layers, whatever this student keeps
     assert sorted(m["kept"]["ffn"]) == [f"{l}.{n}" for l in (0, 3) for n in S.FFN_NAMES]
     assert all(len(v) == 40 for v in m["kept"]["ffn"].values())
+    assert "anchor_check" not in m  # pruned shapes are not expected to reproduce the teacher
     s = m["step0"]["saved"]
     assert 0 <= s["cer_vs_teacher"] and s["frames"] > 0 and "kd_objective" in s and "argmax_agree" in s
     st = CS.load_ctc_student(out, "cpu")
@@ -474,6 +476,39 @@ def test_build_script_golden_runs_on_the_built_and_the_saved_student(build_env, 
     g = CS.load_meta(tmp / "anchor")["golden"]
     assert g["built"]["match"] == 32 and g["saved"]["match"] == 31
     assert len(seen) == 2 and seen[0][0] is not seen[1][0]
+
+
+def test_build_script_fails_an_anchor_that_does_not_reproduce_the_teacher(build_env, monkeypatch):
+    """The unpruned shape is the reproduction check: a build that drifts from the teacher (here one norm weight scaled,
+    as a changed module would) or a golden mismatch exits non-zero, saves no weights and leaves stage "failed"."""
+    mod, base, tmp = build_env
+    real_build = CS.build_ctc_student
+
+    def drifted(*a, **kw):
+        st = real_build(*a, **kw)
+        with torch.no_grad():
+            st.encoder.layers[-1].norm_out.weight.mul_(1.5)
+        return st
+
+    monkeypatch.setattr(CS, "build_ctc_student", drifted)
+    out = tmp / "anchor_bad"
+    with pytest.raises(SystemExit, match="does not reproduce the teacher"):
+        mod.main(base + ["--enc-layers", "all", "--ffn", "64", "--out", str(out)])
+    m = CS.load_meta(out)
+    assert m["stage"] == "failed" and not m["anchor_check"]["ok"]
+    assert any("tensors differ" in p for p in m["anchor_check"]["problems"])
+    assert any("gate log-probs differ" in p for p in m["anchor_check"]["problems"])
+    assert not list(out.glob("*.safetensors"))
+    # a pruned shape is never held to it (the same drift passes there)
+    assert mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(tmp / "p"), "--gate-utts", "1",
+                            "--importance", str(tmp / "imp.pt")]) == 0
+
+    monkeypatch.setattr(CS, "build_ctc_student", real_build)
+    monkeypatch.setattr(mod, "golden_check", lambda *a: dict(n=32, match=31, mismatches=[dict(id="x")]))
+    with pytest.raises(SystemExit, match="golden: 31/32"):
+        mod.main(base + ["--enc-layers", "all", "--ffn", "64", "--golden", "--gate-utts", "0", "--init-class",
+                         "pruned_kept", "--out", str(tmp / "anchor_golden")])
+    assert CS.load_meta(tmp / "anchor_golden")["stage"] == "failed"
 
 
 def test_build_script_refuses_an_unpinned_dir_and_needs_an_init_class(build_env, monkeypatch):
