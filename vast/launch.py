@@ -118,9 +118,23 @@ def parse_json(text: str):
 
 
 def vastai(exe: str, args: list[str]) -> str:
-    r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=180)
-    if r.returncode != 0:
-        raise LaunchError(f"vastai {' '.join(args[:2])} failed ({r.returncode}): {(r.stderr or r.stdout).strip()[:500]}")
+    """vastai 1.8.0 exits 0 on an API error (a 401 bad key on search, a 410 no_such_ask when the offer was taken before
+    the create): stdout stays empty and --raw puts {"error": true, ...} on stderr. Both calls here print JSON on
+    success (a search that finds nothing prints []), so an empty stdout is a failure too, reported with vast's reason.
+    A create that times out may still have rented an instance, so the error says where to look before a re-run."""
+    what = " ".join(args[:2])
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        hint = ""
+        if args[:2] == ["create", "instance"]:
+            label = args[args.index("--label") + 1] if "--label" in args else "kitsune-..."
+            hint = (f"; the instance may still have been created: check `vastai show instances` for label {label} "
+                    f"before re-running (or you may rent twice)")
+        raise LaunchError(f"vastai {what} timed out after 180 s{hint}") from None
+    if r.returncode != 0 or not r.stdout.strip() or '"error": true' in r.stderr:
+        raise LaunchError(f"vastai {what} failed ({r.returncode}): "
+                          f"{(r.stderr or r.stdout).strip()[:500] or 'no output'}")
     return r.stdout
 
 

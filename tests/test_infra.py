@@ -438,15 +438,20 @@ OFFERS_80 = [{"id": 333, "gpu_name": "A100 SXM4", "gpu_ram": 81920, "dph_total":
 
 
 class FakeVastai:
-    """Stands in for subprocess.run of the vastai CLI; answers searches from a queue of offer lists."""
+    """Stands in for subprocess.run of the vastai CLI; answers searches from a queue of offer lists (a
+    CompletedProcess in the queue is returned as it is), and a create with `create` if given."""
 
-    def __init__(self, searches):
-        self.searches, self.calls = list(searches), []
+    def __init__(self, searches, create=None):
+        self.searches, self.calls, self.create = list(searches), [], create
 
     def __call__(self, argv, **kw):
         self.calls.append(list(argv))
         if argv[1:3] == ["search", "offers"]:
+            if isinstance(self.searches[0], subprocess.CompletedProcess):
+                return self.searches.pop(0)
             out = json.dumps(self.searches.pop(0))
+        elif argv[1:3] == ["create", "instance"] and self.create is not None:
+            return self.create(argv)
         elif argv[1:3] == ["create", "instance"]:
             out = "WARNING: something\n" + json.dumps({"success": True, "new_contract": 98765})
         else:
@@ -461,8 +466,8 @@ def launch_args(*extra):
 
 @pytest.fixture
 def fake_vastai(monkeypatch):
-    def install(searches):
-        fake = FakeVastai(searches)
+    def install(searches, create=None):
+        fake = FakeVastai(searches, create)
         monkeypatch.setattr(launch.shutil, "which", lambda name: "/fake/vastai" if name == "vastai" else None)
         monkeypatch.setattr(launch.subprocess, "run", fake)
         return fake
@@ -524,6 +529,31 @@ def test_launch_refuses_expensive_offer(fake_vastai):
     fake = fake_vastai([[], OFFERS_80])
     assert launch.main(launch_args("--yes", "--max-dph", "1.0")) == 1
     assert all(c[1:3] != ["create", "instance"] for c in fake.calls)
+
+
+def test_launch_reports_vastais_api_error_despite_exit_0(fake_vastai):
+    """vastai 1.8.0 exits 0 on an API error, with nothing on stdout and the JSON error on stderr (VAST-X1)."""
+    def refused(msg):
+        return lambda argv: subprocess.CompletedProcess(argv, 0, stdout="", stderr=json.dumps(
+            {"error": True, "status_code": 410, "msg": msg}))
+
+    fake_vastai([OFFERS_40], create=refused("error 410/3907: no_such_ask Instance type 111 is no longer available."))
+    with pytest.raises(launch.LaunchError, match="no_such_ask"):
+        launch.main(launch_args("--yes"))
+    bad_key = subprocess.CompletedProcess([], 0, stdout="", stderr='{"error": true, "status_code": 401, '
+                                                                   '"msg": "Invalid user key"}')
+    fake_vastai([bad_key])
+    with pytest.raises(launch.LaunchError, match="search offers failed .*Invalid user key"):
+        launch.main(launch_args("--yes"))
+
+
+def test_launch_create_timeout_says_an_instance_may_exist(fake_vastai):
+    def hangs(argv):
+        raise subprocess.TimeoutExpired(argv, 180)
+
+    fake_vastai([OFFERS_40], create=hangs)
+    with pytest.raises(launch.LaunchError, match=r"vastai show instances.*kitsune-viability-0123456"):
+        launch.main(launch_args("--yes"))
 
 
 def test_launch_without_vastai_prints_install_help(monkeypatch, capsys):
