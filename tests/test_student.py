@@ -526,6 +526,9 @@ def test_build_script_end_to_end_tiny(tmp_path):
             "--calib-per-group", "4", "--calib-batch-s", "20", "--eval-batch-s", "20"]
     mod = load_script("03_build_student")
     assert mod.main(argv) == 0
+    # the BN recalibration stops its feature generator early (max_utts); closing it must not leave grad mode off for
+    # the rest of the process (any later test that calls backward would fail)
+    assert torch.is_grad_enabled()
 
     meta = S.load_meta(out)
     assert meta["stage"] == "complete"
@@ -541,8 +544,10 @@ def test_build_script_end_to_end_tiny(tmp_path):
     assert 0 < meta["importance"]["kept_mass_min"] <= meta["importance"]["kept_mass_mean"] < 1
     assert meta["params"]["total"] == meta["params"]["closed_form"]
     assert "teacher_revision" in meta and meta["teacher_revision"] is None  # a local teacher dir has no hub commit
-    assert (out / "README.md").exists()  # the model card
-    assert meta["step0"]["n_per_set"] == {"eval_x": 4}
+    card = (out / "README.md").read_text(encoding="utf-8")  # the model card, its notice describing this student
+    assert "It was pruned (encoder: 3 of 48 layers, FFN 5120 -> 48; decoder: 2 of 8 layers), its output head tied to " \
+           "the token embedding and its BatchNorm statistics recalibrated, then trained" in card
+    assert meta["step0"]["n_per_set"] == {"eval_x": 4} and meta["step0"]["seed"] == 1234
     assert meta["step0"]["greedy"]["sets"]["eval_x"]["n"] == 4
     assert "kl" in meta["step0"]["teacher_forced"]["sets"]["eval_x"]
     assert {"started", "saved", "finished"} <= set(meta["timestamps"]) and "sha" in meta["git"]
@@ -608,6 +613,12 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
     fcheck = ma["function_check"]
     assert fcheck["on_gate"] is False and fcheck["function"] in ("kept", "lost") and fcheck["threshold"] == 0.9
     assert fcheck["cer_vs_teacher"] == ma["step0"]["greedy"]["all"]["cer_teacher_corpus"]
+    assert ma["build"]["seed"] == 1234 and ma["build"]["calibration"] == dict(
+        sources=["src_a"], calib_utts=10, bn_utts=6, per_group=4, ids_sha256=None)
+    card = (a / "README.md").read_text(encoding="utf-8")
+    assert "It was pruned (encoder: 3 of 48 layers, FFN 5120 -> 48; decoder: 2 of 8 layers), its output head tied to " \
+           "the token embedding, then trained by distillation from the teacher's outputs. Its BatchNorm statistics " \
+           "are the teacher's." in card and "recalibrated" not in card
     cache = torch.load(a / "importance.pt", weights_only=True)
     assert cache["layers"] == [0, 1, 2, 3] and len(cache["importance"]) == 8
     tsd = teacher.state_dict()
@@ -629,12 +640,18 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
     imp = S.importance_from_state(cache["importance"])
     want = S.select_ffn_neurons(imp, [0, 3], 32, 128)
     assert mb["kept"]["ffn"] == {f"{l}.{n}": v.tolist() for (l, n), v in sorted(want.items())}
-    # a named cache that does not match (other calibration ids) is an input: refused, never overwritten
+    # a named cache that does not match (other calibration ids; the same ids through a bf16 teacher, which ranks the
+    # neurons at the cut differently) is an input: refused, never overwritten
     with pytest.raises(SystemExit, match="does not match"):
         mod.main([x if x != "10" else "9" for x in common] + [
             "--enc-layers", "2", "--ffn", "32", "--dec-layers", "1", "--bn", "keep", "--importance-cache",
             str(a / "importance.pt"), "--step0-eval-utts", "0", "--out", str(tmp_path / "b2")])
+    with pytest.raises(SystemExit, match="does not match"):
+        mod.main([x if x != "fp32" else "bf16" for x in common] + [
+            "--enc-layers", "2", "--ffn", "32", "--dec-layers", "1", "--bn", "keep", "--importance-cache",
+            str(a / "importance.pt"), "--step0-eval-utts", "0", "--out", str(tmp_path / "b2")])
     assert (a / "importance.pt").stat().st_mtime_ns == mtime
+    assert cache["key"]["teacher_dtype"] == "torch.float32"
 
     # the sampled ids are written in sample order; --calib-ids reads exactly them back (another seed would draw
     # others), so the cache key matches again
@@ -648,6 +665,7 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
         "--out", str(b3)]) == 0
     mb3 = S.load_meta(b3)
     assert mb3["importance"]["reused"] and mb3["calibration"]["ids_from"] == str(a / "calibration_ids.txt")
+    assert mb3["build"]["seed"] == 99 and mb3["build"]["calibration"]["ids_sha256"] == mod.ids_sha(ids_a)
     assert (b3 / "calibration_ids.txt").read_text(encoding="utf-8").split() == ids_a
     (tmp_path / "bad_ids.txt").write_text("\n".join(ids_a[:9] + ["no-such-id"]) + "\n", encoding="utf-8")
     with pytest.raises(SystemExit, match="not kept train rows"):
@@ -662,6 +680,7 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
     assert mod.main(argv_c) == 0
     mc = S.load_meta(c)
     assert mc["kept"] == ma["kept"] and mc["importance"]["reproduced_by_importance"]
+    assert mc["importance"]["source_teacher_dtype"] == "torch.float32"  # the selection is a's, measured in fp32
     assert mc["importance"]["ffn_from"] == str(a) and mc["calibration"]["n_importance"] == 0
     assert mc["calibration"]["importance_ids_sha256"] == ma["calibration"]["importance_ids_sha256"]
     assert mc["build"]["ffn_from"] == str(a) and "sample" in mc["durations_s"]
@@ -681,10 +700,14 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
         mod.main(common + ["--enc-layers", "3", "--ffn", "48", "--dec-layers", "0", "2", "--bn", "keep",
                            "--ffn-from", str(tmp_path / "e"), "--step0-eval-utts", "0", "--out", str(tmp_path / "f")])
 
-    # the build identity: the same dir with recalibrated BN is another student
+    # the build identity: the same dir with recalibrated BN is another student; so is one with another seed (it draws
+    # the calibration sample and the step-0 ids), even when only the step-0 eval is left to resume
     with pytest.raises(SystemExit, match="different student"):
         mod.main([x if x != "keep" else "recal" for x in argv_a])
     assert mod.main(argv_a) == 0  # the same build: already complete
+    S.write_meta(a, dict(S.load_meta(a), stage="saved"))
+    with pytest.raises(SystemExit, match="different student"):
+        mod.main(argv_a + ["--seed", "5"])
 
 
 def test_build_script_refuses_a_teacher_commit_the_targets_did_not_come_from(tmp_path):
@@ -734,6 +757,138 @@ def test_importance_cache_is_keyed_on_the_teacher_commit(tmp_path, monkeypatch):
     c["key"].pop("teacher_revision")
     torch.save(c, tmp_path / "importance.pt")
     assert reused(b) is False and computed == [a, b, b]
+
+
+def test_importance_cache_is_keyed_on_the_teacher_dtype(tmp_path, monkeypatch):
+    """The same utterances through a bf16 and an fp32 teacher rank the neurons at the cut differently, so a cache is
+    only reused by a build in its own dtype. A cache from before the key held the dtype counts as the dtype its info
+    recorded, or bf16 (the only one before --teacher-dtype)."""
+    from types import SimpleNamespace
+
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    computed = []
+
+    def fake_importance(teacher, feats, layers, device):
+        computed.append(mod.teacher_dtype(teacher))
+        return {(l, n): torch.rand(8) for l in layers for n in S.FFN_NAMES}
+
+    monkeypatch.setattr(S, "ffn_importance", fake_importance)
+    utts = [dict(id=f"u{i}", duration=1.0, source="s", wave=None) for i in range(3)]
+    args = SimpleNamespace(teacher=S.TEACHER_ID, calib_batch_s=10.0)
+    spec = SimpleNamespace(enc_layers=[0, 2])
+    path = tmp_path / "importance.pt"
+
+    def reused(dtype):
+        teacher = torch.nn.Linear(2, 2).to(dtype)
+        teacher.config = SimpleNamespace(_commit_hash="a" * 40)
+        _, info = mod.load_or_compute_importance(teacher, None, utts, args, spec, "cpu", tmp_path, log=lambda *_: None)
+        return info["reused"]
+
+    assert [reused(torch.float32), reused(torch.float32), reused(torch.bfloat16)] == [False, True, False]
+    c = torch.load(path, weights_only=True)
+    assert c["key"]["teacher_dtype"] == c["info"]["teacher_dtype"] == "torch.bfloat16"
+    c["key"].pop("teacher_dtype")  # written before the key held the dtype; info says bf16
+    torch.save(c, path)
+    assert reused(torch.bfloat16) is True
+    c["key"].pop("teacher_dtype", None)
+    c["info"]["teacher_dtype"] = "torch.float32"  # this branch's first caches: the dtype only in info
+    torch.save(c, path)
+    assert reused(torch.float32) is True and reused(torch.bfloat16) is False
+    c = torch.load(path, weights_only=True)
+    c["key"].pop("teacher_dtype")
+    c["info"].pop("teacher_dtype")  # the first run's: no dtype anywhere, computed in bf16
+    torch.save(c, path)
+    assert mod.importance_key(c)["teacher_dtype"] == "torch.bfloat16" and reused(torch.bfloat16) is True
+    assert computed == ["torch.float32", "torch.bfloat16", "torch.bfloat16"]
+
+
+def test_feature_batches_leave_grad_mode_alone():
+    """A consumer under @torch.no_grad() that stops early leaves feature_batches suspended; closing it afterwards must
+    not switch grad mode off for the rest of the process (it did while the generator yielded inside its no_grad)."""
+    import gc
+
+    import numpy as np
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    utts = [dict(id=f"u{i}", duration=1.0, wave=np.zeros(16000, np.float32)) for i in range(3)]
+
+    @torch.no_grad()
+    def first(it):
+        for item in it:
+            return item
+
+    g = mod.feature_batches(utts, lambda w, n: (w, n), "cpu", 1.0, "test")  # one utterance per batch
+    wave, _ = first(g)
+    assert torch.is_grad_enabled() and wave.shape == (1, 16000)
+    del g
+    gc.collect()
+    assert torch.is_grad_enabled()
+
+
+def test_build_identity_gate_and_legacy_meta():
+    """A pruned build's identity holds the seed and the calibration inputs; the first run's format-1 meta still reads
+    as the default build; function_check's on_gate needs the gate's 20 per set AND its seed."""
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    default = mod.build_identity(mod.parse_args([]))
+    assert default["seed"] == 1234 and default["calibration"] == dict(
+        sources=["reazon_small", "emilia_yodas", "galgame"], calib_utts=1000, bn_utts=1000, per_group=16,
+        ids_sha256=None)
+    first_run = {"format": 1, "args": {  # students/b20x2560-d4/student_meta.json
+        "enc_layers": 20, "ffn": 2560, "dec_layers": [0, 2, 5, 7], "no_tie_head": False, "calib_utts": 1000,
+        "bn_utts": 1000, "sources": ["reazon_small", "emilia_yodas", "galgame"], "seed": 1234, "calib_per_group": 16}}
+    assert mod.legacy_identity(first_run) == default
+    assert mod.build_identity(mod.parse_args(["--seed", "7"])) != default
+
+    step0 = dict(n_per_set={s: 20 for s in mod.EVAL_SETS}, seed=1234, greedy={"all": {"cer_teacher_corpus": 0.95}},
+                 teacher_forced={"all": {"kl": 4.0}})
+    fc = mod.function_check(step0)
+    assert fc == dict(cer_vs_teacher=0.95, kl=4.0, threshold=0.9, function="lost", on_gate=True)
+    assert mod.function_check(dict(step0, seed=7))["on_gate"] is False  # another 60 utterances
+    assert mod.function_check(dict(step0, n_per_set={"eval_jsut": 20}))["on_gate"] is False
+    no_seed = {k: v for k, v in step0.items() if k != "seed"}  # recorded before step-0 held its seed
+    assert mod.function_check(no_seed)["on_gate"] is False
+    assert mod.function_check(dict(step0, greedy={"all": {"cer_teacher_corpus": 0.6}}))["function"] == "kept"
+
+
+def test_model_card_describes_the_student():
+    """README.md's Apache-2.0 modification notice says what was done to the teacher: the first run's student keeps
+    the card as written; a study student gets its own shape and BN mode; a scratch student says its weights are
+    random. The card's wording is what model_card rewrites (a changed card would only warn)."""
+    from dataclasses import asdict
+
+    card = S.MODEL_CARD.read_bytes().decode("utf-8")
+    assert S._CARD_CHANGES.search(card)
+    assert S.model_card({}) == card and S.model_card({"format": 1, "bn": {"n_utts": 1000}}) == card
+
+    def split(text):  # (the card outside the notice's what-was-done part, that part with whitespace normalised)
+        head, rest = text.split("LICENSE-2.0). ", 1)
+        part, tail = rest.split("\n## Training data", 1)
+        return head + tail, " ".join(part.split())
+
+    def notice(meta):
+        outside, part = split(S.model_card(meta))
+        assert outside == split(card)[0]  # everything else is the card's, byte for byte
+        return part
+
+    pruned = dict(init_class="pruned_kept", enc_layers=S.evenly_spaced(20, 48), ffn=2560, dec_layers=[0, 2, 5, 7],
+                  build={"tie_head": True})
+    assert notice(dict(pruned, bn="recal")) == split(card)[1]  # the first run's student: the card's own words
+    t03 = notice(dict(pruned, bn="teacher", enc_layers=S.evenly_spaced(10, 48), dec_layers=[0, 7]))
+    assert t03.startswith("It was pruned (encoder: 10 of 48 layers, FFN 5120 -> 2560; decoder: 2 of 8 layers), its "
+                          "output head tied to the token embedding, then trained by distillation from the teacher's "
+                          "outputs. Its BatchNorm statistics are the teacher's.") and "recalibrated" not in t03
+    untied = notice(dict(pruned, bn="recal", ffn=5120, build={"tie_head": False}))
+    assert "FFN 5120;" in untied and "tied" not in untied and "BatchNorm statistics recalibrated" in untied
+    scratch = notice(dict(init_class="scratch", bn="fresh", scratch=dict(name="t01", **asdict(S.SCRATCH_SHAPES["t01"])),
+                          build={"init": "scratch"}))
+    assert scratch.startswith("It has that model's architecture at another size (encoder: 12 layers, width 512, FFN "
+                              "2048; decoder: 4 layers, width 512, FFN 2048;") and "randomly initialised" in scratch
+    assert "pruned" not in scratch and "FFN neurons kept" not in scratch
 
 
 def test_importance_state_roundtrip(tmp_path):

@@ -48,7 +48,7 @@ import copy
 import json
 import math
 import re
-import shutil
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -63,6 +63,7 @@ from kitsune.patches import unfreeze_batchnorm
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 TEACHER_ENC_LAYERS = 48
 TEACHER_DEC_LAYERS = 8
+TEACHER_FFN = 5120  # the teacher's encoder FFN width (the model card's "FFN 5120 -> ...")
 DECODER_START, EOS, PAD, BOS = 13764, 3, 2, 4
 FFN_NAMES = ("feed_forward1", "feed_forward2")
 EXPECTED_DEFAULT_PARAMS = 616_963_328  # closed form for B20x2560 / dec4 / V16384 tied (report_model.md section 2)
@@ -72,7 +73,8 @@ PRUNED_EXPECTED_PARAMS = {
     (20, 2560, (0, 2, 5, 7)): EXPECTED_DEFAULT_PARAMS,  # T-0.6B, the first run's student
     (10, 2560, (0, 7)): 320_752_384,  # T-0.3B
 }
-MODEL_CARD = Path(__file__).resolve().parents[1] / "MODEL_CARD.md"  # save_student copies it next to the weights
+# save_student writes it next to the weights as README.md, its modification notice fitted to the student (model_card)
+MODEL_CARD = Path(__file__).resolve().parents[1] / "MODEL_CARD.md"
 
 _BN = nn.modules.batchnorm._BatchNorm
 
@@ -638,10 +640,59 @@ def write_meta(out_dir, meta: dict):
     tmp.replace(p)
 
 
+# The part of MODEL_CARD.md's Apache-2.0 modification notice that says what was done to the teacher. It describes the
+# first run's student; model_card rewrites it for any other student from its student_meta.json.
+_CARD_CHANGES = re.compile(r"It was pruned \(.*?`student_meta\.json` records the exact layers and FFN neurons kept\.",
+                           re.S)
+
+
+def model_card(meta: dict) -> str:
+    """MODEL_CARD.md with a modification notice that describes this student (meta = its student_meta.json).
+
+    The card's notice describes the first run's student (20 of 48 layers, FFN 2560, 4 decoder layers, BN
+    recalibrated), and a verbatim copy would misstate every other build. A meta with the size study's fields
+    (init_class) gets its own sentence: the pruned shape and its BN mode, or, for a from-scratch student, that it has
+    the teacher's architecture at another size with randomly initialised weights. A meta without them (the first
+    run's format 1, tests) keeps the card as it is. A card whose notice no longer has the expected wording is kept as
+    it is, with a warning (save_student must not fail a training run's checkpoint over the card)."""
+    card = MODEL_CARD.read_bytes().decode("utf-8")
+    init = meta.get("init_class") if meta else None
+    if not init:
+        return card
+    head = (meta.get("build") or {}).get("tie_head", True)
+    if init == "scratch":
+        s = meta.get("scratch") or {}
+        text = (f"It has that model's architecture at another size (encoder: {s.get('enc_layers')} layers, width "
+                f"{s.get('enc_hidden')}, FFN {s.get('enc_ffn')}; decoder: {s.get('dec_layers')} layers, width "
+                f"{s.get('dec_hidden')}, FFN {s.get('dec_ffn')}; output head tied to the token embedding), but its "
+                f"weights were randomly initialised, not copied from that model; it was then trained by distillation "
+                f"from the teacher's outputs. The configuration is Cohere's with these sizes; the tokenizer and "
+                f"processor files are Cohere's, unmodified. `student_meta.json` records the exact shape and the seed.")
+    else:
+        ffn = meta.get("ffn")
+        ffn_text = f"FFN {TEACHER_FFN} -> {ffn}" if ffn is not None and ffn < TEACHER_FFN else f"FFN {TEACHER_FFN}"
+        changes = (["its output head tied to the token embedding"] if head else []) + (
+            ["its BatchNorm statistics recalibrated"] if meta.get("bn") == "recal" else [])
+        text = (f"It was pruned (encoder: {len(meta.get('enc_layers') or [])} of {TEACHER_ENC_LAYERS} layers, "
+                f"{ffn_text}; decoder: {len(meta.get('dec_layers') or [])} of {TEACHER_DEC_LAYERS} layers)"
+                + (", " + " and ".join(changes) if changes else "")
+                + ", then trained by distillation from the teacher's outputs."
+                + (" Its BatchNorm statistics are the teacher's." if meta.get("bn") == "teacher" else "")
+                + " The tokenizer and processor files are Cohere's, unmodified. `student_meta.json` records the exact"
+                  " layers and FFN neurons kept.")
+    new, n = _CARD_CHANGES.subn(lambda _: text, card, count=1)
+    if n != 1:
+        warnings.warn(f"{MODEL_CARD}: the modification notice's wording changed; README.md is copied unchanged and may "
+                      f"not describe this student")
+        return card
+    return new
+
+
 def save_student(student: CohereAsrForConditionalGeneration, out_dir, processor, meta: dict):
     """save_pretrained (safetensors, HF key names) with bf16 weights and fp32 BN stats, the processor (feature
-    extractor + tokenizer files), a generation_config with the teacher's special ids, the model card as README.md,
-    and student_meta.json. `processor` may be None (tests). student_meta.json is written last."""
+    extractor + tokenizer files), a generation_config with the teacher's special ids, the model card as README.md
+    (its modification notice describing this student, model_card), and student_meta.json. `processor` may be None
+    (tests). student_meta.json is written last."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     gc = student.generation_config
@@ -662,7 +713,7 @@ def save_student(student: CohereAsrForConditionalGeneration, out_dir, processor,
     # the model card (licence terms, the Apache-2.0 modified-from notice, data credits) travels with every copy of the
     # weights: the student init, each step_<N>/ and any checkpoint later promoted or copied out of the run repo
     if MODEL_CARD.exists():
-        shutil.copyfile(MODEL_CARD, out / "README.md")
+        (out / "README.md").write_bytes(model_card(meta).encode("utf-8"))
     write_meta(out, meta)
 
 

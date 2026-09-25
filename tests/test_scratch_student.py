@@ -381,7 +381,10 @@ def test_build_script_scratch_end_to_end_tiny(tmp_path, monkeypatch):
     assert meta["build"] == dict(init="scratch", shape="tiny", seed=7) and meta["expected_params"] is None
     assert meta["teacher"] == str(teacher_dir) and "function_check" not in meta  # not a pruned student
     assert meta["step0"]["n_per_set"] == {"eval_x": 3}
-    assert not (out / "importance.pt").exists() and (out / "tokenizer.json").exists() and (out / "README.md").exists()
+    assert not (out / "importance.pt").exists() and (out / "tokenizer.json").exists()
+    card = (out / "README.md").read_text(encoding="utf-8")  # the notice says what this student is: not pruned
+    assert "encoder: 2 layers, width 64, FFN 128; decoder: 2 layers, width 48, FFN 96" in card
+    assert "randomly initialised" in card and "It was pruned" not in card
     loaded = S.load_student(out, "cpu")
     ref = S.build_scratch_student(teacher_config(), TINY, seed=7).state_dict()
     for k, v in loaded.state_dict().items():
