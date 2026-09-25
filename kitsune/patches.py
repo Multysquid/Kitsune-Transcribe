@@ -14,6 +14,12 @@ BatchNorm. Each conformer conv module has a BatchNorm1d. In train mode it would 
 padded frames, and under gradient checkpointing it would update the running stats twice per step. The teacher's
 stats come from 276k batches, so they stay frozen (eval mode) for the whole run. `freeze_batchnorm` overrides each BN
 module's own `train()` so that a later `model.train()` - from our code, HF's, or a library's - cannot unfreeze it.
+`train_mode(model, bn=...)` takes the BN mode of a run (scripts/04_distill.py bn.mode): "frozen" as above (the pruned
+students, whose BN holds the teacher's statistics), or "train" for a student trained from scratch, whose fresh BN has
+no statistics worth keeping: BN then trains with the model (batch statistics in the training forward, padded frames
+included as in NeMo's conformer, running stats updated; eval mode uses the running stats), and the trainer never turns
+gradient checkpointing on for it (the recomputed forward would update the running stats a second time).
+`assert_bn_mode` is the check that goes with each mode.
 """
 import types
 import warnings
@@ -117,9 +123,21 @@ def unfreeze_batchnorm(model: nn.Module) -> int:
     return len(bns)
 
 
-def train_mode(model: nn.Module) -> nn.Module:
-    model.train()
-    freeze_batchnorm(model)
+BN_MODES = ("frozen", "train")
+
+
+def train_mode(model: nn.Module, bn: str = "frozen") -> nn.Module:
+    """model.train() with BatchNorm in the run's mode: "frozen" (the default: eval mode, running stats fixed and kept
+    so across later .train() calls; freeze_batchnorm) or "train" (BN trains with the model; a BN frozen before is
+    unfrozen first, so a later call can never re-freeze a training BN, nor the other way round)."""
+    if bn not in BN_MODES:
+        raise ValueError(f"BatchNorm mode must be one of {BN_MODES}, got {bn!r}")
+    if bn == "train":
+        unfreeze_batchnorm(model)
+        model.train()
+    else:
+        model.train()
+        freeze_batchnorm(model)
     return model
 
 
@@ -129,6 +147,23 @@ def assert_bn_frozen(model: nn.Module) -> int:
     bad = [name for name, m in model.named_modules() if isinstance(m, nn.modules.batchnorm._BatchNorm) and m.training]
     if bad:
         raise AssertionError(f"{len(bad)}/{len(bns)} BatchNorm modules in train mode, e.g. {bad[:3]}")
+    return len(bns)
+
+
+def assert_bn_mode(model: nn.Module, bn: str = "frozen") -> int:
+    """The BN check of a model in training (between steps, and after an eval gave every module its flag back): "frozen"
+    is assert_bn_frozen; "train" raises if any BatchNorm is out of train mode or pinned frozen (a frozen_eval that did
+    not restore the flags, or a train_mode call that froze it). Returns the number of BN modules checked."""
+    if bn not in BN_MODES:
+        raise ValueError(f"BatchNorm mode must be one of {BN_MODES}, got {bn!r}")
+    if bn == "frozen":
+        return assert_bn_frozen(model)
+    bns = _batchnorms(model)
+    bad = [name for name, m in model.named_modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)
+           and (not m.training or getattr(m, _BN_ATTR, False))]
+    if bad:
+        raise AssertionError(f"{len(bad)}/{len(bns)} BatchNorm modules not training although bn.mode is 'train', e.g. "
+                             f"{bad[:3]}")
     return len(bns)
 
 
