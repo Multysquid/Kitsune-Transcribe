@@ -124,8 +124,13 @@ def plan():
         try:
             api.auth_check(out_repo, repo_type="model", write=write)
         except Exception as e:
-            sys.exit(f"HF_TOKEN cannot {'write' if write else 'read'} {out_repo} ({type(e).__name__}: {e}): give the "
-                     f"fine-grained token read and write access to it (vast/README.md step 2.3)")
+            # only a refusal is the token's fault (404/401 = RepoNotFound: the Hub hides a private repo the token
+            # cannot see); a 5xx, 429 or dropped connection is the Hub's, and the plan phase runs under retry()
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (401, 403, 404):
+                sys.exit(f"HF_TOKEN cannot {'write' if write else 'read'} {out_repo} ({type(e).__name__}: {e}): give "
+                         f"the fine-grained token read and write access to it (vast/README.md step 2.3)")
+            sys.exit(f"Hub error checking {out_repo} ({type(e).__name__}: {e}); bootstrap retries the plan")
     files = api.list_repo_files(repo, repo_type="dataset", revision=rev)
 
     def has(pat: str) -> bool:
@@ -236,8 +241,11 @@ PYEOF
 
 log "repo $KITSUNE_DIR at $(git -C "$KITSUNE_DIR" rev-parse --short HEAD 2>/dev/null || echo '?'), config $CONFIG, data $KITSUNE_DATA_REPO@$KITSUNE_DATA_REVISION"
 log "disk free before: $(df -h --output=avail "$KITSUNE_DIR" | tail -1 | tr -d ' ')"
-phase plan "$PY" "$HELPER" plan
-phase pull_derived retry 3 "$PY" "$HELPER" pull  # snapshot_download skips what is already on disk
+# the plan only reads the Hub and rewrites bootstrap_plan.json; neither its GETs nor snapshot_download's repo_info and
+# tree listing have an HTTP timeout, so each attempt gets one. A killed pull resumes: downloads land as .incomplete
+# files renamed when done, and snapshot_download skips what is already on disk (~2.3 GB in all)
+phase plan retry 3 timeout -k 30 10m "$PY" "$HELPER" plan
+phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull
 
 DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["data_root"])' "$STATE/bootstrap_plan.json")"
 mapfile -t REBUILD < <("$PY" -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1]))["rebuild"]))' "$STATE/bootstrap_plan.json" | sed '/^$/d')
