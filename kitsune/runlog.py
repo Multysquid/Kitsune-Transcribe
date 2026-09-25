@@ -44,11 +44,13 @@ waits at most close_join_s for it and its own final sync, then logs sync_abandon
 and dies with the process; on the box vast/finish.py uploads again and verifies before a destroy).
 
 Resume: pass the dict from state_dict() (kept in the trainer's full state) as `resume=`. elapsed_s continues, steps
-after the restored step are dropped from steps.parquet and purged from TensorBoard, and are then logged again as far as
-the resumed launch gets (a budget re-fitted to the time left may end it before the crash step). The append-only files
-(jsonl, parquet parts, evals/, samples/) keep the crashed launch's rows: a row with a step after the restored one,
-logged before the resumed launch's logger_start event, comes from weights the crash discarded, whether or not that
-step is logged again (tools/export_run.py marks these `discarded`).
+after the restored step are dropped from steps.parquet and purged from TensorBoard (a SessionLog.START at the restored
+step + 1; the run's first event file opens with one at step 0, since TensorBoard's server ignores a run's first START:
+RunLogger._tb_purge_step), and are then logged again as far as the resumed launch gets (a budget re-fitted to the
+time left may end it before the crash step). The append-only files (jsonl, parquet parts, evals/, samples/) keep the
+crashed launch's rows: a row with a step after the restored one, logged before the resumed launch's logger_start
+event, comes from weights the crash discarded, whether or not that step is logged again (tools/export_run.py marks
+these `discarded`).
 
 TensorBoard buckets: TensorBoard groups cards by the first component of a tag, so tb/ gets every tag under one of
   1_operational     time, throughput, memory, system, data progress (tokens per source too), schedule, early-stop
@@ -758,9 +760,9 @@ class RunLogger:
             _repair_tail(p)
         self.p_tag_map = m / "tag_map.json"
         self._tags = TagMapper(load_tag_map(self.p_tag_map))  # a restart keeps the tags of the earlier launches
+        tb_files = sorted(p.name for p in (self.dir / "tb").iterdir() if p.is_file() and "tfevents" in p.name)
         # event files but no tag map: the earlier launches logged flat tags (before the buckets), this one will not
-        flat_tb = [] if self.p_tag_map.exists() else sorted(
-            p.name for p in (self.dir / "tb").iterdir() if p.is_file() and "tfevents" in p.name)
+        flat_tb = [] if self.p_tag_map.exists() else tb_files
 
         self._t0 = time.monotonic()
         self._elapsed0 = float(resume["elapsed_s"]) if resume else 0.0
@@ -788,7 +790,7 @@ class RunLogger:
                 t = _Tee(orig, self._f_log, self._lock)
                 setattr(sys, name, t)
                 self._tees.append((name, orig, t))
-        self.tb = SummaryWriter(log_dir=str(self.dir / "tb"), purge_step=self.step + 1 if resume else None,
+        self.tb = SummaryWriter(log_dir=str(self.dir / "tb"), purge_step=self._tb_purge_step(resume, not tb_files),
                                 max_queue=1000, flush_secs=60)
         # the Custom Scalars chart, once per event file (torch allows one call per writer): at step 0, which a resume's
         # purge (the steps after the restored one) never drops
@@ -814,6 +816,19 @@ class RunLogger:
                             f"{self.dir.as_posix()} rebuilds tb/ in the bucketed layout from the open files")
 
     # ------------------------------------------------------------------------------------------ helpers
+
+    def _tb_purge_step(self, resume: dict | None, first: bool) -> int | None:
+        """The step of the SessionLog.START the SummaryWriter opens its event file with (purge_step), which drops the
+        run's points from that step on. A resume's: the restored step + 1 (the steps after it came from weights the
+        crash discarded, and are logged again). The first launch into an empty tb/: step 0, where it drops nothing.
+        That one is needed: TensorBoard's server (plugin_event_accumulator, what `tensorboard --logdir` serves) takes a
+        run's first START for its start and purges only on a later one, so a run whose first file had none kept a
+        resume's discarded steps in every chart, the combined-loss curve doubling back at the restored step (the
+        EventAccumulator of tools/export_run.py purges on every START and never showed it). A re-launch without resume
+        into a used tb/ (not the trainer's way: a fresh start gets a new run dir) writes none, as before."""
+        if resume:
+            return self.step + 1
+        return 0 if first else None
 
     @staticmethod
     def _find_student_meta(cfg: dict) -> dict | None:

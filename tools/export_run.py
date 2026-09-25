@@ -3,7 +3,10 @@
 Why: the run dir is written for crash-safety (append-only jsonl, parquet parts, per-eval folders, TensorBoard event
 files); analysis wants one table per kind. This folds everything into export/:
   - TensorBoard events (EventAccumulator: scalars, histograms, text) -> tb_*.parquet/csv. A resumed run's purged steps
-    are dropped by the accumulator, exactly as TensorBoard shows them. TensorBoard files the tags under three buckets
+    are dropped by the accumulator, as TensorBoard shows them. (This reader purges on every SessionLog.START, the
+    server only from a run's second one on: a run whose first event file opens without one, logged before
+    kitsune.runlog.RunLogger._tb_purge_step, shows the discarded steps in the server until tools/regroup_tb.py
+    rebuilds it.) TensorBoard files the tags under three buckets
     (1_operational/, 2_loss_accuracy/, 3_misc/); the tables give back the logged tag (`tag`) with `bucket` and
     `tb_tag` next to it, from metrics/tag_map.json (copied as tag_map.json, and as the tag_map table); a tag the map
     lacks (no tag_map.json: a run logged before the buckets, or a copy without the file) is mapped by the same rules
@@ -105,12 +108,13 @@ FILES = {
     "tb_histograms": "every TensorBoard histogram (weights, grads, activations)",
     "tb_text": "every TensorBoard text entry (config, samples, events)",
     "scalars": "EVERY scalar ever logged, long format (from metrics/scalars.jsonl). Rows with discarded = true come "
-               "from weights a crash discarded (TensorBoard hides them); the rest is what TensorBoard shows",
+               "from weights a crash discarded (TensorBoard's purge drops them); the rest is what TensorBoard shows",
     "steps": "one wide row per optimizer step; NaN = not logged at that step",
     "combined_loss": "the run's overall loss chart (TensorBoard: 2_loss_accuracy/00_combined/ and the Custom Scalars "
                      "chart \"combined_loss: train vs val\"): the training objective w_kl * KL + w_ce * CE per target "
                      "token, without the L2-SP term, one row per (series, step), from the scalars combined_loss/"
-                     "<series>; rows from weights a crash discarded left out, as TensorBoard shows the curves",
+                     "<series>; rows from weights a crash discarded left out, as TensorBoard's purge drops them "
+                     "from the chart",
     "train_utts": "one row per utterance per time it was trained on. Rows with discarded = true were trained on by "
                   "weights a crash discarded; the rest has one row per (step, utterance), unless a resumed launch "
                   "died before its own full state (see `discarded`)",

@@ -379,13 +379,40 @@ def tb_view(run: Path) -> dict[str, pd.DataFrame]:
     return out
 
 
-def make_run(path: Path, *, flat: bool | str = False, monkeypatch=None, summary: dict | None = None) -> Path:
+def server_view(run: Path) -> dict[str, list[tuple[int, float]]]:
+    """What TensorBoard's server shows of run/tb: {TensorBoard tag: [(step, value), ...]} in its order, every point
+    kept, read by the server's own reader (plugin_event_multiplexer: `tensorboard --logdir` serves the Scalars and the
+    Custom Scalars tab from it). Unlike the EventAccumulator behind tb_view (tools/export_run.py), which purges on every
+    SessionLog.START, it ignores a run's first START."""
+    from tensorboard.backend.event_processing import plugin_event_multiplexer as pem
+    from tensorboard.util import tensor_util
+
+    mux = pem.EventMultiplexer(tensor_size_guidance={"scalars": 0})
+    mux.AddRunsFromDirectory(str(run / "tb"))
+    mux.Reload()
+    (name,) = mux.Runs()
+    return {tag: [(e.step, float(tensor_util.make_ndarray(e.tensor_proto))) for e in mux.Tensors(name, tag)]
+            for tag in sorted(mux.PluginRunToTagToContent("scalars")[name])}
+
+
+def old_purge_step(self, resume, first):
+    """RunLogger._tb_purge_step before it gave the first launch a SessionLog.START (every run logged until then)."""
+    return self.step + 1 if resume else None
+
+
+def make_run(path: Path, *, flat: bool | str = False, monkeypatch=None, summary: dict | None = None,
+             first_start: bool | None = None) -> Path:
     """A run with a resume from step 3 (steps 4-5 logged twice), histograms, text, an unmapped tag. flat=True logs the
     way the logger did before the buckets (logged tags in TensorBoard, no tag_map.json); flat="first" only the first
-    launch, so the resume with the bucketed logger mixes both layouts in tb/."""
-    with monkeypatch.context() if flat else contextlib.nullcontext() as mp:
+    launch, so the resume with the bucketed logger mixes both layouts in tb/. first_start=False (the default of a flat
+    run, which is older still) opens the first launch's event file without the SessionLog.START at step 0, as every
+    logger did before RunLogger._tb_purge_step."""
+    old = not (first_start if first_start is not None else not flat)
+    with monkeypatch.context() if flat or old else contextlib.nullcontext() as mp:
         if flat:
             mp.setattr(RunLogger, "_tb_tag", lambda self, tag, plugin: tag)
+        if old:
+            mp.setattr(RunLogger, "_tb_purge_step", old_purge_step)
         g = torch.Generator().manual_seed(0)
         log = RunLogger(path, CFG, sync_every_min=60, capture=False, tee=False)
         state = None
@@ -486,6 +513,54 @@ def test_every_launch_writes_the_chart_and_regroup_keeps_it(tmp_path):
     load_tool("regroup_tb").regroup(run)
     (rebuilt,) = [p for p in (run / "tb").iterdir() if p.name.endswith(".regrouped")]
     assert tb_layouts(rebuilt) == [(0, layout_as_written())]
+
+
+def starts(tb_file) -> list[int]:
+    """The steps of the SessionLog.START events in one event file (SummaryWriter's purge_step, regroup_tb's replayed
+    purges)."""
+    from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
+    from tensorboard.compat.proto.event_pb2 import SessionLog
+
+    return [e.step for e in EventFileLoader(str(tb_file)).Load()
+            if e.HasField("session_log") and e.session_log.status == SessionLog.START]
+
+
+def test_the_tensorboard_server_drops_the_steps_a_resume_discarded(tmp_path, monkeypatch):
+    """After a crash and resume the server, not only the export's reader, drops the steps after the restored one, so a
+    chart (the combined-loss one among them) does not double back at the resume: the logger opens the run's first event
+    file with a SessionLog.START at step 0, and the server, which takes a run's first START for its start and ignores
+    it, purges on the resume's. A run logged before that (first_start=False) showed steps 4-5 of both launches in the
+    server while the export's EventAccumulator dropped the first launch's; tools/regroup_tb.py rebuilds it into one file
+    that opens with the same START, and the server then shows what the export shows."""
+    def export_view(run):
+        s = tb_view(run)["tb_scalars"]
+        return {t: list(zip(g["step"].tolist(), g["value"].tolist())) for t, g in s.groupby("tb_tag")}
+
+    def same(a, b):
+        assert a.keys() == b.keys()
+        for t in a:
+            assert [s for s, _ in a[t]] == [s for s, _ in b[t]], t
+            assert [v for _, v in a[t]] == pytest.approx([v for _, v in b[t]]), t
+
+    kl = "2_loss_accuracy/train_loss/kl"
+    run = make_run(tmp_path / "runs" / "new")
+    assert [starts(f) for f in sorted((run / "tb").glob("*tfevents*"))] == [[0], [4]]
+    view = server_view(run)
+    assert view[kl] == [(s, pytest.approx(v)) for s, v in [(1, 1), (2, 1 / 2), (3, 1 / 3), (4, 10 / 4), (5, 10 / 5),
+                                                             (6, 10 / 6)]]
+    same(view, export_view(run))
+    assert len(view) == 4 and all([s for s, _ in pts] == [1, 2, 3, 4, 5, 6] for pts in view.values())
+
+    old = make_run(tmp_path / "runs" / "old", monkeypatch=monkeypatch, first_start=False)
+    assert [starts(f) for f in sorted((old / "tb").glob("*tfevents*"))] == [[], [4]]
+    assert [s for s, _ in server_view(old)[kl]] == [1, 2, 3, 4, 5, 4, 5, 6]  # the resume's START ignored
+    exported = export_view(old)
+    assert [s for s, _ in exported[kl]] == [1, 2, 3, 4, 5, 6]
+    load_tool("regroup_tb").regroup(old)
+    (rebuilt,) = (old / "tb").glob("*.regrouped")
+    assert starts(rebuilt) == [0, 4]  # its own START at step 0, then the resume's purge replayed
+    same(server_view(old), exported)
+    same(export_view(old), exported)
 
 
 def test_regroup_refuses_a_live_run(tmp_path, monkeypatch, capsys):

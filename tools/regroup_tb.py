@@ -8,10 +8,13 @@ keeps in open formats, each logged tag mapped by the same rules:
   metrics/text.jsonl        the config and the eval sample tables
   events.jsonl              lifecycle events (TensorBoard text events/<kind>)
 Records go in the order the logger wrote them, and a resume is replayed as it happened: the restarted logger's purge
-of the steps after the restored one (SessionLog.START) goes into the rebuilt file at that point, so TensorBoard shows
-what it showed before. What never reached the open files is not rebuilt (histograms still buffered in a process that
-was killed without close()). The rebuilt file starts with the Custom Scalars layout (kitsune.runlog.TB_LAYOUT: the
-combined_loss train vs val chart), as every event file of the logger does; a run logged before it gets it too.
+of the steps after the restored one (SessionLog.START) goes into the rebuilt file at that point. The file opens with a
+START at step 0, as the logger's first event file does: TensorBoard's server ignores a run's first START, so a run
+logged before the logger wrote that one showed a resume's discarded steps in the server (not in tools/export_run.py,
+whose reader purges on every START) until it is rebuilt here. What never reached the open files is not rebuilt
+(histograms still buffered in a process that was killed without close()). The rebuilt file starts with the Custom
+Scalars layout (kitsune.runlog.TB_LAYOUT: the combined_loss train vs val chart), as every event file of the logger
+does; a run logged before it gets it too.
 
 The original event files are kept under a name TensorBoard skips. TensorBoard reads every file whose name contains
 "tfevents" (a plain .bak suffix would not hide one), so events.out.tfevents.X becomes events.out.tf-events.X.bak; to
@@ -217,10 +220,13 @@ def _write(run: Path, out_dir: Path) -> tuple[TagMapper, dict, list[str]]:
     from torch.utils.tensorboard import SummaryWriter
 
     tm, n, unmapped = TagMapper(), dict.fromkeys(("scalars", "histograms", "text", "purge"), 0), []
-    w = SummaryWriter(log_dir=str(out_dir), filename_suffix=SUFFIX, max_queue=10_000, flush_secs=3600)
+    # purge_step=0: the file opens with a SessionLog.START at step 0 (it drops nothing), as the logger's first event
+    # file does (RunLogger._tb_purge_step). TensorBoard's server ignores a run's first START, so without it the first
+    # replayed purge below would be ignored there and the discarded steps would stay in its charts
+    w = SummaryWriter(log_dir=str(out_dir), filename_suffix=SUFFIX, max_queue=10_000, flush_secs=3600, purge_step=0)
     try:
         # the Custom Scalars chart the logger writes into every event file (the originals' copies go with them into
-        # the .bak files): at step 0, ahead of the records, so no replayed purge drops it
+        # the .bak files): at step 0, after that START and ahead of the records, so no replayed purge drops it
         w.add_custom_scalars(TB_LAYOUT)
         for wall, _, _, what, p in heapq.merge(_scalars(run), _hists(run), _texts(run), _events(run)):
             n[what] += 1
