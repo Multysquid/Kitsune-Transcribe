@@ -24,20 +24,35 @@ Usage:
   python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs        # look only
   python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --yes  # rent the cheapest
 Add --no-self-stop to debug a fresh box: a failed on-start or bootstrap then leaves it running (KITSUNE_NO_SELF_STOP=1).
+
+A config with an `extent` (configs/full.json, configs/full_sub3k.json) trains on the label box's labels: the HF check
+then reads <extent.root>/extent.json at the pinned revision, requires COMPLETE.json and every file of the subset
+(extent_problems), and sizes the disk, the rebuild timeout (KITSUNE_REBUILD_TIMEOUT_MIN) and --max-hours from it.
+
+--job label rents one RTX 5090 for the label box (vast/label.py, docs in vast/README.md): its own tiers and host
+filter, a 250 GB disk, offers ranked by the estimated total (GPU hours + traffic), machines that failed a label run
+avoided, and a read-only preflight of the label root (lease, COMPLETE.json, seeds, Parakeet pins, extents):
+  python vast/launch.py --job label --data-repo Multy123/kitsune-data --image-tag main        # look only
 Needs the vastai CLI (`pip install vastai==1.8.0`, then `vastai set api-key <key>`); --help works without it.
 """
 import argparse
 import json
+import math
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:  # kitsune.extent (pure Python) when run as `python vast/launch.py`
+    sys.path.insert(1, str(ROOT))
 
 VASTAI_PIN = "vastai==1.8.0"
 IMAGE_REPO = "ghcr.io/multysquid/kitsune-train"
@@ -75,6 +90,55 @@ TIERS = [
 ]
 SECRET_RE = re.compile(r"TOKEN|SECRET|PASSWORD|API_KEY", re.I)
 
+# --job label (FINAL.md §11): one RTX 5090 (32 GB; the CLI token verified live), driver CUDA >= 13.0 (GeForce has no
+# forward compatibility), >= 16 effective cores for the prep pools and 01, room for the 250 GB disk
+LABEL_DISK_GB = 250
+# the label disk, in GB: image, Cohere + Parakeet models, labels, sidecars/whisper/seeds, 01's unpruned-audio backlog
+# cap (the hold file), in-flight downloads, 01's free-space floor and logs; LABEL_DISK_GB adds headroom
+LABEL_DISK_PARTS = {"image": 12, "models": 7, "labels": 45, "sidecars": 3, "backlog": 80, "in_flight": 2.5,
+                    "floor_01": 30, "logs": 1}
+LABEL_DISK_MIN_GB = math.ceil(sum(LABEL_DISK_PARTS.values()))
+LABEL_FILTER = [
+    "num_gpus=1", "verified=true", "rentable=true", "cuda_vers>=13.0", "cpu_cores_effective>=16", "cpu_ram>=64",
+    "inet_down>=500", "direct_port_count>=1", f"disk_space>={LABEL_DISK_GB}",
+]
+LABEL_TIERS = [
+    ("RTX 5090 (strict)", ["gpu_name=RTX_5090", "gpu_ram>=30", "reliability>=0.97", "disk_bw>=300", "inet_up>=100"]),
+    ("RTX 5090", ["gpu_name=RTX_5090", "gpu_ram>=30"]),
+]
+# ranking: a missing $/GB counts as this; label_end.json classes whose machine is avoided on the next launch
+DEFAULT_GB_COST = 0.01
+AVOID_CLASSES = ("host_failure", "slow_host")
+LABEL_CONFIGS = "configs/full.json,configs/full_sub3k.json"
+LABEL_WATCHDOG_ENV = {"KITSUNE_WATCHDOG_SYNC_LEAD_S": "1800", "KITSUNE_WATCHDOG_ORPHAN_S": "900"}
+MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"  # kitsune.features.HF_MODEL_ID (that module imports torch)
+LEASE_MAX_AGE_S = 2700  # a lease heartbeat younger than this is a live box (label_sync.lease_live)
+# HF storage (§16.4): what a full label run adds to the data repo at most, and the size launch warns above
+LABEL_REPO_ADD_GB = 49
+REPO_WARN_GB = 80
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    """What one kind of box rents: offer tiers and host filter, disk, the traffic and hours of its cost line, its
+    caps, how offers are ranked (dph: $/h; est_total: GPU hours plus traffic) and the instance label's prefix."""
+    tiers: list
+    base_filter: list
+    disk_gb: int
+    est_down_gb: float
+    est_up_gb: float
+    est_hours: float | None
+    max_hours: float
+    max_dph: float
+    sort: str
+    label_prefix: str
+
+
+JOBS = {
+    "train": JobSpec(TIERS, HOST_FILTER, DISK_GB, EST_DOWN_GB, EST_UP_GB, None, 5.5, DEFAULT_MAX_DPH, "dph", "kitsune"),
+    "label": JobSpec(LABEL_TIERS, LABEL_FILTER, LABEL_DISK_GB, 590, 45, 16, 30, 1.0, "est_total", "kitsune-label"),
+}
+
 
 class LaunchError(RuntimeError):
     pass
@@ -91,8 +155,17 @@ def build_query(tier_terms: list[str]) -> str:
     return " ".join([*tier_terms, *HOST_FILTER])
 
 
-def search_args(query: str) -> list[str]:
-    return ["search", "offers", query, "--type", "on-demand", "-o", "dph", "--storage", str(DISK_GB), "--raw"]
+def host_filter(terms: list[str], disk_gb: int) -> list[str]:
+    """A host filter with its disk_space term set to `disk_gb` (the disk the box is created with)."""
+    return [t for t in terms if not t.startswith("disk_space")] + [f"disk_space>={disk_gb}"]
+
+
+def job_query(job: JobSpec, tier_terms: list[str], disk_gb: int) -> str:
+    return " ".join([*tier_terms, *host_filter(job.base_filter, disk_gb)])
+
+
+def search_args(query: str, disk_gb: int = DISK_GB) -> list[str]:
+    return ["search", "offers", query, "--type", "on-demand", "-o", "dph", "--storage", str(disk_gb), "--raw"]
 
 
 def env_string(env: dict[str, str]) -> str:
@@ -105,8 +178,9 @@ def env_string(env: dict[str, str]) -> str:
     return " ".join(f"-e {k}={v}" for k, v in env.items())
 
 
-def create_args(offer_id: int | str, image: str, env: dict[str, str], onstart: Path, label: str) -> list[str]:
-    return ["create", "instance", str(offer_id), "--image", image, "--disk", str(DISK_GB), "--ssh", "--direct",
+def create_args(offer_id: int | str, image: str, env: dict[str, str], onstart: Path, label: str,
+                disk_gb: int = DISK_GB) -> list[str]:
+    return ["create", "instance", str(offer_id), "--image", image, "--disk", str(disk_gb), "--ssh", "--direct",
             "--env", env_string(env), "--onstart", str(onstart), "--label", label, "--cancel-unavail", "--raw"]
 
 
@@ -139,30 +213,67 @@ def vastai(exe: str, args: list[str]) -> str:
     return r.stdout
 
 
-def search_offers(exe: str) -> tuple[str, str, list[dict]]:
-    """-> (tier name, query, offers sorted by $/h) for the first tier with any offer."""
-    for name, terms in TIERS:
-        query = build_query(terms)
-        offers = parse_json(vastai(exe, search_args(query)))
+def _gb_cost(offer: dict, key: str) -> float:
+    v = offer.get(key)
+    return v if isinstance(v, (int, float)) else DEFAULT_GB_COST
+
+
+def est_total(offer: dict, job: JobSpec) -> float:
+    """The run's expected cost at this offer: $/h (GPU + disk) x the job's hours, plus its traffic at the host's $/GB
+    (a missing $/GB counts as DEFAULT_GB_COST)."""
+    dph = offer.get("dph_total")
+    dph = dph if isinstance(dph, (int, float)) else 1e9
+    return (dph * (job.est_hours or 0) + _gb_cost(offer, "inet_down_cost") * job.est_down_gb
+            + _gb_cost(offer, "inet_up_cost") * job.est_up_gb)
+
+
+def rank_offers(offers: list[dict], job: JobSpec, avoid=frozenset(), max_dph: float | None = None) -> list[dict]:
+    """Offers without the avoided machines, cheapest first by $/h (train) or by est_total (label). The label ranking
+    drops offers over max_dph first: its winner is the cheapest total, which need not be the cheapest per hour."""
+    avoid = {str(m) for m in avoid}
+    kept = [o for o in offers if str(o.get("machine_id")) not in avoid]
+    if job.sort == "est_total":
+        if max_dph is not None:
+            kept = [o for o in kept if isinstance(o.get("dph_total"), (int, float)) and o["dph_total"] <= max_dph]
+        return sorted(kept, key=lambda o: est_total(o, job))
+    return sorted(kept, key=lambda o: o.get("dph_total", 1e9))
+
+
+def search_offers(exe: str, job: JobSpec | None = None, disk_gb: int | None = None,
+                  avoid=frozenset(), max_dph: float | None = None) -> tuple[str, str, list[dict]]:
+    """-> (tier name, query, ranked offers) for the first tier with any offer that is not on an avoided machine."""
+    job = job or JOBS["train"]
+    disk_gb = disk_gb or job.disk_gb
+    for name, terms in job.tiers:
+        query = job_query(job, terms, disk_gb)
+        offers = parse_json(vastai(exe, search_args(query, disk_gb)))
         if isinstance(offers, dict):
             offers = offers.get("offers", [])
-        if offers:
-            return name, query, sorted(offers, key=lambda o: o.get("dph_total", 1e9))
-        print(f"no offers for {name}: {query}")
+        ranked = rank_offers(offers, job, avoid, max_dph)
+        if ranked:
+            return name, query, ranked
+        print(f"no offers for {name}" + (f" (all {len(offers)} on avoided machines)" if offers else "") + f": {query}")
+    if job.sort == "est_total":  # --ssh --direct needs a direct port: show whether that is what empties the search
+        hint = " ".join(t for t in job_query(job, job.tiers[-1][1], disk_gb).split(" ")
+                        if not t.startswith("direct_port_count"))
+        print(f"hint: the same search without direct_port_count: vastai {shlex.join(search_args(hint, disk_gb))}")
     return "", "", []
 
 
-def offer_table(offers: list[dict], limit: int = 10) -> str:
+def offer_table(offers: list[dict], limit: int = 10, job: JobSpec | None = None) -> str:
     cols = [("id", "id", "{}"), ("gpu", "gpu_name", "{}"), ("GB", "gpu_ram", "{:.0f}"), ("$/h", "dph_total", "{:.3f}"),
             ("rel", "reliability", "{:.3f}"), ("cuda", "cuda_max_good", "{}"), ("cpu", "cpu_cores_effective", "{:.0f}"),
             ("ramGB", "cpu_ram", "{:.0f}"), ("down", "inet_down", "{:.0f}"), ("up", "inet_up", "{:.0f}"),
             ("diskMB/s", "disk_bw", "{:.0f}"), ("$/GBdn", "inet_down_cost", "{:.3f}"),
             ("$/GBup", "inet_up_cost", "{:.3f}"), ("where", "geolocation", "{}")]
+    if job is not None and job.sort == "est_total":  # label: the machine, disk $/GB-month and the ranking's total
+        cols[-1:-1] = [("machine", "machine_id", "{}"), ("$/GBmo", "storage_cost", "{:.3f}"),
+                       ("est$", "_est", "{:.2f}")]
     rows = [[h for h, _, _ in cols]]
     for o in offers[:limit]:
         row = []
         for _, key, fmt in cols:
-            v = o.get(key)
+            v = est_total(o, job) if key == "_est" else o.get(key)
             if key in ("gpu_ram", "cpu_ram") and isinstance(v, (int, float)) and v > 1000:
                 v = v / 1024  # the API reports MB
             try:
@@ -337,11 +448,14 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
         got = dict(sources=set(args.get("sources") or []), eval_sets=set(args.get("eval_sets") or []),
                    agree_max=args.get("agree_max"), agree_max_source=_by_source(args.get("agree_max_source")),
                    filter_eval_sets=set(args.get("filter_eval_sets") or []),
-                   partial_second_opinion=set(args.get("partial_second_opinion") or []))
+                   partial_second_opinion=set(args.get("partial_second_opinion") or []),
+                   extent=args.get("extent") or None)
+        ext = cfg.get("extent") or None  # make_selection records {name, inputs} of the config's extent (None: none)
         want = dict(sources=set(cfg.get("sources", [])), eval_sets=set(cfg.get("eval_sets", [])),
                     agree_max=float(recipe["agree_max"]), agree_max_source=_by_source(recipe["agree_max_source"]),
                     filter_eval_sets=set(recipe["filter_eval_sets"]),
-                    partial_second_opinion=set(recipe.get("partial_second_opinion", [])))
+                    partial_second_opinion=set(recipe.get("partial_second_opinion", [])),
+                    extent=dict(name=ext.get("name"), inputs=ext.get("inputs") or {}) if ext else None)
         for k, v in want.items():
             if got[k] != v:
                 shown = [sorted(x.items()) if isinstance(x, dict) else sorted(x) if isinstance(x, set) else x
@@ -370,6 +484,36 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
     return problems
 
 
+def extent_problems(files: list[str], cfg: dict, record: dict) -> list[str]:
+    """What a config with an `extent` needs from the data repo listing `files`, given the extent record: a valid
+    extent that the record serves, the root sealed (<root>/COMPLETE.json: the label box verified and finished it), the
+    teacher npz and jsonl of every subset stem, second_out jsonl for the subset stems of the train sources and
+    filter_eval_sets, both meta files, the selection and the student's STUDENT_FILES. Pure: the label box's consumer
+    check runs it against the Hub listing, the A100 launch (extent_preflight) before renting."""
+    from kitsune import extent
+
+    problems = extent.validate(cfg)
+    if problems:
+        return problems
+    have = set(files)
+    root = extent.extent_block(cfg)["root"].rstrip("/")
+    if f"{root}/COMPLETE.json" not in have:
+        problems.append(f"no {root}/COMPLETE.json: the label run of this root has not finished (relaunch it with "
+                        f"vast/launch.py --job label)")
+    problems += extent.pull_plan(cfg, record, files)["problems"]
+    if cfg.get("student"):
+        student = cfg["student"].rstrip("/")
+        problems += [f"no {student}/{n}" for n in STUDENT_FILES if f"{student}/{n}" not in have]
+    return problems
+
+
+def _hub():
+    """(HfApi(), hf_hub_download); one seam for the tests."""
+    from huggingface_hub import HfApi, hf_hub_download
+
+    return HfApi(), hf_hub_download
+
+
 def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, list[str]]:
     """-> (data repo commit to pin, problems). Uses the laptop's own HF login, read-only (the selection, ~2 MB, is
     downloaded to a temporary dir). Both repos must be private: they hold dataset reference transcripts (`ref` in
@@ -388,7 +532,8 @@ def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, 
                             f"ReazonSpeech, Galgame) that must not be republished; hf repos settings {data_repo} "
                             f"--repo-type dataset --private")
         files = api.list_repo_files(data_repo, repo_type="dataset", revision=rev)
-        problems += [f"{data_repo}@{rev[:12]}: {p}" for p in data_problems(files, cfg)]
+        if not cfg.get("extent"):  # an extent config: extent_preflight checks the files (extent_problems)
+            problems += [f"{data_repo}@{rev[:12]}: {p}" for p in data_problems(files, cfg)]
         if cfg["selection"] in files:
             with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
                 local = hf_hub_download(data_repo, cfg["selection"], repo_type="dataset", revision=rev, local_dir=tmp)
@@ -413,6 +558,200 @@ def hf_preflight(data_repo: str, out_repo: str, cfg: dict) -> tuple[str | None, 
     return rev, problems
 
 
+def _selection_kept(path: Path) -> dict | None:
+    """make_selection's `kept` ({"<source>/<split>": {"utts", "hours"}}) from the selection's metadata."""
+    import pyarrow.parquet as pq
+
+    raw = (pq.ParquetFile(path).schema_arrow.metadata or {}).get(b"kitsune_selection")
+    return json.loads(raw).get("kept") if raw else None
+
+
+def extent_preflight(data_repo: str, data_rev: str | None, cfg: dict) -> tuple[list[str], dict | None]:
+    """-> (problems, sizing) for a train config with an `extent`, read-only with the laptop's login at the pinned
+    revision: <root>/extent.json must be there, extent_problems() empty, and kitsune.extent.sizing() (with the kept
+    hours of the selection's metadata) gives the disk, the download and the rebuild timeout of the A100's bootstrap."""
+    import tempfile
+
+    from kitsune import extent
+
+    problems, sizing = extent.validate(cfg), None
+    if problems:
+        return problems, None
+    root = extent.extent_block(cfg)["root"].rstrip("/")
+    record_path = f"{root}/{extent.RECORD_FILE}"
+    try:
+        api, download = _hub()
+        files = api.list_repo_files(data_repo, repo_type="dataset", revision=data_rev)
+        if record_path not in files:
+            return [f"{data_repo}: no {record_path}: the label box writes it when it finishes the root"], None
+        with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+            record = extent.load_record(Path(download(data_repo, record_path, repo_type="dataset", revision=data_rev,
+                                                      local_dir=tmp)))
+            kept = None
+            if cfg["selection"] in files:
+                kept = _selection_kept(Path(download(data_repo, cfg["selection"], repo_type="dataset",
+                                                     revision=data_rev, local_dir=tmp)))
+        problems += [f"{data_repo}@{(data_rev or 'head')[:12]}: {p}" for p in extent_problems(files, cfg, record)]
+        if not extent.record_problems(record, cfg):
+            sizing = extent.sizing(record, cfg, kept)
+    except Exception as e:
+        problems.append(f"cannot check the extent {record_path} of {data_repo}: {type(e).__name__}: {e}")
+    return problems, sizing
+
+
+def _heartbeat_s(v) -> float | None:
+    """A lease heartbeat as epoch seconds: a number, or an ISO-8601 time (UTC when it has no zone)."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            t = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return t.timestamp() if t.tzinfo else t.replace(tzinfo=timezone.utc).timestamp()
+    return None
+
+
+def lease_live(lease: dict | None, now: float, max_age_s: int = LEASE_MAX_AGE_S) -> bool:
+    """A lease another box still holds: not released and a heartbeat younger than max_age_s. From the laptop every
+    holder is another container (the box to rent does not exist yet). An unreadable heartbeat counts as live."""
+    if not lease or lease.get("released"):
+        return False
+    hb = _heartbeat_s(lease.get("heartbeat"))
+    return hb is None or now - hb < max_age_s
+
+
+def _lfs_sha256(info) -> str | None:
+    lfs = getattr(info, "lfs", None)
+    if lfs is None:
+        return None
+    return getattr(lfs, "sha256", None) or (lfs.get("sha256") if isinstance(lfs, dict) else None)
+
+
+def label_preflight(data_repo: str, sha: str, cfg: dict, label_cfgs: dict[str, dict], *, steal_lease: bool = False,
+                    now: float | None = None) -> tuple[str | None, list[str], list[str]]:
+    """-> (data repo commit to pin, problems, notes) for --job label, read-only with the laptop's login; it replaces
+    hf_preflight (never data_problems/selection_problems: the label box makes that data). Checks: the data repo is
+    private; the label root is not sealed (COMPLETE.json) and no other box holds a live lease (unless steal_lease);
+    the seed teacher meta and the gate sets' teacher files; the Parakeet model files with their pinned sha256; read
+    access to the gated Cohere model (the box re-checks its own token in minute 1); every label config's extent valid
+    and inside `cfg`'s with the same root. Notes: the resume plan (what the root already holds) and the repo size with
+    the run's projected additions (a warning above REPO_WARN_GB). `sha` names the commit whose configs these are."""
+    import tempfile
+
+    from kitsune import extent
+
+    now = time.time() if now is None else now
+    problems, notes, rev = [], [], None
+    problems += [f"the label config: {p}" for p in extent.validate(cfg)]
+    ext = extent.extent_block(cfg) or {}
+    root = str(ext.get("root") or "labels/full").rstrip("/")
+    for name, other in label_cfgs.items():
+        if other is cfg:
+            continue
+        problems += [f"{name}: {p}" for p in extent.validate(other)]
+        problems += [f"{name}: {p}" for p in extent.within(cfg, other)]
+    try:
+        api, download = _hub()
+        info = api.dataset_info(data_repo, files_metadata=True)
+        rev = info.sha
+        if info.private is not True:
+            problems.append(f"{data_repo} is not private: the labels carry dataset reference transcripts; hf repos "
+                            f"settings {data_repo} --repo-type dataset --private")
+        files = api.list_repo_files(data_repo, repo_type="dataset", revision=rev)
+        have = set(files)
+        if f"{root}/COMPLETE.json" in have:
+            problems.append(f"{data_repo}: {root}/COMPLETE.json exists: this root is sealed; a new label run needs a "
+                            f"new extent root")
+        if f"{root}/LEASE.json" in have:
+            with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+                lease = json.loads(Path(download(data_repo, f"{root}/LEASE.json", repo_type="dataset", revision=rev,
+                                                 local_dir=tmp)).read_text(encoding="utf-8"))
+            if lease_live(lease, now):
+                msg = (f"{root}/LEASE.json is held by a live box (container {lease.get('container_id')}, machine "
+                       f"{lease.get('machine_id')}, heartbeat {lease.get('heartbeat')})")
+                if steal_lease:
+                    notes.append(f"{msg}: taken over (--steal-lease); make sure that box is gone")
+                else:
+                    problems.append(f"{msg}: two boxes must not write one root; destroy it or pass --steal-lease")
+        counts: dict[str, int] = {}
+        for f in files:
+            parts = f.split("/")
+            if f.startswith(f"{root}/") and len(parts) == root.count("/") + 4 and f.endswith(".npz"):
+                key = "/".join(parts[-3:-1])
+                counts[key] = counts.get(key, 0) + 1
+        notes.append("resume plan: " + (", ".join(f"{k} {n} stems" for k, n in sorted(counts.items()))
+                                        + f" already under {root} (the box pulls them, labels the rest)"
+                                        if counts else f"{root} holds no labels yet: a fresh run"))
+        seeds = ["teacher_out/meta.json"] + [f"teacher_out/{g}/" for g in extent.GATE_SETS]
+        for s in seeds:
+            if s.endswith("/"):
+                if not any(f.startswith(s) and f.endswith(".npz") for f in files) or not any(
+                        f.startswith(s) and f.endswith(".jsonl") for f in files):
+                    problems.append(f"{data_repo}: no {s}*.npz/.jsonl seed (the gate sets are adopt-only)")
+            elif s not in have:
+                problems.append(f"{data_repo}: no {s} seed")
+        try:
+            from kitsune import parakeet
+            pins, ppath = dict(parakeet.PARAKEET_FILES), parakeet.PARAKEET_PATH.rstrip("/")
+        except (ImportError, AttributeError) as e:
+            problems.append(f"no Parakeet pins in kitsune/parakeet.py ({type(e).__name__}: {e})")
+            pins, ppath = {}, ""
+        if pins:
+            paths = [f"{ppath}/{n}" for n in pins]
+            if missing := [x for x in paths if x not in have]:
+                problems.append(f"{data_repo}: {len(missing)} Parakeet model files missing (e.g. {missing[0]}): run "
+                                f"tools/publish_parakeet.py --upload on the laptop")
+            present = [x for x in paths if x in have]
+            for pi in (api.get_paths_info(data_repo, present, repo_type="dataset", revision=rev) if present else []):
+                got = _lfs_sha256(pi)
+                want = pins.get(pi.path.rsplit("/", 1)[1])
+                if got and want and got != want:
+                    problems.append(f"{data_repo}: {pi.path} has sha256 {got[:12]}..., kitsune/parakeet.py pins "
+                                    f"{want[:12]}...")
+        try:
+            from huggingface_hub import auth_check
+            auth_check(MODEL_ID, repo_type="model")
+            notes.append(f"{MODEL_ID}: readable with the laptop login (the box re-checks its own HF_TOKEN in minute 1)")
+        except Exception as e:
+            problems.append(f"cannot read the gated {MODEL_ID} with the laptop login ({type(e).__name__}): accept its "
+                            f"terms; the box's HF_TOKEN needs the same access")
+        size = sum(getattr(x, "size", None) or 0 for x in (getattr(info, "siblings", None) or [])) / 1e9
+        labelled = sum(getattr(x, "size", None) or 0 for x in (getattr(info, "siblings", None) or [])
+                       if getattr(x, "rfilename", "").startswith(f"{root}/")) / 1e9
+        projected = size + max(0.0, LABEL_REPO_ADD_GB - labelled)
+        warn = projected > REPO_WARN_GB
+        notes.append(f"{'WARNING: ' if warn else ''}{data_repo} holds {size:.1f} GB; after the label run up to "
+                     f"~{projected:.0f} GB" + (f" (> {REPO_WARN_GB} GB: check the account's private storage quota)"
+                                               if warn else ""))
+    except Exception as e:
+        problems.append(f"cannot read dataset {data_repo}: {type(e).__name__}: {e}")
+    return rev, problems, notes
+
+
+def avoided_machines(data_repo: str, rev: str | None) -> tuple[set[str], list[str]]:
+    """-> (machine ids, notes): the machines of earlier label runs that ended as host_failure or slow_host
+    (label_runs/*/label_end.json), best effort."""
+    import tempfile
+
+    out, notes = set(), []
+    try:
+        api, download = _hub()
+        ends = [f for f in api.list_repo_files(data_repo, repo_type="dataset", revision=rev)
+                if re.fullmatch(r"label_runs/[^/]+/label_end\.json", f)]
+        with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+            for f in ends:
+                end = json.loads(Path(download(data_repo, f, repo_type="dataset", revision=rev,
+                                               local_dir=tmp)).read_text(encoding="utf-8"))
+                if end.get("class") in AVOID_CLASSES and end.get("machine_id") not in (None, ""):
+                    out.add(str(end["machine_id"]))
+                    notes.append(f"avoiding machine {end['machine_id']}: {f} ended {end['class']}")
+    except Exception as e:
+        notes.append(f"could not read label_runs/*/label_end.json ({type(e).__name__}: {e}); only --avoid-machine "
+                     f"applies")
+    return out, notes
+
+
 def sanitize_tag(branch: str) -> str:
     """The branch tag docker/metadata-action writes: '/' and other invalid characters become '-'."""
     return re.sub(r"[^A-Za-z0-9_.-]", "-", branch)[:128]
@@ -420,15 +759,37 @@ def sanitize_tag(branch: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--job", choices=sorted(JOBS), default="train",
+                    help="train: the A100 run (default); label: the RTX 5090 label box (vast/label.py)")
     ap.add_argument("--data-repo", required=True, help="private HF dataset with the derived data (KITSUNE_DATA_REPO)")
-    ap.add_argument("--out-repo", required=True, help="private HF model repo for runs/ (KITSUNE_OUT_REPO)")
-    ap.add_argument("--config", default="configs/viability.json", help="run config, relative to the repo root")
+    ap.add_argument("--out-repo", default=None, help="private HF model repo for runs/ (KITSUNE_OUT_REPO; train only)")
+    ap.add_argument("--config", default=None,
+                    help="run config, relative to the repo root (default: configs/viability.json; label: "
+                         "configs/full.json)")
     ap.add_argument("--sha", default=None, help="commit to run (default: HEAD); must be pushed to GitHub")
     ap.add_argument("--image", default=None, help=f"full image ref with digest (default: resolve {IMAGE_REPO}:<tag>)")
     ap.add_argument("--image-tag", default=None, help="tag to resolve (default: the current branch, as CI tags it)")
     ap.add_argument("--offer-id", type=int, default=None, help="rent this offer from the search results")
-    ap.add_argument("--max-dph", type=float, default=DEFAULT_MAX_DPH, help="refuse offers above this $/h")
-    ap.add_argument("--max-hours", type=float, default=5.5, help="watchdog cap from first boot (KITSUNE_MAX_HOURS)")
+    ap.add_argument("--max-dph", type=float, default=None,
+                    help=f"refuse offers above this $/h (default {JOBS['train'].max_dph:g}; label "
+                         f"{JOBS['label'].max_dph:g})")
+    ap.add_argument("--max-hours", type=float, default=None,
+                    help="watchdog cap from first boot (KITSUNE_MAX_HOURS; default 5.5, plus the rebuild timeout for "
+                         "an extent config; label 30)")
+    ap.add_argument("--disk-gb", type=int, default=None,
+                    help="disk to rent (default: 150; an extent config: its sizing; label: 250); refused below the "
+                         "computed minimum")
+    ap.add_argument("--label-configs", default=LABEL_CONFIGS,
+                    help="label: comma list of the configs the label box's consumer check serves "
+                         "(KITSUNE_LABEL_CONFIGS); each extent must lie inside --config's")
+    ap.add_argument("--steal-lease", action="store_true",
+                    help="label: take over a live LEASE.json (only when that box is surely gone; "
+                         "KITSUNE_STEAL_LEASE=1)")
+    ap.add_argument("--avoid-machine", action="append", default=[], metavar="ID",
+                    help="label: never rent this vast machine_id (repeatable); label_runs/*/label_end.json with class "
+                         "host_failure/slow_host adds its machine by itself")
+    ap.add_argument("--cohere-procs", type=int, default=None,
+                    help="label: Cohere processes on the GPU (KITSUNE_COHERE_PROCS; default: the config's)")
     ap.add_argument("--no-self-stop", action="store_true",
                     help="debugging: the box does not stop itself when its on-start or bootstrap fails "
                          "(KITSUNE_NO_SELF_STOP=1); the watchdog still stops it once onstart.sh has started it")
@@ -438,14 +799,26 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="never create, even with --yes")
     ap.add_argument("--yes", action="store_true", help="actually create the instance (this spends money)")
     args = ap.parse_args(argv)
+    label_job = args.job == "label"
+    job = JOBS[args.job]
+    if not label_job and not args.out_repo:
+        ap.error("the following arguments are required: --out-repo")
+    if args.cohere_procs is not None and args.cohere_procs < 1:
+        ap.error("--cohere-procs must be >= 1")
+    config = args.config or ("configs/full.json" if label_job else "configs/viability.json")
+    label_configs = list(dict.fromkeys([config] + [c for c in args.label_configs.split(",") if c])) \
+        if label_job else []
+    max_dph = args.max_dph if args.max_dph is not None else job.max_dph
     will_create = args.yes and not args.dry_run
     errors: list[str] = []
+    notes: list[str] = []
 
     sha = args.sha or git("rev-parse", "HEAD")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise LaunchError(f"--sha must be a full 40-hex commit id, got {sha!r}")
     if not args.skip_git_checks:
-        errors += git_checks(sha, args.config)
+        for c in label_configs or [config]:
+            errors += [p for p in git_checks(sha, c) if p not in errors]
 
     image, pinned = args.image, True
     if image is None:
@@ -465,20 +838,63 @@ def main(argv: list[str] | None = None) -> int:
     if pinned and not args.skip_git_checks:
         errors += image_problems(image, sha)
 
-    data_rev = None
+    data_rev, sizing, avoid = None, None, {str(m) for m in args.avoid_machine}
+    if args.no_hf_check:
+        if label_job:
+            errors.append("--job label needs the HF preflight (it pins KITSUNE_DATA_REVISION and checks the lease): "
+                          "drop --no-hf-check")
+        else:
+            try:  # local git only: an extent config's sizing cannot be skipped with the Hub checks
+                # --skip-git-checks: the sha may not be local; the working tree's config is the best guess
+                c = json.loads((ROOT / config).read_text(encoding="utf-8")) if args.skip_git_checks                     else config_at(sha, config)
+                has_extent = bool(c.get("extent"))
+            except Exception:  # noqa: BLE001  an unreadable config is git_checks' finding (unless skipped)
+                has_extent = False
+            if has_extent and (args.disk_gb is None or args.max_hours is None):
+                errors.append(f"{config} has an extent: its disk and hours come from the HF preflight; with "
+                              f"--no-hf-check pass --disk-gb and --max-hours explicitly")
     if not args.no_hf_check:
         try:
-            cfg = config_at(sha, args.config)
+            cfg = config_at(sha, config)
+            label_cfgs = {c: (cfg if c == config else config_at(sha, c)) for c in label_configs}
         except (subprocess.CalledProcessError, OSError, ValueError) as e:
-            errors.append(f"cannot read {args.config} at {sha[:12]} ({type(e).__name__}), so the HF preflight did "
-                          f"not run")
+            errors.append(f"cannot read {', '.join(label_configs or [config])} at {sha[:12]} ({type(e).__name__}), so "
+                          f"the HF preflight did not run")
         else:
-            data_rev, problems = hf_preflight(args.data_repo, args.out_repo, cfg)
-            errors += problems
+            if label_job:
+                data_rev, problems, pre_notes = label_preflight(args.data_repo, sha, cfg, label_cfgs,
+                                                                steal_lease=args.steal_lease)
+                errors += problems
+                notes += pre_notes
+                hub_avoid, avoid_notes = avoided_machines(args.data_repo, data_rev)
+                avoid |= hub_avoid
+                notes += avoid_notes
+            else:
+                data_rev, problems = hf_preflight(args.data_repo, args.out_repo, cfg)
+                errors += problems
+                if cfg.get("extent"):
+                    problems, sizing = extent_preflight(args.data_repo, data_rev, cfg)
+                    errors += problems
     stub = ONSTART.read_bytes()
     if len(stub) > ONSTART_MAX_BYTES:
         errors.append(f"{ONSTART.name} is {len(stub)} bytes (> {ONSTART_MAX_BYTES}): vast may truncate the on-start "
                       f"field, and a truncated script starts nothing, not even the watchdog")
+
+    # disk, hours and traffic: the job's, or an extent config's sizing (the A100 rebuilds the subset's audio)
+    min_disk = LABEL_DISK_MIN_GB if label_job else sizing["disk_gb"] if sizing else DISK_GB
+    disk_gb = args.disk_gb or (sizing["disk_gb"] if sizing else job.disk_gb)
+    if disk_gb < min_disk:
+        errors.append(f"--disk-gb {disk_gb} is below the {min_disk} GB this run needs")
+    est_down = sizing["down_gb"] if sizing else job.est_down_gb
+    max_hours = args.max_hours if args.max_hours is not None else \
+        job.max_hours + (sizing["rebuild_timeout_min"] / 60 if sizing else 0)
+    if sizing:
+        notes.append(f"extent sizing: ~{sizing['down_gb']:.0f} GB upstream down, shards ~{sizing['shard_gb']:.0f} GB, "
+                     f"selected audio ~{sizing['sel_gb']:.0f} GB, labels ~{sizing['labels_gb']:.1f} GB -> disk "
+                     f"{sizing['disk_gb']} GB, rebuild timeout {sizing['rebuild_timeout_min']} min, max hours "
+                     f"{max_hours:g}")
+    for n in notes:
+        print(n)
 
     exe = shutil.which("vastai")
     if exe is None:
@@ -486,41 +902,72 @@ def main(argv: list[str] | None = None) -> int:
         print(install_help())
         return 2
 
-    env = {"KITSUNE_SHA": sha, "KITSUNE_CONFIG": args.config, "KITSUNE_DATA_REPO": args.data_repo,
-           "KITSUNE_OUT_REPO": args.out_repo, "KITSUNE_MAX_HOURS": f"{args.max_hours:g}", "TZ": "UTC"}
+    if label_job:
+        env = {"KITSUNE_JOB": "label", "KITSUNE_SHA": sha, "KITSUNE_CONFIG": config,
+               "KITSUNE_LABEL_CONFIGS": ",".join(label_configs), "KITSUNE_DATA_REPO": args.data_repo}
+    else:
+        env = {"KITSUNE_SHA": sha, "KITSUNE_CONFIG": config, "KITSUNE_DATA_REPO": args.data_repo,
+               "KITSUNE_OUT_REPO": args.out_repo}
+    env["KITSUNE_MAX_HOURS"] = f"{max_hours:g}"
+    if not label_job:
+        env["TZ"] = "UTC"
     if data_rev:
         env["KITSUNE_DATA_REVISION"] = data_rev
+    if sizing:
+        env["KITSUNE_REBUILD_TIMEOUT_MIN"] = str(sizing["rebuild_timeout_min"])
+    if label_job:
+        env.update(LABEL_WATCHDOG_ENV)
+        env["KITSUNE_IMAGE"] = image
+        if args.steal_lease:
+            env["KITSUNE_STEAL_LEASE"] = "1"
+        if args.cohere_procs is not None:
+            env["KITSUNE_COHERE_PROCS"] = str(args.cohere_procs)
     if args.no_self_stop:  # inside the one --env value: vastai has no -e option, and a second --env replaces the first
         env["KITSUNE_NO_SELF_STOP"] = "1"
 
-    tier, query, offers = search_offers(exe)
-    print(f"\nsearch ({tier or 'nothing found'}): vastai {shlex.join(search_args(query or build_query(TIERS[0][1])))}")
+    tier, query, offers = search_offers(exe, job, disk_gb, avoid, max_dph if label_job else None)
+    print(f"\nsearch ({tier or 'nothing found'}): vastai "
+          f"{shlex.join(search_args(query or job_query(job, job.tiers[0][1], disk_gb), disk_gb))}")
     if not offers:
-        errors.append("no offer matches the strict filter (D45a); try again later or relax it by hand")
+        errors.append("no offer matches the strict filter (D45a); try again later or relax it by hand" if not label_job
+                      else "no RTX 5090 offer matches the label filter (see the hint above); try again later")
         offer = None
     else:
-        print(offer_table(offers))
+        print(offer_table(offers, job=job if label_job else None))
         offer = next((o for o in offers if o.get("id") == args.offer_id), None) if args.offer_id else offers[0]
         if offer is None:
             errors.append(f"offer {args.offer_id} is not in the results")
-        elif offer.get("dph_total", 0) > args.max_dph:
-            errors.append(f"offer {offer['id']} costs ${offer['dph_total']:.3f}/h > --max-dph {args.max_dph}")
+        elif offer.get("dph_total", 0) > max_dph:
+            errors.append(f"offer {offer['id']} costs ${offer['dph_total']:.3f}/h > --max-dph {max_dph}")
 
     if offer and isinstance(offer.get("dph_total"), (int, float)):
         env["KITSUNE_DPH"] = f"{offer['dph_total']:.4f}"  # kitsune.runlog records it for the cost estimate
-    label = f"kitsune-{Path(args.config).stem}-{sha[:7]}"
-    cargs = create_args(offer["id"] if offer else "<offer-id>", image, env, ONSTART, label)
+    if label_job:
+        if offer and offer.get("machine_id") not in (None, ""):
+            env["KITSUNE_MACHINE_ID"] = str(offer["machine_id"])  # label_end.json names it for the avoid list
+        elif offer:
+            errors.append(f"offer {offer['id']} lists no machine_id (the box records it for the avoid list)")
+        env["TZ"] = "UTC"
+    label = f"{job.label_prefix}-{Path(config).stem}-{sha[:7]}"
+    cargs = create_args(offer["id"] if offer else "<offer-id>", image, env, ONSTART, label, disk_gb)
     assert not any("HF_TOKEN" in a for a in cargs), "HF_TOKEN must never be on the command line"
     print(f"\ncreate command:\n  vastai {shlex.join(cargs)}")
     print("HF_TOKEN is not passed: it must be set in vast Account -> Settings -> Environment Variables.")
-    if offer:
+    if offer and label_job:
+        dph = offer.get("dph_total", 0)
+        down, up = _gb_cost(offer, "inet_down_cost"), _gb_cost(offer, "inet_up_cost")
+        traffic = job.est_down_gb * down + job.est_up_gb * up
+        print(f"expected cost: ~${dph:.3f}/h (GPU + {disk_gb} GB) x ~{job.est_hours:g} h (12-24; cap {max_hours:g} h) "
+              f"+ ~{job.est_down_gb:g} GB down x ${down:.3f}/GB + ~{job.est_up_gb:g} GB up x ${up:.3f}/GB "
+              f"= ~${est_total(offer, job):.2f} (cap = ~${dph * max_hours + traffic:.2f})")
+    elif offer:
         dph = offer.get("dph_total", 0)
         down, up = (offer.get(k) if isinstance(offer.get(k), (int, float)) else None
                     for k in ("inet_down_cost", "inet_up_cost"))
-        bw = (f"~${EST_DOWN_GB * down + EST_UP_GB * up:.2f} (~{EST_DOWN_GB} GB down, ~{EST_UP_GB} GB up at this host's "
+        bw = (f"~${est_down * down + EST_UP_GB * up:.2f} (~{est_down:.0f} GB down, ~{EST_UP_GB} GB up at this host's "
               f"$/GB)" if down is not None and up is not None else "unknown (the offer lists no $/GB)")
-        print(f"expected cost: ${dph:.3f}/h (GPU + {DISK_GB} GB disk) x <= {args.max_hours:g} h (watchdog cap) "
-              f"= <= ${dph * args.max_hours:.2f}, plus bandwidth {bw}")
+        print(f"expected cost: ${dph:.3f}/h (GPU + {disk_gb} GB disk) x <= {max_hours:g} h (watchdog cap) "
+              f"= <= ${dph * max_hours:.2f}, plus bandwidth {bw}")
 
     if errors:
         print("\nproblems:\n  " + "\n  ".join(errors))
