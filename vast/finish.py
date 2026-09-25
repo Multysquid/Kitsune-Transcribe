@@ -257,7 +257,9 @@ def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_r
     for sha256. This mostly repairs a checkpoint upload that failed and captures log lines written after the trainer's
     last sync. The logs go first: they are small, the watchdog's --sync-only has 10 minutes before the stop, which a
     ~9 GB full state not yet on the hub can take all of (the final eval and verdict of a trainer still waiting on its
-    end-state upload are on this disk only), and a checkpoint upload that raises must not cost them."""
+    end-state upload are on this disk only). Each part gets its own try, logs first: a checkpoint upload that raises
+    must not cost the logs, nor a log upload that raises (the unretried repo_info GET of an unchanged snapshot, say)
+    the checkpoints, which may be the only copy off the box. Raises after both were tried if either failed."""
     expected = expected_files(run_dir, expect_full)
     rels = sorted(p[len(f"runs/{run_dir.name}/"):] for p in expected)
     ckpt = [r for r in rels if r.startswith("checkpoints/")]
@@ -266,14 +268,27 @@ def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_r
     log(f"sync {run_dir} -> {repo}:{dest} ({len(live)} files + {len(ckpt)} checkpoint files)")
     if dry_run:
         return
-    if live:  # logs the trainer may still be writing: a consistent copy (module docstring)
+
+    def upload_live():  # logs the trainer may still be writing: a consistent copy (module docstring)
         with tempfile.TemporaryDirectory(prefix="kitsune-finish-") as stage:
             snapshot(run_dir, live, Path(stage))
             api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=stage, path_in_repo=dest,
                               allow_patterns=live, commit_message=f"finish: sync {run_dir.name}")
-    if ckpt:  # renamed into place when complete (the end save may still replace trainer.pt/.json): uploaded in place
+
+    def upload_ckpt():  # renamed into place when complete (the end save may still replace trainer.pt/.json): in place
         api.upload_folder(repo_id=repo, repo_type=repo_type, folder_path=str(run_dir), path_in_repo=dest,
                           allow_patterns=ckpt, commit_message=f"finish: checkpoints {run_dir.name}")
+
+    failed = []
+    for what, files, upload in (("logs", live, upload_live), ("checkpoints", ckpt, upload_ckpt)):
+        if files:
+            try:
+                upload()
+            except Exception as e:  # noqa: BLE001  (main() logs the combined error and records sync_failed)
+                log(f"sync of {run_dir.name} {what} failed: {type(e).__name__}: {e}")
+                failed.append(f"{what}: {type(e).__name__}: {e}")
+    if failed:
+        raise RuntimeError("; ".join(failed))
 
 
 def scrub(data: bytes) -> bytes:

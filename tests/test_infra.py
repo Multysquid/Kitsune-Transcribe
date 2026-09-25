@@ -1433,6 +1433,30 @@ def test_finish_sync_uploads_the_logs_before_the_checkpoints(finish_env, tmp_pat
     assert kinds == ["sync_failed"]
 
 
+def test_finish_sync_uploads_the_checkpoints_when_the_log_upload_fails(finish_env, tmp_path):
+    """The reverse holds too: a log upload that raises (the unretried repo_info GET of a snapshot the trainer's close()
+    already pushed, say) skipped the checkpoint upload, and --destroy then found the end state missing and stopped the
+    box, which kept billing storage. Each part now has its own try; sync still fails as a whole, once."""
+    run, go = finish_env
+    expected = finish.expected_files(run)
+    full = f"runs/{run.name}/checkpoints/full_step_200/state.pt"
+
+    class LogsFail(FakeHub):
+        def upload_folder(self, **kw):
+            if not any(p.startswith("checkpoints/") for p in kw["allow_patterns"]):
+                raise RuntimeError("502 Bad Gateway (repo_info)")
+            super().upload_folder(**kw)
+            self.files.update(remote_from_local({full: expected[full]}))  # now on the hub
+
+    hub = LogsFail(remote_from_local({p: f for p, f in expected.items() if p != full}))
+    rc, actions = go(hub, "--destroy")
+    (ckpt,) = hub.uploads
+    assert "checkpoints/full_step_200/state.pt" in ckpt["allow_patterns"]
+    assert rc == 0 and actions == ["destroy"]
+    kinds = [json.loads(ln)["kind"] for ln in (tmp_path / "state" / "events.jsonl").read_text().splitlines()]
+    assert kinds[0] == "sync_failed" and kinds.count("sync_failed") == 1
+
+
 def test_snapshot_copies_a_growing_file_as_it_was(tmp_path):
     src = tmp_path / "run"
     (src / "metrics").mkdir(parents=True)
