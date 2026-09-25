@@ -20,7 +20,9 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fixtures import REAL, load_script, make_fake_corpus, make_fake_selection, need_real, no_real_data  # noqa: E402
+from fixtures import (  # noqa: E402
+    REAL, ROOT, load_script, make_fake_corpus, make_fake_selection, need_real, no_real_data,
+)
 
 from kitsune.audio import decode_audio  # noqa: E402
 from kitsune.store import SCHEMA  # noqa: E402
