@@ -114,6 +114,29 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    Options: `--offer-id N` to pick another row, `--max-dph 1.0` to cap the price, `--image ...@sha256:...` to pin an
    image by hand, `--config configs/<other>.json`, `--no-self-stop` to debug a box (see "How it ends").
 
+## The next runs: `configs/next_run_template.json`
+
+`configs/viability.json` (the default `--config`) is the first A100 run's config and stays as it was run; the rest of
+this README describes it. The scaling study's configs start from `configs/next_run_template.json`: copy it to
+`configs/<study>.json`, set `run_name`, the data (`student`, `sources`, `eval_sets`, `selection`, `selection_recipe`)
+and `schedule.epochs`, and rent with `--config configs/<study>.json`. It is viability.json with the first run's report
+recommendations (its `_comment` has the details and the arithmetic):
+
+| key | viability.json (first run) | template | why |
+|---|---|---|---|
+| `batch.micro_audio_s` | 400 | 600, the memory probe's first choice (it halves on OOM) | ~0.14 s fixed cost per micro-batch: ~+18 % audio-s/s at ~29-30 GiB (estimated) |
+| `schedule.clock` / `epochs` | wall, 4 h | epochs, 8 | the cooldown counts steps, so evals cost it no LR; the last epoch's eval is the final eval |
+| `eval.full_every_epochs` | 1 | 2 (mini evals every 500 steps in between) | complete evals took 13 % of the loop |
+| `eval.verdict_version` | 1 | 2 | the CER trend on the pre-cooldown evals, complete sets, de-duplicated end points; cooldown gain and pre-cooldown slope reported |
+| `perf.profile_smoke` | "auto" (the default: on under CUDA; the first run had no profiler) | true | the profiler record of the smoke steps (below) |
+| `eval.reference` | none | null until Parakeet 0.6B ja's complete-set CER is in a file | the reference model next to the gate (below) |
+
+On the epochs clock the trainer does not shorten the run to the watchdog's deadline (it does so on the wall clock
+only), so size `schedule.epochs` to fit well inside `--max-hours`: steps per epoch (the `plan` event; 1,216 for the
+viability data) x ~1.05-1.25 s, plus ~4 min per complete eval and ~15 min of box overhead. Verdict v2 needs at least
+3 complete evals before the cooldown: with a complete eval every 2 epochs and a 20 % cooldown that means 8 epochs or
+more (epochs 2, 4 and 6 before the cooldown at 6.4); with fewer it reports "trend: insufficient pre-cooldown evals".
+
 ## Watching it
 
 ```bash
