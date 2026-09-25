@@ -95,9 +95,10 @@ Checkpoints under runs/<run_id>/checkpoints/:
 time budget; the config comes from the checkpoint, with this invocation's --set overrides applied on top (--config is
 then ignored). optim.*, loss.* and memory.grad_ckpt among them go on top of the restored optimizer, L2-SP and memory
 choice too; a new value for a key that shapes the step plan (RESUME_FIXED: seed, mix, sources, selection, subset.*,
-batch.*) stops the resume with the key named (repeating the checkpoint's value is fine). A resume from an older full
-state moves the abandoned attempt's newer full_step_<M>/ and step_<M>/ to checkpoints/abandoned-<UTC stamp>/
-(set_aside_newer), so rotation, a later run-dir resume and finish.py see only the resumed run's.
+batch.*) stops the resume with the key named (repeating the checkpoint's value is fine). A resume moves every
+full_step_<M>/ and step_<M>/ newer than its state (an abandoned attempt's, or weights saved after the newest full state)
+to checkpoints/abandoned-<UTC stamp>/ (set_aside_newer), so rotation, a later run-dir resume and finish.py see only the
+resumed run's.
 
 Time: in schedule.clock "wall" (the real run) the budget T = train_hours of loop wall-clock from the first training
 step, evals and checkpoints included; the step-0 eval and the final eval are outside it. The clock continues across a
@@ -2009,16 +2010,20 @@ def set_aside_newer(ckpt_dir: Path, step: int) -> list[str]:
     place, that attempt's newer full_step_<M>/ would outrank the resumed run's own: rotate_full (the newest keep_local)
     deletes the resumed run's states instead, and a later --resume <run dir> (find_full_state; supervise_distill.py)
     silently continues the abandoned attempt; finish.py would upload its step_<M>/ weights next to the resumed run's.
-    So when a full_step_<M> with M > step exists, every full_step_<M>/ and step_<M>/ with M > step moves to
-    checkpoints/abandoned-<UTC stamp>/ (a rename: nothing is deleted). Every scanner of checkpoints/ (these, finish.py,
-    both supervisors) reads only its top level. A resume from the newest full state moves nothing, not even the
-    weights saved after it (the resumed run replays those steps). Returns the names moved."""
+    So every full_step_<M>/ and step_<M>/ with M > step moves to checkpoints/abandoned-<UTC stamp>/ (a rename:
+    nothing is deleted). Every scanner of checkpoints/ (these, finish.py, both supervisors) reads only its top level.
+    That includes the weights saved after the newest full state, when the resume is from that one: a crash inside
+    the full-state save that follows the same step's weights (periodic or end), or the laptop's minute cadences.
+    The resumed run replays the steps but not those saves: on the wall and minute clocks its weights fall due at other
+    steps, and a re-fit budget may end it before M, so step_<M>/ would stay next to its own, uploaded and verified by
+    finish.py (on the steps clock the same step_<M> comes back). The `resume` event lists the names (set_aside); a copy
+    the Uploader already pushed stays on the Hub. Returns the names moved."""
     def newer(regex):
         return [p for p in ckpt_dir.iterdir() if (m := regex.match(p.name)) and int(m[1]) > step]
 
-    if not newer(FULL_RE):
-        return []
     moved = sorted(newer(FULL_RE) + newer(WEIGHTS_RE), key=lambda p: p.name)
+    if not moved:
+        return []
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dest, n = ckpt_dir / f"abandoned-{stamp}", 1
     while dest.exists():

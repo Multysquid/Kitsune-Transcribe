@@ -452,15 +452,33 @@ def test_resume_from_an_older_full_state_sets_the_abandoned_attempt_aside(tmp_pa
     """--resume full_step_4 while the attempt it backs out of left full_step_8: rotation kept the highest-numbered
     states and --resume <run dir> took the newest, so the resumed run's own states were deleted and the next run-dir
     resume (supervise_distill.py) silently continued the abandoned attempt. Its newer dirs now move under
-    abandoned-*/, where no scanner looks; a resume from the newest state moves nothing."""
+    abandoned-*/, where no scanner looks. A resume from the newest state moves only the weights saved after it: the
+    resumed run replays the steps, not those saves, so they would stay next to its own and go up with them."""
     m = load_script("04_distill")
+
+    def tree(root, names):
+        ck = root / "checkpoints"
+        for name in names:
+            (ck / name).mkdir(parents=True)
+            if name.startswith("full") and not name.endswith(".tmp"):
+                (ck / name / "trainer.pt").write_bytes(b"x")
+        return ck
+
+    names = ("full_step_4", "full_step_8", "step_4", "step_6", "step_9")
+    ck8 = tree(tmp_path / "newest", names)
+    assert m.set_aside_newer(ck8, 8) == ["step_9"] and m.set_aside_newer(ck8, 8) == []
+    (aside8,) = [p for p in ck8.iterdir() if p.name.startswith("abandoned-")]
+    assert [p.name for p in aside8.iterdir()] == ["step_9"]
+    assert m.find_full_state(ck8.parent) == ck8 / "full_step_8"
+    # a crash inside the full-state save right after the same step's weights: the resume is from the full state
+    # before, and the orphaned weights move (the torn .tmp is no checkpoint any scanner takes)
+    ckt = tree(tmp_path / "torn", ("full_step_4", "step_4", "step_8", "full_step_8.tmp"))
+    assert m.find_full_state(ckt.parent) == ckt / "full_step_4" and m.set_aside_newer(ckt, 4) == ["step_8"]
+    assert (ckt / "full_step_8.tmp").is_dir()
+
     run = tmp_path / "run"
-    ck = run / "checkpoints"
-    for name in ("full_step_4", "full_step_8", "step_4", "step_6", "step_9"):
-        (ck / name).mkdir(parents=True)
-        if name.startswith("full"):
-            (ck / name / "trainer.pt").write_bytes(b"x")
-    assert m.set_aside_newer(ck, 8) == [] and m.set_aside_newer(ck, 4) == ["full_step_8", "step_6", "step_9"]
+    ck = tree(run, names)
+    assert m.set_aside_newer(ck, 4) == ["full_step_8", "step_6", "step_9"]
     (aside,) = [p for p in ck.iterdir() if p.name.startswith("abandoned-")]
     assert sorted(p.name for p in aside.iterdir()) == ["full_step_8", "step_6", "step_9"]
     assert (aside / "full_step_8" / "trainer.pt").exists() and m.find_full_state(run) == ck / "full_step_4"
