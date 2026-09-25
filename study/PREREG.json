@@ -1,4 +1,50 @@
 {
+ "analysis": {
+  "anchor_flag_rel": 0.05,
+  "bootstrap": {
+   "B": 10000,
+   "seed": 1234,
+   "z": 1.96
+  },
+  "delta": 0.1,
+  "deltas": [
+   0.05,
+   0.1,
+   0.2
+  ],
+  "m4_strata": [
+   "eval_jsut",
+   "eval_cv8",
+   "eval_reazon",
+   "galgame_neutral"
+  ],
+  "sigma_run": {
+   "factor": 0.886,
+   "prior": 0.016,
+   "replicate": [
+    "study-t01-s1235",
+    "study-t01"
+   ]
+  },
+  "strata": [
+   "eval_jsut",
+   "eval_cv8",
+   "eval_reazon",
+   "eval_emilia",
+   "galgame_neutral",
+   "galgame_all",
+   "galgame_label_box"
+  ],
+  "teacher_bars": [
+   1.2,
+   1.5
+  ],
+  "teachers": [
+   "cohere",
+   "parakeet-ctc",
+   "parakeet-tdt"
+  ]
+ },
  "anchor": {
   "flag": "the study's T-0.6B has a gate-pooled CER worse than the anchor's by > 5 % relative with a paired CI excluding 0",
   "model": "the first run's 0.6B, step_9774",
@@ -10,32 +56,32 @@
    "eval_emilia": "pending",
    "eval_jsut": "pending",
    "eval_reazon": "pending",
-   "galgame:all": "pending",
-   "galgame:label_box": "pending",
-   "galgame:neutral": "pending",
+   "galgame_all": "pending",
+   "galgame_label_box": "pending",
+   "galgame_neutral": "pending",
    "m4": "pending"
   },
-  "fill": "the sidecar's baselines: corpus CER (kitsune.evaluate.corpus_cer) on the manifest rows",
-  "parakeet_ctc": {
+  "parakeet-ctc": {
    "eval_cv8": "pending",
    "eval_emilia": "pending",
    "eval_jsut": "pending",
    "eval_reazon": "pending",
-   "galgame:all": "pending",
-   "galgame:label_box": "pending",
-   "galgame:neutral": "pending",
+   "galgame_all": "pending",
+   "galgame_label_box": "pending",
+   "galgame_neutral": "pending",
    "m4": "pending"
   },
-  "parakeet_tdt": {
+  "parakeet-tdt": {
    "eval_cv8": "pending",
    "eval_emilia": "pending",
    "eval_jsut": "pending",
    "eval_reazon": "pending",
-   "galgame:all": "pending",
-   "galgame:label_box": "pending",
-   "galgame:neutral": "pending",
+   "galgame_all": "pending",
+   "galgame_label_box": "pending",
+   "galgame_neutral": "pending",
    "m4": "pending"
   },
+  "source": "the sidecar's baselines: corpus CER (kitsune.evaluate.corpus_cer) on the manifest rows; m4 = the macro mean over eval_jsut, eval_cv8, eval_reazon, galgame_neutral",
   "status": "pending"
  },
  "branch": {
@@ -93,7 +139,7 @@
    "name": "full",
    "root": "labels/full"
   },
-  "reazon_large_cap": "the smallest reazon_large input count whose pool after all filters holds >= 1010 h (expected 50-55), read from the sealed labels",
+  "reazon_large_cap": "the smallest reazon_large input count whose pool after all filters holds >= 1010 h (expected 50-55), read from the sealed labels (the sidecar's details.pool_hours_if_capped; the fill refuses any other count)",
   "sources": [
    "reazon_small",
    "reazon_large",
@@ -284,7 +330,7 @@
    }
   },
   "ratio": "r_s = M4_s / M4_top",
-  "replicate": "study-t01-s1235 feeds sigma_run only; the walk uses study-t01",
+  "replicate_role": "study-t01-s1235 feeds sigma_run only; the walk uses study-t01",
   "walk": "down the sizes: the limit is the smallest size WITHIN with every larger size WITHIN; the first OUTSIDE ends it (limit between X and Y); an UNRESOLVED gives 'at or below X, Y unresolved' and the smaller sizes are descriptive; one decisive claim per family, no Holm correction"
  },
  "lr_probes": {
@@ -371,8 +417,6 @@
   "run_names": "probe-<class>-<lr>, lr like 1e-3 / 4e-4"
  },
  "manifest": {
-  "extent_inputs": "pending",
-  "fill": "python -m kitsune.prereg --write study/ --sidecar labels/full/selections/study_1000h.json, from the selection built on the sealed labels (scripts/make_selection.py --config study/data.json)",
   "galgame_views": {
    "all": {
     "ids_sha256": "pending",
@@ -387,29 +431,44 @@
     "n": "pending"
    }
   },
-  "ids_sha256": {
-   "eval_cv8": "pending",
-   "eval_emilia": "pending",
-   "eval_jsut": "pending",
-   "eval_reazon": "pending",
-   "galgame": "pending",
-   "probe": "pending",
-   "train": "pending"
-  },
+  "manifest_file": "labels/full/selections/study_manifest.json",
   "manifest_sha256": "pending",
-  "n": {
-   "eval_cv8": "pending",
-   "eval_emilia": "pending",
-   "eval_jsut": "pending",
-   "eval_reazon": "pending",
-   "galgame": "pending",
-   "probe": "pending",
-   "train": "pending"
-  },
   "pool_hours": "pending",
+  "probe": {
+   "ids_sha256": "pending",
+   "n": "pending"
+  },
+  "selection_file": "labels/full/selections/study_1000h.parquet",
   "selection_sha256": "pending",
+  "sets": {
+   "eval_cv8": {
+    "ids_sha256": "pending",
+    "n": "pending"
+   },
+   "eval_emilia": {
+    "ids_sha256": "pending",
+    "n": "pending"
+   },
+   "eval_jsut": {
+    "ids_sha256": "pending",
+    "n": "pending"
+   },
+   "eval_reazon": {
+    "ids_sha256": "pending",
+    "n": "pending"
+   },
+   "galgame": {
+    "ids_sha256": "pending",
+    "n": "pending"
+   }
+  },
+  "source": "python -m kitsune.prereg --write study/ --sidecar labels/full/selections/study_1000h.json, from the selection built on the sealed labels (scripts/make_selection.py --config study/data.json)",
   "status": "pending",
-  "train_hours": "pending"
+  "train": {
+   "hours": "pending",
+   "ids_sha256": "pending",
+   "n": "pending"
+  }
  },
  "metrics": {
   "cer": "kitsune.evaluate.corpus_cer: sum(S+D+I) / sum(ref chars) on normalize_ja text, empty refs skipped",
@@ -423,23 +482,24 @@
   "qualifiers": {
    "in_domain": [
     "eval_reazon",
-    "galgame:neutral"
+    "galgame_neutral"
    ],
    "out_of_domain": [
     "eval_jsut",
     "eval_cv8"
    ]
-  }
+  },
+  "strata": "every eval set is one stratum, Galgame is its three views instead: eval_jsut, eval_cv8, eval_reazon, eval_emilia, galgame_neutral, galgame_all, galgame_label_box"
  },
  "noise": {
   "bootstrap": {
    "B": 10000,
-   "kind": "paired utterance bootstrap, stratified: resampled within each set, the same indices for every system",
+   "kind": "paired utterance bootstrap, stratified: resampled within each stratum, the same indices for every system",
    "seed": 1234
   },
   "ci_student_ratio": "ln r +- 1.96 sqrt(v_boot + 2 sigma_run^2)",
   "ci_student_vs_teacher": "ln r +- 1.96 sqrt(v_boot + sigma_run^2)",
-  "replicate_estimate": "0.886 x |ln(M4_replicate / M4_study-t01)|",
+  "replicate_estimate": "0.886 x |ln(M4_study-t01-s1235 / M4_study-t01)|",
   "sigma_prior": 0.016,
   "sigma_rule": "sigma_run = max(0.016, the replicate's estimate)"
  },
@@ -619,7 +679,7 @@
  },
  "selection": {
   "coverage": "launch refuses a selection with any eval row not_in_parakeet (K6: both passes label the eval sets whole) or more than 0.1 % of its train rows not_in_parakeet (K5)",
-  "file": "labels/full/selections/study_1000h.parquet (+ study_1000h.json, study_manifest.json)",
+  "file": "labels/full/selections/study_1000h.parquet (+ labels/full/selections/study_1000h.json, labels/full/selections/study_manifest.json)",
   "frame_preflight": "at store build, for every row: the ParakeetFeatureExtractor length of the rebuilt audio, 8x subsampled, equals the stored n_frames; mismatches are dropped and counted, the box fails above 0.1 % of train rows or on any eval row (decision 15)",
   "reasons": [
    "kept",

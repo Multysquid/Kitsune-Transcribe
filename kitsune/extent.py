@@ -36,6 +36,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from kitsune.prereg import study_files
 from kitsune.store import fsync_path, load_progress, read_manifest, sidecar_meta
 from kitsune.store import ids_sha256  # noqa: F401  re-exported: the record's per-stem join key
 
@@ -434,8 +435,10 @@ def pull_plan(cfg: dict, record: dict, files: list[str]) -> dict:
     have none). parakeet_out (<stem>.npz/.jsonl of every name, and its meta.json) only for a CTC student
     (cfg family "ctc") or with cfg pull_parakeet true (the study box pulls both teachers for every run); a CTC run
     without pull_parakeet needs teacher_out only for its eval sets' eval stems (the Cohere baselines), not for its train
-    stems. Without either key (every config before the study) the plan is what it always was. `required` is every file
-    the run needs; missing ones are problems. The student's files are the caller's to check (vast/launch.py
+    stems. A study selection (selection_recipe.study) also brings its sidecar and manifest (kitsune.prereg.study_files:
+    <selection>.json and study_manifest.json next to it; the box checks the manifest hash and every scorer reads it).
+    Without these keys (every config before the study) the plan is what it always was. `required` is every file the
+    run needs; missing ones are problems. The student's files are the caller's to check (vast/launch.py
     STUDENT_FILES)."""
     problems = validate(cfg)
     if problems:
@@ -452,6 +455,8 @@ def pull_plan(cfg: dict, record: dict, files: list[str]) -> dict:
     teacher_all = not ctc or bool(cfg.get("pull_parakeet"))  # else: eval stems of the eval sets only
     eval_sets = set(cfg.get("eval_sets") or [])
     required = [f"{teacher_root}/meta.json", f"{second_root}/meta.json", cfg["selection"]]
+    if (cfg.get("selection_recipe") or {}).get("study") is not None:
+        required += list(study_files(cfg["selection"]))
     required += [f"{parakeet_root}/meta.json"] if parakeet_root else []
     dir_patterns = list(required) + ([f"{cfg['student'].rstrip('/')}/*"] if cfg.get("student") else [])
     explicit = []

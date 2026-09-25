@@ -445,7 +445,8 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
     trainer's build_stores raises on a missing one, after the paid bootstrap, and data_problems only asks for SOME
     teacher shard per source (a train npz also satisfies the galgame hold-out).
     Drop reasons must be ones the recipe produces: the study's (kitsune.prereg.STUDY_REASONS) only with a
-    selection_recipe.study block, which must equal the one the selection was built with. A study selection also
+    selection_recipe.study block, which must equal the one the selection was built with and the pre-registered one
+    (kitsune.prereg.STUDY_SELECTION), with the pre-registered seed (SELECTION_SEED). A study selection also
     keeps every eval row in both label roots (an eval row not_in_parakeet means the Parakeet pass did not label the
     set whole, K6), leaves at most kitsune.prereg.ONE_ROOT_MAX_FRAC of its train rows in teacher_out only (K5), and,
     with `have`, has its sidecar (<selection>.json) and manifest (study_manifest.json) uploaded next to it. A CTC
@@ -483,6 +484,13 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
                 shown = [sorted(x.items()) if isinstance(x, dict) else sorted(x) if isinstance(x, set) else x
                          for x in (got[k], v)]
                 problems.append(f"{name} was built with {k} {shown[0]}, the run config says {shown[1]}: {rebuild}")
+        if want["study"] is not None:  # the study's data is pre-registered: one recipe, one seed for every run
+            if want["study"] != prereg.STUDY_SELECTION:
+                problems.append(f"the run config's selection_recipe.study {want['study']} is not the pre-registered "
+                                f"{prereg.STUDY_SELECTION} (kitsune.prereg; study/data.json carries it)")
+            if args.get("seed") != prereg.SELECTION_SEED:
+                problems.append(f"{name} was built with seed {args.get('seed')!r}, the study selection's is "
+                                f"pre-registered as {prereg.SELECTION_SEED}: {rebuild}")
 
     sel = pd.read_parquet(path, columns=["source", "split", "keep", "reason", "teacher_file"])
     kept = sel[sel["keep"]].groupby(["source", "split"]).size()
@@ -529,9 +537,7 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
                 problems.append(f"{name} keeps rows whose Parakeet targets are not in the data repo: {len(absent)} of "
                                 f"{len(need)} files missing (e.g. {absent[0]})")
         if study:
-            stem = name[: -len(".parquet")] if name.endswith(".parquet") else name
-            folder = name.rsplit("/", 1)[0] + "/" if "/" in name else ""
-            for f in (f"{stem}.json", f"{folder}{prereg.MANIFEST_FILE}"):
+            for f in prereg.study_files(name):
                 if f not in have:
                     problems.append(f"no {f}: upload the study selection's sidecar and manifest with it")
     return problems

@@ -60,16 +60,23 @@ the sealed label root. Rules for TRAIN rows, first match wins, then the existing
   kept
 EVAL rows: every row present in both roots (not_in_parakeet otherwise, and no_audio), never label-filtered (the
 recipe's filter_eval_sets must be []). The probe is study.probe_n kept rows per train source (the convention above),
-the greedy subsets as above. Next to the parquet it writes, deterministically (no timestamps: a rebuild gives the same
-bytes, so the hashes pre-register):
+the greedy subsets as above. Next to the parquet it writes, deterministically (no timestamps and no machine paths:
+the parquet records the config's own roots and the content hashes of the extent record and the kotoba file, so a
+rebuild from any checkout or output directory gives the same bytes with the same pyarrow, and the hashes
+pre-register):
   <selection>.json      the sidecar: the recipe and seed, hours per source after each rule, the draw, ids_sha256 of
                         the train list, the probe and each eval set (kitsune.store.ids_sha256, selection order), the
-                        Galgame views, the teachers' baselines on the manifest rows and the file hashes
+                        Galgame views, the teachers' baselines on the manifest rows (cohere, parakeet-ctc,
+                        parakeet-tdt per scoring stratum: the eval sets, Galgame as galgame_neutral / _all /
+                        _label_box, and m4), the file hashes, and the reazon_large cap readout (pool_hours_if_capped:
+                        the pool had the cap been N; reazon_large_cap: the smallest N whose pool holds >= 1,010 h,
+                        the only cap kitsune.prereg registers)
   study_manifest.json   per eval set its ordered ids and their sha256, and the Galgame view id lists: neutral
                         (cer(kotoba-whisper hyp2, ref) <= study.neutral_max_cer and a non-empty reference, from the
                         laptop's second_out/galgame/eval-00000.jsonl: --kotoba-galgame), all, and label_box (the label
                         box's own filter: not truncated, agree <= the galgame threshold)
-python -m kitsune.prereg --write study/ --sidecar <selection>.json then fills the PREREG's pending fields.
+python -m kitsune.prereg --write study/ --sidecar <selection>.json then fills the PREREG's pending fields; it takes only
+the pre-registered selection (recipe, seed, sources, eval sets, extent and the rule's reazon_large cap).
 
 Usage:
   python scripts/make_selection.py --config configs/viability.json       # the viability run's selection
@@ -106,7 +113,6 @@ COLUMNS = ["id", "source", "split", "teacher_file", "duration", "n_tok", "trunca
            "reason", "in_greedy_subset", "in_probe"]
 # the laptop's kotoba-whisper-v2.0 hypotheses of the galgame hold-out (02b before the label box): the neutral view
 KOTOBA_GALGAME = "second_out/galgame/eval-00000.jsonl"
-STUDY_SCHEMA = 1
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -510,9 +516,10 @@ def build_study_selection(teacher_root, second_root, parakeet_root, data_root, s
             neutral[i] = bool(normalize_ja(ref[i])) and cer_fn(k2[sel["id"].iat[i]] or "", ref[i]) <= \
                 study["neutral_max_cer"]
         views = {"neutral": neutral, "all": m, "label_box": box}
-    keys = [(s, sets[s]["sel"]) for s in eval_sets if s != "galgame"] + [(f"galgame:{v}", m) for v, m in views.items()]
+    # the scoring strata as kitsune.study_stats names them (Galgame as its views), the systems as CONTRACT.md 5 does
+    keys = [(s, sets[s]["sel"]) for s in eval_sets if s != "galgame"] + [(f"galgame_{v}", m) for v, m in views.items()]
     baselines = {}
-    for system, hyps in (("cohere", hyp), ("parakeet_tdt", p_hyp), ("parakeet_ctc", p_ctc)):
+    for system, hyps in (("cohere", hyp), ("parakeet-ctc", p_ctc), ("parakeet-tdt", p_hyp)):
         b = {}
         for k, m in keys:
             c = corpus_cer(list(hyps[m]), list(ref[m]))
@@ -521,8 +528,9 @@ def build_study_selection(teacher_root, second_root, parakeet_root, data_root, s
             b["m4"] = float(np.mean([b[k]["cer"] for k in kprereg.M4_SETS]))
         baselines[system] = b
 
-    manifest = {"schema": STUDY_SCHEMA, "order": "selection order: eval_sets in config order, stems sorted, rows in "
-                                                 "teacher_out order; ids_sha256 = kitsune.store.ids_sha256",
+    manifest = {"schema": kprereg.STUDY_SCHEMA,
+                "order": "selection order: eval_sets in config order, stems sorted, rows in teacher_out order; "
+                         "ids_sha256 = kitsune.store.ids_sha256",
                 "sets": {s: dict(_id_block(v["ids"]), hours=_utts_hours(sel[v["sel"]])["hours"], ids=v["ids"])
                          for s, v in sets.items()},
                 "galgame_views": {v: dict(_id_block(sel["id"][m].tolist()), ids=sel["id"][m].tolist())
@@ -532,10 +540,12 @@ def build_study_selection(teacher_root, second_root, parakeet_root, data_root, s
     pool_s = float(sel["duration"][pool].astype(np.float64).sum())
     extra = {}
     if record is not None and capped:
-        extra["pool_hours_if_capped"] = _pool_by_cap(record, capped, sel, pool, sources)
+        extra["pool_hours_if_capped"] = by_cap = _pool_by_cap(record, capped, sel, pool, sources)
+        if (readout := cap_readout(by_cap, capped)) is not None:
+            extra["reazon_large_cap"] = readout
     q = f1a[~np.isnan(f1a)]
     sidecar = {
-        "schema": STUDY_SCHEMA, "seed": seed, "sources": list(sources), "eval_sets": list(eval_sets),
+        "schema": kprereg.STUDY_SCHEMA, "seed": seed, "sources": list(sources), "eval_sets": list(eval_sets),
         "hours": hours,
         "draw": {"budget_s": float(study["draw_audio_s"]), "pool_s": pool_s,
                  "drawn_s": float(sel["duration"][stage["drawn"]].astype(np.float64).sum()),
@@ -577,6 +587,26 @@ def _pool_by_cap(record: dict, capped: dict, sel: pd.DataFrame, pool: np.ndarray
         by = per.groupby("o")["duration"].sum().astype(np.float64) / 3600
         out[src] = {str(n): rest_h + float(by[by.index < n].sum()) for n in range(1, cap + 1)}
     return out
+
+
+def cap_readout(by_cap: dict, capped: dict) -> dict | None:
+    """The reazon_large cap rule against the configured cap, from _pool_by_cap's {source: {N: pool hours}} (None when
+    reazon_large is not capped): kitsune.prereg registers only the rule's cap, the smallest N whose pool holds >=
+    POOL_MIN_HOURS h, so a selection built at another cap cannot fill the PREREG."""
+    if "reazon_large" not in by_cap:
+        return None
+    rule = kprereg.cap_rule(by_cap["reazon_large"])
+    return {"min_pool_hours": kprereg.POOL_MIN_HOURS, "configured": capped["reazon_large"], "rule": rule,
+            "holds": rule == capped["reazon_large"]}
+
+
+def cap_line(cap: dict) -> str:
+    """cap_readout as one line of the build's report."""
+    rule = cap["rule"] if cap["rule"] is not None else "none up to it: rebuild at a larger cap"
+    tail = "" if cap["holds"] else (" - kitsune.prereg registers only the rule's cap: set extent.inputs.reazon_large "
+                                    "to it and rebuild")
+    return (f"reazon_large cap: configured {cap['configured']}, the rule (pool >= {cap['min_pool_hours']} h) gives "
+            f"{rule}{tail}")
 
 
 def _write_json(path: Path, obj):
@@ -796,9 +826,33 @@ def main(argv: list[str] | None = None):
     print(f"\nwrote {out} ({len(sel)} rows) in {time.time() - t0:.1f} s")
 
 
+STUDY_ARGS = ("sources", "eval_sets", "agree_max", "agree_max_source", "filter_eval_sets", "partial_second_opinion",
+              "study", "extent", "seed", "greedy_n", "probe_n", "skip_audio_check", "from_selection")
+
+
+def _json_sha256(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def study_meta_args(args, cfg: dict, record: dict | None, kotoba: Path | None) -> dict:
+    """The study selection's recorded arguments, location-free: the same labels and config give the same parquet
+    bytes from any checkout, worktree or output directory, so the selection's sha256 can be pre-registered and
+    re-verified elsewhere. The recipe arguments launch compares, the seed and subset sizes, the config's own
+    repo-relative roots (config_roots), and the content hashes of the extent record and the kotoba file instead of
+    the absolute paths they were read from. (The file bytes still depend on the pyarrow version that writes them; the
+    ids hashes and the manifest do not.)"""
+    out = {k: getattr(args, k) for k in STUDY_ARGS}
+    out["config_roots"] = {k: cfg.get(k) for k in ("teacher_root", "second_root", "parakeet_root", "data_root",
+                                                    "selection")}
+    out["extent_record_sha256"] = None if record is None else _json_sha256(record)
+    out["kotoba_galgame_sha256"] = None if kotoba is None else file_sha256(kotoba)
+    return out
+
+
 def study_main(args, cfg: dict, by_source: dict, stems, record, t0: float) -> int:
     """Build and write the study selection, its manifest and its sidecar (the sidecar last: it hashes the other two).
-    No timestamp anywhere, so the same labels and arguments give the same three files byte for byte."""
+    No timestamp and no machine path anywhere (study_meta_args), so the same labels and config give the same three
+    files byte for byte."""
     try:
         sel, manifest, body = build_study_selection(
             args.teacher_out, args.second_out, args.parakeet_out, args.data, args.sources, args.eval_sets, args.study,
@@ -813,20 +867,21 @@ def study_main(args, cfg: dict, by_source: dict, stems, record, t0: float) -> in
     man_out = out.parent / kprereg.MANIFEST_FILE
     summary = summarize(sel)
     kept = sel[sel["keep"]].groupby(["source", "split"])["duration"].agg(["size", "sum"])
-    meta = dict(args=vars(args), n_no_audio_any=int(sel.attrs.get("n_no_audio_any", 0)),
-                summary=summary.to_dict(orient="records"),
+    kotoba = Path(args.kotoba_galgame) if "galgame" in args.eval_sets else None
+    meta = dict(args=study_meta_args(args, cfg, record, kotoba),
+                n_no_audio_any=int(sel.attrs.get("n_no_audio_any", 0)), summary=summary.to_dict(orient="records"),
                 kept={f"{s}/{sp}": dict(utts=int(r["size"]), hours=float(r["sum"] / 3600))
                       for (s, sp), r in kept.iterrows()})
     write_selection(sel, out, meta)
     _write_json(man_out, dict(manifest, selection=sel_rel))
     recipe = {k: cfg["selection_recipe"].get(k) for k in ("agree_max", "agree_max_source", "filter_eval_sets",
                                                           "partial_second_opinion", "study")}
-    kotoba = Path(args.kotoba_galgame) if "galgame" in args.eval_sets else None
+    man_rel = kprereg.study_files(sel_rel)[1]
     sidecar = {"schema": body["schema"],
                "selection": {"path": sel_rel, "sha256": file_sha256(out)},
-               "manifest": {"path": str(Path(sel_rel).parent / kprereg.MANIFEST_FILE).replace("\\", "/"),
-                            "sha256": file_sha256(man_out)},
+               "manifest": {"path": man_rel, "sha256": file_sha256(man_out)},
                "recipe": recipe, "extent": args.extent,
+               "extent_record_sha256": meta["args"]["extent_record_sha256"],
                "kotoba": None if kotoba is None else {"file": KOTOBA_GALGAME, "sha256": file_sha256(kotoba)},
                **{k: v for k, v in body.items() if k != "schema"}}
     side_out = out.with_suffix(".json")
@@ -843,6 +898,8 @@ def study_main(args, cfg: dict, by_source: dict, stems, record, t0: float) -> in
     print(f"draw: {d['drawn_s'] / 3600:.2f} h of a {d['pool_s'] / 3600:.2f} h pool (budget "
           f"{d['budget_s'] / 3600:.2f} h); train {body['n']['train']} utts, probe {body['n']['probe']}; eval "
           + ", ".join(f"{s} {n}" for s, n in body["n"]["eval"].items()) + (f"; galgame views {views}" if views else ""))
+    if cap := body["details"].get("reazon_large_cap"):
+        print(cap_line(cap))
     print(f"\nwrote {out}, {man_out} and {side_out} ({len(sel)} rows) in {time.time() - t0:.1f} s")
     return 0
 

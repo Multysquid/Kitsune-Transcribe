@@ -7,6 +7,7 @@ The corpus plants one kind of bad row per rule and a toy extent record spreads g
 reason, the extent filter and the reazon_large cap readout are exercised; the expectations come from the ground truth
 the fixture WROTE, not from the code under test. CPU only, no network.
 """
+import copy
 import importlib
 import json
 import shutil
@@ -253,20 +254,64 @@ def test_manifest_views_and_baselines(st, built):
     assert side["galgame_views"]["all"]["n_with_ref"] == len(gal) - 1
     assert man["selection"] == "labels/t/selections/study.parquet"
     base = side["baselines"]
-    keys = {"eval_jsut", "eval_cv8", "eval_reazon", "galgame:neutral", "galgame:all", "galgame:label_box", "m4"}
-    assert set(base) == {"cohere", "parakeet_tdt", "parakeet_ctc"} and all(set(b) == keys for b in base.values())
+    # the strata as kitsune.study_stats names them (Galgame as its views), the systems as CONTRACT.md 5 names them
+    keys = {"eval_jsut", "eval_cv8", "eval_reazon", "galgame_neutral", "galgame_all", "galgame_label_box", "m4"}
+    assert set(base) == {"cohere", "parakeet-ctc", "parakeet-tdt"} and all(set(b) == keys for b in base.values())
     m4 = np.mean([base["cohere"][k]["cer"] for k in prereg.M4_SETS])
     assert base["cohere"]["m4"] == pytest.approx(m4)
     # the fixture's Parakeet hyp is Cohere's on every eval row: identical corpus CER
-    assert base["parakeet_tdt"]["eval_jsut"] == base["cohere"]["eval_jsut"]
+    assert base["parakeet-tdt"]["eval_jsut"] == base["cohere"]["eval_jsut"]
     assert side["selection"] == {"path": "labels/t/selections/study.parquet", "sha256": ms.file_sha256(built.parquet)}
-    assert side["manifest"]["sha256"] == ms.file_sha256(built.manifest_path)
-    # the sidecar fills the PREREG's pending fields (python -m kitsune.prereg --write study/ --sidecar ...)
-    r = prereg.rules(side)
+    assert side["manifest"] == {"path": "labels/t/selections/study_manifest.json",
+                                "sha256": ms.file_sha256(built.manifest_path)}
+
+
+def registered(side: dict) -> dict:
+    """The toy sidecar dressed as the pre-registered selection (its recipe, seed, sources, eval sets, file names and
+    extent; eval_emilia and the two unlabelled sources borrowed from existing entries): what the fill reads is the
+    toy build's own ids, views and baselines."""
+    sc = copy.deepcopy(side)
+    sc.update(sources=list(prereg.STUDY_SOURCES), eval_sets=list(prereg.STUDY_EVAL_SETS),
+              recipe=prereg.registered_recipe(), seed=prereg.SELECTION_SEED)
+    sc["selection"]["path"] = prereg.SELECTION_FILE
+    sc["manifest"]["path"] = prereg.study_files(prereg.SELECTION_FILE)[1]
+    for k in ("ids_sha256", "n"):
+        sc[k]["eval"]["eval_emilia"] = sc[k]["eval"]["eval_cv8"]
+    for b in sc["baselines"].values():
+        b["eval_emilia"] = b["eval_cv8"]
+    sc["n"]["probe"] = prereg.STUDY_SELECTION["probe_n"] * len(prereg.STUDY_SOURCES)
+    sc["extent"] = {"name": "full", "inputs": {**{k: v for k, v in prereg.STUDY_INPUTS.items() if v is not None},
+                                               "reazon_large": 2}}
+    sc["details"]["pool_hours_if_capped"] = {"reazon_large": {"1": 1000.0, "2": 1010.0}}  # the rule: 2
+    sc["draw"].update(budget_s=float(prereg.STUDY_SELECTION["draw_audio_s"]), drawn_s=3_599_000.0,
+                      pool_s=1010.0 * 3600)
+    return sc
+
+
+def test_the_sidecar_fills_the_prereg_only_when_it_is_the_registered_selection(built):
+    """python -m kitsune.prereg --write study/ --sidecar ...: the toy build (its own recipe, sources and extent) is
+    refused, and the same sidecar with the registered recipe, seed, sources and extent fills every pending field from
+    the build's own hashes, views and baselines."""
+    side = built.sidecar
+    with pytest.raises(ValueError, match="not the pre-registered study selection"):
+        prereg.rules(side)
+    problems = prereg.sidecar_problems(side)
+    assert any(p.startswith("sources") for p in problems) and any(p.startswith("recipe") for p in problems)
+    sc = registered(side)
+    assert prereg.sidecar_problems(sc) == []
+    r = prereg.rules(sc)
     assert prereg.pending(r) == []
-    assert r["manifest"]["ids_sha256"]["train"] == side["ids_sha256"]["train"]
-    assert r["manifest"]["galgame_views"]["neutral"]["n"] == len(views["neutral"]["ids"])
-    assert r["baselines"]["cohere"]["m4"] == pytest.approx(m4)
+    m = r["manifest"]
+    assert m["train"] == {"ids_sha256": side["ids_sha256"]["train"], "n": side["n"]["train"],
+                          "hours": pytest.approx(3_599_000 / 3600)}
+    assert m["sets"]["galgame"]["ids_sha256"] == built.manifest["sets"]["galgame"]["ids_sha256"]
+    assert m["galgame_views"]["neutral"] == {"ids_sha256": built.manifest["galgame_views"]["neutral"]["ids_sha256"],
+                                             "n": len(built.manifest["galgame_views"]["neutral"]["ids"])}
+    assert m["manifest_sha256"] == ms.file_sha256(built.manifest_path)
+    assert r["baselines"]["cohere"]["m4"] == pytest.approx(side["baselines"]["cohere"]["m4"])
+    assert r["baselines"]["parakeet-ctc"]["galgame_neutral"] == side["baselines"]["parakeet-ctc"]["galgame_neutral"][
+        "cer"]
+    assert r["data"]["extent"]["inputs"]["reazon_large"] == 2
 
 
 def test_corpus_cer_is_the_evaluators():
@@ -279,15 +324,28 @@ def test_corpus_cer_is_the_evaluators():
 
 
 def test_a_rebuild_gives_the_same_bytes(st, built, tmp_path):
-    """No timestamp in any of the three files: the same labels and arguments give the same sha256 (the hashes
-    pre-register); a build into another directory gives the same rows and ids hashes."""
-    before = {p: ms.file_sha256(p) for p in (built.parquet, built.sidecar_path, built.manifest_path)}
+    """No timestamp and no machine path in any of the three files: the same labels and config give the same sha256
+    (the hashes pre-register), rebuilt in place or into another directory from another config path (another checkout
+    or worktree)."""
+    files = ("parquet", "sidecar_path", "manifest_path")
+    before = [ms.file_sha256(getattr(built, f)) for f in files]
     again = build(st, built.parquet.parent.parent)
-    assert {p: ms.file_sha256(p) for p in (again.parquet, again.sidecar_path, again.manifest_path)} == before
-    other = build(st, tmp_path / "elsewhere")
+    assert [ms.file_sha256(getattr(again, f)) for f in files] == before
+    other = build(st, tmp_path / "elsewhere" / "deeper")
+    assert [ms.file_sha256(getattr(other, f)) for f in files] == before
     pd.testing.assert_frame_equal(other.sel, built.sel)
-    assert other.sidecar["ids_sha256"] == built.sidecar["ids_sha256"]
-    assert other.manifest_path.read_bytes() == built.manifest_path.read_bytes()
+    # what the parquet records instead of paths: the config's own roots and the inputs' content hashes
+    def strings(obj):
+        if isinstance(obj, dict):
+            return [x for v in obj.values() for x in strings(v)]
+        return [x for v in obj for x in strings(v)] if isinstance(obj, list) else [obj] if isinstance(obj, str) else []
+
+    assert not [v for v in strings(built.args) if Path(v).is_absolute()]
+    assert built.args["config_roots"]["teacher_root"] == "labels/t/teacher_out"
+    assert built.args["kotoba_galgame_sha256"] == ms.file_sha256(st.kotoba) == built.sidecar["kotoba"]["sha256"]
+    record = kextent.load_record(built.parquet.parent.parent / "extent.json")
+    assert built.args["extent_record_sha256"] == built.sidecar["extent_record_sha256"] == ms._json_sha256(record)
+    assert set(built.args) == {*ms.STUDY_ARGS, "config_roots", "extent_record_sha256", "kotoba_galgame_sha256"}
 
 
 def test_the_recipe_is_recorded_and_the_extent_is_followed(st, built, tmp_path):
@@ -299,12 +357,26 @@ def test_the_recipe_is_recorded_and_the_extent_is_followed(st, built, tmp_path):
     assert built.sidecar["recipe"]["study"] == STUDY and built.sidecar["kotoba"]["sha256"] == ms.file_sha256(st.kotoba)
     caps = built.sidecar["details"]["pool_hours_if_capped"]
     assert set(caps) == {"galgame"} and list(caps["galgame"]) == ["1", "2", "3"]
+    assert "reazon_large_cap" not in built.sidecar["details"]  # the rule's readout is reazon_large's only
     assert caps["galgame"]["3"] == pytest.approx(built.sidecar["draw"]["pool_s"] / 3600)
     assert caps["galgame"]["1"] <= caps["galgame"]["2"] <= caps["galgame"]["3"]
     small = build(st, tmp_path, study_cfg({"emilia_yodas": "300h", "galgame": 2}, draw_audio_s=60))
     assert not small.sel["teacher_file"].eq("galgame/train-00004").any()
     assert built.sel["teacher_file"].eq("galgame/train-00004").any()
     assert small.sidecar["draw"]["pool_s"] / 3600 == pytest.approx(caps["galgame"]["2"])
+
+
+def test_the_cap_readout():
+    """make_selection's readout of the reazon_large cap rule (kitsune.prereg.cap_rule) and its report line."""
+    by_cap = {"reazon_large": {"1": 1000.0, "2": 1009.0, "3": 1010.5, "4": 1020.0}, "galgame": {"1": 1.0}}
+    assert ms.cap_readout({"galgame": {"1": 1.0}}, {"galgame": 1}) is None
+    held = ms.cap_readout(by_cap, {"reazon_large": 3, "galgame": 1})
+    assert held == {"min_pool_hours": 1010, "configured": 3, "rule": 3, "holds": True}
+    assert ms.cap_line(held) == "reazon_large cap: configured 3, the rule (pool >= 1010 h) gives 3"
+    over = ms.cap_readout(by_cap, {"reazon_large": 4})
+    assert over["rule"] == 3 and not over["holds"] and "set extent.inputs.reazon_large to it" in ms.cap_line(over)
+    short = ms.cap_readout({"reazon_large": {"1": 900.0, "2": 950.0}}, {"reazon_large": 2})
+    assert short["rule"] is None and "rebuild at a larger cap" in ms.cap_line(short)
 
 
 def test_refusals(st, tmp_path):
@@ -402,6 +474,15 @@ def test_pull_plan_parakeet_per_family(st):
     assert not any("parakeet_out" in f for f in aed["dir_patterns"] + aed["explicit"] + aed["required"])
     old = {k: v for k, v in plan_cfg().items() if k != "parakeet_root"}  # a config with no parakeet_root at all
     assert kextent.pull_plan(old, rec, files) == aed
+    # a study selection brings its sidecar and manifest (the box checks the manifest, every scorer reads it)
+    study_files = ["labels/t/selections/study.json", f"labels/t/selections/{prereg.MANIFEST_FILE}"]
+    assert set(study_files) <= pulled(aed, files) and set(study_files) <= set(aed["required"])
+    plain = plan_cfg(selection_recipe={k: v for k, v in plan_cfg()["selection_recipe"].items() if k != "study"})
+    plan = kextent.pull_plan(plain, rec, files)
+    assert plan["problems"] == [] and not set(study_files) & (pulled(plan, files) | set(plan["required"]))
+    assert set(aed["required"]) - set(plan["required"]) == set(study_files)
+    gone = kextent.pull_plan(plan_cfg(), rec, [f for f in files if f != study_files[1]])["problems"]
+    assert len(gone) == 1 and study_files[1] in gone[0]
 
     both = kextent.pull_plan(plan_cfg(pull_parakeet=True), rec, files)
     assert both["problems"] == []
@@ -462,9 +543,9 @@ LCFG = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galg
         "selection": "labels/t/selections/study.parquet", "teacher_root": "labels/t/teacher_out",
         "parakeet_root": "labels/t/parakeet_out",
         "selection_recipe": {"agree_max": 0.5, "agree_max_source": [], "filter_eval_sets": [],
-                             "partial_second_opinion": [], "study": dict(STUDY)}}
+                             "partial_second_opinion": [], "study": dict(prereg.STUDY_SELECTION)}}
 LARGS = {"sources": LCFG["sources"], "eval_sets": LCFG["eval_sets"], "agree_max": 0.5, "agree_max_source": [],
-         "filter_eval_sets": [], "partial_second_opinion": [], "study": dict(STUDY)}
+         "filter_eval_sets": [], "partial_second_opinion": [], "study": dict(prereg.STUDY_SELECTION), "seed": 1234}
 LROWS = [("reazon_small", "train", True, "kept"), ("galgame", "train", True, "kept"),
          ("galgame", "train", False, "not_drawn"), ("galgame", "train", False, "f1a_disagree"),
          ("reazon_small", "train", False, "eval_dup"), ("reazon_small", "train", False, "ctc_infeasible"),
@@ -481,6 +562,14 @@ def test_selection_problems_know_the_study(tmp_path):
     for args, cfg in ((dict(LARGS, study=dict(STUDY, draw_audio_s=99)), LCFG), (dict(LARGS, study=None), LCFG)):
         problems = launch.selection_problems(write_sel(path, LROWS, args), name, cfg)
         assert any("was built with study" in p for p in problems), problems
+    # ... and both must be the pre-registered block, built with the pre-registered seed
+    toy_cfg = dict(LCFG, selection_recipe=dict(LCFG["selection_recipe"], study=dict(STUDY)))
+    assert launch.selection_problems(write_sel(path, LROWS, dict(LARGS, study=dict(STUDY))), name, toy_cfg) == [
+        f"the run config's selection_recipe.study {STUDY} is not the pre-registered {prereg.STUDY_SELECTION} "
+        f"(kitsune.prereg; study/data.json carries it)"]
+    assert launch.selection_problems(write_sel(path, LROWS, dict(LARGS, seed=7)), name, LCFG) == [
+        f"{name} was built with seed 7, the study selection's is pre-registered as 1234: rebuild it with "
+        f"scripts/make_selection.py --config <the run config> and upload it"]
     plain_cfg = dict(LCFG, selection_recipe={k: v for k, v in LCFG["selection_recipe"].items() if k != "study"})
     plain_args = {k: v for k, v in LARGS.items() if k != "study"}
     problems = launch.selection_problems(write_sel(path, LROWS, plain_args), name, plain_cfg)
@@ -548,11 +637,14 @@ def test_data_problems_know_the_parakeet_requirement():
 
 
 def test_a_real_study_selection_passes_launch(st, built):
-    """The selection the study path wrote satisfies selection_problems with its config, except the K5 coverage gap the
-    fixture plants on purpose (2 train rows missing from parakeet_out in ~112)."""
+    """The selection the study path wrote satisfies selection_problems with its config (the recorded arguments and seed
+    included), except the toy recipe, which is not the registered one, and the K5 coverage gap the fixture plants on
+    purpose (2 train rows missing from parakeet_out in ~112)."""
     cfg = study_cfg()
     problems = launch.selection_problems(built.parquet, cfg["selection"], cfg)
     assert [p for p in problems if "no_agree" not in p] == [
+        f"the run config's selection_recipe.study {STUDY} is not the pre-registered {prereg.STUDY_SELECTION} "
+        f"(kitsune.prereg; study/data.json carries it)",  # the toy recipe (a 120 s draw) is not the study's
         f"{cfg['selection']}: 2 of {int((built.sel['split'] == 'train').sum())} train rows are in teacher_out only, "
         f"more than 0.1 % (K5): the Parakeet pass is incomplete"]
     assert LONG_REF  # the dedup reference the fixture planted is >= 15 characters

@@ -23,6 +23,17 @@ selection's sidecar (labels/full/selections/study_1000h.json), and the final pre
     python -m kitsune.prereg --write study/ --sidecar labels/full/selections/study_1000h.json   # the final commit
     python -m kitsune.prereg --check study/     # the committed files equal the generator's output; lists pending
 
+The fill takes only the pre-registered selection (sidecar_problems): the registered sources, eval sets, recipe, seed
+and extent, reazon_large at the cap the rule gives (the smallest N whose pool holds >= POOL_MIN_HOURS h, from the
+sidecar's pool_hours_if_capped), and every eval set, view, teacher and stratum present. Otherwise a selection built
+with another recipe could fill the hashes of a PREREG whose text says something else.
+
+The layout is machine-read by kitsune.study_stats (tools/study_report.py --prereg): "analysis" holds delta, the
+sigma_run rule and the bootstrap settings; "manifest" holds sets.<eval set>.ids_sha256, galgame_views.<view>.ids_sha256,
+manifest_sha256 and selection_sha256; "baselines" holds <teacher>.<stratum> corpus CERs (teachers cohere,
+parakeet-ctc, parakeet-tdt; strata the eval sets with Galgame as galgame_neutral / galgame_all / galgame_label_box;
+plus m4), all as fractions.
+
 Pure Python (stdlib only); no torch.
 """
 import argparse
@@ -122,20 +133,40 @@ DATA_WAIT_MAX = 0.05  # at or above: perf.num_workers 12 and calibrate again; st
 # ------------------------------------------------------------------------------------------------ the selection
 
 # the recipe block every study run config carries as selection_recipe.study (scripts/make_selection.py applies it,
-# vast/launch.py checks the selection was built with it). probe_n is per train source, as the existing probe convention
-# draws it: 300 x the five sources = 1,500 kept rows
+# vast/launch.py checks the selection was built with it and that it is this one). probe_n is per train source, as the
+# existing probe convention draws it: 300 x the five sources = 1,500 kept rows
 STUDY_SELECTION = {"f1a_max": 0.5, "dedup_min_chars": 15, "draw_audio_s": 3_600_000, "probe_n": 300,
                    "neutral_max_cer": 0.5}
+SELECTION_SEED = 1234  # make_selection --seed of the study selection: the draw, the probe and the greedy subsets
+STUDY_SCHEMA = 1  # of the study selection's sidecar and manifest (scripts/make_selection.py writes both)
 # drop reasons of a study selection, after the existing ones (truncated, not_judged, no_agree, agree>A, no_audio)
 STUDY_REASONS = ("not_in_parakeet", "f1a_disagree", "eval_dup", "ctc_infeasible", "not_drawn")
+SELECTION_FILE = "labels/full/selections/study_1000h.parquet"
 MANIFEST_FILE = "study_manifest.json"  # next to the selection
 ONE_ROOT_MAX_FRAC = 0.001  # K5: train rows in teacher_out only (not_in_parakeet) above this share refuse the launch
 STUDY_SOURCES = ["reazon_small", "reazon_large", "emilia_yodas", "emilia_nc", "galgame"]
 STUDY_EVAL_SETS = ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia", "galgame"]
+# the extent inputs study/data.json registers; reazon_large's cap is the cap rule's (POOL_MIN_HOURS), from the labels
+STUDY_INPUTS = {"reazon_large": None, "emilia_yodas": "300h", "emilia_nc": 8, "galgame": 3}
 GATE_SETS = ("eval_jsut", "eval_cv8", "eval_reazon")
-M4_SETS = ("eval_jsut", "eval_cv8", "eval_reazon", "galgame:neutral")
+GALGAME_VIEWS = ("neutral", "all", "label_box")
+# the scoring strata, named as kitsune.study_stats names them: every eval set, but Galgame as its three views
+STRATA = (*[s for s in STUDY_EVAL_SETS if s != "galgame"], *(f"galgame_{v}" for v in GALGAME_VIEWS))
+M4_SETS = ("eval_jsut", "eval_cv8", "eval_reazon", "galgame_neutral")
+TEACHERS = ("cohere", "parakeet-ctc", "parakeet-tdt")  # the baselines' system names (CONTRACT.md 5)
 POOL_MIN_HOURS = 1010  # the reazon_large cap: the smallest N whose pool after all filters holds >= this
 COHERE_CER_PREREG = {"eval_jsut": 0.0830, "eval_cv8": 0.0407, "eval_reazon": 0.0628}  # kitsune.evaluate's, 0.05 pp
+
+# ------------------------------------------------------------------------------------------------ the analysis
+
+# STUDY.md 4.3-4.7; the "analysis" block of the rules holds them in the form kitsune.study_stats.settings_from_prereg
+# reads (the prose in metrics, noise and limit_rule says the same, from these constants)
+DELTA, DELTAS = 0.10, (0.05, 0.10, 0.20)  # decision 1: the primary tolerance; all three always reported
+SIGMA_PRIOR = 0.016  # sigma_run's prior: the first run's residual SD of the 4-set macro around its trend
+SIGMA_FACTOR = 0.886  # sqrt(pi) / 2: one replicate pair's |ln ratio| x this is unbiased for sigma_run
+BOOT_B, BOOT_SEED, Z = 10_000, 1234, 1.96
+TEACHER_BARS = (1.2, 1.5)  # the practical bars against the own teacher (4.7)
+ANCHOR_FLAG_REL = 0.05  # 4.1: T-0.6B worse than the anchor by more than 5 % relative, paired CI excluding 0
 
 # ------------------------------------------------------------------------------------------------ the decisions
 
@@ -189,30 +220,59 @@ def probe_run_name(cls: str, lr: float) -> str:
     return f"probe-{cls}-{lr_tag(lr)}"
 
 
-def _pending_selection() -> dict:
-    return {"status": PENDING,
-            "fill": "python -m kitsune.prereg --write study/ --sidecar labels/full/selections/study_1000h.json, "
-                    "from the selection built on the sealed labels (scripts/make_selection.py --config "
-                    "study/data.json)",
-            "extent_inputs": PENDING, "selection_sha256": PENDING, "manifest_sha256": PENDING,
-            "ids_sha256": {"train": PENDING, "probe": PENDING, **{s: PENDING for s in STUDY_EVAL_SETS}},
-            "n": {"train": PENDING, "probe": PENDING, **{s: PENDING for s in STUDY_EVAL_SETS}},
-            "galgame_views": {v: {"n": PENDING, "ids_sha256": PENDING} for v in ("neutral", "all", "label_box")},
-            "train_hours": PENDING, "pool_hours": PENDING}
+def study_files(selection: str) -> tuple[str, str]:
+    """(sidecar, manifest) of a study selection, as repo paths: <selection without .parquet>.json and
+    study_manifest.json in the selection's folder (make_selection writes both; pull_plan and launch need both)."""
+    stem = selection[: -len(".parquet")] if selection.endswith(".parquet") else selection
+    folder = selection.rsplit("/", 1)[0] + "/" if "/" in selection else ""
+    return f"{stem}.json", f"{folder}{MANIFEST_FILE}"
+
+
+FILL = ("python -m kitsune.prereg --write study/ --sidecar labels/full/selections/study_1000h.json, from the selection "
+        "built on the sealed labels (scripts/make_selection.py --config study/data.json)")
+
+
+def registered_recipe() -> dict:
+    """The run configs' selection_recipe (study/data.json carries it verbatim): the label box's judges (F0) and the
+    study block."""
+    return {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "emilia_nc=0.2"], "filter_eval_sets": [],
+            "partial_second_opinion": [], "study": dict(STUDY_SELECTION)}
+
+
+def cap_rule(pool_hours_if_capped: dict) -> int | None:
+    """The reazon_large cap the rule gives: the smallest N whose pool after all filters holds >= POOL_MIN_HOURS, from
+    {N (int or its str, as JSON keys are): pool hours}; None when no N listed reaches it (rebuild at a larger cap)."""
+    ok = [int(n) for n, h in pool_hours_if_capped.items() if isinstance(h, (int, float)) and h >= POOL_MIN_HOURS]
+    return min(ok) if ok else None
+
+
+def _pending_manifest() -> dict:
+    """The manifest block with every field that needs the sealed labels pending. The filled block has exactly these
+    keys (check_rules compares the shapes). sets / galgame_views hold what kitsune.study_stats compares with
+    study_manifest.json; train and probe are the selection's other two id lists."""
+    return {"status": PENDING, "source": FILL,
+            "selection_file": SELECTION_FILE, "selection_sha256": PENDING,
+            "manifest_file": study_files(SELECTION_FILE)[1], "manifest_sha256": PENDING,
+            "sets": {s: {"ids_sha256": PENDING, "n": PENDING} for s in STUDY_EVAL_SETS},
+            "galgame_views": {v: {"ids_sha256": PENDING, "n": PENDING} for v in GALGAME_VIEWS},
+            "train": {"ids_sha256": PENDING, "n": PENDING, "hours": PENDING},
+            "probe": {"ids_sha256": PENDING, "n": PENDING},
+            "pool_hours": PENDING}
 
 
 def _pending_baselines() -> dict:
-    per = {s: PENDING for s in (*GATE_SETS, "eval_emilia", "galgame:neutral", "galgame:all", "galgame:label_box")}
-    return {"status": PENDING, "fill": "the sidecar's baselines: corpus CER (kitsune.evaluate.corpus_cer) on the "
-                                       "manifest rows",
-            "cohere": dict(per, m4=PENDING), "parakeet_ctc": dict(per, m4=PENDING),
-            "parakeet_tdt": dict(per, m4=PENDING)}
+    """Per teacher (CONTRACT.md 5 names), per scoring stratum (kitsune.study_stats names) and M4: the corpus CER on
+    the manifest rows, as fractions."""
+    return {"status": PENDING, "source": "the sidecar's baselines: corpus CER (kitsune.evaluate.corpus_cer) on the "
+                                         "manifest rows; m4 = the macro mean over " + ", ".join(M4_SETS),
+            **{t: {k: PENDING for k in (*STRATA, "m4")} for t in TEACHERS}}
 
 
 def rules(sidecar: dict | None = None) -> dict:
     """Everything the study fixes in advance (STUDY.md 4.8 point 1). Without `sidecar` the fields that need the sealed
     labels are "pending"; with the study selection's sidecar (make_selection.py's study_1000h.json) they are filled
-    from it. Pure data, deterministic: the same sidecar gives the same rules."""
+    from it, and a sidecar that is not the pre-registered selection raises ValueError (sidecar_problems). Pure data,
+    deterministic: the same sidecar gives the same rules."""
     r = {
         "prereg_version": RULES_VERSION,
         "study": "Kitsune size study: 7 students + bridge + replicate on the same 1,000 h at equal A100 compute",
@@ -291,16 +351,16 @@ def rules(sidecar: dict | None = None) -> dict:
                               "epochs, audio-hours; params total and non-embedding; speed and VRAM"},
         "data": {
             "extent": {"name": "full", "root": "labels/full",
-                       "inputs": {"reazon_large": PENDING, "emilia_yodas": "300h", "emilia_nc": 8, "galgame": 3}},
+                       "inputs": {k: PENDING if v is None else v for k, v in STUDY_INPUTS.items()}},
             "reazon_large_cap": f"the smallest reazon_large input count whose pool after all filters holds >= "
-                                f"{POOL_MIN_HOURS} h (expected 50-55), read from the sealed labels",
+                                f"{POOL_MIN_HOURS} h (expected 50-55), read from the sealed labels (the sidecar's "
+                                f"details.pool_hours_if_capped; the fill refuses any other count)",
             "sources": list(STUDY_SOURCES), "eval_sets": list(STUDY_EVAL_SETS),
         },
         "selection": {
-            "file": "labels/full/selections/study_1000h.parquet (+ study_1000h.json, study_manifest.json)",
-            "recipe": {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "emilia_nc=0.2"],
-                       "filter_eval_sets": [], "partial_second_opinion": [], "study": dict(STUDY_SELECTION)},
-            "seed": 1234,
+            "file": f"{SELECTION_FILE} (+ {', '.join(study_files(SELECTION_FILE))})",
+            "recipe": registered_recipe(),
+            "seed": SELECTION_SEED,
             "rules": [
                 "1 not_in_parakeet: candidates are the extent's rows present in both teacher_out and parakeet_out",
                 "2 F0, the label box's judges: truncated (Cohere, no EOS); no_agree; agree>A with A = 0.5 for Reazon "
@@ -321,11 +381,12 @@ def rules(sidecar: dict | None = None) -> dict:
                                "audio, 8x subsampled, equals the stored n_frames; mismatches are dropped and counted, "
                                "the box fails above 0.1 % of train rows or on any eval row (decision 15)",
         },
-        "manifest": _pending_selection(),
+        "manifest": _pending_manifest(),
         "metrics": {
             "m4": "the macro mean of complete-set corpus CER over eval_jsut, eval_cv8, eval_reazon and Galgame-neutral,"
                   " equal weights (within-family primary)",
-            "qualifiers": {"out_of_domain": ["eval_jsut", "eval_cv8"], "in_domain": ["eval_reazon", "galgame:neutral"]},
+            "strata": f"every eval set is one stratum, Galgame is its three views instead: {', '.join(STRATA)}",
+            "qualifiers": {"out_of_domain": ["eval_jsut", "eval_cv8"], "in_domain": ["eval_reazon", "galgame_neutral"]},
             "cross_family": "JSUT + Galgame-neutral, raw and no-style, paired CIs; descriptive only, no threshold",
             "galgame_views": {"neutral": "primary: the rows whose kotoba-whisper-v2.0 hypothesis (the laptop's "
                                          "second_out/galgame/eval-00000.jsonl) has cer(hyp2, ref) <= 0.5 and a "
@@ -335,24 +396,32 @@ def rules(sidecar: dict | None = None) -> dict:
             "cer": "kitsune.evaluate.corpus_cer: sum(S+D+I) / sum(ref chars) on normalize_ja text, empty refs "
                    "skipped",
         },
-        "noise": {"sigma_prior": 0.016, "replicate_estimate": "0.886 x |ln(M4_replicate / M4_study-t01)|",
-                  "sigma_rule": "sigma_run = max(0.016, the replicate's estimate)",
-                  "ci_student_ratio": "ln r +- 1.96 sqrt(v_boot + 2 sigma_run^2)",
-                  "ci_student_vs_teacher": "ln r +- 1.96 sqrt(v_boot + sigma_run^2)",
-                  "bootstrap": {"B": 10000, "seed": 1234, "kind": "paired utterance bootstrap, stratified: "
-                                                                 "resampled within each set, the same indices for "
-                                                                 "every system"}},
+        "noise": {"sigma_prior": SIGMA_PRIOR,
+                  "replicate_estimate": f"{SIGMA_FACTOR} x |ln(M4_{REPLICATE} / M4_{REPLICATE_OF})|",
+                  "sigma_rule": f"sigma_run = max({SIGMA_PRIOR}, the replicate's estimate)",
+                  "ci_student_ratio": f"ln r +- {Z} sqrt(v_boot + 2 sigma_run^2)",
+                  "ci_student_vs_teacher": f"ln r +- {Z} sqrt(v_boot + sigma_run^2)",
+                  "bootstrap": {"B": BOOT_B, "seed": BOOT_SEED, "kind": "paired utterance bootstrap, stratified: "
+                                                                       "resampled within each stratum, the same "
+                                                                       "indices for every system"}},
+        "analysis": {  # the machine-read form (kitsune.study_stats.settings_from_prereg); the prose blocks say the same
+            "delta": DELTA, "deltas": list(DELTAS),
+            "sigma_run": {"prior": SIGMA_PRIOR, "factor": SIGMA_FACTOR, "replicate": [REPLICATE, REPLICATE_OF]},
+            "bootstrap": {"B": BOOT_B, "seed": BOOT_SEED, "z": Z},
+            "teacher_bars": list(TEACHER_BARS), "anchor_flag_rel": ANCHOR_FLAG_REL,
+            "strata": list(STRATA), "m4_strata": list(M4_SETS), "teachers": list(TEACHERS),
+        },
         "limit_rule": {
             "families": {"aed": {"top": "study-t06", "walk": ["study-t03", "study-t01", "study-t005"]},
                          "ctc": {"top": "study-p03", "walk": ["study-p01", "study-p005"]}},
             "ratio": "r_s = M4_s / M4_top",
-            "delta": 0.10, "delta_reported": [0.05, 0.10, 0.20],
+            "delta": DELTA, "delta_reported": list(DELTAS),
             "calls": {"WITHIN": "the CI's upper end <= ln(1 + delta)", "OUTSIDE": "the CI's lower end > ln(1 + delta)",
                       "UNRESOLVED": "otherwise"},
             "walk": "down the sizes: the limit is the smallest size WITHIN with every larger size WITHIN; the first "
                     "OUTSIDE ends it (limit between X and Y); an UNRESOLVED gives 'at or below X, Y unresolved' and "
                     "the smaller sizes are descriptive; one decisive claim per family, no Holm correction",
-            "replicate": f"{REPLICATE} feeds sigma_run only; the walk uses {REPLICATE_OF}",
+            "replicate_role": f"{REPLICATE} feeds sigma_run only; the walk uses {REPLICATE_OF}",
         },
         "readouts": {
             "transcribe_ladder": "T-0.6B -> T-0.3B (pruned) -> T-0.1B -> T-0.05B (scratch)",
@@ -368,7 +437,8 @@ def rules(sidecar: dict | None = None) -> dict:
                       "compute-limited at T'",
         },
         "practical_bars": ["the smallest student whose JSUT+Galgame-neutral CI upper end is <= Parakeet 0.6B TDT",
-                           "the smallest student within 1.2x and within 1.5x of its own teacher on M4",
+                           f"the smallest student within {TEACHER_BARS[0]}x and within {TEACHER_BARS[1]}x of its own "
+                           f"teacher on M4",
                            "a Pareto view: CER against A100 RTF and VRAM"],
         "anchor": {"model": "the first run's 0.6B, step_9774", "flag": "the study's T-0.6B has a gate-pooled CER "
                                                                        "worse than the anchor's by > 5 % relative "
@@ -407,48 +477,147 @@ def rules(sidecar: dict | None = None) -> dict:
     return r
 
 
-def _fill(r: dict, sc: dict):
-    """The pending fields from the study selection's sidecar (scripts/make_selection.py): the extent it was built on,
-    the file and id hashes, the Galgame views and the teacher baselines (corpus CER) on the manifest rows."""
-    ids, n = sc["ids_sha256"], sc["n"]
+def _is_sha(v) -> bool:
+    return isinstance(v, str) and len(v) == 64 and all(c in "0123456789abcdef" for c in v)
+
+
+def _is_count(v, lo: int = 1) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= lo
+
+
+def _cer(v):
+    """A baseline entry of the sidecar ({"cer": x, "edits": ...}, or a bare number) as its CER."""
+    return v.get("cer") if isinstance(v, dict) else v
+
+
+def sidecar_problems(sc: dict) -> list[str]:
+    """Why a sidecar is not the pre-registered study selection, so that its hashes must not fill the PREREG: the
+    selection must have been built from the registered sources, eval sets, recipe (F0 thresholds and the study block),
+    seed and extent (every input as registered; reazon_large at the cap the rule gives, the smallest N whose pool
+    holds >= POOL_MIN_HOURS h), under the registered file names; and it must hold every field the rules fill: a
+    non-empty id list with its sha256 for the train set, the probe (probe_n per train source), every eval set and
+    every Galgame view, and a finite baseline per teacher, stratum and M4."""
+    if not isinstance(sc, dict):
+        return [f"a sidecar is a JSON object, not {type(sc).__name__}"]
+    p = []
+    want = {"schema": STUDY_SCHEMA, "sources": STUDY_SOURCES, "eval_sets": STUDY_EVAL_SETS,
+            "recipe": registered_recipe(), "seed": SELECTION_SEED}
+    p += [f"{k} {sc.get(k)!r}, registered {v!r}" for k, v in want.items() if sc.get(k) != v]
+    sel_file, man_file = (sc.get("selection") or {}), (sc.get("manifest") or {})
+    for what, block, path in (("selection", sel_file, SELECTION_FILE),
+                              ("manifest", man_file, study_files(SELECTION_FILE)[1])):
+        if block.get("path") != path or not _is_sha(block.get("sha256")):
+            p.append(f"{what} {block.get('path')!r} (sha256 {str(block.get('sha256'))[:12]!r}): registered {path} "
+                     f"with its sha256")
+    ext = sc.get("extent") or {}
+    inputs = ext.get("inputs") or {}
+    fixed = {k: v for k, v in STUDY_INPUTS.items() if v is not None}
+    if ext.get("name") != "full" or {k: inputs.get(k) for k in inputs if k != "reazon_large"} != fixed:
+        p.append(f"extent {ext.get('name')!r} inputs {inputs!r}: registered 'full' with {fixed} and reazon_large")
+    cap = inputs.get("reazon_large")
+    caps = ((sc.get("details") or {}).get("pool_hours_if_capped") or {}).get("reazon_large") or {}
+    rule = cap_rule(caps)
+    if not _is_count(cap):
+        p.append(f"extent reazon_large {cap!r} is not an input count")
+    elif rule is None:
+        best = max((h for h in caps.values() if isinstance(h, (int, float))), default=None)
+        p.append(f"no reazon_large cap up to {cap} leaves {POOL_MIN_HOURS} h after all filters (the most: "
+                 f"{best if best is None else round(best, 1)} h): rebuild the selection at a larger cap")
+    elif cap != rule:
+        p.append(f"extent reazon_large {cap}: the cap rule gives {rule} (the smallest N whose pool holds >= "
+                 f"{POOL_MIN_HOURS} h); rebuild the selection with reazon_large {rule}")
+    draw = sc.get("draw") or {}
+    if caps and _is_count(cap) and isinstance(caps.get(str(cap)), (int, float)) and isinstance(
+            draw.get("pool_s"), (int, float)) and abs(caps[str(cap)] - draw["pool_s"] / 3600) > 1e-6 * max(
+            1.0, caps[str(cap)]):
+        p.append(f"pool_hours_if_capped at reazon_large {cap} ({caps[str(cap)]:.3f} h) differs from the draw's pool "
+                 f"({draw['pool_s'] / 3600:.3f} h)")
+    if draw.get("budget_s") != STUDY_SELECTION["draw_audio_s"] or not (
+            isinstance(draw.get("drawn_s"), (int, float)) and 0 < draw["drawn_s"] <= STUDY_SELECTION["draw_audio_s"]
+            and isinstance(draw.get("pool_s"), (int, float)) and draw["pool_s"] > STUDY_SELECTION["draw_audio_s"]):
+        p.append(f"draw {draw!r}: registered a budget of {STUDY_SELECTION['draw_audio_s']} s from a larger pool")
+    ids, n = sc.get("ids_sha256") or {}, sc.get("n") or {}
+    probe_n = STUDY_SELECTION["probe_n"] * len(STUDY_SOURCES)
+    for what, h, k, lo in (("train", ids.get("train"), n.get("train"), 1),
+                           ("probe", ids.get("probe"), n.get("probe"), probe_n),
+                           *((s, (ids.get("eval") or {}).get(s), (n.get("eval") or {}).get(s), 1)
+                             for s in STUDY_EVAL_SETS)):
+        if not _is_sha(h) or not _is_count(k, lo) or (what == "probe" and k != probe_n):
+            p.append(f"{what}: {k!r} ids (sha256 {str(h)[:12]!r}); registered "
+                     + (f"{probe_n} ids" if what == "probe" else "a non-empty id list") + " with its sha256")
     views = sc.get("galgame_views") or {}
-    inputs = _inputs_in_order(dict((sc.get("extent") or {}).get("inputs") or {}))
-    r["manifest"] = {
-        "status": "filled", "from": sc["selection"]["path"], "extent_inputs": inputs,
-        "selection_sha256": sc["selection"]["sha256"], "manifest_sha256": sc["manifest"]["sha256"],
-        "ids_sha256": {"train": ids["train"], "probe": ids["probe"], **{s: ids["eval"][s] for s in ids["eval"]}},
-        "n": {"train": n["train"], "probe": n["probe"], **{s: n["eval"][s] for s in n["eval"]}},
-        "galgame_views": {v: {"n": views[v]["n"], "ids_sha256": views[v]["ids_sha256"]} for v in sorted(views)},
-        "train_hours": sc["draw"]["drawn_s"] / 3600, "pool_hours": sc["draw"]["pool_s"] / 3600,
-    }
-    r["data"]["extent"]["inputs"] = inputs
-    b = sc.get("baselines") or {}
-    r["baselines"] = {"status": "filled", "from": "the sidecar's baselines on the manifest rows",
-                      **{system: {k: v["cer"] if isinstance(v, dict) else v for k, v in b[system].items()}
-                         for system in sorted(b)}}
+    for v in GALGAME_VIEWS:
+        b = views.get(v) or {}
+        if not _is_sha(b.get("ids_sha256")) or not _is_count(b.get("n")):
+            p.append(f"Galgame view {v}: {b!r}; registered a non-empty id list with its sha256")
+    base = sc.get("baselines") or {}
+    for t in TEACHERS:
+        bad = [k for k in (*STRATA, "m4") if not (isinstance(_cer((base.get(t) or {}).get(k)), (int, float))
+                                                  and math.isfinite(_cer(base[t][k])) and _cer(base[t][k]) >= 0)]
+        if bad:
+            p.append(f"baselines {t}: no finite corpus CER for {bad}")
+    return p
 
 
-def _inputs_in_order(inputs) -> dict | str:
-    """extent.inputs in the rules' order (the mix's sources), whichever order a JSON file or a sidecar has them in."""
-    if not isinstance(inputs, dict):
-        return inputs
-    order = ["reazon_large", "emilia_yodas", "emilia_nc", "galgame"]
-    return {k: inputs[k] for k in [*[o for o in order if o in inputs], *sorted(set(inputs) - set(order))]}
+def _fill(r: dict, sc: dict):
+    """The pending fields from the study selection's sidecar (scripts/make_selection.py): the file and id hashes of
+    the selection, its manifest and views, the train and pool hours, the reazon_large cap and the teacher baselines
+    (corpus CER) on the manifest rows. Raises ValueError unless the sidecar is the pre-registered selection
+    (sidecar_problems): the pending mechanism is what makes the registration complete, so it only takes the one
+    selection the rules describe."""
+    if problems := sidecar_problems(sc):
+        raise ValueError(f"the sidecar is not the pre-registered study selection ({len(problems)} problem(s)): "
+                         + "; ".join(problems))
+    ids, n, views, draw = sc["ids_sha256"], sc["n"], sc["galgame_views"], sc["draw"]
+    r["manifest"] = dict(
+        _pending_manifest(), status="filled",
+        source="the study selection's sidecar (scripts/make_selection.py --config study/data.json, sealed labels)",
+        selection_sha256=sc["selection"]["sha256"], manifest_sha256=sc["manifest"]["sha256"],
+        sets={s: {"ids_sha256": ids["eval"][s], "n": n["eval"][s]} for s in STUDY_EVAL_SETS},
+        galgame_views={v: {"ids_sha256": views[v]["ids_sha256"], "n": views[v]["n"]} for v in GALGAME_VIEWS},
+        train={"ids_sha256": ids["train"], "n": n["train"], "hours": draw["drawn_s"] / 3600},
+        probe={"ids_sha256": ids["probe"], "n": n["probe"]},
+        pool_hours=draw["pool_s"] / 3600)
+    r["data"]["extent"]["inputs"]["reazon_large"] = sc["extent"]["inputs"]["reazon_large"]
+    b = sc["baselines"]
+    r["baselines"] = dict(_pending_baselines(), status="filled",
+                          **{t: {k: float(_cer(b[t][k])) for k in (*STRATA, "m4")} for t in TEACHERS})
 
 
-def _filled_parts(r: dict) -> dict:
-    """The parts of a rules dict that the sidecar fills (pending until the labels are sealed)."""
-    return {"manifest": r.get("manifest"), "baselines": r.get("baselines"),
-            "extent_inputs": ((r.get("data") or {}).get("extent") or {}).get("inputs")}
+def _shape(obj):
+    """The key structure of a JSON value (dicts by key, lists by length), without the values."""
+    if isinstance(obj, dict):
+        return {k: _shape(v) for k, v in obj.items()}
+    return [_shape(v) for v in obj] if isinstance(obj, list) else None
+
+
+def filled_problems(committed: dict) -> list[str]:
+    """Why the filled parts of a committed PREREG.json are not a fill of these rules: the manifest and baselines blocks
+    must have exactly the keys of their pending templates (no eval set, view, teacher or stratum lost or added, even
+    as a hand edit), and data.extent.inputs must be the registered inputs with reazon_large an input count (or
+    pending)."""
+    p = []
+    for key, template in (("manifest", _pending_manifest()), ("baselines", _pending_baselines())):
+        if _shape(committed.get(key)) != _shape(template):
+            p.append(f"{key}: its keys differ from the rules' ({key} block of kitsune/prereg.py)")
+    inputs = ((committed.get("data") or {}).get("extent") or {}).get("inputs")
+    cap = inputs.get("reazon_large") if isinstance(inputs, dict) else None
+    if not isinstance(inputs, dict) or set(inputs) != set(STUDY_INPUTS) or \
+            any(inputs[k] != v for k, v in STUDY_INPUTS.items() if v is not None) or \
+            not (cap == PENDING or _is_count(cap)):
+        p.append(f"data.extent.inputs {inputs!r}: registered {STUDY_INPUTS} with reazon_large pending or a count")
+    return p
 
 
 def regenerate(committed: dict) -> dict:
-    """rules() with the filled parts taken from a committed PREREG.json: everything else must equal the code, so a
-    committed file whose rule part was edited by hand (or is stale) differs from this."""
+    """rules() with the filled parts taken from a committed PREREG.json (the manifest and baselines blocks and the
+    reazon_large cap): everything else must equal the code, so a committed file whose rule part was edited by hand
+    (or is stale) differs from this."""
     r = rules()
-    parts = _filled_parts(committed)
-    r["manifest"], r["baselines"] = parts["manifest"], parts["baselines"]
-    r["data"]["extent"]["inputs"] = _inputs_in_order(parts["extent_inputs"])
+    r["manifest"], r["baselines"] = committed.get("manifest"), committed.get("baselines")
+    inputs = ((committed.get("data") or {}).get("extent") or {}).get("inputs")
+    if isinstance(inputs, dict) and "reazon_large" in inputs:
+        r["data"]["extent"]["inputs"]["reazon_large"] = inputs["reazon_large"]
     return r
 
 
@@ -542,7 +711,9 @@ def rules_md(r: dict) -> str:
     titles = [("decisions", "Owner decisions (all at the recommendation)"), ("waves", "Waves"),
               ("training", "Training"), ("calibration", "Calibration and max_steps"), ("branch", "The T/2 branch"),
               ("evals", "Evals"), ("data", "Data"), ("selection", "Selection"), ("manifest", "Manifest and hashes"),
-              ("metrics", "Metrics"), ("noise", "Noise model"), ("limit_rule", "The limit rule (primary answer)"),
+              ("metrics", "Metrics"), ("noise", "Noise model"),
+              ("analysis", "Analysis settings (the form kitsune.study_stats reads)"),
+              ("limit_rule", "The limit rule (primary answer)"),
               ("readouts", "Decomposition and readouts"), ("practical_bars", "Practical bars"), ("anchor", "Anchor"),
               ("baselines", "Teacher baselines on the manifest"), ("cohere_prereg", "Cohere baselines registered "
                                                                                     "by the first run"),
@@ -576,47 +747,62 @@ def write_rules(out_dir, sidecar: dict | None = None) -> str:
 # ================================================================================================ the numbers
 
 
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
 def calibration_problems(calib: dict) -> list[str]:
-    """Why a calibration table cannot give max_steps: a run of the waves missing, a key missing, a step time that is
-    not a positive number, fewer steps than the window, or a loader-bound run (data_wait_frac >= DATA_WAIT_MAX: raise
-    perf.num_workers to 12 and calibrate again; if it stays, the box halts)."""
+    """Why a calibration table cannot give max_steps: a run of the waves missing, the replicate present (it takes
+    study-t01's max_steps: its own step time would give it another budget, and then it no longer measures the
+    run-to-run noise of T-0.1B), a key missing, a step time or micro_audio_s that is not a positive number, fewer
+    steps than the window, a data_wait_frac that is not a fraction, or a loader-bound run (data_wait_frac >=
+    DATA_WAIT_MAX: raise perf.num_workers to 12 and calibrate again; if it stays, the box halts)."""
     problems = []
     want = [run for run in RUNS if run != REPLICATE]
     for run in want:
         if run not in calib:
             problems.append(f"{run}: not calibrated")
     for run, c in calib.items():
+        if run == REPLICATE:
+            problems.append(f"{run}: not calibrated by the rules (it takes {REPLICATE_OF}'s max_steps)")
+            continue
         if run not in RUNS:
             problems.append(f"{run}: not a study run")
             continue
         if missing := [k for k in CALIB_KEYS if k not in c]:
             problems.append(f"{run}: missing {missing}")
             continue
-        t = c["t_step_s"]
-        if not isinstance(t, (int, float)) or isinstance(t, bool) or not math.isfinite(t) or t <= 0:
-            problems.append(f"{run}: t_step_s {t!r} is not a positive number")
-        if c["steps_measured"] < CALIB_STEPS[1] - CALIB_STEPS[0]:
-            problems.append(f"{run}: {c['steps_measured']} steps measured, the window is "
+        for k in ("t_step_s", "micro_audio_s"):
+            if not (_number(c[k]) and c[k] > 0):
+                problems.append(f"{run}: {k} {c[k]!r} is not a positive number")
+        if not (_is_count(c["steps_measured"], 0) and c["steps_measured"] >= CALIB_STEPS[1] - CALIB_STEPS[0]):
+            problems.append(f"{run}: {c['steps_measured']!r} steps measured, the window is "
                             f"{CALIB_STEPS[1] - CALIB_STEPS[0]}")
-        if c["data_wait_frac"] >= DATA_WAIT_MAX:
-            problems.append(f"{run}: loader-bound (data_wait_frac {c['data_wait_frac']:.3f} >= {DATA_WAIT_MAX})")
+        w = c["data_wait_frac"]
+        if not (_number(w) and 0 <= w <= 1):
+            problems.append(f"{run}: data_wait_frac {w!r} is not a fraction")
+        elif w >= DATA_WAIT_MAX:
+            problems.append(f"{run}: loader-bound (data_wait_frac {w:.3f} >= {DATA_WAIT_MAX})")
     return problems
 
 
 def max_steps(calib: dict, t_ref_run: str = T_REF_RUN, ref_steps: int = REF_STEPS) -> dict[str, int]:
     """run -> max_steps = round(ref_steps x t_ref / t_run), half up: every run gets the reference run's step-time
-    budget T (STUDY.md 5.1). `calib` is {run: {"t_step_s": ...}} as measured on the study host; the replicate, when
-    not calibrated itself, takes the run it replicates."""
+    budget T (STUDY.md 5.1). `calib` is {run: {"t_step_s": ...}} as measured on the study host. The replicate always
+    takes the max_steps of the run it replicates (the rules; its own entry, if any, is ignored here and refused by
+    calibration_problems): a replicate with other steps would not measure run-to-run noise."""
     if t_ref_run not in calib:
         raise ValueError(f"the reference run {t_ref_run} is not calibrated")
     t_ref = float(calib[t_ref_run]["t_step_s"])
     out = {}
     for run, c in calib.items():
+        if run == REPLICATE:
+            continue
         t = float(c["t_step_s"])
         if not (math.isfinite(t) and t > 0 and math.isfinite(t_ref) and t_ref > 0):
             raise ValueError(f"{run}: step time {t} (reference {t_ref}) is not a positive number")
         out[run] = int(math.floor(ref_steps * t_ref / t + 0.5))
-    if REPLICATE not in out and REPLICATE_OF in out:
+    if REPLICATE_OF in out:
         out[REPLICATE] = out[REPLICATE_OF]
     return out
 
@@ -723,14 +909,15 @@ def write_numbers(path, calibration: dict, probes: dict, lrs: dict, max_steps: d
     numbers = {
         "calibration": {run: {k: calibration[run][k] for k in CALIB_KEYS} for run in sorted(calibration)},
         "max_steps": dict(sorted(want_steps.items())),
-        "lr_probes": {cls: {lr_tag(lr): res[lr] for lr in sorted(res, key=_key)}
+        # a diverged probe (a non-finite objective, which loses) is null: the file is strict JSON for every reader
+        "lr_probes": {cls: {lr_tag(lr): float(res[lr]) if _number(res[lr]) else None for lr in sorted(res, key=_key)}
                       for cls, res in sorted(probes.items())},
         "lr": dict(sorted(want_lr.items())),
         "rules_sha256": rules_sha256(rules_path),
         "written_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "host": host if host is not None else platform.node(),
     }
-    data = (json.dumps(numbers, sort_keys=True, indent=1) + "\n").encode("utf-8")
+    data = (json.dumps(numbers, sort_keys=True, indent=1, allow_nan=False) + "\n").encode("utf-8")
     _write_bytes(Path(path), data)
     return hashlib.sha256(data).hexdigest()
 
@@ -747,29 +934,36 @@ def main(argv: list[str] | None = None) -> int:
                                                     "pending fields")
     args = ap.parse_args(argv)
     sidecar = json.loads(Path(args.sidecar).read_text(encoding="utf-8")) if args.sidecar else None
-    if args.write:
-        sha = write_rules(args.write, sidecar)
-        left = pending(rules(sidecar))
-        print(f"wrote {Path(args.write) / RULES_JSON} (sha256 {sha}) and {RULES_MD}; {len(left)} pending field(s)")
-        return 0
-    d = Path(args.check)
-    ok, r = check_rules(d, sidecar)
+    try:
+        if args.write:
+            sha = write_rules(args.write, sidecar)
+            left = pending(rules(sidecar))
+            print(f"wrote {Path(args.write) / RULES_JSON} (sha256 {sha}) and {RULES_MD}; {len(left)} pending field(s)")
+            return 0
+        d = Path(args.check)
+        ok, r = check_rules(d, sidecar)
+    except ValueError as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 2
     left = pending(r) if r is not None else ["(no PREREG.json)"]
+    problems = filled_problems(json.loads((d / RULES_JSON).read_text(encoding="utf-8"))) if r is not None else []
     print(f"{d}: {'up to date' if ok else 'DIFFERS from kitsune/prereg.py'}; {len(left)} pending field(s)"
-          + (": " + ", ".join(left) if left else ""))
+          + (": " + ", ".join(left) if left else "") + "".join(f"\n  {p}" for p in problems))
     return 0 if ok else 1
 
 
 def check_rules(d, sidecar: dict | None = None) -> tuple[bool, dict | None]:
     """(the committed PREREG.json and PREREG.md in `d` are what the code writes, the rules). Without `sidecar` the
-    filled parts are taken from the committed file itself (regenerate)."""
+    filled parts are taken from the committed file itself (regenerate), and must have the shape of a fill
+    (filled_problems); with it they must be the ones this sidecar fills (which refuses a sidecar that is not the
+    pre-registered selection)."""
     d = Path(d)
     if not (d / RULES_JSON).is_file():
         return False, None
     committed = json.loads((d / RULES_JSON).read_text(encoding="utf-8"))
     r = rules(sidecar) if sidecar is not None else regenerate(committed)
     # compared as parsed JSON and as text with universal newlines: a CRLF checkout is the same file
-    ok = committed == json.loads(rules_json(r)) and (d / RULES_MD).is_file() and \
+    ok = committed == json.loads(rules_json(r)) and not filled_problems(committed) and (d / RULES_MD).is_file() and \
         (d / RULES_MD).read_text(encoding="utf-8") == rules_md(r)
     return ok, r
 
