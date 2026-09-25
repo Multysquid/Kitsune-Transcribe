@@ -26,9 +26,10 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                written right after them, and before the cooldown starts.
                Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
-               sets, verdict (kitsune.evaluate.verdict with eval.verdict_version's trend definition, verdict_options;
-               "N/A" with its numbers under eval.gate false: the sanity/overfit runs), summary.json (uploads
-               "pending") and a log sync, uploads awaited (bounded),
+               sets, verdict (kitsune.evaluate.verdict with eval.verdict_version's trend definition, verdict_options,
+               and eval.reference's model next to the teacher gate, reported only; "N/A" with its numbers under
+               eval.gate false: the sanity/overfit runs), summary.json (uploads "pending") and a log sync, uploads
+               awaited (bounded),
                summary.json with their results, final forced sync; exit 0
 
 Evals in the loop (run_eval): every eval.every_min minutes of loop clock (eval.every_steps steps when set), or at the
@@ -260,12 +261,15 @@ DEFAULTS = {
     # (kitsune.evaluate.verdict): 1, the one the first A100 run was judged by (kept here and in every config written
     # before v2, so its INCONCLUSIVE reproduces), or 2 (the CER trend on the pre-cooldown evals, complete-set numbers
     # when every eval in its window has them, de-duplicated end points, the cooldown gain and the pre-cooldown slope
-    # reported); verdict_min_epoch_gap: v2's de-duplication, in epochs (verdict_options)
+    # reported); verdict_min_epoch_gap: v2's de-duplication, in epochs (verdict_options). reference: null, or
+    # {"name": ..., "path": <JSON file, relative to the repo root>} - a reference model's corpus CER on the complete
+    # gate sets (kitsune.evaluate.load_reference has the file format), which the verdict reports next to the teacher
+    # gate, per set and pooled, without any effect on the tier (reference_model)
     "eval": {"every_min": 20, "every_steps": None, "greedy_subset": 500, "probe": True, "final_full_greedy": True,
              "batch_s": 400, "check_baselines": True, "every_epochs": None, "probe_is_train": False,
              "probe_greedy_audio_s": None, "full_every_epochs": None,
              "mini": {"every_steps": None, "val_per_set": 32, "train_utts": 64, "greedy": True}, "gate": True,
-             "verdict_version": 1, "verdict_min_epoch_gap": 0.25},
+             "verdict_version": 1, "verdict_min_epoch_gap": 0.25, "reference": None},
     "ckpt": {"weights_every_min": 30, "full_local_every_min": 30, "weights_every_steps": None,
              "full_every_steps": None, "keep_local": 2, "upload_full_at": ["pre_cooldown", "end"],
              "full_after_smoke": True},
@@ -409,6 +413,11 @@ def validate(cfg: dict):
     if not (_number(ev_cfg["verdict_min_epoch_gap"]) and ev_cfg["verdict_min_epoch_gap"] >= 0):
         raise SystemExit(f"eval.verdict_min_epoch_gap must be a number of epochs >= 0, got "
                          f"{ev_cfg['verdict_min_epoch_gap']!r}")
+    ref = ev_cfg["reference"]
+    if ref is not None and not (isinstance(ref, dict) and set(ref) <= {"name", "path"}
+                                and isinstance(ref.get("path"), str) and ref["path"]
+                                and (ref.get("name") is None or isinstance(ref["name"], str))):
+        raise SystemExit(f"eval.reference must be null or {{\"name\": <label>, \"path\": <JSON file>}}, got {ref!r}")
     es = cfg["early_stop"]
     if es["metric"] not in EARLY_STOP_METRICS:
         raise SystemExit(f"early_stop.metric must be one of {', '.join(EARLY_STOP_METRICS)}, got {es['metric']}")
@@ -612,6 +621,7 @@ class Run:
     # the final eval when the loop ends at that step. Not in st: a resumed run decodes again
     last_complete: tuple | None = None
     vram_cap_gb: float | None = None  # the caching allocator's cap on Windows (cap_vram); None = no cap
+    reference: dict | None = None  # eval.reference's per-set CER, read at setup (reference_model); None = none
     loop_t0: float | None = None
     t_start: float = field(default_factory=time.time)
     st: dict = field(default_factory=lambda: dict(
@@ -2645,6 +2655,9 @@ def train(R: Run, state: dict | None) -> int:
         log.event("teacher_baselines", sets=base)
     except FileNotFoundError as e:
         log.event("teacher_baselines", skipped=str(e))
+    R.reference = reference_model(cfg)  # a missing or malformed file stops the run here, not at its verdict
+    if R.reference:
+        log.event("reference", **R.reference)
     from kitsune import student as S
 
     log.event("model", params=S.param_report(R.model), trainable=sum(p.numel() for p in R.params),
@@ -2709,9 +2722,12 @@ def train(R: Run, state: dict | None) -> int:
         log.event("eval_final_reused", at_step=step)
     else:
         full_sum = run_eval(R, step, final=True)
-    verdict = gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=R.st["history"]), **verdict_options(cfg)))
+    verdict = gate_verdict(cfg, ev.verdict(verdict_results(full_sum, R.st["history"], R.reference),
+                                           **verdict_options(cfg)))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
+    if line := reference_line((verdict.get("numbers") or verdict).get("reference")):
+        print(line, flush=True)
     headline = (R.st["history"][-1] if R.st["history"] else {}).get("headline")
     # the final eval, the verdict, summary.json (uploads "pending" until close() rewrites it) and the end events go up
     # now, while the ~9 GB end state drains (up to UPLOAD_WAIT_S), not only with close()'s sync after it: on a slow Hub
@@ -2743,6 +2759,43 @@ def verdict_options(cfg: dict) -> dict:
     if int(ev_cfg["verdict_version"]) == 1:
         return {}
     return dict(version=int(ev_cfg["verdict_version"]), min_epoch_gap=float(ev_cfg["verdict_min_epoch_gap"]))
+
+
+def reference_model(cfg: dict) -> dict | None:
+    """eval.reference's per-set corpus CER (kitsune.evaluate.load_reference; its path relative to the repo root, the
+    code checkout, as the student path is), or None without one. The trainer reads it at setup and
+    scripts/05_evaluate.py before its eval, so a missing or malformed file stops them before any paid work."""
+    ref = cfg["eval"]["reference"]
+    if not ref:
+        return None
+    from kitsune import evaluate as ev
+
+    try:
+        return ev.load_reference(rpath(ref["path"]), ref.get("name"))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"eval.reference: {e}") from e
+
+
+def verdict_results(final: dict, history: list[dict], reference: dict | None = None) -> dict:
+    """kitsune.evaluate.verdict's results: the final eval's greedy summary, the history and, when the config has one,
+    the reference model's CER (the verdict's "reference", reported only)."""
+    return dict(final=final, history=history, **({"reference": reference} if reference else {}))
+
+
+def reference_line(bar: dict | None) -> str | None:
+    """The console line of the verdict's reference bar (kitsune.evaluate.reference_bar): '[reference] <name> |
+    eval_jsut 12.65% vs 7.30% (1.73x) | ... | pooled 12.15% vs 7.44% (1.63x)' - student CER vs the reference's,
+    student / reference; None without a reference."""
+    if not bar:
+        return None
+
+    def cell(label, d):
+        return f"{label} {100 * d['student']:.2f}% vs {100 * d['reference']:.2f}% ({d['ratio']:.2f}x)"
+
+    parts = [cell(s, d) for s, d in bar["sets"].items()]
+    if bar.get("pooled"):
+        parts.append(cell("pooled", bar["pooled"]))
+    return f"[reference] {bar['name']} (not a gate) | " + " | ".join(parts)
 
 
 def gate_verdict(cfg: dict, computed: dict) -> dict:

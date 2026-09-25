@@ -677,7 +677,10 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
                           the rows that could not be decoded, per set),
                "history": [eval_record(...), ...],
                "teacher": optional {set: teacher corpus CER} (default: teacher CER on the same ids from "final",
-                          else the pre-registered numbers)}
+                          else the pre-registered numbers),
+               "reference": optional load_reference(...): a reference model's per-set CER, reported as the
+                          verdict's "reference" next to the teacher gate (reference_bar), under either version; no
+                          tier depends on it}
 
     GO         student corpus CER <= 1.2x teacher on >= 2 of the 3 sets, AND truncation <= 0.5 % of the final outputs,
                AND the (held-out KL - probe KL) gap is not widening over the last 20 % of evals
@@ -855,4 +858,67 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
                      n_pre_cooldown=len(pre))
         thresholds.update(min_epoch_gap=float(min_epoch_gap))
         out = dict(verdict=v, version=2, **{k: x for k, x in out.items() if k != "verdict"}, **extra)
+    if results.get("reference"):  # reported next to the tiers, never part of them
+        out["reference"] = reference_bar(fin, results["reference"])
     return out
+
+
+# ------------------------------------------------------------------------------------------- reference model
+
+
+def load_reference(path, name: str | None = None) -> dict:
+    """A reference model's corpus CER on the gate sets (eval.reference: {"name": ..., "path": ...}), for the bar the
+    verdict reports next to the teacher gate (reference_bar). The file is JSON (the numbers here only show the format):
+        {"name": "parakeet-tdt-0.6b-ja",
+         "scope": "complete gate sets, corpus CER under kitsune.text.normalize_ja",
+         "cer": {"eval_jsut": 0.0731, "eval_cv8": 0.0795, "eval_reazon": 0.0718}}
+    cer holds fractions (0.0731 = 7.31 %) of the gate's own measure, corpus CER (corpus_cer: sum of char edits / sum of
+    reference chars under normalize_ja) on the COMPLETE gate sets, so they compare with the verdict's student CER; a
+    gate set left out is not compared. name (the config's wins when it gives one) and scope are labels. Anything else
+    - no gate set, a set that is not a gate set, a CER outside [0, 1] (a percent typed as 7.31) - raises ValueError,
+    so a bad file stops the trainer at start-up rather than at its verdict 4 h later."""
+    p = Path(path)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    cer = raw.get("cer") if isinstance(raw, dict) else None
+    if not isinstance(cer, dict) or not cer:
+        raise ValueError(f"{p}: a reference file needs a non-empty \"cer\": {{set: corpus CER}} (load_reference)")
+    unknown = sorted(set(cer) - set(GATE_SETS))
+    if unknown:
+        raise ValueError(f"{p}: {unknown} are not gate sets ({', '.join(GATE_SETS)}): only those are compared")
+    out = {}
+    for s in GATE_SETS:
+        if s in cer:
+            v = cer[s]
+            if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 <= v <= 1):
+                raise ValueError(f"{p}: cer.{s} must be a fraction in [0, 1] (0.0731 = 7.31 %), got {v!r}")
+            out[s] = float(v)
+    label = name or raw.get("name")
+    if not label:
+        raise ValueError(f"{p}: the reference needs a name (in the file or eval.reference.name)")
+    return dict(name=str(label), path=str(p), scope=raw.get("scope"), cer=out)
+
+
+def reference_bar(final: dict | None, reference: dict) -> dict:
+    """The student's final corpus CER next to a reference model's (load_reference) on each gate set both have, and
+    pooled over those sets; ratio = student / reference (below 1: the student is better). Pooled: the student's sum of
+    char edits / sum of reference chars (the final summary's ref_edits / ref_chars, the headline's val_cer when all
+    three sets are there), and the reference's per-set CERs weighted by the same reference chars - what the reference
+    scores on the pooled corpus, since its numbers are on the same complete sets and references. Reported only
+    (gating false): no tier depends on it; it answers "is the student useful?", which the teacher-ratio gate does not
+    (a student at a public model's level can still fail 1.5x of this teacher on CV8 and ReazonSpeech)."""
+    fsets = (final or {}).get("sets") or {}
+    rows = {}
+    for s in GATE_SETS:
+        if s in reference["cer"] and s in fsets:
+            st, rf = float(fsets[s]["cer_ref_corpus"]), float(reference["cer"][s])
+            rows[s] = dict(student=st, reference=rf, ratio=st / rf if rf > 0 else (0.0 if st == 0 else math.inf))
+    pooled = None
+    if rows and all(fsets[s].get("ref_chars") and "ref_edits" in fsets[s] for s in rows):
+        chars = {s: float(fsets[s]["ref_chars"]) for s in rows}
+        n = sum(chars.values())
+        st = sum(float(fsets[s]["ref_edits"]) for s in rows) / n
+        rf = sum(rows[s]["reference"] * chars[s] for s in rows) / n
+        pooled = dict(student=st, reference=rf, ratio=st / rf if rf > 0 else (0.0 if st == 0 else math.inf),
+                      sets=sorted(rows))
+    return dict(name=reference["name"], scope=reference.get("scope"), path=reference.get("path"), gating=False,
+                sets=rows, pooled=pooled, not_compared=[s for s in GATE_SETS if s not in rows])

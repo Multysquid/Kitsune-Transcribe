@@ -353,6 +353,66 @@ def test_verdict_v1_is_unchanged_by_the_v2_fields():
         assert a == b and "version" not in a and "cooldown_gain" not in a
 
 
+def write_ref(tmp_path, obj, name="ref.json"):
+    p = tmp_path / name
+    p.write_text(json.dumps(obj), encoding="utf-8")
+    return p
+
+
+def test_load_reference_checks_the_file(tmp_path):
+    """The reference file: a name and the corpus CER of each gate set it covers, as fractions. The config's name wins
+    over the file's; anything malformed raises at load time (the trainer reads it at setup), with the reason."""
+    good = dict(name="parakeet-tdt-0.6b-ja", scope="complete gate sets", cer=dict(eval_jsut=0.073, eval_cv8=0.079,
+                                                                                  eval_reazon=0.072))
+    r = ev.load_reference(write_ref(tmp_path, good))
+    assert r == dict(name="parakeet-tdt-0.6b-ja", path=str(tmp_path / "ref.json"), scope="complete gate sets",
+                     cer=dict(eval_jsut=0.073, eval_cv8=0.079, eval_reazon=0.072))
+    assert ev.load_reference(write_ref(tmp_path, good), name="parakeet (bake-off)")["name"] == "parakeet (bake-off)"
+    assert ev.load_reference(write_ref(tmp_path, dict(cer=dict(eval_jsut=0.07))), name="x")["cer"] == dict(
+        eval_jsut=0.07)  # a gate set left out is simply not compared
+    for bad, match in ((dict(name="x"), "non-empty"), (dict(name="x", cer={}), "non-empty"),
+                       (dict(name="x", cer=dict(jsut=0.07)), "not gate sets"),
+                       (dict(name="x", cer=dict(galgame=0.2)), "not gate sets"),
+                       (dict(name="x", cer=dict(eval_jsut=7.3)), r"fraction in \[0, 1\]"),
+                       (dict(name="x", cer=dict(eval_jsut=None)), "fraction"),
+                       (dict(name="x", cer=dict(eval_jsut=True)), "fraction"),
+                       (dict(cer=dict(eval_jsut=0.07)), "needs a name"), ([0.07], "non-empty")):
+        with pytest.raises(ValueError, match=match):
+            ev.load_reference(write_ref(tmp_path, bad))
+
+
+def test_reference_bar_next_to_the_teacher_gate(tmp_path):
+    """Per gate set the student's final corpus CER next to the reference's and their ratio; pooled, the student's sum
+    of edits / sum of chars and the reference's CERs weighted by the same chars. It never moves the tier: the verdict
+    with and without it differs only by the "reference" entry, under v1 and v2."""
+    fin = final((1.8, 2.0, 1.4))
+    chars = dict(eval_jsut=1000, eval_cv8=3000, eval_reazon=6000)
+    for s, d in fin["sets"].items():
+        d.update(ref_chars=chars[s], ref_edits=d["cer_ref_corpus"] * chars[s])
+    ref = ev.load_reference(write_ref(tmp_path, dict(name="ref", cer=dict(eval_jsut=0.10, eval_cv8=0.05,
+                                                                           eval_reazon=0.12))))
+    bar = ev.reference_bar(fin, ref)
+    assert bar["name"] == "ref" and bar["gating"] is False and bar["not_compared"] == []
+    for s, r in (("eval_jsut", 0.10), ("eval_cv8", 0.05), ("eval_reazon", 0.12)):
+        st = fin["sets"][s]["cer_ref_corpus"]
+        assert bar["sets"][s] == pytest.approx(dict(student=st, reference=r, ratio=st / r))
+    st = sum(fin["sets"][s]["ref_edits"] for s in chars) / 10_000
+    rf = (0.10 * 1000 + 0.05 * 3000 + 0.12 * 6000) / 10_000
+    assert bar["pooled"] == dict(student=pytest.approx(st), reference=pytest.approx(rf), ratio=pytest.approx(st / rf),
+                                 sets=sorted(chars))
+    # a set the file does not cover is not compared, and the pool covers the others only
+    part = ev.reference_bar(fin, dict(ref, cer=dict(eval_jsut=0.10)))
+    assert list(part["sets"]) == ["eval_jsut"] and part["not_compared"] == ["eval_cv8", "eval_reazon"]
+    assert part["pooled"]["reference"] == pytest.approx(0.10) and part["pooled"]["sets"] == ["eval_jsut"]
+    # without edit / char counts (an older summary) there is no pool, the per-set rows stay
+    assert ev.reference_bar(final((1.8, 2.0, 1.4)), ref)["pooled"] is None
+    hist = history(FALLING, KL_DOWN, PROBE_DOWN)
+    for opts in ({}, dict(version=2)):
+        base = ev.verdict(dict(final=fin, history=hist), **opts)
+        with_ref = ev.verdict(dict(final=fin, history=hist, reference=ref), **opts)
+        assert with_ref.pop("reference") == bar and with_ref == base and "reference" not in base
+
+
 FIRST_RUN = REAL / "cache" / "hf_runs" / "runs" / "viability-b20x2560-20260925T071746Z"
 
 

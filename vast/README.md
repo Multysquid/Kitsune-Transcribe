@@ -157,6 +157,18 @@ The cost of a full eval on the A100 is an estimate until the first run measures 
 `eval/greedy_full/rtf`): ~5-10 min (the laptop measured ~10 min for this student in batched decoding; the `_comment`
 in `configs/viability.json` has the arithmetic), against ~12-47 min of training per epoch.
 
+A reference model next to the gate (optional, off by default): `"reference": {"name": "<label>", "path":
+"configs/reference/<model>.json"}` under `eval` in the run config makes the verdict report, per gate set and pooled,
+the student's final CER next to that model's and the ratio student / reference (`verdict.reference` in `summary.json`
+and `verdict.json`, and one `[reference] ...` line in `kitsune.log`). It never changes the tier. The file is read
+from the repo clone at setup, so commit it with the code; a missing or malformed one stops the run before it trains.
+Its format (the numbers only show the format; each model's come from scoring its transcripts of the complete gate
+sets with the gate's own corpus CER, `kitsune.evaluate.corpus_cer`):
+```json
+{"name": "parakeet-tdt-0.6b-ja", "scope": "complete gate sets, corpus CER under kitsune.text.normalize_ja",
+ "cer": {"eval_jsut": 0.0731, "eval_cv8": 0.0795, "eval_reazon": 0.0718}}
+```
+
 To stop the training by hand (it looks flat on TensorBoard, or the results are already what you need):
 ```bash
 ls /workspace/Kitsune-Transcribe/runs/                       # the run id: <run_name>-<UTC stamp>

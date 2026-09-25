@@ -366,8 +366,13 @@ def test_config_keys_are_validated():
     assert m.verdict_options(m.load_config(str(ROOT / "configs" / "viability.json"), [])) == {}
     assert m.verdict_options(m.load_config(None, ["eval.verdict_version=2", "eval.verdict_min_epoch_gap=0.5"])) == \
         dict(version=2, min_epoch_gap=0.5)
+    ok = m.load_config(None, ['eval.reference={"name": "parakeet", "path": "configs/reference/parakeet.json"}'])
+    assert ok["eval"]["reference"] == dict(name="parakeet", path="configs/reference/parakeet.json")
+    assert m.DEFAULTS["eval"]["reference"] is None and m.reference_model(m.load_config(None, [])) is None
     for bad in (["eval.verdict_version=3"], ["eval.verdict_version=true"], ["eval.verdict_version=2.0"],
-                ["eval.verdict_min_epoch_gap=-1"], ["eval.verdict_min_epoch_gap=x"]):
+                ["eval.verdict_min_epoch_gap=-1"], ["eval.verdict_min_epoch_gap=x"],
+                ['eval.reference={"name": "x"}'], ['eval.reference={"path": ""}'], ["eval.reference=parakeet.json"],
+                ['eval.reference={"path": "p.json", "cer": 0.07}'], ['eval.reference={"path": "p.json", "name": 1}']):
         with pytest.raises(SystemExit):
             m.load_config(None, bad)
     ok = m.load_config(None, ["eval.full_every_epochs=2", "eval.mini.every_steps=200", "eval.mini.val_per_set=0",
@@ -786,17 +791,23 @@ def test_export_keeps_minis_apart(steps_runs, tmp_path):
 
 
 def test_verdict_v2_changes_the_verdict_only(env, steps_runs):
-    """eval.verdict_version 2 on the run `plain` is (the step clock, a complete eval at every epoch end): the same
-    training, evals and history; each record names the LR phase of its last step (the lr_phase events') and a complete
-    eval's carries the complete sets' numbers; only the verdict differs - v2's, whose CER trend reads the pre-cooldown
-    evals on the complete sets, and the v1 verdict of `plain` is kitsune.evaluate.verdict v1 of its history."""
+    """eval.verdict_version 2 and a reference model (eval.reference) on the run `plain` is (the step clock, a complete
+    eval at every epoch end): the same training, evals and history; each record names the LR phase of its last step
+    (the lr_phase events') and a complete eval's carries the complete sets' numbers; only the verdict differs - v2's,
+    whose CER trend reads the pre-cooldown evals on the complete sets, with the reference model's CER next to the
+    teacher gate - and the v1 verdict of `plain` is kitsune.evaluate.verdict v1 of its history."""
     from kitsune import evaluate as ev
     from kitsune.runlog import _finite  # summary.json holds a non-finite float as null
 
     m = load_script("04_distill")
     plain = steps_runs["plain"]
+    ref_file = env["root"] / "reference.json"
+    ref_file.write_text(json.dumps(dict(name="file name", scope="complete gate sets",
+                                        cer=dict(eval_jsut=0.5, eval_cv8=0.6, eval_reazon=0.7))), encoding="utf-8")
+    ref_cfg = dict(name="ref-model", path=str(ref_file))
     assert m.main(["--config", write_config(env, "cad-v2", {"eval": {"mini": {"every_steps": None},
-                                                                     "verdict_version": 2}})]) == 0
+                                                                     "verdict_version": 2,
+                                                                     "reference": ref_cfg}})]) == 0
     run = one_run(env["root"], "cad-v2")
     sa, sb = steps_of(plain), steps_of(run)
     for col in ("loss/total", "opt/lr", "opt/grad_norm", "sched/phase"):
@@ -816,9 +827,19 @@ def test_verdict_v2_changes_the_verdict_only(env, steps_runs):
                                                                                         pb["history"]]
     final = json.loads((run / f"evals/step_{MAX_STEPS}/summary.json").read_text(encoding="utf-8"))["greedy_full"]
     v1, v2 = pa_["verdict"], pb["verdict"]
-    assert "version" not in v1 and v1 == _finite(ev.verdict(dict(final=final, history=pa_["history"])))
-    assert v2["version"] == 2 and v2 == _finite(ev.verdict(dict(final=final, history=pb["history"]), version=2))
+    assert "version" not in v1 and "reference" not in v1
+    assert v1 == _finite(ev.verdict(dict(final=final, history=pa_["history"])))
+    ref = ev.load_reference(ref_file, "ref-model")
+    assert v2["version"] == 2 and v2 == _finite(ev.verdict(dict(final=final, history=pb["history"], reference=ref),
+                                                           version=2))
     assert v2["sets"] == v1["sets"] and v2["thresholds"]["min_epoch_gap"] == 0.25
+    bar = v2["reference"]
+    assert bar["name"] == "ref-model" and bar["gating"] is False and set(bar["sets"]) == set(EVAL)
+    for x in EVAL:
+        assert bar["sets"][x]["student"] == v2["sets"][x]["student"] == final["sets"][x]["cer_ref_corpus"]
+    assert bar["pooled"]["student"] == pytest.approx(pb["headline"]["val_cer"])  # the final eval's pooled val CER
+    (e,) = events(run, "reference")
+    assert e["name"] == "ref-model" and e["cer"] == ref["cer"] and e["scope"] == "complete gate sets"
     stable = [r["step"] for r in pb["history"] if r.get("lr_phase") == "stable"]
     assert v2["trend"]["n_pre_cooldown"] == len(stable)
     if len(stable) >= 3:  # the fixture's data decide how many epochs end before the cooldown
@@ -828,6 +849,31 @@ def test_verdict_v2_changes_the_verdict_only(env, steps_runs):
     assert v2["cooldown_gain"]["from_step"] == stable[-1] and v2["cooldown_gain"]["to_step"] == MAX_STEPS
     (e,) = events(run, "verdict")
     assert e["version"] == 2 and e["cooldown_gain"] == v2["cooldown_gain"]
+
+
+def test_a_bad_reference_file_stops_the_run_before_it_trains(env):
+    """eval.reference is read at setup: a CER typed as a percent stops the run there, with the reason, before any
+    step or eval (not 4 h later at the verdict)."""
+    m = load_script("04_distill")
+    bad = env["root"] / "bad_reference.json"
+    bad.write_text(json.dumps(dict(name="x", cer=dict(eval_jsut=7.3))), encoding="utf-8")
+    path = write_config(env, "cad-badref", {"eval": {"reference": {"path": str(bad)}}})
+    with pytest.raises(SystemExit, match=r"eval.reference: .*fraction in \[0, 1\]"):
+        m.main(["--config", path])
+    run = one_run(env["root"], "cad-badref")
+    kinds = [e["kind"] for e in events(run)]
+    assert "exception" in kinds and not {"eval_start", "reference", "model"} & set(kinds)
+    assert [e["name"] for e in events(run, "phase")] == ["setup"] and summary(run)["steps"] == 0
+
+
+def test_the_reference_console_line():
+    m = load_script("04_distill")
+    bar = dict(name="parakeet", sets=dict(eval_jsut=dict(student=0.1265, reference=0.073, ratio=0.1265 / 0.073)),
+               pooled=dict(student=0.1215, reference=0.0744, ratio=0.1215 / 0.0744))
+    assert m.reference_line(bar) == ("[reference] parakeet (not a gate) | eval_jsut 12.65% vs 7.30% (1.73x) | pooled "
+                                     "12.15% vs 7.44% (1.63x)")
+    assert m.reference_line(None) is None
+    assert m.verdict_results({"sets": {}}, []) == dict(final={"sets": {}}, history=[])
 
 
 def test_full_eval_every_other_epoch_on_the_wall_clock_and_gate_off(env, monkeypatch):

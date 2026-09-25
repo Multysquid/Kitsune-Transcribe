@@ -223,26 +223,30 @@ def test_a_crash_mid_pass_resumes_to_the_same_results(env, tmp_path, monkeypatch
 
 
 def test_verdict_v2_is_the_trainers_too(env, tmp_path):
-    """Under eval.verdict_version 2 the evaluator's verdict.json is still the trainer's: its record of the checkpoint
-    carries the LR phase of the checkpoint's last step (from the checkpoint's trained block) and the complete sets'
-    numbers, as the trainer's final record does. The same run under v1 (the fixture's) keeps the v1 verdict."""
+    """Under eval.verdict_version 2, with a reference model (eval.reference), the evaluator's verdict.json is still
+    the trainer's: its record of the checkpoint carries the LR phase of the checkpoint's last step (from the
+    checkpoint's trained block) and the complete sets' numbers, as the trainer's final record does, and it reads the
+    same reference file. The same run under v1 (the fixture's) keeps the v1 verdict."""
     from kitsune import student as S
 
     m, m05 = load_script("04_distill"), load_script("05_evaluate")
     cfg = json.loads((env["root"] / "trainer.json").read_text(encoding="utf-8"))
-    cfg.update(run_name="tiny-eval-v2", eval=dict(cfg["eval"], verdict_version=2))
+    ref = tmp_path / "reference.json"
+    ref.write_text(json.dumps(dict(name="ref", cer=dict(eval_jsut=0.3, eval_cv8=0.4))), encoding="utf-8")
+    cfg.update(run_name="tiny-eval-v2", eval=dict(cfg["eval"], verdict_version=2, reference=dict(path=str(ref))))
     path = tmp_path / "v2.json"
     path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     assert m.main(["--config", str(path)]) == 0
     (run,) = list((env["root"] / "runs").glob("tiny-eval-v2-*"))
     ckpt = run / "checkpoints" / "step_1"
     assert S.load_meta(ckpt)["trained"]["lr_phase"] == "stable"  # warmup_steps 1: step 1 is at the peak LR
-    ref = load(run / "evals" / "step_1" / "verdict.json")
-    assert ref["version"] == 2 and "version" not in load(env["run"] / "evals" / "step_1" / "verdict.json")
+    got = load(run / "evals" / "step_1" / "verdict.json")
+    assert got["version"] == 2 and "version" not in load(env["run"] / "evals" / "step_1" / "verdict.json")
     assert summary_history(run)[-1]["lr_phase"] == "stable" and "greedy_full" in summary_history(run)[-1]
     out = tmp_path / "out"
     assert m05.main(["--config", str(path), "--ckpt", str(ckpt), "--out", str(out), "--probe"]) == 0
-    assert load(out / "verdict.json") == ref
+    assert load(out / "verdict.json") == got and got["reference"]["not_compared"] == ["eval_reazon"]
+    assert events(out, "reference")[-1]["cer"] == dict(eval_jsut=0.3, eval_cv8=0.4)
 
 
 def summary_history(run: Path) -> list[dict]:
