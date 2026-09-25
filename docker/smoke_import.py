@@ -136,10 +136,11 @@ def audio_roundtrip() -> str:
 
 def tensorboard_server() -> dict:
     """The TensorBoard the box serves (vast/onstart.sh runs `python -m tensorboard.main`), not only the SummaryWriter
-    the trainer logs with: tensorboard 2.20.0's default.py imports pkg_resources, which setuptools 81+ no longer ships.
+    the trainer logs with: tensorboard 2.20.0's default.py imports pkg_resources, which setuptools 82.0.0 removed.
     The first A100 box had setuptools 84.0.0, so its TensorBoard died at boot with ModuleNotFoundError while `import
     tensorboard` and every SummaryWriter worked. Imports the server's modules, lists the plugins it loads (the
-    first-party ones and the entry-point ones pkg_resources finds) and parses the box's flags; no port is opened."""
+    first-party ones and the entry-point ones pkg_resources finds) and parses the box's flags (vast/onstart.sh's, its
+    scalars sampling included); no port is opened."""
     import tempfile
 
     import tensorboard.default as default
@@ -148,9 +149,10 @@ def tensorboard_server() -> dict:
 
     plugins = default.get_plugins() + default.get_dynamic_plugins()
     with tempfile.TemporaryDirectory() as logdir:
-        program.TensorBoard(plugins=default.get_plugins()).configure(
-            argv=[None, "--logdir", logdir, "--host", "127.0.0.1", "--port", "6006"])
-    return {"plugins": len(plugins)}
+        tb = program.TensorBoard(plugins=default.get_plugins())
+        tb.configure(argv=[None, "--logdir", logdir, "--host", "127.0.0.1", "--port", "6006",
+                           "--samples_per_plugin", "scalars=30000"])
+    return {"plugins": len(plugins), "samples_per_plugin": tb.flags.samples_per_plugin}
 
 
 def tiny_forward_backward(seed: int = 0) -> dict:

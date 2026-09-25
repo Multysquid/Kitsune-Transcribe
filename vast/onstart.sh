@@ -111,15 +111,18 @@ start_tensorboard() {
     # our own TensorBoard on localhost, so `ssh -L 6006:localhost:<port>` works whatever the portal does with 6006.
     # A viewer that fails must never fail the boot (the ERR trap under errtrace stops the box): every command that can
     # fail is guarded, and the wait for the port only decides which line is logged. The first A100 box logged a start
-    # while tensorboard.main had died at import (setuptools without pkg_resources): say whether it answers
-    local port last="" waited=0 wait_s=20
+    # while tensorboard.main had died at import (setuptools without pkg_resources): say whether it answers, is still
+    # starting (alive, no answer yet) or died (its log's last line). scalars=30000: every step of a 4 h run (~17k) in
+    # the charts, not the default random 1000 (~1.5 KB of RAM per point, ~2 GB for the ~70 per-step tags)
+    local port pid last="" waited=0 wait_s=20
     mkdir -p "$KITSUNE_DIR/runs" 2>/dev/null || true
     for port in 6006 6007 6008; do
         if ! port_busy "$port"; then
             nohup setsid "$PY" -m tensorboard.main --logdir "$KITSUNE_DIR/runs" --host 127.0.0.1 --port "$port" \
-                > /workspace/tensorboard.log 2>&1 < /dev/null &
+                --samples_per_plugin scalars=30000 > /workspace/tensorboard.log 2>&1 < /dev/null &
+            pid=$!  # the viewer itself: no job control here, so setsid runs it in place
             echo "$port" > "$KITSUNE_STATE/tensorboard_port" 2>/dev/null || true
-            while [ "$waited" -lt "$wait_s" ]; do
+            while [ "$waited" -lt "$wait_s" ] && kill -0 "$pid" 2>/dev/null; do
                 if port_busy "$port"; then
                     log "TensorBoard up on 127.0.0.1:$port (laptop: ssh -p <port> root@<ip> -L 6006:localhost:$port)"
                     return 0
@@ -127,6 +130,11 @@ start_tensorboard() {
                 sleep 1 || true
                 waited=$(( waited + 1 ))
             done
+            if kill -0 "$pid" 2>/dev/null; then
+                log "TensorBoard not answering on 127.0.0.1:$port after $wait_s s (still starting?);" \
+                    "see /workspace/tensorboard.log"
+                return 0
+            fi
             last=$(tail -n 1 /workspace/tensorboard.log 2>/dev/null || true)
             log "TensorBoard did not start: ${last:-/workspace/tensorboard.log is empty (no answer on port $port)}"
             return 0

@@ -118,8 +118,11 @@ ssh -p <port> root@<ip> -L 6006:localhost:6006
 ```
 Then open http://localhost:6006 for TensorBoard, and on the box `tail -f /workspace/kitsune.log`. onstart.sh waits
 up to ~20 s for its TensorBoard to answer and logs `TensorBoard up on 127.0.0.1:<port>` (if port 6006 was taken on the
-box, forward that port instead) or `TensorBoard did not start: <last line of /workspace/tensorboard.log>`; either way
-the boot goes on, and a run without a viewer still logs everything (`tb/` and the open files reach the output repo).
+box, forward that port instead), `TensorBoard not answering ... (still starting?)` (it is alive but slow: try again in
+a minute) or `TensorBoard did not start: <last line of /workspace/tensorboard.log>` (it exited); either way the boot
+goes on, and a run without a viewer still logs everything (`tb/` and the open files reach the output repo). It keeps
+up to 30,000 points per scalar tag (`--samples_per_plugin scalars=30000`), so the per-step curves are drawn at every
+step of the run; TensorBoard's default keeps a random 1,000.
 
 Timeline: ~5 min boot and image pull, ~10-20 min data (derived pull + audio rebuild, see
 `/workspace/kitsune_state/bootstrap_timings.jsonl`), 10-15 min smoke phase, 4 h training with evals, ~15 min final
@@ -168,7 +171,8 @@ In the output repo under `runs/<run_id>/`: `summary.json` (verdict and final met
 (TensorBoard events), `events.jsonl`, `checkpoints/step_<N>/` (bf16 weights every 30 min), the full resume state from
 before the cooldown and at the end, and `infra/` (box logs; exported too). Convert to flat files with
 `python tools/export_run.py hf://Multy123/kitsune-runs/runs/<run_id> --out <dir>`, or run TensorBoard locally on
-a downloaded `tb/`.
+a downloaded `tb/` (`python -m tensorboard.main --logdir <dir> --samples_per_plugin scalars=30000`, to see every step
+as on the box; the export's `combined_loss` table and `metrics/steps.parquet` hold every step too).
 
 ## How it ends
 
