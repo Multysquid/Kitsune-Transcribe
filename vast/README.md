@@ -116,8 +116,10 @@ vastai show instance <id>          # wait for "running"
 vastai ssh-url <id>                # -> ssh://root@<ip>:<port>
 ssh -p <port> root@<ip> -L 6006:localhost:6006
 ```
-Then open http://localhost:6006 for TensorBoard, and on the box `tail -f /workspace/kitsune.log`. If port 6006 was
-taken on the box, the log line `TensorBoard on 127.0.0.1:<port>` says which one to forward instead.
+Then open http://localhost:6006 for TensorBoard, and on the box `tail -f /workspace/kitsune.log`. onstart.sh waits
+up to ~20 s for its TensorBoard to answer and logs `TensorBoard up on 127.0.0.1:<port>` (if port 6006 was taken on the
+box, forward that port instead) or `TensorBoard did not start: <last line of /workspace/tensorboard.log>`; either way
+the boot goes on, and a run without a viewer still logs everything (`tb/` and the open files reach the output repo).
 
 Timeline: ~5 min boot and image pull, ~10-20 min data (derived pull + audio rebuild, see
 `/workspace/kitsune_state/bootstrap_timings.jsonl`), 10-15 min smoke phase, 4 h training with evals, ~15 min final

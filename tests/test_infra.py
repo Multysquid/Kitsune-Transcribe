@@ -63,6 +63,27 @@ def test_requirements_pins():
     for name in ("tqdm", "nvidia-ml-py", "pytest", "vastai", "tokenizers", "sentencepiece", "safetensors"):
         assert name in pins, name
     assert "torch" not in pins, "torch comes from the base image"
+    # tensorboard 2.20.0's server imports pkg_resources, gone from setuptools 81 on: the base image's 84.0.0 killed the
+    # box's TensorBoard at boot. Held below 81, at the laptop's version, where the viewer runs
+    assert pins.get("setuptools") == "80.9.0"
+    assert tuple(int(x) for x in pins["setuptools"].split(".")[:2]) < (81, 0)
+
+
+def test_smoke_import_loads_the_tensorboard_server(monkeypatch):
+    """The image's CI smoke imports the viewer the box starts (tensorboard.main -> tensorboard.default ->
+    pkg_resources), not only `import tensorboard`: without pkg_resources (setuptools 81+) it fails, as the box's
+    TensorBoard did."""
+    pytest.importorskip("tensorboard")
+    pytest.importorskip("pkg_resources")
+    smoke = load_path("smoke_import", ROOT / "docker" / "smoke_import.py")
+    assert smoke.MODULES["setuptools"] == "pkg_resources"
+    assert smoke.tensorboard_server()["plugins"] > 0
+    for name in [m for m in sys.modules if m == "tensorboard.main" or m.startswith(("tensorboard.default",
+                                                                                   "tensorboard.program"))]:
+        monkeypatch.delitem(sys.modules, name)  # imported afresh below, as on the box
+    monkeypatch.setitem(sys.modules, "pkg_resources", None)  # what setuptools 84 leaves: no such module
+    with pytest.raises(ModuleNotFoundError, match="pkg_resources"):
+        smoke.tensorboard_server()
 
 
 def test_smoke_import_covers_every_pin():
@@ -518,6 +539,69 @@ def test_onstart_fits_vast_limits():
     for line in text.splitlines():
         if "/sys/fs/cgroup" in line and not line.lstrip().startswith("#"):
             assert "2>/dev/null ||" in line, line
+
+
+@pytest.mark.parametrize("viewer", ["dies_at_import", "silent_exit", "answers"])
+def test_onstart_tensorboard_says_whether_it_answers_and_never_fails_the_boot(tmp_path, viewer):
+    """start_tensorboard waits for the port (port_busy) and logs `TensorBoard up on 127.0.0.1:<port>`, or `TensorBoard
+    did not start: <last line of its log>` - the first A100 box logged a start while tensorboard.main had died at
+    import. Either way the boot goes on: run here under onstart.sh's set -euo pipefail and an ERR trap with errtrace,
+    which on the box stops the instance. The functions come from onstart.sh itself; only the log path, the ports (free
+    ones here, not the laptop's 6006) and the wait (4 s, not 20) are swapped in, and a fake interpreter plays the
+    viewer (python for port_busy)."""
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    import socket
+
+    text = (VAST / "onstart.sh").read_text(encoding="utf-8")
+    funcs = "".join(re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", text, re.M | re.S).group(0)
+                    for name in ("port_busy", "start_tensorboard"))
+    socks = [socket.socket() for _ in range(3)]
+    for s in socks:
+        s.bind(("127.0.0.1", 0))
+    ports = [s.getsockname()[1] for s in socks]
+    for s in socks:
+        s.close()
+    tb_log = tmp_path / "tensorboard.log"
+    for old, new in (("/workspace/tensorboard.log", tb_log.as_posix()), ("wait_s=20", "wait_s=4"),
+                     ("for port in 6006 6007 6008", f"for port in {' '.join(map(str, ports))}")):
+        assert old in funcs, old
+        funcs = funcs.replace(old, new)
+    real_py = Path(sys.executable).as_posix()
+    listen = ("import socket, sys, time; s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(8); "
+              "time.sleep(12)")
+    play = {"dies_at_import": "echo 'Traceback (most recent call last):' >&2\n"
+                              "echo \"ModuleNotFoundError: No module named 'pkg_resources'\" >&2\nexit 1",
+            "silent_exit": "exit 1",
+            "answers": f'echo "TensorBoard 2.20.0 at http://127.0.0.1:$port/"\nexec "{real_py}" -c "{listen}" "$port"'}
+    py = tmp_path / "py"
+    py.write_text("#!/bin/bash\n"
+                  f'if [ "$1" != -m ]; then exec "{real_py}" "$@"; fi\n'  # port_busy: python -c ... <port>
+                  'port=""; while [ $# -gt 0 ]; do [ "$1" = --port ] && port=$2; shift; done\n'
+                  + play[viewer] + "\n", encoding="utf-8", newline="\n")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "setsid").write_text('#!/bin/bash\nexec "$@"\n', encoding="utf-8", newline="\n")
+    script = tmp_path / "boot.sh"
+    script.write_text("\n".join([
+        "set -euo pipefail", "set -o errtrace", "trap 'echo \"ERR trap fired at line $LINENO\"; exit 99' ERR",
+        "log() { printf '%s\\n' \"$*\"; }", f'PY="{py.as_posix()}"', f'KITSUNE_DIR="{(tmp_path / "repo").as_posix()}"',
+        f'KITSUNE_STATE="{(tmp_path / "state").as_posix()}"', 'mkdir -p "$KITSUNE_STATE"', funcs,
+        "start_tensorboard", "echo boot goes on"]) + "\n", encoding="utf-8", newline="\n")
+    env = dict(os.environ, PATH=str(tmp_path / "bin") + os.pathsep + os.environ.get("PATH", ""))
+    t0 = time.time()
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=120)
+    out = r.stdout
+    assert r.returncode == 0 and "ERR trap" not in out and out.rstrip().endswith("boot goes on"), out + r.stderr
+    assert (tmp_path / "state" / "tensorboard_port").read_text().strip() == str(ports[0])
+    if viewer == "answers":
+        assert f"TensorBoard up on 127.0.0.1:{ports[0]} (laptop: ssh" in out and "did not start" not in out, out
+    elif viewer == "dies_at_import":
+        assert "TensorBoard did not start: ModuleNotFoundError: No module named 'pkg_resources'" in out, out
+        assert time.time() - t0 >= 4  # it waited for the port before giving up
+    else:
+        assert f"TensorBoard did not start: {tb_log.as_posix()} is empty (no answer on port {ports[0]})" in out, out
+    assert "TensorBoard up" not in out or viewer == "answers"
 
 
 def test_onstart_skips_bootstrap_on_a_restart_with_a_supervisor_history(tmp_path):
