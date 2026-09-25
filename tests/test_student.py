@@ -636,6 +636,25 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
             str(a / "importance.pt"), "--step0-eval-utts", "0", "--out", str(tmp_path / "b2")])
     assert (a / "importance.pt").stat().st_mtime_ns == mtime
 
+    # the sampled ids are written in sample order; --calib-ids reads exactly them back (another seed would draw
+    # others), so the cache key matches again
+    ids_a = (a / "calibration_ids.txt").read_text(encoding="utf-8").split()
+    assert len(ids_a) == 10 and ma["calibration"]["ids_file"] == "calibration_ids.txt"
+    assert mod.ids_sha(ids_a) == ma["calibration"]["importance_ids_sha256"] == cache["key"]["ids_sha256"]
+    b3 = tmp_path / "b3"
+    assert mod.main(common + [
+        "--seed", "99", "--calib-ids", str(a / "calibration_ids.txt"), "--enc-layers", "2", "--ffn", "32",
+        "--dec-layers", "1", "--bn", "keep", "--importance-cache", str(a / "importance.pt"), "--step0-eval-utts", "0",
+        "--out", str(b3)]) == 0
+    mb3 = S.load_meta(b3)
+    assert mb3["importance"]["reused"] and mb3["calibration"]["ids_from"] == str(a / "calibration_ids.txt")
+    assert (b3 / "calibration_ids.txt").read_text(encoding="utf-8").split() == ids_a
+    (tmp_path / "bad_ids.txt").write_text("\n".join(ids_a[:9] + ["no-such-id"]) + "\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="not kept train rows"):
+        mod.main(common + ["--calib-ids", str(tmp_path / "bad_ids.txt"), "--enc-layers", "2", "--ffn", "32",
+                           "--dec-layers", "1", "--bn", "keep", "--step0-eval-utts", "0",
+                           "--out", str(tmp_path / "b4")])
+
     # --ffn-from: a's selection, verbatim; no calibration audio; the same weights as a
     c = tmp_path / "c"
     argv_c = common + ["--enc-layers", "3", "--ffn", "48", "--dec-layers", "0", "2", "--bn", "keep",

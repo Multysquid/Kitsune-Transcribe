@@ -3,7 +3,9 @@ Or (--scratch) a randomly initialised student of the teacher's architecture at a
 
 The shape and the reasons for it are in kitsune/student.py. This script runs the pipeline end to end:
   1. seeded calibration sample of the selection's kept TRAIN rows (all --sources, equal share each), audio read by id
-     (skipped when nothing needs audio: --ffn-from with --bn keep)
+     (skipped when nothing needs audio: --ffn-from with --bn keep); the ids go to <out>/calibration_ids.txt, and
+     --calib-ids <file> calibrates on exactly such a list instead (the draw depends on the selection and the shard
+     list: the first run's ids could not be drawn again after the selection was regenerated)
   2. load the teacher in --teacher-dtype (bf16) on --device, at --teacher-revision (the commit 02_teacher_pass read)
   3. FFN importance over --calib-utts utterances, log-mels computed on the device (kitsune.features.LogMel), in the
      kept layers (--importance-layers spec) or in all 48 (all); or the FFN selection of another student (--ffn-from)
@@ -169,6 +171,63 @@ def sample_calibration(selection: Path, data_root: Path, sources: list[str], n: 
         out += got
     order = rng.permutation(len(out))  # interleave sources so every prefix is a mixed sample
     return [out[i] for i in order]
+
+
+def read_calibration_ids(selection: Path, data_root: Path, sources: list[str], ids: list[str], log=print) -> list[dict]:
+    """--calib-ids: exactly these utterances, in this order (the importance cache key hashes the ordered ids), as
+    sample_calibration returns them. Each must be a kept train row of the selection in `sources`, with audio.
+
+    Why: a seeded draw is only reproducible on the same selection and the same shard list. The first run's 1,000 ids
+    could not be drawn again a day later (the selection was regenerated, shards were added), so every build that
+    samples writes <out>/calibration_ids.txt, and a later build passes it back here to calibrate on the same audio."""
+    import pyarrow.parquet as pq
+
+    from kitsune.audio import TARGET_SR, decode_audio
+    from kitsune.trainset import read_selection
+
+    if len(set(ids)) != len(ids):
+        sys.exit("--calib-ids: the list repeats ids")
+    sel = read_selection(selection, sources, ["train"])
+    src_of = dict(zip(sel["id"], sel["source"]))
+    missing = [x for x in ids if x not in src_of]
+    if missing:
+        sys.exit(f"--calib-ids: {len(missing)} ids are not kept train rows of {selection} for {sources}, e.g. "
+                 f"{missing[:3]}")
+    found, t0 = {}, time.time()
+    for source in sources:
+        want = {x for x in ids if src_of[x] == source}
+        for p in sorted((data_root / "shards" / source).glob("train-*.parquet")):
+            if not want:
+                break
+            pf = pq.ParquetFile(p)
+            for g in range(pf.num_row_groups):
+                gids = pf.read_row_group(g, columns=["id"]).column("id").to_pylist()
+                hits = [j for j, x in enumerate(gids) if x in want]
+                if not hits:
+                    continue
+                audio = pf.read_row_group(g, columns=["audio"]).column("audio")
+                for j in hits:
+                    wave = decode_audio(audio[j].as_py())
+                    if not 0 < len(wave) <= MAX_SECONDS * TARGET_SR:
+                        sys.exit(f"--calib-ids: {gids[j]} has {len(wave) / TARGET_SR:.1f} s of audio")
+                    found[gids[j]] = dict(id=gids[j], source=source, duration=len(wave) / TARGET_SR, wave=wave)
+                    want.discard(gids[j])  # first copy of an id wins, as in sample_calibration
+                if not want:
+                    break
+    if len(found) < len(ids):
+        lost = [x for x in ids if x not in found]
+        sys.exit(f"--calib-ids: no audio under {data_root} for {len(lost)} ids, e.g. {lost[:3]}")
+    log(f"  calibration ids: {len(ids)} utts, {sum(u['duration'] for u in found.values()) / 3600:.2f} h, read in "
+        f"{time.time() - t0:.1f} s")
+    return [found[x] for x in ids]
+
+
+def write_calibration_ids(out: Path, utts: list[dict]) -> None:
+    """<out>/calibration_ids.txt: the sampled ids in sample order (the importance prefix first), for --calib-ids."""
+    p = out / "calibration_ids.txt"
+    tmp = p.with_suffix(".txt.tmp")
+    tmp.write_text("".join(u["id"] + "\n" for u in utts), encoding="utf-8")
+    tmp.replace(p)
 
 
 def pack(durations: list[float], batch_s: float) -> list[list[int]]:
@@ -416,13 +475,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--ffn-from", default=None,
                     help="reuse the FFN selection of this built student (its student_meta.json kept.ffn; read-only) "
                          "instead of measuring importance: T-0.6B takes the first run's students/b20x2560-d4")
+    ap.add_argument("--calib-ids", default=None,
+                    help="calibrate on exactly these ids (one per line, in order; e.g. another build's "
+                         "calibration_ids.txt) instead of the seeded sample, which a changed selection or shard list "
+                         "no longer reproduces")
     ap.add_argument("--scratch", default=None, metavar="SHAPE",
                     help="build a randomly initialised student of this kitsune.student.SCRATCH_SHAPES shape (t01, "
                          "t005, bridge) instead of pruning; --seed seeds the init")
     args = ap.parse_args(argv)
     if args.scratch:
         bad = [f for f, v in (("--bn", args.bn), ("--ffn-from", args.ffn_from),
-                              ("--importance-cache", args.importance_cache)) if v]
+                              ("--importance-cache", args.importance_cache), ("--calib-ids", args.calib_ids)) if v]
         if args.importance_layers != "spec":
             bad.append("--importance-layers")
         if bad:
@@ -435,7 +498,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         name = (f"scratch-{args.scratch}-s{args.seed}" if args.scratch
                 else f"b{args.enc_layers}x{args.ffn}-d{len(args.dec_layers)}")
         args.out = str(ROOT / "students" / name)
-    for k in ("selection", "data", "teacher_root", "eval_cache", "out", "importance_cache", "ffn_from"):
+    for k in ("selection", "data", "teacher_root", "eval_cache", "out", "importance_cache", "ffn_from", "calib_ids"):
         if getattr(args, k) is not None:
             setattr(args, k, Path(getattr(args, k)))
     return args
@@ -471,12 +534,20 @@ def build_pruned(args, spec, teacher_cfg, processor, featurizer, device, meta: d
     t = time.time()
     n_sample = max(args.calib_utts if need_importance else 0, args.bn_utts if args.bn == "recal" else 0)
     utts = []
-    if need_audio:
+    if need_audio and args.calib_ids:
+        ids = [x.strip() for x in Path(args.calib_ids).read_text(encoding="utf-8").splitlines() if x.strip()]
+        if len(ids) < n_sample:
+            sys.exit(f"--calib-ids {args.calib_ids}: {len(ids)} ids, this build needs {n_sample}")
+        log(f"[1/8] calibration: the first {n_sample} of {len(ids)} ids in {args.calib_ids}")
+        utts = read_calibration_ids(args.selection, args.data, args.sources, ids[:n_sample], log=log)
+    elif need_audio:
         log(f"[1/8] calibration sample: {n_sample} utts from {args.sources}")
         utts = sample_calibration(args.selection, args.data, args.sources, n_sample, args.seed, args.calib_per_group,
                                   log=log)
     else:
         log("[1/8] calibration sample: not needed (FFN selection given, BN kept)")
+    if utts:
+        write_calibration_ids(args.out, utts)
     imp_utts = utts[:args.calib_utts] if need_importance else []
     bn_utts = utts[:args.bn_utts] if args.bn == "recal" else []
     dur["sample"] = round(time.time() - t, 1)
@@ -542,7 +613,9 @@ def build_pruned(args, spec, teacher_cfg, processor, featurizer, device, meta: d
     dur["bn"] = round(time.time() - t, 1)
 
     calibration = dict(sources=args.sources, seed=args.seed, per_group=args.calib_per_group,
-                       n_importance=len(imp_utts), n_bn=bn_recal["n_utts"] if bn_recal else 0)
+                       n_importance=len(imp_utts), n_bn=bn_recal["n_utts"] if bn_recal else 0,
+                       ids_from=str(args.calib_ids) if args.calib_ids else ("seeded sample" if utts else None),
+                       ids_file="calibration_ids.txt" if utts else None)
     if imp_utts:
         calibration.update(importance_ids_sha256=ids_sha([u["id"] for u in imp_utts]),
                            hours_importance=sum(u["duration"] for u in imp_utts) / 3600,
