@@ -33,8 +33,9 @@ parameters and no compute, and it would add id-remapping risk.
 make_selection.py    which utterances train / evaluate, and why -> selection/*.parquet
 03_build_student.py  prune the teacher to the student (20 enc layers, FFN 2560, 4 dec layers), init from teacher
 04_distill.py        KL on the stored top-16 + CE on the teacher tokens + L2-SP; TensorBoard (cards in three groups:
-                     1_operational, 2_loss_accuracy, 3_misc; every eval's val / train CER and KL first, under
-                     2_loss_accuracy/00_summary) + open-format logs
+                     1_operational, 2_loss_accuracy, 3_misc; first the combined loss KL + 0.8 CE per step and on the
+                     gate sets, under 2_loss_accuracy/00_combined and as one Custom Scalars chart, then every eval's
+                     val / train CER and KL under 2_loss_accuracy/00_summary) + open-format logs
 tools/               export_run.py: a run -> parquet/CSV tables + README; regroup_tb.py: rebuild an older run's
                      TensorBoard files in the three groups
 vast/                training image, CI build and the vast.ai run scripts (see vast/README.md)

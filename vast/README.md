@@ -131,8 +131,12 @@ the run goes to its scheduled end, `stopped_early` stays null and `early_stop_tr
 with `cooldown.already: true`) records it.
 
 Evals (`eval` in `configs/viability.json`): a full eval at the end of every epoch - teacher-forced and greedy on the
-complete eval sets, plus the probe - and a mini eval every 200 optimizer steps (32 utterances per gate set, 64 of the
-probe). The numbers to read first are in TensorBoard under `2_loss_accuracy/00_summary/full/` and `.../mini/`
+complete eval sets, plus the probe - and a mini eval every 500 optimizer steps (32 utterances per gate set, 64 of the
+probe). The overall loss chart is TensorBoard's Custom Scalars tab, `combined_loss: train vs val`: the training
+objective 1.0 * KL + 0.8 * CE per target token (no L2-SP term) at every optimizer step (`train`, on augmented audio),
+on the mini evals' gate subsets every 500 steps from step 0 on (`val`) and on the complete gate sets at every epoch
+end and the final eval (`val_full`); the same three curves are the first cards of `2_loss_accuracy/00_combined/`.
+The numbers to read first are in TensorBoard under `2_loss_accuracy/00_summary/full/` and `.../mini/`
 (`val_cer_pct`: CER vs the reference pooled over JSUT / CV8 / ReazonSpeech-test, `val_cer_vs_teacher_pct`,
 `train_cer_vs_teacher_pct`, `val_loss`, `train_loss`, ...), and each eval prints one line to `kitsune.log`:
 `[full eval] step N epoch E | val CER x.x% (vs teacher y.y%) on U utts (complete) | train CER vs teacher z.z% (vs ref

@@ -51,6 +51,18 @@ utterances its val CER pools: the step-0 eval decodes the fixed subset, a full_e
 and one console line (" on U utts (subset|complete)" after the val CER of a full eval):
   [full eval] step N epoch E | val CER x.x% (vs teacher y.y%) | train CER vs teacher z.z% (vs ref w.w%) | val KL ...
 
+The combined loss, the run's overall loss chart: one quantity, the training objective w_kl * KL + w_ce * CE (loss.*)
+per target token - the same 17-bin KL and CE on the teacher tokens, masking and normalisation as the step's loss,
+without the decoupled L2-SP term (kitsune.evaluate.combined_loss) - as three series, each with one scope throughout:
+  combined_loss/train     every optimizer step: the step's objective (= loss/objective; augmented audio, train mode)
+  combined_loss/val       every mini eval: its val subset's gate sets, teacher-forced and pooled token-weighted (the
+                          monitor-only hold-outs never), plus a step-0 point on the same utterances (run_eval's
+                          mini_val: a teacher-forced pass only, not a mini eval). Needs eval.mini
+  combined_loss/val_full  every eval that decodes the complete eval sets (full_every_epochs, the final eval): the
+                          complete gate sets. Never step 0, whose eval decodes the greedy subset
+They are the first cards of 2_loss_accuracy (00_combined/) and one Custom Scalars chart overlays them
+(kitsune.runlog.TB_LAYOUT); each eval's summary.json keeps the sums under combined_loss.
+
 Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and configs/overfit_*.json): after every
 eval inside the loop (never the step-0 eval, never the final one) the metric - "probe_kl" (teacher-forced KL on the
 train probe), "heldout_kl" (the gate sets' pooled held-out KL, as the verdict reads it) or "train_loss" (the mean
@@ -238,7 +250,8 @@ DEFAULTS = {
     # greedy subset; set one of the two. probe_is_train: the probe is the whole train set (a small subset) rather than
     # its in_probe rows. probe_greedy_audio_s: also greedy-decode a seeded ~N s of the probe (null:
     # subset.eval_audio_s; both null: no probe decode). mini: a small eval of its own every mini.every_steps steps
-    # (null: none; run_mini_eval). gate: false = no GO/NO-GO verdict (sanity/overfit runs: "N/A" + the numbers)
+    # (null: none, and no combined_loss/val curve; run_mini_eval). gate: false = no GO/NO-GO verdict (sanity/overfit
+    # runs: "N/A" + the numbers)
     "eval": {"every_min": 20, "every_steps": None, "greedy_subset": 500, "probe": True, "final_full_greedy": True,
              "batch_s": 400, "check_baselines": True, "every_epochs": None, "probe_is_train": False,
              "probe_greedy_audio_s": None, "full_every_epochs": None,
@@ -1447,7 +1460,11 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
              s: int) -> float:
     """The step's row (steps.parquet, scalars, TensorBoard) and per-utterance records. Returns the objective
     (w_kl * KL + w_ce * CE, the optimised loss; loss/total adds the decoupled L2-SP value, which is not in the
-    gradient)."""
+    gradient). The objective goes out twice: as loss/objective and as combined_loss/train, the train curve of the
+    combined-loss chart next to combined_loss/val (kitsune.evaluate.combined_loss, the same quantity on the gate sets).
+    It is measured on the step's augmented audio (SpecAugment on its log-mel features, under specaug.enabled) in train
+    mode, with the weights before this step's update; the val points are un-augmented, in eval mode. That difference
+    is the point of a train curve (what the optimizer sees), not something to correct."""
     from kitsune.runlog import system_stats
 
     cfg = R.cfg
@@ -1470,6 +1487,7 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
         flops = mult * R.st["flops_per_padded_s"] * out["audio_pad"]
     row = {
         "loss/total": objective + l2sp, "loss/objective": objective, "loss/kl": kl, "loss/ce": ce, "loss/l2sp": l2sp,
+        "combined_loss/train": objective,
         "opt/lr": lr, "opt/grad_norm": out["grad_norm"], "opt/clip_coef": out["clip_coef"],
         "time/step_s": step_s, "time/data_wait_s": wait_s, "time/compute_s": step_s - wait_s,
         "perf/audio_s_per_s": out["audio_real"] / step_s, "perf/tokens_per_s": n_tok / step_s,
@@ -1516,13 +1534,20 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
 # ---------------------------------------------------------------------------------------------------------- evals
 
 
-def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = None) -> dict:
+def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = None, mini_val: bool = False) -> dict:
     """Teacher-forced on every eval utterance and on the train probe, greedy on the fixed subsets - or on the COMPLETE
     eval sets (`complete`; default: the final eval under eval.final_full_greedy; the loop passes it for every
     eval.full_every_epochs eval), the subset summary then taken from those rows so the history stays comparable.
     Tables, summary, scalars, the headline numbers (summary/full/..., log_headline) and samples go to the logger; one
     record goes to the history the verdict and the early stop read. Returns the greedy summary the verdict should
-    judge: the complete-set one when there is one (the subset one if eval.final_full_greedy is off)."""
+    judge: the complete-set one when there is one (the subset one if eval.final_full_greedy is off).
+
+    The combined loss (kitsune.evaluate.combined_loss; summary.json's combined_loss, one record per series): an eval
+    of the complete sets logs combined_loss/val_full, the gate sets' teacher-forced pass (every eval runs that pass on
+    the complete sets, but only these evals are complete ones: the step-0 eval and the every_min / every_steps ones
+    decode the greedy subset). mini_val (the step-0 eval, when mini evals are on) adds a teacher-forced pass over the
+    mini eval's val subset for combined_loss/val's first point, the scope of every later one (run_mini_eval): the
+    mini evals themselves stay out of step 0, the early stop and the verdict."""
     from kitsune import evaluate as ev
 
     cfg, log = R.cfg, R.log
@@ -1531,6 +1556,15 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     t0 = time.time()
     log.event("eval_start", at_step=step, final=final, complete=complete)
     tf_sum, tf_df = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, amp=R.amp)
+    w_kl, w_ce = cfg["loss"]["w_kl"], cfg["loss"]["w_ce"]
+    combined = {}  # series -> its combined_loss record, the scope it pooled next to the numbers
+    if complete and (c := ev.combined_loss(tf_sum, w_kl, w_ce)):
+        combined["val_full"] = dict(c, scope="complete")
+    if mini_val and R.mini_val_ids:
+        mini_tf, _ = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, ids=R.mini_val_ids,
+                                            amp=R.amp)
+        if c := ev.combined_loss(mini_tf, w_kl, w_ce):
+            combined["val"] = dict(c, scope="mini")
     probe_sum = probe_df = None
     if R.probe_ids:
         probe_sum, probe_df = ev.teacher_forced_eval(R.model, R.train, R.feat_eval, R.device, bs, ids=R.probe_ids,
@@ -1582,6 +1616,8 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     if epoch_mode(cfg):
         extra["epoch"] = R.st["epoch_progress"]  # epochs done: 0 at step 0, e + 1 at the end of epoch e
     summary.update(extra)
+    if combined:
+        summary["combined_loss"] = combined
     log.eval_json("summary", summary, step)
     scal = ev.flatten(tf_sum, "eval/tf")
     scal.update(ev.flatten(gr_sum, "eval/greedy"))
@@ -1601,6 +1637,7 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     if "epoch" in extra:
         scal["eval/epoch"] = extra["epoch"]
     scal["eval/wall_s"] = summary["wall_s"]
+    scal.update({f"combined_loss/{k}": c["value"] for k, c in combined.items()})
     log.scalars(scal, step)
     log_headline(R, "full", head, step, scope=summary["headline_scope"])
     samples = ev.pick_samples(gr_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"]))
@@ -1631,6 +1668,8 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
                                        trunc=round(d["trunc_rate"], 4))
     if pg_sum and "all" in pg_sum:
         extra["probe_cer_teacher"] = round(pg_sum["all"]["cer_teacher_corpus"], 4)
+    if combined:
+        extra["combined_loss"] = {k: round(c["value"], 5) for k, c in combined.items()}
     log.event("eval", at_step=step, final=final, complete=complete, wall_s=summary["wall_s"], sets=brief,
               probe_kl=probe_sum["all"]["kl"] if probe_sum and "all" in probe_sum else None,
               headline={k: round(v, 5) for k, v in head.items()},
@@ -1698,7 +1737,9 @@ def run_mini_eval(R: Run, step: int) -> dict:
     logged apart from the full evals: tables and summary.json under evals/step_<N>_mini/, scalars under eval/mini/
     (its wall time eval/mini/wall_s), the headline under summary/mini/, an `eval_mini` event and a row of
     st["mini_history"] (summary.json's mini_history). It never feeds the verdict's history, the early stop or the
-    final-eval estimate. Returns the headline."""
+    final-eval estimate. Its teacher-forced val pass also gives combined_loss/val (kitsune.evaluate.combined_loss over
+    the gate sets of the val subset, summary.json's combined_loss): the held-out curve of the combined-loss chart, one
+    scope from its step-0 point (run_eval's mini_val) to the last mini. Returns the headline."""
     from kitsune import evaluate as ev
 
     cfg, log = R.cfg, R.log
@@ -1717,6 +1758,8 @@ def run_mini_eval(R: Run, step: int) -> dict:
                                                  teacher_rows=mini_teacher_rows(R, kind, store, ids))
     assert_bn_frozen(R.model)
     wall = round(time.time() - t0, 1)
+    comb = ev.combined_loss(parts.get("tf"), cfg["loss"]["w_kl"], cfg["loss"]["w_ce"])
+    combined = {"val": dict(comb, scope="mini")} if comb else {}
 
     for kind in ("tf", "greedy"):
         if kind in frames:
@@ -1729,12 +1772,14 @@ def run_mini_eval(R: Run, step: int) -> dict:
                        probe_greedy=parts.get("probe_greedy"))
     epoch = R.st["epoch_progress"]
     log.eval_json("summary", dict(step=step, train_s=R.clock(), epoch=epoch, mini=True, wall_s=wall, headline=head,
-                                  n_val=len(R.mini_val_ids), n_train=len(R.mini_train_ids), **parts),
+                                  n_val=len(R.mini_val_ids), n_train=len(R.mini_train_ids), **parts,
+                                  **({"combined_loss": combined} if combined else {})),
                   step, suffix="mini")
     scal = {}
     for kind, s in parts.items():
         scal.update(ev.flatten(s, f"eval/mini/{kind}"))
     scal["eval/mini/wall_s"] = wall
+    scal.update({f"combined_loss/{k}": c["value"] for k, c in combined.items()})
     log.scalars(scal, step)
     log_headline(R, "mini", head, step)
     R.st["mini_history"].append(dict(step=int(step), epoch=epoch, elapsed_s=R.clock(), wall_s=wall, **head))
@@ -1743,7 +1788,8 @@ def run_mini_eval(R: Run, step: int) -> dict:
     for s, d in (parts.get("greedy") or {}).get("sets", {}).items():
         brief.setdefault(s, {}).update(cer=round(d["cer_ref_corpus"], 4), cer_teacher=round(d["cer_teacher_corpus"], 4))
     log.event("eval_mini", at_step=step, epoch=epoch, wall_s=wall, n_val=len(R.mini_val_ids),
-              n_train=len(R.mini_train_ids), sets=brief, headline={k: round(v, 5) for k, v in head.items()})
+              n_train=len(R.mini_train_ids), sets=brief, headline={k: round(v, 5) for k, v in head.items()},
+              **({"combined_loss": {k: round(c["value"], 5) for k, c in combined.items()}} if combined else {}))
     return head
 
 
@@ -2521,7 +2567,7 @@ def train(R: Run, state: dict | None) -> int:
         log.event("plan", micro_audio_s=R.planner.micro_audio_s, **R.planner.stats)
     if not R.st["step0_done"]:
         log.event("phase", name="step0_eval")
-        run_eval(R, 0)
+        run_eval(R, 0, mini_val=True)  # with combined_loss/val's step-0 point on the mini val subset (minis on)
         R.st["step0_done"] = True
 
     if R.st["early_stop"]["stop"]:  # resumed after an early stop had triggered: straight to the end phase

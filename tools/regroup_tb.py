@@ -10,7 +10,8 @@ keeps in open formats, each logged tag mapped by the same rules:
 Records go in the order the logger wrote them, and a resume is replayed as it happened: the restarted logger's purge
 of the steps after the restored one (SessionLog.START) goes into the rebuilt file at that point, so TensorBoard shows
 what it showed before. What never reached the open files is not rebuilt (histograms still buffered in a process that
-was killed without close()).
+was killed without close()). The rebuilt file starts with the Custom Scalars layout (kitsune.runlog.TB_LAYOUT: the
+combined_loss train vs val chart), as every event file of the logger does; a run logged before it gets it too.
 
 The original event files are kept under a name TensorBoard skips. TensorBoard reads every file whose name contains
 "tfevents" (a plain .bak suffix would not hide one), so events.out.tfevents.X becomes events.out.tf-events.X.bak; to
@@ -62,7 +63,7 @@ sys.path.insert(0, str(ROOT))
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
-from kitsune.runlog import TB_BUCKETS, TB_PLUGINS, TagMapper, _atomic_json, read_scalars_jsonl  # noqa: E402
+from kitsune.runlog import TB_BUCKETS, TB_LAYOUT, TB_PLUGINS, TagMapper, _atomic_json, read_scalars_jsonl  # noqa: E402
 
 FINAL_STATUS = ("complete", "failed", "throughput_too_low")  # 04_distill's summary.json statuses
 LIVE_S = 300.0  # a write this recent makes a run live (see the module docstring)
@@ -218,6 +219,9 @@ def _write(run: Path, out_dir: Path) -> tuple[TagMapper, dict, list[str]]:
     tm, n, unmapped = TagMapper(), dict.fromkeys(("scalars", "histograms", "text", "purge"), 0), []
     w = SummaryWriter(log_dir=str(out_dir), filename_suffix=SUFFIX, max_queue=10_000, flush_secs=3600)
     try:
+        # the Custom Scalars chart the logger writes into every event file (the originals' copies go with them into
+        # the .bak files): at step 0, ahead of the records, so no replayed purge drops it
+        w.add_custom_scalars(TB_LAYOUT)
         for wall, _, _, what, p in heapq.merge(_scalars(run), _hists(run), _texts(run), _events(run)):
             n[what] += 1
             if what == "purge":
@@ -334,7 +338,8 @@ def regroup(run, force: bool = False, settle_s: float | None = None) -> dict:
         for plugin, e in [(entry["plugin"], entry), *(entry.get("other_plugins") or {}).items()]:
             counts[e["bucket"]][plugin] += 1
     return dict(run=run, file=dest, counts=counts, records=n, unmapped=unmapped, live=reason,
-                backups=sorted(p.name for p in tb_dir.iterdir() if p.name.endswith(".bak")))
+                backups=sorted(p.name for p in tb_dir.iterdir() if p.name.endswith(".bak")),
+                charts=[chart for charts in TB_LAYOUT.values() for chart in charts])
 
 
 def report(res: dict) -> str:
@@ -347,6 +352,7 @@ def report(res: dict) -> str:
         lines.append(f"  {b:18s}" + "".join(f"{res['counts'][b][p]:>12,}" for p in TB_PLUGINS))
     lines.append(f"  {'tags':18s}" + "".join(f"{sum(c[p] for c in res['counts'].values()):>12,}" for p in TB_PLUGINS))
     lines.append(f"  no rule matched (-> 3_misc): {', '.join(res['unmapped']) or 'none'}")
+    lines.append(f"  Custom Scalars charts: {', '.join(res['charts'])}")
     lines.append(f"  originals kept as: {', '.join(res['backups']) or 'none'}")
     return "\n".join(lines)
 

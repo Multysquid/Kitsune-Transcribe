@@ -601,5 +601,11 @@
   "summary/mini/val_cer_vs_teacher_pct",
   "summary/mini/val_loss",
   "summary/mini/val_top1"
+ ],
+ "combined_note": "scalar tags the combined-loss change adds to the same run: the training objective w_kl * KL + w_ce * CE per step (combined_loss/train, = loss/objective), on the mini evals' gate subsets (combined_loss/val) and on the complete gate sets at the complete-set evals (combined_loss/val_full), the three curves of the Custom Scalars chart",
+ "combined_scalars": [
+  "combined_loss/train",
+  "combined_loss/val",
+  "combined_loss/val_full"
  ]
 }

@@ -199,7 +199,11 @@ def test_tensorboard_tags_are_bucketed(run):
     acc = EventAccumulator(str(run / "tb"))
     acc.Reload()
     tags = acc.Tags()
-    assert all(t.split("/", 1)[0] in runlog.TB_BUCKETS for k in ("scalars", "histograms", "tensors") for t in tags[k])
+    # every logged tag bucketed; the one other entry is the Custom Scalars layout under TensorBoard's own fixed tag
+    layout = "custom_scalars__config__"
+    assert all(t.split("/", 1)[0] in runlog.TB_BUCKETS for k in ("scalars", "histograms", "tensors") for t in tags[k]
+               if t != layout)
+    assert layout in tags["tensors"] and acc.SummaryMetadata(layout).plugin_data.plugin_name == "custom_scalars"
     assert {"2_loss_accuracy/train_loss_incl_l2sp/total", "2_loss_accuracy/train_loss/kl/src_a", "3_misc/lr",
             "3_misc/grad_norm"} <= set(tags["scalars"])
     assert any(t.startswith("1_operational/sys/proc/") for t in tags["scalars"])

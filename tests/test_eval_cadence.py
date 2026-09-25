@@ -12,12 +12,16 @@
 - the headline numbers after every eval (kitsune.evaluate.headline): pooled corpus CER = sum edits / sum chars of the
   per-set numbers, gate sets only; summary/{full,mini}/<name> with <name>_pct copies; one console line per eval
 - eval.gate false: summary.json's verdict is "N/A" with the numbers
+- the combined loss (w_kl * KL + w_ce * CE): combined_loss/train at every step (= loss/objective), combined_loss/val at
+  step 0 and at every mini eval (the mini val subset's gate sets), combined_loss/val_full at every complete-set eval;
+  first in 2_loss_accuracy and overlaid in one Custom Scalars chart in every event file
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import copy
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +39,7 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa: E402
+from fixtures import load_script, make_fake_corpus, make_fake_selection, tb_layouts  # noqa: E402
 
 EVAL = ["eval_jsut", "eval_cv8", "eval_reazon"]
 PEAK = 3e-3
@@ -461,6 +465,66 @@ def test_headline_numbers_are_the_pooled_per_set_numbers(steps_runs):
         assert f"[mini eval] step {mrec['step']} epoch " in out
 
 
+def _pooled_objective(tf: dict, cfg: dict) -> float:
+    """w_kl * KL + w_ce * CE over the gate sets of a summary.json's teacher-forced part, token-weighted."""
+    n = sum(tf["sets"][x]["n_tok"] for x in EVAL)
+    kl = sum(tf["sets"][x]["kl"] * tf["sets"][x]["n_tok"] for x in EVAL) / n
+    ce = sum(tf["sets"][x]["ce"] * tf["sets"][x]["n_tok"] for x in EVAL) / n
+    return cfg["loss"]["w_kl"] * kl + cfg["loss"]["w_ce"] * ce
+
+
+def test_combined_loss_curves(steps_runs):
+    """The overall loss chart's three series, each on one scope: combined_loss/train at every optimizer step (= the
+    step's loss/objective, in steps.parquet too), combined_loss/val at step 0 and at every mini eval (the mini val
+    subset's gate sets, pooled token-weighted; the step-0 point on the very same utterances, without a mini eval of its
+    own), combined_loss/val_full at every complete-set eval (epoch ends, the final eval; never step 0). Each value is
+    the eval's summary.json numbers recombined, and summary.json keeps the sums; a run without minis has no val curve.
+    The run crashed and resumed: its replayed steps are read at their later values (scalar)."""
+    run, plain = steps_runs["mini"], steps_runs["plain"]
+    s = summary(run)
+    cfg = s["config"]
+    st = steps_of(run)
+    assert (st["combined_loss/train"] == st["loss/objective"]).all()
+    train = scalar(run, "combined_loss/train")
+    assert sorted(train) == list(range(1, MAX_STEPS + 1))
+    obj = scalar(run, "loss/objective")
+    assert all(train[k] == obj[k] for k in train)
+
+    minis = [r["step"] for r in s["mini_history"]]
+    val = scalar(run, "combined_loss/val")
+    assert sorted(val) == [0, *minis] and minis
+    n_tok = set()
+    for step in minis:
+        d = json.loads((run / "evals" / f"step_{step}_mini" / "summary.json").read_text(encoding="utf-8"))
+        c = d["combined_loss"]["val"]
+        assert c["scope"] == "mini" and c["sets"] == sorted(EVAL) and (c["w_kl"], c["w_ce"]) == (1.0, 0.8)
+        assert val[step] == pytest.approx(c["value"], rel=1e-9)
+        assert c["value"] == pytest.approx(_pooled_objective(d["tf"], cfg), rel=1e-9)
+        assert c["value"] == pytest.approx((c["kl_sum"] + 0.8 * c["ce_sum"]) / c["n_tok"])
+        n_tok.add(c["n_tok"])
+    s0 = json.loads((run / "evals" / "step_0" / "summary.json").read_text(encoding="utf-8"))
+    c0 = s0["combined_loss"]["val"]
+    assert c0["scope"] == "mini" and {c0["n_tok"]} == n_tok  # the mini val subset's tokens, at step 0 too
+    assert val[0] == pytest.approx(c0["value"]) and "val_full" not in s0["combined_loss"]
+    assert val[0] > min(val[k] for k in minis)  # the untrained student is worse on the same utterances
+    assert not (run / "evals" / "step_0_mini").exists() and 0 not in minis
+
+    ends = epoch_ends(run)
+    full = scalar(run, "combined_loss/val_full")
+    assert sorted(full) == sorted({*ends, MAX_STEPS}) and 0 not in full
+    for step in full:
+        d = json.loads((run / "evals" / f"step_{step}" / "summary.json").read_text(encoding="utf-8"))
+        c = d["combined_loss"]["val_full"]
+        assert d["complete"] and c["scope"] == "complete" and "val" not in d["combined_loss"]
+        assert full[step] == pytest.approx(c["value"], rel=1e-9)
+        assert c["value"] == pytest.approx(_pooled_objective(d["tf"], cfg), rel=1e-9)
+        assert c["n_tok"] == sum(d["tf"]["sets"][x]["n_tok"] for x in EVAL)
+    assert "combined_loss/val" not in set(pd.read_parquet(plain / "metrics" / "scalars.parquet")["tag"])
+    assert sorted(scalar(plain, "combined_loss/val_full")) == sorted({*epoch_ends(plain), MAX_STEPS})
+    assert "combined_loss" not in json.loads((plain / "evals" / "step_0" / "summary.json").read_text(encoding="utf-8"))
+    assert [e["combined_loss"] for e in events(run, "eval_mini")][-1] == {"val": round(val[minis[-1]], 5)}
+
+
 def test_tensorboard_places_the_new_tags(steps_runs):
     """summary/* first in 2_loss_accuracy (00_summary), eval/mini/* next to the full sections (<section>_mini), their
     cost in 1_operational/eval/mini; no tag of the run falls through to 3_misc unmatched."""
@@ -470,6 +534,9 @@ def test_tensorboard_places_the_new_tags(steps_runs):
     tags = set(pd.read_parquet(run / "metrics" / "scalars.parquet")["tag"])
     assert tags <= set(tag_map) and not any(e.get("unmapped") for e in tag_map.values())
     want = {
+        "combined_loss/train": "2_loss_accuracy/00_combined/train",
+        "combined_loss/val": "2_loss_accuracy/00_combined/val",
+        "combined_loss/val_full": "2_loss_accuracy/00_combined/val_full",
         "summary/full/val_cer": "2_loss_accuracy/00_summary/full/val_cer",
         "summary/full/val_cer_pct": "2_loss_accuracy/00_summary/full/val_cer_pct",
         "summary/mini/train_cer_vs_teacher_pct": "2_loss_accuracy/00_summary/mini/train_cer_vs_teacher_pct",
@@ -493,6 +560,21 @@ def test_tensorboard_places_the_new_tags(steps_runs):
     assert all(buckets[t] == "2_loss_accuracy" for t in tags if t.startswith("summary/"))
     assert all(buckets[t] == "2_loss_accuracy" for t in tags if t.startswith("eval/mini/") and "/cer_" in t
                and not t.endswith("_chars"))
+    # the combined-loss chart: in every event file (the crashed launch's and the resumed one's), its regexes drawing
+    # exactly the three curves among the tags TensorBoard reads from the run
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    from kitsune.runlog import TB_LAYOUT
+
+    files = sorted(p for p in (run / "tb").iterdir() if "tfevents" in p.name)
+    assert len(files) == 2
+    (kind, regexes), = TB_LAYOUT["combined_loss"].values()
+    assert all(tb_layouts(f) == [(0, {"combined_loss": {"combined_loss: train vs val": regexes}})] for f in files)
+    acc = EventAccumulator(str(run / "tb"))
+    acc.Reload()
+    tb_scalars = acc.Tags()["scalars"]
+    assert [[t for t in tb_scalars if re.match(rx, t)] for rx in regexes] == [
+        [tag_map[t]["tb_tag"]] for t in ("combined_loss/train", "combined_loss/val", "combined_loss/val_full")]
 
 
 def test_export_keeps_minis_apart(steps_runs, tmp_path):
@@ -523,6 +605,19 @@ def test_export_keeps_minis_apart(steps_runs, tmp_path):
     assert {"final", "complete", "headline_scope/val_greedy"}.isdisjoint(es["key"])  # columns, not keys
     readme = (tmp_path / "export" / "README.md").read_text(encoding="utf-8")
     assert "| `scope` |" in readme and "| `final` |" in readme and "| `complete` |" in readme
+    # the combined-loss chart as one table: each curve as TensorBoard draws it (the crashed launch's rows after the
+    # restored step 8 left out), the sums of every eval's combined_loss in eval_summaries
+    cl = t["combined_loss"]
+    assert list(cl.columns) == ["series", "step", "value", "wall", "elapsed_s"]
+    assert list(dict.fromkeys(cl["series"])) == ["train", "val", "val_full"]
+    for series in ("train", "val", "val_full"):
+        rows = cl[cl["series"] == series]
+        assert rows["step"].tolist() == sorted(scalar(run, f"combined_loss/{series}")), series
+        assert rows["value"].tolist() == pytest.approx([scalar(run, f"combined_loss/{series}")[k]
+                                                        for k in rows["step"]])
+    assert cl.loc[cl["series"] == "val", "step"].tolist() == [0, *want]
+    assert {"combined_loss/val/kl_sum", "combined_loss/val_full/n_tok"} <= set(es["key"])
+    assert (tmp_path / "export" / "combined_loss.csv").is_file() and "## `combined_loss.parquet`" in readme
 
 
 def test_full_eval_every_other_epoch_on_the_wall_clock_and_gate_off(env, monkeypatch):
@@ -571,8 +666,8 @@ def test_a_complete_eval_that_runs_past_T_is_the_final_eval(env, monkeypatch):
     m = load_script("04_distill")
     real = m.run_eval
 
-    def slow(R, step, final=False, complete=None):  # the loop clock runs on during an eval: this one outlasts T
-        out = real(R, step, final=final, complete=complete)
+    def slow(R, step, final=False, complete=None, **kw):  # the loop clock runs on during an eval: this one outlasts T
+        out = real(R, step, final=final, complete=complete, **kw)  # kw: the step-0 eval's mini_val
         if complete and not final:
             R.st["train_s"] += float(R.cfg["schedule"]["train_hours"]) * 3600
         return out
