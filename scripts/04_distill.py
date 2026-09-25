@@ -1617,13 +1617,34 @@ def eval_history_record(step: int, elapsed_s: float, tf_sum: dict, gr_sum: dict,
     return rec
 
 
+def eval_event_sets(tf_sum: dict, gr_sum: dict, full_sum: dict | None) -> dict:
+    """The `eval` event's per-set numbers: kl / top1 of the teacher-forced pass (every eval utterance), cer / ratio /
+    trunc of the greedy decode the headline pools - the complete sets at a complete eval (full_sum; the event's
+    greedy_scope "complete"), else the fixed subset ("subset") - so they match summary.json's greedy_full and the
+    verdict. A complete eval keeps the subset's own next to them as cer_subset / ratio_subset / trunc_subset: the
+    numbers of summary.json's greedy, the ones the history (the verdict's trend, the early stop) reads."""
+    def greedy(d: dict) -> dict:
+        return dict(cer=round(d["cer_ref_corpus"], 4), ratio=round(d["ratio_vs_teacher"], 3),
+                    trunc=round(d["trunc_rate"], 4))
+
+    brief = {s: dict(kl=round(d["kl"], 4), top1=round(d["top1"], 4)) for s, d in tf_sum.get("sets", {}).items()}
+    for s, d in (full_sum if full_sum is not None else gr_sum).get("sets", {}).items():
+        brief.setdefault(s, {}).update(greedy(d))
+    if full_sum is not None:
+        for s, d in gr_sum.get("sets", {}).items():
+            brief.setdefault(s, {}).update({f"{k}_subset": v for k, v in greedy(d).items()})
+    return brief
+
+
 def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = None, mini_val: bool = False) -> dict:
     """Teacher-forced on every eval utterance and on the train probe, greedy on the fixed subsets - or on the COMPLETE
     eval sets (`complete`; default: the final eval under eval.final_full_greedy; the loop passes it for every
     eval.full_every_epochs eval), the subset summary then taken from those rows so the history stays comparable.
     Tables, summary, scalars, the headline numbers (summary/full/..., log_headline) and samples go to the logger; one
-    record goes to the history the verdict and the early stop read. Returns the greedy summary the verdict should
-    judge: the complete-set one when there is one (the subset one if eval.final_full_greedy is off).
+    record goes to the history the verdict and the early stop read (the subset's greedy numbers). The `eval` event's
+    per-set CERs are those of the headline's scope, named in its greedy_scope (eval_event_sets). Returns the greedy
+    summary the verdict should judge: the complete-set one when there is one (the subset one if
+    eval.final_full_greedy is off).
 
     The combined loss (kitsune.evaluate.combined_loss; summary.json's combined_loss, one record per series): an eval
     of the complete sets logs combined_loss/val_full, the gate sets' teacher-forced pass (every eval runs that pass on
@@ -1731,15 +1752,14 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
         hist[-1] = rec
     else:
         hist.append(rec)
-    brief = {s: dict(kl=round(d["kl"], 4), top1=round(d["top1"], 4)) for s, d in tf_sum.get("sets", {}).items()}
-    for s, d in gr_sum.get("sets", {}).items():
-        brief.setdefault(s, {}).update(cer=round(d["cer_ref_corpus"], 4), ratio=round(d["ratio_vs_teacher"], 3),
-                                       trunc=round(d["trunc_rate"], 4))
     if pg_sum and "all" in pg_sum:
         extra["probe_cer_teacher"] = round(pg_sum["all"]["cer_teacher_corpus"], 4)
     if combined:
         extra["combined_loss"] = {k: round(c["value"], 5) for k, c in combined.items()}
-    log.event("eval", at_step=step, final=final, complete=complete, wall_s=summary["wall_s"], sets=brief,
+    # greedy_scope ahead of the per-set numbers: the console's [event] line is cut at 300 characters
+    log.event("eval", at_step=step, final=final, complete=complete,
+              greedy_scope=summary["headline_scope"]["val_greedy"], wall_s=summary["wall_s"],
+              sets=eval_event_sets(tf_sum, gr_sum, full_sum),
               probe_kl=probe_sum["all"]["kl"] if probe_sum and "all" in probe_sum else None,
               headline={k: round(v, 5) for k, v in head.items()},
               **{k: v for k, v in extra.items() if k != "probe_greedy"})
