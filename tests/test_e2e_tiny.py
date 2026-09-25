@@ -136,7 +136,10 @@ def test_schedule_wsd_and_cadence():
 def test_configs_resolve():
     m = load_script("04_distill")
     via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
-    assert via == m.DEFAULTS  # the file spells out the defaults
+    # the file spells out the defaults, and turns early stopping on (off in DEFAULTS: a config that does not mention it
+    # trains to its budget, as before early stopping existed)
+    assert not m.DEFAULTS["early_stop"]["enabled"] and via["early_stop"]["enabled"]
+    assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True))
     smoke = m.load_config(str(ROOT / "configs" / "smoke_laptop.json"), ["hf.output_repo=u/r", "seed=7"])
     assert smoke["student"] == "students/b4x2560-d2" and smoke["schedule"]["train_hours"] == 0.1
     assert smoke["batch"]["micro_audio_s"] == 60 and smoke["batch"]["step_audio_s"] == 120
@@ -256,26 +259,44 @@ def test_shm_cap_fits_workers_into_dev_shm(monkeypatch, tmp_path):
     assert m.shm_cap(8, 4, 400, shm=str(tmp_path / "missing")) == (8, 4, None)  # no /dev/shm (Windows)
 
 
-def test_train_crash_resume_export(env, hub, monkeypatch, tmp_path):
-    m = load_script("04_distill")
-    monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "13")
-    with pytest.raises(RuntimeError, match="simulated crash"):
-        m.main(["--config", str(env["config"])])
-    run = next((env["root"] / "runs").glob("tiny-2*"))
-    ev1 = events(run)
+@pytest.fixture(scope="module")
+def crash_resume(env):
+    """The run that dies at a simulated crash at step 13 (KITSUNE_CRASH_AT_STEP) and is resumed from its full state at
+    step 10 to the end, uploading to a FakeHub. Module-scoped, so every test that reads it gets the run whichever test
+    runs first (or alone); what the crashed launch left behind is kept here, since the resume changes it."""
+    import huggingface_hub
+
+    hub = FakeHub()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(huggingface_hub, "HfApi", lambda *a, **k: hub)
+        mp.setenv("KITSUNE_CRASH_AT_STEP", "13")
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            load_script("04_distill").main(["--config", str(env["config"])])
+        (run,) = (env["root"] / "runs").glob("tiny-2*")
+        ck = run / "checkpoints"
+        crashed = dict(events=events(run), summary=json.loads((run / "summary.json").read_text(encoding="utf-8")),
+                       fulls=sorted(p.name for p in ck.glob("full_step_*")),
+                       weights={p.name for p in ck.glob("step_*")},
+                       utts=pd.concat([pd.read_parquet(p)
+                                       for p in sorted((run / "metrics" / "train_utts").glob("part-*.parquet"))]))
+        mp.delenv("KITSUNE_CRASH_AT_STEP")
+        rc = load_script("04_distill").main(["--config", str(env["config"]), "--resume", str(ck / "full_step_10")])
+    return dict(run=run, hub=hub, crashed=crashed, rc=rc)
+
+
+def test_train_crash_resume_export(crash_resume, tmp_path):
+    run, hub, crashed = crash_resume["run"], crash_resume["hub"], crash_resume["crashed"]
+    ev1 = crashed["events"]
     assert [e for e in ev1 if e["kind"] == "exception"][0]["type"] == "RuntimeError"
     kinds1 = [e["kind"] for e in ev1]
     assert "sync_ok" in kinds1[kinds1.index("logger_close"):]  # the forced sync ran after the crash
-    assert json.loads((run / "summary.json").read_text(encoding="utf-8"))["status"] == "failed"
+    assert crashed["summary"]["status"] == "failed"
     ck = run / "checkpoints"
     # full states after the smoke steps (4) and every 5 steps; keep_local=2 leaves 5 and 10
-    assert sorted(p.name for p in ck.glob("full_step_*")) == ["full_step_10", "full_step_5"]
-    assert {"step_5", "step_10"} <= {p.name for p in ck.glob("step_*")}
-    utts1 = pd.concat([pd.read_parquet(p) for p in sorted((run / "metrics" / "train_utts").glob("part-*.parquet"))])
-
-    monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
-    m2 = load_script("04_distill")
-    assert m2.main(["--config", str(env["config"]), "--resume", str(ck / "full_step_10")]) == 0
+    assert crashed["fulls"] == ["full_step_10", "full_step_5"]
+    assert {"step_5", "step_10"} <= crashed["weights"]
+    utts1 = crashed["utts"]
+    assert crash_resume["rc"] == 0  # the resumed launch ran to the end
 
     # ---- the section 7 layout
     for rel in ["config.json", "env/git_sha.txt", "env/git_diff.patch", "env/pip_freeze.txt", "env/nvidia_smi.txt",
@@ -337,6 +358,12 @@ def test_train_crash_resume_export(env, hub, monkeypatch, tmp_path):
     assert {"layers/grad_norm/encoder.layers.0", "layers/update_ratio/decoder.layers.0", "l2sp/dist/encoder.layers.1",
             "bn/max_abs_drift", "eval/tf/eval_jsut/kl", "eval/greedy/eval_cv8/cer_ref_corpus",
             "eval/probe/all/kl", "eval/greedy_full/eval_reazon/cer_ref_corpus"} <= tags
+    # every tag the trainer logs has a TensorBoard bucket by a rule (none fell through to 3_misc unmatched)
+    assert "tb_tag_unmapped" not in kinds
+    tag_map = json.loads((run / "metrics" / "tag_map.json").read_text(encoding="utf-8"))
+    assert tags <= set(tag_map) and not any(e.get("unmapped") for e in tag_map.values())
+    assert tag_map["eval/greedy_full/eval_reazon/cer_ref_corpus"]["tb_tag"] == \
+        "2_loss_accuracy/val_accuracy_full/eval_reazon/cer_ref_corpus"
     hist_tags = set(pd.concat([pd.read_parquet(p) for p in (run / "metrics" / "hist").glob("part-*.parquet")])["tag"])
     assert {"weight/encoder.layers.0", "grad/decoder.layers.0", "act/encoder.layers.1", "act/decoder.layers.0"} <= hist_tags
 
@@ -375,7 +402,62 @@ def test_train_crash_resume_export(env, hub, monkeypatch, tmp_path):
     spec.loader.exec_module(exp)
     tables = exp.export(str(run), tmp_path / "export")
     for name in ("steps", "scalars", "train_utts", "hist", "eval_tf", "eval_greedy", "eval_probe", "eval_summaries",
-                 "samples", "events", "tb_scalars", "tb_histograms", "tb_text"):
+                 "samples", "events", "tb_scalars", "tb_histograms", "tb_text", "tag_map"):
         assert name in tables and len(tables[name]), name
         assert (tmp_path / "export" / f"{name}.parquet").is_file()
     assert (tmp_path / "export" / "README.md").is_file()
+    assert set(tables["tb_scalars"]["tag"]) == set(tables["scalars"]["tag"])
+
+
+def _tool(name: str):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(name, ROOT / "tools" / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_regroup_tb_on_a_copy_of_the_run(crash_resume, tmp_path):
+    """tools/regroup_tb.py on a copy of the crash + resume run (the crash_resume fixture, made here if no other test
+    made it yet): TensorBoard shows the same points after the rebuild (the resume's purge replayed from events.jsonl),
+    the original event files are kept under names TensorBoard skips, and a second run rebuilds the same file again
+    instead of adding one."""
+    import shutil
+
+    from kitsune.runlog import TB_BUCKETS, load_tag_map, read_scalars_jsonl
+
+    src = crash_resume["run"]
+    run = tmp_path / "runs" / src.name
+    shutil.copytree(src, run, ignore=shutil.ignore_patterns("checkpoints"))
+    exp, rg = _tool("export_run"), _tool("regroup_tb")
+
+    def view():
+        t = exp.tb_tables(run / "tb", load_tag_map(run / "metrics" / "tag_map.json"))
+        return {k: df.drop(columns=["wall_time", *(["sum", "sum_squares"] if k == "tb_histograms" else [])])
+                .sort_values(["tag", "step"], kind="stable").reset_index(drop=True) for k, df in t.items()}
+
+    before = view()
+    originals = sorted(p.name for p in (run / "tb").iterdir())
+    assert len(originals) == 2  # the crashed launch's event file and the resumed launch's
+    assert rg.live_reason(run) is None
+    res = rg.regroup(run)
+    assert res["records"]["purge"] == 1 and res["unmapped"] == []
+    after = view()
+    for k in before:
+        assert len(before[k]) and before[k].equals(after[k]), k
+    kl = after["tb_scalars"][after["tb_scalars"]["tag"] == "loss/kl"]
+    assert kl["step"].tolist() == list(range(1, MAX_STEPS + 1))  # steps 11-13 of the crashed launch purged
+    logged = set(read_scalars_jsonl(run / "metrics" / "scalars.jsonl").column("tag").to_pylist())
+    assert sum(res["counts"][b]["scalars"] for b in TB_BUCKETS) == len(logged)
+    assert all(res["counts"][b]["scalars"] for b in TB_BUCKETS) and res["counts"]["3_misc"]["histograms"] > 0
+    files = sorted(p.name for p in (run / "tb").iterdir())
+    assert sorted(f for f in files if f.endswith(".bak")) == sorted(rg.backup_name(f) for f in originals)
+    assert len([f for f in files if "tfevents" in f]) == 1
+
+    res2 = rg.regroup(run)
+    files2 = sorted(p.name for p in (run / "tb").iterdir())
+    assert [f for f in files2 if f.endswith(".bak")] == [f for f in files if f.endswith(".bak")]
+    assert len([f for f in files2 if "tfevents" in f]) == 1 and res2["counts"] == res["counts"]
+    again = view()
+    assert all(again[k].equals(after[k]) for k in after)

@@ -9,6 +9,10 @@ Sources (all streamed file-by-file from HF; each raw download is deleted after c
                 medium) transcript. Tars are taken in order until --emilia-hours of kept audio. Replaces galgame for
                 runs whose model must stay free of galgame's non-commercial / must-open-source terms.
                 NEVER point this at the amphion Emilia/JA (non-YODAS) files: those are CC BY-NC.
+  emilia_nc     laion/Emolia JA-B*_standard.tar.gz: Emilia's non-YODAS Japanese part (podcasts, talk shows; CC BY-NC 4.0,
+                non-commercial models only), same format and filters as emilia_yodas, --emilia-nc-hours budget
+  reazon_large  japanese-asr/whisper_transcriptions.reazonspeech.large (~5000 h, contains medium and small; rows
+                already in reazon_small/reazon_medium are skipped)
   cv            Common Voice ja  -- NOT on HF anymore. Download cv-corpus-*-ja.tar.gz from
                 https://datacollective.mozillafoundation.org and extract to data/raw/common_voice/ ; this script ingests it.
   eval_emilia   monitor-only Emilia hold-out: first 1000 Japanese clips of JA-B000029 from videos absent from
@@ -33,6 +37,7 @@ import argparse
 import csv
 import json
 import re
+import shutil
 import sys
 import tarfile
 from pathlib import Path
@@ -54,6 +59,7 @@ HF_PARQUET_SOURCES = {
     # name: (repo, split)
     "reazon_small": ("japanese-asr/whisper_transcriptions.reazonspeech.small", "train"),
     "reazon_medium": ("japanese-asr/whisper_transcriptions.reazonspeech.medium", "train"),
+    "reazon_large": ("japanese-asr/whisper_transcriptions.reazonspeech.large", "train"),
     "eval_jsut": ("japanese-asr/ja_asr.jsut_basic5000", "eval"),
     "eval_cv8": ("japanese-asr/ja_asr.common_voice_8_0", "eval"),
     "eval_reazon": ("japanese-asr/ja_asr.reazonspeech_test", "eval"),
@@ -69,15 +75,21 @@ REVISIONS = {
     "japanese-asr/ja_asr.common_voice_8_0": "bf8819e8d9a5feb51b0c718686bd20ea67a3c729",
     "japanese-asr/ja_asr.reazonspeech_test": "dd08bfb9dfc1cef4e4d0609fd78c3755d48b926f",
     "TTS-AGI/emilia-yodas": "613a372ba2cc5ecb6b27ea38a4a0926abb38263d",
+    "japanese-asr/whisper_transcriptions.reazonspeech.large": "4ad8d64a13594f0ce1f0622627a18ef99b42b5e8",
+    "laion/Emolia": "4d375b4bf276834e555022bb7c937f87091e895e",
 }
 EMILIA_REPO = "TTS-AGI/emilia-yodas"
 EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS = "JA/JA-B000029.tar", 1000  # last tar: far beyond any training budget
+# Emilia's non-YODAS Japanese part (CC BY-NC 4.0 per amphion/Emilia-Dataset; the laion card's cc-by-4.0 tag does not
+# override that) from LAION's ungated re-upload, which adds emotion annotations. Only for non-commercial models.
+EMOLIA_REPO = "laion/Emolia"
 # Emilia's language tag is per video, so a 'ja' tar still holds some English clips; require Japanese script instead
 _JA_SCRIPT = re.compile(r"[぀-ヿ㐀-䶿一-鿿]")
-ALL_SOURCES = ["reazon_small", "reazon_medium", "galgame", "emilia_yodas", "cv", "eval", "eval_jsut", "eval_cv8",
-               "eval_reazon", "eval_emilia"]
+ALL_SOURCES = ["reazon_small", "reazon_medium", "reazon_large", "galgame", "emilia_yodas", "emilia_nc", "cv", "eval",
+               "eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia"]
 # ReazonSpeech tiers are nested (small is a subset of medium), so a larger tier must skip rows already ingested
-DEDUP_AGAINST = {"reazon_medium": "reazon_small"}
+DEDUP_AGAINST = {"reazon_medium": ("reazon_small",), "reazon_large": ("reazon_small", "reazon_medium")}
+MIN_FREE_GB = 30.0  # stop a download (resumably) before it would fill the data disk
 
 
 class Ingest:
@@ -130,6 +142,11 @@ class Ingest:
         save_progress(self.root, self.source, self.progress)
 
     def download(self, repo: str, filename: str) -> Path:
+        here = next(d for d in (self.root, *self.root.parents) if d.exists())  # the data root may not exist yet
+        free_gb = shutil.disk_usage(here).free / 1e9
+        if free_gb < MIN_FREE_GB:  # everything flushed so far stays; a re-run continues with this input file
+            raise SystemExit(f"  {self.source}: only {free_gb:.0f} GB free on the data disk (< {MIN_FREE_GB:.0f} GB); "
+                             f"stopping before {filename}")
         return Path(hf_hub_download(repo, filename, repo_type="dataset", revision=REVISIONS[repo], cache_dir=self.raw))
 
     @staticmethod
@@ -164,7 +181,7 @@ def ingest_hf_parquet(ing: Ingest, repo: str, split: str):
     # dedup against a nested smaller tier AND against this source's own manifest shards (a crash mid input
     # file re-reads rows already flushed; only manifest-listed shards count - orphans are re-ingested).
     seen: set[str] = set()
-    dedup_sources = {ing.source} | ({DEDUP_AGAINST[ing.source]} if ing.source in DEDUP_AGAINST else set())
+    dedup_sources = {ing.source} | set(DEDUP_AGAINST.get(ing.source, ()))
     for sh in read_manifest(ing.root):
         if sh.source in dedup_sources:
             for row in iter_rows(ing.root / sh.path, columns=["id"]):
@@ -244,7 +261,11 @@ def ingest_emilia(ing: Ingest, max_hours: float):
     training box) stops at the same utterance. A tar cut short by the budget is not marked finished, so raising
     --emilia-hours later continues inside it (the id dedup skips what is already stored)."""
     tars = sorted(f for f in HfApi().list_repo_files(EMILIA_REPO, repo_type="dataset", revision=REVISIONS[EMILIA_REPO])
-                  if f.startswith("JA/") and f.endswith(".tar"))
+                  if f.startswith("JA/") and f.endswith(".tar") and f != EMILIA_EVAL_TAR)  # never the hold-out's tar
+    # videos with clips in the eval_emilia hold-out never enter training (a video's clips can span tars)
+    eval_videos = {_emilia_video(row["id"]) for sh in read_manifest(ing.root) if sh.source == "eval_emilia"
+                   for row in iter_rows(ing.root / sh.path, columns=["id"])}
+    ing.stats.setdefault("eval_video", 0)
     seen: set[str] = set()
     for sh in read_manifest(ing.root):
         if sh.source == ing.source:
@@ -277,6 +298,9 @@ def ingest_emilia(ing: Ingest, max_hours: float):
                 if rid in seen:
                     ing.stats["dup"] += 1
                     continue
+                if _emilia_video(key) in eval_videos:
+                    ing.stats["eval_video"] += 1
+                    continue
                 meta = json.loads(d["json"].decode("utf-8", "replace"))
                 text = meta.get("text") or ""
                 if meta.get("language", "ja") != "ja" or not _JA_SCRIPT.search(text):
@@ -291,6 +315,61 @@ def ingest_emilia(ing: Ingest, max_hours: float):
         ing.free_download(local)
     if pending:
         print(f"  {ing.source}: {len(pending)} unpaired members dropped")
+    ing.done()
+    print(f"  {ing.source}: dropped non-Japanese text={ing.stats['non_ja']}")
+
+
+def ingest_emilia_nc(ing: Ingest, max_hours: float):
+    """Emilia's non-YODAS JA part from laion/Emolia JA-B*_standard.tar.gz (<worker>/<key>.mp3 + .json), in order until
+    max_hours of kept audio. Same filters and resume logic as ingest_emilia; the budget counts stored audio."""
+    tars = sorted(f for f in HfApi().list_repo_files(EMOLIA_REPO, repo_type="dataset", revision=REVISIONS[EMOLIA_REPO])
+                  if f.startswith("JA-") and f.endswith("_standard.tar.gz"))
+    seen: set[str] = set()
+    for sh in read_manifest(ing.root):
+        if sh.source == ing.source:
+            for row in iter_rows(ing.root / sh.path, columns=["id", "duration"]):
+                seen.add(row["id"])
+                ing.stats["seconds"] += row["duration"]
+    budget_s = max_hours * 3600
+    ing.stats.setdefault("non_ja", 0)
+    for f in tqdm(tars, desc=ing.source, unit="tar"):
+        if ing.stats["seconds"] >= budget_s or ing.limit_hit():
+            break
+        if ing.is_finished(f):
+            continue
+        local = ing.download(EMOLIA_REPO, f)
+        pending: dict[str, dict] = {}
+        cut_short = False
+        with tarfile.open(local, "r:gz") as tf:
+            for m in tf:
+                if not m.isfile() or "." not in m.name.rsplit("/", 1)[-1]:
+                    continue
+                key, ext = m.name.rsplit("/", 1)[-1].rsplit(".", 1)
+                if ext not in ("mp3", "json"):
+                    continue
+                d = pending.setdefault(key, {})
+                d[ext] = tf.extractfile(m).read()
+                if "mp3" not in d or "json" not in d:
+                    continue
+                del pending[key]
+                rid = f"{ing.source}/{key}"
+                if rid in seen:
+                    ing.stats["dup"] += 1
+                    continue
+                meta = json.loads(d["json"].decode("utf-8", "replace"))
+                text = meta.get("text") or ""
+                if meta.get("language", "ja") != "ja" or not _JA_SCRIPT.search(text):
+                    ing.stats["non_ja"] += 1
+                    continue
+                ing.add("train", rid, d["mp3"], text)
+                if ing.stats["seconds"] >= budget_s or ing.limit_hit():
+                    cut_short = True
+                    break
+        if pending:
+            print(f"  {ing.source}/{f}: {len(pending)} unpaired members dropped")
+        if not cut_short:
+            ing.finish_input(f)
+        ing.free_download(local)
     ing.done()
     print(f"  {ing.source}: dropped non-Japanese text={ing.stats['non_ja']}")
 
@@ -374,14 +453,18 @@ def ingest_common_voice(ing: Ingest):
 
 
 def main():
+    global MIN_FREE_GB
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default=None, help=f"data root (default: {ROOT / 'data'}, or data_smoke with --limit-rows)")
     ap.add_argument("--sources", nargs="+", default=["reazon_small", "galgame", "eval"], choices=ALL_SOURCES)
     ap.add_argument("--galgame-shards", type=int, default=6, help="number of 0.88 GB tars (~47 h each) to take")
     ap.add_argument("--emilia-hours", type=float, default=300.0, help="kept hours of Emilia-YODAS JA to ingest (~1 GB tar per 36-73 h)")
+    ap.add_argument("--emilia-nc-hours", type=float, default=float("inf"), help="kept hours of Emilia non-YODAS JA (CC BY-NC)")
+    ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB, help="stop before a download would leave less free")
     ap.add_argument("--limit-rows", type=int, default=None, help="debug: stop each source after N kept rows (galgame hold-out exempt)")
     ap.add_argument("--force", action="store_true", help="wipe and re-ingest sources that are already present")
     args = ap.parse_args()
+    MIN_FREE_GB = args.min_free_gb
 
     # a row-limited run must never look like a finished dataset: keep it in its own root
     root = Path(args.data) if args.data else ROOT / ("data_smoke" if args.limit_rows else "data")
@@ -408,6 +491,8 @@ def main():
             ingest_emilia(ing, args.emilia_hours)
         elif s == "eval_emilia":
             ingest_emilia_eval(ing, EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS)
+        elif s == "emilia_nc":
+            ingest_emilia_nc(ing, args.emilia_nc_hours)
         elif s == "cv":
             ingest_common_voice(ing)
 

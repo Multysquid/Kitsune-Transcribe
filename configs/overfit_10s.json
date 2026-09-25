@@ -1,0 +1,22 @@
+{
+  "_comment": "Laptop overfit sanity run 2 of 3 (scripts/run_overfit_tests.cmd): the real 0.6B student on ~10 s of train audio (seeded subset of the kept reazon_small/emilia_yodas/galgame train rows; the ids are the `subset` events) for up to 100 epochs = 100 optimizer steps (step_audio_s >= the subset: one step per epoch), an eval after every epoch on ~10 s of the pooled gate eval sets (teacher-forced + greedy) and a probe on the whole train subset (teacher-forced + greedy on up to 10 s of it). Expect the probe KL and CER vs teacher to fall towards 0. Early stop as in overfit_1s.json: once the probe KL has not improved by max(0.001, 2 %) for 20 epochs in a row (never before epoch 10) the run goes to its end phase. Viability settings otherwise, SpecAugment off, warmup 10 steps (10 %), cooldown over the last 20 %, AdamW + fp32 masters offloaded to host memory with the fused CPU kernel (see overfit_1s.json for the measured CPU cost, ~2-2.5 s per step). Expected wall time: at most 100 x ~2.5-3 s steps (~5 min) + 100 evals x ~3-4 s (~6 min) + setup, smoke and the full states (8.6 GB each) after the smoke steps and every 10 min of loop time, the resume points scripts/supervise_distill.py relaunches from after a GPU fault (~6 min) = about 12-20 min, less when the early stop ends it. To stop it by hand: create runs/<run_id>/STOP.",
+  "run_name": "overfit-10s",
+  "student": "students/b20x2560-d4",
+  "sources": ["reazon_small", "emilia_yodas", "galgame"],
+  "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon"],
+  "subset": {"train_audio_s": 10, "eval_audio_s": 10},
+  "specaug": {"enabled": false},
+  "optim": {"offload": "cpu", "offload_fused": true},
+  "schedule": {"clock": "epochs", "epochs": 100, "warmup_steps": 300, "cooldown_frac": 0.2},
+  "batch": {"step_audio_s": 60, "micro_audio_s": 60, "pool_micro": 50, "max_dec_len": 200},
+  "memory": {"grad_ckpt": "auto", "probe_longest_bucket": true, "min_micro_audio_s": 15, "max_oom_skips": 3},
+  "perf": {"num_workers": 2, "prefetch": 2, "peak_tflops": 165.0},
+  "eval": {"every_epochs": 1, "probe": true, "probe_is_train": true, "probe_greedy_audio_s": null, "batch_s": 60},
+  "ckpt": {"weights_every_min": 60, "full_local_every_min": 10, "keep_local": 1, "upload_full_at": [],
+           "full_after_smoke": true},
+  "log": {"layer_stats_every": 10, "hist_every": 50, "train_utts_flush": 10, "sync_every_min": 2},
+  "hf": {"output_repo": null},
+  "smoke": {"enabled": true, "steps": 2, "min_audio_s_per_s": 0, "require_loss_decrease": false},
+  "early_stop": {"enabled": true, "metric": "probe_kl", "patience": 20, "min_delta_rel": 0.02, "min_delta_abs": 0.001,
+                 "min_evals": 10, "floor": null, "action": "stop"}
+}

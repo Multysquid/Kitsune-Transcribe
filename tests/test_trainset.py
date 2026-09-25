@@ -491,3 +491,19 @@ def test_real_shard_alignment(tmp_path):
         assert abs(int(b["lengths"][r]) - float(z["duration"][r]) * 16000) <= 1
         n += e - s
     assert n == b["top_idx"].shape[0]
+
+
+def test_selection_filters_only_named_monitor_eval_sets(corpus, tmp_path):
+    """--filter-eval-sets gives a monitor-only hold-out the train label rules; other eval sets stay unfiltered."""
+    ev = EVAL[0]
+    out = tmp_path / "sel.parquet"
+    make_fake_selection(corpus, out, greedy_n=5, probe_n=5, extra_args=("--filter-eval-sets", ev))
+    sel = pd.read_parquet(out)
+    rows = sel[(sel["source"] == ev) & (sel["split"] == "eval")]
+    assert not rows[rows["truncated"]]["keep"].any()  # truncated hold-out rows now dropped
+    assert set(rows["reason"]) - {"kept", "truncated", "no_agree", "no_audio"} <= {r for r in rows["reason"] if r.startswith("agree>")}
+    for other in EVAL[1:]:
+        o = sel[(sel["source"] == other) & (sel["split"] == "eval")]
+        assert set(o["reason"]) <= {"kept", "no_audio"}
+    with pytest.raises(SystemExit):  # the pre-registered gate sets can never be filtered
+        make_fake_selection(corpus, tmp_path / "bad.parquet", extra_args=("--filter-eval-sets", "eval_jsut"))

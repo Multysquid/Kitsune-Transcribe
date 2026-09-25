@@ -187,6 +187,72 @@ def test_train_utts_and_hist_parts(run):
     assert g["n"] == 3 and g["n_nonfinite"] == 2 and g["max"] == 3.0
 
 
+def test_tensorboard_tags_are_bucketed(run):
+    """TensorBoard gets every tag under 1_operational/, 2_loss_accuracy/ or 3_misc/; the open-format files keep the
+    logged tag; metrics/tag_map.json maps one to the other; a tag no rule matches leaves one event, however often it
+    is logged."""
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    acc = EventAccumulator(str(run / "tb"))
+    acc.Reload()
+    tags = acc.Tags()
+    assert all(t.split("/", 1)[0] in runlog.TB_BUCKETS for k in ("scalars", "histograms", "tensors") for t in tags[k])
+    assert {"2_loss_accuracy/train_loss/total", "2_loss_accuracy/train_loss/kl/src_a", "3_misc/lr",
+            "3_misc/grad_norm"} <= set(tags["scalars"])
+    assert any(t.startswith("1_operational/sys/proc/") for t in tags["scalars"])
+    assert set(tags["histograms"]) == {"3_misc/weights/enc0", "3_misc/grads/enc0"}
+    assert {"1_operational/config/text_summary", "2_loss_accuracy/samples/text_summary", "3_misc/note/text_summary",
+            "1_operational/events/phase/text_summary"} <= set(tags["tensors"])
+
+    sc = read_scalars_jsonl(run / "metrics" / "scalars.jsonl").to_pandas()
+    assert {"loss/total", "lr", "grad_norm"} <= set(sc["tag"]) and not any(sc["tag"].str.startswith("2_loss"))
+    assert set(pd.read_parquet(run / "metrics" / "steps.parquet").columns) >= {"loss/total", "lr"}
+    tag_map = json.loads((run / "metrics" / "tag_map.json").read_text(encoding="utf-8"))
+    assert tag_map["loss/total"] == {"tb_tag": "2_loss_accuracy/train_loss/total", "bucket": "2_loss_accuracy",
+                                     "plugin": "scalars"}
+    assert tag_map["weights/enc0"] == {"tb_tag": "3_misc/weights/enc0", "bucket": "3_misc", "plugin": "histograms"}
+    assert tag_map["samples"]["tb_tag"] == "2_loss_accuracy/samples"
+    assert tag_map["events/logger_start"]["bucket"] == "1_operational"
+    assert set(sc["tag"]) | {"weights/enc0", "grads/enc0", "note", "samples", "config"} <= set(tag_map)
+    unmapped = [e for e in events(run) if e["kind"] == "tb_tag_unmapped"]
+    assert sorted((e["tag"], e["plugin"]) for e in unmapped) == [("grad_norm", "scalars"), ("lr", "scalars"),
+                                                                ("note", "text")]  # 5 steps, one event each
+    assert all(tag_map[e["tag"]]["unmapped"] is True for e in unmapped)
+
+
+def test_tag_map_survives_a_restart(tmp_path):
+    run = tmp_path / "restart-run"
+    log = RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False)
+    log.scalar("odd", 1.0, 1)
+    log.scalar("loss/kl", 1.0, 1)
+    log.close()
+    log = RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False)  # re-launch into the same dir
+    log.scalar("odd", 2.0, 2)
+    log.scalar("odder", 2.0, 2)
+    log.close()
+    tag_map = json.loads((run / "metrics" / "tag_map.json").read_text(encoding="utf-8"))
+    assert {"odd", "odder", "loss/kl"} <= set(tag_map)
+    assert [e["tag"] for e in events(run) if e["kind"] == "tb_tag_unmapped"] == ["odd", "odder"]
+    assert "tb_layout_mixed" not in [e["kind"] for e in events(run)]  # the tag map was there: one layout
+
+
+def test_restart_into_a_run_without_tag_map_warns_once(tmp_path):
+    """A restart into a run logged before the buckets (event files in tb/, no metrics/tag_map.json) mixes both layouts
+    in TensorBoard: one tb_layout_mixed event names the earlier files and tools/regroup_tb.py; the next restart finds
+    the tag map the first one wrote and stays quiet."""
+    run = tmp_path / "old-run"
+    log = RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False)
+    log.scalar("loss/kl", 1.0, 1)
+    log.close()
+    (run / "metrics" / "tag_map.json").unlink()  # as a logger from before the buckets left the run
+    old = sorted(p.name for p in (run / "tb").iterdir())
+    for _ in range(2):
+        RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False).close()
+    mixed = [e for e in events(run) if e["kind"] == "tb_layout_mixed"]
+    assert len(mixed) == 1 and mixed[0]["files"] == old and "tools/regroup_tb.py" in mixed[0]["hint"]
+    assert (run / "metrics" / "tag_map.json").is_file()
+
+
 def test_sync_runs_in_background_and_excludes_checkpoints(tmp_path):
     api = FakeApi(delay=1.5)
     run = tmp_path / "bg-run"
@@ -206,6 +272,7 @@ def test_sync_runs_in_background_and_excludes_checkpoints(tmp_path):
     assert "checkpoints/*" in call["ignore_patterns"]
     assert api.repos == [("me/kitsune-runs", dict(repo_type="model", private=True, exist_ok=True))]
     assert "metrics/steps.parquet" in call["files"] and "events.jsonl" in call["files"]
+    assert "metrics/tag_map.json" in call["files"]
     log.close()
     assert len(api.calls) == 2  # the final forced sync waited for its upload
     assert pd.read_parquet(run / "metrics" / "steps.parquet")["step"].tolist() == [1, 2]
@@ -372,14 +439,29 @@ def test_export_run(run, tmp_path):
 
     tb = pd.read_parquet(out / "tb_scalars.parquet")
     sc = pd.read_parquet(out / "scalars.parquet")
-    assert set(tb["tag"]) == set(sc["tag"])  # TensorBoard mirrors every scalar
+    assert set(tb["tag"]) == set(sc["tag"])  # TensorBoard mirrors every scalar (the logged tags given back)
     t = tb[tb["tag"] == "loss/total"].sort_values("step")
     assert t["step"].tolist() == [1, 2, 3, 4, 5] and t["value"].tolist() == pytest.approx([2.0 / s for s in range(1, 6)])
+    assert set(t["tb_tag"]) == {"2_loss_accuracy/train_loss/total"} and set(t["bucket"]) == {"2_loss_accuracy"}
+    for df in (tb, sc):  # the bucket columns agree between the TensorBoard mirror and the open files
+        assert list(df.columns[:3]) == ["tag", "bucket", "tb_tag"]
+        assert (df["tb_tag"].str.split("/").str[0] == df["bucket"]).all()
+        assert set(df["bucket"]) <= set(runlog.TB_BUCKETS)
+    assert dict(zip(tb["tag"], tb["tb_tag"])) == dict(zip(sc["tag"], sc["tb_tag"]))
+    assert sc.set_index("tag").loc["lr", "bucket"].iloc[0] == "3_misc"
     hi = pd.read_parquet(out / "tb_histograms.parquet")
     assert set(hi["tag"]) == {"weights/enc0", "grads/enc0"} and hi.set_index("tag").loc["weights/enc0", "num"] == 10_000
+    assert set(hi["bucket"]) == {"3_misc"} and set(pd.read_parquet(out / "hist.parquet")["bucket"]) == {"3_misc"}
     tx = pd.read_parquet(out / "tb_text.parquet")
     assert {"note", "samples", "config"} <= set(tx["tag"]) and any(tx["tag"].str.startswith("events/"))
     assert "hello **world**" in tx.set_index("tag").loc["note", "text"]
+    assert tx.set_index("tag").loc["samples", "tb_tag"] == "2_loss_accuracy/samples"
+    tm = pd.read_parquet(out / "tag_map.parquet").set_index(["tag", "plugin"])
+    assert tm.loc[("loss/total", "scalars"), "tb_tag"] == "2_loss_accuracy/train_loss/total"
+    assert tm.loc[("lr", "scalars"), "unmapped"] and not tm.loc[("loss/total", "scalars"), "unmapped"]
+    assert tm.loc[("events/phase", "text"), "bucket"] == "1_operational"
+    assert json.loads((out / "tag_map.json").read_text(encoding="utf-8")) == json.loads(
+        (run / "metrics" / "tag_map.json").read_text(encoding="utf-8"))
 
     tf = pd.read_parquet(out / "eval_tf.parquet")
     assert tf["step"].tolist() == [5, 5] and tf["set"].tolist() == ["eval_jsut"] * 2
@@ -393,11 +475,15 @@ def test_export_run(run, tmp_path):
     assert len(pd.read_parquet(out / "train_utts.parquet")) == 15
 
     readme = (out / "README.md").read_text(encoding="utf-8")
-    for name in ["tb_scalars", "scalars", "steps", "train_utts", "hist", "eval_tf", "eval_greedy", "events", "samples"]:
+    for name in ["tb_scalars", "scalars", "steps", "train_utts", "hist", "eval_tf", "eval_greedy", "events", "samples",
+                 "tag_map"]:
         assert f"`{name}.parquet`" in readme, name
         for col in pd.read_parquet(out / f"{name}.parquet").columns:
             assert f"`{col}`" in readme, (name, col)
-    assert "`loss/total`" in readme  # the tag list
+    assert "`loss/total`" in readme and "`2_loss_accuracy/train_loss/total`" in readme  # the tag list
+    for needle in ("## TensorBoard layout", "`1_operational/`", "`2_loss_accuracy/`", "`3_misc/`", "- `tag_map.json`:",
+                   "tools/regroup_tb.py", "| `3_misc` |", "`lr`"):
+        assert needle in readme, needle
 
 
 def test_export_keeps_infra_logs_and_restart_configs(run, tmp_path):

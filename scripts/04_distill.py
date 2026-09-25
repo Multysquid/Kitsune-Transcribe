@@ -6,11 +6,12 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                the LM head in fp32 outside autocast, as in the teacher pass), rel-pos patch, BatchNorm frozen, the
                frozen decoder pos_emb, AdamW, the decoupled L2-SP anchor, train/eval stores and the step planner
   2. smoke     (fresh runs) the memory probe first (CUDA: forward+backward on the three worst micro-batches with the
-               optimizer state's bytes reserved; on OOM halve micro_audio_s down to memory.min_micro_audio_s, then
-               per-layer gradient checkpointing), then LogMel vs the HF extractor, forward+backward on the longest
-               padded micro-batch with finite gradients, padded rows == the same utterances run alone (mean KL over
-               the shortest smoke.pad_utts; see padded_row_check), SDPA backends, a FLOP count for the MFU estimate
-               and an HF upload round trip
+               optimizer state's bytes reserved and, when steps accumulate several micro-batches, the gradients held;
+               on OOM halve micro_audio_s down to memory.min_micro_audio_s, then per-layer gradient checkpointing; on
+               Windows under a cap at the free VRAM, see cap_vram), then LogMel vs the HF extractor,
+               forward+backward on the longest padded micro-batch with finite gradients, padded rows == the same
+               utterances run alone (mean KL over the shortest smoke.pad_utts; see padded_row_check), SDPA backends, a
+               FLOP count for the MFU estimate and an HF upload round trip
   3. step 0    eval of the untrained student: teacher-forced on the eval sets and the train probe, greedy on the fixed
                subsets. It runs BEFORE any weight update (the spec lists the 100 smoke steps first, which would make
                "step 0" a 100-step model)
@@ -18,22 +19,45 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                `lr_phase` event), L2-SP after every optimizer step,
                gradients clipped (the pre-clip norm is logged). The first smoke.steps steps are the smoke run: finite
                losses, the loss trend, and throughput - below smoke.min_audio_s_per_s audio-s/s the run exits with
-               code 3 (ThroughputTooLow). A full state is written right after them, and before the cooldown starts
+               code 3 (ThroughputTooLow). A full state is written right after them, and before the cooldown starts.
+               Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
                sets, verdict (kitsune.evaluate.verdict), summary.json, uploads awaited, final forced sync; exit 0
 
-Exit codes (vast/supervise.py keys on them): 0 finished, 3 throughput too low, 1 anything else. Any exception is
-logged as an event with its traceback, a partial summary.json is written and the logs are force-synced before the
-exception propagates.
+Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and configs/overfit_*.json): after every
+eval inside the loop (never the step-0 eval, never the final one) the metric - "probe_kl" (teacher-forced KL on the
+train probe), "heldout_kl" (the gate sets' pooled held-out KL, as the verdict reads it) or "train_loss" (the mean
+loss/total of the optimizer steps since the previous eval) - improves when best - value > max(min_delta_abs,
+min_delta_rel * |best|); the first in-loop eval sets the best. Once early_stop.min_evals in-loop evals are done,
+early_stop.patience evals in a row without an improvement (reason "patience") or a value <= early_stop.floor (reason
+"floor") trigger early_stop.action, once:
+  stop       leave the loop right after that eval: the end phase as usual (final eval with the probe, verdict, summary,
+             uploads; exit 0)
+  cooldown   start the WSD cooldown now (1 - sqrt over schedule.cooldown_frac x the loop time, or steps, done so far,
+             capped by what is left of the budget; on the epoch clock in steps, so the epoch plan ends early), then the
+             end phase. Already in the cooldown: the run goes on to its scheduled end
+Manual stop: create the file runs/<run_id>/STOP (on the vast box: touch
+/workspace/Kitsune-Transcribe/runs/<run_id>/STOP). It is checked before every optimizer step, whatever
+early_stop.enabled says: the step under way finishes (its eval and checkpoints included), then the "stop" path with
+reason "stop_file". Every trigger is an `early_stop` event (metric, value, best, best_step, evals_since_best, reason,
+action, at_step, epoch; `cooldown` with the new schedule) and summary.json's `stopped_early` (null if none); the
+scalars early_stop/{value,best,evals_since_best,triggered} follow every checked eval. The early-stop state is part of
+the full state: a resumed run continues the patience count, and one that had already triggered "stop" goes straight
+to the end phase (a triggered cooldown carries on to its end).
+
+Exit codes (vast/supervise.py and scripts/supervise_distill.py key on them): 0 finished, 3 throughput too low, 1
+anything else. Any exception is logged as an event with its traceback, a partial summary.json is written and the logs
+are force-synced before the exception propagates.
 
 Checkpoints under runs/<run_id>/checkpoints/:
   step_<N>/        bf16 weights via kitsune.student.save_student (processor + student_meta.json with a `trained`
                    block); loadable with kitsune.student.load_student. Every ckpt.weights_every_min, uploaded to
                    <repo>:runs/<run_id>/checkpoints/step_<N>/ when hf.output_repo is set. All are kept locally.
-  full_step_<N>/   model.pt (fp32 state_dict), optimizer.pt, l2sp.pt (theta_0), trainer.pt (config, progress
-                   counters and clocks, eval history, planner position, RNG states, logger state). Every
-                   ckpt.full_local_every_min, the newest ckpt.keep_local are kept; uploaded at ckpt.upload_full_at
-                   ("pre_cooldown", "end"). Written as <name>.tmp/ and renamed, so a crash never leaves a torn one.
+  full_step_<N>/   model.pt (fp32 state_dict), optimizer.pt (the host AdamW's under optim.offload "cpu", same
+                   format), l2sp.pt (theta_0), trainer.pt (config, progress counters and clocks, eval history,
+                   planner position, RNG states, logger state). Every ckpt.full_local_every_min, the newest
+                   ckpt.keep_local are kept; uploaded at ckpt.upload_full_at ("pre_cooldown", "end"). Written as
+                   <name>.tmp/ and renamed, so a crash never leaves a torn one.
 `--resume <full_step_N dir | run dir>` restores all of it into the same run dir and continues the same schedule and
 time budget; the config comes from the checkpoint, with this invocation's --set overrides applied on top (--config is
 then ignored).
@@ -42,9 +66,18 @@ Time: in schedule.clock "wall" (the real run) the budget T = train_hours of loop
 step, evals and checkpoints included; the step-0 eval and the final eval are outside it. The clock continues across a
 resume (time between a crash and the resume is not counted). On the vast box T is also clipped at every loop start so
 the end phase finishes before the watchdog's fixed deadline ($KITSUNE_DEADLINE or $KITSUNE_STATE/deadline; see
-fit_budget). schedule.clock "steps" makes T = schedule.max_steps
-optimizer steps, and eval.every_steps / ckpt.*_every_steps replace the minute cadences when set: deterministic
-schedules for tests and debugging.
+fit_budget). schedule.clock "steps" makes T = schedule.max_steps optimizer steps, and eval.every_steps /
+ckpt.*_every_steps replace the minute cadences when set: deterministic schedules for tests and debugging.
+schedule.clock "epochs" makes T = the optimizer steps of schedule.epochs full passes over the train set (plan_epochs),
+with the warmup capped at ceil(10 %) of them; eval.every_epochs runs the eval at every N-th epoch end instead of the
+minute/step cadence (the last epoch's is the end phase's final eval).
+
+Overfit sanity runs (configs/overfit_*.json, scripts/run_overfit_tests.cmd): subset.train_audio_s / eval_audio_s train
+and evaluate on seeded subsets of about that many seconds (audio_subset; logged as `subset` events with every id),
+eval.probe_is_train makes the whole train subset the teacher-forced probe and eval.probe_greedy_audio_s adds a greedy
+decode of part of it, so memorisation (probe KL and CER vs teacher -> 0) shows next to the held-out eval;
+specaug.enabled false trains un-augmented. optim.offload "cpu" keeps AdamW and fp32 master weights in host memory
+(CpuOffloadAdamW), for a GPU that holds the weights and gradients but not the optimizer state (the 8 GB laptop).
 
 Test hook: the environment variable KITSUNE_CRASH_AT_STEP=<n> raises a RuntimeError just before step n (exercises
 the crash path and --resume; it lives in the environment so a resumed run does not inherit it from the config).
@@ -55,10 +88,12 @@ and re-import this file as __mp_main__, and should only pay for torch.
 Usage:
   python scripts/04_distill.py --config configs/viability.json --set hf.output_repo=<user>/<repo>
   python scripts/04_distill.py --config configs/smoke_laptop.json
+  python scripts/04_distill.py --config configs/overfit_10s.json
   python scripts/04_distill.py --config configs/viability.json --resume runs/<run_id>/checkpoints/full_step_<N>
 """
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -88,6 +123,7 @@ from kitsune import trainset  # noqa: E402
 from kitsune.features import LogMel, SpecAugment  # noqa: E402
 from kitsune.kd import L2SP, kd_losses, kd_objective, module_key  # noqa: E402
 from kitsune.patches import assert_bn_frozen, patch_relpos_once_per_batch, train_mode  # noqa: E402
+from kitsune.runlog import _replace as _replace_file  # noqa: E402  (atomic file replace with the Windows retry)
 
 EXIT_OK, EXIT_THROUGHPUT, EXIT_FAIL = 0, 3, 1
 SR = 16000
@@ -100,26 +136,38 @@ TERM_TAGS = dict(kl="loss/kl", ce="loss/ce", top1_match="tok/top1", student_entr
                  teacher_tail="tok/tail_teacher", teacher_p1="tok/teacher_p1")
 BUCKETS = (("p1_gt_0.99", lambda p1: p1 > 0.99), ("p1_lt_0.9", lambda p1: p1 < 0.9))
 
-# Defaults = the viability run (configs/viability.json spells out the same values). Paths are relative to the repo root.
+# Defaults = the viability run (configs/viability.json spells out the same values, and turns early_stop on). Paths are
+# relative to the repo root.
 DEFAULTS = {
     "run_name": "viability-b20x2560", "student": "students/b20x2560-d4", "data_root": "data",
     "teacher_root": "teacher_out", "second_root": "second_out", "selection": "selection/viability.parquet",
     "cache_dir": "cache", "runs_root": "runs",
-    "sources": ["reazon_small", "emilia_yodas"], "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia"], "mix": "natural",
-    "subset": {"train_utts": None, "eval_utts_per_set": None},  # smoke runs: seeded id subsets, small caches
+    "sources": ["reazon_small", "emilia_yodas", "galgame"],
+    "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia", "galgame"], "mix": "natural",
+    # smoke runs: seeded id subsets, small caches. *_audio_s: seeded subsets of about that many seconds of audio
+    # (audio_subset; the overfit runs), the eval one pooled over eval_sets and decoded greedily in full at every eval
+    "subset": {"train_utts": None, "eval_utts_per_set": None, "train_audio_s": None, "eval_audio_s": None},
     "device": "auto", "autocast": "bfloat16",  # autocast: "bfloat16" or "none" (fp32; the CPU tests)
     "loss": {"w_kl": 1.0, "w_ce": 0.8, "l2sp_lambda": 0.05},
-    "specaug": {"freq_masks": 2, "freq_width": 27, "time_masks_min": 2, "time_masks_max": 5, "time_width": 0.05},
+    "specaug": {"enabled": True, "freq_masks": 2, "freq_width": 27, "time_masks_min": 2, "time_masks_max": 5,
+                "time_width": 0.05},
+    # offload "cpu": AdamW and fp32 master weights in host memory (CpuOffloadAdamW), for a GPU that holds the weights
+    # and gradients but not the AdamW state; offload_fused: torch's fused CPU AdamW kernel there instead of foreach.
+    # `fused` is the on-device (CUDA) optimizer's flag
     "optim": {"lr": 1e-4, "betas": [0.9, 0.98], "eps": 1e-8, "weight_decay": 0.0, "clip": 1.0, "fused": True,
-              "max_nonfinite_skips": 3},
+              "max_nonfinite_skips": 3, "offload": "none", "offload_fused": False},
     "schedule": {"warmup_steps": 300, "cooldown_frac": 0.2, "train_hours": 4.0, "clock": "wall", "max_steps": None,
-                 "end_reserve_min": 30},
+                 "end_reserve_min": 30, "epochs": None},
     "batch": {"step_audio_s": 1500, "micro_audio_s": 400, "pool_micro": 50, "max_dec_len": 200},
     "memory": {"grad_ckpt": "auto", "probe_longest_bucket": True, "min_micro_audio_s": 100, "max_oom_skips": 3},
     "perf": {"relpos_patch": True, "compile": False, "num_workers": "auto", "prefetch": 4, "tf32": True,
              "peak_tflops": 312.0, "train_exact_dither": False},
+    # every_epochs: eval at the end of every N-th epoch instead of every_min / every_steps. probe_is_train: the probe
+    # is the whole train set (a small subset) rather than its in_probe rows. probe_greedy_audio_s: also greedy-decode
+    # a seeded ~N s of the probe (null: subset.eval_audio_s; both null: no probe decode)
     "eval": {"every_min": 20, "every_steps": None, "greedy_subset": 500, "probe": True, "final_full_greedy": True,
-             "batch_s": 400, "check_baselines": True},
+             "batch_s": 400, "check_baselines": True, "every_epochs": None, "probe_is_train": False,
+             "probe_greedy_audio_s": None},
     "ckpt": {"weights_every_min": 30, "full_local_every_min": 30, "weights_every_steps": None,
              "full_every_steps": None, "keep_local": 2, "upload_full_at": ["pre_cooldown", "end"],
              "full_after_smoke": True},
@@ -128,8 +176,14 @@ DEFAULTS = {
     "hf": {"output_repo": None, "private": True},
     "smoke": {"enabled": True, "steps": 100, "min_audio_s_per_s": 600, "pad_utts": 32, "pad_max_mean_kl": 0.05,
               "pad_min_argmax_agree": None, "require_loss_decrease": True},
+    # checked after every in-loop eval (the module docstring; early_stop_update, early_stop_trigger). Off here, so a
+    # config that does not mention it trains to its budget; viability.json turns it on with these values
+    "early_stop": {"enabled": False, "metric": "heldout_kl", "patience": 3, "min_delta_rel": 0.005,
+                   "min_delta_abs": 0.0, "min_evals": 3, "floor": None, "action": "cooldown"},
     "seed": 1234,
 }
+EARLY_STOP_METRICS = ("probe_kl", "heldout_kl", "train_loss")
+STOP_FILE = "STOP"  # runs/<run_id>/STOP: finish the step under way, then the end phase (reason "stop_file")
 
 
 class ThroughputTooLow(RuntimeError):
@@ -190,12 +244,61 @@ def load_config(path: str | None, sets: list[str]) -> dict:
 def validate(cfg: dict):
     if cfg["autocast"] not in ("bfloat16", "none", None):
         raise SystemExit(f"autocast must be 'bfloat16' or 'none' (fp16 would need a GradScaler), got {cfg['autocast']}")
-    if cfg["schedule"]["clock"] not in ("wall", "steps"):
-        raise SystemExit(f"schedule.clock must be 'wall' or 'steps', got {cfg['schedule']['clock']}")
-    if cfg["schedule"]["clock"] == "steps" and not cfg["schedule"]["max_steps"]:
+    sch, sub, ev_cfg = cfg["schedule"], cfg["subset"], cfg["eval"]
+    if sch["clock"] not in ("wall", "steps", "epochs"):
+        raise SystemExit(f"schedule.clock must be 'wall', 'steps' or 'epochs', got {sch['clock']}")
+    if sch["clock"] == "steps" and not sch["max_steps"]:
         raise SystemExit("schedule.clock 'steps' needs schedule.max_steps")
+    if sch["clock"] == "epochs" and not _pos_int(sch["epochs"]):
+        raise SystemExit(f"schedule.clock 'epochs' needs schedule.epochs (an int >= 1), got {sch['epochs']}")
     if cfg["memory"]["grad_ckpt"] not in ("auto", True, False):
         raise SystemExit(f"memory.grad_ckpt must be 'auto', true or false, got {cfg['memory']['grad_ckpt']}")
+    if cfg["optim"]["offload"] not in ("none", "cpu"):
+        raise SystemExit(f"optim.offload must be 'none' or 'cpu', got {cfg['optim']['offload']}")
+    if not isinstance(cfg["specaug"]["enabled"], bool):
+        raise SystemExit(f"specaug.enabled must be true or false, got {cfg['specaug']['enabled']}")
+    for a, b in (("train_audio_s", "train_utts"), ("eval_audio_s", "eval_utts_per_set")):
+        if sub[a] is not None and sub[b]:
+            raise SystemExit(f"subset.{a} and subset.{b} are two ways to pick the same subset: set one")
+    for key, v in (("subset.train_audio_s", sub["train_audio_s"]), ("subset.eval_audio_s", sub["eval_audio_s"]),
+                   ("eval.probe_greedy_audio_s", ev_cfg["probe_greedy_audio_s"])):
+        if v is not None and not (isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0):
+            raise SystemExit(f"{key} must be null or a number of seconds > 0, got {v}")
+    if ev_cfg["every_epochs"] is not None and not _pos_int(ev_cfg["every_epochs"]):
+        raise SystemExit(f"eval.every_epochs must be null or an int >= 1, got {ev_cfg['every_epochs']}")
+    if ev_cfg["probe_is_train"] and not ev_cfg["probe"]:
+        raise SystemExit("eval.probe_is_train needs eval.probe")
+    es = cfg["early_stop"]
+    if not isinstance(es["enabled"], bool):
+        raise SystemExit(f"early_stop.enabled must be true or false, got {es['enabled']}")
+    if es["metric"] not in EARLY_STOP_METRICS:
+        raise SystemExit(f"early_stop.metric must be one of {', '.join(EARLY_STOP_METRICS)}, got {es['metric']}")
+    if es["action"] not in ("stop", "cooldown"):
+        raise SystemExit(f"early_stop.action must be 'stop' or 'cooldown', got {es['action']}")
+    if not _pos_int(es["patience"]):
+        raise SystemExit(f"early_stop.patience must be an int >= 1, got {es['patience']}")
+    if not (isinstance(es["min_evals"], int) and not isinstance(es["min_evals"], bool) and es["min_evals"] >= 0):
+        raise SystemExit(f"early_stop.min_evals must be an int >= 0, got {es['min_evals']}")
+    for key in ("min_delta_rel", "min_delta_abs"):
+        if not (_number(es[key]) and es[key] >= 0):
+            raise SystemExit(f"early_stop.{key} must be a number >= 0, got {es[key]}")
+    if es["floor"] is not None and not _number(es["floor"]):
+        raise SystemExit(f"early_stop.floor must be null or a number, got {es['floor']}")
+    if es["enabled"] and es["metric"] == "probe_kl" and not ev_cfg["probe"]:
+        raise SystemExit("early_stop.metric 'probe_kl' needs eval.probe")
+
+
+def _pos_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 1
+
+
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def epoch_mode(cfg: dict) -> bool:
+    """Evals at epoch ends (the epoch clock or eval.every_epochs): eval records, events and scalars carry the epoch."""
+    return cfg["schedule"]["clock"] == "epochs" or bool(cfg["eval"]["every_epochs"])
 
 
 def rpath(value) -> Path:
@@ -206,17 +309,60 @@ def rpath(value) -> Path:
 # -------------------------------------------------------------------------------------------------------- schedule
 
 
-def wsd_lr(peak: float, step: int, t: float, T: float, warmup_steps: int, cooldown_frac: float) -> tuple[float, int]:
+def wsd_lr(peak: float, step: int, t: float, T: float, warmup_steps: int, cooldown_frac: float,
+           t_c: float | None = None) -> tuple[float, int]:
     """Warmup-stable-decay. `step` is the 1-based optimizer step about to be taken, `t` the progress when it starts
     (loop seconds, or steps done) out of the budget `T`. Linear warmup over warmup_steps, constant until
-    t >= (1 - cooldown_frac) T, then peak * (1 - sqrt((t - t_c) / (T - t_c))). Returns (lr, phase) with phase
-    0 warmup, 1 stable, 2 cooldown."""
+    t >= t_c = (1 - cooldown_frac) T (or the given t_c: an early-stop cooldown, Run.cooldown_start), then
+    peak * (1 - sqrt((t - t_c) / (T - t_c))). Returns (lr, phase) with phase 0 warmup, 1 stable, 2 cooldown."""
     warm = min(1.0, step / warmup_steps) if warmup_steps > 0 else 1.0
-    t_c = (1.0 - cooldown_frac) * T
+    t_c = (1.0 - cooldown_frac) * T if t_c is None else t_c
     if t < t_c:
         return peak * warm, 0 if warm < 1.0 else 1
     frac = min(1.0, (t - t_c) / max(T - t_c, 1e-12))
     return peak * warm * (1.0 - math.sqrt(frac)), 2
+
+
+def warmup_steps(sch: dict, total_steps: int | None = None) -> int:
+    """schedule.warmup_steps; on the epoch clock at most ceil(10 %) of the run's total_steps (a 100-step overfit run
+    would otherwise never leave the warmup)."""
+    w = int(sch["warmup_steps"])
+    if sch["clock"] == "epochs" and total_steps:
+        w = min(w, math.ceil(0.1 * total_steps))
+    return w
+
+
+def early_stop_state() -> dict:
+    """The early-stop part of the full state (Run.st["early_stop"]): the best value and its step, in-loop evals
+    checked, evals since the best, the last value, the train-loss sum and count since the previous eval (metric
+    "train_loss"), the trigger (the `early_stop` event's fields, or None), whether the loop must end (`stop`) and an
+    early cooldown's schedule (`cooldown`: t_c and T on the run's clock, or None)."""
+    return dict(best=None, best_step=None, evals=0, evals_since_best=0, value=None, loss_sum=0.0, loss_n=0,
+                triggered=None, stop=False, cooldown=None)
+
+
+def early_stop_update(es: dict, ec: dict, value, step: int) -> str | None:
+    """One in-loop eval's update of the early-stop state `es` under the rule `ec` (config early_stop). The eval improves
+    when best - value > max(min_delta_abs, min_delta_rel * |best|) (strictly: a tie is no improvement; the first
+    checked eval always improves; a missing or non-finite value never does); the best moves only on an improvement.
+    Returns the trigger, never before ec["min_evals"] checked evals: "floor" (value <= ec["floor"]), "patience"
+    (ec["patience"] evals in a row without an improvement), else None."""
+    ok = value is not None and math.isfinite(float(value))
+    value = float(value) if ok else None
+    es["evals"] += 1
+    es["value"] = value
+    best = es["best"]
+    if ok and (best is None or best - value > max(float(ec["min_delta_abs"]), float(ec["min_delta_rel"]) * abs(best))):
+        es["best"], es["best_step"], es["evals_since_best"] = value, int(step), 0
+    else:
+        es["evals_since_best"] += 1
+    if es["evals"] < int(ec["min_evals"]):
+        return None
+    if ec["floor"] is not None and ok and value <= float(ec["floor"]):
+        return "floor"
+    if es["evals_since_best"] >= int(ec["patience"]):
+        return "patience"
+    return None
 
 
 def due(t: float, step: int, last_t: float, last_step: int, every_min, every_steps) -> bool:
@@ -295,6 +441,7 @@ class Run:
     ds: object = None
     planner: object = None
     probe_ids: list = field(default_factory=list)
+    probe_greedy_ids: list = field(default_factory=list)
     greedy_ids: list = field(default_factory=list)
     src_index: dict = field(default_factory=dict)
     uploader: object = None
@@ -302,6 +449,7 @@ class Run:
     gen: object = None
     resumed_from: Path | None = None
     budget_s: float | None = None  # wall-clock T clipped to the instance deadline (fit_budget); None = train_hours
+    vram_cap_gb: float | None = None  # the caching allocator's cap on Windows (cap_vram); None = no cap
     loop_t0: float | None = None
     t_start: float = field(default_factory=time.time)
     st: dict = field(default_factory=lambda: dict(
@@ -309,17 +457,29 @@ class Run:
         last_eval_t=0.0, last_eval_step=0, last_weights_t=0.0, last_weights_step=0, last_full_t=0.0,
         last_full_step=0, memory={}, flops_per_padded_s=None, history=[], nonfinite_skips=0, nonfinite_total=0,
         oom_skips=0, audio_s=0.0, tokens=0, step_time_s=0.0, smoke_losses=[], smoke_audio_s=0.0, smoke_time_s=0.0,
-        epoch=0, epoch_progress=0.0, resumes=0, weights=[], fulls=[], last_objective=None, lr_phase=None))
+        epoch=0, epoch_progress=0.0, resumes=0, weights=[], fulls=[], last_objective=None, lr_phase=None,
+        last_eval_epoch=0, total_steps=None, early_stop=early_stop_state()))
 
     def clock(self) -> float:
         """Loop clock in seconds: continues across resumes, frozen outside the training loop."""
         return self.st["train_s"] + (time.monotonic() - self.loop_t0 if self.loop_t0 is not None else 0.0)
 
     def progress(self) -> tuple[float, float]:
+        """(t, T): loop seconds or steps done, out of the budget; T ends early under an early-stop cooldown."""
         s = self.cfg["schedule"]
         if s["clock"] == "steps":
-            return float(self.st["step"]), float(s["max_steps"])
-        return self.clock(), self.budget_s if self.budget_s is not None else float(s["train_hours"]) * 3600
+            t, T = float(self.st["step"]), float(s["max_steps"])
+        elif s["clock"] == "epochs":  # total_steps: plan_epochs
+            t, T = float(self.st["step"]), float(self.st["total_steps"])
+        else:
+            t, T = self.clock(), self.budget_s if self.budget_s is not None else float(s["train_hours"]) * 3600
+        cd = self.st["early_stop"]["cooldown"]
+        return (t, min(T, cd["T"])) if cd else (t, T)
+
+    def cooldown_start(self, T: float) -> float:
+        """t_c of the WSD schedule with budget T: (1 - cooldown_frac) T, or where an early-stop cooldown began."""
+        cd = self.st["early_stop"]["cooldown"]
+        return cd["t_c"] if cd else (1.0 - float(self.cfg["schedule"]["cooldown_frac"])) * T
 
     def autocast(self):
         return torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.amp)
@@ -478,12 +638,155 @@ def setup_processing(R: Run):
         R.feat_eval = LogMel().to(R.device)
         R.feat_train = LogMel(exact_dither=R.cfg["perf"]["train_exact_dither"]).to(R.device)
         R.tokenizer = ev.teacher_tokenizer()
-    R.specaug = SpecAugment(**R.cfg["specaug"])
+    R.specaug = SpecAugment(**{k: v for k, v in R.cfg["specaug"].items() if k != "enabled"})
     R.gen = torch.Generator(device=R.device)
+
+
+# ------------------------------------------------------------------------------------------------------ optimizer
+
+
+class CpuOffloadAdamW:
+    """torch.optim.AdamW on fp32 master weights in host memory (optim.offload "cpu"), for a GPU that holds the model's
+    fp32 weights and gradients but not the AdamW state: the 617M student needs 9.9 GB for weights, gradients, m and v,
+    the laptop's RTX 4070 has 8 GB.
+
+    The device keeps its fp32 parameters and gradients for forward/backward (the trainer clips there and logs the
+    pre-clip norm as usual). step() copies the gradients into host buffers, frees the device gradients and runs AdamW
+    on the masters (foreach, or torch's fused CPU kernel with fused=True); the trainer then applies the decoupled
+    L2-SP pull to the masters (its theta_0 lives in host memory too) and push() copies the masters into the device
+    parameters. Same hyper-parameters, same order of operations: the maths is the on-device optimizer's
+    (tests/test_overfit.py checks the two give the same weights).
+
+    The masters are fp32 copies of fp32 device weights, so after every push() they are bit-identical to the model's
+    state_dict. The full state therefore stores only state_dict() (the same format as the on-device optimizer's), and
+    load_state_dict() - called after the model's weights are loaded - rebuilds the masters from the device weights.
+
+    Host buffers are views into chunks of CHUNK elements, pinned when the device is CUDA (fast, asynchronous copies):
+    CUDA's caching host allocator rounds every pinned block up to a power of two, so one block per tensor (or one
+    2.5 GB block) would waste up to half of it. Pinning falls back to pageable memory if the allocation fails."""
+
+    CHUNK = 1 << 26  # fp32 elements (256 MiB)
+
+    def __init__(self, params, *, lr: float, betas: tuple[float, float], eps: float, weight_decay: float,
+                 fused: bool = False):
+        self.params = list(params)
+        if not self.params or any(p.dtype != torch.float32 for p in self.params):
+            raise ValueError("CpuOffloadAdamW needs fp32 device parameters (the masters are rebuilt from them)")
+        self.device = self.params[0].device
+        self.fused = bool(fused)
+        self.pinned, self.pin_error, self.chunks = self.device.type == "cuda", None, []
+        self.master = self._host_views()
+        self.grads = self._host_views()
+        self.pull()
+        for m in self.master:
+            m.requires_grad_(True)  # leaves the optimizer and L2SP treat as trainable; never part of a graph
+        impl = dict(fused=True) if self.fused else dict(foreach=True)
+        self.opt = torch.optim.AdamW(self.master, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, **impl)
+
+    def _host_views(self) -> list[torch.Tensor]:
+        out, chunk, used = [], None, 0
+        left = sum(p.numel() for p in self.params)
+        for p in self.params:
+            n = p.numel()
+            if chunk is None or used + n > chunk.numel():
+                chunk, used = self._alloc(max(n, min(self.CHUNK, left))), 0
+            out.append(chunk[used:used + n].view(p.shape))
+            used += n
+            left -= n
+        return out
+
+    def _alloc(self, n: int) -> torch.Tensor:
+        if self.pinned:
+            try:
+                t = torch.empty(n, dtype=torch.float32, pin_memory=True)
+                self.chunks.append(t)
+                return t
+            except RuntimeError as e:  # e.g. the OS refuses to page-lock more memory
+                self.pinned, self.pin_error = False, f"{type(e).__name__}: {e}"[:300]
+        t = torch.empty(n, dtype=torch.float32)
+        self.chunks.append(t)
+        return t
+
+    def _sync(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    @property
+    def param_groups(self) -> list[dict]:
+        return self.opt.param_groups
+
+    def info(self) -> dict:
+        n = sum(p.numel() for p in self.params)
+        return dict(params=n, tensors=len(self.params), impl="fused" if self.fused else "foreach",
+                    pinned=self.pinned, pin_error=self.pin_error, chunks=len(self.chunks),
+                    host_buffers_gb=round(sum(c.numel() for c in self.chunks) * 4 / 2**30, 3),
+                    host_adam_state_gb=round(n * 8 / 2**30, 3))
+
+    def zero_grad(self, set_to_none: bool = True):
+        """The device gradients (the host buffers are overwritten by every step)."""
+        for p in self.params:
+            if set_to_none:
+                p.grad = None
+            elif p.grad is not None:
+                p.grad.zero_()
+
+    @torch.no_grad()
+    def step(self):
+        """Device gradients (already clipped) -> host buffers, device gradients freed, AdamW on the masters. A
+        parameter without a gradient is skipped, as torch.optim skips it. The device weights change only at push()."""
+        for p, m, g in zip(self.params, self.master, self.grads):
+            if p.grad is None:
+                m.grad = None
+            else:
+                g.copy_(p.grad, non_blocking=True)
+                m.grad = g
+        self._sync()  # the host must not read the buffers before the copies land
+        self.zero_grad(set_to_none=True)
+        self.opt.step()
+
+    @torch.no_grad()
+    def push(self):
+        """Masters -> device parameters (after step() and the L2-SP pull)."""
+        for p, m in zip(self.params, self.master):
+            p.copy_(m, non_blocking=True)
+        self._sync()  # the next step writes the masters again
+
+    @torch.no_grad()
+    def pull(self):
+        """Device parameters -> masters."""
+        for p, m in zip(self.params, self.master):
+            m.copy_(p.detach(), non_blocking=True)
+        self._sync()
+
+    def state_dict(self) -> dict:
+        return self.opt.state_dict()
+
+    def load_state_dict(self, sd: dict):
+        """Call after the model's weights are loaded: the masters are rebuilt from them. Also takes a state saved by
+        the on-device optimizer (its fused/foreach flags are replaced by this one's)."""
+        self.pull()
+        self.opt.load_state_dict(sd)
+        for g in self.opt.param_groups:
+            g["fused"], g["foreach"] = (True, None) if self.fused else (None, True)
+
+
+def offloaded(R: Run) -> bool:
+    return isinstance(R.opt, CpuOffloadAdamW)
+
+
+def _weights(R: Run) -> list[torch.Tensor]:
+    """The weights the optimizer and L2-SP update: the host masters under offload, else the model's parameters."""
+    return R.opt.master if offloaded(R) else R.params
 
 
 def setup_optim(R: Run):
     o = R.cfg["optim"]
+    if o["offload"] == "cpu":
+        R.opt = CpuOffloadAdamW(R.params, lr=o["lr"], betas=tuple(o["betas"]), eps=o["eps"],
+                                weight_decay=o["weight_decay"], fused=bool(o["offload_fused"]))
+        R.l2sp = L2SP(zip(R.param_names, R.opt.master), lam=R.cfg["loss"]["l2sp_lambda"])  # theta_0 in host memory
+        R.log.event("optim_offload", **R.opt.info())
+        return
     fused = bool(o["fused"]) and R.device.type == "cuda"
     R.opt = torch.optim.AdamW(R.params, lr=o["lr"], betas=tuple(o["betas"]), eps=o["eps"],
                               weight_decay=o["weight_decay"], fused=fused)
@@ -497,13 +800,57 @@ def _seeded_ids(pool: list[str], n: int, rng: np.random.Generator) -> list[str]:
     return pool if len(pool) <= n else sorted(rng.choice(pool, size=n, replace=False).tolist())
 
 
+def audio_subset(ids: list[str], durations, budget_s: float, rng: np.random.Generator,
+                 min_single_s: float = 0.3) -> tuple[list[str], dict]:
+    """About `budget_s` seconds of audio out of `ids`: walk them in a seeded order (sorted first, so the draw depends
+    only on the rng and the id set, not on file order) and take every utterance that still fits (total <= budget_s).
+    If none fits (budget_s below every duration), the single utterance of >= min_single_s (of any length if there
+    is none) whose duration is closest to budget_s. Returns (ids in draw order, a record for the log: budget, count,
+    total, whether the fallback was used, the ids and their durations)."""
+    if not len(ids):
+        raise ValueError("audio_subset: no utterances to draw from")
+    order = sorted(range(len(ids)), key=ids.__getitem__)
+    pool = [ids[i] for i in order]
+    dur = [float(durations[i]) for i in order]
+    shortest = min(dur)
+    pick, total = [], 0.0
+    for j in rng.permutation(len(pool)).tolist():
+        if total + dur[j] <= budget_s:
+            pick.append(j)
+            total += dur[j]
+            if budget_s - total < shortest:
+                break
+    fallback = not pick
+    if fallback:
+        cand = [j for j in range(len(pool)) if dur[j] >= min_single_s] or list(range(len(pool)))
+        pick = [min(cand, key=lambda j: (abs(dur[j] - budget_s), j))]
+        total = dur[pick[0]]
+    return [pool[j] for j in pick], dict(budget_s=float(budget_s), n=len(pick), total_s=round(total, 3),
+                                          fallback=fallback, ids=[pool[j] for j in pick],
+                                          durations=[round(dur[j], 3) for j in pick])
+
+
+def _subset_dir(prefix: str, budget_s: float, seed: int, ids: list[str]) -> str:
+    """Cache dir name of a duration subset: the id hash keeps configs that draw different ids apart."""
+    return f"{prefix}_{budget_s:g}s_s{seed}_{hashlib.sha256(chr(10).join(sorted(ids)).encode()).hexdigest()[:8]}"
+
+
 def setup_data(R: Run):
     """Train/eval stores (cached under cache_dir, shared with 03's eval cache), probe and greedy ids, planner."""
     cfg, log = R.cfg, R.log
     sel, data, teach, cache = rpath(cfg["selection"]), rpath(cfg["data_root"]), rpath(cfg["teacher_root"]), rpath(cfg["cache_dir"])
     sub, seed = cfg["subset"], int(cfg["seed"])
     t0 = time.time()
-    if sub["train_utts"]:
+    if sub["train_audio_s"] is not None:
+        rows = trainset.read_selection(sel, cfg["sources"], ["train"])
+        prompt_len = len(trainset._teacher_meta(teach)["prompt"])
+        rows = rows[rows["n_tok"] + prompt_len - 1 <= int(cfg["batch"]["max_dec_len"])]  # what the planner can use
+        ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["train_audio_s"]),
+                                np.random.default_rng([seed, 11]))
+        log.event("subset", split="train", sources=cfg["sources"], seed=seed, pool=len(rows), **rec)
+        R.train = trainset.build_stores(sel, data, teach, cache / _subset_dir("train", rec["budget_s"], seed, ids),
+                                        cfg["sources"], ["train"], ids=ids, log=print)
+    elif sub["train_utts"]:
         n = int(sub["train_utts"])
         rows = trainset.read_selection(sel, cfg["sources"], ["train"])
         rng = np.random.default_rng([seed, 1])
@@ -513,7 +860,14 @@ def setup_data(R: Run):
                                         ids=probe + rest, log=print)
     else:
         R.train = trainset.build_stores(sel, data, teach, cache / "train", cfg["sources"], ["train"], log=print)
-    if sub["eval_utts_per_set"]:
+    if sub["eval_audio_s"] is not None:  # pooled over the eval sets
+        rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
+        ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["eval_audio_s"]),
+                                np.random.default_rng([seed, 12]))
+        log.event("subset", split="eval", sources=cfg["eval_sets"], seed=seed, pool=len(rows), **rec)
+        R.evalstore = trainset.build_stores(sel, data, teach, cache / _subset_dir("eval", rec["budget_s"], seed, ids),
+                                            cfg["eval_sets"], ["eval"], ids=ids, log=print)
+    elif sub["eval_utts_per_set"]:
         n = int(sub["eval_utts_per_set"])
         rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
         rng = np.random.default_rng([seed, 2])
@@ -527,21 +881,40 @@ def setup_data(R: Run):
     else:
         R.evalstore = trainset.eval_store(sel, data, teach, cache / "eval", cfg["eval_sets"], log=print)
 
-    R.probe_ids = [R.train.utts[i].id for i in R.train.indices(in_probe=True)] if cfg["eval"]["probe"] else []
-    rng = np.random.default_rng([seed, 3])
-    R.greedy_ids = []
-    for s in cfg["eval_sets"]:
-        cand = R.evalstore.indices(source=s, in_greedy_subset=True) or R.evalstore.indices(source=s)
-        pick = cand if len(cand) <= cfg["eval"]["greedy_subset"] else sorted(
-            rng.choice(cand, size=int(cfg["eval"]["greedy_subset"]), replace=False).tolist())
-        R.greedy_ids += [R.evalstore.utts[i].id for i in pick]
+    if cfg["eval"]["probe"] and cfg["eval"]["probe_is_train"]:
+        R.probe_ids = [u.id for u in R.train.utts]
+    else:
+        R.probe_ids = [R.train.utts[i].id for i in R.train.indices(in_probe=True)] if cfg["eval"]["probe"] else []
+    es = cfg["early_stop"]
+    if es["enabled"] and es["metric"] == "probe_kl" and not R.probe_ids:  # validate() cannot see an empty probe
+        raise SystemExit("early_stop.metric probe_kl needs a non-empty probe: this selection/subset has no probe rows "
+                         "(set eval.probe_is_train, or use metric heldout_kl / train_loss)")
+    pg_budget = cfg["eval"]["probe_greedy_audio_s"]
+    pg_budget = sub["eval_audio_s"] if pg_budget is None else pg_budget
+    R.probe_greedy_ids = []
+    if pg_budget is not None and R.probe_ids:  # greedy CER on the train data itself, next to the held-out one
+        dur = {u.id: u.duration for u in R.train.utts}
+        R.probe_greedy_ids, rec = audio_subset(R.probe_ids, [dur[i] for i in R.probe_ids], float(pg_budget),
+                                               np.random.default_rng([seed, 13]))
+        log.event("subset", split="probe_greedy", seed=seed, pool=len(R.probe_ids), **rec)
+    if sub["eval_audio_s"] is not None:
+        R.greedy_ids = [u.id for u in R.evalstore.utts]  # the whole (small) eval subset, at every eval
+    else:
+        rng = np.random.default_rng([seed, 3])
+        R.greedy_ids = []
+        for s in cfg["eval_sets"]:
+            cand = R.evalstore.indices(source=s, in_greedy_subset=True) or R.evalstore.indices(source=s)
+            pick = cand if len(cand) <= cfg["eval"]["greedy_subset"] else sorted(
+                rng.choice(cand, size=int(cfg["eval"]["greedy_subset"]), replace=False).tolist())
+            R.greedy_ids += [R.evalstore.utts[i].id for i in pick]
     R.ds = trainset.AudioBatchDataset(R.train)
     R.src_index = {s: i for i, s in enumerate(sorted({u.source for u in R.train.utts}))}
     log.event("data", train_utts=len(R.train), train_h=round(R.train.hours, 3),
               per_source=R.train.info.get("per_source"), dropped=R.train.info.get("dropped"),
               eval_utts=len(R.evalstore), eval_h=round(R.evalstore.hours, 3),
               eval_per_set=R.evalstore.info.get("per_source"), probe=len(R.probe_ids), greedy=len(R.greedy_ids),
-              build_s=round(time.time() - t0, 1))
+              build_s=round(time.time() - t0, 1),
+              **(dict(probe_greedy=len(R.probe_greedy_ids)) if R.probe_greedy_ids else {}))
 
 
 def make_planner(R: Run, micro_audio_s: float) -> trainset.StepPlanner:
@@ -550,6 +923,19 @@ def make_planner(R: Run, micro_audio_s: float) -> trainset.StepPlanner:
     return trainset.StepPlanner(R.train.utts, step_audio_s=b["step_audio_s"], micro_audio_s=micro_audio_s,
                                 max_dec_len=b["max_dec_len"], pool_micro=b["pool_micro"], seed=int(R.cfg["seed"]),
                                 weights=weights, prompt_len=len(R.train.info.get("prompt", trainset.PROMPT)))
+
+
+def plan_epochs(R: Run):
+    """Clock "epochs": T = the optimizer steps of schedule.epochs full passes, summed over the planner's epoch plans
+    (the step count of an epoch can differ by one between epochs). Computed once, kept in the full state."""
+    sch = R.cfg["schedule"]
+    if sch["clock"] != "epochs" or R.st.get("total_steps"):
+        return
+    per = [len(R.planner.epoch_plan(e)) for e in range(int(sch["epochs"]))]
+    R.st["total_steps"] = sum(per)
+    R.log.event("schedule", clock="epochs", epochs=len(per), total_steps=sum(per), steps_per_epoch=per,
+                warmup_steps=warmup_steps(sch, sum(per)),
+                first_cooldown_step=math.ceil((1.0 - float(sch["cooldown_frac"])) * sum(per)) + 1)
 
 
 # -------------------------------------------------------------------------------------------------- forward pass
@@ -650,10 +1036,11 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
     per_utt, meta = [], []
     audio_real = audio_pad = dec_real = dec_pad = 0.0
     logits = losses = oom = None
+    gen = R.gen if cfg["specaug"]["enabled"] else None
     j = -1
     try:
         for j, mb in enumerate(mbs):
-            logits, rows, mfrac = forward_logits(R, mb, R.feat_train, gen=R.gen, capture=capture if j == 0 else None)
+            logits, rows, mfrac = forward_logits(R, mb, R.feat_train, gen=gen, capture=capture if j == 0 else None)
             losses = kd_losses(logits, mb["top_idx"].to(dev, non_blocking=True), mb["top_lp"].to(dev, non_blocking=True))
             kd_objective(losses, n_tok, cfg["loss"]["w_kl"], cfg["loss"]["w_ce"]).backward()
             with torch.no_grad():
@@ -698,7 +1085,7 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
     out: dict = {}
     if stats_step:
         out["grad_sq_by_module"] = _grad_sq_by_module(R)
-        before = [p.detach().clone() for p in R.params]
+        before = [p.detach().clone() for p in _weights(R)]  # offload: the host masters, not a second model on the GPU
     if hist_step:
         _grad_hists(R, step)
     clip = cfg["optim"]["clip"]
@@ -722,12 +1109,16 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
         return None
     R.st["nonfinite_skips"] = 0
     R.opt.step()
-    R.l2sp.apply_(lr)
+    if offloaded(R):  # L2-SP on the host masters, its value from the same pass (a second one costs ~1 s), then push
+        out["l2sp"] = float(R.l2sp.apply_(lr, value=True))
+        R.opt.push()
+    else:
+        R.l2sp.apply_(lr)
     if stats_step:  # ||delta theta|| / ||theta|| per module, the L2-SP pull included
-        diffs = torch._foreach_sub([p.detach() for p in R.params], before)
+        diffs = torch._foreach_sub([p.detach() for p in _weights(R)], before)
         dn = _by_module(R, _sq_norms(diffs))
         del diffs, before
-        pn = _by_module(R, _sq_norms([p.detach() for p in R.params]))
+        pn = _by_module(R, _sq_norms([p.detach() for p in _weights(R)]))
         out["update_ratio"] = {k: math.sqrt(dn[k] / pn[k]) if pn[k] > 0 else float("nan") for k in dn}
     if hist_step:
         _weight_hists(R, step)
@@ -767,21 +1158,25 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
     return out
 
 
-def _groups(R: Run, tensors: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+def _groups(R: Run, tensors: list[torch.Tensor]):
+    """(module, its tensors as one flat tensor), one module at a time: concatenating every module up front would put a
+    third full-size fp32 copy on the device next to the weights and gradients (2.3 GiB for the real student, more than
+    the 8 GB laptop has left at a histogram step)."""
     by: dict[str, list[torch.Tensor]] = {}
     for n, t in zip(R.param_names, tensors):
         if t is not None:
-            by.setdefault(module_key(n), []).append(t.detach().flatten())
-    return {k: torch.cat(v) for k, v in by.items()}
+            by.setdefault(module_key(n), []).append(t)
+    for k, ts in by.items():
+        yield k, torch.cat([t.detach().flatten() for t in ts])
 
 
 def _grad_hists(R: Run, step: int):
-    for k, t in _groups(R, [p.grad for p in R.params]).items():
+    for k, t in _groups(R, [p.grad for p in R.params]):
         R.log.hist(f"grad/{k}", t, step)
 
 
 def _weight_hists(R: Run, step: int):
-    for k, t in _groups(R, list(R.params)).items():
+    for k, t in _groups(R, list(R.params)):
         R.log.hist(f"weight/{k}", t, step)
 
 
@@ -801,7 +1196,10 @@ def _bn_drift_check(R: Run, step: int):
 # ------------------------------------------------------------------------------------------------------- logging
 
 
-def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float, step_s: float, e: int, s: int):
+def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float, step_s: float, e: int,
+             s: int) -> tuple[float, float]:
+    """The step's row (steps.parquet, scalars, TensorBoard) and per-utterance records. Returns (objective,
+    loss/total)."""
     from kitsune.runlog import system_stats
 
     cfg = R.cfg
@@ -809,7 +1207,7 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
     tot = out["tot"]
     w_kl, w_ce = cfg["loss"]["w_kl"], cfg["loss"]["w_ce"]
     kl, ce = tot[0] / n_tok, tot[1] / n_tok
-    l2sp = float(R.l2sp.value())
+    l2sp = out["l2sp"] if "l2sp" in out else float(R.l2sp.value())
     objective = w_kl * kl + w_ce * ce
     t, T = R.progress()
     n_steps = R.planner.epoch_stats[e]["steps"] if e in R.planner.epoch_stats else 1
@@ -864,7 +1262,7 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
         R.log.scalars({f"layers/update_ratio/{k}": v for k, v in out["update_ratio"].items()}, step)
         R.log.scalars({f"l2sp/dist/{k}": v for k, v in R.l2sp.per_module_distance().items()}, step)
         R.log.scalars({f"l2sp/rel/{k}": v for k, v in R.l2sp.per_module_distance(relative=True).items()}, step)
-    return objective
+    return objective, row["loss/total"]
 
 
 # ---------------------------------------------------------------------------------------------------------- evals
@@ -886,6 +1284,10 @@ def run_eval(R: Run, step: int, final: bool = False) -> dict:
     if R.probe_ids:
         probe_sum, probe_df = ev.teacher_forced_eval(R.model, R.train, R.feat_eval, R.device, bs, ids=R.probe_ids,
                                                      amp=R.amp)
+    pg_sum = pg_df = None
+    if R.probe_greedy_ids:  # un-augmented greedy decode of train utterances: memorisation shows as CER vs teacher -> 0
+        pg_sum, pg_df = ev.greedy_eval(R.model, R.train, R.probe_greedy_ids, R.feat_eval, R.device, bs,
+                                       tokenizer=R.tokenizer, amp=R.amp)
     full_sum = None
     if final and cfg["eval"]["final_full_greedy"]:
         full_sum, gr_df = ev.greedy_eval(R.model, R.evalstore, None, R.feat_eval, R.device, bs, tokenizer=R.tokenizer,
@@ -901,10 +1303,18 @@ def run_eval(R: Run, step: int, final: bool = False) -> dict:
         log.table(f"tf_{src}", g.reset_index(drop=True), step)
     if probe_df is not None:
         log.table("probe", probe_df, step)
+    if pg_df is not None:
+        log.table("probe_greedy", pg_df, step)
     for src, g in gr_df.groupby("source", sort=True):
         log.table(f"greedy_{src}", g.reset_index(drop=True), step)
     summary = dict(step=step, train_s=R.clock(), final=final, tf=tf_sum, probe=probe_sum, greedy=gr_sum,
                    greedy_full=full_sum, wall_s=round(time.time() - t0, 1))
+    extra = {}  # only in the runs that use them, so the viability run's records are unchanged
+    if pg_sum is not None:
+        extra["probe_greedy"] = pg_sum
+    if epoch_mode(cfg):
+        extra["epoch"] = R.st["epoch_progress"]  # epochs done: 0 at step 0, e + 1 at the end of epoch e
+    summary.update(extra)
     log.eval_json("summary", summary, step)
     scal = ev.flatten(tf_sum, "eval/tf")
     scal.update(ev.flatten(gr_sum, "eval/greedy"))
@@ -912,17 +1322,32 @@ def run_eval(R: Run, step: int, final: bool = False) -> dict:
         scal.update(ev.flatten(probe_sum, "eval/probe"))
         if "all" in probe_sum and "all" in tf_sum:
             scal["eval/kl_gap_heldout_minus_probe"] = tf_sum["all"]["kl"] - probe_sum["all"]["kl"]
+    if pg_sum:
+        scal.update(ev.flatten(pg_sum, "eval/probe_greedy"))
+        if "all" in pg_sum and "all" in gr_sum:
+            scal["eval/cer_teacher_gap_heldout_minus_probe"] = (gr_sum["all"]["cer_teacher_corpus"]
+                                                                 - pg_sum["all"]["cer_teacher_corpus"])
     if full_sum:
         scal.update(ev.flatten(full_sum, "eval/greedy_full"))
+    if "epoch" in extra:
+        scal["eval/epoch"] = extra["epoch"]
     scal["eval/wall_s"] = summary["wall_s"]
     log.scalars(scal, step)
-    log.samples(step, ev.pick_samples(gr_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"])))
+    samples = ev.pick_samples(gr_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"]))
+    if pg_df is not None:  # train utterances (their source says so) after the held-out ones
+        samples += ev.pick_samples(pg_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"]))
+    log.samples(step, samples)
 
     if not final:  # what fit_budget scales the final eval's duration from
         R.st["eval_cost"] = dict(tf_s=float(tf_sum.get("wall_s", 0.0)),
-                                 probe_s=float(probe_sum.get("wall_s", 0.0)) if probe_sum else 0.0,
+                                 probe_s=(float(probe_sum.get("wall_s", 0.0)) if probe_sum else 0.0)
+                                 + (float(pg_sum.get("wall_s", 0.0)) if pg_sum else 0.0),
                                  greedy_s=float(gr_sum.get("wall_s", 0.0)), greedy_n=len(R.greedy_ids))
     rec = ev.eval_record(step, R.clock(), tf=tf_sum, greedy=gr_sum, probe=probe_sum)
+    if pg_sum and "all" in pg_sum:
+        rec["probe_greedy"] = {k: pg_sum["all"][k] for k in ("cer_teacher_corpus", "cer_ref_corpus", "n")}
+    if "epoch" in extra:
+        rec["epoch"] = extra["epoch"]
     hist = R.st["history"]
     if hist and hist[-1]["step"] == step:
         hist[-1] = rec
@@ -932,9 +1357,81 @@ def run_eval(R: Run, step: int, final: bool = False) -> dict:
     for s, d in gr_sum.get("sets", {}).items():
         brief.setdefault(s, {}).update(cer=round(d["cer_ref_corpus"], 4), ratio=round(d["ratio_vs_teacher"], 3),
                                        trunc=round(d["trunc_rate"], 4))
+    if pg_sum and "all" in pg_sum:
+        extra["probe_cer_teacher"] = round(pg_sum["all"]["cer_teacher_corpus"], 4)
     log.event("eval", at_step=step, final=final, wall_s=summary["wall_s"], sets=brief,
-              probe_kl=probe_sum["all"]["kl"] if probe_sum and "all" in probe_sum else None)
+              probe_kl=probe_sum["all"]["kl"] if probe_sum and "all" in probe_sum else None,
+              **{k: v for k, v in extra.items() if k != "probe_greedy"})
     return full_sum if full_sum is not None else gr_sum
+
+
+# ----------------------------------------------------------------------------------------------------- early stop
+
+
+def early_stop_value(R: Run, metric: str) -> float | None:
+    """The early-stop metric right after an eval: the newest eval record's probe_kl / heldout_kl (eval_record), or the
+    mean loss/total of the optimizer steps since the previous eval (None if there were none)."""
+    es = R.st["early_stop"]
+    if metric == "train_loss":
+        return es["loss_sum"] / es["loss_n"] if es["loss_n"] else None
+    return (R.st["history"][-1] if R.st["history"] else {}).get(metric)
+
+
+def early_stop_check(R: Run, step: int) -> bool:
+    """After every in-loop eval: with early_stop.enabled and no trigger yet, update the early-stop state
+    (early_stop_update), log it and act on a trigger (early_stop_trigger). Returns True when the loop must end now."""
+    ec, es = R.cfg["early_stop"], R.st["early_stop"]
+    value = early_stop_value(R, ec["metric"])
+    es["loss_sum"], es["loss_n"] = 0.0, 0  # the next eval's train-loss window starts here
+    if not ec["enabled"] or es["triggered"]:
+        return False
+    reason = early_stop_update(es, ec, value, step)
+    nan = float("nan")
+    row = {"early_stop/value": nan if es["value"] is None else es["value"],
+           "early_stop/best": nan if es["best"] is None else es["best"],
+           "early_stop/evals_since_best": es["evals_since_best"]}
+    if reason is None:
+        row["early_stop/triggered"] = 0.0
+    R.log.scalars(row, step)
+    return reason is not None and early_stop_trigger(R, reason, ec["action"])
+
+
+def early_stop_trigger(R: Run, reason: str, action: str) -> bool:
+    """Act on an early-stop trigger (reason "patience", "floor" or "stop_file") and log it (`early_stop` event,
+    early_stop/triggered = 1). "stop": the loop ends now. "cooldown": the WSD cooldown starts now, over
+    schedule.cooldown_frac x the loop time (or the steps; whole steps) done so far, capped by what is left of the
+    budget, and the run ends when it is over (Run.progress, Run.cooldown_start); a run already in its cooldown goes on
+    to the scheduled end. Returns True when the loop must end now."""
+    ec, es, sch = R.cfg["early_stop"], R.st["early_stop"], R.cfg["schedule"]
+    step = R.st["step"]
+    info = dict(metric=ec["metric"] if ec["enabled"] else None, value=es["value"], best=es["best"],
+                best_step=es["best_step"], evals_since_best=es["evals_since_best"], reason=reason, action=action,
+                at_step=step, epoch=R.st["epoch_progress"])
+    if es["triggered"]:  # the STOP file after an early cooldown began
+        info["previous"] = es["triggered"]
+    if action == "cooldown":
+        t, T = R.progress()
+        t_c = R.cooldown_start(T)
+        if R.st["pre_cooldown_done"] or t >= t_c or es["cooldown"]:
+            info["cooldown"] = dict(already=True, t_c=t_c, T=T, clock=sch["clock"])
+        else:
+            length = float(sch["cooldown_frac"]) * t
+            if sch["clock"] != "wall":
+                length = float(math.ceil(length))
+            es["cooldown"] = dict(t_c=t, T=t + max(0.0, min(length, T - t)), clock=sch["clock"], at_step=step)
+            info["cooldown"] = dict(es["cooldown"], already=False)
+    else:
+        es["stop"] = True
+    es["triggered"] = info
+    R.log.event("early_stop", **info)
+    R.log.scalars({"early_stop/triggered": 1.0}, step)
+    return es["stop"]
+
+
+def stop_requested(R: Run) -> bool:
+    """The manual stop: runs/<run_id>/STOP exists (one stat per optimizer step, whatever early_stop.enabled says) ->
+    the "stop" path with reason "stop_file"."""
+    return (R.run_dir / STOP_FILE).exists() and early_stop_trigger(R, "stop_file", "stop")
 
 
 # ----------------------------------------------------------------------------------------------------- checkpoints
@@ -956,10 +1453,20 @@ def _set_rng_state(s: dict):
     random.setstate(tuple(tuple(x) if isinstance(x, list) else x for x in s["python"]))
 
 
-def _replace_dir(tmp: Path, final: Path):
+def _replace_dir(tmp: Path, final: Path, tries: int = 150):
+    """tmp -> final. On Windows a directory cannot be renamed while any file in it is open (PermissionError), and a
+    virus scanner or the search indexer may still be reading a just-written multi-GB model.pt / optimizer.pt, so retry
+    there for up to ~30 s (as kitsune.runlog._replace does for single files)."""
     if final.exists():
         shutil.rmtree(final)
-    os.replace(tmp, final)
+    for i in range(tries):
+        try:
+            os.replace(tmp, final)
+            return
+        except PermissionError:
+            if os.name != "nt" or i == tries - 1:
+                raise
+            time.sleep(0.2)
 
 
 def save_weights(R: Run, step: int, reason: str) -> Path:
@@ -993,29 +1500,46 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False) -> Path:
     name = f"full_step_{step}"
     d = R.ckpt_dir / name
     t0 = time.time()
-    if not (d.exists() and step in R.st["fulls"]):
-        tmp = R.ckpt_dir / f"{name}.tmp"
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        tmp.mkdir(parents=True)
+
+    def trainer_state():
         st = copy.deepcopy(R.st)
         st["train_s"] = R.clock()
         st["fulls"] = sorted(set(st["fulls"]) | {step})
         trainer = dict(format=1, step=step, reason=reason, run_id=R.run_dir.name, cfg=R.cfg, st=st,
                        planner=R.planner.state_dict(), logger=R.log.state_dict(), rng=_rng_state(),
                        time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        brief = {k: v for k, v in trainer.items() if k not in ("rng", "st")}
+        brief["st"] = {k: v for k, v in st.items() if k not in ("history", "smoke_losses")}
+        return trainer, brief, st
+
+    if not (d.exists() and step in R.st["fulls"]):
+        tmp = R.ckpt_dir / f"{name}.tmp"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        trainer, brief, st = trainer_state()
         torch.save(R.model.state_dict(), tmp / "model.pt")
         torch.save(R.opt.state_dict(), tmp / "optimizer.pt")
         torch.save(R.l2sp.state_dict(), tmp / "l2sp.pt")
         torch.save(trainer, tmp / "trainer.pt")
-        brief = {k: v for k, v in trainer.items() if k not in ("rng", "st")}
-        brief["st"] = {k: v for k, v in st.items() if k not in ("history", "smoke_losses")}
         (tmp / "trainer.json").write_text(json.dumps(brief, indent=1, default=str), encoding="utf-8")
         _replace_dir(tmp, d)
         R.st["fulls"] = st["fulls"]
         R.log.event("checkpoint", ckpt="full", name=name, reason=reason, save_s=round(time.time() - t0, 1),
                     gb=round(sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / 1e9, 3),
                     disk_free_gb=_disk_free_gb(d))
+    elif reason == "end":
+        # a periodic/after-smoke full state already holds this step's weights and optimizer, but its trainer state
+        # predates the stop (early_stop.stop / triggered); rewrite only trainer.pt/.json so a resume ends the run
+        trainer, brief, _ = trainer_state()
+        for fname, write in (("trainer.pt", lambda f: torch.save(trainer, f)),
+                             ("trainer.json", lambda f: f.write_text(json.dumps(brief, indent=1, default=str),
+                                                                     encoding="utf-8"))):
+            tmp = d / f"{fname}.tmp"
+            write(tmp)
+            _replace_file(tmp, d / fname)
+        R.log.event("checkpoint", ckpt="full", name=name, reason=reason, trainer_only=True,
+                    save_s=round(time.time() - t0, 1))
     if upload:
         R.uploader.submit(d, name)
     rotate_full(R)
@@ -1182,11 +1706,55 @@ def smoke_checks(R: Run):
     log.event("smoke_checks_done", wall_s=round(time.time() - t0, 1))
 
 
+VRAM_MARGIN_GIB = 0.5  # left outside the Windows VRAM cap: cuBLAS/cuDNN kernels and handles load outside the allocator
+
+
+def cap_vram(R: Run):
+    """Windows + CUDA: cap PyTorch's caching allocator, for the whole process, at the VRAM free now (plus what it
+    already holds) minus VRAM_MARGIN_GIB. The Windows driver's sysmem fallback (on by default) serves an allocation that
+    no longer fits the card from shared system memory instead of failing it, so an oversized micro-batch would run
+    several times slower instead of raising OutOfMemoryError, and the memory probe's fallbacks (halve micro_audio_s,
+    gradient checkpointing) and train_step's OOM skip would never fire. Under the cap they do. Linux has no fallback."""
+    if R.device.type != "cuda" or os.name != "nt":
+        return
+    idx = R.device.index if R.device.index is not None else torch.cuda.current_device()  # the API needs an index
+    free, total = torch.cuda.mem_get_info(idx)
+    held = torch.cuda.memory_reserved(idx)
+    frac = min(1.0, max(0.0, (free + held - VRAM_MARGIN_GIB * 2**30) / total))
+    torch.cuda.set_per_process_memory_fraction(frac, idx)
+    R.vram_cap_gb = round(frac * total / 2**30, 2)
+    R.log.event("vram_cap", cap_gb=R.vram_cap_gb, free_gb=round(free / 2**30, 2), held_gb=round(held / 2**30, 2),
+                total_gb=round(total / 2**30, 2), margin_gb=VRAM_MARGIN_GIB, fraction=round(frac, 4))
+
+
+def probe_passes(R: Run, planner: trainset.StepPlanner, rec: dict):
+    """The memory probe's measured passes: forward+backward on each of the plan's worst micro-batches, peak GiB
+    allocated / reserved into rec (CUDA). train_step accumulates a step's micro-batches into the same gradients, so
+    from the second micro-batch on, forward and backward run with the full fp32 gradients (4 B/param, 2.3 GiB for the
+    real student) already allocated. When the plan has steps of more than one micro-batch every pass therefore starts
+    from zero-filled gradients (backward adds into them in place, as in training) instead of none."""
+    cuda = R.device.type == "cuda"
+    plan = planner.epoch_plan(0)
+    rec["grads_held"] = held = max(len(step) for step in plan) > 1
+    for name, idx in planner.worst_micro_batches(plan).items():
+        if held:
+            for p in R.params:
+                p.grad = torch.zeros_like(p)
+        if cuda:
+            torch.cuda.reset_peak_memory_stats()
+        fwd_bwd(R, R.ds[idx])  # frees the gradients at the end
+        if cuda:
+            rec["peak_gb"][name] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+            rec["max_reserved_gb"] = max(rec.get("max_reserved_gb", 0.0),
+                                         round(torch.cuda.max_memory_reserved() / 2**30, 2))
+
+
 def memory_probe(R: Run) -> dict:
     """CUDA only. Run forward+backward on the micro-batches that stress memory most (longest audio, most decoder
-    positions, most targets) with the optimizer state's bytes held in reserve. On OOM halve micro_audio_s (down to
-    memory.min_micro_audio_s); if that still fails, enable per-layer gradient checkpointing and start again from the
-    configured size. The choice is kept in the full state, so a resume uses the same batches."""
+    positions, most targets) with the optimizer state's bytes held in reserve, and the step's gradients too when a step
+    has several micro-batches (probe_passes). On OOM halve micro_audio_s (down to memory.min_micro_audio_s); if that
+    still fails, enable per-layer gradient checkpointing and start again from the configured size. The choice is kept in
+    the full state, so a resume uses the same batches. On Windows it runs under cap_vram's cap, so OOM means OOM."""
     cfg, log = R.cfg, R.log
     micro0 = float(cfg["batch"]["micro_audio_s"])
     ckpt = cfg["memory"]["grad_ckpt"] is True
@@ -1198,29 +1766,29 @@ def memory_probe(R: Run) -> dict:
         R.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         train_mode(R.model)
     micro = micro0
-    adam_bytes = 8 * sum(p.numel() for p in R.params)  # exp_avg + exp_avg_sq, allocated lazily at the first step
+    # exp_avg + exp_avg_sq, allocated lazily at the first step (in host memory under optim.offload "cpu")
+    adam_bytes = 0 if offloaded(R) else 8 * sum(p.numel() for p in R.params)
     while True:
         planner = make_planner(R, micro) if micro != float(R.planner.micro_audio_s) else R.planner
-        peaks, reserve, err = {}, None, None
+        rec, reserve, err = dict(peak_gb={}), None, None
         try:
             reserve = torch.empty(adam_bytes, dtype=torch.uint8, device=R.device)
-            for name, idx in planner.worst_micro_batches().items():
-                torch.cuda.reset_peak_memory_stats()
-                fwd_bwd(R, R.ds[idx])
-                peaks[name] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+            probe_passes(R, planner, rec)
         except torch.OutOfMemoryError as e:
             err = str(e)[:300]
         reserve = None
         if err is None:
             R.planner = planner
             total = torch.cuda.get_device_properties(R.device).total_memory / 2**30
-            log.event("memory_probe", ok=True, micro_audio_s=micro, grad_ckpt=ckpt, peak_gb=peaks,
-                      device_gb=round(total, 1), reserved_adam_gb=round(adam_bytes / 2**30, 2))
+            log.event("memory_probe", ok=True, micro_audio_s=micro, grad_ckpt=ckpt, peak_gb=rec["peak_gb"],
+                      grads_held=rec["grads_held"], max_reserved_gb=rec.get("max_reserved_gb"),
+                      vram_cap_gb=R.vram_cap_gb, device_gb=round(total, 1),
+                      reserved_adam_gb=round(adam_bytes / 2**30, 2))
             return dict(micro_audio_s=micro, grad_ckpt=ckpt)
         # outside the except: its traceback no longer pins the failed pass's activations
         R.opt.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
-        log.event("oom_fallback", micro_audio_s=micro, grad_ckpt=ckpt, peaks_so_far=peaks, error=err)
+        log.event("oom_fallback", micro_audio_s=micro, grad_ckpt=ckpt, peaks_so_far=rec["peak_gb"], error=err)
         if micro / 2 >= float(cfg["memory"]["min_micro_audio_s"]):
             micro /= 2
         elif not ckpt and cfg["memory"]["grad_ckpt"] == "auto":
@@ -1270,7 +1838,7 @@ def build(args) -> tuple[Run, dict | None]:
     if args.resume:
         full = find_full_state(Path(args.resume))
         state = torch.load(full / "trainer.pt", map_location="cpu", weights_only=True)
-        cfg = copy.deepcopy(state["cfg"])
+        cfg = _merge(DEFAULTS, copy.deepcopy(state["cfg"]))  # keys added since it was written take the defaults
         overrides = [apply_set(cfg, s) for s in args.set]
         validate(cfg)
         run_dir = full.parent.parent
@@ -1314,6 +1882,7 @@ def train(R: Run, state: dict | None) -> int:
     if R.device.type == "cuda":
         torch.set_float32_matmul_precision("high" if cfg["perf"]["tf32"] else "highest")
     log.event("phase", name="setup", device=str(R.device), autocast=cfg["autocast"])
+    cap_vram(R)  # before anything is allocated on the device, and on every resume too
 
     if state is not None:
         R.st.update(copy.deepcopy(state["st"]))
@@ -1337,10 +1906,13 @@ def train(R: Run, state: dict | None) -> int:
     if state is not None:
         full = R.resumed_from
         R.model.load_state_dict(torch.load(full / "model.pt", map_location=R.device, weights_only=True))
-        R.opt.load_state_dict(torch.load(full / "optimizer.pt", map_location=R.device, weights_only=True))
+        # offload: the AdamW state stays in host memory, and the masters are rebuilt from the weights just loaded
+        R.opt.load_state_dict(torch.load(full / "optimizer.pt", map_location="cpu" if offloaded(R) else R.device,
+                                         weights_only=True))
         R.l2sp.load_state_dict(torch.load(full / "l2sp.pt", map_location="cpu", weights_only=True))
         R.planner.load_state_dict(state["planner"])
         _set_rng_state(state["rng"])
+        plan_epochs(R)  # a no-op unless the clock was switched to "epochs" on this resume
         log.event("resumed", at_step=R.st["step"], train_s=round(R.st["train_s"], 1), epoch=R.st["epoch_progress"],
                   planner=state["planner"])
     else:
@@ -1355,6 +1927,7 @@ def train(R: Run, state: dict | None) -> int:
                 R.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
                 train_mode(R.model)
             R.st["flops_per_padded_s"] = measure_flops(R, R.ds[R.planner.worst_micro_batches()["longest"]])
+        plan_epochs(R)  # after the memory probe: the micro-batch size it chose shapes the plans
         R.planner.epoch_plan(0)
         log.event("plan", micro_audio_s=R.planner.micro_audio_s, **R.planner.stats)
     if not R.st["step0_done"]:
@@ -1362,7 +1935,11 @@ def train(R: Run, state: dict | None) -> int:
         run_eval(R, 0)
         R.st["step0_done"] = True
 
-    loop(R)
+    if R.st["early_stop"]["stop"]:  # resumed after an early stop had triggered: straight to the end phase
+        log.event("phase", name="train", at_step=R.st["step"], skipped="early_stop",
+                  reason=R.st["early_stop"]["triggered"]["reason"])
+    else:
+        loop(R)
 
     step = R.st["step"]
     log.event("phase", name="end", at_step=step, train_s=round(R.clock(), 1))
@@ -1426,6 +2003,11 @@ def loop(R: Run):
         log.event("shm_cap", **cap)
     crash_at = int(os.environ["KITSUNE_CRASH_AT_STEP"]) if os.environ.get("KITSUNE_CRASH_AT_STEP") else None
     smoke_n = int(cfg["smoke"]["steps"]) if cfg["smoke"]["enabled"] else 0
+    epochs = int(sch["epochs"]) if sch["clock"] == "epochs" else None
+
+    def passes_done() -> bool:  # clock "epochs": the planner's position is past the last epoch (skipped steps too)
+        return epochs is not None and R.planner.epoch >= epochs
+
     fit_budget(R)
     log.event("phase", name="train", at_step=R.st["step"], workers=nw, micro_audio_s=R.planner.micro_audio_s,
               grad_ckpt=R.st["memory"].get("grad_ckpt"))
@@ -1435,9 +2017,11 @@ def loop(R: Run):
     try:
         while True:
             t, T = R.progress()
-            if t >= T or (sch["max_steps"] and R.st["step"] >= int(sch["max_steps"])):
+            if t >= T or (sch["max_steps"] and R.st["step"] >= int(sch["max_steps"])) or passes_done():
                 break
-            t_c = (1.0 - float(sch["cooldown_frac"])) * T
+            if stop_requested(R):  # runs/<run_id>/STOP
+                break
+            t_c = R.cooldown_start(T)
             if not R.st["pre_cooldown_done"] and t >= t_c and float(sch["cooldown_frac"]) > 0:
                 R.st["pre_cooldown_done"] = True
                 log.event("phase", name="cooldown", at_step=R.st["step"], t=t, T=T)
@@ -1445,7 +2029,8 @@ def loop(R: Run):
             step = R.st["step"] + 1
             if crash_at is not None and step >= crash_at:
                 raise RuntimeError(f"KITSUNE_CRASH_AT_STEP={crash_at}: simulated crash before step {step}")
-            lr, phase = wsd_lr(float(cfg["optim"]["lr"]), step, t, T, int(sch["warmup_steps"]), float(sch["cooldown_frac"]))
+            lr, phase = wsd_lr(float(cfg["optim"]["lr"]), step, t, T, warmup_steps(sch, R.st["total_steps"]),
+                               float(sch["cooldown_frac"]), t_c=t_c)
             if phase != R.st.get("lr_phase"):
                 log.event("lr_phase", at_step=step, phase=("warmup", "stable", "cooldown")[phase], lr=lr, t=t, T=T)
                 R.st["lr_phase"] = phase
@@ -1465,7 +2050,9 @@ def loop(R: Run):
                 torch.cuda.synchronize()
             step_s = time.perf_counter() - t0
             R.st["step"] = step
-            objective = log_step(R, step, lr, phase, out, wait, step_s, e, s)
+            objective, total = log_step(R, step, lr, phase, out, wait, step_s, e, s)
+            es = R.st["early_stop"]
+            es["loss_sum"], es["loss_n"] = es["loss_sum"] + float(total), es["loss_n"] + 1  # metric "train_loss"
             if not R.st["smoke_done"] and smoke_n:
                 R.st["smoke_losses"].append(float(objective))
                 if step > max(1, smoke_n // 10):  # the first steps pay for worker start-up and kernel autotuning
@@ -1474,11 +2061,23 @@ def loop(R: Run):
                 if step >= smoke_n:
                     smoke_end(R)
             t = R.clock()
-            if due(t, step, R.st["last_eval_t"], R.st["last_eval_step"], ev_cfg["every_min"], ev_cfg["every_steps"]):
+            if ev_cfg["every_epochs"]:  # epochs completed since the last eval; the end phase's eval covers the last
+                eval_now = (R.planner.epoch - R.st["last_eval_epoch"] >= int(ev_cfg["every_epochs"])
+                            and not passes_done())
+            else:
+                eval_now = due(t, step, R.st["last_eval_t"], R.st["last_eval_step"], ev_cfg["every_min"],
+                               ev_cfg["every_steps"])
+            if eval_now and R.st["early_stop"]["cooldown"]:  # an early cooldown's last step: the final eval covers it
+                t_now, T_now = R.progress()
+                eval_now = t_now < T_now
+            if eval_now:
                 run_eval(R, step)
                 R.st["last_eval_t"], R.st["last_eval_step"] = R.clock(), step
+                R.st["last_eval_epoch"] = R.planner.epoch
                 if not R.st["pre_cooldown_done"]:  # a fresher final-eval estimate (never moves T in the cooldown)
                     fit_budget(R)
+                if early_stop_check(R, step):  # action "stop": the end phase right after this eval
+                    break
             if due(t, step, R.st["last_weights_t"], R.st["last_weights_step"], ck["weights_every_min"],
                    ck["weights_every_steps"]):
                 save_weights(R, step, "periodic")
@@ -1519,6 +2118,7 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         memory=st["memory"], skipped=dict(nonfinite=st["nonfinite_total"], oom=st["oom_skips"]),
         cost=dict(dph=dph, usd=round(dph * elapsed / 3600, 2) if dph else None, note="trainer process time only"),
         best=dict(greedy_cer_ratio_mean=best(cer_ratio), heldout_kl=best(lambda r: r.get("heldout_kl"))),
+        stopped_early=st["early_stop"]["triggered"],  # the `early_stop` event's fields; None: no early stop triggered
         history=hist, checkpoints=dict(weights=st["weights"], full=st["fulls"]),
         config=R.cfg, **extra)
 

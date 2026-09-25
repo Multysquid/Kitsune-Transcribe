@@ -9,7 +9,9 @@ is lost and a human can look. The vast REST API is called with the per-instance 
 
 Expected files for each run dir runs/<run_id>/ (see scripts/04_distill.py):
   every file outside checkpoints/                      -> runs/<run_id>/<same path>   (RunLogger sync)
-  the newest weights dir  checkpoints/step_<N>/        -> runs/<run_id>/checkpoints/step_<N>/
+  every weights dir       checkpoints/step_<N>/        -> runs/<run_id>/checkpoints/step_<N>/
+    (all of them, not just the newest: an earlier upload that failed would otherwise go with the destroyed disk; the
+    hub skips re-uploads of content it already has)
   the newest full state   checkpoints/full_step_<N>/   -> runs/<run_id>/checkpoints/full_step_<N>/  (--expect-full)
 The files outside checkpoints/ are uploaded from a snapshot copy: the watchdog's --sync-only runs while the trainer
 still appends to its logs, and a file handed to the Hub by path is sized when it is listed but hashed and read later
@@ -104,7 +106,8 @@ def expected_files(run_dir: Path, expect_full: bool = True) -> dict[str, Path]:
             continue
         out[f"{prefix}/{rel}"] = f
     ckpt = run_dir / "checkpoints"
-    picks = [newest_checkpoint(ckpt, WEIGHTS_RE)] + ([newest_checkpoint(ckpt, FULL_RE)] if expect_full else [])
+    weights = sorted(p for p in ckpt.iterdir() if WEIGHTS_RE.match(p.name)) if ckpt.is_dir() else []
+    picks = weights + ([newest_checkpoint(ckpt, FULL_RE)] if expect_full else [])
     for pick in picks:
         if pick is None:
             continue

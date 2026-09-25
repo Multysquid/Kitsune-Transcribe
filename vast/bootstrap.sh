@@ -15,8 +15,10 @@
 # already on disk. Phase timings go to $KITSUNE_STATE/bootstrap_timings.jsonl.
 #
 # Env: KITSUNE_DATA_REPO (required), KITSUNE_DATA_REVISION (default main), KITSUNE_CONFIG (default
-# configs/viability.json), KITSUNE_PREP_ARGS (extra args for 01, e.g. --galgame-shards 12), KITSUNE_MIN_COVERAGE
-# (default 0.99), HF_TOKEN (vast account env; never printed).
+# configs/viability.json), KITSUNE_PREP_ARGS (extra args for 01; leave it empty for the viability data: its teacher
+# outputs cover exactly the first 6 Galgame tars and 300 h of Emilia-YODAS, which are 01's defaults, and a larger
+# --galgame-shards/--emilia-hours only downloads audio without teacher output), KITSUNE_MIN_COVERAGE (default 0.99),
+# HF_TOKEN (vast account env; never printed).
 set -euo pipefail
 
 KITSUNE_DIR="${KITSUNE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -74,6 +76,8 @@ repo = os.environ["KITSUNE_DATA_REPO"]
 rev = os.environ["KITSUNE_DATA_REVISION"]
 sources = list(cfg.get("sources", []))
 evals = list(cfg.get("eval_sets", []))
+# a source can be a train source AND an eval set (galgame keeps its hold-out in its own eval split)
+names = list(dict.fromkeys(sources + evals))
 teacher_root = cfg.get("teacher_root", "teacher_out")
 second_root = cfg.get("second_root", "second_out")
 data_root = cfg.get("data_root", "data")
@@ -94,16 +98,21 @@ def plan():
 
     patterns = [f"{teacher_root}/meta.json", f"{second_root}/meta.json", selection, f"{student}/*"]
     required = [f"{selection}", f"{student}/config.json"]
-    for s in sources + evals:
+    for s in names:
         patterns += [f"{teacher_root}/{s}/*", f"{second_root}/{s}/*"]
         required.append(f"{teacher_root}/{s}/*.npz")
     required += [f"{second_root}/{s}/*.jsonl" for s in sources]
     missing = [p for p in required if not has(p)]
+    for s in sources:  # every teacher shard needs its second opinion (the same rule as vast/launch.py data_problems)
+        teacher = {f.rsplit("/", 1)[1][:-4] for f in files if f.startswith(f"{teacher_root}/{s}/") and f.endswith(".npz")}
+        second = {f.rsplit("/", 1)[1][:-6] for f in files if f.startswith(f"{second_root}/{s}/") and f.endswith(".jsonl")}
+        if teacher - second:
+            missing.append(f"{second_root}/{s}: {len(teacher - second)} of {len(teacher)} shards without a second opinion")
     if missing:
         sys.exit(f"data repo {repo}@{rev} lacks: {missing}")
-    parked = [s for s in sources + evals if has(f"{data_root}/shards/{s}/*.parquet")]
+    parked = [s for s in names if has(f"{data_root}/shards/{s}/*.parquet")]
     patterns += [f"{data_root}/shards/{s}/*.parquet" for s in parked]
-    rebuild = [s for s in sources + evals if s not in parked]
+    rebuild = [s for s in names if s not in parked]
     out = dict(repo=repo, revision=rev, patterns=patterns, parked=parked, rebuild=rebuild, data_root=data_root,
                repo_files=len(files), wall=time.time())
     plan_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
@@ -128,7 +137,7 @@ def coverage():
 
     floor = float(os.environ.get("KITSUNE_MIN_COVERAGE", "0.99"))
     report, bad = {}, []
-    for s in sources + evals:
+    for s in names:
         tids = set()
         for npz in sorted((root / teacher_root / s).glob("*.npz")):
             with np.load(npz, allow_pickle=False) as z:

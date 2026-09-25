@@ -57,10 +57,12 @@ WHISPER_TOK = "openai/whisper-large-v3"  # tokenizer that produced the precomput
 JOIN_SOURCES = {  # sources whose mirror parquets already carry whisper-large-v3 transcripts
     "reazon_small": "japanese-asr/whisper_transcriptions.reazonspeech.small",
     "reazon_medium": "japanese-asr/whisper_transcriptions.reazonspeech.medium",
+    "reazon_large": "japanese-asr/whisper_transcriptions.reazonspeech.large",
 }
 SELF_TEXT_SOURCES = {  # sources whose dataset text is itself a second-model transcript
     "emilia_yodas": "whisper-medium (Emilia WhisperX)",
     "eval_emilia": "whisper-medium (Emilia WhisperX)",
+    "emilia_nc": "whisper-medium (Emilia WhisperX)",
 }
 
 

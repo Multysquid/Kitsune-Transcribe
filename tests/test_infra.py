@@ -20,7 +20,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 VAST = ROOT / "vast"
-SHELL_SCRIPTS = [VAST / "onstart.sh", VAST / "bootstrap.sh", VAST / "watchdog.sh"]
+SHELL_SCRIPTS = [VAST / "onstart_stub.sh", VAST / "onstart.sh", VAST / "bootstrap.sh", VAST / "watchdog.sh"]
 SHA = "0123456789abcdef0123456789abcdef01234567"
 DIGEST_IMAGE = "ghcr.io/multysquid/kitsune-train@sha256:" + "ab" * 32
 
@@ -132,10 +132,36 @@ def test_shell_script_syntax_and_hygiene(script: Path):
     assert r.returncode == 0, r.stderr
 
 
+def test_onstart_stub_fits_vast_limits():
+    raw = (VAST / "onstart_stub.sh").read_bytes()
+    assert len(raw) <= launch.ONSTART_MAX_BYTES < 4048, "the API's onstart field may be capped near 4 KB"
+    raw.decode("ascii")  # vastai reads the file with the platform default encoding on Windows
+    assert b"\r\n" not in raw
+    text = raw.decode()
+    for needle in ("KITSUNE_SHA", "https://github.com/Multysquid/Kitsune-Transcribe", "fetch -q --depth 1",
+                   'exec bash "$D/vast/onstart.sh"', "console.vast.ai/api/v0/instances", "KITSUNE_NO_SELF_STOP",
+                   "--config -", "/workspace/kitsune.log"):
+        assert needle in text, needle
+    assert launch.ONSTART == VAST / "onstart_stub.sh"
+
+
+def test_onstart_stub_stops_the_box_when_the_clone_fails(tmp_path):
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    log = tmp_path / "kitsune.log"
+    env = dict(os.environ, KITSUNE_DIR=(tmp_path / "repo").as_posix(), KITSUNE_LOG=log.as_posix(), KITSUNE_SHA="not-a-sha",
+               KITSUNE_NO_SELF_STOP="1")
+    r = subprocess.run([bash, str(VAST / "onstart_stub.sh")], capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 1
+    text = log.read_text(encoding="utf-8")
+    assert "full 40-hex" in text and "KITSUNE_NO_SELF_STOP=1" in text
+
+
 def test_onstart_fits_vast_limits():
     raw = (VAST / "onstart.sh").read_bytes()
-    assert len(raw) < 16 * 1024, "vast's on-start field is limited to 16 KB"
-    raw.decode("ascii")  # vastai reads the file with the platform default encoding on Windows
+    assert len(raw) < 16 * 1024, "vast's on-start field is limited to 16 KB (it is run from the clone by the stub)"
+    raw.decode("ascii")
     text = raw.decode()
     for needle in ("/etc/environment", "ulimit -Sn", "/dev/shm", "KITSUNE_SHARING=file_system",
                    "entrypoint.sh", "https://github.com/Multysquid/Kitsune-Transcribe", "vast/watchdog.sh",
@@ -164,7 +190,7 @@ OFFERS_40 = [
      "geolocation": "US"},
     {"id": 111, "gpu_name": "A100 SXM4", "gpu_ram": 40960, "dph_total": 0.672, "reliability": 0.995,
      "cuda_max_good": 13.0, "cpu_cores_effective": 12, "cpu_ram": 64000, "inet_down": 600, "disk_bw": 800,
-     "geolocation": "SE"},
+     "inet_down_cost": 0.01, "inet_up_cost": 0.02, "geolocation": "SE"},
 ]
 OFFERS_80 = [{"id": 333, "gpu_name": "A100 SXM4", "gpu_ram": 81920, "dph_total": 1.604, "reliability": 0.99}]
 
@@ -212,19 +238,21 @@ def test_launch_dry_run_builds_query_and_command(fake_vastai, capsys):
                  "cpu_cores_effective>=12", "cpu_ram>=64", "disk_bw>=500", "inet_down>=500",
                  "direct_port_count>=1", "gpu_ram<=48"):
         assert term in query.split(" ") or term in query, term
-    assert search[4:] == ["--type", "on-demand", "-o", "dph", "--storage", "80", "--raw"]
+    assert search[4:] == ["--type", "on-demand", "-o", "dph", "--storage", "150", "--raw"]
     out = capsys.readouterr().out
     create_line = next(ln for ln in out.splitlines() if ln.strip().startswith("vastai create instance"))
     # cheapest offer wins even if the API returned it second
     assert create_line.strip().startswith("vastai create instance 111 ")
-    for piece in (f"--image {DIGEST_IMAGE}", "--disk 80", "--ssh", "--direct", "--cancel-unavail",
+    for piece in (f"--image {DIGEST_IMAGE}", "--disk 150", "--ssh", "--direct", "--cancel-unavail",
                   f"-e KITSUNE_SHA={SHA}", "-e KITSUNE_CONFIG=configs/viability.json",
                   "-e KITSUNE_DATA_REPO=Multy123/kitsune-data", "-e KITSUNE_OUT_REPO=Multy123/kitsune-runs",
                   "-e TZ=UTC", "--onstart"):
         assert piece in create_line, piece
-    assert "onstart.sh" in create_line
+    assert "onstart_stub.sh" in create_line
     assert "HF_TOKEN" not in create_line
     assert "not creating anything (--dry-run)" in out
+    # bandwidth priced from the host's $/GB (OFFERS_40[1]: 0.01 down, 0.02 up)
+    assert "~$0.85 (~25 GB down, ~30 GB up" in out and "$/GBup" in out
 
 
 def test_launch_needs_yes_to_create(fake_vastai, capsys):
@@ -242,8 +270,8 @@ def test_launch_falls_back_to_80gb_and_creates_with_yes(fake_vastai, capsys):
     create = next(c for c in fake.calls if c[1:3] == ["create", "instance"])
     assert create[3] == "333"
     assert create[create.index("--image") + 1] == DIGEST_IMAGE
-    assert create[create.index("--disk") + 1] == "80"
-    assert Path(create[create.index("--onstart") + 1]) == VAST / "onstart.sh"
+    assert create[create.index("--disk") + 1] == "150"
+    assert Path(create[create.index("--onstart") + 1]) == VAST / "onstart_stub.sh"
     env = create[create.index("--env") + 1]
     assert f"-e KITSUNE_SHA={SHA}" in env and "-e TZ=UTC" in env and "HF_TOKEN" not in env
     assert not any("HF_TOKEN" in a for a in create)
@@ -259,7 +287,56 @@ def test_launch_refuses_expensive_offer(fake_vastai):
 def test_launch_without_vastai_prints_install_help(monkeypatch, capsys):
     monkeypatch.setattr(launch.shutil, "which", lambda name: None)
     assert launch.main(launch_args()) == 2
-    assert "pip install vastai==" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "pip install vastai==" in out and "checks passed" in out
+
+
+def test_launch_runs_the_checks_without_vastai(monkeypatch, capsys):
+    """The git/image/HF checks report before the CLI is needed (here: an image not pinned by digest)."""
+    monkeypatch.setattr(launch.shutil, "which", lambda name: None)
+    args = [a if a != DIGEST_IMAGE else "ghcr.io/multysquid/kitsune-train:main" for a in launch_args()]
+    assert launch.main(args) == 2
+    out = capsys.readouterr().out
+    assert "must be pinned by digest" in out and "pip install vastai==" in out
+
+
+VIAB_CFG = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"],
+            "selection": "selection/viability.parquet", "student": "students/b20x2560-d4"}
+DATA_FILES = ["teacher_out/meta.json", "second_out/meta.json", "selection/viability.parquet",
+              "students/b20x2560-d4/config.json", "students/b20x2560-d4/model.safetensors",
+              "teacher_out/reazon_small/train-00000.npz", "teacher_out/reazon_small/train-00000.jsonl",
+              "second_out/reazon_small/train-00000.jsonl",
+              "teacher_out/galgame/train-00000.npz", "teacher_out/galgame/train-00001.npz",
+              "teacher_out/galgame/eval-00000.npz", "second_out/galgame/train-00000.jsonl",
+              "second_out/galgame/train-00001.jsonl", "second_out/galgame/eval-00000.jsonl",
+              "teacher_out/eval_jsut/eval-00000.npz"]
+
+
+def test_data_problems_complete_repo_passes():
+    assert launch.data_problems(DATA_FILES, VIAB_CFG) == []
+
+
+def test_data_problems_catch_a_partial_second_opinion_pass_and_missing_files():
+    files = [f for f in DATA_FILES if f not in ("second_out/galgame/train-00001.jsonl", "second_out/meta.json",
+                                                 "teacher_out/eval_jsut/eval-00000.npz")]
+    problems = launch.data_problems(files, VIAB_CFG)
+    assert any("second_out/galgame: 1 of 3 teacher shards have no second opinion (e.g. train-00001)" in p
+               for p in problems), problems
+    assert "no second_out/meta.json" in problems and "no teacher_out/eval_jsut/*.npz" in problems
+    # an eval-only set needs no second opinion
+    assert not any("eval_jsut: " in p and "second opinion" in p for p in problems)
+
+
+def test_selection_problems_flag_no_agree_rows(tmp_path):
+    import pandas as pd
+
+    path = tmp_path / "sel.parquet"
+    pd.DataFrame({"source": ["galgame", "galgame", "reazon_small"],
+                  "reason": ["kept", "no_agree", "agree>0.5"]}).to_parquet(path)
+    problems = launch.selection_problems(path, "selection/viability.parquet")
+    assert len(problems) == 1 and "1 rows as no_agree ({'galgame': 1})" in problems[0]
+    pd.DataFrame({"source": ["galgame"], "reason": ["kept"]}).to_parquet(path)
+    assert launch.selection_problems(path, "selection/viability.parquet") == []
 
 
 def test_launch_help_needs_nothing():
@@ -470,13 +547,14 @@ class FakeHub:
                     if op.path_in_repo.endswith("/" + name))
 
 
-def test_expected_files_picks_newest_checkpoints(tmp_path):
+def test_expected_files_picks_every_weights_dir_and_the_newest_full_state(tmp_path):
     run = make_run(tmp_path)
     exp = finish.expected_files(run)
     prefix = f"runs/{run.name}"
     assert f"{prefix}/checkpoints/step_200/model.safetensors" in exp
+    assert f"{prefix}/checkpoints/step_100/model.safetensors" in exp, "an older weights upload may have failed"
     assert f"{prefix}/checkpoints/full_step_200/state.pt" in exp
-    assert not any("step_100" in p or ".tmp" in p for p in exp)
+    assert not any("full_step_100" in p or ".tmp" in p for p in exp)
     assert f"{prefix}/tb/events.out.tfevents.1.box" in exp and f"{prefix}/config.json" in exp
     assert not any("full_step" in p for p in finish.expected_files(run, expect_full=False))
 
@@ -616,7 +694,7 @@ def prep():
 
 
 def test_every_upstream_repo_is_pinned(prep):
-    repos = {r for r, _ in prep.HF_PARQUET_SOURCES.values()} | {prep.GALGAME_REPO, prep.EMILIA_REPO}
+    repos = {r for r, _ in prep.HF_PARQUET_SOURCES.values()} | {prep.GALGAME_REPO, prep.EMILIA_REPO, prep.EMOLIA_REPO}
     assert repos == set(prep.REVISIONS)
     assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in prep.REVISIONS.values())
     assert prep.REVISIONS[prep.GALGAME_REPO].startswith("3fb86654")

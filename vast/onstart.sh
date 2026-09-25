@@ -1,7 +1,8 @@
 #!/bin/bash
 # vast.ai on-start script for the Kitsune-Transcribe viability run (SSH launch mode; runs as root at EVERY container
-# start). vast/launch.py passes this file with `vastai create instance --onstart`, so it must stay self-contained,
-# ASCII-only and under vast's 16 KB limit: nothing from the repo exists until it has cloned it.
+# start). vast/launch.py passes the small vast/onstart_stub.sh with `vastai create instance --onstart` (the API may cap
+# that field near 4 KB); the stub clones the repo at $KITSUNE_SHA and execs this file from the clone. It still clones
+# by itself if run on a box without the stub (clone_repo is a no-op when the checkout is already at $KITSUNE_SHA).
 #
 # Steps: sync the env to /etc/environment (SSH/tmux sessions do not inherit the container env), raise the nofile limit,
 # check /dev/shm, start TensorBoard and the vast portal, clone the repo at $KITSUNE_SHA, start vast/watchdog.sh (hard
