@@ -133,9 +133,10 @@ recommendations (its `_comment` has the details and the arithmetic):
 
 On the epochs clock the trainer does not shorten the run to the watchdog's deadline (it does so on the wall clock
 only), so size `schedule.epochs` to fit well inside `--max-hours`: steps per epoch (the `plan` event; 1,216 for the
-viability data) x ~1.05-1.25 s, plus ~4 min per complete eval and ~15 min of box overhead. Verdict v2 needs at least
-3 complete evals before the cooldown: with a complete eval every 2 epochs and a 20 % cooldown that means 8 epochs or
-more (epochs 2, 4 and 6 before the cooldown at 6.4); with fewer it reports "trend: insufficient pre-cooldown evals".
+viability data) x ~1.05-1.25 s, plus ~4 min per complete eval, ~5 min for the smoke profile (estimated) and ~15 min
+of box overhead. Verdict v2 needs at least 3 complete evals before the cooldown: with a complete eval every 2 epochs
+and a 20 % cooldown that means 8 epochs or more (epochs 2, 4 and 6 before the cooldown at 6.4); with fewer it reports
+"trend: insufficient pre-cooldown evals".
 
 ## Watching it
 
@@ -211,9 +212,11 @@ In the output repo under `runs/<run_id>/`: `summary.json` (verdict and final met
 (TensorBoard events), `events.jsonl`, `checkpoints/step_<N>/` (bf16 weights every 30 min), the full resume state from
 before the cooldown and at the end, and `infra/` (box logs; exported too). `smoke/profile/` holds a torch.profiler
 record of ~20 of the smoke steps (steps 22-41 of the 100; `perf.profile_smoke`, on under CUDA; it does not change what
-the run trains, and it costs about a minute): `summary.json` - per step the data-wait and GPU-kernel-time shares,
-kernel launches and aten ops per micro-batch, device syncs and the host scalar reads behind them, the top ops by self
-CUDA and self CPU time - and the first two recorded steps' raw trace, `trace_steps_<a>-<b>.json.gz` (gzip, dropped
+the steps compute, but it costs a few minutes - ~4-5 min extrapolated from the laptop CPU, not measured on a GPU -
+which on the wall clock come out of the training time; `summary.json`'s `wall_s` and `cycles[].process_s` have the
+measured cost): `summary.json` - per step the data-wait and GPU-kernel-time shares, kernel launches and aten ops per
+micro-batch, device syncs and the host scalar reads behind them, the top ops by self CUDA and self CPU time - and the
+first two recorded steps' raw trace, `trace_steps_<a>-<b>.json.gz` (gzip, dropped
 above 32 MB; open it in https://ui.perfetto.dev or chrome://tracing). The `smoke_profile` event has the headline. Convert to flat files with
 `python tools/export_run.py hf://Multy123/kitsune-runs/runs/<run_id> --out <dir>`, or run TensorBoard locally on
 a downloaded `tb/` (`python -m tensorboard.main --logdir <dir> --samples_per_plugin scalars=30000`, to see every step

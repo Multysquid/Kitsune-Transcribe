@@ -252,7 +252,8 @@ DEFAULTS = {
     # loader_timeout_s: seconds the loop waits for a worker micro-batch before it raises (a crash the supervisor can
     # resume) instead of hanging until the watchdog; 0 = wait forever (trainset.make_loader). profile_smoke: a
     # torch.profiler record of ~20 smoke steps into runs/<run_id>/smoke/profile/ (kitsune.profiling, smoke_profiler);
-    # "auto" = on under CUDA, off on CPU; it does not change what the run trains
+    # "auto" = on under CUDA, off on CPU; it does not change what the steps compute, but it costs a few minutes of
+    # host time (kitsune.profiling: cost), which on the wall clock comes out of the loop's training time
     "perf": {"relpos_patch": True, "compile": False, "num_workers": "auto", "prefetch": 4, "tf32": True,
              "peak_tflops": 312.0, "train_exact_dither": False, "loader_timeout_s": 600, "profile_smoke": "auto"},
     # every_epochs: eval at the end of every N-th epoch instead of every_min / every_steps. full_every_epochs: the
@@ -2519,9 +2520,10 @@ def smoke_profiler(R: Run, smoke_n: int):
     """perf.profile_smoke ("auto": on under CUDA only): a kitsune.profiling.SmokeProfiler over ~20 real training steps
     of the smoke phase (profiling.profile_window: after its warm-up steps, inside smoke.steps), writing under
     runs/<run_id>/smoke/profile/ and logging `smoke_profile` events - the evidence for where the first A100 run's fixed
-    cost per micro-batch goes, before any change for speed. CPU runs record CPU activities only. None when it is off,
-    the smoke phase is off or too short to record a step (a `smoke_profile` event says so), or this launch starts
-    past the window (a resume)."""
+    cost per micro-batch goes, before any change for speed. It costs a few minutes of host time on the A100
+    (extrapolated; profiling's docstring, "cost"), paid in the loop: summary.json's wall_s and cycles[].process_s say
+    how many. CPU runs record CPU activities only. None when it is off, the smoke phase is off or too short to record
+    a step (a `smoke_profile` event says so), or this launch starts past the window (a resume)."""
     ps = R.cfg["perf"]["profile_smoke"]
     if not (R.device.type == "cuda" if ps == "auto" else ps) or not smoke_n or R.st["smoke_done"]:
         return None

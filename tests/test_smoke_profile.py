@@ -10,10 +10,12 @@ torch.profiler, summarised into runs/<run_id>/smoke/profile/summary.json with th
   the outputs in the run dir and the `smoke_profile` events; "auto" leaves it off on CPU
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
+import gc
 import gzip
 import json
 import os
 import sys
+import weakref
 from pathlib import Path
 
 if not os.environ.get("CUDA_VISIBLE_DEVICES"):
@@ -118,8 +120,14 @@ def test_the_profiler_on_cpu_writes_its_summary_and_trace(tmp_path):
     prof = P.SmokeProfiler(tmp_path / "profile", torch.device("cpu"), first=3, n=7,
                            emit=lambda kind, **kw: got.append(dict(kw, kind=kind)))
     assert _steps(prof, 1, 2) is None and not prof.running  # before the window
-    s = _steps(prof, 3, 12, skip=(6,))
+    assert _steps(prof, 3, 3) is None and prof.running  # the warm-up step
+    torch_prof = weakref.ref(prof.prof)
+    s = _steps(prof, 4, 12, skip=(6,))
     assert s is not None and s["complete"] and prof.done and not prof.running
+    # the torch profiler, which holds its last cycle's events (GBs on the A100), is freed when the window ends, not
+    # when the loop that holds this object does
+    gc.collect()
+    assert prof.prof is None and torch_prof() is None
     assert s["steps"] == [4, 5, 6, 7, 8, 9, 10] and s["n_steps"] == 7  # after the warm-up step 3; 6 was skipped
     assert s["activities"] == ["CPU"] and [c["steps"] for c in s["cycles"]] == [2, 5]
     assert s["micro_batches_per_step"] == 2 and s["host"]["aten_ops_per_step"] > 0
@@ -150,6 +158,7 @@ def test_the_trace_cap_and_a_window_left_early(tmp_path):
     assert _steps(prof, 2, 5) is None and prof.running
     s = prof.close()
     assert s is not None and not s["complete"] and s["steps"] == [3, 4, 5] and not prof.running
+    assert prof.prof is None  # dropped with its events (_release)
     assert [c["steps"] for c in s["cycles"]] == [2, 1] and got[-1]["complete"] is False
     assert json.loads((tmp_path / "b" / "summary.json").read_text(encoding="utf-8"))["complete"] is False
 
@@ -172,13 +181,13 @@ def test_a_profiler_failure_costs_the_profile_not_the_run(tmp_path, monkeypatch)
     with monkeypatch.context() as mp:
         mp.setattr(torch.profiler, "profile", Broken)
         prof = P.SmokeProfiler(tmp_path / "a", torch.device("cpu"), first=2, n=3, emit=emit)
-        assert _steps(prof, 1, 6) is None and prof.done and not prof.running
+        assert _steps(prof, 1, 6) is None and prof.done and not prof.running and prof.prof is None
     assert got == [dict(kind="smoke_profile", complete=False, failed_in="start", at_step=2,
                         error="RuntimeError: CUPTI_ERROR_NOT_INITIALIZED")]
     got.clear()
     prof = P.SmokeProfiler(tmp_path / "b", torch.device("cpu"), first=2, n=4, emit=emit)
     monkeypatch.setattr(prof, "_cycle_ready", lambda p: (_ for _ in ()).throw(OSError("disk full")))
-    assert _steps(prof, 1, 8) is None and prof.done and prof.close() is None
+    assert _steps(prof, 1, 8) is None and prof.done and prof.close() is None and prof.prof is None
     assert [e["kind"] for e in got] == ["smoke_profile_start", "smoke_profile"]
     assert got[1]["failed_in"] == "step" and got[1]["at_step"] == 4 and "disk full" in got[1]["error"]
 

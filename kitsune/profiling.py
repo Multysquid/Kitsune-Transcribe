@@ -4,17 +4,27 @@ Why: the first A100 run spent ~45 % of each 1.22 s step on a fixed cost per micr
 steps; MFU 18 % where the plan assumed 30-45 %). The suspected cause - eager-mode host dispatch: ~13,200 small ops per
 micro-batch, device syncs such as a GPU tensor's .tolist() and a blocking torch.tensor(..., device=cuda), a
 per-utterance dither loop - was inferred, never profiled. Before any code change for speed (removing syncs,
-torch.compile), the run records the evidence itself, in the smoke phase, where it costs about a minute:
+torch.compile), the run records the evidence itself, in the smoke phase, for a few minutes (cost, below):
   window   after the smoke's own warm-up (the steps its throughput check leaves out: kernel autotuning, loader
            start-up), one profiler warm-up step, then up to PROFILE_STEPS recorded steps, all inside smoke.steps
            (profile_window). They are the run's own training steps, so the profile shows the real step (data wait,
            forward/backward per micro-batch, clip, AdamW, L2-SP, the logging's host transfers); the profiler only
            observes, so the weights, losses and RNG streams are those of a run without it (tests/test_smoke_profile.py
-           on CPU). On the steps and epochs clocks the run is bitwise the same; on the wall clock the minute it costs
-           (the steps' overhead and the trace processing) comes out of the loop time, as an eval's or a checkpoint's
-           does. The profiled steps are left out of the smoke throughput check
+           on CPU). On the steps and epochs clocks the run is bitwise the same (the epochs clock pays the cost in box
+           time); on the wall clock the cost comes out of the loop time, as an eval's or a checkpoint's does, so a
+           wall-clock config (configs/viability.json, smoke_laptop.json under "auto") trains fewer steps than it did
+           without the profiler. The profiled steps are left out of the smoke throughput check
   cycles   the recorded steps in profiler cycles (TRACE_STEPS first, then up to CYCLE_STEPS each): each cycle's events
            are aggregated when it ends and then dropped, which bounds host memory and CUPTI's buffers
+  cost     the profiled steps run slower, and at each cycle's end the loop waits while the main thread parses and
+           aggregates the cycle's events (key_averages; the first cycle's trace export too): ~70 us of host time per
+           recorded event, measured on the laptop CPU (torch 2.14, 100k-500k CPU events). At the A100 student's ~150k
+           events per step (TRACE_STEPS) the 20 steps' ~3M events come to ~3.5 min of processing, ~4-5 min with the
+           slower steps - an extrapolation, not measured on a GPU (about 2 % of a 4 h loop, more of a short wall-clock
+           run such as smoke_laptop.json's 6 min). summary.json's wall_s (the window, start to summary) and
+           cycles[].process_s (each cycle's aggregation), and the `smoke_profile` event's wall_s, record the real cost.
+           Host RAM: ~6 KB per event of the cycle being aggregated (measured on CPU; ~5 GB for a 6-step cycle), freed
+           when the window ends (SmokeProfiler._release)
   outputs  under runs/<run_id>/smoke/profile/ (uploaded with the logs, verified by vast/finish.py):
              summary.json          what to read (summarise): per step - iteration wall time and its data-wait share,
                                    GPU kernel time and its share, kernel launches (the CUDA runtime's launch calls)
@@ -260,12 +270,13 @@ class SmokeProfiler:
             return None
 
     def _fail(self, where: str, step: int | None, e: Exception):
-        """Give up on the profile (never on the run): stop the profiler if it runs, say why in a `smoke_profile`
-        event."""
+        """Give up on the profile (never on the run): stop the profiler if it runs, drop it (_release), say why in a
+        `smoke_profile` event."""
         running, self.done = self.prof is not None and not self.done, True
         if running:
             with suppress(Exception):
                 self.prof.stop()
+        self._release()
         self.emit("smoke_profile", complete=False, failed_in=where, at_step=step,
                   error=f"{type(e).__name__}: {e}"[:500])
 
@@ -300,9 +311,17 @@ class SmokeProfiler:
             for p in (raw, gz):
                 p.unlink(missing_ok=True)
 
+    def _release(self):
+        """Drop the torch profiler once the window is over. It keeps its last cycle's recorded and parsed events (the
+        ones _cycle_ready aggregated) until it is freed, and the loop holds this object until it ends: ~6 KB of host
+        RAM per event (measured on CPU), so ~0.9M events, ~5 GB, for the hours of the run after a 6-step cycle of the
+        A100 student. `done` keeps the profiler from starting again."""
+        self.prof = None
+
     def _finish(self, complete: bool) -> dict:
         self.prof.stop()  # a partial cycle (close) ends here too: its rows and, if it is the first, its trace
         self.done = True
+        self._release()
         summary = summarise(list(self.totals.values()), self.steps, self.device.type)
         summary.update(complete=complete, activities=[a.name for a in self.activities], cycles=self.cycles,
                        trace=self.trace, wall_s=round(time.perf_counter() - self.t_start, 1),
