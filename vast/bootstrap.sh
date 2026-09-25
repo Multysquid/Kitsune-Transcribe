@@ -3,7 +3,8 @@
 #
 # Why this split: home upload is slow, so only the small DERIVED data is parked in the private HF dataset
 # $KITSUNE_DATA_REPO (teacher_out for the train sources and eval sets, second_out, the selection parquet, the student
-# init; ~1.5 GB). The ~10 GB of audio is REBUILT here from the original public HF datasets by
+# init; ~2.3 GB). The ~23 GB of audio (reazon_small ~7, Emilia-YODAS 300 h ~8, Galgame's 6 tars ~5, eval sets ~3;
+# sized in vast/launch.py's DISK_GB comment) is REBUILT here from the original public HF datasets by
 # scripts/01_prepare_data.py, which reads every upstream repo at a pinned commit, so the utterance ids match the
 # teacher outputs exactly. If the data repo also holds data/shards/<source>/*.parquet for a source, those parked
 # shards are pulled (and listed in data/manifest.jsonl, which 01 reads) instead of rebuilding that source. The trainer
