@@ -105,6 +105,22 @@ class FakeHub:
         return str(p)
 
 
+@pytest.fixture(autouse=True)
+def grad_enabled():
+    """Autograd on at the start of every test here, as in a trainer process. An earlier test file can leave it off for
+    the whole pytest process: scripts/03_build_student.py's feature_batches yields inside `with torch.no_grad()`, and
+    kitsune.student.recalibrate_batchnorm (itself under no_grad) stops iterating it early, so the suspended generator's
+    __exit__ restores grad mode to *off* whenever it is finalized (tests/test_student.py runs just before this file).
+    gc.collect() first, so such a generator is finalized now and not in the middle of a test."""
+    import gc
+
+    gc.collect()
+    prev = torch.is_grad_enabled()
+    torch.set_grad_enabled(True)
+    yield
+    torch.set_grad_enabled(prev)
+
+
 @pytest.fixture
 def hub(monkeypatch):
     import huggingface_hub
