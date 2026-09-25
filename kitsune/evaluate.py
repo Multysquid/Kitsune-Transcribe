@@ -218,9 +218,25 @@ def teacher_forced_eval(model, store, featurizer, device, batch_s: float = 400.0
     id, source, n_tok, kl, ce, top1, duration and the per-utterance mean of every other kd_losses term;
     summary["sets"][source] and summary["all"] hold token-normalised (corpus) and utterance-mean values, plus the
     same for the teacher-confidence buckets p1 > 0.99 and p1 < 0.9."""
+    t0 = time.time()
+    raw, dropped = teacher_forced_records(model, store, featurizer, device, batch_s, ids=ids, losses_fn=losses_fn,
+                                          amp=amp)
+    return summarise_tf(raw, n_bad_audio=len(dropped), bad_audio=dropped[:50],
+                        bad_audio_per_set=_bad_audio_per_set(store, dropped), wall_s=time.time() - t0)
+
+
+@torch.no_grad()
+def teacher_forced_records(model, store, featurizer, device, batch_s: float = 400.0, *,
+                           ids: Iterable[str] | None = None, losses_fn: Callable | None = None,
+                           amp: bool | None = None) -> tuple[pd.DataFrame, list[str]]:
+    """teacher_forced_eval's pass without the summary: (raw, dropped). raw has one row per utterance in batch order
+    (id, source, n_tok, duration, sum_<term> of every kd_losses term over its tokens, and the teacher-confidence
+    buckets' token counts and sums _n_hi / _<term>_hi, _n_lo / _<term>_lo); dropped lists the ids whose audio could
+    not be decoded, in batch order. summarise_tf turns raw into teacher_forced_eval's (summary, per_utt), for any rows
+    of it: scripts/05_evaluate.py evaluates a checkpoint in resumable chunks of the same batches and summarises them
+    together."""
     losses_fn = losses_fn or _default_losses()
     device = torch.device(device)
-    t0 = time.time()
     ds = AudioBatchDataset(store)
     batches = eval_batches(store.utts, batch_s, _indices(store, ids))
     W, B = model.proj_out.weight, model.proj_out.bias
@@ -257,15 +273,19 @@ def teacher_forced_eval(model, store, featurizer, device, batch_s: float = 400.0
                 rec.update({f"sum_{k}": float(v[r]) for k, v in sums.items()})
                 rec.update({k: float(v[r]) for k, v in buckets.items()})
                 recs.append(rec)
+    return pd.DataFrame(recs), dropped
 
-    df = pd.DataFrame(recs)
-    per_utt = _tf_per_utt(df)
-    summary = dict(sets={}, n_utts=len(df), n_bad_audio=len(dropped), bad_audio=dropped[:50],
-                   bad_audio_per_set=_bad_audio_per_set(store, dropped), wall_s=time.time() - t0)
-    if len(df):
-        for src, g in df.groupby("source", sort=True):
+
+def summarise_tf(raw: pd.DataFrame, **extra) -> tuple[dict, pd.DataFrame]:
+    """teacher_forced_eval's (summary, per_utt) for any rows of teacher_forced_records' raw frame (a default
+    RangeIndex; the rows in batch order give the trainer's numbers to the bit). `extra` goes into the summary after
+    n_utts (teacher_forced_eval: n_bad_audio, bad_audio, bad_audio_per_set, wall_s)."""
+    per_utt = _tf_per_utt(raw)
+    summary = dict(sets={}, n_utts=len(raw), **extra)
+    if len(raw):
+        for src, g in raw.groupby("source", sort=True):
             summary["sets"][src] = _tf_summarise(g, per_utt.loc[g.index])
-        summary["all"] = _tf_summarise(df, per_utt)
+        summary["all"] = _tf_summarise(raw, per_utt)
     return summary, per_utt
 
 
@@ -490,6 +510,39 @@ def headline_val_utts(greedy: dict | None) -> int:
     """How many utterances headline()'s val CERs pool: the greedy summary's gate sets (every set if none is one). The
     trainer logs it next to val_cer, since its full evals decode the fixed subset or the complete sets."""
     return sum(int(d.get("n", 0)) for d in _gate_sets(greedy).values())
+
+
+def gate_kd_sums(tf: dict | None) -> dict | None:
+    """A teacher_forced_eval summary's KL and CE pooled token-weighted over its GATE sets (JSUT / CV8 / Reazon: the
+    monitor-only hold-outs eval_emilia and galgame are left out; every evaluated set only when none is a gate set, as
+    headline() pools val_loss): kl_sum and ce_sum, the sums of the per-token terms, n_tok the target tokens they run
+    over, sets the sets pooled. A set's kl / ce is its sum over tokens / n_tok (_tf_summarise), so kl * n_tok gives
+    that sum back to float64 rounding: the pooled mean is the sum over every gate token / their count, not a mean of
+    per-set means. None without a token."""
+    vt = {s: d for s, d in _gate_sets(tf).items() if d.get("n_tok")}
+    n = sum(int(d["n_tok"]) for d in vt.values())
+    if not n:
+        return None
+    return dict(kl_sum=sum(float(d["kl"]) * int(d["n_tok"]) for d in vt.values()),
+                ce_sum=sum(float(d["ce"]) * int(d["n_tok"]) for d in vt.values()), n_tok=n, sets=sorted(vt))
+
+
+def combined_loss(tf: dict | None, w_kl: float, w_ce: float) -> dict | None:
+    """The training objective measured on an eval: (w_kl * sum KL + w_ce * sum CE) / target tokens over the gate sets
+    (gate_kd_sums). The trainer's loss for a step is the same expression over the step's tokens
+    (kitsune.kd.kd_objective, logged as loss/objective): per target token of the teacher's sequence (the collate's
+    tgt_row / tgt_pos, pads never counted), the 17-bin KL and the CE on the teacher's greedy token of kd_losses, which
+    teacher_forced_eval scores with. The decoupled L2-SP value is not part of it, as it is not part of the gradient.
+    The two differ only in their input, deliberately: a training step's value is on augmented audio (SpecAugment on
+    the log-mel features) in train mode with the weights before its update, an eval's on the un-augmented audio in
+    eval mode. Returns gate_kd_sums' record with value (the combined loss), kl and ce per token and the weights; None
+    without a token."""
+    s = gate_kd_sums(tf)
+    if s is None:
+        return None
+    n = s["n_tok"]
+    return dict(value=(float(w_kl) * s["kl_sum"] + float(w_ce) * s["ce_sum"]) / n, kl=s["kl_sum"] / n,
+                ce=s["ce_sum"] / n, w_kl=float(w_kl), w_ce=float(w_ce), **s)
 
 
 def eval_record(step: int, elapsed_s: float, tf: dict | None = None, greedy: dict | None = None,

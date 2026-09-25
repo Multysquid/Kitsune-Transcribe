@@ -656,11 +656,12 @@ def test_configs_resolve():
     via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
     # the file spells out the defaults, turns early stopping on (off in DEFAULTS: a config that does not mention it
     # trains to its budget, as before early stopping existed) and sets the eval cadence: a full eval (complete eval
-    # sets) at every epoch end, a mini eval every 200 steps, a greedy decode of ~600 s of the probe for the train CER
-    # (all off in DEFAULTS: a config that does not mention them evaluates as before)
+    # sets) at every epoch end, a mini eval every 500 steps (the combined_loss/val curve's cadence), a greedy decode of
+    # ~600 s of the probe for the train CER (all off in DEFAULTS: a config that does not mention them evaluates as
+    # before)
     assert not m.DEFAULTS["early_stop"]["enabled"] and via["early_stop"]["enabled"]
     ev_via = dict(m.DEFAULTS["eval"], full_every_epochs=1, probe_greedy_audio_s=600,
-                  mini=dict(every_steps=200, val_per_set=32, train_utts=64, greedy=True))
+                  mini=dict(every_steps=500, val_per_set=32, train_utts=64, greedy=True))
     assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True), eval=ev_via)
     assert via["eval"]["every_min"] == 20 and via["eval"]["gate"] is True  # every_min: the fallback cadence only
     assert m.epoch_cadence(via) == 1 and m.DEFAULTS["eval"]["mini"]["every_steps"] is None
@@ -1006,6 +1007,7 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
     assert steps["sched/phase"].iloc[-1] == 2 and steps["opt/lr"].iloc[-1] > 0
     obj = steps["loss/objective"].to_numpy()
     assert np.isfinite(obj).all() and obj[-3:].mean() < 0.8 * obj[:3].mean(), obj  # it learns
+    assert (steps["combined_loss/train"].to_numpy() == obj).all()  # the combined-loss chart's train curve
     for col in ["loss/total", "loss/kl", "loss/ce", "loss/l2sp", "tok/top1", "tok/entropy_student",
                 "tok/tail_teacher", "opt/grad_norm", "time/data_wait_s", "perf/audio_s_per_s", "perf/tokens_per_s",
                 "perf/pad_eff_audio", "perf/mfu", "aug/masked_frac", "data/epoch_progress", "src/src_a/kl",
@@ -1107,6 +1109,14 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
     assert len(gone) and set(gone["attempt"]) == {0} and gone["step"].min() == 11
     assert not tu[~tu["discarded"]].duplicated(["step", "id"]).any()
     assert not tables["eval_tf"]["discarded"].any() and not tables["samples"]["discarded"].any()
+    # the combined-loss chart: train once per step (the discarded steps 11-13 left out), the final eval's val_full (the
+    # complete sets; step 0 and the every_steps evals decode the greedy subset), no val without mini evals
+    cl = tables["combined_loss"]
+    assert list(dict.fromkeys(cl["series"])) == ["train", "val_full"]
+    tr = cl[cl["series"] == "train"]
+    assert tr["step"].tolist() == list(range(1, MAX_STEPS + 1))
+    np.testing.assert_array_equal(tr["value"].to_numpy(), steps["loss/objective"].to_numpy())
+    assert cl.loc[cl["series"] == "val_full", "step"].tolist() == [MAX_STEPS]
 
 
 def _tool(name: str):

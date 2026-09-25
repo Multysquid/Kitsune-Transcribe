@@ -121,8 +121,13 @@ vastai show instance <id>          # wait for "running"
 vastai ssh-url <id>                # -> ssh://root@<ip>:<port>
 ssh -p <port> root@<ip> -L 6006:localhost:6006
 ```
-Then open http://localhost:6006 for TensorBoard, and on the box `tail -f /workspace/kitsune.log`. If port 6006 was
-taken on the box, the log line `TensorBoard on 127.0.0.1:<port>` says which one to forward instead.
+Then open http://localhost:6006 for TensorBoard, and on the box `tail -f /workspace/kitsune.log`. onstart.sh waits
+up to ~20 s for its TensorBoard to answer and logs `TensorBoard up on 127.0.0.1:<port>` (if port 6006 was taken on the
+box, forward that port instead), `TensorBoard not answering ... (still starting?)` (it is alive but slow: try again in
+a minute) or `TensorBoard did not start: <last line of /workspace/tensorboard.log>` (it exited); either way the boot
+goes on, and a run without a viewer still logs everything (`tb/` and the open files reach the output repo). It keeps
+up to 30,000 points per scalar tag (`--samples_per_plugin scalars=30000`), so the per-step curves are drawn at every
+step of the run; TensorBoard's default keeps a random 1,000.
 
 Timeline: ~5 min boot and image pull, ~10-20 min data (derived pull + audio rebuild, see
 `/workspace/kitsune_state/bootstrap_timings.jsonl`), 10-15 min smoke phase, 4 h training with evals, ~15 min final
@@ -136,8 +141,12 @@ the run goes to its scheduled end, `stopped_early` stays null and `early_stop_tr
 with `cooldown.already: true`) records it.
 
 Evals (`eval` in `configs/viability.json`): a full eval at the end of every epoch - teacher-forced and greedy on the
-complete eval sets, plus the probe - and a mini eval every 200 optimizer steps (32 utterances per gate set, 64 of the
-probe). The numbers to read first are in TensorBoard under `2_loss_accuracy/00_summary/full/` and `.../mini/`
+complete eval sets, plus the probe - and a mini eval every 500 optimizer steps (32 utterances per gate set, 64 of the
+probe). The overall loss chart is TensorBoard's Custom Scalars tab, `combined_loss: train vs val`: the training
+objective 1.0 * KL + 0.8 * CE per target token (no L2-SP term) at every optimizer step (`train`, on augmented audio),
+on the mini evals' gate subsets every 500 steps from step 0 on (`val`) and on the complete gate sets at every epoch
+end and the final eval (`val_full`); the same three curves are the first cards of `2_loss_accuracy/00_combined/`.
+The numbers to read first are in TensorBoard under `2_loss_accuracy/00_summary/full/` and `.../mini/`
 (`val_cer_pct`: CER vs the reference pooled over JSUT / CV8 / ReazonSpeech-test, `val_cer_vs_teacher_pct`,
 `train_cer_vs_teacher_pct`, `val_loss`, `train_loss`, ...), and each eval prints one line to `kitsune.log`:
 `[full eval] step N epoch E | val CER x.x% (vs teacher y.y%) on U utts (complete) | train CER vs teacher z.z% (vs ref
@@ -167,7 +176,8 @@ In the output repo under `runs/<run_id>/`: `summary.json` (verdict and final met
 (TensorBoard events), `events.jsonl`, `checkpoints/step_<N>/` (bf16 weights every 30 min), the full resume state from
 before the cooldown and at the end, and `infra/` (box logs; exported too). Convert to flat files with
 `python tools/export_run.py hf://Multy123/kitsune-runs/runs/<run_id> --out <dir>`, or run TensorBoard locally on
-a downloaded `tb/`.
+a downloaded `tb/` (`python -m tensorboard.main --logdir <dir> --samples_per_plugin scalars=30000`, to see every step
+as on the box; the export's `combined_loss` table and `metrics/steps.parquet` hold every step too).
 
 ## How it ends
 

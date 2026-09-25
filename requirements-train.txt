@@ -28,6 +28,12 @@ scikit-learn==1.7.2
 # eval + logging
 jiwer==4.0.0
 tensorboard==2.20.0
+# the TensorBoard server (python -m tensorboard.main, vast/onstart.sh) needs pkg_resources: tensorboard 2.20.0's
+# default.py imports it, and setuptools 82.0.0 removed it (80.9.0's own deprecation warning says to stay below 81).
+# The base image comes with setuptools 84.0.0, whose ModuleNotFoundError killed the box's TensorBoard at boot on the
+# first A100 run; 80.9.0 is the laptop's (it works). The SummaryWriter the trainer logs with does not import it: only
+# the viewer broke
+setuptools==80.9.0
 tqdm==4.68.4
 nvidia-ml-py==13.610.43
 # process RSS / CPU % in kitsune.runlog.system_stats (the trainer logs them every step)

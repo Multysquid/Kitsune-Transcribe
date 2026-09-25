@@ -51,6 +51,18 @@ utterances its val CER pools: the step-0 eval decodes the fixed subset, a full_e
 and one console line (" on U utts (subset|complete)" after the val CER of a full eval):
   [full eval] step N epoch E | val CER x.x% (vs teacher y.y%) | train CER vs teacher z.z% (vs ref w.w%) | val KL ...
 
+The combined loss, the run's overall loss chart: one quantity, the training objective w_kl * KL + w_ce * CE (loss.*)
+per target token - the same 17-bin KL and CE on the teacher tokens, masking and normalisation as the step's loss,
+without the decoupled L2-SP term (kitsune.evaluate.combined_loss) - as three series, each with one scope throughout:
+  combined_loss/train     every optimizer step: the step's objective (= loss/objective; augmented audio, train mode)
+  combined_loss/val       every mini eval: its val subset's gate sets, teacher-forced and pooled token-weighted (the
+                          monitor-only hold-outs never), plus a step-0 point on the same utterances (run_eval's
+                          mini_val: a teacher-forced pass only, not a mini eval). Needs eval.mini
+  combined_loss/val_full  every eval that decodes the complete eval sets (full_every_epochs, the final eval): the
+                          complete gate sets. Never step 0, whose eval decodes the greedy subset
+They are the first cards of 2_loss_accuracy (00_combined/) and one Custom Scalars chart overlays them
+(kitsune.runlog.TB_LAYOUT); each eval's summary.json keeps the sums under combined_loss.
+
 Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and configs/overfit_*.json): after every
 eval inside the loop (never the step-0 eval, never the final one) the metric - "probe_kl" (teacher-forced KL on the
 train probe), "heldout_kl" (the gate sets' pooled held-out KL, as the verdict reads it) or "train_loss" (the mean
@@ -242,7 +254,8 @@ DEFAULTS = {
     # greedy subset; set one of the two. probe_is_train: the probe is the whole train set (a small subset) rather than
     # its in_probe rows. probe_greedy_audio_s: also greedy-decode a seeded ~N s of the probe (null:
     # subset.eval_audio_s; both null: no probe decode). mini: a small eval of its own every mini.every_steps steps
-    # (null: none; run_mini_eval). gate: false = no GO/NO-GO verdict (sanity/overfit runs: "N/A" + the numbers)
+    # (null: none, and no combined_loss/val curve; run_mini_eval). gate: false = no GO/NO-GO verdict (sanity/overfit
+    # runs: "N/A" + the numbers)
     "eval": {"every_min": 20, "every_steps": None, "greedy_subset": 500, "probe": True, "final_full_greedy": True,
              "batch_s": 400, "check_baselines": True, "every_epochs": None, "probe_is_train": False,
              "probe_greedy_audio_s": None, "full_every_epochs": None,
@@ -1046,12 +1059,13 @@ def _subset_dir(prefix: str, budget_s: float, seed: int, ids: list[str]) -> str:
     return f"{prefix}_{budget_s:g}s_s{seed}_{hashlib.sha256(chr(10).join(sorted(ids)).encode()).hexdigest()[:8]}"
 
 
-def setup_data(R: Run):
-    """Train/eval stores (cached under cache_dir, shared with 03's eval cache), probe and greedy ids, planner."""
-    cfg, log = R.cfg, R.log
-    sel, data, teach, cache = rpath(cfg["selection"]), rpath(cfg["data_root"]), rpath(cfg["teacher_root"]), rpath(cfg["cache_dir"])
+def train_store_spec(cfg: dict, log) -> tuple[str, list[str] | None]:
+    """The train store setup_data builds: its cache dir name under cache_dir and the ids it holds (None: every kept
+    train row of cfg["sources"]). subset.train_audio_s draws a seeded duration subset (a `subset` event with every
+    id), subset.train_utts a seeded one that starts with probe rows. scripts/05_evaluate.py takes its probe rows from
+    the same ids."""
+    sel, teach = rpath(cfg["selection"]), rpath(cfg["teacher_root"])
     sub, seed = cfg["subset"], int(cfg["seed"])
-    t0 = time.time()
     if sub["train_audio_s"] is not None:
         rows = trainset.read_selection(sel, cfg["sources"], ["train"])
         prompt_len = len(trainset._teacher_meta(teach)["prompt"])
@@ -1059,26 +1073,32 @@ def setup_data(R: Run):
         ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["train_audio_s"]),
                                 np.random.default_rng([seed, 11]))
         log.event("subset", split="train", sources=cfg["sources"], seed=seed, pool=len(rows), **rec)
-        R.train = trainset.build_stores(sel, data, teach, cache / _subset_dir("train", rec["budget_s"], seed, ids),
-                                        cfg["sources"], ["train"], ids=ids, log=print)
-    elif sub["train_utts"]:
+        return _subset_dir("train", rec["budget_s"], seed, ids), ids
+    if sub["train_utts"]:
         n = int(sub["train_utts"])
         rows = trainset.read_selection(sel, cfg["sources"], ["train"])
         rng = np.random.default_rng([seed, 1])
         probe = rows["id"][rows["in_probe"]].tolist()[: max(1, n // 4)]
         rest = _seeded_ids(rows["id"][~rows["id"].isin(probe)].tolist(), n - len(probe), rng)
-        R.train = trainset.build_stores(sel, data, teach, cache / f"train_sub{n}_s{seed}", cfg["sources"], ["train"],
-                                        ids=probe + rest, log=print)
-    else:
-        R.train = trainset.build_stores(sel, data, teach, cache / "train", cfg["sources"], ["train"], log=print)
+        return f"train_sub{n}_s{seed}", probe + rest
+    return "train", None
+
+
+def build_eval_store(cfg: dict, log) -> trainset.Stores:
+    """The eval store of cfg["eval_sets"] (cached under cache_dir, shared with 03's eval cache): every kept eval row,
+    or the seeded subset subset.eval_audio_s (pooled over the sets; a `subset` event) or subset.eval_utts_per_set
+    asks for. setup_data's, and scripts/05_evaluate.py's."""
+    sel, data, teach, cache = (rpath(cfg["selection"]), rpath(cfg["data_root"]), rpath(cfg["teacher_root"]),
+                               rpath(cfg["cache_dir"]))
+    sub, seed = cfg["subset"], int(cfg["seed"])
     if sub["eval_audio_s"] is not None:  # pooled over the eval sets
         rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
         ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["eval_audio_s"]),
                                 np.random.default_rng([seed, 12]))
         log.event("subset", split="eval", sources=cfg["eval_sets"], seed=seed, pool=len(rows), **rec)
-        R.evalstore = trainset.build_stores(sel, data, teach, cache / _subset_dir("eval", rec["budget_s"], seed, ids),
-                                            cfg["eval_sets"], ["eval"], ids=ids, log=print)
-    elif sub["eval_utts_per_set"]:
+        return trainset.build_stores(sel, data, teach, cache / _subset_dir("eval", rec["budget_s"], seed, ids),
+                                     cfg["eval_sets"], ["eval"], ids=ids, log=print)
+    if sub["eval_utts_per_set"]:
         n = int(sub["eval_utts_per_set"])
         rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
         rng = np.random.default_rng([seed, 2])
@@ -1087,10 +1107,50 @@ def setup_data(R: Run):
             r = rows[rows["source"] == s]
             greedy = _seeded_ids(r["id"][r["in_greedy_subset"]].tolist(), min(n, int(cfg["eval"]["greedy_subset"])), rng)
             ids += greedy + _seeded_ids(r["id"][~r["id"].isin(greedy)].tolist(), max(0, n - len(greedy)), rng)
-        R.evalstore = trainset.build_stores(sel, data, teach, cache / f"eval_sub{n}_s{seed}", cfg["eval_sets"],
-                                            ["eval"], ids=ids, log=print)
-    else:
-        R.evalstore = trainset.eval_store(sel, data, teach, cache / "eval", cfg["eval_sets"], log=print)
+        return trainset.build_stores(sel, data, teach, cache / f"eval_sub{n}_s{seed}", cfg["eval_sets"], ["eval"],
+                                     ids=ids, log=print)
+    return trainset.eval_store(sel, data, teach, cache / "eval", cfg["eval_sets"], log=print)
+
+
+def probe_greedy_subset(cfg: dict, probe_ids: list[str], duration: dict[str, float], log) -> list[str]:
+    """The probe rows greedy-decoded at every full eval (eval.probe_greedy_audio_s, else subset.eval_audio_s: a
+    seeded ~N s of the probe; none if both are null or the probe is empty), logged as a `subset` event. duration: id ->
+    seconds of every probe row."""
+    pg_budget = cfg["eval"]["probe_greedy_audio_s"]
+    pg_budget = cfg["subset"]["eval_audio_s"] if pg_budget is None else pg_budget
+    if pg_budget is None or not probe_ids:
+        return []
+    seed = int(cfg["seed"])
+    ids, rec = audio_subset(probe_ids, [duration[i] for i in probe_ids], float(pg_budget),
+                            np.random.default_rng([seed, 13]))
+    log.event("subset", split="probe_greedy", seed=seed, pool=len(probe_ids), **rec)
+    return ids
+
+
+def greedy_subset_ids(cfg: dict, evalstore) -> list[str]:
+    """The fixed greedy subset every full eval decodes (the complete-set evals take its summary from their rows): per
+    eval set its in_greedy_subset rows (all of a set without them), a seeded eval.greedy_subset of them if more; the
+    whole eval subset under subset.eval_audio_s."""
+    if cfg["subset"]["eval_audio_s"] is not None:
+        return [u.id for u in evalstore.utts]  # the whole (small) eval subset, at every eval
+    rng = np.random.default_rng([int(cfg["seed"]), 3])
+    ids = []
+    for s in cfg["eval_sets"]:
+        cand = evalstore.indices(source=s, in_greedy_subset=True) or evalstore.indices(source=s)
+        pick = cand if len(cand) <= cfg["eval"]["greedy_subset"] else sorted(
+            rng.choice(cand, size=int(cfg["eval"]["greedy_subset"]), replace=False).tolist())
+        ids += [evalstore.utts[i].id for i in pick]
+    return ids
+
+
+def setup_data(R: Run):
+    """Train/eval stores (cached under cache_dir, shared with 03's eval cache), probe and greedy ids, planner."""
+    cfg, log = R.cfg, R.log
+    sel, data, teach, cache = rpath(cfg["selection"]), rpath(cfg["data_root"]), rpath(cfg["teacher_root"]), rpath(cfg["cache_dir"])
+    t0 = time.time()
+    name, ids = train_store_spec(cfg, log)
+    R.train = trainset.build_stores(sel, data, teach, cache / name, cfg["sources"], ["train"], ids=ids, log=print)
+    R.evalstore = build_eval_store(cfg, log)
 
     if cfg["eval"]["probe"] and cfg["eval"]["probe_is_train"]:
         R.probe_ids = [u.id for u in R.train.utts]
@@ -1100,24 +1160,9 @@ def setup_data(R: Run):
     if es["enabled"] and es["metric"] == "probe_kl" and not R.probe_ids:  # validate() cannot see an empty probe
         raise SystemExit("early_stop.metric probe_kl needs a non-empty probe: this selection/subset has no probe rows "
                          "(set eval.probe_is_train, or use metric heldout_kl / train_loss)")
-    pg_budget = cfg["eval"]["probe_greedy_audio_s"]
-    pg_budget = sub["eval_audio_s"] if pg_budget is None else pg_budget
-    R.probe_greedy_ids = []
-    if pg_budget is not None and R.probe_ids:  # greedy CER on the train data itself, next to the held-out one
-        dur = {u.id: u.duration for u in R.train.utts}
-        R.probe_greedy_ids, rec = audio_subset(R.probe_ids, [dur[i] for i in R.probe_ids], float(pg_budget),
-                                               np.random.default_rng([seed, 13]))
-        log.event("subset", split="probe_greedy", seed=seed, pool=len(R.probe_ids), **rec)
-    if sub["eval_audio_s"] is not None:
-        R.greedy_ids = [u.id for u in R.evalstore.utts]  # the whole (small) eval subset, at every eval
-    else:
-        rng = np.random.default_rng([seed, 3])
-        R.greedy_ids = []
-        for s in cfg["eval_sets"]:
-            cand = R.evalstore.indices(source=s, in_greedy_subset=True) or R.evalstore.indices(source=s)
-            pick = cand if len(cand) <= cfg["eval"]["greedy_subset"] else sorted(
-                rng.choice(cand, size=int(cfg["eval"]["greedy_subset"]), replace=False).tolist())
-            R.greedy_ids += [R.evalstore.utts[i].id for i in pick]
+    # greedy CER on the train data itself, next to the held-out one
+    R.probe_greedy_ids = probe_greedy_subset(cfg, R.probe_ids, {u.id: u.duration for u in R.train.utts}, log)
+    R.greedy_ids = greedy_subset_ids(cfg, R.evalstore)
     R.mini_val_ids, R.mini_train_ids = mini_subsets(R)
     R.ds = trainset.AudioBatchDataset(R.train)
     R.src_index = {s: i for i, s in enumerate(sorted({u.source for u in R.train.utts}))}
@@ -1451,7 +1496,11 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
              s: int) -> float:
     """The step's row (steps.parquet, scalars, TensorBoard) and per-utterance records. Returns the objective
     (w_kl * KL + w_ce * CE, the optimised loss; loss/total adds the decoupled L2-SP value, which is not in the
-    gradient)."""
+    gradient). The objective goes out twice: as loss/objective and as combined_loss/train, the train curve of the
+    combined-loss chart next to combined_loss/val (kitsune.evaluate.combined_loss, the same quantity on the gate sets).
+    It is measured on the step's augmented audio (SpecAugment on its log-mel features, under specaug.enabled) in train
+    mode, with the weights before this step's update; the val points are un-augmented, in eval mode. That difference
+    is the point of a train curve (what the optimizer sees), not something to correct."""
     from kitsune.runlog import system_stats
 
     cfg = R.cfg
@@ -1474,6 +1523,7 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
         flops = mult * R.st["flops_per_padded_s"] * out["audio_pad"]
     row = {
         "loss/total": objective + l2sp, "loss/objective": objective, "loss/kl": kl, "loss/ce": ce, "loss/l2sp": l2sp,
+        "combined_loss/train": objective,
         "opt/lr": lr, "opt/grad_norm": out["grad_norm"], "opt/clip_coef": out["clip_coef"],
         "time/step_s": step_s, "time/data_wait_s": wait_s, "time/compute_s": step_s - wait_s,
         "perf/audio_s_per_s": out["audio_real"] / step_s, "perf/tokens_per_s": n_tok / step_s,
@@ -1520,13 +1570,92 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
 # ---------------------------------------------------------------------------------------------------------- evals
 
 
-def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = None) -> dict:
+def combined_val_full(cfg: dict, tf_sum: dict) -> dict | None:
+    """combined_loss/val_full's record of a complete-set eval (kitsune.evaluate.combined_loss over the gate sets of its
+    teacher-forced pass, with scope "complete"), None without a token."""
+    from kitsune import evaluate as ev
+
+    c = ev.combined_loss(tf_sum, cfg["loss"]["w_kl"], cfg["loss"]["w_ce"])
+    return dict(c, scope="complete") if c else None
+
+
+def eval_summary(step: int, train_s: float, final: bool, complete: bool, tf_sum: dict, probe_sum: dict | None,
+                 gr_sum: dict, full_sum: dict | None, pg_sum: dict | None, wall_s: float, *, n_probe_greedy: int,
+                 n_probe: int, epoch: float | None = None, combined: dict | None = None) -> dict:
+    """A full eval's evals/step_<N>/summary.json (run_eval; scripts/05_evaluate.py writes the same for a checkpoint).
+    The headline pools the complete sets' greedy numbers when they were decoded (full_sum), else the greedy subset's
+    (the scope says which: the step-0 eval decodes the subset, a full_every_epochs run's later ones the complete sets,
+    on the same curve). probe_greedy / epoch / combined_loss only when given, so the runs without them keep their
+    records unchanged."""
+    from kitsune import evaluate as ev
+
+    head_gr = full_sum if full_sum is not None else gr_sum
+    head = ev.headline(tf=tf_sum, greedy=head_gr, probe=probe_sum, probe_greedy=pg_sum)
+    summary = dict(step=step, train_s=train_s, final=final, complete=complete, tf=tf_sum, probe=probe_sum,
+                   greedy=gr_sum, greedy_full=full_sum, wall_s=wall_s, headline=head,
+                   headline_scope=dict(val_greedy="complete" if full_sum is not None else "subset",
+                                       val_greedy_utts=head_gr.get("n_utts", 0),
+                                       val_cer_utts=ev.headline_val_utts(head_gr),
+                                       train_greedy_utts=n_probe_greedy, train_tf_utts=n_probe))
+    if pg_sum is not None:
+        summary["probe_greedy"] = pg_sum
+    if epoch is not None:
+        summary["epoch"] = epoch
+    if combined:
+        summary["combined_loss"] = combined
+    return summary
+
+
+def eval_history_record(step: int, elapsed_s: float, tf_sum: dict, gr_sum: dict, probe_sum: dict | None,
+                        pg_sum: dict | None, head: dict, epoch: float | None = None) -> dict:
+    """A full eval's record in the history the verdict and the early stop read (kitsune.evaluate.eval_record, the
+    probe's greedy CERs, the epoch in epoch mode and the headline)."""
+    from kitsune import evaluate as ev
+
+    rec = ev.eval_record(step, elapsed_s, tf=tf_sum, greedy=gr_sum, probe=probe_sum)
+    if pg_sum and "all" in pg_sum:
+        rec["probe_greedy"] = {k: pg_sum["all"][k] for k in ("cer_teacher_corpus", "cer_ref_corpus", "n")}
+    if epoch is not None:
+        rec["epoch"] = epoch
+    rec["headline"] = head
+    return rec
+
+
+def eval_event_sets(tf_sum: dict, gr_sum: dict, full_sum: dict | None) -> dict:
+    """The `eval` event's per-set numbers: kl / top1 of the teacher-forced pass (every eval utterance), cer / ratio /
+    trunc of the greedy decode the headline pools - the complete sets at a complete eval (full_sum; the event's
+    greedy_scope "complete"), else the fixed subset ("subset") - so they match summary.json's greedy_full and the
+    verdict. A complete eval keeps the subset's own next to them as cer_subset / ratio_subset / trunc_subset: the
+    numbers of summary.json's greedy, the ones the history (the verdict's trend, the early stop) reads."""
+    def greedy(d: dict) -> dict:
+        return dict(cer=round(d["cer_ref_corpus"], 4), ratio=round(d["ratio_vs_teacher"], 3),
+                    trunc=round(d["trunc_rate"], 4))
+
+    brief = {s: dict(kl=round(d["kl"], 4), top1=round(d["top1"], 4)) for s, d in tf_sum.get("sets", {}).items()}
+    for s, d in (full_sum if full_sum is not None else gr_sum).get("sets", {}).items():
+        brief.setdefault(s, {}).update(greedy(d))
+    if full_sum is not None:
+        for s, d in gr_sum.get("sets", {}).items():
+            brief.setdefault(s, {}).update({f"{k}_subset": v for k, v in greedy(d).items()})
+    return brief
+
+
+def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = None, mini_val: bool = False) -> dict:
     """Teacher-forced on every eval utterance and on the train probe, greedy on the fixed subsets - or on the COMPLETE
     eval sets (`complete`; default: the final eval under eval.final_full_greedy; the loop passes it for every
     eval.full_every_epochs eval), the subset summary then taken from those rows so the history stays comparable.
     Tables, summary, scalars, the headline numbers (summary/full/..., log_headline) and samples go to the logger; one
-    record goes to the history the verdict and the early stop read. Returns the greedy summary the verdict should
-    judge: the complete-set one when there is one (the subset one if eval.final_full_greedy is off)."""
+    record goes to the history the verdict and the early stop read (the subset's greedy numbers). The `eval` event's
+    per-set CERs are those of the headline's scope, named in its greedy_scope (eval_event_sets). Returns the greedy
+    summary the verdict should judge: the complete-set one when there is one (the subset one if
+    eval.final_full_greedy is off).
+
+    The combined loss (kitsune.evaluate.combined_loss; summary.json's combined_loss, one record per series): an eval
+    of the complete sets logs combined_loss/val_full, the gate sets' teacher-forced pass (every eval runs that pass on
+    the complete sets, but only these evals are complete ones: the step-0 eval and the every_min / every_steps ones
+    decode the greedy subset). mini_val (the step-0 eval, when mini evals are on) adds a teacher-forced pass over the
+    mini eval's val subset for combined_loss/val's first point, the scope of every later one (run_mini_eval): the
+    mini evals themselves stay out of step 0, the early stop and the verdict."""
     from kitsune import evaluate as ev
 
     cfg, log = R.cfg, R.log
@@ -1535,6 +1664,15 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     t0 = time.time()
     log.event("eval_start", at_step=step, final=final, complete=complete)
     tf_sum, tf_df = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, amp=R.amp)
+    w_kl, w_ce = cfg["loss"]["w_kl"], cfg["loss"]["w_ce"]
+    combined = {}  # series -> its combined_loss record, the scope it pooled next to the numbers
+    if complete and (c := combined_val_full(cfg, tf_sum)):
+        combined["val_full"] = c
+    if mini_val and R.mini_val_ids:
+        mini_tf, _ = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, ids=R.mini_val_ids,
+                                            amp=R.amp)
+        if c := ev.combined_loss(mini_tf, w_kl, w_ce):
+            combined["val"] = dict(c, scope="mini")
     probe_sum = probe_df = None
     if R.probe_ids:
         probe_sum, probe_df = ev.teacher_forced_eval(R.model, R.train, R.feat_eval, R.device, bs, ids=R.probe_ids,
@@ -1570,22 +1708,15 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
         log.table("probe_greedy", pg_df, step)
     for src, g in gr_df.groupby("source", sort=True):
         log.table(f"greedy_{src}", g.reset_index(drop=True), step)
-    # val CER from the complete sets when they were decoded, else from the greedy subset (the scope says which: the
-    # step-0 eval decodes the subset, a full_every_epochs run's later ones the complete sets, on the same curve)
-    head_gr = full_sum if full_sum is not None else gr_sum
-    head = ev.headline(tf=tf_sum, greedy=head_gr, probe=probe_sum, probe_greedy=pg_sum)
-    summary = dict(step=step, train_s=R.clock(), final=final, complete=complete, tf=tf_sum, probe=probe_sum,
-                   greedy=gr_sum, greedy_full=full_sum, wall_s=round(time.time() - t0, 1), headline=head,
-                   headline_scope=dict(val_greedy="complete" if full_sum is not None else "subset",
-                                       val_greedy_utts=head_gr.get("n_utts", 0),
-                                       val_cer_utts=ev.headline_val_utts(head_gr),
-                                       train_greedy_utts=len(R.probe_greedy_ids), train_tf_utts=len(R.probe_ids)))
     extra = {}  # only in the runs that use them, so the viability run's records are unchanged
     if pg_sum is not None:
         extra["probe_greedy"] = pg_sum
     if epoch_mode(cfg):
         extra["epoch"] = R.st["epoch_progress"]  # epochs done: 0 at step 0, e + 1 at the end of epoch e
-    summary.update(extra)
+    summary = eval_summary(step, R.clock(), final, complete, tf_sum, probe_sum, gr_sum, full_sum, pg_sum,
+                           round(time.time() - t0, 1), n_probe_greedy=len(R.probe_greedy_ids),
+                           n_probe=len(R.probe_ids), epoch=extra.get("epoch"), combined=combined)
+    head = summary["headline"]
     log.eval_json("summary", summary, step)
     scal = ev.flatten(tf_sum, "eval/tf")
     scal.update(ev.flatten(gr_sum, "eval/greedy"))
@@ -1605,6 +1736,7 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     if "epoch" in extra:
         scal["eval/epoch"] = extra["epoch"]
     scal["eval/wall_s"] = summary["wall_s"]
+    scal.update({f"combined_loss/{k}": c["value"] for k, c in combined.items()})
     log.scalars(scal, step)
     log_headline(R, "full", head, step, scope=summary["headline_scope"])
     samples = ev.pick_samples(gr_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"]))
@@ -1618,24 +1750,20 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
                                  + (float(pg_sum.get("wall_s", 0.0)) if pg_sum else 0.0),
                                  greedy_s=float(gr_sum.get("wall_s", 0.0)),
                                  greedy_n=len(R.evalstore) if full_sum is not None else len(R.greedy_ids))
-    rec = ev.eval_record(step, R.clock(), tf=tf_sum, greedy=gr_sum, probe=probe_sum)
-    if pg_sum and "all" in pg_sum:
-        rec["probe_greedy"] = {k: pg_sum["all"][k] for k in ("cer_teacher_corpus", "cer_ref_corpus", "n")}
-    if "epoch" in extra:
-        rec["epoch"] = extra["epoch"]
-    rec["headline"] = head
+    rec = eval_history_record(step, R.clock(), tf_sum, gr_sum, probe_sum, pg_sum, head, epoch=extra.get("epoch"))
     hist = R.st["history"]
     if hist and hist[-1]["step"] == step:
         hist[-1] = rec
     else:
         hist.append(rec)
-    brief = {s: dict(kl=round(d["kl"], 4), top1=round(d["top1"], 4)) for s, d in tf_sum.get("sets", {}).items()}
-    for s, d in gr_sum.get("sets", {}).items():
-        brief.setdefault(s, {}).update(cer=round(d["cer_ref_corpus"], 4), ratio=round(d["ratio_vs_teacher"], 3),
-                                       trunc=round(d["trunc_rate"], 4))
     if pg_sum and "all" in pg_sum:
         extra["probe_cer_teacher"] = round(pg_sum["all"]["cer_teacher_corpus"], 4)
-    log.event("eval", at_step=step, final=final, complete=complete, wall_s=summary["wall_s"], sets=brief,
+    if combined:
+        extra["combined_loss"] = {k: round(c["value"], 5) for k, c in combined.items()}
+    # greedy_scope ahead of the per-set numbers: the console's [event] line is cut at 300 characters
+    log.event("eval", at_step=step, final=final, complete=complete,
+              greedy_scope=summary["headline_scope"]["val_greedy"], wall_s=summary["wall_s"],
+              sets=eval_event_sets(tf_sum, gr_sum, full_sum),
               probe_kl=probe_sum["all"]["kl"] if probe_sum and "all" in probe_sum else None,
               headline={k: round(v, 5) for k, v in head.items()},
               **{k: v for k, v in extra.items() if k != "probe_greedy"})
@@ -1702,7 +1830,9 @@ def run_mini_eval(R: Run, step: int) -> dict:
     logged apart from the full evals: tables and summary.json under evals/step_<N>_mini/, scalars under eval/mini/
     (its wall time eval/mini/wall_s), the headline under summary/mini/, an `eval_mini` event and a row of
     st["mini_history"] (summary.json's mini_history). It never feeds the verdict's history, the early stop or the
-    final-eval estimate. Returns the headline."""
+    final-eval estimate. Its teacher-forced val pass also gives combined_loss/val (kitsune.evaluate.combined_loss over
+    the gate sets of the val subset, summary.json's combined_loss): the held-out curve of the combined-loss chart, one
+    scope from its step-0 point (run_eval's mini_val) to the last mini. Returns the headline."""
     from kitsune import evaluate as ev
 
     cfg, log = R.cfg, R.log
@@ -1721,6 +1851,8 @@ def run_mini_eval(R: Run, step: int) -> dict:
                                                  teacher_rows=mini_teacher_rows(R, kind, store, ids))
     assert_bn_frozen(R.model)
     wall = round(time.time() - t0, 1)
+    comb = ev.combined_loss(parts.get("tf"), cfg["loss"]["w_kl"], cfg["loss"]["w_ce"])
+    combined = {"val": dict(comb, scope="mini")} if comb else {}
 
     for kind in ("tf", "greedy"):
         if kind in frames:
@@ -1733,12 +1865,14 @@ def run_mini_eval(R: Run, step: int) -> dict:
                        probe_greedy=parts.get("probe_greedy"))
     epoch = R.st["epoch_progress"]
     log.eval_json("summary", dict(step=step, train_s=R.clock(), epoch=epoch, mini=True, wall_s=wall, headline=head,
-                                  n_val=len(R.mini_val_ids), n_train=len(R.mini_train_ids), **parts),
+                                  n_val=len(R.mini_val_ids), n_train=len(R.mini_train_ids), **parts,
+                                  **({"combined_loss": combined} if combined else {})),
                   step, suffix="mini")
     scal = {}
     for kind, s in parts.items():
         scal.update(ev.flatten(s, f"eval/mini/{kind}"))
     scal["eval/mini/wall_s"] = wall
+    scal.update({f"combined_loss/{k}": c["value"] for k, c in combined.items()})
     log.scalars(scal, step)
     log_headline(R, "mini", head, step)
     R.st["mini_history"].append(dict(step=int(step), epoch=epoch, elapsed_s=R.clock(), wall_s=wall, **head))
@@ -1747,7 +1881,8 @@ def run_mini_eval(R: Run, step: int) -> dict:
     for s, d in (parts.get("greedy") or {}).get("sets", {}).items():
         brief.setdefault(s, {}).update(cer=round(d["cer_ref_corpus"], 4), cer_teacher=round(d["cer_teacher_corpus"], 4))
     log.event("eval_mini", at_step=step, epoch=epoch, wall_s=wall, n_val=len(R.mini_val_ids),
-              n_train=len(R.mini_train_ids), sets=brief, headline={k: round(v, 5) for k, v in head.items()})
+              n_train=len(R.mini_train_ids), sets=brief, headline={k: round(v, 5) for k, v in head.items()},
+              **({"combined_loss": {k: round(c["value"], 5) for k, c in combined.items()}} if combined else {}))
     return head
 
 
@@ -2247,22 +2382,27 @@ def smoke_checks(R: Run):
 VRAM_MARGIN_GIB = 0.5  # left outside the Windows VRAM cap: cuBLAS/cuDNN kernels and handles load outside the allocator
 
 
-def cap_vram(R: Run):
+def cap_vram(R: Run, max_frac: float | None = None):
     """Windows + CUDA: cap PyTorch's caching allocator, for the whole process, at the VRAM free now (plus what it
     already holds) minus VRAM_MARGIN_GIB. The Windows driver's sysmem fallback (on by default) serves an allocation that
     no longer fits the card from shared system memory instead of failing it, so an oversized micro-batch would run
     several times slower instead of raising OutOfMemoryError, and the memory probe's fallbacks (halve micro_audio_s,
-    gradient checkpointing) and train_step's OOM skip would never fire. Under the cap they do. Linux has no fallback."""
-    if R.device.type != "cuda" or os.name != "nt":
+    gradient checkpointing) and train_step's OOM skip would never fire. Under the cap they do. Linux has no fallback.
+    max_frac (scripts/05_evaluate.py --vram-frac; the trainer passes none): also at most that fraction of the card, on
+    any OS."""
+    if R.device.type != "cuda" or (os.name != "nt" and max_frac is None):
         return
     idx = R.device.index if R.device.index is not None else torch.cuda.current_device()  # the API needs an index
     free, total = torch.cuda.mem_get_info(idx)
     held = torch.cuda.memory_reserved(idx)
     frac = min(1.0, max(0.0, (free + held - VRAM_MARGIN_GIB * 2**30) / total))
+    if max_frac is not None:
+        frac = min(frac, float(max_frac))
     torch.cuda.set_per_process_memory_fraction(frac, idx)
     R.vram_cap_gb = round(frac * total / 2**30, 2)
     R.log.event("vram_cap", cap_gb=R.vram_cap_gb, free_gb=round(free / 2**30, 2), held_gb=round(held / 2**30, 2),
-                total_gb=round(total / 2**30, 2), margin_gb=VRAM_MARGIN_GIB, fraction=round(frac, 4))
+                total_gb=round(total / 2**30, 2), margin_gb=VRAM_MARGIN_GIB, fraction=round(frac, 4),
+                **({"max_frac": float(max_frac)} if max_frac is not None else {}))
 
 
 def probe_passes(R: Run, planner: trainset.StepPlanner, rec: dict):
@@ -2525,7 +2665,7 @@ def train(R: Run, state: dict | None) -> int:
         log.event("plan", micro_audio_s=R.planner.micro_audio_s, **R.planner.stats)
     if not R.st["step0_done"]:
         log.event("phase", name="step0_eval")
-        run_eval(R, 0)
+        run_eval(R, 0, mini_val=True)  # with combined_loss/val's step-0 point on the mini val subset (minis on)
         R.st["step0_done"] = True
 
     if R.st["early_stop"]["stop"]:  # resumed after an early stop had triggered: straight to the end phase

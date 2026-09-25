@@ -203,6 +203,28 @@ def test_eval_record_and_flatten():
     assert not any("per_set" in k for k in flat) and "eval/tf/eval_jsut/n_bad_audio" not in flat
 
 
+def test_combined_loss_pools_the_gate_tokens():
+    """combined_loss = (w_kl * sum KL + w_ce * sum CE) / tokens over the gate sets: every gate token weighs the same
+    (not the mean of the per-set means), the monitor-only hold-outs are left out, the sums and counts come with it,
+    and a summary without gate tokens gives None."""
+    tf = dict(sets=dict(eval_jsut=dict(kl=1.0, ce=2.0, top1=0.5, n_tok=10),
+                        eval_cv8=dict(kl=0.5, ce=1.0, top1=0.5, n_tok=30),
+                        eval_reazon=dict(kl=0.25, ce=4.0, top1=0.5, n_tok=60),
+                        galgame=dict(kl=9.0, ce=9.0, top1=0.0, n_tok=1000)),
+              all=dict(kl=8.0, ce=8.0, top1=0.1, n_tok=1100))
+    s = ev.gate_kd_sums(tf)
+    assert s == dict(kl_sum=10 + 15 + 15, ce_sum=20 + 30 + 240, n_tok=100,
+                     sets=["eval_cv8", "eval_jsut", "eval_reazon"])
+    c = ev.combined_loss(tf, 1.0, 0.8)
+    assert c["value"] == pytest.approx((40 + 0.8 * 290) / 100) and (c["kl"], c["ce"]) == (0.4, 2.9)
+    assert c["value"] != pytest.approx(np.mean([1.0 + 0.8 * 2.0, 0.5 + 0.8 * 1.0, 0.25 + 0.8 * 4.0]))
+    assert (c["w_kl"], c["w_ce"], c["n_tok"]) == (1.0, 0.8, 100)
+    assert c["value"] == pytest.approx(ev.headline(tf=tf)["val_loss"] + 0.8 * c["ce"])  # val_loss is its KL part
+    assert ev.combined_loss(tf, 2.0, 0.0)["value"] == pytest.approx(0.8)
+    assert ev.combined_loss(None, 1.0, 0.8) is None and ev.combined_loss(dict(sets={}), 1.0, 0.8) is None
+    assert ev.combined_loss(dict(sets=dict(eval_jsut=dict(kl=1.0, ce=1.0, n_tok=0))), 1.0, 0.8) is None
+
+
 # ------------------------------------------------------------------------------------------------ teacher baselines
 
 
@@ -444,3 +466,93 @@ def test_greedy_eval_stops_at_eos(self_store, featurizer, tokenizer):
     assert summary["all"]["n_empty_hyp"] == len(per_utt)
     samples = ev.pick_samples(per_utt, n=4)
     assert len(samples) == 4 and set(samples[0]) >= {"id", "ref", "teacher_hyp", "hyp", "cer_ref", "cer_teacher"}
+
+
+# ------------------------------------------------------------------------------ combined loss: eval code == train code
+
+
+@pytest.fixture(scope="module")
+def mixed_store(tmp_path_factory):
+    """Gate sets and a monitor-only hold-out (galgame) in one eval store, as the viability run evaluates them."""
+    from fixtures import make_fake_corpus, make_fake_selection
+    from kitsune.trainset import eval_store
+
+    root = tmp_path_factory.mktemp("mixed")
+    sets = ("eval_jsut", "eval_cv8", "galgame")
+    fc = make_fake_corpus(root / "corpus", {"src_a": (3, "train"), **{s: (4, "eval") for s in sets}}, rows_per_shard=8,
+                          seed=5, dur_range=(0.4, 2.2), no_second=sets)
+    sel = make_fake_selection(fc, greedy_n=2, probe_n=1)
+    return eval_store(sel, fc.data, fc.teacher_out, root / "cache", list(sets), log=lambda s: None)
+
+
+def test_combined_val_is_the_training_objective(mixed_store, featurizer):
+    """combined_loss/val as the trainer logs it (run_mini_eval: teacher_forced_eval -> kitsune.evaluate.combined_loss)
+    equals w_kl * KL + w_ce * CE as the trainer computes it for an optimizer step (train_step: forward_logits,
+    kd_losses, kd_objective; log_step's loss/objective and combined_loss/train) on the same batch without
+    augmentation (SpecAugment off, the eval featuriser, eval mode; lr 0), to float tolerance: the same tokens, KL, CE
+    and normalisation. Pooled over the gate sets only: galgame, in the store and in the ids, is left out; the step
+    split over two micro-batches gives the same value (kd_objective divides by the step's tokens)."""
+    from types import SimpleNamespace
+
+    from fixtures import load_script
+    from kitsune.kd import L2SP
+    from kitsune.trainset import AudioBatchDataset, eval_batches
+
+    m = load_script("04_distill")
+    store = mixed_store
+    w_kl, w_ce = 1.0, 0.8
+    gate = [i for i, u in enumerate(store.utts) if u.source in ev.GATE_SETS]
+    assert gate and len(gate) < len(store.utts) and {u.source for u in store.utts} >= {"galgame"}
+    (batch,) = eval_batches(store.utts, 1e9, gate)  # the one batch the eval packs these utterances into
+    ds = AudioBatchDataset(store)
+
+    def train_objective(mbs: list[list[int]]) -> dict:
+        model = tiny_model(0)  # eval mode: no dropout, as the eval sees it
+        params = [p for p in model.parameters() if p.requires_grad]
+        cfg = m.load_config(None, ["specaug.enabled=false", "log.layer_stats_every=0", "log.hist_every=0",
+                                   f"loss.w_kl={w_kl}", f"loss.w_ce={w_ce}"])
+        rows = []
+        R = SimpleNamespace(cfg=cfg, device=torch.device("cpu"), model=model, feat_train=featurizer, specaug=None,
+                            gen=torch.Generator(), opt=torch.optim.SGD(params, lr=0.0),
+                            l2sp=L2SP(model.named_parameters(), lam=0.0), params=params,
+                            param_names=[n for n, p in model.named_parameters() if p.requires_grad],
+                            src_index={s: i for i, s in enumerate(sorted({store.utts[i].source for i in gate}))},
+                            st=dict(nonfinite_skips=0, nonfinite_total=0, oom_skips=0, resumes=0, epoch=0,
+                                    epoch_progress=0.0, audio_s=0.0, tokens=0, step_time_s=0.0, last_objective=None,
+                                    flops_per_padded_s=None, memory={}),
+                            log=SimpleNamespace(event=lambda *a, **k: None, train_utts=lambda r: None,
+                                                step_row=lambda row, step: rows.append(row)),
+                            planner=SimpleNamespace(epoch_stats={}), progress=lambda: (0.0, 1.0), clock=lambda: 0.0,
+                            autocast=lambda: torch.autocast("cpu", enabled=False))
+        out = m.train_step(R, 1, 0.0, [ds[b] for b in mbs], 0)
+        objective = m.log_step(R, 1, 0.0, 0, out, 0.0, 1.0, 0, 0)
+        return dict(objective=objective, row=rows[0], n_tok=out["n_tok"])
+
+    one = train_objective([batch])
+    assert one["row"]["combined_loss/train"] == one["row"]["loss/objective"] == one["objective"]
+    assert one["row"]["loss/kl"] > 0.1 and one["row"]["loss/ce"] > 0.1  # a random student: both terms count
+    assert one["n_tok"] == sum(store.utts[i].n_tok for i in gate)
+    two = train_objective([batch[::2], batch[1::2]])
+    assert two["objective"] == pytest.approx(one["objective"], rel=1e-6)
+
+    scal = {}
+    cfg = m.load_config(None, ["eval.mini.greedy=false", "eval.batch_s=1e9", f"loss.w_kl={w_kl}", f"loss.w_ce={w_ce}"])
+    R = SimpleNamespace(cfg=cfg, model=tiny_model(0), evalstore=store, train=None, feat_eval=featurizer,
+                        device="cpu", amp=False, mini_val_ids=[store.utts[i].id for i in batch], mini_train_ids=[],
+                        st=dict(epoch_progress=0.0, mini_history=[]), clock=lambda: 0.0,
+                        log=SimpleNamespace(event=lambda *a, **k: None, table=lambda *a, **k: None,
+                                            eval_json=lambda *a, **k: None, scalars=lambda row, step: scal.update(row)))
+    m.run_mini_eval(R, 1)
+    assert scal["combined_loss/val"] == pytest.approx(one["objective"], rel=1e-6, abs=1e-7)
+    tf, _ = ev.teacher_forced_eval(R.model, store, featurizer, "cpu", 1e9, ids=R.mini_val_ids)
+    c = ev.combined_loss(tf, w_kl, w_ce)
+    assert c["n_tok"] == one["n_tok"] and c["value"] == scal["combined_loss/val"]
+    assert c["kl"] == pytest.approx(one["row"]["loss/kl"], rel=1e-6) and c["ce"] == pytest.approx(one["row"]["loss/ce"],
+                                                                                                    rel=1e-6)
+
+    # the monitor-only hold-out in the val ids changes nothing: it is not pooled
+    scal.clear()
+    R.mini_val_ids = [u.id for u in store.utts]
+    m.run_mini_eval(R, 2)
+    assert scal["combined_loss/val"] == pytest.approx(one["objective"], rel=1e-5)
+    assert scal["eval/mini/tf/all/n_tok"] > one["n_tok"]  # galgame was evaluated, only not pooled

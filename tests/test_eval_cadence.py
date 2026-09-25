@@ -11,13 +11,19 @@
   at an epoch end, an eval that runs past T), the end phase reuses it as the final eval: one decode per step
 - the headline numbers after every eval (kitsune.evaluate.headline): pooled corpus CER = sum edits / sum chars of the
   per-set numbers, gate sets only; summary/{full,mini}/<name> with <name>_pct copies; one console line per eval
+- the `eval` event's per-set CERs are those of the headline's scope (greedy_scope): the complete sets at a complete
+  eval, with the fixed subset's as *_subset next to them; the subset at a subset eval
 - eval.gate false: summary.json's verdict is "N/A" with the numbers
+- the combined loss (w_kl * KL + w_ce * CE): combined_loss/train at every step (= loss/objective), combined_loss/val at
+  step 0 and at every mini eval (the mini val subset's gate sets), combined_loss/val_full at every complete-set eval;
+  first in 2_loss_accuracy and overlaid in one Custom Scalars chart in every event file
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import copy
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,7 +41,7 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa: E402
+from fixtures import load_script, make_fake_corpus, make_fake_selection, tb_layouts  # noqa: E402
 
 EVAL = ["eval_jsut", "eval_cv8", "eval_reazon"]
 PEAK = 3e-3
@@ -234,6 +240,75 @@ def test_overfit_gap_scalars_pool_the_gate_sets(monkeypatch):
                                                                     - scal["summary/full/train_loss"])
     assert scal["eval/cer_teacher_gap_heldout_minus_probe"] == pytest.approx(0.1 - 0.05)  # all sets: 0.26 - 0.05
     assert scal["eval/tf/all/kl"] == pytest.approx(1.1)  # the all-sets numbers stay logged
+
+
+def test_eval_event_per_set_numbers_follow_the_headline_scope(monkeypatch):
+    """Bug B-1: a complete eval's `eval` event gives each set's cer / ratio / trunc of the complete set (summary.json's
+    greedy_full, what the verdict judges), no longer the fixed subset's, and keeps the subset's next to them as
+    cer_subset / ratio_subset / trunc_subset (summary.json's greedy); greedy_scope names the scope, as headline_scope
+    does. A subset eval's event is as before (the subset's numbers under the plain names, no *_subset), with its
+    greedy_scope "subset". The history (the verdict's trend, the early stop) and the scalars keep the subset. run_eval
+    itself on fixed per-utterance rows, the subset decoded better than the rest of each set."""
+    from kitsune import evaluate as ev
+
+    m = load_script("04_distill")
+    ref, teach = "あいうえおかきくけこ", "あいうえおかきくけさ"  # the teacher: 1 error in 10 characters
+    rows = []
+    for k, x in enumerate(EVAL):
+        for i in range(4):  # <set>_0 and _1: the fixed greedy subset, decoded as well as the teacher
+            hyp = teach if i < 2 else "ん" * (k + 2) + ref[k + 2:]  # the rest: k + 2 errors, the last one truncated
+            rows.append(dict(id=f"{x}_{i}", source=x, duration=1.0, n_tok=11, ref=ref, teacher_hyp=teach, hyp=hyp,
+                             cer_ref=(1 if i < 2 else k + 2) / 10, cer_teacher=0.0 if i < 2 else (k + 3) / 10,
+                             truncated=i == 3, has_teacher=True, teacher_cer=0.1, teacher_truncated=False))
+    df = pd.DataFrame(rows)
+    greedy_ids = [f"{x}_{i}" for x in EVAL for i in range(2)]
+    tf = dict(sets={x: dict(kl=0.5, ce=1.0, top1=0.9, n_tok=100) for x in EVAL},
+              all=dict(kl=0.5, ce=1.0, top1=0.9, n_tok=300), wall_s=1.0)
+
+    def greedy_eval(model, store, ids, feat, device, bs, tokenizer=None, amp=None):
+        g = (df if ids is None else df[df["id"].isin(ids)]).reset_index(drop=True)
+        return ev.summarise_greedy(g, wall_s=1.0), g
+
+    monkeypatch.setattr(ev, "teacher_forced_eval", lambda *a, **k: (tf, pd.DataFrame({"source": []})))
+    monkeypatch.setattr(ev, "greedy_eval", greedy_eval)
+    monkeypatch.setattr(ev, "pick_samples", lambda *a, **k: [])
+    got, js, scal = [], {}, {}
+    log = SimpleNamespace(event=lambda kind, **k: got.append(dict(k, kind=kind)), table=lambda *a, **k: None,
+                          eval_json=lambda name, obj, step: js.update({step: obj}), samples=lambda *a, **k: None,
+                          scalars=lambda row, step: scal.setdefault(step, {}).update(row))
+    R = SimpleNamespace(cfg=m.load_config(None, []), log=log, model=torch.nn.Linear(1, 1), evalstore="eval",
+                        train="train", feat_eval=None, device="cpu", amp=None, tokenizer=None, probe_ids=[],
+                        probe_greedy_ids=[], greedy_ids=greedy_ids, st=dict(history=[], epoch_progress=0.0),
+                        clock=lambda: 0.0)
+    m.run_eval(R, 0)  # the step-0 eval: the fixed subset
+    m.run_eval(R, 5, complete=True)  # an epoch-end eval: the complete sets
+    sub_ev, full_ev = [e for e in got if e["kind"] == "eval"]
+    assert (sub_ev["at_step"], full_ev["at_step"]) == (0, 5) and not sub_ev["complete"] and full_ev["complete"]
+    assert sub_ev["greedy_scope"] == js[0]["headline_scope"]["val_greedy"] == "subset"
+    assert full_ev["greedy_scope"] == js[5]["headline_scope"]["val_greedy"] == "complete"
+    assert list(full_ev).index("greedy_scope") < list(full_ev).index("sets")  # ahead of them in the console line
+
+    def brief(g: dict, suffix: str = "") -> dict:
+        return {f"cer{suffix}": round(g["cer_ref_corpus"], 4), f"ratio{suffix}": round(g["ratio_vs_teacher"], 3),
+                f"trunc{suffix}": round(g["trunc_rate"], 4)}
+
+    for k, x in enumerate(EVAL):
+        sub, full = js[5]["greedy"]["sets"][x], js[5]["greedy_full"]["sets"][x]
+        assert (sub["n"], full["n"]) == (2, 4) and js[0]["greedy"]["sets"][x] == sub  # the same subset both times
+        assert sub["cer_ref_corpus"] == pytest.approx(0.1) and sub["ratio_vs_teacher"] == pytest.approx(1.0)
+        assert full["cer_ref_corpus"] == pytest.approx((2 + 2 * (k + 2)) / 40) and full["trunc_rate"] == 0.25
+        assert full_ev["sets"][x] == dict(kl=0.5, top1=0.9, **brief(full), **brief(sub, "_subset"))
+        assert (full_ev["sets"][x]["cer"], full_ev["sets"][x]["ratio"], full_ev["sets"][x]["trunc"]) == (
+            round((2 + 2 * (k + 2)) / 40, 4), round((2 + 2 * (k + 2)) / 40 / 0.1, 3), 0.25)
+        assert sub_ev["sets"][x] == dict(kl=0.5, top1=0.9, **brief(sub))  # unchanged: the subset, no *_subset
+        # what stays on the subset: the history, and the scalars under their tags (the complete sets' own next to them)
+        assert R.st["history"][-1]["greedy"][x]["cer_ref_corpus"] == sub["cer_ref_corpus"]
+        assert scal[5][f"eval/greedy/{x}/cer_ref_corpus"] == sub["cer_ref_corpus"] == scal[0][
+            f"eval/greedy/{x}/cer_ref_corpus"]
+        assert scal[5][f"eval/greedy_full/{x}/cer_ref_corpus"] == full["cer_ref_corpus"]
+    # the verdict judges the complete sets: what the complete eval's event now says
+    v = ev.verdict(dict(final=js[5]["greedy_full"], history=R.st["history"]))
+    assert all(round(v["sets"][x]["student"], 4) == full_ev["sets"][x]["cer"] for x in EVAL)
 
 
 def test_config_keys_are_validated():
@@ -461,6 +536,103 @@ def test_headline_numbers_are_the_pooled_per_set_numbers(steps_runs):
         assert f"[mini eval] step {mrec['step']} epoch " in out
 
 
+def test_eval_events_match_the_summaries(steps_runs):
+    """Every `eval` event against its step's summary.json (bug B-1): greedy_scope is headline_scope.val_greedy, and
+    the per-set cer / ratio / trunc are that scope's (greedy_full at the complete evals - the epoch ends and the final
+    eval, whose CERs are the verdict's - greedy at the step-0 subset eval), a complete eval's subset numbers next to
+    them as *_subset. The console's [event] line names the scope ahead of the per-set numbers (it is cut at 300
+    characters)."""
+    def rnd(v, nd):
+        return None if v is None or not math.isfinite(v) else round(v, nd)  # the event writes NaN as null
+
+    def brief(g: dict, suffix: str = "") -> dict:
+        return {f"cer{suffix}": rnd(g["cer_ref_corpus"], 4), f"ratio{suffix}": rnd(g["ratio_vs_teacher"], 3),
+                f"trunc{suffix}": rnd(g["trunc_rate"], 4)}
+
+    for run in (steps_runs["mini"], steps_runs["plain"]):
+        last = {e["at_step"]: e for e in events(run, "eval")}  # a step replayed after the resume: its later event
+        s = summary(run)
+        assert sorted(last) == [r["step"] for r in s["history"]]
+        for step, e in last.items():
+            d = json.loads((run / "evals" / f"step_{step}" / "summary.json").read_text(encoding="utf-8"))
+            assert e["greedy_scope"] == d["headline_scope"]["val_greedy"] == ("complete" if d["complete"] else "subset")
+            assert e["complete"] == d["complete"] and (d["greedy_full"] is not None) == d["complete"]
+            head = d["greedy_full"] if d["complete"] else d["greedy"]
+            assert set(head["sets"]) == set(e["sets"]) == set(EVAL)
+            for x, g in head["sets"].items():
+                want = dict(brief(g), **(brief(d["greedy"]["sets"][x], "_subset") if d["complete"] else {}))
+                assert {k: v for k, v in e["sets"][x].items() if k not in ("kl", "top1")} == want, (step, x)
+        fin = last[MAX_STEPS]
+        assert fin["complete"] and all(fin["sets"][x]["cer"] == round(s["verdict"]["sets"][x]["student"], 4)
+                                       for x in EVAL)
+        lines = [ln for ln in (run / "logs" / "stdout.log").read_text(encoding="utf-8").splitlines()
+                 if ln.startswith("[event] eval {")]
+        assert len(lines) >= len(last)
+        assert all(re.search(r'"greedy_scope": "(complete|subset)"', ln.split('"sets"')[0]) for ln in lines)
+        assert any('"greedy_scope": "subset"' in ln for ln in lines)
+        assert any('"greedy_scope": "complete"' in ln for ln in lines)
+
+
+def _pooled_objective(tf: dict, cfg: dict) -> float:
+    """w_kl * KL + w_ce * CE over the gate sets of a summary.json's teacher-forced part, token-weighted."""
+    n = sum(tf["sets"][x]["n_tok"] for x in EVAL)
+    kl = sum(tf["sets"][x]["kl"] * tf["sets"][x]["n_tok"] for x in EVAL) / n
+    ce = sum(tf["sets"][x]["ce"] * tf["sets"][x]["n_tok"] for x in EVAL) / n
+    return cfg["loss"]["w_kl"] * kl + cfg["loss"]["w_ce"] * ce
+
+
+def test_combined_loss_curves(steps_runs):
+    """The overall loss chart's three series, each on one scope: combined_loss/train at every optimizer step (= the
+    step's loss/objective, in steps.parquet too), combined_loss/val at step 0 and at every mini eval (the mini val
+    subset's gate sets, pooled token-weighted; the step-0 point on the very same utterances, without a mini eval of its
+    own), combined_loss/val_full at every complete-set eval (epoch ends, the final eval; never step 0). Each value is
+    the eval's summary.json numbers recombined, and summary.json keeps the sums; a run without minis has no val curve.
+    The run crashed and resumed: its replayed steps are read at their later values (scalar)."""
+    run, plain = steps_runs["mini"], steps_runs["plain"]
+    s = summary(run)
+    cfg = s["config"]
+    st = steps_of(run)
+    assert (st["combined_loss/train"] == st["loss/objective"]).all()
+    train = scalar(run, "combined_loss/train")
+    assert sorted(train) == list(range(1, MAX_STEPS + 1))
+    obj = scalar(run, "loss/objective")
+    assert all(train[k] == obj[k] for k in train)
+
+    minis = [r["step"] for r in s["mini_history"]]
+    val = scalar(run, "combined_loss/val")
+    assert sorted(val) == [0, *minis] and minis
+    n_tok = set()
+    for step in minis:
+        d = json.loads((run / "evals" / f"step_{step}_mini" / "summary.json").read_text(encoding="utf-8"))
+        c = d["combined_loss"]["val"]
+        assert c["scope"] == "mini" and c["sets"] == sorted(EVAL) and (c["w_kl"], c["w_ce"]) == (1.0, 0.8)
+        assert val[step] == pytest.approx(c["value"], rel=1e-9)
+        assert c["value"] == pytest.approx(_pooled_objective(d["tf"], cfg), rel=1e-9)
+        assert c["value"] == pytest.approx((c["kl_sum"] + 0.8 * c["ce_sum"]) / c["n_tok"])
+        n_tok.add(c["n_tok"])
+    s0 = json.loads((run / "evals" / "step_0" / "summary.json").read_text(encoding="utf-8"))
+    c0 = s0["combined_loss"]["val"]
+    assert c0["scope"] == "mini" and {c0["n_tok"]} == n_tok  # the mini val subset's tokens, at step 0 too
+    assert val[0] == pytest.approx(c0["value"]) and "val_full" not in s0["combined_loss"]
+    assert val[0] > min(val[k] for k in minis)  # the untrained student is worse on the same utterances
+    assert not (run / "evals" / "step_0_mini").exists() and 0 not in minis
+
+    ends = epoch_ends(run)
+    full = scalar(run, "combined_loss/val_full")
+    assert sorted(full) == sorted({*ends, MAX_STEPS}) and 0 not in full
+    for step in full:
+        d = json.loads((run / "evals" / f"step_{step}" / "summary.json").read_text(encoding="utf-8"))
+        c = d["combined_loss"]["val_full"]
+        assert d["complete"] and c["scope"] == "complete" and "val" not in d["combined_loss"]
+        assert full[step] == pytest.approx(c["value"], rel=1e-9)
+        assert c["value"] == pytest.approx(_pooled_objective(d["tf"], cfg), rel=1e-9)
+        assert c["n_tok"] == sum(d["tf"]["sets"][x]["n_tok"] for x in EVAL)
+    assert "combined_loss/val" not in set(pd.read_parquet(plain / "metrics" / "scalars.parquet")["tag"])
+    assert sorted(scalar(plain, "combined_loss/val_full")) == sorted({*epoch_ends(plain), MAX_STEPS})
+    assert "combined_loss" not in json.loads((plain / "evals" / "step_0" / "summary.json").read_text(encoding="utf-8"))
+    assert [e["combined_loss"] for e in events(run, "eval_mini")][-1] == {"val": round(val[minis[-1]], 5)}
+
+
 def test_tensorboard_places_the_new_tags(steps_runs):
     """summary/* first in 2_loss_accuracy (00_summary), eval/mini/* next to the full sections (<section>_mini), their
     cost in 1_operational/eval/mini; no tag of the run falls through to 3_misc unmatched."""
@@ -470,6 +642,9 @@ def test_tensorboard_places_the_new_tags(steps_runs):
     tags = set(pd.read_parquet(run / "metrics" / "scalars.parquet")["tag"])
     assert tags <= set(tag_map) and not any(e.get("unmapped") for e in tag_map.values())
     want = {
+        "combined_loss/train": "2_loss_accuracy/00_combined/train",
+        "combined_loss/val": "2_loss_accuracy/00_combined/val",
+        "combined_loss/val_full": "2_loss_accuracy/00_combined/val_full",
         "summary/full/val_cer": "2_loss_accuracy/00_summary/full/val_cer",
         "summary/full/val_cer_pct": "2_loss_accuracy/00_summary/full/val_cer_pct",
         "summary/mini/train_cer_vs_teacher_pct": "2_loss_accuracy/00_summary/mini/train_cer_vs_teacher_pct",
@@ -493,6 +668,21 @@ def test_tensorboard_places_the_new_tags(steps_runs):
     assert all(buckets[t] == "2_loss_accuracy" for t in tags if t.startswith("summary/"))
     assert all(buckets[t] == "2_loss_accuracy" for t in tags if t.startswith("eval/mini/") and "/cer_" in t
                and not t.endswith("_chars"))
+    # the combined-loss chart: in every event file (the crashed launch's and the resumed one's), its regexes drawing
+    # exactly the three curves among the tags TensorBoard reads from the run
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    from kitsune.runlog import TB_LAYOUT
+
+    files = sorted(p for p in (run / "tb").iterdir() if "tfevents" in p.name)
+    assert len(files) == 2
+    (kind, regexes), = TB_LAYOUT["combined_loss"].values()
+    assert all(tb_layouts(f) == [(0, {"combined_loss": {"combined_loss: train vs val": regexes}})] for f in files)
+    acc = EventAccumulator(str(run / "tb"))
+    acc.Reload()
+    tb_scalars = acc.Tags()["scalars"]
+    assert [[t for t in tb_scalars if re.match(rx, t)] for rx in regexes] == [
+        [tag_map[t]["tb_tag"]] for t in ("combined_loss/train", "combined_loss/val", "combined_loss/val_full")]
 
 
 def test_export_keeps_minis_apart(steps_runs, tmp_path):
@@ -523,6 +713,19 @@ def test_export_keeps_minis_apart(steps_runs, tmp_path):
     assert {"final", "complete", "headline_scope/val_greedy"}.isdisjoint(es["key"])  # columns, not keys
     readme = (tmp_path / "export" / "README.md").read_text(encoding="utf-8")
     assert "| `scope` |" in readme and "| `final` |" in readme and "| `complete` |" in readme
+    # the combined-loss chart as one table: each curve as TensorBoard draws it (the crashed launch's rows after the
+    # restored step 8 left out), the sums of every eval's combined_loss in eval_summaries
+    cl = t["combined_loss"]
+    assert list(cl.columns) == ["series", "step", "value", "wall", "elapsed_s"]
+    assert list(dict.fromkeys(cl["series"])) == ["train", "val", "val_full"]
+    for series in ("train", "val", "val_full"):
+        rows = cl[cl["series"] == series]
+        assert rows["step"].tolist() == sorted(scalar(run, f"combined_loss/{series}")), series
+        assert rows["value"].tolist() == pytest.approx([scalar(run, f"combined_loss/{series}")[k]
+                                                        for k in rows["step"]])
+    assert cl.loc[cl["series"] == "val", "step"].tolist() == [0, *want]
+    assert {"combined_loss/val/kl_sum", "combined_loss/val_full/n_tok"} <= set(es["key"])
+    assert (tmp_path / "export" / "combined_loss.csv").is_file() and "## `combined_loss.parquet`" in readme
 
 
 def test_full_eval_every_other_epoch_on_the_wall_clock_and_gate_off(env, monkeypatch):
@@ -571,8 +774,8 @@ def test_a_complete_eval_that_runs_past_T_is_the_final_eval(env, monkeypatch):
     m = load_script("04_distill")
     real = m.run_eval
 
-    def slow(R, step, final=False, complete=None):  # the loop clock runs on during an eval: this one outlasts T
-        out = real(R, step, final=final, complete=complete)
+    def slow(R, step, final=False, complete=None, **kw):  # the loop clock runs on during an eval: this one outlasts T
+        out = real(R, step, final=final, complete=complete, **kw)  # kw: the step-0 eval's mini_val
         if complete and not final:
             R.st["train_s"] += float(R.cfg["schedule"]["train_hours"]) * 3600
         return out
