@@ -246,7 +246,8 @@ def test_onstart_and_watchdog_curl_stops_read_the_reply(tmp_path, reply, rc, ok)
 def test_bootstrap_retries_the_audio_rebuild(tmp_path):
     """One transient Hub error in 01's listing calls (sent once, with no HTTP timeout) must not stop the box after the
     paid boot: the rebuild runs through retry() with a timeout. retry() returns 0 once an attempt passes, and after
-    the last one the last exit code, so set -e still stops bootstrap with the real cause."""
+    the last one the last exit code, so set -e still stops bootstrap with the real cause. Exit 3 (the plan helper's
+    NO_RETRY: a token or data repo the Hub refused) returns at once: three tries cost ~3 paid minutes for nothing."""
     text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
     line = next(ln for ln in text.splitlines() if ln.lstrip().startswith("phase rebuild_audio"))
     assert re.search(r"phase rebuild_audio retry \d+ timeout -k \d+ \d+m \"\$PY\" scripts/01_prepare_data\.py", line)
@@ -254,16 +255,17 @@ def test_bootstrap_retries_the_audio_rebuild(tmp_path):
     if bash is None:
         pytest.skip("bash not available")
     func = re.search(r"^retry\(\) \{\n.*?^\}\n", text, re.M | re.S).group(0)
-    # an external command that fails until its n-th run
-    (tmp_path / "flaky.sh").write_text('n=$(( $(cat "$1" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$1"; '
-                                       '[ "$n" -ge "$2" ]\n', encoding="utf-8", newline="\n")
+    # an external command that fails until its n-th run, and one that is refused every time
+    count = 'n=$(( $(cat "$1" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$1"; '
+    (tmp_path / "flaky.sh").write_text(count + '[ "$n" -ge "$2" ]\n', encoding="utf-8", newline="\n")
+    (tmp_path / "refused.sh").write_text(count + "exit 3\n", encoding="utf-8", newline="\n")
 
-    def run(counter: str, passes_at: int):
+    def run(counter: str, passes_at: int, cmd: str = "flaky.sh"):
         script = tmp_path / f"{counter}.sh"
         script.write_text("\n".join([
             "set -euo pipefail", f'cd "{tmp_path.as_posix()}"', "log() { printf '%s\\n' \"$*\"; }",
-            "sleep() { :; }",  # the real waits are minutes
-            func, f'retry 3 "$BASH" flaky.sh {counter} {passes_at}', f'echo "after $(cat {counter})"', ""]),
+            'sleep() { echo "slept $1"; }',  # the real waits are minutes
+            func, f'retry 3 "$BASH" {cmd} {counter} {passes_at}', f'echo "after $(cat {counter})"', ""]),
             encoding="utf-8", newline="\n")
         return subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=60)
 
@@ -271,7 +273,10 @@ def test_bootstrap_retries_the_audio_rebuild(tmp_path):
     assert r.returncode == 0 and "attempt 1/3" in r.stdout and "after 2" in r.stdout, r.stdout + r.stderr
     r = run("always", 99)
     assert r.returncode == 1 and "attempt 3/3" in r.stdout and "after" not in r.stdout, r.stdout + r.stderr
-    assert (tmp_path / "always").read_text().strip() == "3"
+    assert "slept 60" in r.stdout and "slept 120" in r.stdout and (tmp_path / "always").read_text().strip() == "3"
+    r = run("refusal", 99, "refused.sh")
+    assert r.returncode == 3 and "attempt 1/3" in r.stdout and "not retrying" in r.stdout, r.stdout + r.stderr
+    assert "slept" not in r.stdout and (tmp_path / "refusal").read_text().strip() == "1"
 
 
 def test_bootstrap_lists_parked_shards_in_the_manifest(tmp_path, prep):
@@ -429,7 +434,8 @@ def test_bootstrap_plan_checks_the_box_token_on_the_output_repo(tmp_path):
     asks the Hub whether the token can read and write it (auth_check: GETs, no commit) before anything is pulled, so a
     wrongly scoped token stops the box in its first minutes. Only a refusal (401/403/404) is blamed on the token: a
     Hub 5xx, 429 or dropped connection is reported as a Hub error, and the plan phase runs under retry() with a
-    timeout (its GETs have none), as the pull does."""
+    timeout (its GETs have none), as the pull does. A refusal (of whoami, auth_check or the data repo listing) and data
+    the repo lacks exit 3, which retry() does not repeat; a Hub error exits 1 and is retried."""
     text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
     line = next(ln for ln in text.splitlines() if ln.lstrip().startswith("phase plan"))
     assert re.search(r'phase plan retry \d+ timeout -k \d+ \d+m "\$PY" "\$HELPER" plan', line)
@@ -444,7 +450,10 @@ def test_bootstrap_plan_checks_the_box_token_on_the_output_repo(tmp_path):
         "        super().__init__(f'{status} from the Hub')\n"
         "        self.response = types.SimpleNamespace(status_code=status)\n"
         "class HfApi:\n"
-        "    def whoami(self):\n        return {'name': 'u'}\n"
+        "    def whoami(self):\n"
+        "        if os.environ.get('DENY_WHOAMI'):\n"
+        "            raise HTTPError(int(os.environ['DENY_WHOAMI']))\n"
+        "        return {'name': 'u'}\n"
         "    def auth_check(self, repo_id, *, repo_type=None, write=False):\n"
         "        print(f'auth_check {repo_id} {repo_type} write={write}')\n"
         "        deny = os.environ.get('DENY_WRITE')\n"
@@ -452,7 +461,10 @@ def test_bootstrap_plan_checks_the_box_token_on_the_output_repo(tmp_path):
         "            raise ConnectionError('Server disconnected without sending a response.')\n"
         "        if write and deny:\n"
         "            raise HTTPError(int(deny))\n"
-        "    def list_repo_files(self, *a, **k):\n        return []\n", encoding="utf-8")
+        "    def list_repo_files(self, *a, **k):\n"
+        "        if os.environ.get('DENY_LIST'):\n"
+        "            raise HTTPError(int(os.environ['DENY_LIST']))\n"
+        "        return []\n", encoding="utf-8")
     (stub / "utils.py").write_text("def filter_repo_objects(items, **kw):\n    return list(items)\n", encoding="utf-8")
     box, state = tmp_path / "box", tmp_path / "state"
     (box / "configs").mkdir(parents=True)
@@ -464,21 +476,32 @@ def test_bootstrap_plan_checks_the_box_token_on_the_output_repo(tmp_path):
                PYTHONPATH=os.pathsep.join([str(tmp_path / "stub"), str(ROOT)]))
     run = [sys.executable, str(tmp_path / "helper.py"), "plan"]
     r = subprocess.run(run, capture_output=True, text=True, env=env, timeout=120)
-    assert r.returncode != 0 and "auth_check u/runs model write=False" in r.stdout
+    assert r.returncode == 3 and "auth_check u/runs model write=False" in r.stdout, "a refusal is not retried"
     assert "HF_TOKEN cannot write u/runs (HTTPError: 403 from the Hub)" in r.stderr, r.stdout + r.stderr
-    assert not (state / "bootstrap_plan.json").exists()
+    assert "(not retried)" in r.stderr and not (state / "bootstrap_plan.json").exists()
     r = subprocess.run(run, capture_output=True, text=True, env=dict(env, DENY_WRITE="404"), timeout=120)
     assert "HF_TOKEN cannot write u/runs (HTTPError: 404 from the Hub)" in r.stderr, "RepoNotFound hides the repo"
+    assert r.returncode == 3
     for deny, what in (("503", "HTTPError: 503 from the Hub"), ("429", "HTTPError: 429 from the Hub"),
                        ("drop", "ConnectionError: Server disconnected")):
         r = subprocess.run(run, capture_output=True, text=True, env=dict(env, DENY_WRITE=deny), timeout=120)
-        assert r.returncode != 0 and "HF_TOKEN cannot" not in r.stderr, r.stdout + r.stderr
+        assert r.returncode not in (0, 3) and "HF_TOKEN cannot" not in r.stderr, r.stdout + r.stderr
         assert f"Hub error checking u/runs ({what}" in r.stderr and "retries the plan" in r.stderr, r.stderr
         assert not (state / "bootstrap_plan.json").exists()
     del env["DENY_WRITE"]
+    r = subprocess.run(run, capture_output=True, text=True, env=dict(env, DENY_WHOAMI="401"), timeout=120)
+    assert r.returncode == 3 and "HF_TOKEN is not a valid token (HTTPError: 401" in r.stderr, r.stdout + r.stderr
+    assert "auth_check" not in r.stdout
+    r = subprocess.run(run, capture_output=True, text=True, env=dict(env, DENY_WHOAMI="503"), timeout=120)
+    assert r.returncode not in (0, 3) and "503 from the Hub" in r.stderr, "a Hub error is retried"
+    r = subprocess.run(run, capture_output=True, text=True, env=dict(env, DENY_LIST="404"), timeout=120)
+    assert r.returncode == 3 and "HF_TOKEN cannot list u/data@main (HTTPError: 404" in r.stderr, r.stderr
+    r = subprocess.run(run, capture_output=True, text=True, env=dict(env, DENY_LIST="502"), timeout=120)
+    assert r.returncode not in (0, 3) and "502 from the Hub" in r.stderr, "a Hub error is retried"
     r = subprocess.run(run, capture_output=True, text=True, env=env, timeout=120)
     assert "auth_check u/runs model write=True" in r.stdout and "HF_TOKEN cannot" not in r.stderr
     assert "data repo u/data@main lacks" in r.stderr, "past the token check, on to the data listing"
+    assert r.returncode == 3, "the data the pinned revision lacks does not appear on a retry"
 
 
 def test_onstart_fits_vast_limits():

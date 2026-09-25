@@ -70,7 +70,9 @@ phase() {  # phase <name> <command...>: run it and append its wall time
 
 # retry <tries> <command...>: re-run a resumable network step after a failure. One Hub 5xx/429 or dropped connection
 # (01's listing calls are sent once, with no HTTP timeout) would otherwise stop the box after the paid boot; a stalled
-# call is cut by the timeout the caller puts in <command>. The exit code of the last attempt is returned.
+# call is cut by the timeout the caller puts in <command>. The exit code of the last attempt is returned. Exit 3 is a
+# refusal a retry cannot fix (the plan helper's NO_RETRY: a token or data repo the Hub refused, data it lacks) and
+# returns at once; neither 01_prepare_data.py (1, argparse 2) nor timeout (124-127, 137) exits 3.
 retry() {
     local n=$1 i rc=0
     shift
@@ -79,6 +81,7 @@ retry() {
         "$@" || rc=$?
         [ "$rc" -eq 0 ] && return 0
         log "attempt $i/$n of $* failed (exit $rc)"
+        if [ "$rc" -eq 3 ]; then log "exit 3 is a refusal a retry cannot fix; not retrying"; return 3; fi
         if [ "$i" -lt "$n" ]; then sleep $(( i * 60 )); fi
     done
     return "$rc"
@@ -110,6 +113,19 @@ student = cfg["student"].rstrip("/")
 # the student dir files the trainer loads (it has no processor fallback): the same list as vast/launch.py STUDENT_FILES
 STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json")
 plan_path = state / "bootstrap_plan.json"
+NO_RETRY = 3  # the exit code bootstrap's retry() does not repeat: the Hub would refuse again
+
+
+def refused(e: BaseException) -> bool:
+    """A refusal is the token's or the config's fault (404/401 = RepoNotFound: the Hub hides a private repo the token
+    cannot see; 404 also for a missing revision); a 5xx, 429 or dropped connection is the Hub's, and the plan phase
+    runs under retry()."""
+    return getattr(getattr(e, "response", None), "status_code", None) in (401, 403, 404)
+
+
+def refuse(msg: str):
+    print(f"{msg} (not retried)", file=sys.stderr)
+    sys.exit(NO_RETRY)
 
 
 def plan():
@@ -117,7 +133,14 @@ def plan():
     from huggingface_hub.utils import filter_repo_objects
 
     api = HfApi()
-    print(f"hf user: {api.whoami()['name']}")
+    try:
+        user = api.whoami()["name"]
+    except Exception as e:
+        if refused(e):
+            refuse(f"HF_TOKEN is not a valid token ({type(e).__name__}: {e}): put a working fine-grained token in the "
+                   f"vast account env (vast/README.md step 2.3)")
+        raise
+    print(f"hf user: {user}")
     # the box token's first use of the output repo would otherwise be the trainer's hf_roundtrip, after the pull, the
     # audio rebuild and the model load; auth_check is a GET (no commit), and the trainer reads its uploads back
     out_repo = os.environ["KITSUNE_OUT_REPO"]
@@ -125,14 +148,17 @@ def plan():
         try:
             api.auth_check(out_repo, repo_type="model", write=write)
         except Exception as e:
-            # only a refusal is the token's fault (404/401 = RepoNotFound: the Hub hides a private repo the token
-            # cannot see); a 5xx, 429 or dropped connection is the Hub's, and the plan phase runs under retry()
-            status = getattr(getattr(e, "response", None), "status_code", None)
-            if status in (401, 403, 404):
-                sys.exit(f"HF_TOKEN cannot {'write' if write else 'read'} {out_repo} ({type(e).__name__}: {e}): give "
-                         f"the fine-grained token read and write access to it (vast/README.md step 2.3)")
+            if refused(e):
+                refuse(f"HF_TOKEN cannot {'write' if write else 'read'} {out_repo} ({type(e).__name__}: {e}): give "
+                       f"the fine-grained token read and write access to it (vast/README.md step 2.3)")
             sys.exit(f"Hub error checking {out_repo} ({type(e).__name__}: {e}); bootstrap retries the plan")
-    files = api.list_repo_files(repo, repo_type="dataset", revision=rev)
+    try:
+        files = api.list_repo_files(repo, repo_type="dataset", revision=rev)
+    except Exception as e:
+        if refused(e):
+            refuse(f"HF_TOKEN cannot list {repo}@{rev} ({type(e).__name__}: {e}): check KITSUNE_DATA_REPO, "
+                   f"KITSUNE_DATA_REVISION and the token's read access to it (vast/README.md step 2.3)")
+        raise
 
     def has(pat: str) -> bool:
         return any(fnmatch.fnmatch(f, pat) for f in files)
@@ -150,7 +176,7 @@ def plan():
         if teacher - second:
             missing.append(f"{second_root}/{s}: {len(teacher - second)} of {len(teacher)} shards without a second opinion")
     if missing:
-        sys.exit(f"data repo {repo}@{rev} lacks: {missing}")
+        refuse(f"data repo {repo}@{rev} lacks: {missing}")
     parked = [s for s in names if has(f"{data_root}/shards/{s}/*.parquet")]
     patterns += [f"{data_root}/shards/{s}/*.parquet" for s in parked]
     rebuild = [s for s in names if s not in parked]
