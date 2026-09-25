@@ -408,8 +408,12 @@ def test_onstart_fits_vast_limits():
     for needle in ("/etc/environment", "ulimit -Sn", "/dev/shm", "KITSUNE_SHARING=file_system",
                    "entrypoint.sh", "https://github.com/Multysquid/Kitsune-Transcribe", "vast/watchdog.sh",
                    "vast/bootstrap.sh", "vast/supervise.py", "/workspace/kitsune.log", "halt", "--rearm",
-                   "supervise.lock"):
+                   "supervise.lock", "pids.max", "OPENBLAS_NUM_THREADS", "TOKIO_WORKER_THREADS"):
         assert needle in text, needle
+    # onstart runs with errtrace: a cgroup read that fails inside $(...) would fire the ERR trap and stop the box
+    for line in text.splitlines():
+        if "/sys/fs/cgroup" in line and not line.lstrip().startswith("#"):
+            assert "2>/dev/null ||" in line, line
 
 
 def test_watchdog_dry_run(tmp_path):

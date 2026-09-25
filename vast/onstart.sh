@@ -5,9 +5,9 @@
 # by itself if run on a box without the stub (clone_repo is a no-op when the checkout is already at $KITSUNE_SHA).
 #
 # Steps: sync the env to /etc/environment (SSH/tmux sessions do not inherit the container env), raise the nofile limit,
-# check /dev/shm, start TensorBoard and the vast portal, clone the repo at $KITSUNE_SHA, start vast/watchdog.sh (hard
-# cost cap), then detached: vast/bootstrap.sh (data) and vast/supervise.py (training + stop/destroy), all logging to
-# /workspace/kitsune.log.
+# check /dev/shm and the pids budget, start TensorBoard and the vast portal, clone the repo at $KITSUNE_SHA, start
+# vast/watchdog.sh (hard cost cap), then detached: vast/bootstrap.sh (data) and vast/supervise.py (training +
+# stop/destroy), all logging to /workspace/kitsune.log.
 #
 # Restarts: the watchdog deadline is fixed at first boot; a `halt` marker (written by finish.py or by a failure here)
 # means the run is over, so a restarted container only brings up the env and the portal for inspection. An interrupted
@@ -74,7 +74,9 @@ fail() {  # ERR trap: record why, stop the box, keep the disk for inspection
 trap 'fail $LINENO' ERR
 
 sync_env() {
-    # rewrite only our block so repeated boots do not grow the file; values are written, never echoed
+    # rewrite only our block so repeated boots do not grow the file; values are written, never echoed. On the first
+    # boot the portal's 10-prep-env.sh (start_portal) then truncates the file and rewrites it from the env it inherited
+    # from us (our block markers go, the values stay); later boots keep its marker line, so it leaves the file alone
     local tmp k v
     tmp=$(mktemp)
     if [ -f /etc/environment ]; then
@@ -202,6 +204,20 @@ if [ "$shm_kb" -lt $(( 2 * 1024 * 1024 )) ]; then
     log "/dev/shm is $(( shm_kb / 1024 )) MB (< 2 GB): KITSUNE_SHARING=file_system"
 else
     log "/dev/shm is $(( shm_kb / 1024 )) MB"
+fi
+# the base image's 12-cpu-thread-limits.sh caps the CPU thread pools on a host whose pids budget is below 16 per
+# visible CPU (else pools sized to nproc hit EAGAIN), but only in the portal's shell, not in ours (bootstrap's hf_xet
+# downloads, the trainer and its DataLoader workers): same trigger here, before sync_env so SSH sessions get it too.
+# Every read is guarded: with errtrace a failing $(cat ...) would fire the ERR trap and stop the box
+pids_max=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo unknown)
+ncpu=$(nproc 2>/dev/null || echo 0)
+log "pids.max $pids_max, nproc $ncpu, cpu.max $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo n/a)"
+if [[ "$pids_max" =~ ^[0-9]+$ && "$ncpu" =~ ^[0-9]+$ ]] && (( pids_max < ncpu * 16 )); then
+    for v in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS RAYON_NUM_THREADS \
+        TOKIO_WORKER_THREADS; do
+        export "$v=${!v:-16}"  # a value already set wins
+    done
+    log "low pids budget: CPU thread pools capped to 16"
 fi
 sync_env
 
