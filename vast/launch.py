@@ -23,6 +23,7 @@ the code at a pinned commit (KITSUNE_SHA), so this script refuses to rent for a 
 Usage:
   python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs        # look only
   python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --yes  # rent the cheapest
+Add --no-self-stop to debug a fresh box: a failed on-start or bootstrap then leaves it running (KITSUNE_NO_SELF_STOP=1).
 Needs the vastai CLI (`pip install vastai==1.8.0`, then `vastai set api-key <key>`); --help works without it.
 """
 import argparse
@@ -408,6 +409,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--offer-id", type=int, default=None, help="rent this offer from the search results")
     ap.add_argument("--max-dph", type=float, default=DEFAULT_MAX_DPH, help="refuse offers above this $/h")
     ap.add_argument("--max-hours", type=float, default=5.5, help="watchdog cap from first boot (KITSUNE_MAX_HOURS)")
+    ap.add_argument("--no-self-stop", action="store_true",
+                    help="debugging: the box does not stop itself when its on-start or bootstrap fails "
+                         "(KITSUNE_NO_SELF_STOP=1); the watchdog still stops it once onstart.sh has started it")
     ap.add_argument("--no-hf-check", action="store_true", help="skip the read-only HF preflight")
     ap.add_argument("--skip-git-checks", action="store_true",
                     help="rent even if the commit looks unpushed/dirty or the image was built from other dependencies")
@@ -461,6 +465,8 @@ def main(argv: list[str] | None = None) -> int:
            "KITSUNE_OUT_REPO": args.out_repo, "KITSUNE_MAX_HOURS": f"{args.max_hours:g}", "TZ": "UTC"}
     if data_rev:
         env["KITSUNE_DATA_REVISION"] = data_rev
+    if args.no_self_stop:  # inside the one --env value: vastai has no -e option, and a second --env replaces the first
+        env["KITSUNE_NO_SELF_STOP"] = "1"
 
     tier, query, offers = search_offers(exe)
     print(f"\nsearch ({tier or 'nothing found'}): vastai {shlex.join(search_args(query or build_query(TIERS[0][1])))}")

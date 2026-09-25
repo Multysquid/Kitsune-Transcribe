@@ -107,7 +107,7 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --yes
    ```
    Options: `--offer-id N` to pick another row, `--max-dph 1.0` to cap the price, `--image ...@sha256:...` to pin an
-   image by hand, `--config configs/<other>.json`.
+   image by hand, `--config configs/<other>.json`, `--no-self-stop` to debug a box (see "How it ends").
 
 ## Watching it
 
@@ -188,5 +188,8 @@ has usually passed (the watchdog would stop the box at once) and the old history
 `--rearm` refuses (exit 1, reason in the log: the script writes only to `/workspace/kitsune.log`) while a watchdog or
 supervisor of the current container is still running; stop and start the instance first. Running the on-start script
 again during a healthy run starts nothing (the supervisor holds `kitsune_state/supervise.lock`). When done:
-`vastai destroy instance <id>`. For debugging a fresh box without it stopping itself on a bootstrap error, add
-`-e KITSUNE_NO_SELF_STOP=1` to the create command (the watchdog still applies).
+`vastai destroy instance <id>`. For debugging a fresh box without it stopping itself on a bootstrap error, pass
+`--no-self-stop` to launch.py (it adds `-e KITSUNE_NO_SELF_STOP=1` inside the `--env '...'` value). By hand, put it
+inside that quoted value: vastai has no `-e` option of its own, and a second `--env` replaces the first, dropping
+KITSUNE_SHA and the rest. The watchdog still stops the box at the cap once `onstart.sh` has started it; with the flag,
+a box whose stub fails before that (e.g. the clone) keeps running until you destroy it by hand.

@@ -506,6 +506,33 @@ def test_launch_dry_run_builds_query_and_command(fake_vastai, capsys):
     assert "~$0.85 (~25 GB down, ~30 GB up" in out and "$/GBup" in out
 
 
+def test_launch_no_self_stop_goes_inside_the_env_value(fake_vastai, capsys):
+    """vastai's create has no -e option and a second --env replaces the first: the flag must join the one value."""
+    fake_vastai([OFFERS_40])
+    assert launch.main(launch_args("--dry-run")) == 0
+    assert "KITSUNE_NO_SELF_STOP" not in capsys.readouterr().out
+    fake = fake_vastai([OFFERS_40])
+    assert launch.main(launch_args("--yes", "--no-self-stop")) == 0
+    create = next(c for c in fake.calls if c[1:3] == ["create", "instance"])
+    assert create.count("--env") == 1 and not any(a == "-e" for a in create)
+    env = create[create.index("--env") + 1]
+    assert "-e KITSUNE_NO_SELF_STOP=1" in env and f"-e KITSUNE_SHA={SHA}" in env
+
+
+def test_onstart_stub_stops_the_box_when_kitsune_sha_is_unset(tmp_path):
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    log = tmp_path / "kitsune.log"
+    env = dict(os.environ, KITSUNE_DIR=(tmp_path / "repo").as_posix(), KITSUNE_LOG=log.as_posix(),
+               KITSUNE_NO_SELF_STOP="1")
+    env.pop("KITSUNE_SHA", None)
+    r = subprocess.run([bash, str(VAST / "onstart_stub.sh")], capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 1
+    text = log.read_text(encoding="utf-8")
+    assert "onstart.sh missing" in text and "unbound variable" not in text, text
+
+
 def test_launch_needs_yes_to_create(fake_vastai, capsys):
     fake = fake_vastai([OFFERS_40])
     assert launch.main(launch_args()) == 0

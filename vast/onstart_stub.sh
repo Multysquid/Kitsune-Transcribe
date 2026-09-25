@@ -45,5 +45,5 @@ if [ "$(git -C "$D" rev-parse HEAD 2>/dev/null)" != "${KITSUNE_SHA:-}" ]; then
         || stop_box "could not clone $URL at $KITSUNE_SHA"
     log "cloned $URL at $KITSUNE_SHA"
 fi
-[ -f "$D/vast/onstart.sh" ] || stop_box "$D/vast/onstart.sh missing at $KITSUNE_SHA"
+[ -f "$D/vast/onstart.sh" ] || stop_box "$D/vast/onstart.sh missing at ${KITSUNE_SHA:-}"
 exec bash "$D/vast/onstart.sh" "$@"
