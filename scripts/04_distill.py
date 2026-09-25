@@ -2754,19 +2754,36 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         config=R.cfg, **extra)
 
 
+# set by main() when it returns with an upload still running: the __main__ block then skips interpreter finalization
+_HARD_EXIT = False
+
+
+def uploads_left_running(R: Run) -> bool:
+    """A checkpoint upload or log sync still running after the bounded end-phase waits (or an xet commit thread one
+    left behind). hf_xet 1.5.1's wait_to_finish re-takes the GIL every 100 ms for its check_signals poll (PyO3 0.26
+    detach, then PyEval_RestoreThread); CPython 3.12 calls pthread_exit on a thread that does that while the
+    interpreter finalizes, and the unwind through its Rust frames aborts the process (rc -6), which vast/supervise.py
+    read as a crash of a finished run."""
+    return bool(R.uploader.busy()) or not R.log.wait_sync(0) or any(
+        t.name == "hf-upload-committer" and t.is_alive() for t in threading.enumerate())
+
+
 def main(argv=None) -> int:
+    global _HARD_EXIT
     args = parse_args(argv)
     R, state = build(args)
     try:
-        return train(R, state)
+        rc = train(R, state)
     except ThroughputTooLow as e:
         R.log.event("throughput_too_low", error=str(e))
         _close_failed(R, "throughput_too_low", e)
-        return EXIT_THROUGHPUT
+        rc = EXIT_THROUGHPUT
     except BaseException as e:
         R.log.exception(e)
         _close_failed(R, "failed", e)
         raise
+    _HARD_EXIT = uploads_left_running(R)
+    return rc
 
 
 def _close_failed(R: Run, status: str, exc: BaseException):
@@ -2782,5 +2799,17 @@ def _close_failed(R: Run, status: str, exc: BaseException):
         print(f"closing the logger after a failure failed too: {e!r}", file=sys.stderr)
 
 
+def exit_process(rc: int):
+    """sys.exit(rc); os._exit(rc) when main() returned with an upload still running (uploads_left_running): the logs
+    and TensorBoard are closed by then, and finish.py uploads and verifies what the upload did not finish. Here, not in
+    main(): the tests call main() directly."""
+    if _HARD_EXIT:
+        print(f"an upload is still running: exiting {rc} without interpreter finalization", file=sys.stderr)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(rc)
+    sys.exit(rc)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_process(main())

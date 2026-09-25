@@ -203,6 +203,58 @@ def test_a_crash_closes_the_logs_before_waiting_on_uploads(tmp_path, monkeypatch
     assert not R.uploader.worker.is_alive() and order[2:] == [("ckpt_upload_ok", "full_step_7")]
 
 
+def test_a_normal_exit_with_an_upload_running_skips_finalization(tmp_path, monkeypatch):
+    """The end phase's waits are bounded, so the trainer can return 0 with an xet upload still in a daemon thread;
+    hf_xet re-takes the GIL every 100 ms while it waits, and on CPython 3.12 that during finalization aborts the
+    process (rc -6), which the supervisor read as a crash of a finished run. main() notes the running upload and the
+    __main__ block's exit_process() then leaves by os._exit, after flushing."""
+    import threading
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    release, evs = threading.Event(), []
+
+    class StalledHub(FakeHub):
+        def upload_folder(self, **kw):
+            release.wait(30)
+            super().upload_folder(**kw)
+
+    log = SimpleNamespace(event=lambda kind, **kw: evs.append(kind), wait_sync=lambda timeout=None: True)
+    R = SimpleNamespace(uploader=m.Uploader(StalledHub(), "u/r", "run", True, log, retries=()), log=log)
+    d = tmp_path / "full_step_9"
+    d.mkdir()
+    (d / "w.bin").write_bytes(b"x")
+    monkeypatch.setattr(m, "parse_args", lambda argv: None)
+    monkeypatch.setattr(m, "build", lambda args: (R, None))
+    monkeypatch.setattr(m, "train", lambda R, state: m.EXIT_OK)
+    exits = []
+
+    class HardExit(Exception):  # os._exit never returns
+        pass
+
+    def hard_exit(rc):
+        exits.append(("os._exit", rc))
+        raise HardExit
+
+    monkeypatch.setattr(m.os, "_exit", hard_exit)
+    monkeypatch.setattr(m.sys, "exit", lambda rc: exits.append(("sys.exit", rc)))
+    try:
+        R.uploader.submit(d, "full_step_9")
+        assert m.main([]) == 0 and m._HARD_EXIT
+        with pytest.raises(HardExit):
+            m.exit_process(0)
+        log.wait_sync = lambda timeout=None: False  # a log sync still running counts too
+        release.set()
+        R.uploader.worker.join(5)
+        assert not R.uploader.busy() and m.uploads_left_running(R)
+    finally:
+        release.set()
+    log.wait_sync = lambda timeout=None: True
+    assert m.main([]) == 0 and not m._HARD_EXIT
+    m.exit_process(0)
+    assert exits == [("os._exit", 0), ("sys.exit", 0)]
+
+
 def test_a_resume_sets_newer_states_aside_and_uploads_the_pre_cooldown_state_again(tmp_path, monkeypatch):
     """--resume from an older full state moves the abandoned attempt's newer ones aside (set_aside_newer). The
     pre_cooldown full state is uploaded only by the process that saved it (finish.py's syncs take the newest full

@@ -3,12 +3,16 @@
 Policy (decide()):
   exit 0                                   -> vast/finish.py --destroy  (verifies the HF upload first, stops if it can't)
   exit 3 (ThroughputTooLow)                -> vast/finish.py --stop     (a slow host does not get faster)
+  any other exit after the trainer wrote summary.json with status "complete"
+                                           -> vast/finish.py --destroy  (it finished: final eval, verdict, summary)
   any other failure, the FIRST one, reached step >= 100 and a local full state exists
                                            -> resume once: 04 --resume <newest full state>
   a second failure, a failure before step 100, or no full state to resume from
                                            -> vast/finish.py --stop
 Why: after the smoke phase (100 steps) the code path is proven on this host, so a later crash is most likely transient
-(a host hiccup, a NaN spike) and one resume costs minutes. A failure before step 100 is a code or hardware problem that
+(a host hiccup, a NaN spike) and one resume costs minutes. A trainer that dies after its complete summary (a crash in
+the interpreter's teardown, a kill while its end-state upload drains) has nothing left to train: a resume would only
+run the end phase and the final eval again, and finish.py --destroy uploads what is missing and verifies it first. A failure before step 100 is a code or hardware problem that
 a restart would only repeat on the meter, and a second failure means the same. Stop, not destroy, on every failure path:
 the disk (checkpoints, logs) survives for a human to inspect.
 
@@ -70,13 +74,17 @@ def log(msg: str):
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} [supervise] {msg}", flush=True)
 
 
-def decide(rc: int | None, step: int, n_failures: int, full_state: Path | None) -> tuple[str, str]:
-    """-> (action, reason), action in {"destroy", "stop", "resume"}. rc None = attempt interrupted by a restart."""
+def decide(rc: int | None, step: int, n_failures: int, full_state: Path | None,
+           summary: str | None = None) -> tuple[str, str]:
+    """-> (action, reason), action in {"destroy", "stop", "resume"}. rc None = attempt interrupted by a restart;
+    summary = the status in the run's summary.json after a failed attempt (summary_status)."""
     if rc == EXIT_OK:
         return "destroy", "trainer finished (exit 0)"
     if rc == EXIT_THROUGHPUT:
         return "stop", "throughput below the floor (exit 3)"
     what = "interrupted by a container restart" if rc is None else f"exit {rc}"
+    if summary == "complete":
+        return "destroy", f"trainer finished (summary complete, {what})"
     if n_failures >= MAX_FAILURES:
         return "stop", f"second failure ({what}) at step {step}"
     if step < MIN_RESUME_STEP:
@@ -121,6 +129,18 @@ def last_step(run_dir: Path | None) -> int:
         if steps:
             return max(steps)
     return 0
+
+
+def summary_status(run_dir: Path | None) -> str | None:
+    """The status in runs/<id>/summary.json ("complete" once the final eval and verdict are written; "failed" after a
+    Python exception, which rewrites it); None without a readable one."""
+    if run_dir is None:
+        return None
+    try:
+        status = json.loads((run_dir / "summary.json").read_text(encoding="utf-8")).get("status")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return status if isinstance(status, str) else None
 
 
 def latest_full_state(run_dir: Path | None) -> Path | None:
@@ -240,6 +260,8 @@ def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: lis
         if "rc" not in a:  # the container died while this attempt was running
             rd = attempt_run_dir(a, runs_root)
             a.update(rc=None, interrupted=True, run_dir=str(rd) if rd else None, step=last_step(rd))
+            if summary_status(rd) == "complete":
+                a["summary"] = "complete"
 
     while True:
         resume = None
@@ -248,7 +270,7 @@ def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: lis
             run_dir = Path(last["run_dir"]) if last.get("run_dir") else None
             failures = sum(1 for a in state["attempts"] if a["rc"] != EXIT_OK)
             full = latest_full_state(run_dir) if last["rc"] != EXIT_OK else None
-            action, reason = decide(last["rc"], last["step"], failures, full)
+            action, reason = decide(last["rc"], last["step"], failures, full, last.get("summary"))
             log(f"decision after attempt {len(state['attempts'])}: {action} ({reason})")
             if action != "resume":
                 state["final"] = {"action": action, "reason": reason, "wall": time.time()}
@@ -267,11 +289,14 @@ def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: lis
         run_dir = attempt_run_dir(attempt, runs_root)
         attempt.update(rc=rc, t1=time.time(), run_dir=str(run_dir) if run_dir else None, step=last_step(run_dir),
                        oom_kills=oom1 - oom0 if oom0 is not None and oom1 is not None else None)
+        if rc not in (EXIT_OK, EXIT_THROUGHPUT) and summary_status(run_dir) == "complete":
+            attempt["summary"] = "complete"  # recorded, so a supervisor restart replays the same decision
         save_state(state_path, state)
         oom = f" (oom_kill +{attempt['oom_kills']})" if attempt["oom_kills"] else ""
+        done = "; its summary.json is complete" if attempt.get("summary") else ""
         log(f"attempt {len(state['attempts'])} exited {rc}{oom} at step {attempt['step']} after "
-            f"{(attempt['t1'] - attempt['t0']) / 60:.1f} min (run dir {run_dir})")
-        if rc != EXIT_OK:
+            f"{(attempt['t1'] - attempt['t0']) / 60:.1f} min (run dir {run_dir}){done}")
+        if rc != EXIT_OK and not attempt.get("summary"):  # a finished run's --destroy syncs everything anyway
             call_finish(["--sync-only", "--no-full", *dry], timeout=SYNC_TIMEOUT_S)
 
 

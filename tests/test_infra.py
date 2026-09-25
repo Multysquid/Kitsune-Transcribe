@@ -884,15 +884,30 @@ def test_decide(rc, step, n_fail, full, action):
     assert supervise.decide(rc, step, n_fail, Path("full_step_100") if full else None)[0] == action
 
 
+@pytest.mark.parametrize("rc,n_fail,summary,action", [
+    (-6, 1, "complete", "destroy"),  # an abort in the interpreter's teardown after the final eval and verdict
+    (None, 1, "complete", "destroy"),
+    (-6, 2, "complete", "destroy"),
+    (-6, 1, "failed", "resume"),
+    (3, 1, "complete", "stop"),
+])
+def test_decide_a_crash_after_the_complete_summary_destroys(rc, n_fail, summary, action):
+    act, reason = supervise.decide(rc, 5000, n_fail, Path("full_step_5000"), summary)
+    assert act == action
+    if action == "destroy":
+        assert "summary complete" in reason
+
+
 class FakeTrainer:
-    """Plays a script of attempts: (exit code, last step, write a full state?) into one run dir."""
+    """Plays a script of attempts: (exit code, last step, write a full state?[, summary.json status]) into one run
+    dir."""
 
     def __init__(self, runs_root: Path, script):
         self.run_dir, self.script, self.argvs = runs_root / "viability-b20x2560-test", list(script), []
 
     def __call__(self, argv, env):
         self.argvs.append(list(argv))
-        rc, step, full = self.script.pop(0)
+        rc, step, full, *summary = self.script.pop(0)
         (self.run_dir / "metrics").mkdir(parents=True, exist_ok=True)
         (self.run_dir / "config.json").write_text("{}", encoding="utf-8")
         with open(self.run_dir / "metrics" / "scalars.jsonl", "a", encoding="utf-8") as f:
@@ -901,6 +916,8 @@ class FakeTrainer:
             f.write('{"step": 99999, "tag": "torn')  # a crash can leave half a line
         if full:
             (self.run_dir / "checkpoints" / f"full_step_{step}").mkdir(parents=True)
+        if summary:
+            (self.run_dir / "summary.json").write_text(json.dumps({"status": summary[0]}), encoding="utf-8")
         return rc
 
 
@@ -1025,6 +1042,34 @@ def test_supervise_steps_aside_when_another_supervisor_runs(tmp_path, monkeypatc
     state = {"attempts": [{"t0": 0.0, "resume": None}], "final": None}  # the live attempt of the other supervisor
     rc, trainer, finishes, after = run_supervise(tmp_path, monkeypatch, [(0, 10, False)], state=state)
     assert rc == 0 and trainer.argvs == [] and finishes == [] and after == state  # untouched
+
+
+def test_supervise_destroys_a_run_that_died_after_its_complete_summary(tmp_path, monkeypatch, capsys):
+    """An xet upload still running when the trainer returns 0 can abort the interpreter's teardown (rc -6, SIGABRT):
+    the run had finished (final eval, verdict, summary.json complete), and a resume would only run the end phase and
+    its final eval again. It goes to finish --destroy, which uploads what is missing and verifies first."""
+    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(-6, 900, True, "complete")])
+    assert len(trainer.argvs) == 1 and [f[0] for f in finishes] == ["--destroy"]
+    assert state["attempts"][0]["rc"] == -6 and state["attempts"][0]["summary"] == "complete"
+    assert state["final"]["action"] == "destroy" and "summary complete, exit -6" in state["final"]["reason"]
+    assert "exited -6 at step 900" in capsys.readouterr().out
+    # a failed summary (a Python exception rewrites it) is a crash like any other: resume once
+    rc, trainer, finishes, state = run_supervise(tmp_path / "b", monkeypatch, [(1, 150, True, "failed"), (0, 900, True)])
+    assert len(trainer.argvs) == 2 and [f[0] for f in finishes] == ["--sync-only", "--destroy"]
+    assert "summary" not in state["attempts"][0]
+
+
+def test_supervise_restart_after_a_complete_summary_destroys(tmp_path, monkeypatch):
+    """The container restarted while a finished trainer's end-state upload drained: the interrupted attempt's
+    summary.json is complete, so the replayed decision is destroy, not a resume."""
+    run = tmp_path / "runs" / "viability-b20x2560-test"
+    (run / "checkpoints" / "full_step_900").mkdir(parents=True)
+    (run / "config.json").write_text("{}", encoding="utf-8")
+    (run / "summary.json").write_text(json.dumps({"status": "complete"}), encoding="utf-8")
+    state = {"attempts": [{"t0": 0.0, "resume": None, "run_dir": str(run)}], "final": None}
+    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [], state=state)
+    assert trainer.argvs == [] and [f[0] for f in finishes] == ["--destroy"]
+    assert state["attempts"][0]["summary"] == "complete" and state["final"]["action"] == "destroy"
 
 
 def test_supervise_post_crash_sync_leaves_the_full_state_to_the_stop_path(tmp_path, monkeypatch):
