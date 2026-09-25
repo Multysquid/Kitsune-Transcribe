@@ -1,12 +1,15 @@
 """tools/label_checks.py: K1-K12 pass on a synthetic label root that obeys the label box's formats, and each check fails
-(or waits) on a planted defect.
+(or waits) on a planted defect; the statistics K7-K9 are flagged, never failed.
 
 The root is built with the writers the box itself uses: kitsune.parakeet_targets.pack_shard/write_shard for
-parakeet_out, tests/fixtures.make_fake_corpus for the audio shards (real 16 kHz FLAC), teacher_out and second_out. Each
+parakeet_out, tests/fixtures.make_fake_corpus for the audio shards (real 16 kHz FLAC), teacher_out and second_out, and
+vast/label.py's parakeet_baselines for reports/parakeet_baselines.json. Each
 Parakeet utterance gets exactly the frame count the extractor gives its audio, and a greedy CTC path and a TDT path
 that both emit the same tokens, so a sound root is sound for every check; a test plants one defect in a copy.
 CPU only; the Parakeet feature extractor is transformers' default one (the pinned model's settings), not the model dir.
 """
+import hashlib
+import importlib
 import importlib.util
 import json
 import shutil
@@ -29,6 +32,8 @@ _spec = importlib.util.spec_from_file_location("kitsune_tool_label_checks", ROOT
 lc = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = lc  # its dataclass resolves the module's string annotations through sys.modules
 _spec.loader.exec_module(lc)
+sys.path.insert(0, str(ROOT / "vast"))
+label_box = importlib.import_module("label")  # vast/label.py, the box's own report writer
 
 SOURCES = {"reazon_small": (24, "train"), "eval_jsut": (10, "eval"), "galgame": [(8, "eval"), (24, "train")]}
 TRAIN, EVALS = ("reazon_small", "galgame"), ("eval_jsut", "galgame")
@@ -152,8 +157,21 @@ def make_record(root: SimpleNamespace) -> dict:
                                       for src, ins in inputs.items()}}
 
 
+def box_baselines(labels: Path) -> dict:
+    """reports/parakeet_baselines.json as the label box writes it at finalize (vast/label.py parakeet_baselines)."""
+    box = SimpleNamespace(cfg={"eval_sets": list(EVALS)}, parakeet=labels / "parakeet_out", teacher=labels / "teacher_out")
+    return label_box.Controller.parakeet_baselines(box)
+
+
+def write_baselines(labels: Path, report: dict):
+    (labels / "reports").mkdir(exist_ok=True)
+    (labels / "reports" / "parakeet_baselines.json").write_text(json.dumps(report), encoding="utf-8")
+
+
 def seal(root: SimpleNamespace):
+    """What finalize leaves: the extent record, the baselines report, then COMPLETE.json."""
     (root.labels / "extent.json").write_text(json.dumps(make_record(root)), encoding="utf-8")
+    write_baselines(root.labels, box_baselines(root.labels))
     (root.labels / "COMPLETE.json").write_text(json.dumps({"run_id": "t"}), encoding="utf-8")
 
 
@@ -235,6 +253,14 @@ def test_feature_frames_is_the_extractor_mask():
     assert lc.expected_n_frames(16000) == 13 and lc.expected_n_frames(30 * 16000) == 375
 
 
+def test_expected_n_frames_equals_the_ctc_librarys():
+    """K4 and the trainer's frame preflight must count frames alike: kitsune.ctc_student.expected_n_frames (the CTC
+    library, CONTRACT 3) equals this tool's on every sample count up to 35 s. Skipped until that module is merged."""
+    cs = pytest.importorskip("kitsune.ctc_student")
+    ns = [*range(0, 4000), *range(4000, 35 * 16000 + 1, 157), 35 * 16000]
+    assert [cs.expected_n_frames(n) for n in ns] == [lc.expected_n_frames(n) for n in ns]
+
+
 def test_ctc_feasible_need_counts_a_blank_between_repeats():
     assert lc.ctc_feasible_need([]) == 0
     assert lc.ctc_feasible_need([5, 5, 5]) == 5
@@ -259,15 +285,27 @@ def test_every_check_passes_on_a_sound_sealed_root(sound):
     assert res["K10"]["neutral_view_rows"] == sum(1 for r in lc.jsonl_rows(sound.kotoba)
                                                   if r["cer2"] is not None and r["cer2"] <= 0.5)
     assert res["K12"]["labelled_prefix"]["galgame"] == {"labelled_inputs": 2, "inputs": 2}
+    assert res["K6"]["baselines_report_compared"] == ["eval_jsut", "galgame"]  # the box's own report, every set
     report = lc.build_report(ctx, res)
-    assert report["summary"]["pass"] == list(lc.CHECKS) and report["sealed"]
+    assert report["summary"]["pass"] == list(lc.CHECKS) and report["sealed"] and report["flags"] == []
+    code = report["code"]
+    assert code["tool_sha256"] == hashlib.sha256((ROOT / "tools" / "label_checks.py").read_bytes()).hexdigest()
+    assert code["kitsune_sha"] == report["kitsune_sha"] and isinstance(code["dirty"], bool)
+    assert report["data"] == [str(sound.data)] and report["local_copy"] is None  # no pull record: nothing pinned
     json.dumps(report, default=float)
 
 
 def test_unsealed_root_leaves_coverage_and_extent_pending(root):
     (root.labels / "COMPLETE.json").unlink()
     ctx = make_ctx(root)
-    assert status(ctx, "K12")[0] == "pending"
+    st, res = status(ctx, "K12")  # extent.json is there (finalize writes it before the seal): the numbers so far
+    assert st == "pending" and "so far {'galgame': '2/2'}" in res["reason"]
+    assert res["labelled_prefix"]["galgame"] == {"labelled_inputs": 2, "inputs": 2}
+    st, res = status(make_ctx(root, mix={"galgame": 3}), "K12")  # short of the mix: still only pending before the seal
+    assert st == "pending" and res["too_few_inputs"] == {"galgame": {"labelled_inputs": 2, "required": 3}}
+    (root.labels / "extent.json").unlink()
+    st, res = status(ctx, "K12")
+    assert st == "pending" and "no extent.json yet" in res["reason"]
     assert status(ctx, "K5")[0] == "pending"  # every stem covered, but the root can still change
     for name in ("K1", "K2", "K3", "K4", "K6", "K7", "K8", "K9", "K10", "K11"):
         assert status(ctx, name)[0] == "pass", name
@@ -341,6 +379,39 @@ def test_k2_checks_ids_against_the_data_shard_only_when_it_is_the_labelled_one(r
     assert st == "pass" and res["per_group"]["reazon_small"]["other_ids"] == ["train-00001"]
 
 
+def test_k2_k4_find_the_labelled_shard_under_another_name_and_in_a_second_root(root):
+    """Another ingest numbers shards its own way (the laptop's galgame train-00310 holds the box's train-00300), and a
+    rebuild of the stems the first root lacks is a second --data root: both are found by the ids digest. An id
+    sidecar alone serves K2's ids but gives K4 no audio."""
+    first, second = root.base / "d1", root.base / "d2"
+    shutil.copytree(root.data, first)
+    small = first / "shards" / "reazon_small"
+    (small / "train-00001.parquet").rename(small / "train-00007.parquet")
+    (second / "shards").mkdir(parents=True)
+    for src in ("galgame", "eval_jsut"):
+        shutil.move(str(first / "shards" / src), second / "shards" / src)
+    ctx = make_ctx(root, data=[first, second])
+    st, res = status(ctx, "K2")
+    assert st == "pass" and res["data_ids_checked"] == len(root.shards) and res["n_data_other_ids"] == 0
+    st, res = status(ctx, "K4")
+    assert st == "pass" and res["rows"] == sum(s["rows"] for s in root.shards.values())
+    assert res["per_group"]["reazon_small"]["audio_from"] == {"train-00001": (small / "train-00007.parquet").as_posix()}
+    assert set(res["per_group"]["galgame"]["audio_from"]) == {"train-00000", "train-00001"}
+    st, res = status(make_ctx(root, data=first), "K4")  # the first root alone: the other groups wait, none fails
+    assert st == "pending" and res["per_group"]["galgame"]["reason"].startswith("no audio")
+    assert res["per_group"]["reazon_small"]["status"] == "pass"
+    # the renamed shard's audio gone, its ids kept in a sidecar (as the box keeps them after pruning)
+    (small / lc.SIDECAR_DIR).mkdir()
+    pq.write_table(pq.read_table(small / "train-00007.parquet", columns=["id"]),
+                   small / lc.SIDECAR_DIR / "train-00007.parquet")
+    (small / "train-00007.parquet").unlink()
+    st, res = status(make_ctx(root, data=first), "K2")
+    assert st == "pass" and res["data_ids_checked"] == 2  # both reazon_small stems: the ids are enough
+    st, res = status(make_ctx(root, data=first), "K4")
+    assert res["per_group"]["reazon_small"]["no_audio"] == ["train-00001"]
+    assert res["per_group"]["reazon_small"]["status"] == "pass"  # train-00000 still has its audio
+
+
 def test_k3_fails_when_a_stored_ctc_hyp_is_not_the_npz_path(root):
     jsonl = root.labels / "parakeet_out" / "galgame" / "train-00001.jsonl"
     rewrite_jsonl(jsonl, lambda rows: [dict(rows[0], ctc_hyp=rows[0]["ctc_hyp"] + "ん"), *rows[1:]])
@@ -410,17 +481,34 @@ def test_k6_fails_on_a_partial_eval_set_and_off_card_baselines(root):
     assert st == "fail" and "ids differ" in res["per_set"]["eval_jsut"]["reason"]
 
 
-def test_k6_compares_the_boxs_baselines_report(root):
-    ctx = make_ctx(root)
-    per = status(ctx, "K6")[1]["per_set"]
-    report = {"parakeet": {"eval_jsut": {k: per["eval_jsut"]["baselines"][k] for k in ("tdt_cer_corpus", "ctc_cer_corpus")}}}
-    (root.labels / "reports").mkdir()
-    (root.labels / "reports" / "parakeet_baselines.json").write_text(json.dumps(report), encoding="utf-8")
+def test_k6_compares_the_boxs_baselines_report_and_nothing_passes_silently(root):
+    """The box's report must hold every eval set that is whole here with the recomputed n and finite CERs; a missing
+    report fails on a sealed root and waits on an unsealed one."""
+    good = box_baselines(root.labels)
+    jsut, gal = good["parakeet"]["eval_jsut"], good["parakeet"]["galgame"]
     st, res = status(make_ctx(root), "K6")
-    assert st == "pass" and "equals" in res["baselines_report"]
-    report["parakeet"]["eval_jsut"]["tdt_cer_corpus"] += 0.001
-    (root.labels / "reports" / "parakeet_baselines.json").write_text(json.dumps(report), encoding="utf-8")
-    assert status(make_ctx(root), "K6")[0] == "fail"
+    assert st == "pass" and res["baselines_report"] == "reports/parakeet_baselines.json equals the recomputation on " \
+                                                       "['eval_jsut', 'galgame']"
+    defects = {
+        "value": {"parakeet": {"eval_jsut": {**jsut, "tdt_cer_corpus": jsut["tdt_cer_corpus"] + 0.001}, "galgame": gal}},
+        "nan": {"parakeet": {"eval_jsut": jsut, "galgame": {**gal, "ctc_cer_corpus": float("nan")}}},
+        "no value": {"parakeet": {"eval_jsut": {"n": jsut["n"]}, "galgame": gal}},
+        "rows": {"parakeet": {"eval_jsut": jsut, "galgame": {**gal, "n": 7}}},
+        "set missing": {"parakeet": {"eval_jsut": jsut}},
+        "empty": {"parakeet": {}},
+        "wrong key": {"baselines": good["parakeet"]},
+    }
+    for what, report in defects.items():
+        write_baselines(root.labels, report)
+        st, res = status(make_ctx(root), "K6")
+        assert st == "fail" and res["baselines_report_diff"] and "differs" in res["baselines_report"], what
+    (root.labels / "reports" / "parakeet_baselines.json").unlink()
+    st, res = status(make_ctx(root), "K6")
+    assert st == "fail" and "missing on a sealed root" in res["baselines_report_diff"][0]
+    assert res["baselines_report"] == "reports/parakeet_baselines.json missing on a sealed root"
+    (root.labels / "COMPLETE.json").unlink()
+    st, res = status(make_ctx(root), "K6")
+    assert st == "pass" and "not written yet" in res["baselines_report"] and res["baselines_report_compared"] is None
 
 
 def test_k6_waits_for_an_eval_set_one_pass_has_not_labelled(root):
@@ -432,9 +520,9 @@ def test_k6_waits_for_an_eval_set_one_pass_has_not_labelled(root):
     assert status(make_ctx(root), "K10")[0] == "pending"
 
 
-def test_k7_judges_the_target_the_study_uses(root):
-    """TDT tokens that cannot align (more tokens than frames) fail K7 only when the study's target is the TDT
-    hypothesis; the greedy CTC target of the same rows is feasible by construction."""
+def test_k7_flags_the_tdt_rate_and_fails_only_an_inconsistent_greedy_target(root):
+    """TDT tokens that cannot align (more tokens than frames) are a statistic: flagged when the study's target is the
+    TDT hypothesis, never failed. The greedy CTC target is feasible by construction, so one infeasible row fails."""
     src, stem = "reazon_small", "train-00001"
     s = root.shards[(src, stem)]
     rng = np.random.default_rng(2)
@@ -444,14 +532,24 @@ def test_k7_judges_the_target_the_study_uses(root):
     assert status(make_ctx(root), "K2")[0] == "pass"
     st, res = status(make_ctx(root), "K7")
     assert st == "pass" and res["train_rate"]["greedy_ctc"] == 0 and res["train_rate"]["tdt"] > 0.1
-    st, res = status(make_ctx(root, ctc_target="tdt"), "K7")
-    assert st == "fail" and res["per_group"]["reazon_small"]["tdt"] == len(utts)
+    assert not res["outside_design"]  # the design's figure is about the target the study uses
+    ctx = make_ctx(root, ctc_target="tdt")
+    st, res = status(ctx, "K7")
+    assert st == "pass" and res["per_group"]["reazon_small"]["tdt"] == len(utts) and res["outside_design"]
+    assert res["ratio_to_design"] > lc.ABOUT and "flagged" in res["reason"]
+    assert [f["check"] for f in lc.build_report(ctx, {"K7": res})["flags"]] == ["K7"]
+    ctx = make_ctx(root)
+    ids = ctx.ctc_ids(src, stem)
+    ids[0] = [7] * (int(ctx.pk(src, stem).z["n_frames"][0]) + 1)  # planted: a target longer than its frames
+    st, res = status(ctx, "K7")
+    assert st == "fail" and "inconsistent" in res["reason"]
 
 
-def test_k8_fails_when_ctc_hyp_and_hyp_disagree_beyond_the_design(root):
+def test_k8_flags_ctc_hyp_and_hyp_disagreeing_beyond_the_design_without_failing(root, tmp_path):
     ctx = make_ctx(root)
     st, res = status(ctx, "K8")
     assert st == "pass" and res["train"]["cer_ctc_vs_tdt"] == 0 and res["train"]["raw_diff_rate"] == 0
+    assert not res["outside_design"]
     for stem in ("train-00000", "train-00001"):
         rewrite_jsonl(root.labels / "parakeet_out" / "galgame" / f"{stem}.jsonl",
                       lambda rows: [dict(r, hyp=r["hyp"][::-1] + "ぬ") for r in rows])
@@ -459,19 +557,27 @@ def test_k8_fails_when_ctc_hyp_and_hyp_disagree_beyond_the_design(root):
     rows = [r for p in ("reazon_small/train-00000", "reazon_small/train-00001", "galgame/train-00000",
                         "galgame/train-00001") for r in lc.jsonl_rows(root.labels / "parakeet_out" / f"{p}.jsonl")]
     want = corpus_cer([r["ctc_hyp"] for r in rows], [r["hyp"] for r in rows])["cer"]
-    assert st == "fail" and res["train"]["cer_ctc_vs_tdt"] == pytest.approx(want) and want > 0.02
+    assert st == "pass" and res["train"]["cer_ctc_vs_tdt"] == pytest.approx(want) and want > 0.02
+    assert res["outside_design"] and res["value"] == pytest.approx(want) and "flagged" in res["reason"]
     assert res["per_group"]["eval_jsut"]["cer_ctc_vs_tdt"] == 0  # the eval rows are reported, not pooled
+    # the CLI exits 0 on a flag: only failures (label defects) set the exit code
+    out = tmp_path / "r.json"
+    assert lc.main(["run", "--labels", str(root.labels), "--model-dir", str(tmp_path / "none"),
+                    "--kotoba", str(root.kotoba), "--out", str(out), "--checks", "K8"]) == 0
+    rep = json.loads(out.read_text(encoding="utf-8"))
+    assert rep["summary"]["pass"] == ["K8"] and [f["check"] for f in rep["flags"]] == ["K8"]
 
 
-def test_k9_fails_when_parakeet_out_grows_beyond_the_design(root):
+def test_k9_flags_parakeet_out_growing_beyond_the_design(root):
     ctx = make_ctx(root)
     mb = status(ctx, "K9")[1]["train_mb_per_audio_h"]
     expect = dict(lc.EXPECT, k9_mb_per_audio_h=mb)
-    assert status(make_ctx(root, expect=expect), "K9")[0] == "pass"
+    st, res = status(make_ctx(root, expect=expect), "K9")
+    assert st == "pass" and not res["outside_design"] and res["ratio_to_design"] == pytest.approx(1.0)
     rewrite_jsonl(root.labels / "parakeet_out" / "galgame" / "train-00000.jsonl",
                   lambda rows: [dict(r, pad="x" * 20000) for r in rows])
     st, res = status(make_ctx(root, expect=expect), "K9")
-    assert st == "fail" and res["train_mb_per_audio_h"] > 2 * mb
+    assert st == "pass" and res["train_mb_per_audio_h"] > 2 * mb and res["outside_design"]
 
 
 def test_k10_fails_when_the_kotoba_ids_differ(root):
@@ -487,6 +593,19 @@ def test_k11_fails_when_the_cohere_eval_labels_drift(root):
     rewrite_jsonl(jsonl, lambda rows: [dict(rows[0], hyp=""), *rows[1:]])
     st, res = status(make_ctx(root, prereg=prereg), "K11")
     assert st == "fail" and abs(res["per_set"]["eval_jsut"]["diff_pp"]) > 0.05
+
+
+def test_k11_says_when_the_gate_sets_are_adopted_labels(root):
+    """The box adopts the gate sets from the laptop seed (teacher_out/meta.json adopted_from): K11 then shows the
+    adopted labels are intact, and says it cannot show a re-decode reproduces Cohere."""
+    st, res = status(make_ctx(root), "K11")
+    assert st == "pass" and res["adopted_from"] is None and "adopted" not in res["reason"]
+    meta_path = root.labels / "teacher_out" / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta_path.write_text(json.dumps({**meta, "adopted_from": "teacher_out/meta.json@09fe4a3"}), encoding="utf-8")
+    st, res = status(make_ctx(root), "K11")
+    assert st == "pass" and res["adopted_from"] == "teacher_out/meta.json@09fe4a3"
+    assert "not that a re-decode reproduces Cohere" in res["reason"]
 
 
 def test_k11_waits_for_a_gate_set_not_labelled(root):
@@ -569,6 +688,30 @@ def test_pull_copies_one_commit_and_records_the_listing(tmp_path, monkeypatch):
     assert sorted(saved["pulled"]) == sorted(saved["listing"])
     assert not any(p.name.startswith(".") for p in (tmp_path / "labels").iterdir())  # the staging dir is gone
     assert lc.local_listing(out) == {p: n for p, n in saved["listing"].items()}
+
+
+def test_run_fails_when_the_local_copy_is_not_the_pulled_commits(root, tmp_path):
+    """Label files are write-once, so files an earlier pull left are fine; a local file the pinned listing lacks or
+    sizes differently means the checks read data the report does not pin: `run` exits 1 and says so."""
+    local = lc.local_listing(root.labels)
+    earlier = "reazon_small/train-00000"  # pulled before, not by this pull: still consistent
+    pulled = [p for p in local if earlier not in p]
+    rec = {"repo": "u/data", "root": "labels/full", "revision": "abc", "pulled": pulled, "listing": dict(local)}
+    (root.labels / lc.PULL_FILE).write_text(json.dumps(rec), encoding="utf-8")
+    out = tmp_path / "r.json"
+    args = ["run", "--labels", str(root.labels), "--model-dir", str(tmp_path / "none"), "--kotoba", str(root.kotoba),
+            "--out", str(out), "--checks", "K1"]
+    assert lc.main(args) == 0
+    copy = json.loads(out.read_text(encoding="utf-8"))["local_copy"]
+    assert copy["consistent"] and copy["revision"] == "abc"
+    assert copy["from_earlier_pulls"] == len([p for p in local if earlier in p]) == 5  # teacher, parakeet, second
+    rewrite_jsonl(root.labels / "parakeet_out" / "galgame" / "train-00001.jsonl", lambda rows: rows[:-1])
+    (root.labels / "parakeet_out" / "stray.json").write_text("{}", encoding="utf-8")
+    assert lc.main(args) == 1
+    rep = json.loads(out.read_text(encoding="utf-8"))
+    assert rep["summary"]["fail"] == [] and not rep["local_copy"]["consistent"]
+    assert rep["local_copy"]["size_differs"] == ["parakeet_out/galgame/train-00001.jsonl"]
+    assert rep["local_copy"]["not_in_listing"] == ["parakeet_out/stray.json"]
 
 
 def test_cli_run_writes_the_report_and_exits_by_failures(sound, tmp_path):

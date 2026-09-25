@@ -15,14 +15,14 @@ Every check returns {"status": "pass" | "fail" | "pending" | "skipped", "reason"
   K1  parakeet_out/meta.json has exactly the pins the study reads: format 1, k_ctc 8, ctc_dense_thr 0.95, k_tdt 8,
       max_symbols 10, the features string ("... 80 mel, CPU, no dither"), encoder bf16 / CTC fp32, the NeMo repo and
       revision, files_sha256 = kitsune.parakeet.PARAKEET_FILES, blank 3072, vocab 3073, frame 0.08 s.
-  K2  every pulled parakeet npz passes kitsune.parakeet_targets.check_shard (with the data shard's ids when the --data
-      root holds the same shard), stores the documented dtypes, and its jsonl has the same ids in the same order with
-      the fields the study reads (JSONL_KEYS), n_frames and truncated equal to the npz's.
+  K2  every pulled parakeet npz passes kitsune.parakeet_targets.check_shard (with the data shard's ids when a --data
+      root holds the labelled shard, see data_shard), stores the documented dtypes, and its jsonl has the same ids in
+      the same order with the fields the study reads (JSONL_KEYS), n_frames and truncated equal to the npz's.
   K3  decode(ctc_greedy(ctc_col0(n_frames, ctc_dense_frame, ctc_topk_idx))) equals the jsonl ctc_hyp on every pulled
       row: the CTC target (decision 22) can be derived from the npz alone. Decoded with the pinned Parakeet
       processor, as scripts/02p_parakeet_pass.py decodes.
-  K4  frame parity, about 50 rows per train source and eval set: the audio of the --data root (only shards whose ids
-      digest equals the npz's shard_ids_sha256, i.e. the audio that was labelled) through (a) the
+  K4  frame parity, about 50 rows per train source and eval set: the audio of the --data roots (only shards whose ids
+      digest equals the npz's shard_ids_sha256, i.e. the audio that was labelled, under any stem name) through (a) the
       ParakeetFeatureExtractor of --model-dir and (b) kitsune.features.LogMel on that extractor's filterbank with
       dither 0, each followed by the encoder's 8x subsampling length formula (subsampled_length), must give the
       stored n_frames on 100 % of rows. The closed form from the sample count alone is reported too.
@@ -31,30 +31,38 @@ Every check returns {"status": "pass" | "fail" | "pending" | "skipped", "reason"
       ids_sha256 of the stem (sealed root). Stems in one root only are in progress while the root is not sealed.
   K6  the eval sets are labelled whole by both passes (the same ids in the same order, the manifest's row counts) and
       the Parakeet corpus CER on JSUT is near the model card (TDT 6.4 / CTC 6.5 %; "near" = within CARD_TOL);
-      reports/parakeet_baselines.json, once the box writes it (finalize F3), must equal the recomputation here.
+      reports/parakeet_baselines.json, which the box writes at finalize (F3), must hold every eval set that is whole
+      here with finite CERs equal to the recomputation; on a sealed root a missing report fails.
   K7  CTC feasibility, U + repeats <= n_frames, of the target the study uses (decision 22, greedy CTC: feasible by
-      construction, so a failure means an inconsistent npz) and, for reference, of the TDT tokens.
+      construction, so ANY infeasible row means an inconsistent npz and fails) and, for reference, of the TDT tokens.
   K8  the rate of hyp != ctc_hyp and the corpus CER of ctc_hyp against hyp on the pulled train rows (decision 22).
   K9  parakeet_out bytes (npz + jsonl) per audio-hour on the pulled train stems (decision 5, HF storage).
   K10 the galgame eval-00000 ids of both label roots equal the laptop's kotoba file (second_out/galgame/eval-00000.jsonl),
       so its hypotheses give the neutral Galgame view (decision 11); its cer2 <= 0.5 row count is reported.
   K11 the Cohere eval baselines recomputed from teacher_out (kitsune.evaluate.teacher_baselines) equal
-      TEACHER_CER_PREREG within BASELINE_TOL (0.05 pp).
+      TEACHER_CER_PREREG within BASELINE_TOL (0.05 pp). The box adopts the gate sets' labels from the laptop seed
+      (vast/label.py GATE_SETS, adopt-only), so this shows the adopted labels are intact, not that a re-decode matches.
   K12 the sealed extent covers the study mix in both roots (kitsune.extent.subset_stems of the mix): reazon_large >= 55
-      inputs (60 for margin), emilia_nc >= 8, galgame >= 3, the emilia_yodas 300 h step and every eval set.
-K7-K9 are statistics the design assumed ("about X" in its table); they pass up to ABOUT x X (2x) and fail above, since a
-larger value breaks the assumption the named decision was taken on.
+      inputs (60 for margin), emilia_nc >= 8, galgame >= 3, the emilia_yodas 300 h step and every eval set. Before
+      the seal it is pending, with the same numbers so far when extent.json is already there.
+K7-K9 are the checklist's "statistics for decisions": the design assumed "about X" and the labels are not wrong when
+the value differs, the decision's premise is. They pass with their numbers, `ratio_to_design` and `outside_design`
+(above ABOUT x X); the report lists the outside ones under "flags", which never set the exit code. Only K7's
+inconsistency (a greedy-CTC target that cannot align) is a label defect and fails.
 
 Usage:
   python tools/label_checks.py pull --out D:/kitsune-labels/full [--revision SHA] [--train-stems 3]
   python tools/label_checks.py run --labels D:/kitsune-labels/full --data D:/Shizu-ko-distill/data \\
-      --model-dir D:/Shizu-ko-distill/cache/parakeet-tdt_ctc-0.6b-ja-hf \\
+      [--data D:/kitsune-rebuild/data] --model-dir D:/Shizu-ko-distill/cache/parakeet-tdt_ctc-0.6b-ja-hf \\
       --kotoba D:/Shizu-ko-distill/second_out/galgame/eval-00000.jsonl --out label_checks_report.json
-`run` exits 1 if any check fails, else 0 (pending is not a failure). CPU only; `pull` is the only network step (reads).
+`run` exits 1 if any check fails or the local copy is not the pulled commit's (report "local_copy"), else 0 (pending,
+skipped and flags are not failures). The report names the code that produced it ("code": HEAD, dirty, this tool's
+sha256 and whether it is HEAD's). CPU only; `pull` is the only network step (reads).
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -79,7 +87,7 @@ from kitsune.evaluate import BASELINE_TOL, TEACHER_CER_PREREG, corpus_cer, teach
 from kitsune.parakeet import (  # noqa: E402
     BLANK, FRAME_S, NEMO_REPO, NEMO_REVISION, PARAKEET_FILES, PARAKEET_PATH, SAMPLING_RATE, VOCAB,
 )
-from kitsune.store import ShardInfo, ids_sha256, read_ids  # noqa: E402
+from kitsune.store import SIDECAR_DIR, ShardInfo, ids_sha256, read_ids  # noqa: E402
 from kitsune.text import normalize_ja  # noqa: E402
 
 DEFAULT_REPO = "Multy123/kitsune-data"
@@ -97,7 +105,7 @@ PARAKEET_CARD = {"eval_jsut": {"tdt": 0.064, "ctc": 0.065}}  # nvidia/parakeet-t
 CARD_TOL = 0.005  # "near the card": our normalize_ja scoring is not NeMo's, so 0.5 pp, not the 0.05 pp of K11
 ONE_ROOT_MAX = 0.001  # K5: rows labelled by one pass only (02 and 02p skip the same >30 s rows; decode failures differ)
 EXPECT = {"k7_infeasible": 0.002, "k8_cer": 0.01, "k9_mb_per_audio_h": 1.34}  # the design's figures (3.4)
-ABOUT = 2.0
+ABOUT = 2.0  # a statistic above ABOUT x the design's "about X" is flagged outside_design (never a failure)
 NEUTRAL_MAX = 0.5  # the neutral Galgame view keeps cer(kotoba, ref) <= 0.5 (decision 11: 810 rows)
 KOTOBA_STEM = "eval-00000"
 JSONL_KEYS = ("id", "hyp", "ctc_hyp", "ref", "cer", "ctc_cer", "n_frames", "duration", "truncated")
@@ -215,12 +223,29 @@ def spread(items: list, n: int) -> list:
     return [items[i] for i in sorted({round(i * (len(items) - 1) / (n - 1)) for i in range(n)})]
 
 
-def kitsune_sha() -> str | None:
+def _git(*args) -> str | None:
     try:
-        return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
-                              timeout=10, check=True).stdout.strip() or None
-    except Exception:  # noqa: BLE001 - not a checkout / no git
+        return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, timeout=10,
+                              check=True).stdout.strip()
+    except Exception:  # noqa: BLE001 - not a checkout / no git / not tracked
         return None
+
+
+def code_version() -> dict:
+    """The code that produced a report: HEAD, whether tracked files differ from it, this tool's sha256 and whether
+    the tool is HEAD's. HEAD alone is not enough: a run from an uncommitted tool names a commit that could not have
+    produced the report."""
+    me = Path(__file__).resolve()
+    try:
+        rel = me.relative_to(ROOT).as_posix()
+    except ValueError:
+        rel = None
+    status = _git("status", "--porcelain", "--untracked-files=no")
+    at_head = _git("rev-parse", f"HEAD:{rel}") if rel else None
+    blob = _git("hash-object", "--", rel) if rel else None  # with the checkout's eol filter, as git stores it
+    return {"kitsune_sha": _git("rev-parse", "HEAD") or None, "dirty": None if status is None else bool(status),
+            "tool_sha256": hashlib.sha256(me.read_bytes()).hexdigest(),
+            "tool_at_head": bool(at_head) and at_head == blob}
 
 
 # ------------------------------------------------------------------------------------------------------ context
@@ -229,13 +254,14 @@ def kitsune_sha() -> str | None:
 @dataclass
 class Ctx:
     """Everything the checks read. `listing` is the whole root's (root-relative path -> bytes); the files the checks
-    open are the ones present under `labels`. `decode` (token id lists -> texts) and `fe` (a ParakeetFeatureExtractor)
-    come from the pinned model dir; tests pass stand-ins."""
+    open are the ones present under `labels`. `data` is one data root or a list of them (the laptop's, a rebuild of
+    the stems it lacks); `data_roots` is that list. `decode` (token id lists -> texts) and `fe` (a
+    ParakeetFeatureExtractor) come from the pinned model dir; tests pass stand-ins."""
 
     labels: Path
     listing: dict
     pull: dict | None = None
-    data: Path | None = None
+    data: Path | list | None = None
     decode: Callable | None = None
     fe: object | None = None
     sub: dict = field(default_factory=lambda: dict(SUBSAMPLING))
@@ -256,8 +282,12 @@ class Ctx:
 
     def __post_init__(self):
         self.labels = Path(self.labels)
+        roots = self.data if isinstance(self.data, (list, tuple)) else [self.data] if self.data else []
+        self.data_roots = [Path(d) for d in roots]
+        self.data = self.data_roots[0] if self.data_roots else None
         self.idx = index_listing(self.listing)
-        self._pk, self._rows, self._ctc, self._data_ids, self._t = {}, {}, {}, {}, {}
+        self._pk, self._rows, self._ctc, self._t = {}, {}, {}, {}
+        self._data_ids, self._digests, self._found = {}, {}, {}
 
     @property
     def sealed(self) -> bool:
@@ -321,19 +351,60 @@ class Ctx:
                 self._t[key] = {"ids": [str(x) for x in z["ids"]], "n_scanned": int(z["n_scanned"])}
         return self._t[key]
 
-    def data_ids(self, src: str, stem: str) -> list[str] | None:
-        """The --data root's ids of this shard (its id sidecar or the parquet), None if it has no such shard."""
-        if self.data is None:
-            return None
-        key = (src, stem)
-        if key not in self._data_ids:
-            split = "eval" if stem.startswith("eval-") else "train"
-            info = ShardInfo(f"shards/{src}/{stem}.parquet", src, split, 0, 0.0)
-            try:
-                self._data_ids[key] = [r["id"] for r in read_ids(self.data, info)]
-            except FileNotFoundError:
-                self._data_ids[key] = None
-        return self._data_ids[key]
+    def data_ids(self, i: int, src: str, stem: str, cache: bool = True) -> list[str] | None:
+        """Data root i's ids of shard <src>/<stem> (its id sidecar or the parquet), None if it has no such shard."""
+        key = (i, src, stem)
+        if key in self._data_ids:
+            return self._data_ids[key]
+        split = "eval" if stem.startswith("eval-") else "train"
+        info = ShardInfo(f"shards/{src}/{stem}.parquet", src, split, 0, 0.0)
+        try:
+            ids = [r["id"] for r in read_ids(self.data_roots[i], info)]
+        except FileNotFoundError:
+            ids = None
+        if cache:
+            self._data_ids[key] = ids
+        return ids
+
+    def data_digests(self, i: int, src: str) -> dict[str, list[str]]:
+        """ids digest -> stems of every shard of `src` in data root i (parquet or id sidecar)."""
+        key = (i, src)
+        if key not in self._digests:
+            base = self.data_roots[i] / "shards" / src
+            stems = sorted({p.stem for p in base.glob("*.parquet")}
+                           | {p.stem for p in (base / SIDECAR_DIR).glob("*.parquet")})
+            out: dict[str, list[str]] = {}
+            for st in stems:
+                ids = self.data_ids(i, src, st, cache=False)  # only the digest is kept: a source has 1000s of shards
+                if ids is not None:
+                    out.setdefault(ids_sha256(ids), []).append(st)
+            self._digests[key] = out
+        return self._digests[key]
+
+    def has_audio(self, i: int, src: str, stem: str) -> bool:
+        return (self.data_roots[i] / "shards" / src / f"{stem}.parquet").is_file()
+
+    def data_shard(self, src: str, stem: str, audio: bool = False) -> tuple[int, str] | None:
+        """(data root index, stem there) of the shard holding exactly the ids this parakeet stem was labelled on (its
+        npz's shard_ids_sha256), else None; with `audio`, only a shard whose parquet (not just its id sidecar) is on
+        disk. The same stem name in each root first, then every shard of the source: another ingest numbers shards
+        its own way (the laptop's galgame train-00310 holds the label box's train-00300), and a rebuild of the stems
+        the laptop lacks is a second root."""
+        key = (src, stem, audio)
+        if key not in self._found:
+            z = self.pk(src, stem).z
+            want = str(z["shard_ids_sha256"]) if "shard_ids_sha256" in z else None
+            roots = range(len(self.data_roots))
+            same = [(i, stem) for i in roots if want is not None and (ids := self.data_ids(i, src, stem)) is not None
+                    and ids_sha256(ids) == want and (not audio or self.has_audio(i, src, stem))]
+            other = ((i, st) for i in roots if want is not None for st in self.data_digests(i, src).get(want, [])
+                     if not audio or self.has_audio(i, src, st))
+            self._found[key] = same[0] if same else next(other, None)
+        return self._found[key]
+
+    def data_same_name(self, src: str, stem: str) -> bool:
+        """A data root holds a shard of this name (whatever its ids)."""
+        return any(self.data_ids(i, src, stem) is not None for i in range(len(self.data_roots)))
 
     def record(self) -> dict | None:
         return read_json(self.labels / ext.RECORD_FILE)
@@ -377,14 +448,13 @@ def k2_format(ctx: Ctx) -> dict:
         g = per.setdefault(group_of(src, stem), {"shards": 0, "rows": 0})
         g["shards"] += 1
         g["rows"] += sh.n
-        shard_ids = ctx.data_ids(src, stem)
-        same = shard_ids is not None and "shard_ids_sha256" in z and ids_sha256(shard_ids) == str(z["shard_ids_sha256"])
-        if same:
+        found = ctx.data_shard(src, stem)
+        shard_ids = ctx.data_ids(found[0], src, found[1]) if found else None
+        if found:
             data_checked.append(tag)
-        elif shard_ids is not None:
-            data_other.append(tag)
-        problems += [f"{tag}: {p}" for p in pt.check_shard(ctx.path("parakeet_out", src, stem, "npz"), meta,
-                                                            shard_ids if same else None)]
+        elif ctx.data_same_name(src, stem):
+            data_other.append(tag)  # another ingest's shard of that name, and no shard anywhere with the labelled ids
+        problems += [f"{tag}: {p}" for p in pt.check_shard(ctx.path("parakeet_out", src, stem, "npz"), meta, shard_ids)]
         for key, dt in NPZ_DTYPES.items():
             if key in z and z[key].dtype != np.dtype(dt):
                 problems.append(f"{tag}: {key} dtype {z[key].dtype}, documented {np.dtype(dt)}")
@@ -458,29 +528,29 @@ def _k4_group(ctx: Ctx, stems: list[tuple[str, str]], logmel, rng) -> dict:
     from kitsune.audio import decode_audio
     from kitsune.features import pad_waves
 
-    units = []  # (src, stem, row group, [(npz row, row in group)])
+    units = []  # (src, stem, data shard path, row group, [(npz row, row in group)])
     for src, stem in stems:
-        shard = ctx.data / "shards" / src / f"{stem}.parquet"
+        i_root, dstem = ctx.data_shard(src, stem, audio=True)
+        shard = ctx.data_roots[i_root] / "shards" / src / f"{dstem}.parquet"
         pf = pq.ParquetFile(shard)
-        pos = {rid: j for j, rid in enumerate(ctx.data_ids(src, stem))}
+        pos = {rid: j for j, rid in enumerate(ctx.data_ids(i_root, src, dstem))}
         starts = np.cumsum([0] + [pf.metadata.row_group(k).num_rows for k in range(pf.metadata.num_row_groups)])
         by_group: dict[int, list] = {}
         for i, rid in enumerate(ctx.pk(src, stem).ids):
             j = pos[rid]
             k = int(np.searchsorted(starts, j, side="right") - 1)
             by_group.setdefault(k, []).append((i, j - int(starts[k])))
-        units += [(src, stem, k, rows) for k, rows in sorted(by_group.items())]
+        units += [(src, stem, shard, k, rows) for k, rows in sorted(by_group.items())]
     chosen = [units[i] for i in sorted(rng.choice(len(units), size=min(ctx.k4_units, len(units)), replace=False))]
-    flat = [(u, r) for u in chosen for r in u[3]]
+    flat = [(u, r) for u in chosen for r in u[4]]
     picks = sorted(rng.choice(len(flat), size=min(ctx.k4_rows, len(flat)), replace=False).tolist())
     want: dict[tuple, list] = {}
     for p in picks:
         u, r = flat[p]
-        want.setdefault(u[:3], []).append(r)
+        want.setdefault(u[:4], []).append(r)
     rows, mism, max_diff, max_dur = 0, {"hf": [], "logmel": [], "closed_form": []}, 0.0, 0.0
-    for (src, stem, k), rs in want.items():
-        pf = pq.ParquetFile(ctx.data / "shards" / src / f"{stem}.parquet")
-        table = pf.read_row_group(k, columns=["id", "audio"])
+    for (src, stem, shard, k), rs in want.items():
+        table = pq.ParquetFile(shard).read_row_group(k, columns=["id", "audio"])
         sh = ctx.pk(src, stem)
         for i, j in rs:
             rid = sh.ids[i]
@@ -512,7 +582,7 @@ def _k4_group(ctx: Ctx, stems: list[tuple[str, str]], logmel, rng) -> dict:
 def k4_frame_parity(ctx: Ctx) -> dict:
     if ctx.fe is None:
         return result("skipped", ctx.unavailable.get("fe", "no Parakeet feature extractor (--model-dir)"))
-    if ctx.data is None:
+    if not ctx.data_roots:
         return result("skipped", "no --data root with the rebuilt audio")
     try:
         logmel, logmel_note = _logmel(ctx.fe), None
@@ -523,24 +593,26 @@ def k4_frame_parity(ctx: Ctx) -> dict:
     for g, src in groups.items():
         listed = {st for st in ctx.labelled("parakeet_out", src) if group_of(src, st) == g}
         pulled = [(s, st) for s, st in ctx.pulled() if s == src and group_of(s, st) == g]
-        usable, other, no_audio = [], [], []
+        usable, other, no_audio, audio_from = [], [], [], {}
         for s, st in pulled:
-            ids = ctx.data_ids(s, st)
-            if ids is None or not (ctx.data / "shards" / s / f"{st}.parquet").is_file():
-                no_audio.append(st)
-            elif ids_sha256(ids) != str(ctx.pk(s, st).z["shard_ids_sha256"]):
-                other.append(st)
-            else:
+            found = ctx.data_shard(s, st, audio=True)
+            if found:
                 usable.append((s, st))
+                if found != (0, st):  # another stem name or another root: say where the audio came from
+                    audio_from[st] = (ctx.data_roots[found[0]] / "shards" / s / f"{found[1]}.parquet").as_posix()
+            elif not ctx.data_shard(s, st) and ctx.data_same_name(s, st):
+                other.append(st)  # a shard of that name holds other ids, and no shard anywhere holds the labelled ones
+            else:
+                no_audio.append(st)  # no shard of that name, or the labelled ids only in an id sidecar
         info = dict(labelled_stems=len(listed), pulled_stems=len(pulled), other_ids=other[:MAX_LISTED],
-                    no_audio=no_audio[:MAX_LISTED])
+                    no_audio=no_audio[:MAX_LISTED], audio_from=dict(list(audio_from.items())[:MAX_LISTED]))
         if not listed:
             per[g] = result("pending", "not labelled yet", **info)
         elif not pulled:
             per[g] = result("pending", "labelled but not pulled", **info)
         elif not usable:
-            why = ("the --data root's shards hold other ids than the labelled ones" if other
-                   else "the --data root has no audio for the pulled stems")
+            why = ("no --data shard holds the labelled ids (same-named shards hold others)" if other
+                   else "no audio for the pulled stems in any --data root")
             per[g] = result("pending", f"{why}: rebuild the labelled stems (01 --extent-config)", **info)
         else:
             rng = np.random.default_rng([ctx.seed, zlib.crc32(g.encode())])
@@ -667,26 +739,72 @@ def k6_eval_sets(ctx: Ctx) -> dict:
                                 f"card's {100 * card['tdt']:.1f} / {100 * card['ctc']:.1f} %")
         per[g] = result("fail" if problems else "pass", "; ".join(problems) or f"{len(rows)} rows in both roots",
                         rows=len(rows), baselines=base, **info)
-    report = read_json(ctx.labels / "reports" / "parakeet_baselines.json")
-    report_diff = []
-    if report is not None:
-        for name, b in (report.get("parakeet") or {}).items():
-            mine = (per.get(eval_group(name)) or {}).get("baselines")
-            if mine is None:
-                continue
-            for k in ("tdt_cer_corpus", "ctc_cer_corpus"):
-                if abs(float(b.get(k, float("nan"))) - mine[k]) > 1e-9:
-                    report_diff.append(f"{name}.{k}: report {b.get(k)}, recomputed {mine[k]}")
+    report_diff, compared = _compare_baselines_report(ctx, per)
     status = worst([p["status"] for p in per.values()] + (["fail"] if report_diff else []))
-    note = ("reports/parakeet_baselines.json equals the recomputation" if report is not None and not report_diff
-            else "reports/parakeet_baselines.json differs from the recomputation" if report_diff
-            else "reports/parakeet_baselines.json not written yet (the box writes it at finalize, F3); recomputed here")
+    name = "reports/parakeet_baselines.json"
+    note = (f"{name} missing on a sealed root" if compared is None and report_diff
+            else f"{name} not written yet (the box writes it at finalize, F3); recomputed here" if compared is None
+            else f"{name} differs from the recomputation" if report_diff
+            else f"{name} equals the recomputation on {compared}" if compared
+            else f"{name} present, but no eval set is whole here to compare it with")
     reason = "; ".join(f"{g}: {p['reason']}" for g, p in per.items() if p["status"] != "pass") or "every eval set whole"
-    return result(status, reason, per_set=per, baselines_report=note, baselines_report_diff=report_diff)
+    if report_diff:
+        more = f" (+{len(report_diff) - 1} more)" if len(report_diff) > 1 else ""
+        reason = f"{reason}; {name}: {report_diff[0]}{more}"
+    return result(status, reason, per_set=per, baselines_report=note, baselines_report_diff=report_diff,
+                  baselines_report_compared=compared)
+
+
+def _compare_baselines_report(ctx: Ctx, per: dict) -> tuple[list[str], list[str] | None]:
+    """(differences, eval sets compared; None when the report is absent) between the box's
+    reports/parakeet_baselines.json ({"parakeet": {set: {n, tdt_cer_corpus, ctc_cer_corpus}}}, vast/label.py
+    parakeet_baselines) and the recomputation of every eval set that is whole here. Nothing passes silently: a missing
+    report on a sealed root, a missing section or set, a missing or non-finite value and another row count are each a
+    difference."""
+    report = read_json(ctx.labels / "reports" / "parakeet_baselines.json")
+    if report is None:
+        return (["missing on a sealed root (the box writes it at finalize, F3)"] if ctx.sealed else []), None
+    got = report.get("parakeet")
+    if not isinstance(got, dict):
+        return ["no 'parakeet' section"], []
+    diffs, compared = [], []
+    for name in ctx.eval_sets:
+        mine = (per.get(eval_group(name)) or {}).get("baselines")
+        if mine is None:
+            continue  # not whole (or not pulled) here: its own status says so
+        b = got.get(name)
+        if not isinstance(b, dict):
+            diffs.append(f"{name}: missing from the report")
+            continue
+        compared.append(name)
+        if b.get("n") != mine["n"]:
+            diffs.append(f"{name}.n: report {b.get('n')}, recomputed {mine['n']}")
+        for k in ("tdt_cer_corpus", "ctc_cer_corpus"):
+            try:
+                v = float(b.get(k))
+            except (TypeError, ValueError):
+                v = float("nan")
+            if not (math.isfinite(v) and math.isfinite(mine[k]) and abs(v - mine[k]) <= 1e-9):
+                diffs.append(f"{name}.{k}: report {b.get(k)}, recomputed {mine[k]}")
+    return diffs, compared
 
 
 def _train_groups(ctx: Ctx) -> set[str]:
     return set(ctx.train_sources)
+
+
+def design_stat(value: float, expected: float) -> dict:
+    """A statistic against the design's "about X": its ratio, and outside_design when above ABOUT x X (the direction
+    that hurts for K7-K9: more rows dropped, more disagreement, more bytes). Never a status: build_report lists it
+    under "flags"."""
+    ratio = value / expected if expected else None
+    return dict(value=value, expected=expected, flag_above=ABOUT * expected, ratio_to_design=ratio,
+                outside_design=bool(ratio is not None and ratio > ABOUT))
+
+
+def _outside(numbers: dict, what: str) -> str:
+    return (f"; {numbers['ratio_to_design']:.1f}x the design's about {what}: flagged, a statistic for the decision, "
+            f"not a label defect" if numbers["outside_design"] else "")
 
 
 def k7_feasibility(ctx: Ctx) -> dict:
@@ -710,15 +828,18 @@ def k7_feasibility(ctx: Ctx) -> dict:
     if not n:
         return result("pending", "no train shard pulled", per_group=per)
     rates = {k: sum(v[k] for v in train) / n for k in ("greedy_ctc", "tdt")}
-    limit = ABOUT * ctx.expect["k7_infeasible"]
     rate = rates[ctx.ctc_target if ctx.ctc_target == "tdt" else "greedy_ctc"]
-    numbers = dict(target=ctx.ctc_target, train_rows=n, train_rate=rates, limit=limit,
-                   expected=ctx.expect["k7_infeasible"], per_group=per)
-    if rate > limit:
-        return result("fail", f"{100 * rate:.3f} % of train rows cannot align their {ctx.ctc_target} target "
-                              f"(design: about {100 * ctx.expect['k7_infeasible']:.1f} %)", **numbers)
+    numbers = dict(target=ctx.ctc_target, train_rows=n, train_rate=rates, per_group=per,
+                   **design_stat(rate, ctx.expect["k7_infeasible"]))
+    greedy_bad = sum(v["greedy_ctc"] for v in per.values())
+    if ctx.ctc_target != "tdt" and greedy_bad:
+        # the greedy path over n_frames frames is itself an alignment of its collapse: an infeasible one means the
+        # stored n_frames and dense frames disagree, a label defect, not a statistic
+        return result("fail", f"{greedy_bad} row(s) whose greedy CTC target needs more than n_frames frames: the npz "
+                              f"is inconsistent (the target is feasible by construction)", **numbers)
     return result("pass", f"{ctx.ctc_target} target infeasible on {100 * rate:.3f} % of train rows (TDT tokens: "
-                          f"{100 * rates['tdt']:.3f} %)", **numbers)
+                          f"{100 * rates['tdt']:.3f} %)" + _outside(numbers, f"{100 * ctx.expect['k7_infeasible']:.1f} %"),
+                  **numbers)
 
 
 def k8_hyp_vs_ctc(ctx: Ctx) -> dict:
@@ -743,16 +864,12 @@ def k8_hyp_vs_ctc(ctx: Ctx) -> dict:
     if not train:
         return result("pending", "no train shard pulled", per_group=per)
     pooled = stats(train)
-    limit = ABOUT * ctx.expect["k8_cer"]
-    numbers = dict(train=pooled, limit=limit, expected=ctx.expect["k8_cer"], per_group=per)
+    numbers = dict(train=pooled, per_group=per, **design_stat(pooled["cer_ctc_vs_tdt"], ctx.expect["k8_cer"]))
     msg = (f"ctc_hyp differs from hyp on {100 * pooled['raw_diff_rate']:.1f} % of train rows "
            f"({100 * pooled['norm_diff_rate']:.1f} % after normalisation); CER(ctc_hyp vs hyp) "
            f"{100 * pooled['cer_ctc_vs_tdt']:.2f} %; against the reference TDT {100 * pooled['tdt_cer_corpus']:.2f} %, "
            f"CTC {100 * pooled['ctc_cer_corpus']:.2f} %")
-    if pooled["cer_ctc_vs_tdt"] > limit:
-        return result("fail", f"{msg}; above {100 * limit:.1f} % (design: about {100 * ctx.expect['k8_cer']:.0f} %): "
-                              f"a statistic for decision 22, not a label defect", **numbers)
-    return result("pass", msg, **numbers)
+    return result("pass", msg + _outside(numbers, f"{100 * ctx.expect['k8_cer']:.0f} % (decision 22)"), **numbers)
 
 
 def k9_bytes(ctx: Ctx) -> dict:
@@ -780,13 +897,11 @@ def k9_bytes(ctx: Ctx) -> dict:
     if not hours:
         return result("pending", "no train shard pulled", per_group=per, listed_parakeet_bytes=listed)
     mb = sum(v["npz_bytes"] + v["jsonl_bytes"] for v in train) / 1e6 / hours
-    limit = ABOUT * ctx.expect["k9_mb_per_audio_h"]
-    numbers = dict(train_mb_per_audio_h=mb, train_audio_h=hours, gb_per_1000h=mb, limit=limit,
-                   expected=ctx.expect["k9_mb_per_audio_h"], listed_parakeet_bytes=listed, per_group=per)
+    numbers = dict(train_mb_per_audio_h=mb, train_audio_h=hours, gb_per_1000h=mb, listed_parakeet_bytes=listed,
+                   per_group=per, **design_stat(mb, ctx.expect["k9_mb_per_audio_h"]))
     msg = f"{mb:.3f} MB per audio-hour on {hours:.1f} h of pulled train stems ({mb:.2f} GB per 1,000 h)"
-    if mb > limit:
-        return result("fail", f"{msg}, above {limit:.2f} (design: about {ctx.expect['k9_mb_per_audio_h']})", **numbers)
-    return result("pass", msg, **numbers)
+    return result("pass", msg + _outside(numbers, f"{ctx.expect['k9_mb_per_audio_h']} MB (decision 5, HF storage)"),
+                  **numbers)
 
 
 def k10_galgame_ids(ctx: Ctx) -> dict:
@@ -828,14 +943,19 @@ def k11_cohere_baselines(ctx: Ctx) -> dict:
                "diff_pp": 100 * (b["cer_corpus"] - ctx.prereg[s]), "n": b["n"], "n_empty_ref": b["n_empty_ref"],
                "trunc_rate": b["trunc_rate"], "hours": b["hours"]} for s, b in base.items()}
     meta = read_json(ctx.labels / "teacher_out" / "meta.json") or {}
-    numbers = dict(per_set=per, tol_pp=100 * BASELINE_TOL,
+    adopted = meta.get("adopted_from")
+    numbers = dict(per_set=per, tol_pp=100 * BASELINE_TOL, adopted_from=adopted,
                    teacher_meta={k: meta.get(k) for k in ("model", "model_revision", "adopted_from")})
     off = [s for s, v in per.items() if abs(v["diff_pp"]) > 100 * BASELINE_TOL + 1e-9]
     text = " / ".join(f"{v['cer_corpus_pct']:.2f}" for v in per.values())
+    # the box adopts the gate sets from the laptop seed and never re-decodes them (vast/label.py GATE_SETS)
+    how = (f"; the gate sets are adopted from the laptop seed ({adopted}), so this shows the adopted eval labels are "
+           f"intact, not that a re-decode reproduces Cohere" if adopted else "")
     if off:
         return result("fail", f"{off} drift more than {100 * BASELINE_TOL:.2f} pp from the pre-registered baselines "
-                              f"({text} %): re-register or reuse the laptop's eval labels before the PREREG", **numbers)
-    return result("pass", f"{text} % reproduce the pre-registered baselines", **numbers)
+                              f"({text} %): re-register or reuse the laptop's eval labels before the PREREG{how}",
+                      **numbers)
+    return result("pass", f"{text} % reproduce the pre-registered baselines{how}", **numbers)
 
 
 def _progress(ctx: Ctx) -> dict:
@@ -849,12 +969,12 @@ def _progress(ctx: Ctx) -> dict:
 
 def k12_extent(ctx: Ctx) -> dict:
     progress = _progress(ctx)
-    if not ctx.sealed:
-        return result("pending", "root not sealed (no COMPLETE.json): re-run on the sealed root", progress=progress,
-                      required=ctx.mix, margin=ctx.margin)
     record = ctx.record()
     if record is None:
-        return result("fail", f"sealed root without {ext.RECORD_FILE}", progress=progress)
+        if ctx.sealed:
+            return result("fail", f"sealed root without {ext.RECORD_FILE}", progress=progress)
+        return result("pending", f"root not sealed (no COMPLETE.json) and no {ext.RECORD_FILE} yet: re-run on the "
+                                 f"sealed root", progress=progress, required=ctx.mix, margin=ctx.margin)
     cfg = {"extent": {"name": record.get("name"), "root": record.get("root"), "inputs": dict(ctx.mix)},
            "sources": list(ctx.train_sources), "eval_sets": list(ctx.eval_sets)}
     need = ext.subset_stems(record, cfg)
@@ -881,6 +1001,11 @@ def k12_extent(ctx: Ctx) -> dict:
                    missing={s: v[:MAX_LISTED] for s, v in missing.items()},
                    n_missing={s: len(v) for s, v in missing.items()}, empty=empty, too_few_inputs=few,
                    labelled_prefix=prefix, below_margin=short, progress=progress)
+    if not ctx.sealed:  # extent.json is written before the seal (finalize): the numbers so far, the verdict later
+        so_far = {src: f"{prefix.get(src, {}).get('labelled_inputs', 0)}/{n}" for src, n in ctx.mix.items()
+                  if isinstance(n, int) and not isinstance(n, bool)}
+        return result("pending", f"root not sealed (no COMPLETE.json): labelled inputs so far {so_far}, "
+                                 f"{sum(len(v) for v in missing.values())} required stems unlabelled", **numbers)
     if missing or empty or few:
         return result("fail", f"the study mix is not covered: {sum(len(v) for v in missing.values())} required "
                               f"stems unlabelled, {empty} without stems in the record, too few labelled inputs "
@@ -911,13 +1036,34 @@ def run_checks(ctx: Ctx, only=None, catch: bool = True) -> dict:
     return out
 
 
+def local_copy(ctx: Ctx) -> dict | None:
+    """Whether the local label files are the pulled commit's: each one listed there with the listed size. Files an
+    earlier pull left are used too (label files are write-once, and every mutable json is re-pulled each time), so a
+    file the pinned listing lacks or sizes differently means the checks read data the report does not pin."""
+    if not ctx.pull:
+        return None
+    listing, pulled = ctx.pull.get("listing") or {}, set(ctx.pull.get("pulled") or [])
+    local = local_listing(ctx.labels)
+    unlisted = sorted(p for p in local if p not in listing)
+    size = sorted(p for p in local if p in listing and int(listing[p]) != local[p])
+    return {"revision": ctx.pull.get("revision"), "files": len(local),
+            "from_earlier_pulls": len([p for p in local if p not in pulled]),
+            "n_not_in_listing": len(unlisted), "not_in_listing": unlisted[:MAX_LISTED],
+            "n_size_differs": len(size), "size_differs": size[:MAX_LISTED], "consistent": not unlisted and not size}
+
+
 def build_report(ctx: Ctx, results: dict, **extra) -> dict:
     summary = {s: [k for k, v in results.items() if v["status"] == s] for s in ("fail", "pending", "skipped", "pass")}
+    flags = [{"check": k, "value": v["value"], "expected": v["expected"],
+              "ratio_to_design": v["ratio_to_design"], "reason": v["reason"]}
+             for k, v in results.items() if v.get("outside_design")]
     hub = {k: ctx.pull.get(k) for k in ("repo", "root", "revision", "pulled_utc", "bytes")} if ctx.pull else None
+    code = code_version()
     return {"tool": "tools/label_checks.py", "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "kitsune_sha": kitsune_sha(), "labels": str(ctx.labels), "hub": hub, "sealed": ctx.sealed,
-            "data": str(ctx.data) if ctx.data else None, "kotoba": str(ctx.kotoba) if ctx.kotoba else None,
-            "unavailable": ctx.unavailable, **extra, "summary": summary, "checks": results}
+            "kitsune_sha": code["kitsune_sha"], "code": code, "labels": str(ctx.labels), "hub": hub,
+            "local_copy": local_copy(ctx), "sealed": ctx.sealed, "data": [str(d) for d in ctx.data_roots],
+            "kotoba": str(ctx.kotoba) if ctx.kotoba else None, "unavailable": ctx.unavailable, **extra,
+            "summary": summary, "flags": flags, "checks": results}
 
 
 # -------------------------------------------------------------------------------------------------------- pull
@@ -1012,7 +1158,9 @@ def parse_args(argv=None):
     p.add_argument("--max-gb", type=float, default=PULL_MAX_GB)
     r = sub.add_parser("run", help="run K1-K12 on a local label root and write the report")
     r.add_argument("--labels", required=True, help="local label root (teacher_out/, parakeet_out/, second_out/ ...)")
-    r.add_argument("--data", default=None, help="a data root with manifest shards (audio) for K4 and ids for K2")
+    r.add_argument("--data", action="append", default=None,
+                   help="a data root with shards/<src>/*.parquet (audio for K4, ids for K2); repeat it for a rebuild "
+                        "of the stems the first root lacks. A labelled stem is found by its ids digest, under any name")
     r.add_argument("--model-dir", default=str(ROOT / PARAKEET_PATH), help="the pinned converted Parakeet dir")
     r.add_argument("--kotoba", default=str(ROOT / "second_out" / "galgame" / f"{KOTOBA_STEM}.jsonl"),
                    help="the laptop's kotoba second opinions of galgame eval-00000 (K10)")
@@ -1038,7 +1186,7 @@ def main(argv=None) -> int:
     pull_rec = read_json(labels / PULL_FILE)
     listing = pull_rec["listing"] if pull_rec else local_listing(labels)
     decode, fe, subs, unavailable = model_tools(Path(args.model_dir) if args.model_dir else None)
-    ctx = Ctx(labels, listing, pull=pull_rec, data=Path(args.data) if args.data else None, decode=decode, fe=fe,
+    ctx = Ctx(labels, listing, pull=pull_rec, data=[Path(d) for d in args.data or []], decode=decode, fe=fe,
               sub=subs, kotoba=Path(args.kotoba) if args.kotoba else None, k4_rows=args.k4_rows,
               k4_units=args.k4_units, seed=args.seed, ctc_target=args.ctc_target, unavailable=unavailable)
     results = run_checks(ctx, only=set(args.checks) if args.checks else None)
@@ -1047,8 +1195,14 @@ def main(argv=None) -> int:
     Path(args.out).write_text(json.dumps(report, indent=1, ensure_ascii=False, default=float), encoding="utf-8")
     for k, v in results.items():
         print(f"{k:4s} {v['status']:8s} {v['reason']}", flush=True)
+    for f in report["flags"]:
+        print(f"flag {f['check']}: {f['ratio_to_design']:.1f}x the design's figure (not a failure)", flush=True)
+    copy = report["local_copy"]
+    if copy and not copy["consistent"]:
+        print(f"LOCAL COPY is not {copy['revision']}'s: {copy['n_not_in_listing']} file(s) not in its listing, "
+              f"{copy['n_size_differs']} with another size; re-pull into a fresh dir", flush=True)
     print(f"report: {args.out}", flush=True)
-    return 1 if report["summary"]["fail"] else 0
+    return 1 if report["summary"]["fail"] or (copy and not copy["consistent"]) else 0
 
 
 if __name__ == "__main__":
