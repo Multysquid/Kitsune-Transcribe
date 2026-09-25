@@ -5,6 +5,9 @@ private HF dataset, rebuilds the audio from the public upstream datasets, trains
 private HF model repo, verifies the upload and destroys itself. A watchdog stops it at 5.5 h whatever happens.
 Nothing is rented until you run `launch.py --yes`.
 
+The same scripts also rent the **label box**: one RTX 5090 that labels the full download with both teachers and uploads
+the labels to the data repo (`--job label`, see "The label run" at the end).
+
 | file | runs where | what it does |
 |---|---|---|
 | `launch.py` | laptop | search offers with the strict filter, print the exact `vastai create instance` command, create only with `--yes` |
@@ -49,10 +52,12 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    ```
    `launch.py` refuses a data repo where a train source's teacher shard has no second opinion, or where the selection
    still has `no_agree` rows, was built with other sources / eval sets / thresholds than the config's, keeps no rows
-   of a configured source or eval set, or keeps rows whose teacher output is not uploaded. The uploaded `teacher_out`
-   must not go beyond what the box rebuilds with `01_prepare_data.py`'s defaults (the first 6 Galgame tars, 300 h of
-   Emilia-YODAS): a teacher pass on more of the full download needs a matching rebuild extent, or the box's coverage
-   check stops the run after the paid audio rebuild. From the repo root:
+   of a configured source or eval set, or keeps rows whose teacher output is not uploaded. A config without an
+   `extent` (viability) rebuilds with `01_prepare_data.py`'s defaults (the first 6 Galgame tars, 300 h of
+   Emilia-YODAS), so its uploaded `teacher_out` must not go beyond them. A config with an `extent`
+   (`configs/full.json`, `configs/full_sub3k.json`) reads the label box's `labels/full/` instead: the box rebuilds
+   exactly that extent through the canonical ingest order and pulls only its label files (see "Subsets" below), and
+   launch refuses it until `labels/full/COMPLETE.json` exists. From the repo root:
    ```bash
    hf upload Multy123/kitsune-data . . --repo-type dataset \
      --include "teacher_out/meta.json" --include "second_out/meta.json" \
@@ -195,3 +200,217 @@ again during a healthy run starts nothing (the supervisor holds `kitsune_state/s
 inside that quoted value: vastai has no `-e` option of its own, and a second `--env` replaces the first, dropping
 KITSUNE_SHA and the rest. The watchdog still stops the box at the cap once `onstart.sh` has started it; with the flag,
 a box whose stub fails before that (e.g. the clone) keeps running until you destroy it by hand.
+
+## The label run (one RTX 5090 labels the full download)
+
+`python vast/launch.py --job label` rents one on-demand RTX 5090 (32 GB) that labels the full downloaded extent
+(~13.0k h, `configs/full.json`) with both teachers, and destroys itself once everything is verified on the Hub. On the
+box, `onstart.sh` hands over to `vast/label.py` (the controller; `bootstrap.sh` and `supervise.py` are not used). It
+rebuilds the audio from the pinned upstreams with one `01_prepare_data.py --extent-config` process and runs, on the one
+GPU at the same time, two Cohere processes (`02_teacher_pass.py`, the shards split between them) and one Parakeet
+process (`02p_parakeet_pass.py`). Each train shard's audio is deleted as soon as both its label files are checked on
+disk, which keeps the disk at 250 GB. `02b_second_opinion.py` runs on the CPU every 20 min; Galgame is judged by the
+Parakeet hypothesis. At the end the box writes the extent record, the selections, the reports and `COMPLETE.json`.
+Laptop Cohere labels whose ids match the box's shards (reazon_small, galgame tars 0-5, Emilia 300 h, the eval sets)
+are copied byte for byte (`provenance/adopted.json`), not recomputed; the three gate sets are always the laptop's.
+No audio is ever uploaded, and the laptop's roots (`teacher_out/`, `second_out/`, `selection/`, `students/`) are never
+written.
+
+| file | runs where | what it does |
+|---|---|---|
+| `label.py` | box | the controller: steps (plan, pull, models, self-test, roots, golden check), lanes with heartbeats, pruning, syncs, ETA, finalize, the ending |
+| `label_sync.py` | box | write-once uploads under `labels/` and `label_runs/` only, with the lease; per-directory verify; seal |
+| `../tools/publish_parakeet.py` | laptop | the one-time Parakeet model upload (below) |
+
+### What lands in the data repo
+
+```
+Multy123/kitsune-data
+  models/parakeet-tdt_ctc-0.6b-ja-hf/      the Parakeet model, uploaded once from the laptop (8 files)
+  labels/full/
+    LEASE.json                             which box owns the root (heartbeat; released at the end)
+    teacher_out/<source>/<split>-NNNNN.{npz,jsonl}    Cohere, the 02_teacher_pass.py format, unchanged
+    parakeet_out/<source>/<split>-NNNNN.{npz,jsonl}   Parakeet TDT + CTC soft targets (kitsune/parakeet_targets.py)
+    second_out/<source>/<split>-NNNNN.jsonl           {id, hyp2, model2, agree, cer2}
+    extent.json                            every upstream input -> its shard stems and their id hash
+    selections/full.parquet, selections/full_sub3k.parquet
+    reports/  galgame_judge, parakeet_baselines, labels, throughput, consumer_check (.json)
+    provenance/<run_id>.json, provenance/adopted.json
+    COMPLETE.json                          written last, in its own commit: the root is sealed after it
+  label_runs/<run_id>/                     the box's logs and state files (scrubbed)
+```
+
+Every file under `labels/full/` is written once: a relaunch adds missing files and never changes an uploaded one (a
+different remote file is an integrity error that stops the box). The only exceptions are `LEASE.json`, and the
+finalize outputs (`extent.json`, `selections/`, `reports/`, `provenance/`) until `COMPLETE.json` exists. Nothing is
+ever deleted. The Parakeet format (array names, shapes, dtypes, `meta.json`) is documented in the docstring of
+`kitsune/parakeet_targets.py`, which also has the loader and the checker; the top-level README.md summarises it.
+
+### One-time setup for the label run
+
+1. **The token.** The label box writes to the data repo and reads the gated Cohere model, so the one fine-grained
+   `HF_TOKEN` in vast's Account -> Environment Variables needs:
+   - read AND write on `Multy123/kitsune-data`;
+   - read AND write on `Multy123/kitsune-runs` (for the A100 runs, as above);
+   - "Read access to contents of all public gated repos you can access" (the Cohere Transcribe gate is already
+     accepted on your account).
+
+   No new repo and no create permission. The A100 box then also carries data-repo write it never uses. The
+   alternative, swapping the account variable between launches, must never happen while a label box is alive: a
+   container restart would pick up the new token. The box checks its token in its first minutes (write on the data
+   repo, the repo still private, the gated read) and stops with a refusal if any is missing.
+2. **The HF storage quota.** Check it at huggingface.co -> Settings -> Billing / Storage. The run adds ~36-49 GB (see
+   "HF storage" below) to the repo's ~2.3 GB; the free private quota is believed to be ~100 GB (unverified).
+3. **Upload the Parakeet model once** (2.5 GB, ~11 min at 30 Mbit/s; the model, not audio). From the repo root, with
+   the converted model in `cache/parakeet-tdt_ctc-0.6b-ja-hf` (the bake-off's; `--hf-dir` for another path):
+   ```bash
+   python tools/publish_parakeet.py --upload
+   ```
+   It checks the converted config, extracts the CTC head from the cached NeMo checkpoint
+   (`nvidia/parakeet-tdt_ctc-0.6b-ja@44edb27`), runs a CPU sanity check on 8 eval_jsut clips and uploads the folder to
+   `models/parakeet-tdt_ctc-0.6b-ja-hf/` in the data repo (`--repo` and `--path-in-repo` change them). The files must
+   match the sha256 pins in `kitsune/parakeet.py`: the box and `launch.py` refuse the run otherwise. Without
+   `--upload` it only builds and checks the files.
+
+### Launch
+
+The code must be on `main` and pushed (the box clones exactly that commit). Look first (read-only, spends nothing):
+```bash
+python vast/launch.py --job label --data-repo Multy123/kitsune-data --image-tag main
+```
+It checks the commit and the image as for a training run, and with your local login: the data repo is private, the
+laptop seed files and the Parakeet files (with their pins) are there, the Cohere gate, no `COMPLETE.json` and no live
+lease under `labels/full/`, the extent of every label config, and the repo size with the projection (a warning above
+80 GB). If labels are already there (a relaunch), it prints what is done per source. It then searches on-demand RTX
+5090 offers (verified, CUDA >= 13.0, >= 16 cores, >= 64 GB RAM, >= 500 Mbit/s down, a direct port, 250 GB of disk;
+strict tier first: reliability >= 0.97, disk >= 300 MB/s, >= 100 Mbit/s up) and ranks them by the total estimated
+cost with download and upload included (`est$`), not by $/h. The cost line reads like
+`~$0.72/h (GPU + 250 GB) x ~16 h (12-24; cap 30 h) + ~590 GB down x $.../GB + ~45 GB up x $.../GB ~= $13 (cap ~= $31)`.
+
+Rent (spending money is always this explicit step):
+```bash
+python vast/launch.py --job label --data-repo Multy123/kitsune-data --image-tag main --yes
+```
+Options: `--offer-id N`, `--max-dph 1.0` (the default), `--label-configs configs/full.json,configs/full_sub3k.json`
+(the default: the selections built at the end), `--cohere-procs N` (default 2), `--avoid-machine ID` (repeatable;
+machines that ended a label run with a host failure are skipped anyway), `--disk-gb N`, `--steal-lease` (only when
+you know the other box is gone), `--no-self-stop`. The data revision the box reads its seeds from is pinned to the
+data repo's head at launch (`KITSUNE_DATA_REVISION`).
+
+### Timeline and cost
+
+| phase | wall | notes |
+|---|---|---|
+| boot, image pull, plan, pull, models, self-test | 0.3-0.4 h | |
+| ingest up to eval_jsut + golden check | 0.1-0.2 h | the rest of the ~570 GB download overlaps the GPU work |
+| Cohere, ~12.3k h not adopted | 9.9-18.5 h (central 12.5) | ~78 % of the job: galgame ~5.1k h, reazon_large ~4.9k h, emilia_nc ~1.6k h, emilia_yodas ~0.8k h |
+| Parakeet, ~13.05k h, on the same GPU | +1.5-3 h | |
+| 02b, pruning, syncs | ~0 | overlapped |
+| finalize (selections over ~8 M rows, reports, consumer checks, final verify, seal) | 0.6-0.9 h | |
+| **total** | **~12-24 h, central ~16 h** | cap 30 h; the box ends itself at 29 h |
+
+| cost | low | central | high |
+|---|---|---|---|
+| box, hours x $/h (GPU + 250 GB) | 12 x 0.66 = $7.9 | 16 x 0.72 = $11.5 | 24 x 0.82 = $19.7 |
+| download ~585 GB | $0.6 | $1.5 | $5.9 |
+| upload ~45 GB | $0 | $0.1 | $0.45 |
+| **label run** | **~$9** | **~$13** | **~$26** |
+| at the 30 h cap | | | ~$31 |
+| each relaunch after a lost box | | +$1-4 | |
+
+The 5090 rates are extrapolated from the laptop; the first hour's rates line tells. Of EUR 50 (~$58) this leaves
+~$32-49 for the A100.
+
+### Watching it
+
+```bash
+ssh -p <port> root@<ip> tail -f /workspace/kitsune.log
+```
+It shows the steps, the golden checks (Cohere CER <= 1 % against the laptop hypotheses on 64 eval_jsut rows, Parakeet
+<= 2 % against the committed golden on 32), a rates/ETA line every 30 min (x realtime per lane, hours left, ETA against
+the deadline) and a line per sync. Each lane logs to `/workspace/lane_<name>.log` (`ingest`, `cohere-0`, `cohere-1`,
+`parakeet`); the controller's state is `/workspace/kitsune_state/label.json`. On the Hub, a commit under `labels/full/`
+arrives about every 20 min, so a box that dies loses at most ~20 min of labels plus the shards in flight.
+
+### How it ends
+
+| outcome | instance |
+|---|---|
+| finalize passed and `COMPLETE.json` is verified on the Hub | **destroyed** |
+| budget: the deadline minus 60 min with work left, or the work done too late to finalize | final sync + verify, then **destroyed**; relaunch to continue |
+| host failure: self-test or golden check fails, a lane fails or hangs 4 times without progress, disk full while ingest is held, Cohere under 400x realtime after an hour of steady work (`slow_host`) | final sync + verify, then **destroyed**; the machine is avoided on the next launch |
+| refusal: the token cannot write the data repo or read the gated model, the repo is public, a live lease, `COMPLETE.json` present, seeds or Parakeet files missing or not matching their pins, pulled label settings differ | **stopped** (minutes in; nothing unique yet) |
+| integrity: an existing label that does not match its shard, a gate-set adoption that fails, a write-once conflict, a missing reazon capture, a Parakeet row missing for a teacher row, the consumer check fails | final sync of the non-conflicting files, then **stopped**; the disk keeps the evidence |
+| a bug in label.py, or the final verify fails (Hub outage at the end) | best-effort sync, then **stopped** (the labels on disk are unique) |
+| the controller died or hung | the watchdog syncs after 15 min without its heartbeat, then **stops** |
+| anything else | the watchdog syncs 30 min before the 30 h cap and **stops** at it |
+
+A destroy happens only after the Hub provably holds every finished label; any doubt ends in a stop.
+`KITSUNE_LABEL_END=stop` turns every destroy into a stop (debugging). launch.py builds the one `--env` value itself
+and has no flag for it, so it goes in the vast account environment, which applies to every box (the A100 too):
+remove it afterwards. `--no-self-stop` works as for a training run. The reason is in `label_runs/<run_id>/` (`label_end.json`) and in `kitsune.log`.
+
+### Relaunch and continue
+
+- **Destroyed without `COMPLETE.json`** (budget, host failure): run the same launch command again. The new box sees
+  the labels already under `labels/full/`, pulls them, re-downloads the audio (shards already labelled pass their
+  checks at once and are pruned) and resumes at the first unlabelled shard: +0.5-1.5 h and +$1-4. The launch table
+  prints what is already done per source.
+- **Stopped** (refusal, integrity, a bug): read `label_runs/<run_id>/` and `/workspace/kitsune.log`, fix the cause,
+  then either destroy it by hand and relaunch, or continue in place:
+  ```bash
+  vastai start instance <id>
+  bash /workspace/Kitsune-Transcribe/vast/onstart.sh --rearm; tail -n 20 /workspace/kitsune.log
+  ```
+  `--rearm` also moves `label.json` and `label_hb` aside; the controller re-plans against its own lease, pulls only
+  the files missing locally and resumes.
+- **A container restart** on the same disk resumes by itself from `label.json` (no Hub calls; at most one shard per
+  lane is lost).
+- A second box can never write the same root: the lease refuses a launch or a plan while another container's lease
+  heartbeat is under 45 min old. `--steal-lease` overrides it, only for a box you know is gone.
+
+### Subsets
+
+A config chooses how much of the labelled extent a training run uses, with no relabelling. Its `extent.inputs` takes
+a prefix of each capped source's sorted upstream inputs: `{"reazon_large": N}` (of 705 files), `{"galgame": N}` (of
+115 tars, N >= 1), `{"emilia_nc": N}` (of 66), and `emilia_yodas` as `"300h"` or an int >= 9 (the 300 h cut, then the
+rest over the first K tars). `configs/full_sub3k.json` is the example (~3.4k h: reazon_large 216 files, galgame 16
+tars, all of emilia_yodas and reazon_small, no emilia_nc). A new subset or new thresholds is a new config plus a
+selection derived on the laptop in seconds from the full one:
+```bash
+python scripts/make_selection.py --config configs/<new>.json \
+  --from-selection labels/full/selections/full.parquet --out labels/full/selections/<new>.parquet
+```
+Upload that one parquet (a new file under `labels/full/selections/`) and launch the A100 run with that config after
+the upload, so it pins the new head. The A100 box rebuilds only that subset's audio through the same canonical ingest
+order (`01_prepare_data.py --extent-config`), pulls only its label files (never `parakeet_out`), and requires the
+rebuilt shards' ids to match `extent.json` exactly. `launch.py` sizes the disk, the rebuild timeout and the cap from
+the record:
+
+| config | download | disk | rebuild cap |
+|---|---|---|---|
+| `configs/full.json` | ~570 GB | ~1,350 GB | ~6.5 h |
+| `configs/full_sub3k.json` | ~163 GB | ~500 GB | ~2.2 h |
+
+The subset is the practical path for the remaining budget.
+
+### HF storage
+
+| item | size |
+|---|---|
+| existing (laptop labels, selection, student) | 2.3 GB |
+| Parakeet model | 2.5 GB |
+| `labels/full/teacher_out` | 16-20 GB (~1 GB of it adopted copies, likely deduplicated) |
+| `labels/full/parakeet_out` | 13-22 GB (~1.34 MB per audio hour) |
+| `labels/full/second_out` | ~1.5 GB |
+| selections | ~0.5 GB |
+| **total** | **~36-49 GB**, ~27k files |
+
+If the quota binds: a started root keeps its Parakeet settings (the box refuses mixed settings), but on a fresh root
+`--k-tdt 4 --k-ctc 4` for `02p_parakeet_pass.py` saves ~3.5 GB.
+
+### After `COMPLETE.json`
+
+Read `labels/full/reports/galgame_judge.json` (kotoba vs Parakeet on the 58 kotoba-judged galgame shards) and
+`reports/parakeet_baselines.json` (TDT and CTC CER per eval set next to Cohere's), then plan the A100 run with
+`configs/full_sub3k.json` (or `configs/full.json`, or a derived subset).

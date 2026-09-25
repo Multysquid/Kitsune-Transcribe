@@ -29,6 +29,7 @@ parameters and no compute, and it would add id-remapping risk.
 ```
 01_prepare_data.py   download sources -> data/shards/<source>/<split>-NNNNN.parquet + data/manifest.jsonl
 02_teacher_pass.py   teacher forward passes -> teacher_out/<source>/<split>-NNNNN.{npz,jsonl}
+02p_parakeet_pass.py second teacher, Parakeet TDT-CTC 0.6B ja -> parakeet_out/<source>/<split>-NNNNN.{npz,jsonl}
 02b_second_opinion.py  second ASR opinion per utterance -> second_out/ (agreement-based label filter)
 make_selection.py    which utterances train / evaluate, and why -> selection/*.parquet
 03_build_student.py  prune the teacher to the student (20 enc layers, FFN 2560, 4 dec layers), init from teacher
@@ -37,7 +38,8 @@ make_selection.py    which utterances train / evaluate, and why -> selection/*.p
                      2_loss_accuracy/00_summary) + open-format logs
 tools/               export_run.py: a run -> parquet/CSV tables + README; regroup_tb.py: rebuild an older run's
                      TensorBoard files in the three groups
-vast/                training image, CI build and the vast.ai run scripts (see vast/README.md)
+vast/                training image, CI build and the vast.ai run scripts: the A100 training run and the RTX 5090
+                     label box that labels the full download with both teachers (see vast/README.md)
 ```
 
 ### Data
@@ -45,9 +47,10 @@ vast/                training image, CI build and the vast.ai run scripts (see v
 | source | domain | hours | license |
 |---|---|---|---|
 | `japanese-asr/whisper_transcriptions.reazonspeech.small` (ReazonSpeech v2 mirror) | TV / broadcast | ~100 | CDLA-Sharing-1.0 (use under Japanese Copyright Act Art. 30-4) |
-| `TTS-AGI/emilia-yodas` JA (mirror of Emilia-YODAS, Amphion) | YouTube CC-BY talk, vlogs, streams | ~300 | CC BY 4.0 (from YODAS, CC BY 3.0 uploads) |
-| `laion/Emolia` JA `*_standard` (`emilia_nc`: Emilia's non-YODAS part, Amphion) | podcasts, talk shows | optional, in no config | CC BY-NC 4.0: **non-commercial** models only (the repo's cc-by-4.0 tag does not relicense it) |
-| `litagin/Galgame_Speech_ASR_16kHz`, first 6 of 115 tars | game / anime voices | ~280 | GPL-3 + **non-commercial**, trained models **must be open-sourced** |
+| `japanese-asr/whisper_transcriptions.reazonspeech.large` (`reazon_large`; rows already in reazon_small are skipped) | TV / broadcast | ~4,900, `configs/full*.json` only | CDLA-Sharing-1.0 (Art. 30-4) |
+| `TTS-AGI/emilia-yodas` JA (mirror of Emilia-YODAS, Amphion) | YouTube CC-BY talk, vlogs, streams | ~300 (all ~1,080 in `configs/full*.json`) | CC BY 4.0 (from YODAS, CC BY 3.0 uploads) |
+| `laion/Emolia` JA `*_standard` (`emilia_nc`: Emilia's non-YODAS part, Amphion) | podcasts, talk shows | ~1,600, `configs/full.json` only | [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/): **non-commercial** models only (the repo's cc-by-4.0 tag does not relicense it) |
+| `litagin/Galgame_Speech_ASR_16kHz`, first 6 of 115 tars (all 115 in `configs/full.json`) | game / anime voices | ~280 (~5,350) | GPL-3 + **non-commercial**, trained models **must be open-sourced** |
 | Common Voice ja (manual download from [Mozilla Data Collective](https://datacollective.mozillafoundation.org)) | read, diverse mics | optional | CC-0 |
 | `japanese-asr/ja_asr.{jsut_basic5000,common_voice_8_0,reazonspeech_test}` | eval only | ~22 | JSUT: text CC BY-SA 4.0, audio not redistributable; CV8: CC-0, but Mozilla asks that it not be mirrored; ReazonSpeech test: CDLA-Sharing-1.0 (Art. 30-4). Eval only, so no term on the model; keep refs and samples private |
 
@@ -71,8 +74,11 @@ under a non-commercial license (e.g. CC BY-NC 4.0). The model card, [MODEL_CARD.
 student and checkpoint carries as its README.md, records these terms, credits the training data: ReazonSpeech
 (CDLA-Sharing-1.0), Emilia-YODAS (Amphion, CC BY 4.0, built on ESPnet's YODAS, CC BY 3.0) and Galgame_Speech_ASR
 (litagin, [GPL-3](https://www.gnu.org/licenses/gpl-3.0.txt) + non-commercial; the dataset's own `license_link` points
-to a missing file), and says that the model is modified from the teacher, Cohere Transcribe (Apache-2.0). A release
-must also include the Apache-2.0 licence text next to that modified-from notice. Drop `galgame` (and keep `emilia_nc`
+to a missing file), and says that the model is modified from the teacher, Cohere Transcribe (Apache-2.0). A model
+trained with `configs/full.json` also uses `emilia_nc` (Emilia's non-YODAS part, Amphion,
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)): its card must credit it too, and that licence alone
+makes the model non-commercial, with or without Galgame. A release must also include the Apache-2.0 licence text
+next to that modified-from notice. Drop `galgame` (and keep `emilia_nc`
 out) of the run config's `sources` for a model free of non-commercial terms. The open release is a separate public
 repo holding only a chosen `checkpoints/step_N` (weights, config, generation config, tokenizer, processor) plus the
 license, notices and model card: the run repos (`kitsune-runs`, `kitsune-data`) stay private, because they carry the
@@ -86,6 +92,24 @@ together with the full-vocab log-sum-exp (so exact teacher probabilities are rec
 the CER of the teacher hypothesis against the dataset transcript (for pseudo-label filtering), and optionally the
 final encoder states (`--save-encoder`, ~32 KB per audio second). The format is documented at the top of
 [scripts/02_teacher_pass.py](scripts/02_teacher_pass.py).
+
+### Parakeet teacher output
+
+The label box also runs a second teacher, [nvidia/parakeet-tdt_ctc-0.6b-ja](https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja)
+(CC BY 4.0, converted to transformers' `ParakeetForTDT` on the laptop and uploaded once to the data repo under
+`models/parakeet-tdt_ctc-0.6b-ja-hf/`, sha256-pinned in `kitsune/parakeet.py`), with `scripts/02p_parakeet_pass.py`.
+It decodes greedy TDT with transformers' semantics plus NeMo's max-symbols guard (10) and writes
+`parakeet_out/<source>/<split>-NNNNN.{npz,jsonl}` next to the Cohere `teacher_out`, joined by utterance id:
+- TDT soft targets along the greedy path: per joint step the top-8 token log-probs (blank included, column 0 = the
+  emitted token), the 5 duration log-probs, the encoder frame, the applied duration and whether the guard fired;
+- the CTC head: log p(blank) on every 80 ms frame, plus the top-8 classes on frames with p(blank) < 0.95;
+- per utterance in the jsonl: the TDT and CTC hypotheses, their CER against the dataset transcript, and counts.
+
+About 1.34 MB per audio hour (~17.5 GB for the full ~13k h). The format (array names, shapes, dtypes, the settings in
+`meta.json`) is documented in the docstring of [kitsune/parakeet_targets.py](kitsune/parakeet_targets.py), which also
+has the loader (`load_shard`) and the checker (`check_shard`). Parakeet was trained on ReazonSpeech, so its reazon
+targets are in-training-data predictions. No trainer reads `parakeet_out` yet. The same pass's TDT hypothesis is the
+second opinion that judges Galgame in `second_out` (the `model2` field of each row names the judge).
 
 ## Setup
 
