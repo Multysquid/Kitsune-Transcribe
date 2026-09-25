@@ -50,3 +50,10 @@ second_out_smoke/
 students/
 cache/
 selection/
+
+# --- label box (labels/full is parked on HF; seed/: the laptop labels it adopts; models/: the Parakeet upload) ---
+labels/
+seed/
+models/
+parakeet_out/
+parakeet_out_smoke/

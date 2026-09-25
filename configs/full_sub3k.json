@@ -1,0 +1,16 @@
+{
+  "_comment": "An example subset of the full label extent (~3.4k h): reazon_large's first 216 of 705 inputs (~1,501 h), galgame's first 16 of 115 tars (~744 h), emilia_yodas whole (~1,084 h) and reazon_small (~100 h). Its label files are a subset of configs/full.json's (the same extent root; kitsune/extent.py within), so it needs no labelling: the A100 rebuilds only this prefix of the canonical ingest sequence and pulls only its stems, and its selection is derived from the full one (python scripts/make_selection.py --config configs/full_sub3k.json --from-selection labels/full/selections/full.parquet). The trainer sections inherit DEFAULTS; the A100 training recipe is decided in the A100 plan.",
+  "run_name": "full-sub3k-b20x2560",
+  "student": "students/b20x2560-d4",
+  "data_root": "data",
+  "teacher_root": "labels/full/teacher_out",
+  "second_root": "labels/full/second_out",
+  "parakeet_root": "labels/full/parakeet_out",
+  "selection": "labels/full/selections/full_sub3k.parquet",
+  "extent": {"name": "full", "root": "labels/full", "inputs": {"reazon_large": 216, "galgame": 16}},
+  "sources": ["reazon_small", "reazon_large", "emilia_yodas", "galgame"],
+  "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia", "galgame"],
+  "selection_recipe": {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "eval_emilia=0.2"],
+                       "filter_eval_sets": ["eval_emilia", "galgame"], "partial_second_opinion": []},
+  "mix": "natural"
+}
