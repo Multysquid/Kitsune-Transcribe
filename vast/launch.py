@@ -178,6 +178,13 @@ def git(*args: str) -> str:
     return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True, check=True).stdout.strip()
 
 
+def config_at(sha: str, config: str) -> dict:
+    """The run config the box runs: the file committed at `sha` (KITSUNE_SHA), not the working tree's, which differs
+    for a --sha other than HEAD. Read as UTF-8 bytes (git()'s text mode decodes with the locale's code page)."""
+    out = subprocess.run(["git", "-C", str(ROOT), "show", f"{sha}:{config}"], capture_output=True, check=True).stdout
+    return json.loads(out.decode("utf-8"))
+
+
 def git_checks(sha: str, config: str) -> list[str]:
     """Problems that would make the box fail after it is already billing."""
     problems = []
@@ -453,9 +460,14 @@ def main(argv: list[str] | None = None) -> int:
 
     data_rev = None
     if not args.no_hf_check:
-        cfg = json.loads((ROOT / args.config).read_text(encoding="utf-8"))
-        data_rev, problems = hf_preflight(args.data_repo, args.out_repo, cfg)
-        errors += problems
+        try:
+            cfg = config_at(sha, args.config)
+        except (subprocess.CalledProcessError, OSError, ValueError) as e:
+            errors.append(f"cannot read {args.config} at {sha[:12]} ({type(e).__name__}), so the HF preflight did "
+                          f"not run")
+        else:
+            data_rev, problems = hf_preflight(args.data_repo, args.out_repo, cfg)
+            errors += problems
     stub = ONSTART.read_bytes()
     if len(stub) > ONSTART_MAX_BYTES:
         errors.append(f"{ONSTART.name} is {len(stub)} bytes (> {ONSTART_MAX_BYTES}): vast may truncate the on-start "

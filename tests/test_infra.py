@@ -720,6 +720,41 @@ def test_launch_runs_the_checks_without_vastai(monkeypatch, capsys):
     assert "must be pinned by digest" in out and "pip install vastai==" in out
 
 
+def test_launch_preflights_the_config_the_box_runs(tmp_path, monkeypatch, capsys):
+    """The HF preflight read the working tree's config, while the box runs the one committed at --sha (KITSUNE_SHA):
+    with a --sha other than HEAD, launch checked one selection/eval sets and rented a box that runs another."""
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+    repo, name = tmp_path / "repo", "configs/viability.json"
+    (repo / "configs").mkdir(parents=True)
+    empty = tmp_path / "gitconfig"
+    empty.write_text("", encoding="utf-8")
+    genv = dict(os.environ, GIT_CONFIG_GLOBAL=str(empty), GIT_CONFIG_NOSYSTEM="1", GIT_AUTHOR_NAME="t",
+                GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+
+    def commit(selection: str) -> str:
+        (repo / name).write_text(json.dumps({"selection": selection}), encoding="utf-8")
+        for cmd in (["add", name], ["commit", "-q", "-m", selection]):
+            subprocess.run(["git", "-C", str(repo), *cmd], check=True, capture_output=True, env=genv)
+        return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
+                              text=True, env=genv).stdout.strip()
+
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True, env=genv)
+    sha_a = commit("selection/A.parquet")
+    commit("selection/B.parquet")  # HEAD and the working tree
+    seen = []
+    monkeypatch.setattr(launch, "ROOT", repo)
+    monkeypatch.setattr(launch, "hf_preflight", lambda data, out, cfg: (seen.append(cfg), (None, []))[1])
+    monkeypatch.setattr(launch.shutil, "which", lambda name: None)
+    args = [a for a in launch_args() if a != "--no-hf-check"]
+    args[args.index("--sha") + 1] = sha_a
+    assert launch.main(args) == 2 and seen == [{"selection": "selection/A.parquet"}]
+    capsys.readouterr()
+    args[args.index("--sha") + 1] = "0" * 40  # not in this clone (--skip-git-checks): a listed problem, no traceback
+    assert launch.main(args) == 2 and len(seen) == 1
+    assert f"cannot read {name} at 000000000000" in capsys.readouterr().out
+
+
 class FakeRegistry:
     """urllib.request.urlopen for ghcr.io: an anonymous token, an image index (an attestation entry first, then the
     linux/amd64 image), that image's manifest and its config blob with the given labels."""
