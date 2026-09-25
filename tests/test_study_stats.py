@@ -6,7 +6,10 @@ ratio between two systems is exactly the ratio of their multipliers, in the full
 replicate (v_boot = 0). The CI is then ln r +- 1.96 sqrt(k) sigma_run, and each call is a known function of m: at
 sigma_run 1.6 % and delta 10 %, a student-student r is WITHIN up to exp(ln 1.1 - 0.0443) = 1.052 and OUTSIDE from
 exp(ln 1.1 + 0.0443) = 1.150. The noise model itself is checked by Monte Carlo (the STUDY.md 4.5 table; coverage of
-the bootstrap CI on sampled utterances)."""
+the bootstrap CI on sampled utterances). The readers of the invalidation checks' inputs are tested on the layouts the
+study really produces: kitsune.prereg's PREREG.json (inline copy of its shape; its own rules() once it is on the
+branch) and the trainer's runs root."""
+import hashlib
 import importlib.util
 import json
 import math
@@ -359,12 +362,18 @@ def test_manifest_shapes_and_the_prereg_hashes():
     with pytest.raises(ss.ManifestError, match="view neutral"):
         ss.parse_manifest({"sets": {"galgame": {"ids": g, "ids_sha256": ids_sha256(g)}},
                            "galgame_views": {"neutral": {"ids": g[:1], "ids_sha256": "0" * 64}}})
-    hashes = ss.prereg_manifest_hashes({"manifest": {"eval_jsut": ids_sha256(ids), "path": "x", "file": "0" * 64,
-                                                     "galgame": {"ids_sha256": ids_sha256(g)}}})
-    assert hashes == {"eval_jsut": ids_sha256(ids), "galgame": ids_sha256(g)}
-    assert ss.manifest_check(m, hashes)["status"] == "pass"
-    assert ss.manifest_check(m, {"eval_jsut": "f" * 64})["status"] == "fail"
-    assert ss.manifest_check(m, {})["status"] == "pass"
+    pm = ss.prereg_manifest({"manifest": {"eval_jsut": ids_sha256(ids), "path": "x", "file": "0" * 64,
+                                          "galgame": {"ids_sha256": ids_sha256(g)}}})
+    assert pm["sets"] == {"eval_jsut": ids_sha256(ids), "galgame": ids_sha256(g)} and pm["status"] == "filled"
+    chk = ss.manifest_check(m, pm)
+    assert chk["status"] == "pass" and "views not compared" in chk["detail"]
+    assert ss.manifest_check(m, ss.prereg_manifest({"manifest": {"eval_jsut": "f" * 64}}))["status"] == "fail"
+    # nothing compared is never a pass: no PREREG, a pending block, a filled block without a readable hash
+    assert ss.manifest_check(m, ss.prereg_manifest(None))["status"] == "not_checked"
+    pending = {"manifest": {"status": "pending", "ids_sha256": {"eval_jsut": "pending"}}}
+    assert ss.manifest_check(m, ss.prereg_manifest(pending))["status"] == "not_checked"
+    unreadable = {"manifest": {"status": "filled", "ids_sha256": {"train": "c" * 64}}}
+    assert ss.manifest_check(m, ss.prereg_manifest(unreadable))["status"] == "fail"
     assert ss.prereg_baselines({"baselines": {"parakeet-ctc": {"eval_jsut": 0.065, "note": "card", "pct": 6.5}}}) == {
         "parakeet-ctc": {"eval_jsut": 0.065}}
 
@@ -409,13 +418,19 @@ def test_invalidation_checks_from_the_numbers():
     assert ss.lr_edge_check(edge)["status"] == "fail"
     assert ss.loader_check(ok)["status"] == "pass"
     assert ss.loader_check({"calibration": {"study-t06": {"data_wait_frac": 0.07}}})["status"] == "fail"
-    summ = {"study-t06": {"steps": 9366, "started_utc": "2026-10-01T01:00:00+00:00"}, "study-t06-half": {"steps": 4683}}
+    summ = {"study-t06": {"steps": 9366, "started_utc": "2026-10-01T01:00:00+00:00"},
+            "study-t06-half": {"steps": 4683, "started_utc": "20261001T050000Z"}}
     assert ss.max_steps_check(ok, summ)["status"] == "pass"
     assert ss.max_steps_check(ok, {"study-t06": {"steps": 9000}})["status"] == "fail"
     assert ss.max_steps_check(None, summ)["status"] == "not_checked"
     assert ss._timing_check(ok, summ)["status"] == "pass"
     assert ss._timing_check({**ok, "written_utc": "2026-10-02T00:00:00+00:00"}, summ)["status"] == "fail"
-    assert ss.selection_check({"a": {"selection_sha256": "x"}, "b": {"selection_sha256": "y"}})["status"] == "fail"
+    # times compare as times: 01:00:00.5 is after 01:00:00Z, though ".5+00:00" sorts before "Z" as text
+    assert ss._timing_check({"written_utc": "2026-10-01T01:00:00Z"},
+                            {"study-t06": {"started_utc": "2026-10-01T01:00:00.500+00:00"}})["status"] == "pass"
+    assert ss._timing_check(ok, {**summ, "study-t03": {"steps": 1}})["status"] == "not_checked"  # a start unknown
+    assert ss.selection_check({"study-t06": {"selection_sha256": "x"},
+                               "study-t03": {"selection_sha256": "y"}})["status"] == "fail"
 
 
 def test_teacher_baseline_check():
@@ -431,11 +446,196 @@ def test_teacher_baseline_check():
     far = {"eval_jsut": got["eval_jsut"] + 0.001}
     assert ss.teacher_baseline_check(st, {"cohere": far}, defaults={})["status"] == "fail"
     # PREREG.json's numbers override the evaluator's set by set (JSUT and CV8 here; Reazon keeps 6.28 %, which the
-    # planted teacher misses); a teacher without a table is listed, not failed
+    # planted teacher misses); a teacher without a table is listed as not compared, not failed
     chk = ss.teacher_baseline_check(st, {"cohere": got, "parakeet-ctc": {"eval_jsut": 0.065}})
     assert chk["status"] == "fail"
     assert [r["set"] for r in chk["rows"] if not r["ok"]] == ["eval_reazon"]
-    assert "parakeet-ctc/eval_jsut" not in chk["detail"]
+    assert chk["missing"] == ["parakeet-ctc/eval_jsut"]
+    # ...and without a mismatch, that teacher keeps the check from passing
+    chk = ss.teacher_baseline_check(st, {"cohere": got, "parakeet-ctc": {"eval_jsut": 0.065}}, defaults={})
+    assert chk["status"] == "not_checked" and "parakeet-ctc/eval_jsut" in chk["detail"]
+
+
+def wp1_prereg(man: ss.Manifest | None = None, baselines: dict | None = None, manifest_sha: str = "b" * 64) -> dict:
+    """The blocks of study/PREREG.json the report reads, in kitsune.prereg's layout (WP1): the numbers sit among prose
+    (limit_rule.replicate is a sentence), the manifest and baselines stay "pending" until the selection's sidecar
+    fills them, the teachers are parakeet_ctc / parakeet_tdt and the Galgame views galgame:<view>. With man: the
+    manifest block filled from it (kitsune.prereg._fill's shape); with baselines: that block filled."""
+    p = {"branch": {"end_frac": 0.5, "resume_frac": 0.4, "t_c": "the resume step"},
+         "limit_rule": {"delta": 0.1, "delta_reported": [0.05, 0.1, 0.2], "ratio": "r_s = M4_s / M4_top",
+                        "calls": {"WITHIN": "the CI's upper end <= ln(1 + delta)"},
+                        "replicate": "study-t01-s1235 feeds sigma_run only; the walk uses study-t01"},
+         "noise": {"bootstrap": {"B": 10000, "kind": "paired utterance bootstrap, stratified", "seed": 1234},
+                   "sigma_prior": 0.016, "sigma_rule": "sigma_run = max(0.016, the replicate's estimate)"},
+         "cohere_prereg": {"eval_jsut": 0.083, "tolerance_pp": 0.05},
+         "practical_bars": ["the smallest student within 1.2x and within 1.5x of its own teacher on M4"],
+         "manifest": {"status": "pending", "manifest_sha256": "pending", "selection_sha256": "pending",
+                      "ids_sha256": {"train": "pending", "eval_jsut": "pending"},
+                      "galgame_views": {"neutral": {"n": "pending", "ids_sha256": "pending"}}},
+         "baselines": {"status": "pending", "fill": "the sidecar's baselines",
+                       "cohere": {"eval_jsut": "pending", "galgame:neutral": "pending", "m4": "pending"},
+                       "parakeet_ctc": {"eval_jsut": "pending"}}}
+    if man is not None:
+        p["manifest"] = {"status": "filled", "from": "labels/full/selections/study_1000h.parquet",
+                         "selection_sha256": "a" * 64, "manifest_sha256": manifest_sha,
+                         "ids_sha256": {"train": "c" * 64, "probe": "d" * 64, **man.sha256},
+                         "n": {s: len(v) for s, v in man.sets.items()},
+                         "galgame_views": {v: {"n": len(ids), "ids_sha256": ids_sha256(ids)}
+                                           for v, ids in man.views.items()}}
+    if baselines is not None:
+        p["baselines"] = {"status": "filled", "from": "the sidecar's baselines on the manifest rows", **baselines}
+    return p
+
+
+def test_settings_and_manifest_from_kitsune_prereg_layout():
+    """kitsune.prereg's PREREG.json: its numbers are found among the prose (its string limit_rule.replicate once
+    crashed the report), a pending manifest block compares nothing (not_checked), a filled one compares every eval
+    set's, every Galgame view's and the manifest file's hash."""
+    tables, manifest = planted(PLANT)
+    man = ss.parse_manifest(manifest)
+    p = wp1_prereg()
+    st, src = ss.settings_from_prereg(p)
+    assert (st["delta_primary"], st["deltas"], st["sigma_run_prior"], st["boot_b"], st["boot_seed"],
+            st["branch_end_frac"]) == (0.1, [0.05, 0.1, 0.2], 0.016, 10_000, 1234, 0.5)
+    assert src["deltas"] == "PREREG.json:limit_rule.delta_reported"
+    assert src["sigma_run_prior"] == "PREREG.json:noise.sigma_prior"
+    assert src["boot_b"] == "PREREG.json:noise.bootstrap.B"
+    assert st["replicate"] == ["study-t01-s1235", "study-t01"]
+    assert src["replicate"].startswith("default") and "skipped PREREG.json:limit_rule.replicate" in src["replicate"]
+    # in an "analysis" block, a value of the wrong type is an error, not prose
+    with pytest.raises(ValueError, match="replicate"):
+        ss.settings_from_prereg({"analysis": {"sigma_run": {"replicate": "study-t01-s1235"}}})
+    assert ss.prereg_manifest(p)["status"] == "pending" and ss.prereg_baselines(p) == {}
+    assert ss.manifest_check(man, ss.prereg_manifest(p))["status"] == "not_checked"
+    pm = ss.prereg_manifest(wp1_prereg(man))
+    assert pm["sets"] == man.sha256 and pm["views"] == man.view_sha256 and set(pm["sets"]) == set(SIZES)
+    assert (pm["manifest_sha256"], pm["selection_sha256"]) == ("b" * 64, "a" * 64)
+    assert ss.manifest_check(man, pm, "b" * 64)["status"] == "pass"
+    chk = ss.manifest_check(man, pm, "e" * 64)
+    assert chk["status"] == "fail" and "manifest file" in chk["detail"]
+    # a different neutral view (the one M4 uses) is a different manifest, though every eval set's ids are the same
+    other = json.loads(json.dumps(manifest))
+    other["galgame_views"]["neutral"] = other["galgame_views"]["neutral"][1:]
+    chk = ss.manifest_check(ss.parse_manifest(other), pm, "b" * 64)
+    assert chk["status"] == "fail" and "Galgame view neutral" in chk["detail"]
+    # and a set the pre-registration never listed
+    keep = [k for k in man.sets if k != "eval_emilia"]
+    fewer = ss.prereg_manifest(wp1_prereg(ss.Manifest(sets={k: man.sets[k] for k in keep},
+                                                      sha256={k: man.sha256[k] for k in keep},
+                                                      views=man.views, view_sha256=man.view_sha256)))
+    chk = ss.manifest_check(man, fewer, "b" * 64)
+    assert chk["status"] == "fail" and "eval_emilia: in the manifest, not pre-registered" in chk["detail"]
+
+
+def test_teacher_baselines_under_kitsune_prereg_names():
+    """PREREG.json's parakeet_ctc / galgame:<view> / m4 baselines are compared with the parakeet-ctc tables, the
+    galgame_<view> strata and the M4 metric, and a mismatch there fails; a listed teacher without a table does not
+    pass."""
+    tables, manifest = planted({"cohere": 1.0, "parakeet-ctc": 1.1, "study-t06": 1.2})
+    st = ss.Study(ss.build_corpus(tables, manifest), dict(boot_b=100))
+
+    def cer(system, stratum):
+        return float(ss.stratum_cer(st.point, stratum)[st.corpus.index(system)])
+
+    b = {sysname: {"eval_jsut": cer(t, "eval_jsut"), "galgame:neutral": cer(t, "galgame_neutral"),
+                   "galgame:all": cer(t, "galgame_all"), "m4": st.value(t, "m4")}
+         for sysname, t in (("cohere", "cohere"), ("parakeet_ctc", "parakeet-ctc"))}
+    pb = ss.prereg_baselines(wp1_prereg(baselines=b))
+    assert set(pb) == {"cohere", "parakeet-ctc"}
+    assert set(pb["parakeet-ctc"]) == {"eval_jsut", "galgame_neutral", "galgame_all", "m4"}
+    chk = ss.teacher_baseline_check(st, pb, defaults={})
+    assert chk["status"] == "pass" and len(chk["rows"]) == 8
+    for key, stratum in (("galgame:neutral", "galgame_neutral"), ("m4", "m4")):
+        bad = json.loads(json.dumps(b))
+        bad["parakeet_ctc"][key] += 0.01
+        chk = ss.teacher_baseline_check(st, ss.prereg_baselines(wp1_prereg(baselines=bad)), defaults={})
+        assert chk["status"] == "fail" and f"parakeet-ctc/{stratum}" in chk["detail"]
+    tdt = ss.prereg_baselines(wp1_prereg(baselines={**b, "parakeet_tdt": {"eval_jsut": 0.1}}))
+    chk = ss.teacher_baseline_check(st, tdt, defaults={})
+    assert chk["status"] == "not_checked" and chk["missing"] == ["parakeet-tdt/eval_jsut"]
+
+
+def test_kitsune_prereg_rules_feed_the_report():
+    """kitsune.prereg's own rules(), pending and filled from a sidecar built on the planted manifest, read as the
+    inline layout above (skipped until WP1's kitsune/prereg.py is on the branch)."""
+    kp = pytest.importorskip("kitsune.prereg")
+    tables, manifest = planted({"cohere": 1.0, "parakeet-ctc": 1.1, "study-t06": 1.2})
+    man = ss.parse_manifest(manifest)
+    st = ss.Study(ss.build_corpus(tables, manifest), dict(boot_b=100))
+    pending = json.loads(kp.rules_json(kp.rules()))
+    settings, src = ss.settings_from_prereg(pending)
+    assert (settings["delta_primary"], settings["boot_b"], settings["boot_seed"]) == (0.1, 10_000, 1234)
+    assert src["delta_primary"] != "default (STUDY.md)" and src["boot_b"] != "default (STUDY.md)"
+    assert ss.prereg_manifest(pending)["status"] == "pending"
+
+    def cer(t, k):
+        return {"cer": float(ss.stratum_cer(st.point, k)[st.corpus.index(t)])}
+
+    keys = {"eval_jsut": "eval_jsut", "eval_cv8": "eval_cv8", "galgame:neutral": "galgame_neutral"}
+    sidecar = {"selection": {"path": "s.parquet", "sha256": "a" * 64},
+               "manifest": {"path": "m.json", "sha256": "b" * 64}, "extent": {"name": "full", "inputs": {}},
+               "ids_sha256": {"train": "c" * 64, "probe": "d" * 64, "eval": dict(man.sha256)},
+               "n": {"train": 1, "probe": 1, "eval": {s: len(v) for s, v in man.sets.items()}},
+               "galgame_views": {v: {"n": len(ids), "ids_sha256": ids_sha256(ids)} for v, ids in man.views.items()},
+               "draw": {"drawn_s": 3600.0, "pool_s": 7200.0},
+               "baselines": {name: {**{k: cer(t, s) for k, s in keys.items()}, "m4": st.value(t, "m4")}
+                             for name, t in (("cohere", "cohere"), ("parakeet_ctc", "parakeet-ctc"))}}
+    filled = json.loads(kp.rules_json(kp.rules(sidecar)))
+    assert ss.manifest_check(man, ss.prereg_manifest(filled), "b" * 64)["status"] == "pass"
+    chk = ss.teacher_baseline_check(st, ss.prereg_baselines(filled), defaults={})
+    assert chk["status"] == "pass" and len(chk["rows"]) == 8
+
+
+def test_run_summaries_in_the_trainer_layout(tmp_path):
+    """--run-summaries on the trainer's runs root as it is: stamped run dirs keyed by config.run_name, the newest start
+    of a run name counting, the start time from config.json or the stamp; LR probes skipped by the checks."""
+    tool = study_tool()
+    root = tmp_path / "runs"
+    sel = "labels/full/selections/study_1000h.parquet"
+
+    def run(dirname, run_name, steps, created=None, resumes=0):
+        d = root / dirname
+        d.mkdir(parents=True)
+        cfg = {"run_name": run_name, "selection": sel}
+        summ = {"run_id": dirname, "status": "complete", "steps": steps, "resumes": resumes, "config": cfg}
+        (d / "summary.json").write_text(json.dumps(summ), encoding="utf-8")
+        if created:
+            (d / "config.json").write_text(json.dumps({"run_id": dirname, "created_utc": created, "config": cfg}),
+                                           encoding="utf-8")
+
+    run("study-t06-20261001T010203Z", "study-t06", 900)  # an earlier start that died: superseded
+    run("study-t06-20261001T030000Z", "study-t06", 9366, created="2026-10-01T03:00:00.123+00:00")
+    run("study-t06-half-20261001T080000Z", "study-t06-half", 4683)  # no config.json: the stamp is its start
+    run("probe-scratch-1e-3-20260930T220000Z", "probe-scratch-1e-3", 5000)
+    run("study-t03-20261001T030000Z-1", "study-t03", 5000, resumes=1)
+    summ, notes = tool.load_summaries(root)
+    assert set(summ) == {"study-t06", "study-t06-half", "probe-scratch-1e-3", "study-t03"}
+    assert summ["study-t06"]["steps"] == 9366 and len(notes["superseded"]) == 1
+    assert "20261001T010203Z" in notes["superseded"][0]
+    assert summ["study-t06"]["started_utc"] == "2026-10-01T03:00:00.123+00:00"
+    assert summ["study-t06-half"]["started_utc"] == "20261001T080000Z"
+    numbers = {"max_steps": {"study-t06": 9366, "study-t03": 5000}, "written_utc": "2026-10-01T02:00:00Z"}
+    chk = ss.max_steps_check(numbers, summ)
+    assert chk["status"] == "pass" and chk["skipped"] == ["probe-scratch-1e-3"]
+    # the branch ends at round(end_frac x M) with the PRE-REGISTERED end_frac, whatever its own config says
+    assert ss.max_steps_check(numbers, summ, end_frac=0.6)["status"] == "fail"
+    # a pre-registered run without a summary: not a pass
+    more = {"max_steps": {**numbers["max_steps"], "study-t01": 27000}}
+    assert ss.max_steps_check(more, summ)["status"] == "not_checked"
+    # PREREG_numbers.json against the study runs' starts (the probe started earlier and does not count)
+    assert ss._timing_check(numbers, summ)["status"] == "pass"
+    late = ss._timing_check({"written_utc": "2026-10-01T03:30:00Z"}, summ)
+    assert late["status"] == "fail" and "study-t06'" in late["detail"] and "study-t03" in late["detail"]
+    # T-0.3B resumed once: the resume rule cannot be shown to hold; without it, no study run resumed
+    assert ss.resume_check(summ)["status"] == "not_checked"
+    assert ss.resume_check({k: v for k, v in summ.items() if k != "study-t03"})["status"] == "pass"
+    # the same selection file named by every study run is not proof (no hash); a different file fails
+    assert ss.selection_check(summ)["status"] == "not_checked"
+    other = {**summ, "study-t03": {**summ["study-t03"], "config": {"run_name": "study-t03", "selection": "x.parquet"}}}
+    assert ss.selection_check(other)["status"] == "fail"
+    hashed = {k: {**v, "selection_sha256": "a" * 64} for k, v in summ.items()}
+    assert ss.selection_check(hashed, "a" * 64)["status"] == "pass"
+    assert ss.selection_check(hashed, "f" * 64)["status"] == "fail"
 
 
 # ------------------------------------------------------------------------------------------------ the tool
@@ -497,6 +697,21 @@ def test_study_report_end_to_end(tmp_path):
     assert set(rep["pareto"]["front"]["jg"]) <= {"study-t06", "study-t005", "cohere"}
     md = (out / "report.md").read_text(encoding="utf-8")
     assert "the limit is at or below T-0.3B; T-0.1B unresolved" in md and "## Invalidation checks" in md
+    # kitsune.prereg's layout runs through the tool (its prose limit_rule.replicate once crashed it) and its filled
+    # manifest block is compared, the manifest file's bytes included
+    msha = hashlib.sha256((tmp_path / "m.json").read_bytes()).hexdigest()
+    wp1 = wp1_prereg(ss.parse_manifest(manifest), manifest_sha=msha)
+    (tmp_path / "wp1.json").write_text(json.dumps(wp1), encoding="utf-8")
+    assert tool.main(args + ["--prereg", str(tmp_path / "wp1.json"), "--boot-b", "200", "--no-imitation",
+                             "--out", str(tmp_path / "out3")]) == 0
+    rep3 = json.loads((tmp_path / "out3" / "report.json").read_text(encoding="utf-8"))
+    checks3 = {c["rule"]: c for c in rep3["checks"]}
+    assert checks3["manifest"]["status"] == "pass" and "the file's sha256" in checks3["manifest"]["detail"]
+    assert rep3["settings_sources"]["deltas"] == "PREREG.json:limit_rule.delta_reported"
+    # a PREREG setting out of range is a refusal (exit 2, nothing written), not a traceback
+    (tmp_path / "bad.json").write_text(json.dumps({"analysis": {"delta": 10}}), encoding="utf-8")
+    assert tool.main(args + ["--prereg", str(tmp_path / "bad.json"), "--out", str(tmp_path / "out4")]) == 2
+    assert not (tmp_path / "out4").exists()
     # the 05_evaluate layout on its own: scored from the text, the ignored tf_ file listed
     txt_man = {"sets": manifest["sets"]}
     (tmp_path / "m2.json").write_text(json.dumps(txt_man), encoding="utf-8")

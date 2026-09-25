@@ -41,8 +41,12 @@ and the sizes below are reported descriptively; X is the smallest size that is W
 
 Readouts (4.6, 4.7): g per halving for every ladder step, g = r^(1/h) - 1 with h = log2 of the total-parameter ratio
 (STUDY.md 1.3), CI mapped from ln r's; delta-g on the scratch ladder only; the init effect bridge / T-0.3B; the
-distillation gaps; the T/2 vs T budget readout; the practical bars; a Pareto set over CER, A100 RTF and VRAM; the
-anchor regression flag; and the section-7 invalidation rules as far as the inputs show them (checks()).
+distillation gaps (with g over the teacher -> student halvings, outside the walk); the T/2 vs T budget readout; the
+practical bars; a Pareto set over CER, A100 RTF and VRAM; the anchor regression flag; and the section-7 invalidation
+rules as far as the inputs show them (analyse()'s checks: pass, fail or not_checked, and never a pass that compared
+nothing). The PREREG readers (settings_from_prereg, prereg_baselines, prereg_manifest) read kitsune.prereg's
+PREREG.json as it is written: numbers among prose, parakeet_ctc / galgame:<view> keys, a manifest block "pending"
+until the labels are sealed.
 
 Everything here is numpy on CPU: the analysis of 22 systems on the full manifest at B = 10,000 takes about 5 s (plus
 a second per system for the imitation CER); importing kitsune.evaluate (torch) is the slowest part of a report.
@@ -52,6 +56,7 @@ from __future__ import annotations
 import math
 import zlib
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Iterable, Mapping, Sequence
 
 import numpy as np
@@ -72,11 +77,12 @@ Z = 1.96
 TEACHER_BARS = (1.2, 1.5)  # the practical bars against the own teacher (4.7)
 ANCHOR_FLAG_REL = 0.05  # 4.1: T-0.6B worse than the anchor by more than 5 % relative, paired CI excluding 0
 DATA_WAIT_MAX = 0.05  # 6.2: calibration must not be loader-bound
+BRANCH_END_FRAC = 0.5  # 2.5: the T/2 branch ends at round(0.5 x max_steps)
 
 DEFAULT_SETTINGS = dict(delta_primary=DELTA_PRIMARY, deltas=list(DELTAS), sigma_run_prior=SIGMA_RUN_PRIOR,
                         sigma_hat_factor=SIGMA_HAT_FACTOR, boot_b=BOOT_B, boot_seed=BOOT_SEED, z=Z,
                         teacher_bars=list(TEACHER_BARS), anchor_flag_rel=ANCHOR_FLAG_REL,
-                        replicate=["study-t01-s1235", "study-t01"])
+                        replicate=["study-t01-s1235", "study-t01"], branch_end_frac=BRANCH_END_FRAC)
 
 # ------------------------------------------------------------------------------------------------ sets and metrics
 
@@ -165,6 +171,12 @@ GAPS = (("transcribe", "study-t06", "cohere"), ("parakeet", "study-p03", "parake
 
 def base_run(system: str) -> str:
     return system[: -len(HALF)] if system.endswith(HALF) else system
+
+
+def is_study_run(name: str) -> bool:
+    """One of the study's 9 runs or its T/2 branch; not an LR probe (probe-*), the anchor or another run that shares
+    the runs root."""
+    return base_run(name) in RUNS
 
 
 def is_trained(system: str) -> bool:
@@ -294,6 +306,7 @@ class Manifest:
     sets: dict[str, list[str]]  # eval set -> ordered ids
     sha256: dict[str, str]
     views: dict[str, list[str]] = field(default_factory=dict)  # Galgame view -> ids
+    view_sha256: dict[str, str] = field(default_factory=dict)  # Galgame view -> ids_sha256 of its ids (PREREG compares)
 
 
 def _ids_and_sha(v) -> tuple[list[str], str | None]:
@@ -334,7 +347,7 @@ def parse_manifest(obj: Mapping) -> Manifest:
         sets[name], sha[name] = ids, h
     if not sets:
         raise ManifestError("the manifest holds no eval set")
-    views = {}
+    views, view_sha = {}, {}
     for vname, v in views_obj.items():
         ids, h = _ids_and_sha(v)
         if h is not None and ids_sha256(ids) != h:
@@ -345,8 +358,8 @@ def parse_manifest(obj: Mapping) -> Manifest:
         if extra:
             raise ManifestError(f"manifest Galgame view {vname}: {len(extra)} ids are not in the {GALGAME} set, "
                                 f"e.g. {sorted(extra)[:3]}")
-        views[vname] = ids
-    return Manifest(sets=sets, sha256=sha, views=views)
+        views[vname], view_sha[vname] = ids, ids_sha256(ids)
+    return Manifest(sets=sets, sha256=sha, views=views, view_sha256=view_sha)
 
 
 @dataclass
@@ -859,35 +872,48 @@ def check(name: str, status: str, detail: str, **extra) -> dict:
 
 def teacher_baseline_check(study: Study, prereg_baselines: Mapping[str, Mapping[str, float]] | None,
                            defaults: Mapping[str, Mapping[str, float]] | None = None) -> dict:
-    """The teacher baselines reproduce: Cohere's corpus CER on each gate set within BASELINE_TOL (0.05 pp) of the
-    pre-registered number (defaults: kitsune.evaluate.TEACHER_CER_PREREG; PREREG.json's "baselines" override and
-    extend them), and every other teacher's pre-registered number (PREREG.json baselines) likewise."""
+    """The teacher baselines reproduce (7): every pre-registered teacher number within BASELINE_TOL (0.05 pp) of the
+    measured one. The numbers: kitsune.evaluate's (Cohere's gate sets, TEACHER_CER_PREREG; Parakeet CTC's
+    PARAKEET_CTC_CER_PREREG once the evaluator has it), overridden and extended by PREREG.json's "baselines"
+    (prereg_baselines(): per teacher, per stratum, and "m4" against the M4 metric). "pass" only when EVERY listed
+    number was compared: a listed teacher without a table, or a stratum the corpus lacks, leaves the check
+    "not_checked" (a mismatch anywhere makes it "fail"); it is never a pass that skipped something."""
     if defaults is None:
         import kitsune.evaluate as ev
 
         # PARAKEET_CTC_CER_PREREG arrives with the evaluator's family switch (WP5b); read it when it is there
         defaults = {"cohere": TEACHER_CER_PREREG, "parakeet-ctc": getattr(ev, "PARAKEET_CTC_CER_PREREG", None) or {}}
-    want = {k: dict(v) for k, v in defaults.items() if v}
+    want = {k: {s: (float(v), "kitsune.evaluate") for s, v in sets.items()} for k, sets in defaults.items() if sets}
     for sysname, sets in (prereg_baselines or {}).items():
-        want[sysname] = {**want.get(sysname, {}), **{k: float(v) for k, v in sets.items()}}
+        want[sysname] = {**want.get(sysname, {}), **{k: (float(v), "PREREG.json") for k, v in sets.items()}}
     rows, fails, missing = [], [], []
     for sysname, sets in want.items():
-        for s, v in sets.items():
-            if not study.has(sysname) or s not in study.point.ref:
+        for s, (v, source) in sets.items():
+            got = None
+            if study.has(sysname):
+                if s == "m4":
+                    got = study.value(sysname, "m4")
+                elif s in study.point.ref:
+                    got = _f(stratum_cer(study.point, s)[study.corpus.index(sysname)])
+            if got is None:
                 missing.append(f"{sysname}/{s}")
                 continue
-            got = _f(stratum_cer(study.point, s)[study.corpus.index(sysname)])
-            ok = got is not None and abs(got - v) <= BASELINE_TOL
-            rows.append(dict(system=sysname, set=s, prereg=v, measured=got, ok=ok))
+            ok = abs(got - v) <= BASELINE_TOL
+            rows.append(dict(system=sysname, set=s, prereg=v, measured=got, ok=ok, source=source))
             if not ok:
                 fails.append(f"{sysname}/{s}: {_pct(got)} vs {_pct(v)}")
+    tol = f"{BASELINE_TOL * 100:.2f} pp"
+    unseen = f"{len(missing)} pre-registered baselines could not be compared (no table, or no such set): " \
+             f"{', '.join(missing)}" if missing else ""
     if fails:
-        return check("teacher_baselines", "fail", "baselines do not reproduce: " + "; ".join(fails), rows=rows)
-    if not rows:
-        return check("teacher_baselines", "not_checked", "no teacher table for a pre-registered baseline", rows=rows)
-    tail = f" ({', '.join(missing)} not in the tables)" if missing else ""
-    return check("teacher_baselines", "pass", f"{len(rows)} baselines within {BASELINE_TOL * 100:.2f} pp" + tail,
-                 rows=rows)
+        return check("teacher_baselines", "fail", "baselines do not reproduce: " + "; ".join(fails)
+                     + (f"; {unseen}" if unseen else ""), rows=rows, missing=missing)
+    if missing or not rows:
+        return check("teacher_baselines", "not_checked",
+                     f"{len(rows)} baselines within {tol}; " + unseen if rows else unseen or "no baseline to compare",
+                     rows=rows, missing=missing)
+    return check("teacher_baselines", "pass", f"all {len(rows)} pre-registered baselines within {tol}", rows=rows,
+                 missing=missing)
 
 
 def lr_edge_check(numbers: Mapping | None) -> dict:
@@ -923,49 +949,130 @@ def loader_check(numbers: Mapping | None, limit: float = DATA_WAIT_MAX) -> dict:
                  else f"data_wait < {limit:.0%} for all {len(cal)} calibrated runs", runs=bad)
 
 
-def max_steps_check(numbers: Mapping | None, summaries: Mapping[str, Mapping] | None) -> dict:
-    """Every run reached its pre-registered max_steps (PREREG_numbers.json max_steps against the trainer's summary
-    "steps"); a run with a summary but no pre-registered number fails too."""
+def _study_summaries(summaries: Mapping[str, Mapping] | None) -> tuple[dict, list[str]]:
+    """(the study runs' summaries, the names of the others: LR probes, the anchor, anything else in the runs root)."""
+    s = summaries or {}
+    return {r: v for r, v in s.items() if is_study_run(r)}, sorted(r for r in s if not is_study_run(r))
+
+
+def max_steps_check(numbers: Mapping | None, summaries: Mapping[str, Mapping] | None,
+                    end_frac: float = 0.5) -> dict:
+    """Every study run reached its pre-registered max_steps (7): PREREG_numbers.json max_steps against the summary's
+    "steps". A T/2 branch ends at round(end_frac x M) (PREREG.json branch.end_frac, not the branch's own config, which
+    could say otherwise; Python's round, as the trainer's frac_step). A study run with a summary but no pre-registered
+    number fails too. Only the study runs count: LR probes, the anchor and other runs in the same runs root are listed
+    as skipped. A pre-registered run without a summary leaves the check not_checked (unless another run fails)."""
     ms = (numbers or {}).get("max_steps")
-    if not ms or not summaries:
-        return check("max_steps", "not_checked", "needs PREREG_numbers.json max_steps and the runs' summaries")
+    runs, skipped = _study_summaries(summaries)
+    if not ms or not runs:
+        return check("max_steps", "not_checked", "needs PREREG_numbers.json max_steps and the study runs' summaries",
+                     skipped=skipped)
     bad, rows = [], {}
-    for run, summ in summaries.items():
+    for run, summ in runs.items():
         target = ms.get(base_run(run))
         steps = summ.get("steps")
-        if run.endswith(HALF):
-            target = None if target is None else round(0.5 * int(target))  # the branch ends at round(0.5 M)
+        if run.endswith(HALF) and target is not None:
+            target = int(round(float(end_frac) * int(target)))
         rows[run] = dict(steps=steps, max_steps=target)
         if target is None or steps is None or int(steps) != int(target):
             bad.append(f"{run}: {steps} of {target}")
-    return check("max_steps", "fail" if bad else "pass",
-                 "; ".join(bad) if bad else f"{len(rows)} runs at their max_steps", runs=rows)
+    absent = sorted(r for r in ms if r not in runs)
+    tail = (f"; no summary for {absent}" if absent else "") + (f"; skipped (not study runs): {skipped}" if skipped
+                                                                else "")
+    if bad:
+        return check("max_steps", "fail", "; ".join(bad) + tail, runs=rows, absent=absent, skipped=skipped)
+    return check("max_steps", "not_checked" if absent else "pass", f"{len(rows)} runs at their max_steps" + tail,
+                 runs=rows, absent=absent, skipped=skipped)
 
 
-def manifest_check(man: Manifest, prereg_hashes: Mapping[str, str] | None) -> dict:
-    """The tables all matched the manifest (build_corpus refuses otherwise); the manifest's hashes must also equal
-    the ones PREREG.json froze, when it lists them."""
-    if not prereg_hashes:
-        return check("manifest", "pass", f"every table matches the manifest ({len(man.sets)} sets); PREREG.json "
-                                         f"lists no manifest hashes to compare")
-    bad = [s for s, h in prereg_hashes.items() if man.sha256.get(s) not in (None, h)]
-    miss = [s for s in prereg_hashes if s not in man.sha256]
-    if bad or miss:
-        return check("manifest", "fail", f"manifest hashes differ from PREREG.json for {bad}"
-                     + (f"; not in the manifest: {miss}" if miss else ""))
-    return check("manifest", "pass", f"every table matches the manifest, whose {len(prereg_hashes)} hashes equal "
-                                     f"PREREG.json's")
+def manifest_check(man: Manifest, prereg: Mapping | None, manifest_file_sha256: str | None = None) -> dict:
+    """The manifest the tables matched (build_corpus refuses any other) is the one PREREG.json froze (7: "a selection
+    or manifest hash differs"). prereg is prereg_manifest(): every eval set's ids sha256 and every Galgame view's
+    (M4 depends on the neutral one) must equal PREREG's, the manifest may hold no set PREREG does not list and lack
+    none it does, and the manifest file's own sha256 must equal PREREG's manifest_sha256 when both are known. A
+    PREREG manifest block that is absent or still pending leaves the check not_checked; a filled one from which no
+    hash can be read fails. Never a pass that compared nothing."""
+    tables = f"every table matches the manifest ({len(man.sets)} sets)"
+    p = prereg or {}
+    status = p.get("status")
+    if status in (None, "absent"):
+        return check("manifest", "not_checked", f"{tables}; PREREG.json has no manifest hashes to compare it with")
+    if status == "pending":
+        return check("manifest", "not_checked", f"{tables}; PREREG.json's manifest block is still pending")
+    sets, views, file_sha = p.get("sets") or {}, p.get("views") or {}, p.get("manifest_sha256")
+    if not (sets or views or file_sha):
+        return check("manifest", "fail", f"PREREG.json's manifest block ({status}) holds no hash this report can read")
+    bad = []
+    for s in sorted(set(sets) | set(man.sha256)):
+        if s not in man.sha256:
+            bad.append(f"{s}: pre-registered, not in the manifest")
+        elif s not in sets:
+            bad.append(f"{s}: in the manifest, not pre-registered")
+        elif sets[s] != man.sha256[s]:
+            bad.append(f"{s}: ids hash {man.sha256[s][:12]}, pre-registered {sets[s][:12]}")
+    mv = dict(man.view_sha256)
+    if GALGAME in man.sha256 and "all" in views:
+        mv.setdefault("all", man.sha256[GALGAME])  # no "all" view: it is the whole Galgame set (_strata_ids)
+    for v in sorted(set(views) | (set(mv) if views else set())):
+        if v not in mv:
+            bad.append(f"Galgame view {v}: pre-registered, not in the manifest")
+        elif v not in views:
+            bad.append(f"Galgame view {v}: in the manifest, not pre-registered")
+        elif views[v] != mv[v]:
+            bad.append(f"Galgame view {v}: ids hash {mv[v][:12]}, pre-registered {views[v][:12]}")
+    notes = [] if views or not man.view_sha256 else ["PREREG.json lists no Galgame view hashes: views not compared"]
+    if file_sha and manifest_file_sha256:
+        if file_sha != manifest_file_sha256:
+            bad.append(f"the manifest file hashes to {manifest_file_sha256[:12]}, pre-registered {file_sha[:12]}")
+    elif file_sha:
+        notes.append("the manifest file's own sha256 was not compared (no file given)")
+    if bad:
+        return check("manifest", "fail", "the manifest differs from PREREG.json: " + "; ".join(bad))
+    what = [f"{len(sets)} set hashes"] + ([f"{len(views)} Galgame view hashes"] if views else []) \
+        + (["the file's sha256"] if file_sha and manifest_file_sha256 else [])
+    return check("manifest", "pass", f"{tables}; {', '.join(what)} equal PREREG.json's"
+                 + "".join(f"; {n}" for n in notes))
 
 
-def selection_check(summaries: Mapping[str, Mapping] | None) -> dict:
-    """One selection for every run: the summaries' selection_sha256 (when they carry one) must all be equal."""
-    shas = {r: s.get("selection_sha256") for r, s in (summaries or {}).items() if s.get("selection_sha256")}
-    if not shas:
-        return check("selection", "not_checked", "no selection_sha256 in the runs' summaries")
-    distinct = sorted(set(shas.values()))
-    return check("selection", "pass" if len(distinct) == 1 else "fail",
-                 f"{len(shas)} runs on one selection" if len(distinct) == 1
-                 else f"{len(distinct)} different selections: " + ", ".join(f"{r}={h[:12]}" for r, h in shas.items()))
+def selection_check(summaries: Mapping[str, Mapping] | None, prereg_selection: str | None = None) -> dict:
+    """One selection for every study run (7): the summaries' selection_sha256, when they carry one, all equal (and
+    equal to PREREG.json's manifest.selection_sha256 when that is filled). Without a hash in the summaries, the runs'
+    config.selection paths must at least agree: a different file is a different selection (fail); agreeing paths leave
+    the check not_checked (the same path is not proof of the same bytes)."""
+    runs, _ = _study_summaries(summaries)
+    shas = {r: s.get("selection_sha256") for r, s in runs.items() if s.get("selection_sha256")}
+    if shas:
+        distinct = sorted(set(shas.values()))
+        bad = len(distinct) > 1 or (prereg_selection is not None and distinct[0] != prereg_selection)
+        return check("selection", "fail" if bad else "pass",
+                     (f"selections differ (PREREG.json: {str(prereg_selection)[:12]}): " if bad else
+                      f"{len(shas)} runs on one selection" + (", PREREG.json's" if prereg_selection else "") + ": ")
+                     + ", ".join(f"{r}={h[:12]}" for r, h in sorted(shas.items())))
+    paths = {r: (s.get("config") or {}).get("selection") for r, s in runs.items()}
+    paths = {r: p for r, p in paths.items() if p}
+    if len(set(paths.values())) > 1:
+        return check("selection", "fail", "the runs name different selection files: "
+                     + ", ".join(f"{r}={p}" for r, p in sorted(paths.items())))
+    return check("selection", "not_checked", "no selection_sha256 in the study runs' summaries"
+                 + (f"; all {len(paths)} runs name {next(iter(paths.values()))}" if paths else ""))
+
+
+def resume_check(summaries: Mapping[str, Mapping] | None) -> dict:
+    """No study run resumed with a changed config (7). The trainer refuses a resume that changes a RESUME_FIXED key;
+    the eval outputs cannot show what else a resume overrode, but a run that never resumed cannot have: every study
+    summary with resumes == 0 passes the rule, a resumed run leaves it not_checked (read its resume events)."""
+    runs, _ = _study_summaries(summaries)
+    if not runs:
+        return check("resume_config", "not_checked", "no study run summaries")
+    unknown = sorted(r for r, s in runs.items() if not isinstance(s.get("resumes"), int))
+    resumed = {r: s["resumes"] for r, s in runs.items() if isinstance(s.get("resumes"), int) and s["resumes"] > 0}
+    if unknown or resumed:
+        return check("resume_config", "not_checked",
+                     (f"resumed: {dict(sorted(resumed.items()))} (the trainer refuses a changed RESUME_FIXED key; "
+                      f"other overrides are in their resume events)" if resumed else "")
+                     + ("; " if unknown and resumed else "") + (f"no resumes count for {unknown}" if unknown else ""),
+                     resumed=resumed)
+    return check("resume_config", "pass", f"none of the {len(runs)} study runs was resumed")
 
 
 def _pct(x) -> str:
@@ -978,12 +1085,14 @@ def _pct(x) -> str:
 def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[str, int] | None = None,
             speed: Mapping[str, Mapping] | None = None, numbers: Mapping | None = None,
             summaries: Mapping[str, Mapping] | None = None, prereg_baselines: Mapping | None = None,
-            prereg_hashes: Mapping[str, str] | None = None, imitation: bool = True) -> dict:
+            prereg_manifest: Mapping | None = None, manifest_file_sha256: str | None = None,
+            imitation: bool = True) -> dict:
     """Everything the study reports from its eval results, as one JSON-able dict (tools/study_report.py renders it).
 
     speed: {system: {"rtf": float, "vram_gb": float, ...}} (the A100 speed probe); numbers: PREREG_numbers.json;
-    summaries: {run: the trainer's summary.json}; prereg_baselines: {teacher: {set: corpus CER}} from PREREG.json;
-    prereg_hashes: {set: ids sha256} from PREREG.json."""
+    summaries: {run name: the trainer's summary.json} (tools/study_report.load_summaries keys the trainer's stamped run
+    dirs by run name); prereg_baselines: prereg_baselines(PREREG.json); prereg_manifest: prereg_manifest(PREREG.json);
+    manifest_file_sha256: the sha256 of the manifest file's bytes, compared with PREREG's manifest_sha256."""
     st = Study(corpus, settings, params)
     out = dict(settings=dict(st.st), sigma_run=st.sigma,
                bootstrap=dict(B=int(st.st["boot_b"]), seed=int(st.st["boot_seed"]), z=st.z,
@@ -1013,11 +1122,10 @@ def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[
     out["extra_systems"] = [s for s in corpus.systems if s not in expected]
     anchor_flag = out["anchor"].get("flag")
     out["checks"] = [
-        max_steps_check(numbers, summaries),
-        check("resume_config", "not_checked", "the trainer refuses a resume with a changed config (RESUME_FIXED); "
-                                              "not visible in the eval outputs"),
-        manifest_check(corpus.manifest, prereg_hashes),
-        selection_check(summaries),
+        max_steps_check(numbers, summaries, float(st.st["branch_end_frac"])),
+        resume_check(summaries),
+        manifest_check(corpus.manifest, prereg_manifest, manifest_file_sha256),
+        selection_check(summaries, (prereg_manifest or {}).get("selection_sha256")),
         teacher_baseline_check(st, prereg_baselines),
         check("labels_frames", "not_checked", "K3 / K4 and the frame preflight are the label checks' and the box's "
                                               "record (tools/label_checks.py, the store build)"),
@@ -1033,17 +1141,43 @@ def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[
     return _clean(out)
 
 
+def parse_utc(x) -> datetime | None:
+    """An ISO time ("2026-10-01T00:00:00Z", "+00:00", milliseconds) or a run dir stamp ("20261001T000000Z") as an
+    aware UTC datetime; None if it is neither. Times are compared as datetimes, never as strings (".123+00:00" sorts
+    before "Z")."""
+    if not isinstance(x, str) or not x.strip():
+        return None
+    s = x.strip()
+    try:
+        d = datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s)
+    except ValueError:
+        try:
+            d = datetime.strptime(s, "%Y%m%dT%H%M%SZ")
+        except ValueError:
+            return None
+    return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
+
+
 def _timing_check(numbers: Mapping | None, summaries: Mapping[str, Mapping] | None) -> dict:
-    """PREREG_numbers.json before the first study step: its written_utc against each run's started_utc, when the
-    summaries carry one (the rules commit's own order is git's record, not visible here)."""
-    w = (numbers or {}).get("written_utc")
-    starts = {r: s.get("started_utc") for r, s in (summaries or {}).items() if s.get("started_utc")}
-    if not w or not starts:
-        return check("prereg_timing", "not_checked", "needs PREREG_numbers.json written_utc and the runs' started_utc")
-    early = sorted(r for r, t in starts.items() if str(t) < str(w))
-    return check("prereg_timing", "fail" if early else "pass",
-                 f"runs started before PREREG_numbers.json was written: {early}" if early
-                 else f"PREREG_numbers.json ({w}) precedes all {len(starts)} run starts")
+    """PREREG_numbers.json before the first study step (7): its written_utc against each study run's started_utc
+    (tools/study_report.load_summaries fills that from the run dir's config.json created_utc, or its stamp, when the
+    summary has none; both precede the run's first step). The rules commit's own order is git's record, not visible
+    here."""
+    w = parse_utc((numbers or {}).get("written_utc"))
+    runs, _ = _study_summaries(summaries)
+    starts = {r: parse_utc(s.get("started_utc")) for r, s in runs.items()}
+    known = {r: t for r, t in starts.items() if t is not None}
+    if w is None or not known:
+        return check("prereg_timing", "not_checked", "needs PREREG_numbers.json written_utc and the study runs' start "
+                                                     "times")
+    early = sorted(r for r, t in known.items() if t < w)
+    unknown = sorted(r for r, t in starts.items() if t is None)
+    tail = f"; no start time for {unknown}" if unknown else ""
+    if early:
+        return check("prereg_timing", "fail", f"runs started before PREREG_numbers.json was written ({w.isoformat()}): "
+                                              f"{early}" + tail)
+    return check("prereg_timing", "not_checked" if unknown else "pass",
+                 f"PREREG_numbers.json ({w.isoformat()}) precedes all {len(known)} study run starts" + tail)
 
 
 def _systems(st: Study, imitation: bool) -> dict:
@@ -1154,18 +1288,66 @@ def _clean(x):
 PREREG_BLOCKS = ("metrics", "limit", "limit_rule", "noise", "statistics", "stats", "tolerance")
 
 
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_nums(v) -> bool:
+    return isinstance(v, (list, tuple)) and len(v) > 0 and all(_is_num(x) for x in v)
+
+
+def _is_pair(v) -> bool:
+    return isinstance(v, (list, tuple)) and len(v) == 2 and all(isinstance(x, str) for x in v)
+
+
+# setting -> (the paths it is read from inside each block, the type a value must have, that type in words). The paths
+# cover both layouts: an "analysis" block of numbers, and kitsune.prereg's rules (limit_rule.delta,
+# limit_rule.delta_reported, noise.sigma_prior, noise.bootstrap.{B, seed}, branch.end_frac), whose neighbours are prose
+PREREG_SETTINGS = {
+    "delta_primary": (("delta_primary", "delta", "tolerance.delta"), _is_num, "a number"),
+    "deltas": (("deltas", "tolerance.deltas", "delta_reported"), _is_nums, "a list of numbers"),
+    "sigma_run_prior": (("sigma_run.prior", "sigma_run_prior", "sigma_prior"), _is_num, "a number"),
+    "sigma_hat_factor": (("sigma_run.factor", "sigma_hat_factor"), _is_num, "a number"),
+    "replicate": (("sigma_run.replicate", "replicate"), _is_pair, "[replicate run, original run]"),
+    "boot_b": (("bootstrap.B", "bootstrap.b", "boot_b"), _is_int, "an integer"),
+    "boot_seed": (("bootstrap.seed", "boot_seed"), _is_int, "an integer"),
+    "z": (("bootstrap.z", "z"), _is_num, "a number"),
+    "teacher_bars": (("teacher_bars",), _is_nums, "a list of numbers"),
+    "anchor_flag_rel": (("anchor_flag_rel",), _is_num, "a number"),
+    "branch_end_frac": (("branch.end_frac",), _is_num, "a number"),
+}
+_MISSING = object()
+
+
+def _at(obj, path: str):
+    for p in path.split("."):
+        if not (isinstance(obj, Mapping) and p in obj):
+            return _MISSING
+        obj = obj[p]
+    return obj
+
+
 def settings_from_prereg(prereg: Mapping | None) -> tuple[dict, dict]:
     """(settings, sources): the analysis settings PREREG.json fixes, else STUDY.md's defaults (DEFAULT_SETTINGS).
 
-    Read from the "analysis" block, else the top level, else one of the blocks PREREG_BLOCKS names (the first found
-    wins; other blocks are never searched, so an unrelated "delta" or "replicate" elsewhere cannot leak in):
-      delta (or delta_primary)           the primary tolerance, a fraction (0.10)
-      deltas                             every tolerance reported ([0.05, 0.1, 0.2])
-      sigma_run: {prior, factor, replicate: [rep run, original run]}  (or sigma_run_prior / sigma_hat_factor)
-      bootstrap: {B, seed, z}            (or boot_b / boot_seed)
-      teacher_bars ([1.2, 1.5]), anchor_flag_rel (0.05)
-    sources says, per setting, "PREREG.json:<path>" or "default (STUDY.md)". Values out of range raise ValueError
-    (a percent typed as 10 for 0.10 must not silently widen the tolerance)."""
+    Blocks searched in order: "analysis", the top level, then PREREG_BLOCKS (kitsune.prereg's limit_rule and noise
+    among them); within each block the paths PREREG_SETTINGS lists; the first value of the right TYPE wins. The
+    settings and their paths:
+      delta_primary    delta (or delta_primary), tolerance.delta        the primary tolerance, a fraction (0.10)
+      deltas           deltas, tolerance.deltas, delta_reported         every tolerance reported ([0.05, 0.1, 0.2])
+      sigma_run_prior  sigma_run.prior, sigma_run_prior, sigma_prior    (0.016)
+      sigma_hat_factor sigma_run.factor, sigma_hat_factor               (0.886)
+      replicate        sigma_run.replicate, replicate                   [replicate run, original run]
+      boot_b / boot_seed / z   bootstrap.{B, seed, z} (or boot_b / boot_seed / z)
+      teacher_bars ([1.2, 1.5]), anchor_flag_rel (0.05), branch_end_frac (branch.end_frac, 0.5)
+    A value of the wrong type outside "analysis" is prose of the rules (kitsune.prereg writes limit_rule.replicate as a
+    sentence): it is skipped, the search goes on, and the source says so. Inside "analysis" it is an error. sources
+    says, per setting, "PREREG.json:<path>" or "default (STUDY.md)". Values out of range raise ValueError (a percent
+    typed as 10 for 0.10 must not silently widen the tolerance)."""
     st, src = dict(DEFAULT_SETTINGS), {k: "default (STUDY.md)" for k in DEFAULT_SETTINGS}
     if not prereg:
         return st, src
@@ -1175,71 +1357,104 @@ def settings_from_prereg(prereg: Mapping | None) -> tuple[dict, dict]:
     blocks.append(("", prereg))
     blocks += [(k, prereg[k]) for k in PREREG_BLOCKS if isinstance(prereg.get(k), Mapping)]
 
-    def find(*paths):
+    for key, (paths, ok, what) in PREREG_SETTINGS.items():
+        skipped = []
+        found = False
         for bname, b in blocks:
             for path in paths:
-                cur, ok = b, True
-                for p in path.split("."):
-                    if isinstance(cur, Mapping) and p in cur:
-                        cur = cur[p]
-                    else:
-                        ok = False
-                        break
-                if ok and not isinstance(cur, Mapping):
-                    return cur, f"PREREG.json:{bname + '.' if bname else ''}{path}"
-        return None, None
-
-    spec = {"delta_primary": ("delta_primary", "delta", "tolerance.delta"),
-            "deltas": ("deltas", "tolerance.deltas"),
-            "sigma_run_prior": ("sigma_run.prior", "sigma_run_prior"),
-            "sigma_hat_factor": ("sigma_run.factor", "sigma_hat_factor"),
-            "replicate": ("sigma_run.replicate", "replicate"),
-            "boot_b": ("bootstrap.B", "bootstrap.b", "boot_b"),
-            "boot_seed": ("bootstrap.seed", "boot_seed"),
-            "z": ("bootstrap.z", "z"),
-            "teacher_bars": ("teacher_bars",), "anchor_flag_rel": ("anchor_flag_rel",)}
-    for key, paths in spec.items():
-        v, where = find(*paths)
-        if where is not None:
-            st[key], src[key] = v, where
-    for key in ("delta_primary", "sigma_run_prior", "anchor_flag_rel"):
-        if not (isinstance(st[key], (int, float)) and 0 < float(st[key]) < 1):
+                v = _at(b, path)
+                if v is _MISSING or isinstance(v, Mapping):
+                    continue
+                where = f"PREREG.json:{bname + '.' if bname else ''}{path}"
+                if ok(v):
+                    st[key], src[key], found = v, where, True
+                    break
+                if bname == "analysis":
+                    raise ValueError(f"{key} = {v!r} ({where}): must be {what}")
+                skipped.append(where)
+            if found:
+                break
+        if skipped and not found:
+            src[key] += f"; skipped {', '.join(skipped)} (not {what})"
+    for key in ("delta_primary", "sigma_run_prior", "anchor_flag_rel", "branch_end_frac"):
+        if not (_is_num(st[key]) and 0 < float(st[key]) < 1):
             raise ValueError(f"{key} = {st[key]!r} ({src[key]}): must be a fraction in (0, 1)")
-    if not st["deltas"] or not all(isinstance(d, (int, float)) and 0 < d < 1 for d in st["deltas"]):
+    if not st["deltas"] or not all(_is_num(d) and 0 < d < 1 for d in st["deltas"]):
         raise ValueError(f"deltas = {st['deltas']!r} ({src['deltas']}): fractions in (0, 1)")
     if float(st["delta_primary"]) not in [float(d) for d in st["deltas"]]:
         st["deltas"] = sorted([*st["deltas"], st["delta_primary"]])
-    if not (isinstance(st["boot_b"], int) and st["boot_b"] >= 100):
+    if not (_is_int(st["boot_b"]) and st["boot_b"] >= 100):
         raise ValueError(f"bootstrap B = {st['boot_b']!r} ({src['boot_b']}): an integer >= 100")
-    if not isinstance(st["boot_seed"], int):
+    if not _is_int(st["boot_seed"]):
         raise ValueError(f"bootstrap seed = {st['boot_seed']!r} ({src['boot_seed']}): an integer")
-    if not (isinstance(st["replicate"], (list, tuple)) and len(st["replicate"]) == 2):
+    if not all(_is_num(b) and b > 1 for b in st["teacher_bars"]):
+        raise ValueError(f"teacher_bars = {st['teacher_bars']!r} ({src['teacher_bars']}): ratios above 1")
+    if not _is_pair(st["replicate"]):
         raise ValueError(f"replicate = {st['replicate']!r}: [replicate run, original run]")
     st["replicate"] = list(st["replicate"])
     return st, src
 
 
+def _baseline_system(name: str) -> str:
+    """kitsune.prereg / make_selection write the teachers as parakeet_ctc / parakeet_tdt; the tables use CONTRACT.md
+    5's names (parakeet-ctc, parakeet-tdt). No study system name has an underscore."""
+    return name.replace("_", "-")
+
+
+def _baseline_key(key: str) -> str:
+    """A PREREG baseline key -> this module's stratum name: "galgame:<view>" -> "galgame_<view>", a bare "galgame" ->
+    "galgame_all"; eval sets and "m4" (checked against the M4 metric) as they are."""
+    if key == GALGAME:
+        return f"{GALGAME}_all"
+    if key.startswith(GALGAME + ":"):
+        return f"{GALGAME}_{key.split(':', 1)[1]}"
+    return key
+
+
 def prereg_baselines(prereg: Mapping | None) -> dict:
-    """{teacher: {set: corpus CER}} from PREREG.json "baselines" (fractions), for the baseline check."""
+    """{teacher: {stratum or "m4": corpus CER}} from PREREG.json "baselines" (fractions), names normalised to this
+    module's (_baseline_system, _baseline_key), for teacher_baseline_check. Entries that are not numbers in [0, 1]
+    ("pending", a None for an empty set, a note) are left out; a pending block gives {} (the evaluator's defaults
+    are then all that is checked)."""
     b = (prereg or {}).get("baselines") or {}
     out = {}
     for sysname, sets in b.items():
         if isinstance(sets, Mapping):
-            vals = {k: float(v) for k, v in sets.items()
-                    if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1}
+            vals = {_baseline_key(k): float(v) for k, v in sets.items() if _is_num(v) and 0 <= v <= 1}
             if vals:
-                out[sysname] = vals
+                out[_baseline_system(sysname)] = vals
     return out
 
 
-def prereg_manifest_hashes(prereg: Mapping | None) -> dict:
-    """{set: ids sha256} that PREREG.json froze, from "manifest": {set: sha | {"ids_sha256": sha}} when present."""
-    m = (prereg or {}).get("manifest") or {}
-    m = m.get("sets", m) if isinstance(m, Mapping) else {}
-    out = {}
-    for s, v in m.items():
-        h = v if isinstance(v, str) else (v.get("ids_sha256") or v.get("sha256")) if isinstance(v, Mapping) else None
-        # only the eval sets' digests: a "path" or the manifest file's own sha256 next to them is not a set
-        if s in EVAL_SETS and isinstance(h, str) and len(h) == 64 and all(ch in "0123456789abcdef" for ch in h):
-            out[s] = h
+def _sha(v) -> str | None:
+    """v if it is a hex sha256 (not "pending", a path or a note), else None; a {"ids_sha256" | "sha256": ...} entry's
+    digest."""
+    if isinstance(v, Mapping):
+        v = v.get("ids_sha256") or v.get("sha256")
+    return v if isinstance(v, str) and len(v) == 64 and all(c in "0123456789abcdef" for c in v) else None
+
+
+def prereg_manifest(prereg: Mapping | None) -> dict:
+    """What PREREG.json froze about the eval manifest, for manifest_check and selection_check:
+    {"status", "sets": {eval set: ids sha256}, "views": {Galgame view: ids sha256}, "manifest_sha256",
+    "selection_sha256"}. Layouts read: kitsune.prereg's (manifest.status, manifest.ids_sha256.<set>,
+    manifest.galgame_views.<view>.ids_sha256, manifest.manifest_sha256, manifest.selection_sha256) and the flat ones
+    ({set: sha | {"ids_sha256": sha}} directly under "manifest" or under manifest.sets). Only the eval sets count (train
+    and probe are not scored here). status: the block's own, else "filled" when a hash was read, "unreadable" when
+    none was, "absent" without a manifest block."""
+    m = (prereg or {}).get("manifest")
+    out = dict(status="absent", sets={}, views={}, manifest_sha256=None, selection_sha256=None)
+    if not isinstance(m, Mapping) or not m:
+        return out
+    for src in (m.get("ids_sha256"), m.get("sets"), m):
+        if isinstance(src, Mapping):
+            for s, v in src.items():
+                if s in EVAL_SETS and s not in out["sets"] and _sha(v):
+                    out["sets"][s] = _sha(v)
+    gv = m.get("galgame_views") or m.get("views") or {}
+    if isinstance(gv, Mapping):
+        out["views"] = {v: _sha(x) for v, x in gv.items() if _sha(x)}
+    out["manifest_sha256"], out["selection_sha256"] = _sha(m.get("manifest_sha256")), _sha(m.get("selection_sha256"))
+    readable = out["sets"] or out["views"] or out["manifest_sha256"]
+    out["status"] = m["status"] if isinstance(m.get("status"), str) else "filled" if readable else "unreadable"
     return out

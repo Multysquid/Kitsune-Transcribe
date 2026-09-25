@@ -15,19 +15,24 @@ Inputs
                    The manifest must hash to its own sha256s, and every table must hold exactly its ids (none missing,
                    none extra, none twice), with the same reference lengths in every system: anything else stops the
                    report (exit 2) before a number is computed.
-  --prereg FILE    study/PREREG.json: delta, the sigma_run rule and the bootstrap settings (study_stats.
-                   settings_from_prereg; absent keys or no file: STUDY.md's defaults, and the report says which),
-                   the pre-registered baselines ("baselines") and manifest hashes ("manifest"), when it has them
+  --prereg FILE    study/PREREG.json as kitsune.prereg writes it (or an "analysis" block of numbers): delta, the
+                   sigma_run rule, the bootstrap settings and the branch's end_frac (study_stats.settings_from_prereg;
+                   absent keys or no file: STUDY.md's defaults, and the report says which), the teacher baselines
+                   ("baselines", parakeet_ctc and galgame:<view> keys included) and the manifest block (the eval sets'
+                   and Galgame views' id hashes, the manifest file's and the selection's sha256), all compared by the
+                   invalidation checks. Out-of-range settings or unreadable JSON: exit 2.
   --numbers FILE   PREREG_numbers.json (max_steps, lr_probes, calibration, written_utc) for the invalidation checks
-  --run-summaries DIR  the trainer's summaries, DIR/<run>/summary.json or DIR/<run>.json (steps, started_utc,
-                   selection_sha256 when present) for the invalidation checks
+  --run-summaries DIR  the trainer's summaries: its runs root as it is (DIR/<run_name>-<stamp>/summary.json, keyed
+                   by config.run_name; the newest start of a run name counts), or DIR/<run>/summary.json, DIR/<run>.json
+                   (steps, resumes, config.selection, started_utc or the run dir's config.json created_utc). LR probes
+                   and other runs in the same dir are skipped by the checks
   --speed FILE     the A100 speed probe: {system: {"rtf": ..., "vram_gb": ..., "p50_s": ..., "p95_s": ...}} (or
                    under "systems"; study_stats.SPEED_RTF / SPEED_VRAM list the key names accepted)
   --params FILE    {system: params_total} over study_stats.PARAMS_TOTAL (e.g. from the student_meta.json files)
   --boot-b N, --seed N  override the bootstrap (development only: the report marks them as not pre-registered)
 
-Output (--out, written atomically): report.json (everything study_stats.analyse returns, plus the inputs' paths and
-the settings' sources) and report.md.
+Output (--out, written atomically): report.json (everything study_stats.analyse returns, plus the inputs' paths, the
+manifest file's sha256, the summaries read and the settings' sources) and report.md.
 
 Usage:
   python tools/study_report.py --tables evals/study --manifest labels/full/selections/study_manifest.json \
@@ -36,8 +41,10 @@ CPU only. The statistics of 22 systems at B = 10,000 take about 5 s, the imitati
 (--no-imitation skips it); the torch import behind kitsune.evaluate is the slowest part.
 """
 import argparse
+import hashlib
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,15 +104,49 @@ def load_tables(d: Path, sets) -> tuple[dict[str, pd.DataFrame], list[str]]:
     return tables, ignored
 
 
-def load_summaries(d: Path | None) -> dict:
+# the trainer's run dir: <run_name>-<UTC stamp>, plus -<n> when two start in the same second (04_distill build())
+RUN_DIR_STAMP = re.compile(r"-(\d{8}T\d{6}Z)(?:-(\d+))?$")
+
+
+def load_summaries(d: Path | None) -> tuple[dict, dict]:
+    """(run name -> summary, notes) from DIR, read in any of these layouts:
+         DIR/<run_name>-<stamp>[-n]/summary.json   the trainer's runs root as it is
+         DIR/<run>/summary.json, DIR/<run>.json
+    A summary is keyed by its config.run_name (the trainer writes config=R.cfg; a T/2 branch's is <run>-half), else by
+    the entry's name without the stamp. Several entries of one run name (a run started again from scratch): the newest
+    by stamp counts, the others are listed in notes["superseded"]. started_utc, when the summary has none: the run
+    dir's config.json created_utc (kitsune.runlog), else its stamp; both precede the run's first step. LR probes and
+    other runs are kept here and skipped by the checks (study_stats.is_study_run)."""
+    notes = dict(read={}, superseded=[])
     if d is None:
-        return {}
-    out = {}
+        return {}, notes
+    found: dict[str, list] = {}
     for entry in sorted(Path(d).iterdir()):
         f = entry / "summary.json" if entry.is_dir() else entry
-        if f.is_file() and f.suffix == ".json":
-            out[entry.name if entry.is_dir() else entry.stem] = read_json(f)
-    return out
+        if not (f.is_file() and f.suffix == ".json"):
+            continue
+        summ = read_json(f)
+        if not isinstance(summ, dict):
+            continue
+        stem = entry.name if entry.is_dir() else entry.stem
+        m = RUN_DIR_STAMP.search(stem)
+        name = (summ.get("config") or {}).get("run_name") or (stem[:m.start()] if m else stem)
+        if not summ.get("started_utc"):
+            created = None
+            if entry.is_dir() and (entry / "config.json").is_file():
+                created = read_json(entry / "config.json").get("created_utc")
+            if created or m:
+                summ = dict(summ, started_utc=created or m.group(1),
+                            started_utc_from="config.json created_utc" if created else "the run dir's stamp")
+        order = (m.group(1), int(m.group(2) or 0)) if m else ("", 0)
+        found.setdefault(name, []).append((order, str(f), summ))
+    out = {}
+    for name, cands in found.items():
+        cands.sort(key=lambda c: c[0])
+        out[name] = cands[-1][2]
+        notes["read"][name] = cands[-1][1]
+        notes["superseded"] += [c[1] for c in cands[:-1]]
+    return out, notes
 
 
 def load_speed(path) -> dict | None:
@@ -311,6 +352,9 @@ def render_md(rep: dict) -> str:
         L.append("Not available: needs study-t06 and anchor-b20.")
     L += ["", "## Invalidation checks (STUDY.md 7)", ""]
     L += table(["rule", "status", "detail"], [[c["rule"], c["status"], c["detail"]] for c in rep["checks"]]) + [""]
+    if meta.get("summaries_superseded"):
+        L += ["Superseded run summaries (an earlier start of the same run name, not used): "
+              + ", ".join(f"`{s}`" for s in meta["summaries_superseded"]) + ".", ""]
 
     L += ["## Per-system results", "", "Corpus CER per set; group metrics are macro means of the sets' CERs "
           "(gate-pooled: sum / sum over JSUT, CV8, Reazon).", ""]
@@ -335,23 +379,43 @@ def render_md(rep: dict) -> str:
 # ------------------------------------------------------------------------------------------------ main
 
 
+class InputError(ValueError):
+    """An input the report cannot use as given (PREREG.json's settings out of range, an unreadable table): the report
+    refuses (exit 2) instead of computing numbers from it."""
+
+
+def file_sha256(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def build_report(args) -> dict:
     manifest = ss.parse_manifest(read_json(args.manifest))
     tables, ignored = load_tables(args.tables, manifest.sets)
-    corpus = ss.build_corpus(tables, manifest)
-    prereg = read_json(args.prereg) if args.prereg else None
-    settings, sources = ss.settings_from_prereg(prereg)
+    try:
+        corpus = ss.build_corpus(tables, manifest)
+    except ss.ManifestError:
+        raise
+    except ValueError as e:  # a table without edits / ref_len and without text to score
+        raise InputError(f"tables: {e}") from e
+    try:
+        prereg = read_json(args.prereg) if args.prereg else None
+        settings, sources = ss.settings_from_prereg(prereg)
+    except ValueError as e:  # json.JSONDecodeError is one
+        raise InputError(f"PREREG.json {args.prereg}: {e}") from e
     for key, val in (("boot_b", args.boot_b), ("boot_seed", args.seed)):
         if val is not None:
             settings[key], sources[key] = int(val), "command line (NOT the pre-registered value)"
+    summaries, summ_notes = load_summaries(args.run_summaries)
     rep = ss.analyse(corpus, settings, params=load_params(args.params), speed=load_speed(args.speed),
-                     numbers=read_json(args.numbers) if args.numbers else None,
-                     summaries=load_summaries(args.run_summaries), prereg_baselines=ss.prereg_baselines(prereg),
-                     prereg_hashes=ss.prereg_manifest_hashes(prereg), imitation=not args.no_imitation)
+                     numbers=read_json(args.numbers) if args.numbers else None, summaries=summaries,
+                     prereg_baselines=ss.prereg_baselines(prereg), prereg_manifest=ss.prereg_manifest(prereg),
+                     manifest_file_sha256=file_sha256(args.manifest), imitation=not args.no_imitation)
     rep["settings_sources"] = sources
-    rep["inputs"] = dict(tables=str(args.tables), manifest=str(args.manifest), prereg=_s(args.prereg),
+    rep["inputs"] = dict(tables=str(args.tables), manifest=str(args.manifest),
+                         manifest_sha256=file_sha256(args.manifest), prereg=_s(args.prereg),
                          numbers=_s(args.numbers), speed=_s(args.speed), params=_s(args.params),
-                         run_summaries=_s(args.run_summaries), ignored_files=ignored,
+                         run_summaries=_s(args.run_summaries), summaries_read=summ_notes["read"],
+                         summaries_superseded=summ_notes["superseded"], ignored_files=ignored,
                          written_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     return rep
 
@@ -376,7 +440,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     try:
         rep = build_report(args)
-    except ss.ManifestError as e:
+    except (ss.ManifestError, InputError) as e:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 2
     args.out.mkdir(parents=True, exist_ok=True)
