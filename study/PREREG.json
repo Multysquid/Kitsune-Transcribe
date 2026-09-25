@@ -1,0 +1,755 @@
+{
+ "anchor": {
+  "flag": "the study's T-0.6B has a gate-pooled CER worse than the anchor's by > 5 % relative with a paired CI excluding 0",
+  "model": "the first run's 0.6B, step_9774",
+  "then": "interpretation halts until the cause (BN, L2-SP, LR, data) is understood"
+ },
+ "baselines": {
+  "cohere": {
+   "eval_cv8": "pending",
+   "eval_emilia": "pending",
+   "eval_jsut": "pending",
+   "eval_reazon": "pending",
+   "galgame:all": "pending",
+   "galgame:label_box": "pending",
+   "galgame:neutral": "pending",
+   "m4": "pending"
+  },
+  "fill": "the sidecar's baselines: corpus CER (kitsune.evaluate.corpus_cer) on the manifest rows",
+  "parakeet_ctc": {
+   "eval_cv8": "pending",
+   "eval_emilia": "pending",
+   "eval_jsut": "pending",
+   "eval_reazon": "pending",
+   "galgame:all": "pending",
+   "galgame:label_box": "pending",
+   "galgame:neutral": "pending",
+   "m4": "pending"
+  },
+  "parakeet_tdt": {
+   "eval_cv8": "pending",
+   "eval_emilia": "pending",
+   "eval_jsut": "pending",
+   "eval_reazon": "pending",
+   "galgame:all": "pending",
+   "galgame:label_box": "pending",
+   "galgame:neutral": "pending",
+   "m4": "pending"
+  },
+  "status": "pending"
+ },
+ "branch": {
+  "end_frac": 0.5,
+  "resume_frac": 0.4,
+  "t_c": "the resume step",
+  "what": "<run>-half resumes the local full state at 0.4 x max_steps and cools down to 0.5 x max_steps: the WSD schedule of a run whose budget is T/2 (same warm-up, stable LR and data order, 20 % cooldown); one complete eval at its end"
+ },
+ "budget": {
+  "cut_order": [
+   "the replicate",
+   "T at 3 epochs",
+   "the contingency"
+  ],
+  "follow_up_rule": "conditional on the trigger, and only if the contingency is unused",
+  "follow_ups": [
+   "a d-pruned P-0.1B if P-0.1B is OUTSIDE",
+   "a 2T extension from the pre-cooldown state if T/2 -> T says compute-limited",
+   "a second replicate if a decisive call falls within about 1 sigma of delta"
+  ]
+ },
+ "calibration": {
+  "data_wait_max": 0.05,
+  "excluded": "evals, checkpoints and the T/2 branch do not count toward T",
+  "loader_bound": "data_wait_frac >= 0.05: perf.num_workers 12 and calibrate again; still >= 0.05: the box halts",
+  "max_steps": "max_steps_i = round(9366 x t_study-t06 / t_i), half up",
+  "min_steps_measured": 200,
+  "reference_run": "study-t06",
+  "reference_steps": 9366,
+  "replicate": "study-t01-s1235 takes study-t01's max_steps",
+  "t_i": "the median step time over steps 50-250 at the planned micro_audio_s, logging included, on the study host with the run's wave group running concurrently"
+ },
+ "cohere_prereg": {
+  "eval_cv8": 0.0407,
+  "eval_jsut": 0.083,
+  "eval_reazon": 0.0628,
+  "note": "K11: recomputed from labels/full/teacher_out; a drift means re-registering the baselines or reusing the laptop's eval labels before this commit",
+  "tolerance_pp": 0.05
+ },
+ "data": {
+  "eval_sets": [
+   "eval_jsut",
+   "eval_cv8",
+   "eval_reazon",
+   "eval_emilia",
+   "galgame"
+  ],
+  "extent": {
+   "inputs": {
+    "emilia_nc": 8,
+    "emilia_yodas": "300h",
+    "galgame": 3,
+    "reazon_large": "pending"
+   },
+   "name": "full",
+   "root": "labels/full"
+  },
+  "reazon_large_cap": "the smallest reazon_large input count whose pool after all filters holds >= 1010 h (expected 50-55), read from the sealed labels",
+  "sources": [
+   "reazon_small",
+   "reazon_large",
+   "emilia_yodas",
+   "emilia_nc",
+   "galgame"
+  ]
+ },
+ "decisions": {
+  "1": {
+   "answer": "the limit: tolerance delta 10 % against the family's largest student; delta 5 and 20 % also reported",
+   "option": "a"
+  },
+  "10": {
+   "answer": "M4 within a family; JSUT+Galgame across families, descriptive only",
+   "option": "a"
+  },
+  "11": {
+   "answer": "Galgame neutral view (cer(kotoba, ref) <= 0.5) as primary; the other two reported",
+   "option": "a"
+  },
+  "12": {
+   "answer": "P-0.1B and P-0.05B as the d = 1024 ladder, B8x768 and B4x768",
+   "option": "a"
+  },
+  "13": {
+   "answer": "shared agreement filter CER(Transcribe hyp, Parakeet TDT hyp) <= 0.5",
+   "option": "F1a"
+  },
+  "14": {
+   "answer": "eval-leak dedup: exact normalised text match against eval references of >= 15 characters",
+   "option": "t15"
+  },
+  "15": {
+   "answer": "frame mismatches: drop and count; hard fail above 0.1 % of train rows or on any eval row",
+   "option": "a"
+  },
+  "16": {
+   "answer": "BN of pruned students: teacher stats, frozen; recal for both pruned Transcribe students if T-0.6B's CPU step-0 KL is not lower with the teacher stats",
+   "option": "teacher"
+  },
+  "17": {
+   "answer": "T-0.3B = B10x2560 + decoder {0,7}",
+   "option": "a"
+  },
+  "18": {
+   "answer": "from-scratch shapes W: 512x12/4 and 384x10/3",
+   "option": "W"
+  },
+  "19": {
+   "answer": "re-initialise the subsampling conv; keep the 16,384 tied vocabulary",
+   "option": "a"
+  },
+  "2": {
+   "answer": "one 4x A100 SXM4 40 GB box, calibration + probes + 2 waves; S3b, then S1p as fallbacks",
+   "option": "S3"
+  },
+  "20": {
+   "answer": "aux CTC 0.3 for the scratch AED runs, the bridge included",
+   "option": "yes"
+  },
+  "21": {
+   "answer": "dropout 0 and the first run's SpecAugment for all runs",
+   "option": "a"
+  },
+  "22": {
+   "answer": "Parakeet CTC target: the greedy CTC path",
+   "option": "greedy"
+  },
+  "23": {
+   "answer": "w_ctc 0.8, no ablation",
+   "option": "w08"
+  },
+  "24": {
+   "answer": "the CTC trainer is a family switch inside 04_distill",
+   "option": "switch"
+  },
+  "25": {
+   "answer": "L2-SP 0 for all runs",
+   "option": "0"
+  },
+  "26": {
+   "answer": "equal compute on the steps clock with calibrated max_steps",
+   "option": "steps"
+  },
+  "27": {
+   "answer": "students built on the laptop CPU",
+   "option": "laptop"
+  },
+  "28": {
+   "answer": "the speed probe on the A100",
+   "option": "a100"
+  },
+  "29": {
+   "answer": "re-score the first run's 0.6B (step_9774) on the manifest",
+   "option": "rescore"
+  },
+  "3": {
+   "answer": "control runs: the bridge and a replicate of T-0.1B with seed 1235",
+   "option": "a"
+  },
+  "30": {
+   "answer": "follow-ups conditional on their triggers only",
+   "option": "cond"
+  },
+  "4": {
+   "answer": "budget cuts in this order: the replicate, T at 3 epochs, the contingency; never stage away 0.05B",
+   "option": "a"
+  },
+  "5": {
+   "answer": "HF storage: no action (HF PRO, 1 TB)",
+   "option": "b"
+  },
+  "6": {
+   "answer": "a T/2 branch in every run",
+   "option": "a"
+  },
+  "7": {
+   "answer": "LR probes for all classes plus the bridge",
+   "option": "a"
+  },
+  "8": {
+   "answer": "PREREG numbers written by the box; it halts only on a check fixed in advance",
+   "option": "a"
+  },
+  "9": {
+   "answer": "mix D, reazon_large about 50-55 inputs",
+   "option": "D"
+  }
+ },
+ "design": "STUDY.md (final); CONTRACT.md for the interfaces",
+ "evals": {
+  "checkpoint": "the final one, never the best eval; plus the branch's",
+  "complete_at_fracs": [
+   0.2,
+   0.4,
+   0.6,
+   0.8
+  ],
+  "final": "after the cooldown, at max_steps",
+  "mini_every_frac": 0.025,
+  "reported": "per set, group and pooled: corpus CER, ratio to the own teacher, imitation CER, no-style CER, S/D/I, runaway rate (CER > 100 % or hyp > 2 x ref), empty-output rate, AED truncation; teacher-forced KL/CE (AED) or dense/blank KL, CTC per token, argmax agreement and argmax-blank share (CTC); probe vs held-out KL; step-seconds, steps, epochs, audio-hours; params total and non-embedding; speed and VRAM"
+ },
+ "halts": [
+  "calibration still loader-bound after perf.num_workers 12",
+  "an LR probe winner at a grid edge after its one extension",
+  "the frame preflight above 0.1 % of train rows or on any eval row",
+  "a selection, manifest or PREREG hash that differs from this file",
+  "any rule field still pending"
+ ],
+ "invalid_if": [
+  "a run misses its max_steps, or resumes with a changed config",
+  "a selection or manifest hash differs between runs",
+  "the teacher baselines do not reproduce",
+  "K3 or K4 fails, or the frame preflight exceeds its threshold",
+  "this rules commit comes after any study result, or PREREG_numbers.json after the first study step",
+  "the anchor regression flag fires and stays unexplained",
+  "an LR winner sits at a grid edge after its one extension",
+  "calibration stays loader-bound after raising the workers"
+ ],
+ "limit_rule": {
+  "calls": {
+   "OUTSIDE": "the CI's lower end > ln(1 + delta)",
+   "UNRESOLVED": "otherwise",
+   "WITHIN": "the CI's upper end <= ln(1 + delta)"
+  },
+  "delta": 0.1,
+  "delta_reported": [
+   0.05,
+   0.1,
+   0.2
+  ],
+  "families": {
+   "aed": {
+    "top": "study-t06",
+    "walk": [
+     "study-t03",
+     "study-t01",
+     "study-t005"
+    ]
+   },
+   "ctc": {
+    "top": "study-p03",
+    "walk": [
+     "study-p01",
+     "study-p005"
+    ]
+   }
+  },
+  "ratio": "r_s = M4_s / M4_top",
+  "replicate": "study-t01-s1235 feeds sigma_run only; the walk uses study-t01",
+  "walk": "down the sizes: the limit is the smallest size WITHIN with every larger size WITHIN; the first OUTSIDE ends it (limit between X and Y); an UNRESOLVED gives 'at or below X, Y unresolved' and the smaller sizes are descriptive; one decisive claim per family, no Holm correction"
+ },
+ "lr_probes": {
+  "classes": {
+   "bridge": {
+    "cooldown": 1000,
+    "grid": [
+     0.0004,
+     0.001
+    ],
+    "max_steps": 5000,
+    "probed_on": "study-bridge",
+    "runs": [
+     "study-bridge"
+    ],
+    "stable": 2000,
+    "warmup": 2000
+   },
+   "kept-p03": {
+    "cooldown": 400,
+    "grid": [
+     0.0001,
+     0.0002
+    ],
+    "max_steps": 2000,
+    "probed_on": "study-p03",
+    "runs": [
+     "study-p03"
+    ],
+    "stable": 1300,
+    "warmup": 300
+   },
+   "kept-t03": {
+    "cooldown": 400,
+    "grid": [
+     0.0001,
+     0.0002
+    ],
+    "max_steps": 2000,
+    "probed_on": "study-t03",
+    "runs": [
+     "study-t03",
+     "study-t06"
+    ],
+    "stable": 1300,
+    "warmup": 300
+   },
+   "lost": {
+    "cooldown": 600,
+    "grid": [
+     0.0001,
+     0.0003,
+     0.001
+    ],
+    "max_steps": 3000,
+    "probed_on": "study-p01",
+    "runs": [
+     "study-p005",
+     "study-p01"
+    ],
+    "stable": 1400,
+    "warmup": 1000
+   },
+   "scratch": {
+    "cooldown": 1000,
+    "grid": [
+     0.0005,
+     0.001,
+     0.002
+    ],
+    "max_steps": 5000,
+    "probed_on": "study-t01",
+    "runs": [
+     "study-t005",
+     "study-t01",
+     "study-t01-s1235"
+    ],
+    "stable": 2000,
+    "warmup": 2000
+   }
+  },
+  "edge_rule": "a winner at an edge of the tested grid gets one more point (x2 above, /2 below); a winner at an edge after that extension halts the box (an invalidation rule)",
+  "objective": "the family's training objective per target token, teacher-forced, at the probe's end, pooled over the complete gate sets eval_jsut, eval_cv8, eval_reazon (AED: w_kl KL + w_ce CE without aux CTC; CTC: w_kl KL + w_ctc CTC); lowest wins; a non-finite objective loses; a tie goes to the lower LR",
+  "run_names": "probe-<class>-<lr>, lr like 1e-3 / 4e-4"
+ },
+ "manifest": {
+  "extent_inputs": "pending",
+  "fill": "python -m kitsune.prereg --write study/ --sidecar labels/full/selections/study_1000h.json, from the selection built on the sealed labels (scripts/make_selection.py --config study/data.json)",
+  "galgame_views": {
+   "all": {
+    "ids_sha256": "pending",
+    "n": "pending"
+   },
+   "label_box": {
+    "ids_sha256": "pending",
+    "n": "pending"
+   },
+   "neutral": {
+    "ids_sha256": "pending",
+    "n": "pending"
+   }
+  },
+  "ids_sha256": {
+   "eval_cv8": "pending",
+   "eval_emilia": "pending",
+   "eval_jsut": "pending",
+   "eval_reazon": "pending",
+   "galgame": "pending",
+   "probe": "pending",
+   "train": "pending"
+  },
+  "manifest_sha256": "pending",
+  "n": {
+   "eval_cv8": "pending",
+   "eval_emilia": "pending",
+   "eval_jsut": "pending",
+   "eval_reazon": "pending",
+   "galgame": "pending",
+   "probe": "pending",
+   "train": "pending"
+  },
+  "pool_hours": "pending",
+  "selection_sha256": "pending",
+  "status": "pending",
+  "train_hours": "pending"
+ },
+ "metrics": {
+  "cer": "kitsune.evaluate.corpus_cer: sum(S+D+I) / sum(ref chars) on normalize_ja text, empty refs skipped",
+  "cross_family": "JSUT + Galgame-neutral, raw and no-style, paired CIs; descriptive only, no threshold",
+  "galgame_views": {
+   "all": "every Galgame hold-out row of the manifest",
+   "label_box": "the label box's filter: not truncated and agree(Cohere, Parakeet) <= 0.5",
+   "neutral": "primary: the rows whose kotoba-whisper-v2.0 hypothesis (the laptop's second_out/galgame/eval-00000.jsonl) has cer(hyp2, ref) <= 0.5 and a non-empty reference"
+  },
+  "m4": "the macro mean of complete-set corpus CER over eval_jsut, eval_cv8, eval_reazon and Galgame-neutral, equal weights (within-family primary)",
+  "qualifiers": {
+   "in_domain": [
+    "eval_reazon",
+    "galgame:neutral"
+   ],
+   "out_of_domain": [
+    "eval_jsut",
+    "eval_cv8"
+   ]
+  }
+ },
+ "noise": {
+  "bootstrap": {
+   "B": 10000,
+   "kind": "paired utterance bootstrap, stratified: resampled within each set, the same indices for every system",
+   "seed": 1234
+  },
+  "ci_student_ratio": "ln r +- 1.96 sqrt(v_boot + 2 sigma_run^2)",
+  "ci_student_vs_teacher": "ln r +- 1.96 sqrt(v_boot + sigma_run^2)",
+  "replicate_estimate": "0.886 x |ln(M4_replicate / M4_study-t01)|",
+  "sigma_prior": 0.016,
+  "sigma_rule": "sigma_run = max(0.016, the replicate's estimate)"
+ },
+ "numbers": {
+  "file": "PREREG_numbers.json",
+  "keys": [
+   "calibration",
+   "max_steps",
+   "lr_probes",
+   "lr",
+   "rules_sha256",
+   "written_utc",
+   "host"
+  ],
+  "when": "written and uploaded by the study box, its sha256 logged as an event, before the first study step"
+ },
+ "practical_bars": [
+  "the smallest student whose JSUT+Galgame-neutral CI upper end is <= Parakeet 0.6B TDT",
+  "the smallest student within 1.2x and within 1.5x of its own teacher on M4",
+  "a Pareto view: CER against A100 RTF and VRAM"
+ ],
+ "prereg_version": 1,
+ "readouts": {
+  "budget": "per non-top size the call at T/2 and at T; Delta = ln r(T) - ln r(T/2) with CI (v_boot + 2 sigma_run^2): below 0 -> 'compute-limited: the gap closes with compute', else 'not compute-limited at T'",
+  "distillation_gaps": "M4(T-0.6B)/M4(Cohere) and M4(P-0.3B)/M4(Parakeet CTC); not steps of the walk",
+  "g_per_halving": "every step with a CI; descriptive only",
+  "init_effect": "M4(bridge) / M4(T-0.3B)",
+  "parakeet_labels": "P 0.3 -> 0.1 is always labelled 'size + loss of function + depth'; P 0.1 -> 0.05 is clean",
+  "scratch_ladder": "bridge -> T-0.1B -> T-0.05B, a second tolerance walk with top = bridge; the acceleration g(0.1->0.05) - g(0.3s->0.1) with a CI, reported only here",
+  "transcribe_ladder": "T-0.6B -> T-0.3B (pruned) -> T-0.1B -> T-0.05B (scratch)"
+ },
+ "runs": {
+  "study-bridge": {
+   "aux_ctc": 0.3,
+   "bn": "train mode",
+   "family": "aed",
+   "init_class": "scratch",
+   "lr_from": "bridge",
+   "micro_audio_s": 1200,
+   "params_non_embedding": 302926592,
+   "params_total": 320752384,
+   "seed": 1234,
+   "shape": "the T-0.3B shape, from scratch",
+   "student": "students/study/bridge",
+   "warmup_steps": 2000,
+   "wave": 1,
+   "weight_decay": 0.001
+  },
+  "study-p005": {
+   "aux_ctc": 0.0,
+   "bn": "teacher stats, frozen (decision 16)",
+   "family": "ctc",
+   "init_class": "pruned_lost",
+   "lr_from": "lost",
+   "micro_audio_s": 1600,
+   "params_non_embedding": 49040384,
+   "params_total": 52190209,
+   "seed": 1234,
+   "shape": "Parakeet encoder 4 layers [0,8,15,23], FFN 768; CTC head",
+   "student": "students/study/p005",
+   "warmup_steps": 1000,
+   "wave": 2,
+   "weight_decay": 0.0
+  },
+  "study-p01": {
+   "aux_ctc": 0.0,
+   "bn": "teacher stats, frozen (decision 16)",
+   "family": "ctc",
+   "init_class": "pruned_lost",
+   "lr_from": "lost",
+   "micro_audio_s": 1600,
+   "params_non_embedding": 95319040,
+   "params_total": 98468865,
+   "seed": 1234,
+   "shape": "Parakeet encoder 8 layers [0,3,7,10,13,16,20,23], FFN 768; CTC head",
+   "student": "students/study/p01",
+   "warmup_steps": 1000,
+   "wave": 2,
+   "weight_decay": 0.0
+  },
+  "study-p03": {
+   "aux_ctc": 0.0,
+   "bn": "teacher stats, frozen (decision 16)",
+   "family": "ctc",
+   "init_class": "pruned_kept",
+   "lr_from": "kept-p03",
+   "micro_audio_s": 1200,
+   "params_non_embedding": 305374208,
+   "params_total": 308524033,
+   "seed": 1234,
+   "shape": "Parakeet encoder 16 of 24 layers [0,2,3,5,6,8,9,11,12,14,15,17,18,20,21,23], d 1024, FFN 4096 -> 2560; the Parakeet CTC head verbatim (3,073 classes)",
+   "student": "students/study/p03",
+   "warmup_steps": 300,
+   "wave": 1,
+   "weight_decay": 0.0
+  },
+  "study-t005": {
+   "aux_ctc": 0.3,
+   "bn": "train mode",
+   "family": "aed",
+   "init_class": "scratch",
+   "lr_from": "scratch",
+   "micro_audio_s": 1600,
+   "params_non_embedding": 44524928,
+   "params_total": 51209600,
+   "seed": 1234,
+   "shape": "encoder 10 layers, d 384, 6 x 64, FFN 1536, kernel 9; decoder 3 layers, D 384, 6 x 64, FFN 1536; vocab 16,384 tied",
+   "student": "students/study/t005",
+   "warmup_steps": 2000,
+   "wave": 2,
+   "weight_decay": 0.001
+  },
+  "study-t01": {
+   "aux_ctc": 0.3,
+   "bn": "train mode",
+   "family": "aed",
+   "init_class": "scratch",
+   "lr_from": "scratch",
+   "micro_audio_s": 1600,
+   "params_non_embedding": 95083520,
+   "params_total": 103996416,
+   "seed": 1234,
+   "shape": "encoder 12 layers, d 512, 8 x 64, FFN 2048, kernel 9; decoder 4 layers, D 512, 8 x 64, FFN 2048; vocab 16,384 tied",
+   "student": "students/study/t01",
+   "warmup_steps": 2000,
+   "wave": 2,
+   "weight_decay": 0.001
+  },
+  "study-t01-s1235": {
+   "aux_ctc": 0.3,
+   "bn": "train mode",
+   "family": "aed",
+   "init_class": "scratch",
+   "lr_from": "scratch",
+   "micro_audio_s": 1600,
+   "params_non_embedding": 95083520,
+   "params_total": 103996416,
+   "seed": 1235,
+   "shape": "the T-0.1B shape, seed 1235",
+   "student": "students/study/t01-s1235",
+   "warmup_steps": 2000,
+   "wave": "own 1x box after PREREG_numbers.json",
+   "weight_decay": 0.001
+  },
+  "study-t03": {
+   "aux_ctc": 0.0,
+   "bn": "teacher stats, frozen (decision 16)",
+   "family": "aed",
+   "init_class": "pruned_kept",
+   "lr_from": "kept-t03",
+   "micro_audio_s": 1200,
+   "params_non_embedding": 302926592,
+   "params_total": 320752384,
+   "seed": 1234,
+   "shape": "encoder 10 layers [0,5,10,16,21,26,31,37,42,47], d 1280, FFN 2560; decoder {0,7}, D 1024; vocab 16,384 tied",
+   "student": "students/study/t03",
+   "warmup_steps": 300,
+   "wave": 1,
+   "weight_decay": 0.0
+  },
+  "study-t06": {
+   "aux_ctc": 0.0,
+   "bn": "teacher stats, frozen (decision 16)",
+   "family": "aed",
+   "init_class": "pruned_kept",
+   "lr_from": "kept-t03",
+   "micro_audio_s": 600,
+   "params_non_embedding": 599137536,
+   "params_total": 616963328,
+   "seed": 1234,
+   "shape": "encoder 20 of 48 layers [0,2,5,7,10,12,15,17,20,22,25,27,30,32,35,37,40,42,45,47], d 1280, FFN 5120 -> 2560; decoder layers {0,2,5,7}, D 1024; vocab 16,384 tied",
+   "student": "students/study/t06",
+   "warmup_steps": 300,
+   "wave": 1,
+   "weight_decay": 0.0
+  }
+ },
+ "selection": {
+  "coverage": "launch refuses a selection with any eval row not_in_parakeet (K6: both passes label the eval sets whole) or more than 0.1 % of its train rows not_in_parakeet (K5)",
+  "file": "labels/full/selections/study_1000h.parquet (+ study_1000h.json, study_manifest.json)",
+  "frame_preflight": "at store build, for every row: the ParakeetFeatureExtractor length of the rebuilt audio, 8x subsampled, equals the stored n_frames; mismatches are dropped and counted, the box fails above 0.1 % of train rows or on any eval row (decision 15)",
+  "reasons": [
+   "kept",
+   "truncated",
+   "no_agree",
+   "agree>A",
+   "no_audio",
+   "not_in_parakeet",
+   "f1a_disagree",
+   "eval_dup",
+   "ctc_infeasible",
+   "not_drawn"
+  ],
+  "recipe": {
+   "agree_max": 0.5,
+   "agree_max_source": [
+    "emilia_yodas=0.2",
+    "emilia_nc=0.2"
+   ],
+   "filter_eval_sets": [],
+   "partial_second_opinion": [],
+   "study": {
+    "dedup_min_chars": 15,
+    "draw_audio_s": 3600000,
+    "f1a_max": 0.5,
+    "neutral_max_cer": 0.5,
+    "probe_n": 300
+   }
+  },
+  "rules": [
+   "1 not_in_parakeet: candidates are the extent's rows present in both teacher_out and parakeet_out",
+   "2 F0, the label box's judges: truncated (Cohere, no EOS); no_agree; agree>A with A = 0.5 for Reazon (whisper-large-v3) and Galgame (Parakeet), 0.2 for Emilia-YODAS and NC (Emilia's WhisperX text)",
+   "3 f1a_disagree: CER(Transcribe hyp, Parakeet TDT hyp) > 0.5, normalised by Parakeet's length",
+   "4 eval_dup: the normalised reference or Cohere hypothesis equals an eval or hold-out reference of >= 15 characters",
+   "5 ctc_infeasible: U + adjacent repeats of the greedy CTC target > n_frames",
+   "6 not_drawn: keep = a seeded 3,600,000 s subset pooled over the sources (the frozen train list; subset.train_audio_s null for all runs); probe = 300 kept rows per train source (1,500)",
+   "7 eval sets: every row present in both roots, unfiltered (filter_eval_sets []); views at scoring"
+  ],
+  "seed": 1234
+ },
+ "study": "Kitsune size study: 7 students + bridge + replicate on the same 1,000 h at equal A100 compute",
+ "training": {
+  "aed_loss": {
+   "aux_ctc": {
+    "blank": 16384,
+    "head": "training-only nn.Linear(d_enc, 16,385), dropped at export",
+    "targets": "the teacher's stored greedy ids",
+    "weight": "0.3 for the scratch runs (bridge included), 0 otherwise"
+   },
+   "kl": "17 bins: the stored top-16 plus a rest bucket, T = 1",
+   "w_ce": 0.8,
+   "w_kl": 1.0
+  },
+  "all_runs": {
+   "dropout": 0.0,
+   "early_stop": false,
+   "l2sp_lambda": 0.0,
+   "layerdrop": 0.0,
+   "memory": "the memory probe confirms each micro_audio_s; aux-CTC runs fall back to micro 1200 if 1600 does not fit, and calibration measures the consequence",
+   "optimiser": "AdamW beta 0.9/0.98, eps 1e-8, clip 1.0",
+   "schedule": "WSD on the steps clock: linear warm-up, stable, 1 - sqrt cooldown over the last 20 % of max_steps",
+   "specaugment": "the first run's: 2 frequency masks of 27, 2-5 time masks of 5 %",
+   "step_audio_s": 1500,
+   "subset.train_audio_s": null
+  },
+  "bn_fallback": "BN of pruned students: teacher stats, frozen; recal for both pruned Transcribe students if T-0.6B's CPU step-0 KL is not lower with the teacher stats",
+  "ctc_loss": {
+   "alignment": "ParakeetFeatureExtractor features (80 mel, preemphasis 0.97, per-feature normalisation, no dither); no speed/tempo change, time warp, crop or concat",
+   "blank_frames": "2-bin KL {blank, not-blank}",
+   "ctc": "F.ctc_loss(log_softmax fp32, reduction='sum', blank=3072, zero_infinity=True)",
+   "dense_frames": "p_blank < 0.95: the stored top-8 union {blank} plus a rest bucket",
+   "normaliser": "N_u, the CTC target tokens of the step",
+   "target": "Parakeet's greedy CTC path, ctc_greedy(ctc_col0(...)) = the jsonl ctc_hyp",
+   "temperature": 1.0,
+   "w_ctc": 0.8,
+   "w_kl": 1.0
+  },
+  "per_class": {
+   "pruned_kept": {
+    "bn": "teacher stats, eval mode (affine trains)",
+    "runs": [
+     "study-t06",
+     "study-t03",
+     "study-p03"
+    ],
+    "warmup_steps": 300,
+    "weight_decay": 0.0
+   },
+   "pruned_lost": {
+    "bn": "teacher stats, eval mode (affine trains)",
+    "definition": "a pruned student whose step-0 CER against its teacher is >= 90 % on the 60-utterance CPU gate",
+    "runs": [
+     "study-p01",
+     "study-p005"
+    ],
+    "warmup_steps": 1000,
+    "weight_decay": 0.0
+   },
+   "scratch": {
+    "bn": "train mode; evals use the running stats; grad_ckpt off",
+    "runs": [
+     "study-t01",
+     "study-t01-s1235",
+     "study-t005",
+     "study-bridge"
+    ],
+    "warmup_steps": 2000,
+    "weight_decay": 0.001,
+    "weight_decay_on": "parameters with ndim >= 2 only"
+   }
+  }
+ },
+ "waves": {
+  "1": [
+   "study-t06",
+   "study-t03",
+   "study-p03",
+   "study-bridge"
+  ],
+  "2": [
+   "study-t01",
+   "study-t005",
+   "study-p01",
+   "study-p005"
+  ],
+  "replicate": {
+   "lr": "study-t01's",
+   "max_steps": "study-t01's",
+   "run": "study-t01-s1235",
+   "when": "on its own 1x box once PREREG_numbers.json exists"
+  }
+ }
+}
