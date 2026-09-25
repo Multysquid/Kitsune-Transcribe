@@ -144,6 +144,11 @@ def test_g_per_halving_delta_g_init_effect_and_gaps(report):
     gap = report["distillation_gaps"]["transcribe"]
     assert gap["ratio"] == pytest.approx(1.0 / 0.90) and gap["n_noisy"] == 1  # the teacher has no run noise
     assert gap["se"] == pytest.approx(0.016)
+    # g over the teacher -> student halvings (STUDY.md 1.3 and 4.3: 1.743 Transcribe, 0.986 Parakeet)
+    assert gap["h"] == pytest.approx(1.743, abs=1e-3) and gap["g"] == pytest.approx((1 / 0.90) ** (1 / gap["h"]) - 1)
+    assert gap["ci_g"][0] < gap["g"] < gap["ci_g"][1] and "not a step of the walk" in gap["label"]
+    pg = report["distillation_gaps"]["parakeet"]
+    assert pg["h"] == pytest.approx(0.986, abs=1e-3) and pg["ratio"] == pytest.approx(1.0 / 0.85)
 
 
 def test_budget_readout_calls_compute_limited_only_when_the_gap_closes(report):

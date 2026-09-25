@@ -118,11 +118,12 @@ DISPLAY = {"study-t06": "T-0.6B", "study-t03": "T-0.3B", "study-bridge": "bridge
            "parakeet-ctc": "Parakeet CTC", "parakeet-tdt": "Parakeet TDT", ANCHOR: "anchor (first run's 0.6B)"}
 
 # exact total / non-embedding counts, STUDY.md 1.1 (meta-device builds; every builder asserts total == closed form).
-# The anchor is the first run's B20x2560-d4 = the T-0.6B shape; parakeet-ctc is the unpruned CTC path (24 x 4096).
+# The anchor is the first run's B20x2560-d4 = the T-0.6B shape; parakeet-ctc is the unpruned CTC path (24 x 4096);
+# cohere is the teacher itself (tests/test_student.py pins it), the far end of the Transcribe distillation gap.
 PARAMS_TOTAL = {"study-t06": 616_963_328, "study-t03": 320_752_384, "study-bridge": 320_752_384,
                 "study-t01": 103_996_416, "study-t01-s1235": 103_996_416, "study-t005": 51_209_600,
                 "study-p03": 308_524_033, "study-p01": 98_468_865, "study-p005": 52_190_209,
-                "parakeet-ctc": 610_898_945, ANCHOR: 616_963_328}
+                "parakeet-ctc": 610_898_945, ANCHOR: 616_963_328, "cohere": 2_065_647_872}
 PARAMS_NON_EMBEDDING = {"study-t06": 599_137_536, "study-t03": 302_926_592, "study-bridge": 302_926_592,
                         "study-t01": 95_083_520, "study-t01-s1235": 95_083_520, "study-t005": 44_524_928,
                         "study-p03": 305_374_208, "study-p01": 95_319_040, "study-p005": 49_040_384,
@@ -157,6 +158,8 @@ STEPS = (
     ("parakeet", "study-p03", "study-p01", "size + loss of function + depth"),
     ("parakeet", "study-p01", "study-p005", "nothing"),
 )
+# the distillation gaps (4.6): (family, student, its own teacher); g over h = 1.743 and 0.986 halvings (STUDY.md 1.3,
+# 4.3), reported beside the walk, never inside it
 GAPS = (("transcribe", "study-t06", "cohere"), ("parakeet", "study-p03", "parakeet-ctc"))
 
 
@@ -690,6 +693,18 @@ class Study:
                        ci_g=[g_of(lo, h), g_of(hi, h)])
         return out
 
+    def gap(self, fam: str, student: str, teacher: str) -> dict | None:
+        """A distillation gap (4.6): M4(student) / M4(own teacher) with its CI (the teacher is a fixed model, so
+        v_boot + sigma_run^2), and g per halving over h = log2(N_teacher / N_student) (1.743 Transcribe, 0.986
+        Parakeet: STUDY.md 1.3, 4.3), labelled as a gap: never a step of the walk. None without both tables."""
+        c = self.compare(student, teacher, "m4")
+        if c is None:
+            return None
+        h = self.h(teacher, student)
+        lo, hi = c["ci_ln"]
+        return dict(c, family=fam, label="distillation gap (teacher -> student), not a step of the walk", h=h,
+                    g=g_of(c["ln_ratio"], h) if h else None, ci_g=[g_of(lo, h), g_of(hi, h)] if h else None)
+
     def delta_g(self) -> dict:
         """Delta-g = g(T-0.1B -> T-0.05B) - g(bridge -> T-0.1B), the scratch ladder only (4.6). v_boot from the
         bootstrap of delta-g itself; run noise by the delta method over the three independent runs:
@@ -980,7 +995,7 @@ def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[
     out["delta_g"] = st.delta_g()
     init = st.compare("study-bridge", "study-t03", "m4")
     out["init_effect"] = dict(available=init is not None, comparison=init)
-    out["distillation_gaps"] = {f: st.compare(s, t, "m4") for f, s, t in GAPS}
+    out["distillation_gaps"] = {f: st.gap(f, s, t) for f, s, t in GAPS}
     out["budget"] = {f: st.budget(f) for f in LADDERS}
     out["bars"] = st.bars()
     out["cross_family"] = st.cross_family()

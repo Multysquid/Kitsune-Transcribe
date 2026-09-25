@@ -241,10 +241,13 @@ def render_md(rep: dict) -> str:
     ie = rep["init_effect"]
     L.append(f"- Init effect at 0.3B, M4(bridge) / M4(T-0.3B): {rci(ie['comparison'])}"
              + (" (above 1: pruning from Cohere beats scratch at this size)" if ie["available"] else "") + ".")
-    L += ["", "## Distillation gaps (not steps of the walk)", ""]
-    rows = [[f, disp(rep, c["a"]) + " / " + disp(rep, c["b"]) if c else "n/a", rci(c)]
+    L += ["", "## Distillation gaps (not steps of the walk)", "",
+          "Student vs its own teacher (a fixed model: v_boot + sigma_run^2); g per halving over the teacher -> student "
+          "parameter ratio, descriptive only.", ""]
+    rows = [[f, disp(rep, c["a"]) + " / " + disp(rep, c["b"]), f"{c['h']:.3f}" if c.get("h") else "n/a", rci(c),
+             gci(c.get("g"), c.get("ci_g"))] if c else [f, "n/a", "n/a", "n/a", "n/a"]
             for f, c in rep["distillation_gaps"].items()]
-    L += table(["family", "student / teacher", "M4 ratio [CI]"], rows) + [""]
+    L += table(["family", "student / teacher", "h", "M4 ratio [CI]", "g per halving [CI]"], rows) + [""]
 
     L += ["## Budget readout: T/2 vs T", "",
           "Each size's ratio to the top at T/2 (the branches) and at T; delta = ln r(T) - ln r(T/2). A CI below 0 "
