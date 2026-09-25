@@ -26,8 +26,9 @@ One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
                written right after them, and before the cooldown starts.
                Early stop (early_stop, below) and the STOP file can end this phase before the budget is used up
   5. end       final weights + full state (uploaded in the background), final eval with greedy decode of the FULL eval
-               sets, verdict (kitsune.evaluate.verdict; "N/A" with its numbers under eval.gate false: the
-               sanity/overfit runs), summary.json (uploads "pending") and a log sync, uploads awaited (bounded),
+               sets, verdict (kitsune.evaluate.verdict with eval.verdict_version's trend definition, verdict_options;
+               "N/A" with its numbers under eval.gate false: the sanity/overfit runs), summary.json (uploads
+               "pending") and a log sync, uploads awaited (bounded),
                summary.json with their results, final forced sync; exit 0
 
 Evals in the loop (run_eval): every eval.every_min minutes of loop clock (eval.every_steps steps when set), or at the
@@ -255,11 +256,16 @@ DEFAULTS = {
     # its in_probe rows. probe_greedy_audio_s: also greedy-decode a seeded ~N s of the probe (null:
     # subset.eval_audio_s; both null: no probe decode). mini: a small eval of its own every mini.every_steps steps
     # (null: none, and no combined_loss/val curve; run_mini_eval). gate: false = no GO/NO-GO verdict (sanity/overfit
-    # runs: "N/A" + the numbers)
+    # runs: "N/A" + the numbers). verdict_version: which pre-registered trend definition the verdict uses
+    # (kitsune.evaluate.verdict): 1, the one the first A100 run was judged by (kept here and in every config written
+    # before v2, so its INCONCLUSIVE reproduces), or 2 (the CER trend on the pre-cooldown evals, complete-set numbers
+    # when every eval in its window has them, de-duplicated end points, the cooldown gain and the pre-cooldown slope
+    # reported); verdict_min_epoch_gap: v2's de-duplication, in epochs (verdict_options)
     "eval": {"every_min": 20, "every_steps": None, "greedy_subset": 500, "probe": True, "final_full_greedy": True,
              "batch_s": 400, "check_baselines": True, "every_epochs": None, "probe_is_train": False,
              "probe_greedy_audio_s": None, "full_every_epochs": None,
-             "mini": {"every_steps": None, "val_per_set": 32, "train_utts": 64, "greedy": True}, "gate": True},
+             "mini": {"every_steps": None, "val_per_set": 32, "train_utts": 64, "greedy": True}, "gate": True,
+             "verdict_version": 1, "verdict_min_epoch_gap": 0.25},
     "ckpt": {"weights_every_min": 30, "full_local_every_min": 30, "weights_every_steps": None,
              "full_every_steps": None, "keep_local": 2, "upload_full_at": ["pre_cooldown", "end"],
              "full_after_smoke": True},
@@ -398,6 +404,11 @@ def validate(cfg: dict):
             raise SystemExit(f"eval.mini.{key} must be an int >= 0, got {mini[key]}")
     if ev_cfg["probe_is_train"] and not ev_cfg["probe"]:
         raise SystemExit("eval.probe_is_train needs eval.probe")
+    if not (_pos_int(ev_cfg["verdict_version"]) and ev_cfg["verdict_version"] in (1, 2)):
+        raise SystemExit(f"eval.verdict_version must be 1 or 2, got {ev_cfg['verdict_version']!r}")
+    if not (_number(ev_cfg["verdict_min_epoch_gap"]) and ev_cfg["verdict_min_epoch_gap"] >= 0):
+        raise SystemExit(f"eval.verdict_min_epoch_gap must be a number of epochs >= 0, got "
+                         f"{ev_cfg['verdict_min_epoch_gap']!r}")
     es = cfg["early_stop"]
     if es["metric"] not in EARLY_STOP_METRICS:
         raise SystemExit(f"early_stop.metric must be one of {', '.join(EARLY_STOP_METRICS)}, got {es['metric']}")
@@ -1607,12 +1618,16 @@ def eval_summary(step: int, train_s: float, final: bool, complete: bool, tf_sum:
 
 
 def eval_history_record(step: int, elapsed_s: float, tf_sum: dict, gr_sum: dict, probe_sum: dict | None,
-                        pg_sum: dict | None, head: dict, epoch: float | None = None) -> dict:
-    """A full eval's record in the history the verdict and the early stop read (kitsune.evaluate.eval_record, the
-    probe's greedy CERs, the epoch in epoch mode and the headline)."""
+                        pg_sum: dict | None, head: dict, epoch: float | None = None, full_sum: dict | None = None,
+                        lr_phase: str | None = None) -> dict:
+    """A full eval's record in the history the verdict and the early stop read (kitsune.evaluate.eval_record: the
+    fixed subset's greedy numbers, and next to them the complete sets' at a complete eval (full_sum) and the LR phase
+    of the last step, which verdict v2 reads; the probe's greedy CERs, the epoch in epoch mode (and under verdict v2)
+    and the headline). The early stop reads heldout_kl / probe_kl only, so the added numbers change nothing there."""
     from kitsune import evaluate as ev
 
-    rec = ev.eval_record(step, elapsed_s, tf=tf_sum, greedy=gr_sum, probe=probe_sum)
+    rec = ev.eval_record(step, elapsed_s, tf=tf_sum, greedy=gr_sum, probe=probe_sum, greedy_full=full_sum,
+                         lr_phase=lr_phase)
     if pg_sum and "all" in pg_sum:
         rec["probe_greedy"] = {k: pg_sum["all"][k] for k in ("cer_teacher_corpus", "cer_ref_corpus", "n")}
     if epoch is not None:
@@ -1645,7 +1660,8 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     eval sets (`complete`; default: the final eval under eval.final_full_greedy; the loop passes it for every
     eval.full_every_epochs eval), the subset summary then taken from those rows so the history stays comparable.
     Tables, summary, scalars, the headline numbers (summary/full/..., log_headline) and samples go to the logger; one
-    record goes to the history the verdict and the early stop read (the subset's greedy numbers). The `eval` event's
+    record goes to the history the verdict and the early stop read (the subset's greedy numbers, and at a complete eval
+    the complete sets' next to them as greedy_full: eval_history_record). The `eval` event's
     per-set CERs are those of the headline's scope, named in its greedy_scope (eval_event_sets). Returns the greedy
     summary the verdict should judge: the complete-set one when there is one (the subset one if
     eval.final_full_greedy is off).
@@ -1750,7 +1766,10 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
                                  + (float(pg_sum.get("wall_s", 0.0)) if pg_sum else 0.0),
                                  greedy_s=float(gr_sum.get("wall_s", 0.0)),
                                  greedy_n=len(R.evalstore) if full_sum is not None else len(R.greedy_ids))
-    rec = eval_history_record(step, R.clock(), tf_sum, gr_sum, probe_sum, pg_sum, head, epoch=extra.get("epoch"))
+    # verdict v2 de-duplicates its trend window by epochs: its records carry the epoch outside epoch mode too
+    rec_epoch = extra.get("epoch", R.st["epoch_progress"] if verdict_options(cfg) else None)
+    rec = eval_history_record(step, R.clock(), tf_sum, gr_sum, probe_sum, pg_sum, head, epoch=rec_epoch,
+                              full_sum=full_sum, lr_phase=lr_phase_name(R.st.get("lr_phase")))
     hist = R.st["history"]
     if hist and hist[-1]["step"] == step:
         hist[-1] = rec
@@ -2030,9 +2049,12 @@ def save_weights(R: Run, step: int, reason: str) -> Path:
     if tmp.exists():
         shutil.rmtree(tmp)
     meta = dict(R.student_meta)
+    # lr_phase: the phase of the last step, which scripts/05_evaluate.py puts in its history record of this checkpoint
+    # (verdict v2 reads it)
     meta["trained"] = dict(run_id=R.run_dir.name, step=step, train_s=round(R.clock(), 1), epoch=R.st["epoch_progress"],
                            reason=reason, time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                           init=str(R.cfg["student"]), last_objective=R.st["last_objective"])
+                           init=str(R.cfg["student"]), last_objective=R.st["last_objective"],
+                           lr_phase=lr_phase_name(R.st.get("lr_phase")))
     S.save_student(R.model, tmp, R.processor, meta)
     _flush_dir(tmp)
     _replace_dir(tmp, d)
@@ -2687,7 +2709,7 @@ def train(R: Run, state: dict | None) -> int:
         log.event("eval_final_reused", at_step=step)
     else:
         full_sum = run_eval(R, step, final=True)
-    verdict = gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=R.st["history"])))
+    verdict = gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=R.st["history"]), **verdict_options(cfg)))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
     headline = (R.st["history"][-1] if R.st["history"] else {}).get("headline")
@@ -2703,6 +2725,24 @@ def train(R: Run, state: dict | None) -> int:
     R.uploader.shutdown()
     log.close(summary=summary)
     return EXIT_OK
+
+
+def lr_phase_name(phase: int | None) -> str | None:
+    """st["lr_phase"] (wsd_lr's phase of the last optimizer step: 0, 1, 2; None before the first) as the name the
+    `lr_phase` events and the history records use (kitsune.evaluate.LR_PHASES)."""
+    from kitsune.evaluate import LR_PHASES
+
+    return None if phase is None else LR_PHASES[int(phase)]
+
+
+def verdict_options(cfg: dict) -> dict:
+    """kitsune.evaluate.verdict's keyword options for this config: none under eval.verdict_version 1 - the very call
+    the first A100 run was judged with, so its verdict reproduces - and version / min_epoch_gap under 2 (verdict()'s
+    docstring defines what v2 computes)."""
+    ev_cfg = cfg["eval"]
+    if int(ev_cfg["verdict_version"]) == 1:
+        return {}
+    return dict(version=int(ev_cfg["verdict_version"]), min_epoch_gap=float(ev_cfg["verdict_min_epoch_gap"]))
 
 
 def gate_verdict(cfg: dict, computed: dict) -> dict:

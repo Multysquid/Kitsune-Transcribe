@@ -546,9 +546,17 @@ def combined_loss(tf: dict | None, w_kl: float, w_ce: float) -> dict | None:
 
 
 def eval_record(step: int, elapsed_s: float, tf: dict | None = None, greedy: dict | None = None,
-                probe: dict | None = None) -> dict:
-    """Compact per-eval record; the trainer appends one per eval to the history that verdict() reads."""
+                probe: dict | None = None, greedy_full: dict | None = None, lr_phase: str | None = None) -> dict:
+    """Compact per-eval record; the trainer appends one per eval to the history that verdict() reads.
+
+    greedy holds the fixed greedy subset's per-set numbers at every eval (what the early stop's neighbours, the
+    summary's best step and verdict v1 read, so the curve keeps one population from step 0 on); greedy_full, the same
+    numbers of the COMPLETE sets, only for an eval that decoded them (verdict v2's CER trend reads them when every eval
+    in its window has them). lr_phase: the LR phase of the last optimizer step before the eval ("warmup", "stable" or
+    "cooldown", LR_PHASES; none at step 0), which verdict v2 splits the history by."""
     rec = dict(step=int(step), elapsed_s=float(elapsed_s))
+    if lr_phase is not None:
+        rec["lr_phase"] = str(lr_phase)
     if tf and "all" in tf:
         # the pre-registered held-out KL pools the GATE sets only, so adding a monitor-only eval set (eval_emilia)
         # cannot move the over-fitting test; the all-sets value is kept alongside
@@ -559,10 +567,29 @@ def eval_record(step: int, elapsed_s: float, tf: dict | None = None, greedy: dic
         rec["tf"] = {s: {k: d[k] for k in ("kl", "ce", "top1")} for s, d in tf["sets"].items()}
     if probe and "all" in probe:
         rec["probe_kl"] = probe["all"]["kl"]
-    if greedy and greedy.get("sets"):
-        rec["greedy"] = {s: {k: d[k] for k in ("cer_ref_corpus", "teacher_cer_ref_corpus", "trunc_rate", "n")}
-                         for s, d in greedy["sets"].items()}
+    for key, summary in (("greedy", greedy), ("greedy_full", greedy_full)):
+        if summary and summary.get("sets"):
+            rec[key] = {s: {k: d[k] for k in ("cer_ref_corpus", "teacher_cer_ref_corpus", "trunc_rate", "n")}
+                        for s, d in summary["sets"].items()}
     return rec
+
+
+# the trainer's WSD phases 0 / 1 / 2 (04_distill.wsd_lr) by the names its `lr_phase` events and the history use
+LR_PHASES = ("warmup", "stable", "cooldown")
+
+
+def lr_phase_at(step: int, lr_phase_events: Iterable[dict]) -> str | None:
+    """The LR phase of optimizer step `step`, from the trainer's `lr_phase` events (each names the phase that begins at
+    its at_step): the phase of the event with the largest at_step <= step. A resume that replays steps logs the same
+    boundaries again, so the largest at_step, not the last event in the file, is the one that holds. None for step 0
+    (no step taken) and before the first event. It gives the lr_phase of history records written before the trainer
+    recorded one (the first A100 run's), exactly as the trainer now records it."""
+    best = None
+    for e in lr_phase_events:
+        at = int(e["at_step"])
+        if at <= step and (best is None or at >= best[0]):
+            best = (at, str(e["phase"]))
+    return best[1] if best is not None and step > 0 else None
 
 
 # ---------------------------------------------------------------------------------------------------- verdict
@@ -579,9 +606,71 @@ def _rel_change(xs: list[float], ys: list[float], scale: float | None = None) ->
     return float(slope * (x.max() - x.min()) / (scale or 1e-12))
 
 
+def _tail(records: list[dict], tail_frac: float, min_points: int) -> list[dict]:
+    """The last max(min_points, ceil(tail_frac n)) of n records (all of them when there are fewer)."""
+    return records[len(records) - min(len(records), max(min_points, math.ceil(tail_frac * len(records)))):]
+
+
+def _gate_ratio_mean(g: dict | None) -> float | None:
+    """A history record's CER measure for the trend: the mean over the gate sets of student / teacher corpus CER, from
+    its greedy (subset) or greedy_full (complete sets) numbers; None without a gate set that has a teacher CER."""
+    g = g or {}
+    v = [g[s]["cer_ref_corpus"] / g[s]["teacher_cer_ref_corpus"] for s in GATE_SETS
+         if s in g and g[s].get("teacher_cer_ref_corpus")]
+    return float(np.mean(v)) if v else None
+
+
+def _gates(g: dict | None) -> set[str]:
+    return {s for s in GATE_SETS if s in (g or {})}
+
+
+def _complete(records: list[dict]) -> bool:
+    """Every record carries complete-set numbers (greedy_full) for the gate sets its subset numbers cover."""
+    return bool(records) and all(_gates(r.get("greedy_full")) >= (_gates(r.get("greedy")) or set(GATE_SETS))
+                                 for r in records)
+
+
+def dedup_history(records: list[dict], min_epoch_gap: float) -> tuple[list[dict], list[int]]:
+    """verdict v2's de-duplication of the trained records (in step order): a record that comes less than min_epoch_gap
+    epochs after the previous KEPT record is dropped, the later one of the two. The first A100 run's final eval came 46
+    steps (0.04 epoch) after its epoch-8 eval: two near-identical models counted twice at the end of the window. A
+    record without an epoch (a run outside epoch mode written before v2) is kept. Returns (kept, dropped steps)."""
+    kept, dropped = [], []
+    for r in records:
+        p = kept[-1] if kept else None
+        if (p is not None and r.get("epoch") is not None and p.get("epoch") is not None
+                and float(r["epoch"]) - float(p["epoch"]) < min_epoch_gap):
+            dropped.append(int(r["step"]))
+        else:
+            kept.append(r)
+    return kept, dropped
+
+
+def _cooldown_gain(records: list[dict]) -> dict | None:
+    """verdict v2's cooldown gain: the final eval (the last record) against the last pre-cooldown eval (the last record
+    whose lr_phase is "stable"), both on the complete sets when both have them, else on the subset. None when the final
+    eval does not follow a cooldown step or no eval came before the cooldown."""
+    if not records or records[-1].get("lr_phase") != "cooldown":
+        return None
+    pre = [r for r in records if r.get("lr_phase") == "stable"]
+    if not pre:
+        return None
+    a, b = pre[-1], records[-1]
+    key = "greedy_full" if _complete([a, b]) else "greedy"
+    before, after = _gate_ratio_mean(a.get(key)), _gate_ratio_mean(b.get(key))
+    if before is None or after is None:
+        return None
+    ga, gb = a.get(key) or {}, b.get(key) or {}
+    return dict(from_step=int(a["step"]), to_step=int(b["step"]), from_epoch=a.get("epoch"), to_epoch=b.get("epoch"),
+                scope="complete" if key == "greedy_full" else "subset", cer_ratio_before=before, cer_ratio_after=after,
+                cer_ratio_rel_change=after / before - 1.0 if before else None,
+                sets={s: dict(cer_before=float(ga[s]["cer_ref_corpus"]), cer_after=float(gb[s]["cer_ref_corpus"]))
+                      for s in GATE_SETS if s in ga and s in gb})
+
+
 def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.5, max_trunc: float = 0.005,
             tail_frac: float = 0.2, min_points: int = 3, improving_rel: float = 0.01, widening_rel: float = 0.02,
-            overfit_rel: float = 0.01) -> dict:
+            overfit_rel: float = 0.01, version: int = 1, min_epoch_gap: float = 0.25) -> dict:
     """Gate D32a, pre-registered.
 
     results = {"final":   greedy_eval summary of the FULL eval sets at the end of the run (its bad_audio_per_set:
@@ -605,7 +694,33 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     window relative to the window mean (the gap: relative to the mean held-out KL); the thresholds are returned with
     the verdict. A gate set some of whose audio could not be decoded is judged on the rows that decoded (the teacher
     CER on the same ids by default, so the ratio stays paired); per_set carries n and n_bad_audio, and a reason says
-    it was not the pre-registered full set. The tiers do not change."""
+    it was not the pre-registered full set. The tiers do not change.
+
+    version 1 is the above, exactly as the first A100 run was judged (INCONCLUSIVE: "still improving" measured inside
+    the WSD cooldown, on the 500-per-set subset, with two near-identical end points; configs keep it unless they set
+    eval.verdict_version 2). version 2 (pre-registered for the runs after it) keeps the tiers, the per-set gate, the
+    thresholds and the measure (the mean over the gate sets of student / teacher corpus CER) and changes which evals
+    the trends read and on what:
+      1. the trained records (step > 0, by step) are de-duplicated (dedup_history): one that comes less than
+         min_epoch_gap (0.25) epochs after the previous kept one is dropped, the later of the two
+      2. over-fitting and the KL gap: as in v1 over the last max(min_points, ceil(0.2 n)) of the n de-duplicated
+         records, cooldown included (over-fitting in the cooldown still counts)
+      3. "CER still improving": over the PRE-COOLDOWN evals only - the de-duplicated records whose lr_phase is
+         "stable" (the eval followed a step at the peak LR, after the warm-up and before the cooldown; an early-stop
+         cooldown counts as the cooldown) - their last max(min_points, ceil(0.2 m)) of m. At least min_points (3) of
+         them are needed, else the trend is unknown ("trend: insufficient pre-cooldown evals") and the run cannot be
+         PROMISING or the flat NO-GO. The question is whether more training at the peak LR still helps; the
+         cooldown's one-off annealing gain says nothing about that, and a window at the end of a WSD run always
+         falls inside it (both are the last 20 %). The numbers are the complete sets' (greedy_full) when every record
+         in that window has them, else the fixed subset's (greedy); trend.cer_scope and a reason say which
+      4. reported next to the tiers, never gating: pre_cooldown_slope - that window's CER measure, its relative
+         change across the window (the one "improving" tests; x = step) and the least-squares slope per epoch
+         (per_epoch, and rel_per_epoch = per_epoch / the window's mean) - and cooldown_gain - the final eval (the
+         history's last record, whatever the de-duplication dropped) against the last pre-cooldown eval, on the
+         complete sets when both have them: the measure before and after, its relative change, and each gate set's
+         CER before and after (null without an eval on each side)
+    A record's lr_phase is the trainer's (eval_record); lr_phase_at gives it for a history written before the trainer
+    recorded one. Records without it never count as pre-cooldown (a reason counts them)."""
     fin = results.get("final") or {}
     fsets = fin.get("sets", {})
     bad = fin.get("bad_audio_per_set") or {}
@@ -642,21 +757,32 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     trunc_rate = n_trunc / n_out if n_out else float("nan")
     trunc_ok = n_out > 0 and trunc_rate <= max_trunc
 
+    if version not in (1, 2):
+        raise ValueError(f"verdict version must be 1 or 2, got {version!r}")
     hist = sorted((r for r in results.get("history") or [] if r["step"] > 0), key=lambda r: r["step"])  # trained only
-    window = hist[len(hist) - min(len(hist), max(min_points, math.ceil(tail_frac * len(hist)))):]
+    extra = {}
+    if version == 1:
+        window = _tail(hist, tail_frac, min_points)
+        cer_window, cer_key = window, "greedy"
+    else:
+        kept, dropped = dedup_history(hist, float(min_epoch_gap))
+        window = _tail(kept, tail_frac, min_points)
+        pre = [r for r in kept if r.get("lr_phase") == "stable"]
+        cer_window = _tail(pre, tail_frac, min_points) if len(pre) >= min_points else []
+        cer_key = "greedy_full" if _complete(cer_window) else "greedy"
+        if dropped:
+            reasons.append(f"de-duplicated: the evals at steps {dropped} come less than {min_epoch_gap} epoch after "
+                           f"the one before and are left out of the trends")
+        if n_unphased := sum(r.get("lr_phase") is None for r in hist):
+            reasons.append(f"{n_unphased} evals without an LR phase are left out of the CER trend")
 
-    def series(fn):
-        pts = [(r["step"], fn(r)) for r in window]
+    def series(fn, recs=None):
+        pts = [(r["step"], fn(r)) for r in (window if recs is None else recs)]
         pts = [(x, y) for x, y in pts if y is not None and not math.isnan(y)]
         return [x for x, _ in pts], [y for _, y in pts]
 
-    def cer_ratio(r):
-        g = r.get("greedy") or {}
-        v = [g[s]["cer_ref_corpus"] / g[s]["teacher_cer_ref_corpus"] for s in GATE_SETS
-             if s in g and g[s].get("teacher_cer_ref_corpus")]
-        return float(np.mean(v)) if v else None
-
-    cer_change = _rel_change(*series(cer_ratio))
+    cer_x, cer_y = series(lambda r: _gate_ratio_mean(r.get(cer_key)), cer_window)
+    cer_change = _rel_change(cer_x, cer_y) if version == 1 or len(cer_x) >= min_points else None
     held, probe = series(lambda r: r.get("heldout_kl")), series(lambda r: r.get("probe_kl"))
     held_change, probe_change = _rel_change(*held), _rel_change(*probe)
     gx, gy = series(lambda r: r["heldout_kl"] - r["probe_kl"] if "heldout_kl" in r and "probe_kl" in r else None)
@@ -666,8 +792,28 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     gap_ok = gap_change is not None and gap_change <= widening_rel
     overfit = (probe_change is not None and held_change is not None
                and probe_change < -overfit_rel and held_change > overfit_rel)
-    if cer_change is None:
+    if version == 1 and cer_change is None:
         reasons.append("CER trend unknown: fewer than 2 greedy evals after step 0 in the window")
+    if version == 2:
+        scope = ("complete" if cer_key == "greedy_full" else "subset") if cer_window else None
+        if cer_change is None:
+            reasons.append(f"trend: insufficient pre-cooldown evals ({len(cer_x) if cer_window else len(pre)} after "
+                           f"de-duplication, {min_points} needed)")
+        else:
+            reasons.append(f"CER trend {cer_change:+.1%} over the pre-cooldown evals at steps {cer_x} ("
+                           + ("the complete sets)" if scope == "complete" else "the fixed greedy subset)"))
+        slope = None
+        if cer_change is not None:
+            ep = {int(r["step"]): r.get("epoch") for r in cer_window}
+            per_epoch = None
+            if all(ep.get(x) is not None for x in cer_x) and len({float(ep[x]) for x in cer_x}) >= 2:
+                per_epoch = float(np.polyfit(np.asarray([float(ep[x]) for x in cer_x], np.float64),
+                                             np.asarray(cer_y, np.float64), 1)[0])
+            mean = float(np.mean(np.abs(cer_y)))
+            slope = dict(steps=cer_x, epochs=[ep.get(x) for x in cer_x], scope=scope, cer_ratio=cer_y,
+                         rel_change=cer_change, per_epoch=per_epoch,
+                         rel_per_epoch=per_epoch / mean if per_epoch is not None and mean else None)
+        extra = dict(pre_cooldown_slope=slope, cooldown_gain=_cooldown_gain(hist))
     if gap_change is None:
         reasons.append("KL-gap trend unknown: fewer than 2 evals after step 0 with both probe and held-out KL")
 
@@ -695,12 +841,18 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     if n_go >= 2 and trunc_ok and not gap_ok and not overfit:
         reasons.append("probe/held-out KL gap widening (or unknown) blocks GO")
 
-    return dict(verdict=v, reasons=reasons, sets=per_set, n_sets_go=int(n_go), n_sets_promising=int(n_prom),
-                trunc_rate=trunc_rate, trunc_ok=bool(trunc_ok),
-                trend=dict(window_steps=[r["step"] for r in window], cer_ratio_rel_change=cer_change,
-                           improving=bool(improving), heldout_kl_rel_change=held_change,
-                           probe_kl_rel_change=probe_change, gap_rel_change=gap_change,
-                           gap_widening=None if gap_change is None else not gap_ok, overfit=bool(overfit)),
-                thresholds=dict(go_ratio=go_ratio, promising_ratio=promising_ratio, max_trunc=max_trunc,
-                                tail_frac=tail_frac, min_points=min_points, improving_rel=improving_rel,
-                                widening_rel=widening_rel, overfit_rel=overfit_rel))
+    trend = dict(window_steps=[r["step"] for r in window], cer_ratio_rel_change=cer_change,
+                 improving=bool(improving), heldout_kl_rel_change=held_change,
+                 probe_kl_rel_change=probe_change, gap_rel_change=gap_change,
+                 gap_widening=None if gap_change is None else not gap_ok, overfit=bool(overfit))
+    thresholds = dict(go_ratio=go_ratio, promising_ratio=promising_ratio, max_trunc=max_trunc,
+                      tail_frac=tail_frac, min_points=min_points, improving_rel=improving_rel,
+                      widening_rel=widening_rel, overfit_rel=overfit_rel)
+    out = dict(verdict=v, reasons=reasons, sets=per_set, n_sets_go=int(n_go), n_sets_promising=int(n_prom),
+               trunc_rate=trunc_rate, trunc_ok=bool(trunc_ok), trend=trend, thresholds=thresholds)
+    if version == 2:
+        trend.update(cer_window_steps=[r["step"] for r in cer_window], cer_scope=scope, deduplicated_steps=dropped,
+                     n_pre_cooldown=len(pre))
+        thresholds.update(min_epoch_gap=float(min_epoch_gap))
+        out = dict(verdict=v, version=2, **{k: x for k, x in out.items() if k != "verdict"}, **extra)
+    return out

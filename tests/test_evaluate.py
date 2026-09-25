@@ -1,8 +1,10 @@
 """kitsune.evaluate: CER conventions, the pre-registered verdict, the teacher baselines, and both evals on a tiny random
 CohereAsr model over a real (synthetic) trainset store. CPU only; the teacher tokenizer is used from the HF cache if
 present (HF_HUB_OFFLINE), otherwise a stand-in."""
+import copy
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -188,12 +190,241 @@ def test_verdict_reports_undecodable_gate_rows():
     assert "eval_reazon: no final greedy result (5 undecodable rows)" in v["reasons"]
 
 
+# ----------------------------------------------------------------------------------------------- verdict v2
+
+
+def history2(points):
+    """Records as the trainer now writes them. points: (step, epoch, lr_phase, subset ratio, complete ratio or None,
+    held-out KL, probe KL); the ratio is the same on every gate set, the teacher at its pre-registered CER."""
+    out = []
+    for st, ep, ph, sub, full, h, p in points:
+        def sets(r):
+            return {s: dict(cer_ref_corpus=r * t, teacher_cer_ref_corpus=t, trunc_rate=0.0, n=500)
+                    for s, t in ev.TEACHER_CER_PREREG.items()}
+        rec = dict(step=st, elapsed_s=st * 1.0, heldout_kl=h, probe_kl=p, greedy=sets(sub))
+        if ph is not None:
+            rec["lr_phase"] = ph
+        if ep is not None:
+            rec["epoch"] = ep
+        if full is not None:
+            rec["greedy_full"] = sets(full)
+        out.append(rec)
+    return out
+
+
+def wsd_history(ratios, cooldown_from, full=None, kl=None, probe=None):
+    """One eval per epoch (step = 100 x epoch), epoch 1..n; the evals from epoch `cooldown_from` on follow a cooldown
+    step. full: the complete sets' ratios (None: a subset-only history)."""
+    n = len(ratios)
+    kl = kl or list(np.linspace(0.8, 0.3, n))
+    probe = probe or list(np.linspace(0.7, 0.25, n))
+    return history2([(100 * e, float(e), "cooldown" if e >= cooldown_from else "stable", ratios[e - 1],
+                      None if full is None else full[e - 1], kl[e - 1], probe[e - 1]) for e in range(1, n + 1)])
+
+
+def test_verdict_v2_measures_improving_before_the_cooldown():
+    """Flat at the peak LR, then the cooldown's one-off drop: v1 reads the drop ('still improving', INCONCLUSIVE, as the
+    first A100 run), v2 the flat pre-cooldown evals (the pre-registered NO-GO). The tiers and per-set numbers are the
+    same; v2 reports the cooldown gain and the pre-cooldown slope next to them."""
+    ratios = [2.6, 2.3, 2.1, 2.0, 1.95, 1.95, 1.95, 1.95, 1.95, 1.8, 1.7, 1.65]
+    hist, fin = wsd_history(ratios, cooldown_from=10), final((1.8, 2.0, 1.4))
+    v1 = ev.verdict(dict(final=fin, history=hist))
+    assert v1["verdict"] == "INCONCLUSIVE" and v1["trend"]["improving"] and v1["trend"]["window_steps"] == [1000, 1100,
+                                                                                                             1200]
+    v2 = ev.verdict(dict(final=fin, history=hist), version=2)
+    assert v2["verdict"] == "NO-GO" and v2["version"] == 2 and not v2["trend"]["improving"], v2["reasons"]
+    assert v2["sets"] == v1["sets"] and v2["n_sets_promising"] == v1["n_sets_promising"] == 1
+    t = v2["trend"]
+    assert t["cer_window_steps"] == [700, 800, 900] and t["n_pre_cooldown"] == 9  # max(3, ceil(0.2 * 9))
+    assert t["cer_ratio_rel_change"] == pytest.approx(0.0, abs=1e-12) and t["cer_scope"] == "subset"
+    assert t["window_steps"] == [1000, 1100, 1200]  # over-fitting and the KL gap: the end of the run, as in v1
+    assert any(re.fullmatch(r"CER trend [+-]0\.0% over the pre-cooldown evals at steps \[700, 800, 900\] \(the fixed "
+                            r"greedy subset\)", r) for r in v2["reasons"]), v2["reasons"]
+    g = v2["cooldown_gain"]
+    assert (g["from_step"], g["to_step"], g["from_epoch"], g["to_epoch"]) == (900, 1200, 9.0, 12.0)
+    assert g["scope"] == "subset"
+    assert (g["cer_ratio_before"], g["cer_ratio_after"]) == pytest.approx((1.95, 1.65))
+    assert g["cer_ratio_rel_change"] == pytest.approx(1.65 / 1.95 - 1)
+    assert g["sets"]["eval_jsut"] == pytest.approx(dict(cer_before=1.95 * 0.0830, cer_after=1.65 * 0.0830))
+    s = v2["pre_cooldown_slope"]
+    assert s["steps"] == [700, 800, 900] and s["epochs"] == [7.0, 8.0, 9.0] and s["per_epoch"] == pytest.approx(0.0)
+    assert v2["thresholds"] == dict(v1["thresholds"], min_epoch_gap=0.25)
+    # a pre-cooldown slope that still falls: PROMISING under both when 2 sets are within 1.5x
+    ratios = [2.0, 1.9, 1.8, 1.7, 1.6, 1.5, 1.45, 1.4, 1.35, 1.3, 1.25, 1.2]
+    v2 = ev.verdict(dict(final=final((1.3, 1.4, 1.6)), history=wsd_history(ratios, cooldown_from=10)), version=2)
+    assert v2["verdict"] == "PROMISING" and v2["trend"]["improving"]
+    s = v2["pre_cooldown_slope"]
+    assert s["per_epoch"] == pytest.approx(-0.05) and s["rel_per_epoch"] == pytest.approx(-0.05 / 1.4)
+    assert s["rel_change"] == v2["trend"]["cer_ratio_rel_change"] == pytest.approx(-0.1 / 1.4)
+
+
+def test_verdict_v2_needs_three_pre_cooldown_evals():
+    """Fewer than min_points (3) evals at the peak LR: the trend is unknown - neither PROMISING nor the flat NO-GO -
+    and the reason says so; over-fitting and the KL gap still read the end of the run."""
+    ratios = [1.6, 1.5, 1.4, 1.35, 1.3]
+    hist = wsd_history(ratios, cooldown_from=3)
+    v1 = ev.verdict(dict(final=final((1.3, 1.4, 1.6)), history=hist))
+    assert v1["verdict"] == "PROMISING"  # v1: the cooldown's drop counts as improving
+    v2 = ev.verdict(dict(final=final((1.3, 1.4, 1.6)), history=hist), version=2)
+    assert v2["verdict"] == "INCONCLUSIVE" and v2["trend"]["cer_ratio_rel_change"] is None
+    assert "trend: insufficient pre-cooldown evals (2 after de-duplication, 3 needed)" in v2["reasons"]
+    assert v2["trend"]["cer_window_steps"] == [] and v2["trend"]["cer_scope"] is None
+    assert v2["pre_cooldown_slope"] is None and v2["cooldown_gain"]["from_step"] == 200
+    assert v2["trend"]["window_steps"] == [300, 400, 500] and v2["trend"]["gap_widening"] is False
+    v2 = ev.verdict(dict(final=final((1.8, 2.0, 1.4)), history=hist), version=2)
+    assert v2["verdict"] == "INCONCLUSIVE"  # not the flat NO-GO either: the trend is not measured
+    # a GO needs no CER trend, and over-fitting is NO-GO whatever the pre-cooldown evals
+    v2 = ev.verdict(dict(final=final((1.1, 1.1, 1.3)), history=hist), version=2)
+    assert v2["verdict"] == "GO"
+    rising = wsd_history(ratios, 3, kl=[0.30, 0.31, 0.33, 0.36, 0.40], probe=[0.30, 0.25, 0.20, 0.15, 0.10])
+    v2 = ev.verdict(dict(final=final((1.1, 1.1, 1.3)), history=rising), version=2)
+    assert v2["verdict"] == "NO-GO" and v2["trend"]["overfit"]
+    # warm-up evals and evals without an LR phase are not pre-cooldown evals
+    hist = wsd_history([1.5] * 6, cooldown_from=7)
+    hist[0]["lr_phase"] = "warmup"
+    del hist[1]["lr_phase"]
+    v2 = ev.verdict(dict(final=final((1.8, 2.0, 1.4)), history=hist), version=2)
+    assert v2["trend"]["n_pre_cooldown"] == 4 and v2["trend"]["cer_window_steps"] == [400, 500, 600]
+    assert "1 evals without an LR phase are left out of the CER trend" in v2["reasons"]
+    assert v2["cooldown_gain"] is None  # the run never reached its cooldown
+    with pytest.raises(ValueError, match="version"):
+        ev.verdict(dict(final=final((1.0, 1.0, 1.0)), history=[]), version=3)
+
+
+def test_verdict_v2_uses_the_complete_sets_when_every_eval_in_its_window_has_them():
+    """The complete sets (greedy_full) when every record in the pre-cooldown window carries them - here falling while
+    the 500-per-set subset looks flat - else the subset, for the whole window; the reason and trend.cer_scope say
+    which. The cooldown gain picks its scope the same way for its two evals."""
+    sub = [2.0] * 9
+    full = [2.4, 2.3, 2.2, 2.1, 2.0, 1.9, 1.8, 1.7, 1.6]
+    hist = wsd_history(sub, cooldown_from=8, full=full)
+    v2 = ev.verdict(dict(final=final((1.8, 2.0, 1.4)), history=hist), version=2)
+    assert v2["trend"]["cer_scope"] == "complete" and v2["trend"]["cer_window_steps"] == [500, 600, 700]
+    assert v2["trend"]["improving"] and v2["verdict"] == "INCONCLUSIVE"
+    assert v2["trend"]["cer_ratio_rel_change"] == pytest.approx(-0.2 / 1.9)
+    assert any(r.endswith("at steps [500, 600, 700] (the complete sets)") for r in v2["reasons"])
+    assert v2["cooldown_gain"]["scope"] == "complete" and v2["cooldown_gain"]["cer_ratio_after"] == pytest.approx(1.6)
+    # one eval of the window without complete-set numbers (a subset eval): the whole window reads the subset
+    del hist[5]["greedy_full"]
+    v2 = ev.verdict(dict(final=final((1.8, 2.0, 1.4)), history=hist), version=2)
+    assert v2["trend"]["cer_scope"] == "subset" and not v2["trend"]["improving"] and v2["verdict"] == "NO-GO"
+    assert any(r.endswith("(the fixed greedy subset)") for r in v2["reasons"])
+    assert v2["cooldown_gain"]["scope"] == "complete"  # its two evals (700 and 900) both have them
+    # a complete-set record missing a gate set its subset has is not complete
+    hist = wsd_history(sub, cooldown_from=8, full=full)
+    del hist[6]["greedy_full"]["eval_cv8"]
+    assert ev.verdict(dict(final=final((1.8, 2.0, 1.4)), history=hist), version=2)["trend"]["cer_scope"] == "subset"
+
+
+def test_verdict_v2_drops_near_duplicate_end_points():
+    """A record less than min_epoch_gap (0.25) epochs after the previous kept one leaves the trends, the later of the
+    two (the first A100 run's final eval, 46 steps after its epoch-8 eval); one without an epoch is kept; the gap is
+    configurable (0 keeps everything). The cooldown gain still ends at the final eval."""
+    hist = wsd_history([2.0, 1.9, 1.8, 1.7, 1.6, 1.5], cooldown_from=5)
+    hist.append(dict(copy.deepcopy(hist[-1]), step=604, epoch=6.04))
+    hist[-1]["greedy"] = {s: dict(d, cer_ref_corpus=d["cer_ref_corpus"] * 0.9) for s, d in hist[-1]["greedy"].items()}
+    kept, dropped = ev.dedup_history(hist, 0.25)
+    assert dropped == [604] and [r["step"] for r in kept] == [100, 200, 300, 400, 500, 600]
+    v2 = ev.verdict(dict(final=final((1.8, 2.0, 1.4)), history=hist), version=2)
+    assert v2["trend"]["deduplicated_steps"] == [604] and v2["trend"]["window_steps"] == [400, 500, 600]
+    assert any(r.startswith("de-duplicated: the evals at steps [604]") for r in v2["reasons"])
+    assert v2["cooldown_gain"]["to_step"] == 604 and v2["cooldown_gain"]["cer_ratio_after"] == pytest.approx(1.35)
+    v0 = ev.verdict(dict(final=final((1.8, 2.0, 1.4)), history=hist), version=2, min_epoch_gap=0.0)
+    assert v0["trend"]["deduplicated_steps"] == [] and v0["trend"]["window_steps"] == [500, 600, 604]
+    # the gap is measured from the previous KEPT record: evals every 0.1 epoch keep one per 0.25 epoch or more
+    dense = history2([(10 * i, 0.1 * i, "stable", 2.0, None, 0.5, 0.4) for i in range(1, 11)])
+    assert [r["step"] for r in ev.dedup_history(dense, 0.25)[0]] == [10, 40, 70, 100]
+    no_epoch = [{k: v for k, v in r.items() if k != "epoch"} for r in dense]
+    assert ev.dedup_history(no_epoch, 0.25) == (no_epoch, [])
+
+
+def test_verdict_v1_is_unchanged_by_the_v2_fields():
+    """The records now carry lr_phase, greedy_full and (under v2) the epoch: v1 reads none of them, so the verdict of
+    a history written before them and of the same history with them is identical, key for key (the first A100 run's
+    INCONCLUSIVE reproduces: test_the_first_a100_runs_verdict_v1_and_v2)."""
+    plain = history(FALLING, KL_DOWN, PROBE_DOWN)
+    rich = copy.deepcopy(plain)
+    for i, r in enumerate(rich):
+        r.update(lr_phase="stable" if i < 8 else "cooldown", epoch=float(i),
+                 greedy_full={s: dict(d, cer_ref_corpus=d["cer_ref_corpus"] * 3) for s, d in r["greedy"].items()})
+    for ratios in ((1.1, 1.15, 1.6), (1.8, 1.9, 2.0), (1.3, 1.4, 1.45)):
+        a = ev.verdict(dict(final=final(ratios), history=plain))
+        b = ev.verdict(dict(final=final(ratios), history=rich))
+        assert a == b and "version" not in a and "cooldown_gain" not in a
+
+
+FIRST_RUN = REAL / "cache" / "hf_runs" / "runs" / "viability-b20x2560-20260925T071746Z"
+
+
+def test_the_first_a100_runs_verdict_v1_and_v2():
+    """The first A100 run (its downloaded run dir; real data, read only): v1 on its stored history and final eval gives
+    its verdict.json key for key (INCONCLUSIVE, CER trend -2.46 % over steps 8512 / 9728 / 9774, all in the cooldown).
+    v2 on the same history completed from the run's files (scripts/05_evaluate.backfill_history: the LR phase from its
+    lr_phase events, the complete sets' numbers from each eval's summary.json) - what the trainer now records: still
+    INCONCLUSIVE, the CER trend -4.28 % over the pre-cooldown epochs 4-6 on the complete sets, the final eval 46 steps
+    after the epoch-8 one de-duplicated, and a cooldown gain of -10.7 % on the ratio (epoch 6 -> the final eval)."""
+    need_real(FIRST_RUN / "summary.json", FIRST_RUN / "events.jsonl", FIRST_RUN / "evals" / "step_9774")
+
+    def load(p):
+        return json.loads(p.read_text(encoding="utf-8"))
+
+    def strict(o):  # RunLogger writes a non-finite float as null
+        if isinstance(o, dict):
+            return {k: strict(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [strict(v) for v in o]
+        return None if isinstance(o, float) and not np.isfinite(o) else o
+
+    from fixtures import load_script
+
+    s = load(FIRST_RUN / "summary.json")
+    fin = load(FIRST_RUN / "evals" / "step_9774" / "summary.json")["greedy_full"]
+    v1 = ev.verdict(dict(final=fin, history=s["history"]))
+    assert strict(v1) == load(FIRST_RUN / "evals" / "step_9774" / "verdict.json") == s["verdict"]
+    assert v1["verdict"] == "INCONCLUSIVE" and v1["trend"]["window_steps"] == [8512, 9728, 9774]
+    hist = load_script("05_evaluate").backfill_history(s["history"], str(FIRST_RUN / "summary.json"))
+    assert [r.get("lr_phase") for r in hist] == [None] + ["stable"] * 6 + ["cooldown"] * 3
+    assert [bool(r.get("greedy_full")) for r in hist] == [False] + [True] * 9
+    v2 = ev.verdict(dict(final=fin, history=hist), version=2)
+    t = v2["trend"]
+    assert v2["verdict"] == "INCONCLUSIVE" and v2["sets"] == v1["sets"] and t["improving"]
+    assert t["cer_window_steps"] == [4864, 6080, 7296] and t["cer_scope"] == "complete"
+    assert t["cer_ratio_rel_change"] == pytest.approx(-0.04283, abs=5e-5)
+    assert t["deduplicated_steps"] == [9774] and t["window_steps"] == [7296, 8512, 9728] and not t["overfit"]
+    g = v2["cooldown_gain"]
+    assert (g["from_step"], g["to_step"], g["scope"]) == (7296, 9774, "complete")
+    assert g["cer_ratio_rel_change"] == pytest.approx(-0.1074, abs=5e-4)
+    assert g["sets"]["eval_jsut"]["cer_after"] == pytest.approx(v1["sets"]["eval_jsut"]["student"])
+
+
+def test_lr_phase_at_reads_the_lr_phase_events():
+    events = [dict(at_step=1, phase="warmup"), dict(at_step=300, phase="stable"), dict(at_step=7898, phase="cooldown"),
+              dict(at_step=7898, phase="cooldown")]  # a resume from before the cooldown logs its start again
+    assert [ev.lr_phase_at(s, events) for s in (0, 1, 299, 300, 7897, 7898, 9774)] == [
+        None, "warmup", "warmup", "stable", "stable", "cooldown", "cooldown"]
+    replay = [dict(at_step=1, phase="warmup"), dict(at_step=300, phase="stable"), dict(at_step=500, phase="cooldown"),
+              dict(at_step=300, phase="stable")]  # the largest at_step <= step holds, not the last line
+    assert ev.lr_phase_at(600, replay) == "cooldown" and ev.lr_phase_at(400, replay) == "stable"
+    assert ev.lr_phase_at(5, []) is None
+
+
 def test_eval_record_and_flatten():
     tf = dict(sets={"eval_jsut": dict(kl=0.2, ce=0.3, top1=0.9, n_tok=10)}, all=dict(kl=0.2, ce=0.3, top1=0.9),
               wall_s=1.5, bad_audio=["x"])
     probe = dict(sets={}, all=dict(kl=0.1))
     rec = ev.eval_record(300, 1200.0, tf=tf, probe=probe)
     assert rec["heldout_kl"] == 0.2 and rec["probe_kl"] == 0.1 and rec["tf"]["eval_jsut"]["top1"] == 0.9
+    assert "lr_phase" not in rec and "greedy" not in rec and "greedy_full" not in rec
+    # a complete eval's record: the subset's numbers under greedy (unchanged: what v1, the best step and the curve
+    # read) and the complete sets' next to them; the LR phase of the last step (none at step 0)
+    def g(cer, n):
+        return dict(sets={"eval_jsut": dict(cer_ref_corpus=cer, teacher_cer_ref_corpus=0.08, trunc_rate=0.0, n=n,
+                                            ref_edits=1)})
+    rec = ev.eval_record(300, 1200.0, tf=tf, greedy=g(0.12, 500), greedy_full=g(0.11, 5000), lr_phase="stable")
+    assert rec["greedy"]["eval_jsut"] == dict(cer_ref_corpus=0.12, teacher_cer_ref_corpus=0.08, trunc_rate=0.0, n=500)
+    assert rec["greedy_full"]["eval_jsut"] == dict(cer_ref_corpus=0.11, teacher_cer_ref_corpus=0.08, trunc_rate=0.0,
+                                                   n=5000)
+    assert rec["lr_phase"] == "stable" and "lr_phase" not in ev.eval_record(0, 0.0, tf=tf, lr_phase=None)
     flat = ev.flatten(tf, "eval_tf")
     assert flat["eval_tf/eval_jsut/kl"] == 0.2 and flat["eval_tf/all/top1"] == 0.9 and flat["eval_tf/wall_s"] == 1.5
     assert not any("bad_audio" in k for k in flat)

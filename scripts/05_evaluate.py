@@ -17,7 +17,7 @@ headline numbers and combined loss, and the verdict. This script runs that eval 
            in ONE pooled pass of duration-sorted batches of eval.batch_s padded seconds (trainset.eval_batches), the
            very batches of the trainer's final eval when they are the config's eval_sets
   summary  04_distill.eval_summary (headline, headline_scope, combined_loss val_full), eval_history_record and
-           gate_verdict over kitsune.evaluate.verdict
+           gate_verdict over kitsune.evaluate.verdict with the config's verdict_options (eval.verdict_version)
 On the same hardware, weights and settings the per-utterance results and summary.json are the trainer's to the bit
 (tests/test_evaluate_script.py, on CPU). A real run's numbers are close to its evals/step_<N>, not equal: its
 checkpoints hold bf16 weights where the trainer evaluated its fp32 masters, and another GPU runs other kernels.
@@ -31,7 +31,9 @@ Output (--out; the layout of runs/<run_id>/evals/step_<N>/):
                   final = the checkpoint is the run's end one. It covers every set in --out
   verdict.json    when the three gate sets are in --out and so is the train probe, if the config has one (eval.probe:
                   pass --probe): gate_verdict of kitsune.evaluate.verdict, the trends read from the run's history
-                  before this step (--history: default the summary.json of the run the checkpoint sits in) and this
+                  before this step (--history: default the summary.json of the run the checkpoint sits in; one written
+                  before the trainer recorded the LR phase and the complete sets' numbers gets them from the run's
+                  events.jsonl and evals/, backfill_history) and this
                   eval. The trainer's record of this eval holds the probe's KL, which the probe-KL and gap trends read,
                   so without the probe the verdict would not be the trainer's: none is written (a verdict_skipped
                   event says why) and an older one goes
@@ -450,6 +452,36 @@ def load_history(spec: str, ckpt: Path, trained: dict) -> tuple[list[dict], str 
     return list(_read_json(p).get("history") or []), str(p)
 
 
+def backfill_history(hist: list[dict], summary_path: str | None) -> list[dict]:
+    """A history written before the trainer recorded what verdict v2 reads, completed from the run's own files next to
+    its summary.json, with the numbers the trainer now records (kitsune.evaluate.eval_record): lr_phase from the
+    `lr_phase` events of events.jsonl (kitsune.evaluate.lr_phase_at) and, for an eval that decoded the complete sets,
+    greedy_full from its evals/step_<N>/summary.json. A record that has them keeps its own; without the files the
+    records stay as they are (v2 then leaves them out of the CER trend, or reads their subset numbers, and says so).
+    Verdict v1 reads neither."""
+    if not summary_path:
+        return list(hist)
+    from kitsune import evaluate as ev
+
+    run = Path(summary_path).parent
+    phases = []
+    if (run / "events.jsonl").is_file():
+        with open(run / "events.jsonl", encoding="utf-8") as fh:
+            phases = [e for e in (json.loads(x) for x in fh if x.strip()) if e.get("kind") == "lr_phase"]
+    out = []
+    for r in hist:
+        r = dict(r)
+        if "lr_phase" not in r and (ph := ev.lr_phase_at(int(r["step"]), phases)) is not None:
+            r["lr_phase"] = ph
+        s = run / "evals" / f"step_{int(r['step'])}" / "summary.json"
+        if "greedy_full" not in r and s.is_file():
+            full = (_load_json(s) or {}).get("greedy_full")
+            if full and full.get("sets"):
+                r["greedy_full"] = ev.eval_record(int(r["step"]), 0.0, greedy_full=full)["greedy_full"]
+        out.append(r)
+    return out
+
+
 # ------------------------------------------------------------------------------------------------ the eval pass
 
 
@@ -830,9 +862,17 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
                          if no_probe else {}))
         return summary
     hist, src = load_history(ctx.args.history, ckpt, trained)
-    rec = D.eval_history_record(step, train_s, tf_sum, gr_sum, probe_sum, pg_sum, summary["headline"], epoch=epoch)
+    hist = backfill_history(hist, src)
+    # this eval's record as the trainer writes it: the LR phase of the checkpoint's last step (its trained block, or
+    # the run's lr_phase events for a checkpoint saved before it was recorded) and, under verdict v2, the epoch
+    lr_phase = trained.get("lr_phase")
+    if lr_phase is None and src:
+        lr_phase = next((r.get("lr_phase") for r in backfill_history([dict(step=step)], src)), None)
+    rec_epoch = epoch if epoch is not None or not D.verdict_options(cfg) else trained.get("epoch")
+    rec = D.eval_history_record(step, train_s, tf_sum, gr_sum, probe_sum, pg_sum, summary["headline"], epoch=rec_epoch,
+                                full_sum=full_sum, lr_phase=lr_phase)
     history = sorted((r for r in hist if int(r["step"]) < step), key=lambda r: int(r["step"])) + [rec]
-    verdict = D.gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=history)))
+    verdict = D.gate_verdict(cfg, ev.verdict(dict(final=full_sum, history=history), **D.verdict_options(cfg)))
     _write_output_json(out / "verdict.json", verdict)
     ctx.log.event("verdict", verdict=verdict.get("verdict"), reasons=verdict.get("reasons"), history=src,
                   history_steps=[int(r["step"]) for r in history])
