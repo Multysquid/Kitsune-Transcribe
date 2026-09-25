@@ -66,9 +66,10 @@ TensorBoard buckets: TensorBoard groups cards by the first component of a tag, s
                     of tokens per confidence bucket included), every histogram, and any tag no rule matches (one
                     tb_tag_unmapped event per such tag)
 by TB_BUCKET_RULES. Only TensorBoard sees the new names. tools/regroup_tb.py rebuilds tb/ of an existing run in this
-layout from the open files, the TB_LAYOUT chart included. A restart into a run logged before the buckets (event files
-in tb/, no metrics/tag_map.json) leaves one tb_layout_mixed event: TensorBoard then shows the earlier launches under
-the flat tags and this one under the buckets until tools/regroup_tb.py is run on the finished run.
+layout from the open files, the TB_LAYOUT chart included when the run logged one of its curves. A restart into a run
+logged before the buckets (event files in tb/, no metrics/tag_map.json) leaves one tb_layout_mixed event: TensorBoard
+then shows the earlier launches under the flat tags and this one under the buckets until tools/regroup_tb.py is run
+on the finished run.
 """
 import io
 import json
@@ -327,6 +328,7 @@ COMBINED_LOSS_TAGS = ("combined_loss/train", "combined_loss/val", "combined_loss
 # start of the tag) against the tags in the event files - the bucketed ones (TB_BUCKET_RULES), not the logged ones -
 # hence built from tb_tag and anchored at both ends: ".../val" alone would draw val_full a second time. Written into
 # every event file: RunLogger at each logger start (a resume writes a new file), tools/regroup_tb.py when it rebuilds
+# a run that logged one of the curves (a run logged before the combined loss gets no empty chart)
 TB_LAYOUT = {"combined_loss": {"combined_loss: train vs val": [
     "Multiline", [f"^{re.escape(tb_tag(t)[0])}$" for t in COMBINED_LOSS_TAGS]]}}
 

@@ -218,9 +218,25 @@ def teacher_forced_eval(model, store, featurizer, device, batch_s: float = 400.0
     id, source, n_tok, kl, ce, top1, duration and the per-utterance mean of every other kd_losses term;
     summary["sets"][source] and summary["all"] hold token-normalised (corpus) and utterance-mean values, plus the
     same for the teacher-confidence buckets p1 > 0.99 and p1 < 0.9."""
+    t0 = time.time()
+    raw, dropped = teacher_forced_records(model, store, featurizer, device, batch_s, ids=ids, losses_fn=losses_fn,
+                                          amp=amp)
+    return summarise_tf(raw, n_bad_audio=len(dropped), bad_audio=dropped[:50],
+                        bad_audio_per_set=_bad_audio_per_set(store, dropped), wall_s=time.time() - t0)
+
+
+@torch.no_grad()
+def teacher_forced_records(model, store, featurizer, device, batch_s: float = 400.0, *,
+                           ids: Iterable[str] | None = None, losses_fn: Callable | None = None,
+                           amp: bool | None = None) -> tuple[pd.DataFrame, list[str]]:
+    """teacher_forced_eval's pass without the summary: (raw, dropped). raw has one row per utterance in batch order
+    (id, source, n_tok, duration, sum_<term> of every kd_losses term over its tokens, and the teacher-confidence
+    buckets' token counts and sums _n_hi / _<term>_hi, _n_lo / _<term>_lo); dropped lists the ids whose audio could
+    not be decoded, in batch order. summarise_tf turns raw into teacher_forced_eval's (summary, per_utt), for any rows
+    of it: scripts/05_evaluate.py evaluates a checkpoint in resumable chunks of the same batches and summarises them
+    together."""
     losses_fn = losses_fn or _default_losses()
     device = torch.device(device)
-    t0 = time.time()
     ds = AudioBatchDataset(store)
     batches = eval_batches(store.utts, batch_s, _indices(store, ids))
     W, B = model.proj_out.weight, model.proj_out.bias
@@ -257,15 +273,19 @@ def teacher_forced_eval(model, store, featurizer, device, batch_s: float = 400.0
                 rec.update({f"sum_{k}": float(v[r]) for k, v in sums.items()})
                 rec.update({k: float(v[r]) for k, v in buckets.items()})
                 recs.append(rec)
+    return pd.DataFrame(recs), dropped
 
-    df = pd.DataFrame(recs)
-    per_utt = _tf_per_utt(df)
-    summary = dict(sets={}, n_utts=len(df), n_bad_audio=len(dropped), bad_audio=dropped[:50],
-                   bad_audio_per_set=_bad_audio_per_set(store, dropped), wall_s=time.time() - t0)
-    if len(df):
-        for src, g in df.groupby("source", sort=True):
+
+def summarise_tf(raw: pd.DataFrame, **extra) -> tuple[dict, pd.DataFrame]:
+    """teacher_forced_eval's (summary, per_utt) for any rows of teacher_forced_records' raw frame (a default
+    RangeIndex; the rows in batch order give the trainer's numbers to the bit). `extra` goes into the summary after
+    n_utts (teacher_forced_eval: n_bad_audio, bad_audio, bad_audio_per_set, wall_s)."""
+    per_utt = _tf_per_utt(raw)
+    summary = dict(sets={}, n_utts=len(raw), **extra)
+    if len(raw):
+        for src, g in raw.groupby("source", sort=True):
             summary["sets"][src] = _tf_summarise(g, per_utt.loc[g.index])
-        summary["all"] = _tf_summarise(df, per_utt)
+        summary["all"] = _tf_summarise(raw, per_utt)
     return summary, per_utt
 
 

@@ -14,7 +14,8 @@ logged before the logger wrote that one showed a resume's discarded steps in the
 whose reader purges on every START) until it is rebuilt here. What never reached the open files is not rebuilt
 (histograms still buffered in a process that was killed without close()). The rebuilt file starts with the Custom
 Scalars layout (kitsune.runlog.TB_LAYOUT: the combined_loss train vs val chart), as every event file of the logger
-does; a run logged before it gets it too.
+does, with only the charts that draw one of the run's scalars: a run logged before the combined loss (no
+combined_loss/* tag) gets no combined-loss chart, which would stay empty.
 
 The original event files are kept under a name TensorBoard skips. TensorBoard reads every file whose name contains
 "tfevents" (a plain .bak suffix would not hide one), so events.out.tfevents.X becomes events.out.tf-events.X.bak; to
@@ -54,6 +55,7 @@ Usage:
 import argparse
 import heapq
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -66,7 +68,8 @@ sys.path.insert(0, str(ROOT))
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
-from kitsune.runlog import TB_BUCKETS, TB_LAYOUT, TB_PLUGINS, TagMapper, _atomic_json, read_scalars_jsonl  # noqa: E402
+from kitsune.runlog import (TB_BUCKETS, TB_LAYOUT, TB_PLUGINS, TagMapper, _atomic_json,  # noqa: E402
+                            read_scalars_jsonl, tb_tag)
 
 FINAL_STATUS = ("complete", "failed", "throughput_too_low")  # 04_distill's summary.json statuses
 LIVE_S = 300.0  # a write this recent makes a run live (see the module docstring)
@@ -176,8 +179,7 @@ def live_reason(run: Path, now: float | None = None) -> str | None:
 # and keeps every source's own order
 
 
-def _scalars(run: Path):
-    t = read_scalars_jsonl(run / "metrics" / "scalars.jsonl")
+def _scalars(t: pa.Table):
     cols = zip(t.column("wall").to_pylist(), t.column("tag").to_pylist(), t.column("step").to_pylist(),
                t.column("value").to_pylist())
     for i, (wall, tag, step, value) in enumerate(cols):
@@ -215,20 +217,37 @@ def _events(run: Path):
         i += 1
 
 
-def _write(run: Path, out_dir: Path) -> tuple[TagMapper, dict, list[str]]:
+def drawn_layout(tags) -> dict:
+    """The charts of TB_LAYOUT that draw at least one of these logged scalar tags (each put in its bucket by the rules,
+    as the rebuild puts it: the charts' regexes match TensorBoard tags), {} when none does. A run logged before the
+    combined loss has no combined_loss/* tag, and its combined-loss chart would stay empty."""
+    tbs = {tb_tag(t)[0] for t in tags}
+    out = {}
+    for category, charts in TB_LAYOUT.items():
+        drawn = {name: spec for name, spec in charts.items() if any(re.match(rx, t) for rx in spec[1] for t in tbs)}
+        if drawn:
+            out[category] = drawn
+    return out
+
+
+def _write(run: Path, out_dir: Path) -> tuple[TagMapper, dict, list[str], dict]:
     from tensorboard.compat.proto.event_pb2 import Event, SessionLog
     from torch.utils.tensorboard import SummaryWriter
 
     tm, n, unmapped = TagMapper(), dict.fromkeys(("scalars", "histograms", "text", "purge"), 0), []
+    scalars = read_scalars_jsonl(run / "metrics" / "scalars.jsonl")
+    layout = drawn_layout(set(scalars.column("tag").to_pylist()))
     # purge_step=0: the file opens with a SessionLog.START at step 0 (it drops nothing), as the logger's first event
     # file does (RunLogger._tb_purge_step). TensorBoard's server ignores a run's first START, so without it the first
     # replayed purge below would be ignored there and the discarded steps would stay in its charts
     w = SummaryWriter(log_dir=str(out_dir), filename_suffix=SUFFIX, max_queue=10_000, flush_secs=3600, purge_step=0)
     try:
         # the Custom Scalars chart the logger writes into every event file (the originals' copies go with them into
-        # the .bak files): at step 0, after that START and ahead of the records, so no replayed purge drops it
-        w.add_custom_scalars(TB_LAYOUT)
-        for wall, _, _, what, p in heapq.merge(_scalars(run), _hists(run), _texts(run), _events(run)):
+        # the .bak files), when the run logged a curve it draws: at step 0, after that START and ahead of the records,
+        # so no replayed purge drops it
+        if layout:
+            w.add_custom_scalars(layout)
+        for wall, _, _, what, p in heapq.merge(_scalars(scalars), _hists(run), _texts(run), _events(run)):
             n[what] += 1
             if what == "purge":
                 w._get_file_writer().add_event(Event(step=p, session_log=SessionLog(status=SessionLog.START)),
@@ -249,7 +268,7 @@ def _write(run: Path, out_dir: Path) -> tuple[TagMapper, dict, list[str]]:
                                     bucket_counts=json.loads(p["counts"]), global_step=int(p["step"]), walltime=wall)
     finally:
         w.close()
-    return tm, n, unmapped
+    return tm, n, unmapped, layout
 
 
 def _put_back(renamed: list[tuple[Path, Path]]) -> list[str]:
@@ -298,7 +317,7 @@ def regroup(run, force: bool = False, settle_s: float | None = None) -> dict:
     checked = {p.name for p in event_files(tb_dir)}  # the event files there at the live check
     stage = Path(tempfile.mkdtemp(prefix=".regroup-", dir=run))  # same drive: the move into tb/ is a rename
     try:
-        tm, n, unmapped = _write(run, stage)
+        tm, n, unmapped, layout = _write(run, stage)
         (new,) = [p for p in stage.iterdir() if "tfevents" in p.name]
         originals = event_files(tb_dir)
         opened = [p.name for p in originals if p.name not in checked]
@@ -345,7 +364,7 @@ def regroup(run, force: bool = False, settle_s: float | None = None) -> dict:
             counts[e["bucket"]][plugin] += 1
     return dict(run=run, file=dest, counts=counts, records=n, unmapped=unmapped, live=reason,
                 backups=sorted(p.name for p in tb_dir.iterdir() if p.name.endswith(".bak")),
-                charts=[chart for charts in TB_LAYOUT.values() for chart in charts])
+                charts=[chart for charts in layout.values() for chart in charts])
 
 
 def report(res: dict) -> str:
@@ -358,7 +377,7 @@ def report(res: dict) -> str:
         lines.append(f"  {b:18s}" + "".join(f"{res['counts'][b][p]:>12,}" for p in TB_PLUGINS))
     lines.append(f"  {'tags':18s}" + "".join(f"{sum(c[p] for c in res['counts'].values()):>12,}" for p in TB_PLUGINS))
     lines.append(f"  no rule matched (-> 3_misc): {', '.join(res['unmapped']) or 'none'}")
-    lines.append(f"  Custom Scalars charts: {', '.join(res['charts'])}")
+    lines.append(f"  Custom Scalars charts: {', '.join(res['charts']) or 'none (the run logged none of their curves)'}")
     lines.append(f"  originals kept as: {', '.join(res['backups']) or 'none'}")
     return "\n".join(lines)
 

@@ -13,7 +13,8 @@ files); analysis wants one table per kind. This folds everything into export/:
     from the tags of the open files
   - metrics/*: scalars (rebuilt from scalars.jsonl, the source of truth; the parquet mirror may lag one sync),
     steps, train_utts parts, hist parts, text; the combined-loss chart's three curves (combined_loss/train, val,
-    val_full) also as one table of their own, combined_loss
+    val_full) also as one table of their own, combined_loss (a run logged before the combined loss has neither that
+    table nor the README's text on it)
   - evals/step_<N>/*.parquet concatenated per kind with a step column (eval_tf, eval_greedy, eval_probe, ...), the
     mini evals' evals/step_<N>_mini/ likewise (eval_mini_tf, eval_mini_greedy, ...), summary.json files flattened to
     eval_summaries (a `mini` column; the eval's final and complete flags and its val-CER scope as columns),
@@ -455,6 +456,12 @@ def _csv_safe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: list[str], commit: str | None = None):
+    # the overall loss chart's section, its Custom Scalars chart and table only in a run that logged its curves (the
+    # combined_loss table exists): a run logged before the combined loss has none of them
+    combined = ("first `00_combined/`: the training objective w_kl * KL + w_ce * CE per step (`train`) and on the "
+                "gate sets (`val`: the mini evals' subsets and their step-0 point; `val_full`: the complete sets), "
+                "which the Custom Scalars chart `combined_loss: train vs val` overlays and the `combined_loss` table "
+                "holds; then " if "combined_loss" in tables else "first ")
     lines = [f"# Run export: {Path(src).name if not src.startswith('hf://') else src}", "",
              f"Source: `{src}`  ", *([f"Hub commit: `{commit}`  "] if commit else []),
              f"Exported: {datetime.now(timezone.utc).isoformat(timespec='seconds')}", "",
@@ -464,14 +471,11 @@ def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: l
              "TensorBoard groups cards by the first component of a tag, so the run's event files put every tag under "
              "one of three buckets: `1_operational/` (time, throughput, memory, system, data progress with the tokens "
              "per source, schedule, early-stop bookkeeping, eval cost and counts with the CER denominators "
-             "`ref_chars`; lifecycle events and the config as text), `2_loss_accuracy/` (first `00_combined/`: the "
-             "training objective w_kl * KL + w_ce * CE per step (`train`) and on the gate sets (`val`: the mini "
-             "evals' subsets and their step-0 point; `val_full`: the complete sets), which the Custom Scalars chart "
-             "`combined_loss: train vs val` overlays and the `combined_loss` table holds; then `00_summary/full/` and "
-             "`00_summary/mini/`: every eval's headline numbers, the pooled val / train CER vs the reference and vs "
-             "the teacher with `_pct` copies, val / train KL and top-1; then train and held-out loss (the train "
-             "total and the L2-SP value under `train_loss_incl_l2sp/`: the value climbs all run as the weights "
-             "leave the init, so judge training by `train_loss/objective`, `kl` and `ce`), "
+             f"`ref_chars`; lifecycle events and the config as text), `2_loss_accuracy/` ({combined}"
+             "`00_summary/full/` and `00_summary/mini/`: every eval's headline numbers, the pooled val / train CER vs "
+             "the reference and vs the teacher with `_pct` copies, val / train KL and top-1; then train and held-out "
+             "loss (the train total and the L2-SP value under `train_loss_incl_l2sp/`: the value climbs all run as "
+             "the weights leave the init, so judge training by `train_loss/objective`, `kl` and `ce`), "
              "accuracy as top-1 agreement with the teacher and CER, both per source and per teacher-confidence "
              "bucket, the train probe, the overfit gap, the early-stop metric and its best, the mini evals in "
              "`<section>_mini/`; the eval sample tables) "

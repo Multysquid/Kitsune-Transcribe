@@ -36,6 +36,8 @@ make_selection.py    which utterances train / evaluate, and why -> selection/*.p
                      1_operational, 2_loss_accuracy, 3_misc; first the combined loss KL + 0.8 CE per step and on the
                      gate sets, under 2_loss_accuracy/00_combined and as one Custom Scalars chart, then every eval's
                      val / train CER and KL under 2_loss_accuracy/00_summary) + open-format logs
+05_evaluate.py       a checkpoint -> the trainer's complete (final) eval of it, in the evals/step_<N>/ format;
+                     resumable, with a GPU temperature guard (--max-temp / --resume-temp) for the laptop
 tools/               export_run.py: a run -> parquet/CSV tables + README; regroup_tb.py: rebuild an older run's
                      TensorBoard files in the three groups
 vast/                training image, CI build and the vast.ai run scripts (see vast/README.md)

@@ -11,6 +11,8 @@
   at an epoch end, an eval that runs past T), the end phase reuses it as the final eval: one decode per step
 - the headline numbers after every eval (kitsune.evaluate.headline): pooled corpus CER = sum edits / sum chars of the
   per-set numbers, gate sets only; summary/{full,mini}/<name> with <name>_pct copies; one console line per eval
+- the `eval` event's per-set CERs are those of the headline's scope (greedy_scope): the complete sets at a complete
+  eval, with the fixed subset's as *_subset next to them; the subset at a subset eval
 - eval.gate false: summary.json's verdict is "N/A" with the numbers
 - the combined loss (w_kl * KL + w_ce * CE): combined_loss/train at every step (= loss/objective), combined_loss/val at
   step 0 and at every mini eval (the mini val subset's gate sets), combined_loss/val_full at every complete-set eval;
@@ -240,6 +242,75 @@ def test_overfit_gap_scalars_pool_the_gate_sets(monkeypatch):
     assert scal["eval/tf/all/kl"] == pytest.approx(1.1)  # the all-sets numbers stay logged
 
 
+def test_eval_event_per_set_numbers_follow_the_headline_scope(monkeypatch):
+    """Bug B-1: a complete eval's `eval` event gives each set's cer / ratio / trunc of the complete set (summary.json's
+    greedy_full, what the verdict judges), no longer the fixed subset's, and keeps the subset's next to them as
+    cer_subset / ratio_subset / trunc_subset (summary.json's greedy); greedy_scope names the scope, as headline_scope
+    does. A subset eval's event is as before (the subset's numbers under the plain names, no *_subset), with its
+    greedy_scope "subset". The history (the verdict's trend, the early stop) and the scalars keep the subset. run_eval
+    itself on fixed per-utterance rows, the subset decoded better than the rest of each set."""
+    from kitsune import evaluate as ev
+
+    m = load_script("04_distill")
+    ref, teach = "あいうえおかきくけこ", "あいうえおかきくけさ"  # the teacher: 1 error in 10 characters
+    rows = []
+    for k, x in enumerate(EVAL):
+        for i in range(4):  # <set>_0 and _1: the fixed greedy subset, decoded as well as the teacher
+            hyp = teach if i < 2 else "ん" * (k + 2) + ref[k + 2:]  # the rest: k + 2 errors, the last one truncated
+            rows.append(dict(id=f"{x}_{i}", source=x, duration=1.0, n_tok=11, ref=ref, teacher_hyp=teach, hyp=hyp,
+                             cer_ref=(1 if i < 2 else k + 2) / 10, cer_teacher=0.0 if i < 2 else (k + 3) / 10,
+                             truncated=i == 3, has_teacher=True, teacher_cer=0.1, teacher_truncated=False))
+    df = pd.DataFrame(rows)
+    greedy_ids = [f"{x}_{i}" for x in EVAL for i in range(2)]
+    tf = dict(sets={x: dict(kl=0.5, ce=1.0, top1=0.9, n_tok=100) for x in EVAL},
+              all=dict(kl=0.5, ce=1.0, top1=0.9, n_tok=300), wall_s=1.0)
+
+    def greedy_eval(model, store, ids, feat, device, bs, tokenizer=None, amp=None):
+        g = (df if ids is None else df[df["id"].isin(ids)]).reset_index(drop=True)
+        return ev.summarise_greedy(g, wall_s=1.0), g
+
+    monkeypatch.setattr(ev, "teacher_forced_eval", lambda *a, **k: (tf, pd.DataFrame({"source": []})))
+    monkeypatch.setattr(ev, "greedy_eval", greedy_eval)
+    monkeypatch.setattr(ev, "pick_samples", lambda *a, **k: [])
+    got, js, scal = [], {}, {}
+    log = SimpleNamespace(event=lambda kind, **k: got.append(dict(k, kind=kind)), table=lambda *a, **k: None,
+                          eval_json=lambda name, obj, step: js.update({step: obj}), samples=lambda *a, **k: None,
+                          scalars=lambda row, step: scal.setdefault(step, {}).update(row))
+    R = SimpleNamespace(cfg=m.load_config(None, []), log=log, model=torch.nn.Linear(1, 1), evalstore="eval",
+                        train="train", feat_eval=None, device="cpu", amp=None, tokenizer=None, probe_ids=[],
+                        probe_greedy_ids=[], greedy_ids=greedy_ids, st=dict(history=[], epoch_progress=0.0),
+                        clock=lambda: 0.0)
+    m.run_eval(R, 0)  # the step-0 eval: the fixed subset
+    m.run_eval(R, 5, complete=True)  # an epoch-end eval: the complete sets
+    sub_ev, full_ev = [e for e in got if e["kind"] == "eval"]
+    assert (sub_ev["at_step"], full_ev["at_step"]) == (0, 5) and not sub_ev["complete"] and full_ev["complete"]
+    assert sub_ev["greedy_scope"] == js[0]["headline_scope"]["val_greedy"] == "subset"
+    assert full_ev["greedy_scope"] == js[5]["headline_scope"]["val_greedy"] == "complete"
+    assert list(full_ev).index("greedy_scope") < list(full_ev).index("sets")  # ahead of them in the console line
+
+    def brief(g: dict, suffix: str = "") -> dict:
+        return {f"cer{suffix}": round(g["cer_ref_corpus"], 4), f"ratio{suffix}": round(g["ratio_vs_teacher"], 3),
+                f"trunc{suffix}": round(g["trunc_rate"], 4)}
+
+    for k, x in enumerate(EVAL):
+        sub, full = js[5]["greedy"]["sets"][x], js[5]["greedy_full"]["sets"][x]
+        assert (sub["n"], full["n"]) == (2, 4) and js[0]["greedy"]["sets"][x] == sub  # the same subset both times
+        assert sub["cer_ref_corpus"] == pytest.approx(0.1) and sub["ratio_vs_teacher"] == pytest.approx(1.0)
+        assert full["cer_ref_corpus"] == pytest.approx((2 + 2 * (k + 2)) / 40) and full["trunc_rate"] == 0.25
+        assert full_ev["sets"][x] == dict(kl=0.5, top1=0.9, **brief(full), **brief(sub, "_subset"))
+        assert (full_ev["sets"][x]["cer"], full_ev["sets"][x]["ratio"], full_ev["sets"][x]["trunc"]) == (
+            round((2 + 2 * (k + 2)) / 40, 4), round((2 + 2 * (k + 2)) / 40 / 0.1, 3), 0.25)
+        assert sub_ev["sets"][x] == dict(kl=0.5, top1=0.9, **brief(sub))  # unchanged: the subset, no *_subset
+        # what stays on the subset: the history, and the scalars under their tags (the complete sets' own next to them)
+        assert R.st["history"][-1]["greedy"][x]["cer_ref_corpus"] == sub["cer_ref_corpus"]
+        assert scal[5][f"eval/greedy/{x}/cer_ref_corpus"] == sub["cer_ref_corpus"] == scal[0][
+            f"eval/greedy/{x}/cer_ref_corpus"]
+        assert scal[5][f"eval/greedy_full/{x}/cer_ref_corpus"] == full["cer_ref_corpus"]
+    # the verdict judges the complete sets: what the complete eval's event now says
+    v = ev.verdict(dict(final=js[5]["greedy_full"], history=R.st["history"]))
+    assert all(round(v["sets"][x]["student"], 4) == full_ev["sets"][x]["cer"] for x in EVAL)
+
+
 def test_config_keys_are_validated():
     m = load_script("04_distill")
     ok = m.load_config(None, ["eval.full_every_epochs=2", "eval.mini.every_steps=200", "eval.mini.val_per_set=0",
@@ -463,6 +534,43 @@ def test_headline_numbers_are_the_pooled_per_set_numbers(steps_runs):
     assert "on 6 utts (subset) | train CER" in out and "on 18 utts (complete) | train CER" in out
     for mrec in s["mini_history"]:
         assert f"[mini eval] step {mrec['step']} epoch " in out
+
+
+def test_eval_events_match_the_summaries(steps_runs):
+    """Every `eval` event against its step's summary.json (bug B-1): greedy_scope is headline_scope.val_greedy, and
+    the per-set cer / ratio / trunc are that scope's (greedy_full at the complete evals - the epoch ends and the final
+    eval, whose CERs are the verdict's - greedy at the step-0 subset eval), a complete eval's subset numbers next to
+    them as *_subset. The console's [event] line names the scope ahead of the per-set numbers (it is cut at 300
+    characters)."""
+    def rnd(v, nd):
+        return None if v is None or not math.isfinite(v) else round(v, nd)  # the event writes NaN as null
+
+    def brief(g: dict, suffix: str = "") -> dict:
+        return {f"cer{suffix}": rnd(g["cer_ref_corpus"], 4), f"ratio{suffix}": rnd(g["ratio_vs_teacher"], 3),
+                f"trunc{suffix}": rnd(g["trunc_rate"], 4)}
+
+    for run in (steps_runs["mini"], steps_runs["plain"]):
+        last = {e["at_step"]: e for e in events(run, "eval")}  # a step replayed after the resume: its later event
+        s = summary(run)
+        assert sorted(last) == [r["step"] for r in s["history"]]
+        for step, e in last.items():
+            d = json.loads((run / "evals" / f"step_{step}" / "summary.json").read_text(encoding="utf-8"))
+            assert e["greedy_scope"] == d["headline_scope"]["val_greedy"] == ("complete" if d["complete"] else "subset")
+            assert e["complete"] == d["complete"] and (d["greedy_full"] is not None) == d["complete"]
+            head = d["greedy_full"] if d["complete"] else d["greedy"]
+            assert set(head["sets"]) == set(e["sets"]) == set(EVAL)
+            for x, g in head["sets"].items():
+                want = dict(brief(g), **(brief(d["greedy"]["sets"][x], "_subset") if d["complete"] else {}))
+                assert {k: v for k, v in e["sets"][x].items() if k not in ("kl", "top1")} == want, (step, x)
+        fin = last[MAX_STEPS]
+        assert fin["complete"] and all(fin["sets"][x]["cer"] == round(s["verdict"]["sets"][x]["student"], 4)
+                                       for x in EVAL)
+        lines = [ln for ln in (run / "logs" / "stdout.log").read_text(encoding="utf-8").splitlines()
+                 if ln.startswith("[event] eval {")]
+        assert len(lines) >= len(last)
+        assert all(re.search(r'"greedy_scope": "(complete|subset)"', ln.split('"sets"')[0]) for ln in lines)
+        assert any('"greedy_scope": "subset"' in ln for ln in lines)
+        assert any('"greedy_scope": "complete"' in ln for ln in lines)
 
 
 def _pooled_objective(tf: dict, cfg: dict) -> float:
