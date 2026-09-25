@@ -225,6 +225,10 @@ DEFAULTS = {
     # vast/launch.py against the selection's own record; not by the trainer
     "selection_recipe": {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "eval_emilia=0.2"],
                          "filter_eval_sets": ["eval_emilia", "galgame"], "partial_second_opinion": ["galgame"]},
+    # the label extent (kitsune/extent.py; make_selection.py, vast/launch.py and bootstrap.sh read it), the Parakeet
+    # soft-target root and the label box's settings (vast/label.py): configs/full.json sets them, the trainer never
+    # reads them. None, so a config's object replaces the default whole (_merge does not recurse into None)
+    "extent": None, "parakeet_root": None, "label": None,
     # smoke runs: seeded id subsets, small caches. *_audio_s: seeded subsets of about that many seconds of audio
     # (audio_subset; the overfit runs), the eval one pooled over eval_sets and decoded greedily in full at every eval
     "subset": {"train_utts": None, "eval_utts_per_set": None, "train_audio_s": None, "eval_audio_s": None},

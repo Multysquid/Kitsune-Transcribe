@@ -34,6 +34,12 @@ Usage:
   python vast/finish.py --sync-only               # upload only (supervisor after a crash, watchdog before the cap)
   python vast/finish.py --verify-only             # print the comparison, exit 1 on problems
   add --dry-run to any of them to print the actions without uploading, stopping or destroying
+
+Label box (--job label, the default when KITSUNE_JOB=label): the same modes over the config's label root
+(extent.root of $KITSUNE_CONFIG, e.g. labels/full) in $KITSUNE_DATA_REPO, uploaded write-once by vast/label_sync.py
+under $KITSUNE_STATE/sync.lock. --sync-only exits 1 when an upload failed and 65 on a write-once refusal; infra goes
+to label_runs/<run_id>/. --no-infra skips the infra upload; --allow-empty lets --destroy go on with no finished label
+file (a host failure before any lane started).
 """
 import argparse
 import hashlib
@@ -73,6 +79,8 @@ FULL_RE = re.compile(r"^full[_-]?(?:step[_-]?)?(\d+)(?:\.(?!tmp$|partial$)[A-Za-
 # succeeded
 UPLOAD_MARK = ".upload_pending"
 HASH_CHUNK = 8 << 20
+EXIT_INTEGRITY = 65  # label mode: a write-once conflict or a sealed root (vast/label.py ends such a box with a stop)
+SYNC_LOCK_WAIT_S = 1500  # label mode: sync.lock is polled up to 25 min, then the sync is skipped
 
 
 def log(msg: str):
@@ -209,26 +217,29 @@ def hub_retry(fn, what: str):
     return fn()
 
 
-def remote_listing(api, repo: str, repo_type: str, prefix: str) -> dict:
+def remote_listing(api, repo: str, repo_type: str, prefix: str, recursive: bool = True) -> dict:
     """repo path -> RepoFile for every file under prefix (folders are skipped: they have no size)."""
     out = {}
-    for item in api.list_repo_tree(repo, path_in_repo=prefix, recursive=True, repo_type=repo_type):
+    for item in api.list_repo_tree(repo, path_in_repo=prefix, recursive=recursive, repo_type=repo_type):
         if getattr(item, "size", None) is not None:
             out[item.path] = item
     return out
 
 
-def verify(api, repo: str, repo_type: str, expected: dict[str, Path], check_hash: bool = True) -> list[str]:
-    """Compare expected local files with the repo. Returns problems; an empty list means every file is there."""
+def verify(api, repo: str, repo_type: str, expected: dict[str, Path], check_hash: bool = True,
+           prefix_of=None) -> list[str]:
+    """Compare expected local files with the repo. Returns problems; an empty list means every file is there.
+    prefix_of(path) -> dir: list each returned dir non-recursively instead of runs/<run_id> recursively."""
     if not expected:
         return ["nothing to verify: no run directory with files was found"]
     problems = []
     listings: dict[str, dict] = {}
     for path, local in sorted(expected.items()):
-        prefix = "/".join(path.split("/")[:2])  # runs/<run_id>
+        prefix = prefix_of(path) if prefix_of is not None else "/".join(path.split("/")[:2])  # runs/<run_id>
         if prefix not in listings:
             try:  # the whole listing: list_repo_tree's error comes while its pages are iterated
-                listings[prefix] = hub_retry(lambda: remote_listing(api, repo, repo_type, prefix), f"listing {prefix}")
+                listings[prefix] = hub_retry(lambda: remote_listing(api, repo, repo_type, prefix,
+                                                                    recursive=prefix_of is None), f"listing {prefix}")
             except Exception as e:
                 problems.append(f"{prefix}: cannot list the repo: {type(e).__name__}: {e}")
                 listings[prefix] = {}
@@ -436,7 +447,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="do not require the full training states in the repo (the newest, and any whose trainer "
                          "upload failed)")
     ap.add_argument("--dry-run", action="store_true", help="print the actions; no upload, stop or destroy")
+    ap.add_argument("--job", choices=("train", "label"), default=os.environ.get("KITSUNE_JOB") or "train",
+                    help="train: runs/ in the output repo; label: the label root in the data repo (env KITSUNE_JOB)")
+    ap.add_argument("--no-infra", action="store_true", help="label: skip the infra log upload")
+    ap.add_argument("--allow-empty", action="store_true",
+                    help="label: --destroy with no finished label file (nothing unique on the disk yet)")
     args = ap.parse_args(argv)
+    if args.job == "label":
+        return label_main(args)
 
     dirs = [Path(d) for d in args.run_dir] if args.run_dir else run_dirs(Path(args.runs_root))
     expect_full = not args.no_full
@@ -486,6 +504,111 @@ def main(argv: list[str] | None = None) -> int:
         why = f"verification failed ({len(problems)} problems); {args.reason}".rstrip("; ")
         return 2 if instance_action("stop", why, args.dry_run, push_infra) else 1
     return 0 if instance_action("destroy", args.reason or "run verified on the hub", args.dry_run, push_infra) else 1
+
+
+# ---------------------------------------------------------------------------------------------------------- label
+
+def label_prefix(config: str) -> str:
+    """extent.root of the run config (a relative path: the cwd, else the checkout), e.g. labels/full."""
+    p = Path(config)
+    if not p.is_absolute() and not p.exists():
+        p = ROOT / config
+    root = json.loads(p.read_text(encoding="utf-8"))["extent"]["root"]
+    if not isinstance(root, str) or not root.strip("/"):
+        raise ValueError(f"{config}: extent.root {root!r} is not a repo path")
+    return root.strip("/")
+
+
+def label_main(args) -> int:
+    """finish.py --job label (module docstring): sync the label root write-once, verify it per directory, then stop
+    or destroy as the train path does."""
+    import label_sync  # vast/ is on sys.path: this file's directory (python vast/finish.py), or the importer's
+
+    repo = os.environ.get("KITSUNE_DATA_REPO") or args.repo
+    repo_type = label_sync.REPO_TYPE
+    local_root = Path(os.environ.get("KITSUNE_DIR") or ROOT)
+    config = os.environ.get("KITSUNE_CONFIG") or "configs/full.json"
+    try:
+        prefix = label_prefix(config)
+    except Exception as e:  # noqa: BLE001  (no sync and a verify problem; a stop still stops)
+        log(f"cannot read the label root from {config}: {type(e).__name__}: {e}")
+        prefix = None
+    rid = label_sync.run_id(STATE_DIR)
+    ledger = STATE_DIR / "label_ledger.json"
+    infra_dest = f"label_runs/{rid}"
+    mode = "destroy" if args.destroy else "stop" if args.stop else "sync-only" if args.sync_only else "verify-only"
+    api = None
+    if repo:
+        try:
+            api = hf_api()
+        except Exception as e:
+            log(f"huggingface_hub unavailable: {e}")
+    log(f"mode={mode} job=label repo={repo} root={prefix} run_id={rid} dry_run={args.dry_run}")
+
+    def push_infra():  # best effort and bounded, as in the train path
+        if api is not None and not args.verify_only and not args.no_infra:
+            best_effort(lambda: upload_infra(api, repo, repo_type, infra_dest, args.dry_run), "infra upload")
+
+    lock = None  # held until this process exits: the sync and the verify after it share it
+    if not args.verify_only and not args.no_sync:
+        lock = label_sync.acquire_sync_lock(STATE_DIR / "sync.lock", SYNC_LOCK_WAIT_S)
+        if lock is None:
+            log(f"{STATE_DIR / 'sync.lock'} still busy after {SYNC_LOCK_WAIT_S} s; skipping the sync")
+            event("sync_skipped", reason="sync.lock busy")
+
+    def do_sync(released: bool) -> int:
+        """0 synced, 1 an upload failed (or no sync was possible), EXIT_INTEGRITY a write-once refusal."""
+        if lock is None:
+            return 1
+        if api is None or prefix is None:
+            log("no data repo (KITSUNE_DATA_REPO unset), huggingface_hub unavailable or no label root: no sync")
+            event("sync_failed", error="no repo, hub or label root")
+            return 1
+        lease = label_sync.lease_bytes(rid, os.environ.get("CONTAINER_ID") or "local",
+                                       os.environ.get("KITSUNE_MACHINE_ID") or "", os.environ.get("KITSUNE_SHA") or "",
+                                       released=released)
+        try:
+            res = label_sync.sync(api, repo, local_root, prefix, ledger, lease=lease, dry_run=args.dry_run, log=log)
+        except label_sync.IntegrityError as e:
+            log(f"label sync refused: {e}")
+            event("sync_integrity", error=str(e)[:4000])
+            return EXIT_INTEGRITY
+        except Exception as e:  # noqa: BLE001
+            log(f"label sync failed: {type(e).__name__}: {e}")
+            event("sync_failed", error=f"{type(e).__name__}: {e}"[:4000])
+            return 1
+        event("label_sync", **res)
+        return 0
+
+    if args.sync_only:
+        rc = 0 if args.no_sync else do_sync(False)
+        push_infra()
+        return rc
+    if args.stop:
+        if not args.no_sync:
+            do_sync(True)
+        return 0 if instance_action("stop", args.reason or "requested", args.dry_run, push_infra) else 1
+    if args.destroy and not args.no_sync:
+        do_sync(True)
+
+    expected = label_sync.finished_files(local_root, prefix) if prefix is not None else {}
+    if api is None or prefix is None:
+        problems = ["no data repo (KITSUNE_DATA_REPO unset), huggingface_hub unavailable or no label root"]
+    elif not expected:
+        problems = [] if args.allow_empty else [f"nothing to verify: no finished label file under {local_root / prefix}"]
+    else:
+        problems = label_sync.verify(api, repo, expected, ledger, check_hash=not args.no_hash)
+    total_gb = sum(p.stat().st_size for p in expected.values()) / 1e9
+    log(f"verification: {len(expected)} files ({total_gb:.2f} GB), {len(problems)} problem(s)")
+    for p in problems[:50]:
+        log(f"  {p}")
+    event("verify", files=len(expected), gigabytes=round(total_gb, 3), problems=problems[:200])
+    if args.verify_only:
+        return 0 if not problems else 1
+    if problems:
+        why = f"verification failed ({len(problems)} problems); {args.reason}".rstrip("; ")
+        return 2 if instance_action("stop", why, args.dry_run, push_infra) else 1
+    return 0 if instance_action("destroy", args.reason or "labels verified on the hub", args.dry_run, push_infra) else 1
 
 
 if __name__ == "__main__":

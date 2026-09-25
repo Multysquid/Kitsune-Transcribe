@@ -7,7 +7,9 @@
 # Steps: sync the env to /etc/environment (SSH/tmux sessions do not inherit the container env), raise the nofile limit,
 # check /dev/shm and the pids budget, start TensorBoard and the vast portal, clone the repo at $KITSUNE_SHA, start
 # vast/watchdog.sh (hard cost cap), then detached: vast/bootstrap.sh (data) and vast/supervise.py (training +
-# stop/destroy), all logging to /workspace/kitsune.log.
+# stop/destroy), all logging to /workspace/kitsune.log. With KITSUNE_JOB=label (the label box, launch.py --job label)
+# the detached part is vast/label.py alone: it holds supervise.lock, runs its own idempotent steps and resumes from
+# $KITSUNE_STATE/label.json, so bootstrap.sh and supervise.py are not run.
 #
 # Restarts: the watchdog deadline is fixed at first boot; a `halt` marker (written by finish.py or by a failure here)
 # means the run is over, so a restarted container only brings up the env and the portal for inspection. An interrupted
@@ -21,7 +23,8 @@
 # refuses while a watchdog or supervisor of this container still runs (stop/start the instance first).
 #
 # Instance env (set by launch.py): KITSUNE_SHA KITSUNE_CONFIG KITSUNE_DATA_REPO KITSUNE_OUT_REPO TZ, optional
-# KITSUNE_DATA_REVISION KITSUNE_MAX_HOURS. HF_TOKEN comes from the vast account env and is never printed.
+# KITSUNE_DATA_REVISION KITSUNE_MAX_HOURS; the label job has KITSUNE_JOB=label and no KITSUNE_OUT_REPO. HF_TOKEN comes
+# from the vast account env and is never printed.
 set -euo pipefail
 set -o errtrace
 
@@ -187,7 +190,8 @@ rearm() {  # --rearm: archive the previous run's lifecycle state (see the header
     fi
     d="$KITSUNE_STATE/rearm-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$d"
-    for f in halt deadline first_boot supervise.json events.jsonl bootstrap_timings.jsonl bootstrap_coverage.json; do
+    for f in halt deadline first_boot supervise.json events.jsonl bootstrap_timings.jsonl bootstrap_coverage.json \
+        label.json label_hb; do
         if [ -e "$KITSUNE_STATE/$f" ]; then
             mv "$KITSUNE_STATE/$f" "$d/"
         fi
@@ -214,8 +218,8 @@ if [ ! -s "$KITSUNE_STATE/deadline" ]; then
     echo "$now" > "$KITSUNE_STATE/first_boot"
     echo $(( now + $(awk -v h="$KITSUNE_MAX_HOURS" 'BEGIN { printf "%d", h * 3600 }') )) > "$KITSUNE_STATE/deadline"
 fi
-log "boot $boots, instance ${CONTAINER_ID:-?}, sha ${KITSUNE_SHA:-unset}, config $KITSUNE_CONFIG, " \
-    "HF_TOKEN $([ -n "${HF_TOKEN:-}" ] && echo set || echo MISSING)"
+log "boot $boots, instance ${CONTAINER_ID:-?}, job ${KITSUNE_JOB:-train}, sha ${KITSUNE_SHA:-unset}, " \
+    "config $KITSUNE_CONFIG, HF_TOKEN $([ -n "${HF_TOKEN:-}" ] && echo set || echo MISSING)"
 
 ulimit -Sn "$(ulimit -Hn)" 2>/dev/null || log "could not raise the nofile soft limit"
 log "nofile soft limit $(ulimit -Sn)"
@@ -272,6 +276,11 @@ log "watchdog started (deadline $(date -u -d "@$(cat "$KITSUNE_STATE/deadline")"
     if command -v flock >/dev/null && ! flock -n 7; then
         log "a bootstrap or supervisor of this container is already running; not starting another"
         exit 0
+    fi
+    if [ "${KITSUNE_JOB:-train}" = label ]; then
+        log "label job: handing over to vast/label.py (it resumes from its own state file)"
+        exec 7>&-  # label.py takes supervise.lock itself for its lifetime (--rearm checks it)
+        exec "$PY" "$KITSUNE_DIR/vast/label.py"
     fi
     if [ -s "$KITSUNE_STATE/supervise.json" ]; then
         # a restart of this run: the supervisor starts only after a bootstrap that passed its coverage check and

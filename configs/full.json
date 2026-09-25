@@ -1,0 +1,22 @@
+{
+  "_comment": "Full label extent (the label box: vast/launch.py --job label). The trainer sections inherit DEFAULTS; the A100 training recipe for long epochs (eval cadence, schedule, mix) is decided in the A100 plan before it is launched. extent: the label set (kitsune/extent.py); inputs {} takes every upstream input of every named source. All label roots and the selection lie under extent.root (labels/full, write-once on the Hub). label: the label box's settings (vast/label.py); workers 'auto' is computed from the box's effective cores. The trainer reads neither extent, parakeet_root nor label.",
+  "run_name": "full-b20x2560",
+  "student": "students/b20x2560-d4",
+  "data_root": "data",
+  "teacher_root": "labels/full/teacher_out",
+  "second_root": "labels/full/second_out",
+  "parakeet_root": "labels/full/parakeet_out",
+  "selection": "labels/full/selections/full.parquet",
+  "extent": {"name": "full", "root": "labels/full", "inputs": {}},
+  "sources": ["reazon_small", "reazon_large", "emilia_yodas", "emilia_nc", "galgame"],
+  "eval_sets": ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia", "galgame"],
+  "selection_recipe": {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "emilia_nc=0.2", "eval_emilia=0.2"],
+                       "filter_eval_sets": ["eval_emilia", "galgame"], "partial_second_opinion": []},
+  "mix": "natural",
+  "label": {"cohere": {"procs": 2, "max_batch_seconds": 1200, "max_batch": 256, "workers": "auto", "torch_threads": 2,
+                       "vram_fraction": 0.33},
+            "parakeet": {"max_batch_seconds": 2400, "max_batch": 512, "workers": "auto", "torch_threads": 2,
+                         "vram_fraction": 0.22, "k_tdt": 8, "k_ctc": 8, "ctc_dense_thr": 0.95, "max_symbols": 10},
+            "sync_every_min": 20, "backlog_gb": 80, "hang_min": 20, "ingest_hang_min": 30, "min_xrt": 400,
+            "end_margin_min": 60, "finalize_margin_min": 90}
+}

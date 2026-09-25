@@ -22,7 +22,16 @@
 # configs/viability.json), KITSUNE_PREP_ARGS (extra args for 01; leave it empty for the viability data: its teacher
 # outputs cover exactly the first 6 Galgame tars and 300 h of Emilia-YODAS, which are 01's defaults, and a larger
 # --galgame-shards/--emilia-hours only downloads audio without teacher output), KITSUNE_MIN_COVERAGE (default 0.99),
-# HF_TOKEN (vast account env; never printed).
+# HF_TOKEN (vast account env; never printed), KITSUNE_REBUILD_TIMEOUT_MIN (extent mode only: the per-attempt timeout
+# of the audio rebuild in minutes, default 60; vast/launch.py sizes it from the extent record's upstream bytes).
+#
+# Extent mode (a run config with an "extent" block, labels from the label box under <extent root>/, e.g. labels/full):
+# the plan requires <root>/COMPLETE.json and <root>/extent.json in the listing (else it refuses, exit 3), downloads the
+# record into $KITSUNE_STATE and asks kitsune.extent.pull_plan for exactly the extent's label files: directory globs for
+# an uncapped source, explicit <stem>.npz/.jsonl files for a capped one (a prefix of a big source), never parakeet_out.
+# The rebuild is `01 --extent-config $KITSUNE_CONFIG`, the canonical ingest sequence the label box ran, so the ids and
+# stems are the labelled ones (KITSUNE_PREP_ARGS is ignored), and coverage is exact: every pulled stem's rebuilt id
+# sidecar hashes to the record's ids_sha256, its teacher ids are a subset of its ids, and every split joins at 1.0.
 set -euo pipefail
 
 KITSUNE_DIR="${KITSUNE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -159,6 +168,8 @@ def plan():
             refuse(f"HF_TOKEN cannot list {repo}@{rev} ({type(e).__name__}: {e}): check KITSUNE_DATA_REPO, "
                    f"KITSUNE_DATA_REVISION and the token's read access to it (vast/README.md step 2.3)")
         raise
+    if cfg.get("extent"):
+        return plan_extent(files)
 
     def has(pat: str) -> bool:
         return any(fnmatch.fnmatch(f, pat) for f in files)
@@ -194,6 +205,44 @@ def plan():
     print(f"plan: pull {len(patterns)} patterns; parked audio {parked or 'none'}; rebuild audio {rebuild or 'none'}")
 
 
+def plan_extent(files: list):
+    """The config's extent, labelled by the label box under <root>/: pull exactly its label files (kitsune.extent
+    pull_plan: directory globs for uncapped sources, explicit files for capped ones, never parakeet_out) and rebuild
+    all of its audio with `01 --extent-config`. A root the label box has not sealed (no COMPLETE.json) is refused: its
+    files may still change, and its extent.json is written only at the seal."""
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import filter_repo_objects
+
+    sys.path.insert(0, str(root))  # this helper runs from a mktemp path
+    from kitsune.extent import RECORD_FILE, load_record, names as extent_names, pull_plan
+
+    eroot = cfg["extent"].get("root", "")
+    lacks = [f"{eroot}/{n}" for n in ("COMPLETE.json", RECORD_FILE) if f"{eroot}/{n}" not in set(files)]
+    if lacks:
+        refuse(f"data repo {repo}@{rev} lacks {lacks}: the label box has not sealed the extent root {eroot!r}")
+    try:
+        path = hf_hub_download(repo, f"{eroot}/{RECORD_FILE}", repo_type="dataset", revision=rev, local_dir=state)
+    except Exception as e:
+        if refused(e):
+            refuse(f"HF_TOKEN cannot read {repo}@{rev}/{eroot}/{RECORD_FILE} ({type(e).__name__}: {e})")
+        raise
+    p = pull_plan(cfg, load_record(path), files)
+    problems = list(p["problems"])
+    have = set(files)
+    problems += [f"no {student}/{n}" for n in STUDENT_FILES if f"{student}/{n}" not in have]
+    if problems:
+        refuse(f"data repo {repo}@{rev} cannot serve extent {cfg['extent'].get('name')!r}: {problems}")
+    # the files the pull must leave on disk: the globs by snapshot_download's own matcher, plus the explicit files
+    want = list(dict.fromkeys([*filter_repo_objects(files, allow_patterns=p["dir_patterns"]), *p["explicit"]]))
+    rebuild = extent_names(cfg)
+    out = dict(repo=repo, revision=rev, patterns=p["dir_patterns"], parked=[], rebuild=rebuild, data_root=data_root,
+               repo_files=len(files), files=want, wall=time.time(), extent=True, explicit=p["explicit"],
+               record=str(Path(path).resolve()))
+    plan_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print(f"plan: extent {cfg['extent'].get('name')!r}: pull {len(p['dir_patterns'])} patterns and "
+          f"{len(p['explicit'])} explicit files; rebuild audio {rebuild} with 01 --extent-config")
+
+
 def register_parked(parked: list):
     """List the pulled shards of the parked sources in <data_root>/manifest.jsonl, as a local ingest would have (the
     data repo holds no manifest). 01 reads other sources' rows from the manifest - eval_emilia leaves out emilia_yodas's
@@ -227,6 +276,17 @@ def pull():
     t0 = time.time()
     snapshot_download(repo, repo_type="dataset", revision=rev, local_dir=root, allow_patterns=p["patterns"],
                       max_workers=16)
+    if p.get("explicit"):
+        # a capped source's files one by one (fnmatch over ~2k patterns x ~27k repo files would be too slow); a file
+        # already on disk is complete (downloads land as .incomplete files renamed when done), so a retry skips it
+        from concurrent.futures import ThreadPoolExecutor
+
+        from huggingface_hub import hf_hub_download
+
+        todo = [f for f in p["explicit"] if not (root / f).is_file()]
+        with ThreadPoolExecutor(16) as ex:
+            list(ex.map(lambda f: hf_hub_download(repo, f, repo_type="dataset", revision=rev, local_dir=root), todo))
+        print(f"pulled {len(todo)} of {len(p['explicit'])} explicit files ({len(p['explicit']) - len(todo)} on disk)")
     # when its one repo_info request fails (a Hub 5xx/429, a dropped connection) snapshot_download returns local_dir
     # (the checkout, never empty) with only a warning and downloads nothing, and 01's paid audio rebuild would run
     # before the coverage check caught it: fail here instead, so the shell's retry pulls again
@@ -239,12 +299,59 @@ def pull():
     print(f"pulled in {time.time() - t0:.0f} s; derived data + parked shards on disk: {size / 1e9:.2f} GB")
 
 
+def extent_stems(report: dict) -> list:
+    """Extent mode: every pulled stem (kitsune.extent subset_stems) must have been rebuilt with the labelled ids. The
+    rebuilt id sidecar's ids must hash to the record's ids_sha256 (same ids, same order, same stem), and the teacher
+    ids of the stem must be a subset of them. Returns the failures; report["extent_stems"] gets the counts."""
+    import numpy as np
+
+    sys.path.insert(0, str(root))  # this helper runs from a mktemp path
+    from kitsune.extent import load_record, subset_stems
+    from kitsune.store import ids_sha256, read_manifest, shard_ids
+
+    p = json.loads(plan_path.read_text(encoding="utf-8"))
+    record = load_record(Path(p["record"]))
+    droot = root / data_root
+    shards = {(s.source, Path(s.path).stem): s for s in read_manifest(droot)}
+    bad, checked = [], 0
+    for s, stems in sorted(subset_stems(record, cfg).items()):
+        want = {st["stem"]: st["ids_sha256"] for inp in record["sources"].get(s, {}).get("inputs", [])
+                for st in inp["stems"]}
+        for stem in sorted(stems):
+            checked += 1
+            info = shards.get((s, stem))
+            if info is None:
+                bad.append(f"{s}/{stem}: not rebuilt (no manifest line)")
+                continue
+            try:
+                ids = shard_ids(droot, info)
+            except FileNotFoundError as e:
+                bad.append(f"{s}/{stem}: {e}")
+                continue
+            if ids_sha256(ids) != want[stem]:
+                bad.append(f"{s}/{stem}: rebuilt ids_sha256 {ids_sha256(ids)[:12]} != the record's {want[stem][:12]}")
+                continue
+            with np.load(root / teacher_root / s / f"{stem}.npz", allow_pickle=False) as z:
+                extra = {str(i) for i in z["ids"]} - set(ids)
+            if extra:
+                bad.append(f"{s}/{stem}: {len(extra)} teacher ids not in the rebuilt stem, e.g. {sorted(extra)[:2]}")
+    report["extent_stems"] = dict(checked=checked, failed=len(bad), failures=bad[:50])
+    for b in bad[:20]:
+        print(f"  extent: {b}")
+    print(f"  extent: {checked - len(bad)} of {checked} pulled stems rebuilt with the labelled ids")
+    return bad
+
+
 def coverage():
     import numpy as np
     import pyarrow.parquet as pq
 
     floor = float(os.environ.get("KITSUNE_MIN_COVERAGE", "0.99"))
     report, bad = {}, []
+    if cfg.get("extent"):  # the rebuild replayed the label box's ingest: short of an exact join, it is another extent
+        floor = 1.0
+        stems_bad = extent_stems(report)
+        bad += [f"{len(stems_bad)} extent stem(s) (listed above)"] if stems_bad else []
     for s in names:
         # per split (<split>-NNNNN in both trees), as the trainer joins them: pooled over a source's splits,
         # galgame's 1,000-row hold-out is 0.5 % of its ids and could vanish (or trade rows with train) above the floor
@@ -282,13 +389,20 @@ phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull
 
 DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["data_root"])' "$STATE/bootstrap_plan.json")"
 mapfile -t REBUILD < <("$PY" -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1]))["rebuild"]))' "$STATE/bootstrap_plan.json" | sed '/^$/d')
-if [ "${#REBUILD[@]}" -gt 0 ]; then
+EXTENT="$("$PY" -c 'import json,sys; print("1" if json.load(open(sys.argv[1])).get("extent") else "")' "$STATE/bootstrap_plan.json")"
+if [ "${#REBUILD[@]}" -gt 0 ] && [ -z "$EXTENT" ]; then
     read -r -a PREP_ARGS <<< "${KITSUNE_PREP_ARGS:-}"
     # 01 resumes from its progress.json and manifest and its writes are kill-safe, so a retry, or a timeout that proves
     # too short for a healthy rebuild, only redoes the input in progress; 3 x 60 min caps a stall well before the
     # 5.5 h watchdog
     phase rebuild_audio retry 3 timeout -k 60 60m "$PY" scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" \
         --sources "${REBUILD[@]}" "${PREP_ARGS[@]}"
+elif [ -n "$EXTENT" ]; then
+    # the canonical ingest sequence the label box ran, capped by the config's extent (a retry skips 01's finished
+    # inputs and steps); vast/launch.py sizes the per-attempt timeout from the record's upstream bytes
+    [ -z "${KITSUNE_PREP_ARGS:-}" ] || log "KITSUNE_PREP_ARGS ignored: the config's extent defines the rebuild"
+    phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \
+        scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" --extent-config "$CONFIG"
 else
     log "every source has parked shards; nothing to rebuild"
 fi

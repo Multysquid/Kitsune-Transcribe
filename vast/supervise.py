@@ -202,16 +202,23 @@ def final_finish(action: str, reason: str, dry: list[str]):
         log(f"fallback stop exited {rc}")
 
 
-def load_state(path: Path) -> dict:
+def load_state(path: Path, required: str = "attempts") -> dict:
     """The attempt history (none yet: a fresh one). A file that is not one - empty or NUL-filled after an unclean host
     crash, torn bytes, a disk fault, a bad hand edit - is moved aside to <name>.corrupt-<unix time> and flagged
     ("corrupt": where it went): the history it held is unknown (a final decision? a resume already used?), so
-    supervise() stops the box instead of starting a fresh run."""
+    supervise() stops the box instead of starting a fresh run. `required` is the key every valid state has:
+    "attempts" (a list) for this supervisor, "phase" for vast/label.py (whose fresh state is {"phase": None,
+    "final": None})."""
+    fresh = {"attempts": [], "final": None} if required == "attempts" else {required: None, "final": None}
     if not path.exists():
-        return {"attempts": [], "final": None}
+        return fresh
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
-        why = None if isinstance(state, dict) and isinstance(state.get("attempts"), list) else "not an attempt history"
+        if required == "attempts":
+            ok = isinstance(state, dict) and isinstance(state.get("attempts"), list)
+            why = None if ok else "not an attempt history"
+        else:
+            why = None if isinstance(state, dict) and required in state else f"no {required!r} key"
     except ValueError as e:  # JSONDecodeError, and UnicodeDecodeError for bytes that are not UTF-8
         why = f"{type(e).__name__}: {e}"
     if why is None:
@@ -219,7 +226,7 @@ def load_state(path: Path) -> dict:
     aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
     path.replace(aside)
     log(f"{path} is unreadable ({why[:200]}); moved to {aside}")
-    return {"attempts": [], "final": None, "corrupt": str(aside)}
+    return {**fresh, "corrupt": str(aside)}
 
 
 def _sync_dir(p: Path):
