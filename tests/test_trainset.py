@@ -523,8 +523,9 @@ class _FeederDropDataset(torch.utils.data.Dataset):
 def test_loader_times_out_on_a_dropped_worker_batch():
     """A worker micro-batch that never arrives raises "DataLoader timed out" after timeout_s instead of blocking the
     trainer until the watchdog (the loader yields in order, so it would wait for that batch forever). The timeout
-    covers the first wait's spawn and imports too (8-11 s measured on the laptop)."""
-    loader = make_loader(_FeederDropDataset(), [[[0]], [[1]], [[2]]], num_workers=1, prefetch=2, timeout_s=30)
+    covers the first wait's spawn and imports too: 8-11 s measured on an idle laptop, ~26 s beside a live training
+    run and over 30 s late in the full suite there, so 90 s (production: perf.loader_timeout_s = 600)."""
+    loader = make_loader(_FeederDropDataset(), [[[0]], [[1]], [[2]]], num_workers=1, prefetch=2, timeout_s=90)
     try:
         key, mbs = next(loader)
         assert key == 0 and mbs[0]["ids"] == [0]
