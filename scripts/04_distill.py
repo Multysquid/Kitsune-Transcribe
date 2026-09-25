@@ -147,7 +147,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import Future
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2771,7 +2771,8 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         config=R.cfg, **extra)
 
 
-# set by main() when it returns with an upload still running: the __main__ block then skips interpreter finalization
+# set by main() when it returns or fails with an upload still running: run_script (the __main__ entry) then skips
+# interpreter finalization
 _HARD_EXIT = False
 
 
@@ -2798,6 +2799,8 @@ def main(argv=None) -> int:
     except BaseException as e:
         R.log.exception(e)
         _close_failed(R, "failed", e)
+        with suppress(Exception):  # never masks the original exception
+            _HARD_EXIT = uploads_left_running(R)  # an upload still running after FAILED_UPLOAD_WAIT_S
         raise
     _HARD_EXIT = uploads_left_running(R)
     return rc
@@ -2817,9 +2820,9 @@ def _close_failed(R: Run, status: str, exc: BaseException):
 
 
 def exit_process(rc: int):
-    """sys.exit(rc); os._exit(rc) when main() returned with an upload still running (uploads_left_running): the logs
-    and TensorBoard are closed by then, and finish.py uploads and verifies what the upload did not finish. Here, not in
-    main(): the tests call main() directly."""
+    """sys.exit(rc); os._exit(rc) when main() returned or failed with an upload still running (uploads_left_running):
+    the logs and TensorBoard are closed by then, and finish.py uploads and verifies what the upload did not finish.
+    Here, not in main(): the tests call main() directly."""
     if _HARD_EXIT:
         print(f"an upload is still running: exiting {rc} without interpreter finalization", file=sys.stderr)
         sys.stdout.flush()
@@ -2828,5 +2831,25 @@ def exit_process(rc: int):
     sys.exit(rc)
 
 
+def run_script(argv=None):
+    """The __main__ entry: exit_process(main()). main() re-raises a failure, which skipped exit_process: one it
+    re-raised with an upload still running (_HARD_EXIT) is reported as the interpreter would (the traceback, or a
+    SystemExit's message) and leaves by exit_process too, with EXIT_FAIL (a SystemExit's int code); finalizing with
+    the upload's thread in hf_xet aborted the process (rc -6). Any other failure propagates as before."""
+    try:
+        rc = main(argv)
+    except BaseException as e:
+        if not _HARD_EXIT:
+            raise
+        rc = EXIT_FAIL
+        if not isinstance(e, SystemExit):
+            sys.excepthook(type(e), e, e.__traceback__)
+        elif e.code is None or isinstance(e.code, int):
+            rc = e.code or 0
+        else:
+            print(e.code, file=sys.stderr)
+    exit_process(rc)
+
+
 if __name__ == "__main__":
-    exit_process(main())
+    run_script()

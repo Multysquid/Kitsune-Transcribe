@@ -255,6 +255,67 @@ def test_a_normal_exit_with_an_upload_running_skips_finalization(tmp_path, monke
     assert exits == [("os._exit", 0), ("sys.exit", 0)]
 
 
+def test_a_failure_with_an_upload_running_skips_finalization_too(tmp_path, monkeypatch, capsys):
+    """main() re-raises a failure, so the __main__ block's exit_process() never ran: a crash whose checkpoint upload
+    (the 8.6 GB pre_cooldown full state) outlived FAILED_UPLOAD_WAIT_S finalized with that upload's thread in hf_xet
+    and aborted (rc -6) instead of exiting 1. main() now notes the running upload before the re-raise, and run_script
+    (the __main__ entry) prints the traceback and leaves by os._exit(EXIT_FAIL). With no upload left running the
+    exception propagates as before."""
+    import copy
+    import threading
+    from types import SimpleNamespace
+
+    m = load_script("04_distill")
+    monkeypatch.setattr(m, "FAILED_UPLOAD_WAIT_S", 0.3)
+    release, evs = threading.Event(), []
+
+    class StalledHub(FakeHub):
+        def upload_folder(self, **kw):
+            release.wait(30)
+            super().upload_folder(**kw)
+
+    log = SimpleNamespace(event=lambda kind, **kw: evs.append(kind), exception=lambda e: evs.append("exception"),
+                          close=lambda summary: evs.append("close"), elapsed=lambda: 1.0,
+                          wait_sync=lambda timeout=None: True)
+    R = m.Run(cfg=copy.deepcopy(m.DEFAULTS), run_dir=tmp_path / "run", device=torch.device("cpu"), amp=False, log=log)
+    R.uploader = m.Uploader(StalledHub(), "u/r", "run", True, log, retries=())
+    d = tmp_path / "full_step_9"
+    d.mkdir()
+    (d / "w.bin").write_bytes(b"x")
+
+    def crash(R, state):
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(m, "parse_args", lambda argv: None)
+    monkeypatch.setattr(m, "build", lambda args: (R, None))
+    monkeypatch.setattr(m, "train", crash)
+    exits = []
+
+    class HardExit(Exception):  # os._exit never returns
+        pass
+
+    def hard_exit(rc):
+        exits.append(("os._exit", rc))
+        raise HardExit
+
+    monkeypatch.setattr(m.os, "_exit", hard_exit)
+    monkeypatch.setattr(m.sys, "exit", lambda rc: exits.append(("sys.exit", rc)))
+    try:
+        R.uploader.submit(d, "full_step_9")
+        with pytest.raises(HardExit):
+            m.run_script([])
+        assert m._HARD_EXIT and exits == [("os._exit", m.EXIT_FAIL)]
+        assert evs[:3] == ["exception", "close", "ckpt_upload_abandoned"]
+        assert "RuntimeError: CUDA error: an illegal memory access" in capsys.readouterr().err
+    finally:
+        release.set()
+    R.uploader.worker.join(5)
+    assert not R.uploader.worker.is_alive()
+    with pytest.raises(RuntimeError, match="illegal memory access"):  # the interpreter prints it and exits 1
+        m.run_script([])
+    assert not m._HARD_EXIT and exits == [("os._exit", m.EXIT_FAIL)]
+
+
 def test_a_resume_sets_newer_states_aside_and_uploads_the_pre_cooldown_state_again(tmp_path, monkeypatch):
     """--resume from an older full state moves the abandoned attempt's newer ones aside (set_aside_newer). The
     pre_cooldown full state is uploaded only by the process that saved it (finish.py's syncs take the newest full
