@@ -11,9 +11,10 @@
 #
 # Restarts: the watchdog deadline is fixed at first boot; a `halt` marker (written by finish.py or by a failure here)
 # means the run is over, so a restarted container only brings up the env and the portal for inspection. An interrupted
-# run is handled by supervise.py's own history. Any failure before the supervisor takes over stops the instance (not
-# destroy), unless KITSUNE_NO_SELF_STOP=1. Bootstrap + supervisor hold $KITSUNE_STATE/supervise.lock, so running this
-# script again by hand during a run starts nothing new.
+# run is handled by supervise.py's own history: a restart that finds $KITSUNE_STATE/supervise.json skips bootstrap (the
+# data passed its coverage check before the supervisor first ran) and hands straight over to it. Any failure before
+# the supervisor takes over stops the instance (not destroy), unless KITSUNE_NO_SELF_STOP=1. Bootstrap + supervisor
+# hold $KITSUNE_STATE/supervise.lock, so running this script again by hand during a run starts nothing new.
 #
 # Re-arm a halted box for a fresh run: `bash vast/onstart.sh --rearm` moves the halt marker, the deadline and the
 # supervisor/finish history to $KITSUNE_STATE/rearm-<stamp>/, then boots as if for the first time (new 5.5 h cap). It
@@ -252,9 +253,16 @@ log "watchdog started (deadline $(date -u -d "@$(cat "$KITSUNE_STATE/deadline")"
         log "a bootstrap or supervisor of this container is already running; not starting another"
         exit 0
     fi
-    log "bootstrap start"
-    bash "$KITSUNE_DIR/vast/bootstrap.sh"
-    log "bootstrap done; starting the supervisor"
+    if [ -s "$KITSUNE_STATE/supervise.json" ]; then
+        # a restart of this run: the supervisor starts only after a bootstrap that passed its coverage check and
+        # records its history before the first attempt (--rearm moves it aside), so the data is on disk; bootstrap's
+        # Hub calls would turn a Hub outage at restart time into halt + stop instead of the resume / the recorded finish
+        log "supervisor history present: bootstrap already done for this run; handing over to the supervisor"
+    else
+        log "bootstrap start"
+        bash "$KITSUNE_DIR/vast/bootstrap.sh"
+        log "bootstrap done; starting the supervisor"
+    fi
     exec 7>&-  # handed over: supervise.py takes the same lock itself for its lifetime
     exec "$PY" "$KITSUNE_DIR/vast/supervise.py"
 ) < /dev/null &

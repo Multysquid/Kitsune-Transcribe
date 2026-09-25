@@ -497,6 +497,42 @@ def test_onstart_fits_vast_limits():
             assert "2>/dev/null ||" in line, line
 
 
+def test_onstart_skips_bootstrap_on_a_restart_with_a_supervisor_history(tmp_path):
+    """A container restart re-ran all of bootstrap (whoami, auth_check, the repo listing, 01's listings: Hub calls
+    with only 3 tries) before the supervisor, so a Hub outage at restart time halted and stopped a run the supervisor
+    would have resumed, or turned a recorded destroy into a stop. The supervisor starts only after a bootstrap that
+    passed its coverage check and writes supervise.json before its first attempt (--rearm moves it aside): with that
+    history the detached subshell hands straight over to it, still after the supervise.lock check."""
+    text = (VAST / "onstart.sh").read_text(encoding="utf-8")
+    body = re.search(r"^\(\n(.*?)^\) < /dev/null &$", text, re.M | re.S).group(1)
+    assert body.index("supervise.lock") < body.index('-s "$KITSUNE_STATE/supervise.json"') < body.index(
+        'bash "$KITSUNE_DIR/vast/bootstrap.sh"')
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    state, repo = tmp_path / "state", tmp_path / "repo"
+    (repo / "vast").mkdir(parents=True)
+    state.mkdir()
+    for name in ("bootstrap.sh", "supervise.py"):  # run by bash (PY=bash below): each notes that it ran
+        (repo / "vast" / name).write_text(f'echo {name} >> "$KITSUNE_STATE/ran"\n', encoding="utf-8", newline="\n")
+    script = tmp_path / "subshell.sh"
+    script.write_text("\n".join(["set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }", "PY=bash", body]),
+                      encoding="utf-8", newline="\n")
+    env = dict(os.environ, KITSUNE_STATE=state.as_posix(), KITSUNE_DIR=repo.as_posix())
+
+    def boot() -> tuple[list[str], str]:
+        (state / "ran").unlink(missing_ok=True)
+        r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
+        assert r.returncode == 0, r.stdout + r.stderr
+        return (state / "ran").read_text(encoding="utf-8").split(), r.stdout
+
+    ran, out = boot()  # first boot
+    assert ran == ["bootstrap.sh", "supervise.py"] and "bootstrap start" in out
+    (state / "supervise.json").write_text('{"attempts": [{"t0": 1.0, "resume": null}]}', encoding="utf-8")
+    ran, out = boot()  # a restart mid-attempt (or with a recorded final decision)
+    assert ran == ["supervise.py"] and "supervisor history present" in out and "bootstrap start" not in out
+
+
 def test_watchdog_dry_run(tmp_path):
     bash = find_bash()
     if bash is None:
