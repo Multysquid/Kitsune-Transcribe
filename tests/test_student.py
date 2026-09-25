@@ -629,6 +629,12 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
     imp = S.importance_from_state(cache["importance"])
     want = S.select_ffn_neurons(imp, [0, 3], 32, 128)
     assert mb["kept"]["ffn"] == {f"{l}.{n}": v.tolist() for (l, n), v in sorted(want.items())}
+    # a named cache that does not match (other calibration ids) is an input: refused, never overwritten
+    with pytest.raises(SystemExit, match="does not match"):
+        mod.main([x if x != "10" else "9" for x in common] + [
+            "--enc-layers", "2", "--ffn", "32", "--dec-layers", "1", "--bn", "keep", "--importance-cache",
+            str(a / "importance.pt"), "--step0-eval-utts", "0", "--out", str(tmp_path / "b2")])
+    assert (a / "importance.pt").stat().st_mtime_ns == mtime
 
     # --ffn-from: a's selection, verbatim; no calibration audio; the same weights as a
     c = tmp_path / "c"

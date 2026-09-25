@@ -219,12 +219,14 @@ def load_or_compute_importance(teacher, featurizer, utts: list[dict], args, spec
     The layers measured are spec's kept layers, or all the teacher's with --importance-layers all: FFN importance is
     measured inside the full teacher, so it does not depend on which layers a student keeps, and one all-layer pass
     serves every size. A cache is reused when it has the same key (teacher, commit, calibration ids) and covers the
-    layers asked for; it is written only when it is recomputed."""
+    layers asked for; it is written only when it is recomputed. A cache named with --importance-cache that exists but
+    does not match stops the build: it is shared, and recomputing would overwrite it (maybe with fewer layers)."""
     import torch
 
     from kitsune import student as S
 
-    path = Path(getattr(args, "importance_cache", None) or out / "importance.pt")
+    named = getattr(args, "importance_cache", None)
+    path = Path(named or out / "importance.pt")
     if getattr(args, "importance_layers", "spec") == "all":
         layers = list(range(teacher.config.encoder_config.num_hidden_layers))
     else:
@@ -244,6 +246,10 @@ def load_or_compute_importance(teacher, featurizer, utts: list[dict], args, spec
             log(f"  importance: reusing {path} ({c['info']['n_utts']} utts, {len(c['layers'])} layers, computed "
                 f"{c['info']['created']})")
             return S.importance_from_state(c["importance"]), dict(c["info"], reused=True, path=str(path))
+        if named:
+            sys.exit(f"--importance-cache {path} does not match this build (teacher commit, calibration ids or layers:"
+                     f" it has {c and c.get('key')}, {len(c.get('layers', [])) if c else 0} layers; this build needs "
+                     f"{key}, layers {layers}); it is left as it is")
         if c is not None:
             log(f"  importance cache {path} does not match this run (teacher/sample/layers); recomputing")
 
