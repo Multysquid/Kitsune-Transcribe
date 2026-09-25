@@ -338,6 +338,20 @@ def test_verdict_v2_drops_near_duplicate_end_points():
     assert ev.dedup_history(no_epoch, 0.25) == (no_epoch, [])
 
 
+def test_verdict_v2_cooldown_gain_starts_at_the_eval_nearest_the_cooldown():
+    """The cooldown gain's "before" eval is the last stable-phase record of the whole history, taken before the
+    de-duplication (as the docstring and the template's _comment say): an eval 0.2 epoch after the one before it
+    leaves the trend's window, but it is still the model nearest the cooldown's start, so the gain starts there."""
+    hist = history2([(100, 1.0, "stable", 2.0, None, 0.5, 0.4), (200, 2.0, "stable", 1.9, None, 0.5, 0.4),
+                     (300, 3.0, "stable", 1.8, None, 0.5, 0.4), (320, 3.2, "stable", 1.75, None, 0.5, 0.4),
+                     (500, 5.0, "cooldown", 1.5, None, 0.5, 0.4)])
+    v2 = ev.verdict(dict(final=final((1.8, 2.0, 1.4)), history=hist), version=2)
+    assert v2["trend"]["deduplicated_steps"] == [320] and v2["trend"]["cer_window_steps"] == [100, 200, 300]
+    g = v2["cooldown_gain"]
+    assert (g["from_step"], g["from_epoch"], g["to_step"]) == (320, 3.2, 500)
+    assert g["cer_ratio_before"] == pytest.approx(1.75) and g["cer_ratio_after"] == pytest.approx(1.5)
+
+
 def test_verdict_v1_is_unchanged_by_the_v2_fields():
     """The records now carry lr_phase, greedy_full and (under v2) the epoch: v1 reads none of them, so the verdict of
     a history written before them and of the same history with them is identical, key for key (the first A100 run's

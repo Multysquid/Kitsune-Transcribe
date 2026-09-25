@@ -647,9 +647,13 @@ def dedup_history(records: list[dict], min_epoch_gap: float) -> tuple[list[dict]
 
 
 def _cooldown_gain(records: list[dict]) -> dict | None:
-    """verdict v2's cooldown gain: the final eval (the last record) against the last pre-cooldown eval (the last record
-    whose lr_phase is "stable"), both on the complete sets when both have them, else on the subset. None when the final
-    eval does not follow a cooldown step or no eval came before the cooldown."""
+    """verdict v2's cooldown gain: the final eval (the last record) against the last pre-cooldown eval, both on the
+    complete sets when both have them, else on the subset. `records` is the whole trained history, NOT the
+    de-duplicated one: the "before" eval is its last record whose lr_phase is "stable" - the eval nearest the
+    cooldown's start - even when dedup_history left it out of the trend (it came < min_epoch_gap after the one before).
+    De-duplication keeps two near-identical models from both weighing on a slope; a two-point gain wants the model
+    closest to where the cooldown began. None when the final eval does not follow a cooldown step or no eval came
+    before the cooldown."""
     if not records or records[-1].get("lr_phase") != "cooldown":
         return None
     pre = [r for r in records if r.get("lr_phase") == "stable"]
@@ -719,7 +723,9 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
       4. reported next to the tiers, never gating: pre_cooldown_slope - that window's CER measure, its relative
          change across the window (the one "improving" tests; x = step) and the least-squares slope per epoch
          (per_epoch, and rel_per_epoch = per_epoch / the window's mean) - and cooldown_gain - the final eval (the
-         history's last record, whatever the de-duplication dropped) against the last pre-cooldown eval, on the
+         history's last record, whatever the de-duplication dropped) against the last eval before the cooldown (the
+         history's last record whose lr_phase is "stable", also taken BEFORE de-duplication: the eval nearest the
+         cooldown's start, which with evals closer than min_epoch_gap can be one the trend in 3 left out), on the
          complete sets when both have them: the measure before and after, its relative change, and each gate set's
          CER before and after (null without an eval on each side)
     A record's lr_phase is the trainer's (eval_record); lr_phase_at gives it for a history written before the trainer

@@ -1012,6 +1012,7 @@ def test_the_next_run_template_is_viability_with_the_reports_changes():
     c = raw["_comment"]
     for words in ("template for the scaling study", "eval.verdict_version 2", "lr_phase stable",
                   "trend: insufficient pre-cooldown evals", "cooldown_gain", "pre_cooldown_slope",
+                  "taken before the de-duplication",
                   "eval.verdict_min_epoch_gap (0.25)", "batch.micro_audio_s 600", "does NOT shorten",
                   "perf.profile_smoke true", "eval.reference"):
         assert words in c, words
