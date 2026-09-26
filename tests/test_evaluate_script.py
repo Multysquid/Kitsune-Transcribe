@@ -632,6 +632,10 @@ def test_a_manifest_without_the_stores_rows_is_refused(env, tmp_path, monkeypatc
         m05.main([*argv, "--anchor", "--out", str(tmp_path / "o2")])
 
 
+# a study selection's recipe block (configs/study/*.json; the box path validates its keys once it is merged)
+STUDY_BLOCK = {"f1a_max": 0.5, "dedup_min_chars": 15, "draw_audio_s": 3600000, "probe_n": 300, "neutral_max_cer": 0.5}
+
+
 def test_a_study_eval_without_its_manifest_is_refused(env, tmp_path, monkeypatch):
     """Without a manifest (none next to the selection, no --manifest) an eval that would be the study's refuses before
     the model is loaded: --tables or --system ask for tables, a study run name, the anchor's config name (its mode
@@ -653,7 +657,7 @@ def test_a_study_eval_without_its_manifest_is_refused(env, tmp_path, monkeypatch
                        (["--set", "run_name=study-t06"], "run_name study-t06 is a study run"),
                        (["--set", "run_name=study-t06-half"], "run_name study-t06-half is a study run"),
                        (["--set", "run_name=anchor-b20"], "--anchor write the study's tables"),
-                       (["--set", 'selection_recipe.study={"f1a_max": 0.5}'] if "study" in
+                       (["--set", "selection_recipe.study=" + json.dumps(STUDY_BLOCK)] if "study" in
                         m05.load_trainer().DEFAULTS["selection_recipe"] else ["--set", "run_name=study-p01"],
                         "the config's selection is the study's|run_name study-p01"),
                        (["--manifest", "none", "--tables", str(tmp_path / "t")], "--tables write the study's tables")):
@@ -722,7 +726,7 @@ def test_a_generated_study_config_with_max_steps_unset_loads(env, tmp_path):
     m05 = load_script("05_evaluate")
     cfg = load(env["relative"])
     cfg["schedule"] = dict(cfg["schedule"], max_steps=None)
-    cfg["pull_parakeet"] = True
+    cfg.update(pull_parakeet=True, parakeet_root="corpus/parakeet_out")  # the box pulls both label roots
     p = tmp_path / "gen.json"
     p.write_text(json.dumps(cfg), encoding="utf-8")
     args = SimpleNamespace(config=str(p), set=[], batch_s=None, root=str(env["root"]))
