@@ -28,8 +28,9 @@ selection's sidecar (labels/full/selections/study_1000h.json), and the final pre
 
 The fill takes only the pre-registered selection (sidecar_problems): the registered sources, eval sets, recipe, seed
 and extent, reazon_large at the cap the rule gives (the smallest N whose pool holds >= POOL_MIN_HOURS h, from the
-sidecar's pool_hours_if_capped), and every eval set, view, teacher and stratum present. Otherwise a selection built
-with another recipe could fill the hashes of a PREREG whose text says something else.
+sidecar's pool_hours_if_capped), every eval set, view, teacher and stratum present, and drawn hours that give the
+realised mix recorded in data.mix (REALISED_MIX_PCT, the uploaded selection's). Otherwise a selection built with another
+recipe could fill the hashes of a PREREG whose text says something else.
 
 The layout is machine-read by kitsune.study_stats (tools/study_report.py --prereg): "analysis" holds delta, the
 sigma_run rule and the bootstrap settings; "manifest" holds sets.<eval set>.ids_sha256, galgame_views.<view>.ids_sha256,
@@ -238,9 +239,14 @@ OWNER_CHANGES = [
     "The study runs on two boxes, Cohere first (BOXES): box A trains the Transcribe students, box B the Parakeet "
     "students and the bridge, the replicate a 1x box after box A; each box measures study-t06's step time on its own "
     "host and writes its own numbers file (decision 2).",
+    "The replicate is conditional (decision 3; noise.replicate_trigger): every call is computed at sigma_run 1.6 % and "
+    "3.2 % after boxes A and B, and study-t01-s1235 runs only if a family's delta 10 % limit call differs between the "
+    "two; then sigma_run = max(1.6 %, sigma_hat) as before, otherwise the calls are reported robust to sigma_run up to "
+    "3.2 %.",
 ]
 # decision -> what it said before the owner's change of 2026-09-26
 CHANGED_DECISIONS = {2: "S3: one 4x A100 SXM4 40 GB box, calibration + probes + 2 waves; S3b, then S1p as fallbacks",
+                     3: "a: control runs: the bridge and a replicate of T-0.1B with seed 1235 (always run)",
                      17: "a: T-0.3B = B10x2560 + decoder {0,7} (320,752,384 parameters)"}
 # decision -> what the label checks of wave 1 measured on the real labels (tools/label_checks.py, 2026-09-26)
 WAVE1_FACTS = {
@@ -270,6 +276,12 @@ STUDY_SOURCES = ["reazon_small", "reazon_large", "emilia_yodas", "emilia_nc", "g
 STUDY_EVAL_SETS = ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia", "galgame"]
 # the extent inputs study/data.json registers; reazon_large's cap is the cap rule's (POOL_MIN_HOURS), from the labels
 STUDY_INPUTS = {"reazon_large": None, "emilia_yodas": "300h", "emilia_nc": 8, "galgame": 3}
+# the realised mix of the uploaded selection (data repo commit 4b0d801, study_1000h.json hours.<source>.drawn, 1,000 h),
+# in percent of the drawn hours at 0.1 pp, Reazon = reazon_small + reazon_large: a recorded fact (the plan was mix D,
+# decision 9), checked against the sidecar at the fill (mix_problems)
+REALISED_MIX_PCT = {"reazon": 41.6, "emilia_yodas": 26.8, "emilia_nc": 19.6, "galgame": 12.0}
+MIX_GROUPS = {"reazon": ("reazon_small", "reazon_large"), "emilia_yodas": ("emilia_yodas",),
+              "emilia_nc": ("emilia_nc",), "galgame": ("galgame",)}
 GATE_SETS = ("eval_jsut", "eval_cv8", "eval_reazon")
 GALGAME_VIEWS = ("neutral", "all", "label_box")
 # the scoring strata, named as kitsune.study_stats names them: every eval set, but Galgame as its three views
@@ -286,6 +298,10 @@ COHERE_CER_PREREG = {"eval_jsut": 0.0830, "eval_cv8": 0.0407, "eval_reazon": 0.0
 DELTA, DELTAS = 0.10, (0.05, 0.10, 0.20)  # decision 1: the primary tolerance; all three always reported
 SIGMA_PRIOR = 0.016  # sigma_run's prior: the first run's residual SD of the 4-set macro around its trend
 SIGMA_FACTOR = 0.886  # sqrt(pi) / 2: one replicate pair's |ln ratio| x this is unbiased for sigma_run
+# the conditional replicate (owner, 2026-09-26): every call at both; the replicate runs only if a family's primary
+# (delta 10 %) limit call differs between them (the families whose walk is a limit claim: the scratch walk is not)
+SIGMA_GRID = (SIGMA_PRIOR, 0.032)
+TRIGGER_FAMILIES = ("transcribe", "parakeet")
 BOOT_B, BOOT_SEED, Z = 10_000, 1234, 1.96
 TEACHER_BARS = (1.2, 1.5)  # the practical bars against the own teacher (4.7)
 ANCHOR_FLAG_REL = 0.05  # 4.1: T-0.6B worse than the anchor by more than 5 % relative, paired CI excluding 0
@@ -298,7 +314,8 @@ DECISIONS = {
     1: ("a", "the limit: tolerance delta 10 % against the family's largest student; delta 5 and 20 % also reported"),
     2: ("AB", "two 4x A100 boxes, Cohere first: box A the Transcribe students, box B the Parakeet students and the "
               "bridge, each calibrating on its own host; the replicate on a 1x box after box A (BOXES)"),
-    3: ("a", "control runs: the bridge and a replicate of T-0.1B with seed 1235"),
+    3: ("a", "control runs: the bridge, and a replicate of T-0.1B with seed 1235 only if a family's limit call "
+             "depends on sigma_run (1.6 % vs 3.2 %; noise.replicate_trigger)"),
     4: ("a", "budget cuts in this order: the replicate, T at 3 epochs, the contingency; never stage away 0.05B"),
     5: ("b", "HF storage: no action (HF PRO, 1 TB)"),
     6: ("a", "a T/2 branch in every run"),
@@ -467,7 +484,8 @@ def rules(sidecar: dict | None = None) -> dict:
     deterministic: the same sidecar gives the same rules."""
     r = {
         "prereg_version": RULES_VERSION,
-        "study": "Kitsune size study: 7 students + bridge + replicate on the same 1,000 h at equal A100 compute",
+        "study": "Kitsune size study: 7 students + bridge (+ a conditional replicate) on the same 1,000 h at equal A100 "
+                 "compute",
         "design": "STUDY.md (final); CONTRACT.md for the interfaces",
         "decisions": {str(n): {"option": k, "answer": a,
                                **({"changed_2026_09_26": {"was": CHANGED_DECISIONS[n]}} if n in CHANGED_DECISIONS
@@ -576,7 +594,8 @@ def rules(sidecar: dict | None = None) -> dict:
             "loader_bound": f"data_wait_frac >= {DATA_WAIT_MAX}: perf.num_workers 12 and calibrate again; still "
                             f">= {DATA_WAIT_MAX}: the box halts",
             "excluded": "evals, checkpoints and the T/2 branch do not count toward T",
-            "replicate": f"{REPLICATE} is not calibrated: it takes {REPLICATE_OF}'s max_steps and the scratch LR from "
+            "replicate": f"{REPLICATE} runs only on the trigger (noise.replicate_trigger); it is not calibrated: it "
+                         f"takes {REPLICATE_OF}'s max_steps and the scratch LR from "
                          f"box A's numbers file, and trains at the micro_audio_s of {REPLICATE_OF}'s calibration entry "
                          f"there",
         },
@@ -600,6 +619,12 @@ def rules(sidecar: dict | None = None) -> dict:
                                 f"{POOL_MIN_HOURS} h (expected 50-55), read from the sealed labels (the sidecar's "
                                 f"details.pool_hours_if_capped; the fill refuses any other count)",
             "sources": list(STUDY_SOURCES), "eval_sets": list(STUDY_EVAL_SETS),
+            "mix": {"plan": "mix D (decision 9)",
+                    "realised_pct": dict(REALISED_MIX_PCT),
+                    "groups": {k: list(v) for k, v in MIX_GROUPS.items()},
+                    "what": "a recorded fact, not a rule: the shares of the drawn hours of the uploaded selection "
+                            "(data repo commit 4b0d801, study_1000h.json hours.<source>.drawn, 1,000 h), at 0.1 pp; the "
+                            "fill refuses a sidecar whose drawn hours give another mix (mix_problems)"},
         },
         "selection": {
             "file": f"{SELECTION_FILE} (+ {', '.join(study_files(SELECTION_FILE))})",
@@ -643,7 +668,19 @@ def rules(sidecar: dict | None = None) -> dict:
         },
         "noise": {"sigma_prior": SIGMA_PRIOR,
                   "replicate_estimate": f"{SIGMA_FACTOR} x |ln(M4_{REPLICATE} / M4_{REPLICATE_OF})|",
-                  "sigma_rule": f"sigma_run = max({SIGMA_PRIOR}, the replicate's estimate)",
+                  "sigma_rule": f"without the replicate: sigma_run = {SIGMA_PRIOR} (the prior), every call also "
+                                f"reported at {SIGMA_GRID[1]}; with it: sigma_run = max({SIGMA_PRIOR}, the replicate's "
+                                f"estimate)",
+                  "sigma_grid": list(SIGMA_GRID),
+                  "replicate_trigger": f"after boxes A and B every call (both families' walks, the scratch ladder, all "
+                                       f"three deltas, the practical bars) is computed at sigma_run = "
+                                       f"{100 * SIGMA_GRID[0]:g} % and at {100 * SIGMA_GRID[1]:g} %; the replicate "
+                                       f"({REPLICATE}, box 'replicate', {REPLICATE_OF}'s max_steps and the scratch LR "
+                                       f"from box A's numbers) runs only if any family's limit call (the delta "
+                                       f"{100 * DELTA:g} % walk result of {' or '.join(TRIGGER_FAMILIES)}) differs "
+                                       f"between the two (kitsune.study_stats: replicate_needed); then sigma_run = "
+                                       f"max({SIGMA_PRIOR}, sigma_hat). Otherwise it is not run and the report states "
+                                       f"that the calls are robust to sigma_run up to {100 * SIGMA_GRID[1]:g} %",
                   "ci_student_ratio": f"ln r +- {Z} sqrt(v_boot + 2 sigma_run^2)",
                   "ci_student_vs_teacher": f"ln r +- {Z} sqrt(v_boot + sigma_run^2)",
                   "bootstrap": {"B": BOOT_B, "seed": BOOT_SEED, "kind": "paired utterance bootstrap, stratified: "
@@ -651,7 +688,8 @@ def rules(sidecar: dict | None = None) -> dict:
                                                                        "indices for every system"}},
         "analysis": {  # the machine-read form (kitsune.study_stats.settings_from_prereg); the prose blocks say the same
             "delta": DELTA, "deltas": list(DELTAS),
-            "sigma_run": {"prior": SIGMA_PRIOR, "factor": SIGMA_FACTOR, "replicate": [REPLICATE, REPLICATE_OF]},
+            "sigma_run": {"prior": SIGMA_PRIOR, "factor": SIGMA_FACTOR, "replicate": [REPLICATE, REPLICATE_OF],
+                          "grid": list(SIGMA_GRID), "trigger_families": list(TRIGGER_FAMILIES)},
             "bootstrap": {"B": BOOT_B, "seed": BOOT_SEED, "z": Z},
             "teacher_bars": list(TEACHER_BARS), "anchor_flag_rel": ANCHOR_FLAG_REL,
             "strata": list(STRATA), "m4_strata": list(M4_SETS), "teachers": list(TEACHERS),
@@ -666,7 +704,8 @@ def rules(sidecar: dict | None = None) -> dict:
             "walk": "down the sizes: the limit is the smallest size WITHIN with every larger size WITHIN; the first "
                     "OUTSIDE ends it (limit between X and Y); an UNRESOLVED gives 'at or below X, Y unresolved' and "
                     "the smaller sizes are descriptive; one decisive claim per family, no Holm correction",
-            "replicate_role": f"{REPLICATE} feeds sigma_run only; the walk uses {REPLICATE_OF}",
+            "replicate_role": f"{REPLICATE} (run only on the trigger, noise.replicate_trigger) feeds sigma_run only; "
+                              f"the walk uses {REPLICATE_OF}",
         },
         "readouts": {
             "transcribe_ladder": "T-0.6B -> T-0.3B (pruned) -> T-0.1B -> T-0.05B (scratch)",
@@ -702,7 +741,9 @@ def rules(sidecar: dict | None = None) -> dict:
         "invalid_if": ["a run misses its max_steps, or resumes with a changed config",
                        "a selection or manifest hash differs between runs (on one box or across boxes)",
                        "the teacher baselines do not reproduce",
-                       "K3 or K4 fails, or the frame preflight exceeds its threshold",
+                       "K3 fails, exact fp16 ties excepted (the stored top-1 and top-2 CTC log-probs equal on the "
+                       "first differing frame: counted and listed, 1 row on the sealed root), or K4 fails, or the "
+                       "frame preflight exceeds its threshold",
                        "this rules commit comes after any study result, or a box's numbers file after that box's first "
                        "study step",
                        "the anchor regression flag fires and stays unexplained",
@@ -808,7 +849,34 @@ def sidecar_problems(sc: dict) -> list[str]:
                                                   and math.isfinite(_cer(base[t][k])) and _cer(base[t][k]) >= 0)]
         if bad:
             p.append(f"baselines {t}: no finite corpus CER for {bad}")
-    return p
+    return p + mix_problems(sc)
+
+
+def realised_mix(sc: dict) -> dict | None:
+    """The mix a sidecar's drawn hours give: {group: percent of the drawn hours, 0.1 pp} over MIX_GROUPS; None when a
+    source's hours.<source>.drawn.hours is missing or the total is not positive."""
+    hours = sc.get("hours") if isinstance(sc, dict) else None
+    drawn = {}
+    for src in STUDY_SOURCES:
+        v = (((hours or {}).get(src) or {}).get("drawn") or {}).get("hours")
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v < 0:
+            return None
+        drawn[src] = float(v)
+    total = sum(drawn.values())
+    if total <= 0:
+        return None
+    return {g: round(100 * sum(drawn[s] for s in srcs) / total, 1) for g, srcs in MIX_GROUPS.items()}
+
+
+def mix_problems(sc: dict) -> list[str]:
+    """Why a sidecar's drawn hours are not the uploaded selection's realised mix (REALISED_MIX_PCT, recorded in
+    data.mix): the fill must not put another selection's hashes under that record."""
+    got = realised_mix(sc)
+    if got is None:
+        return [f"hours: no drawn hours for every source {STUDY_SOURCES} (hours.<source>.drawn.hours)"]
+    if got != REALISED_MIX_PCT:
+        return [f"mix {got} (percent of the drawn hours): the uploaded selection's is {REALISED_MIX_PCT}"]
+    return []
 
 
 def _fill(r: dict, sc: dict):
