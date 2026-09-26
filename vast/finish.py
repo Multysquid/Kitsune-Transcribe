@@ -40,6 +40,12 @@ Label box (--job label, the default when KITSUNE_JOB=label): the same modes over
 under $KITSUNE_STATE/sync.lock. --sync-only exits 1 when an upload failed and 65 on a write-once refusal; infra goes
 to label_runs/<run_id>/. --no-infra skips the infra upload; --allow-empty lets --destroy go on with no finished label
 file (a host failure before any lane started).
+
+Study box (--job study, the default when KITSUNE_JOB=study; kitsune/study_queue.py runs the box): every mode is lean -
+per run dir the logs, metrics, evals and summary, every exported weights dir and only the full states the run's config
+uploads (ckpt.upload_full_at "frac:<f>" / "end", uploaded_fulls; plus a marked one), never the newest full state for
+its own sake: the box keeps its resume states on its disk and the runs repo gets what the study reports (STUDY.md 5.5).
+The infra logs and the queue's state go to study/box-<KITSUNE_BOX>/infra/<container>/.
 """
 import argparse
 import hashlib
@@ -62,7 +68,10 @@ VAST_API = "https://console.vast.ai/api/v0"
 STATE_DIR = Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state"))
 INFRA_LOGS = ["/workspace/kitsune.log", "/workspace/watchdog.log", "/workspace/portal.log", "/workspace/tensorboard.log"]
 INFRA_TIMEOUT_S = 180  # a hung infra upload must not keep a paid instance up
-HUB_RETRY_WAITS = (5, 15)  # s before the 2nd and 3rd try of a hub call the library does not retry itself
+# s before each retry of a hub call the library does not retry itself: exponential back-off from 5 s up to 10 min, ~21
+# min in all (STUDY.md 5.5: the study's runs share one repo, and a 429 needs the Hub's rate window to pass). Only what a
+# retry can fix is retried (retryable)
+HUB_RETRY_WAITS = (5, 10, 20, 40, 80, 160, 320, 600)
 # an env var whose name holds one of these is a secret: a mirror of kitsune/runlog.py's SECRET_MARKERS (finish stays
 # stdlib-only; runlog imports pyarrow)
 SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CRED", "COOKIE")
@@ -122,8 +131,33 @@ def files_under(p: Path) -> list[Path]:
     return [p] if p.is_file() else sorted(f for f in p.rglob("*") if f.is_file())
 
 
-def expected_files(run_dir: Path, expect_full: bool = True) -> dict[str, Path]:
-    """repo path -> local file, for one run dir (see the module docstring)."""
+def uploaded_fulls(run_dir: Path) -> list[Path]:
+    """The full states a run's config sends to the Hub, which a lean verification expects (the study box's runs keep
+    every other full state on the box): ckpt.upload_full_at "frac:<f>" -> checkpoints/full_step_<round(f x
+    schedule.max_steps)> (none for a T/2 branch, which ignores its fractions) and "end" -> the newest full state; from
+    the run's config.json. A missing or unreadable config.json: none."""
+    try:
+        cfg = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))["config"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    ckpt, out = run_dir / "checkpoints", []
+    ups = (cfg.get("ckpt") or {}).get("upload_full_at") or []
+    m = (cfg.get("schedule") or {}).get("max_steps")
+    for u in ups:
+        if isinstance(u, str) and u.startswith("frac:") and m and not (cfg.get("branch") or {}).get("parent"):
+            try:
+                out.append(ckpt / f"full_step_{int(round(float(u[5:]) * int(m)))}")
+            except ValueError:
+                continue
+        elif u == "end":
+            out.append(newest_checkpoint(ckpt, FULL_RE))
+    return [p for p in out if p is not None and p.exists()]
+
+
+def expected_files(run_dir: Path, expect_full: bool = True, lean: bool = False) -> dict[str, Path]:
+    """repo path -> local file, for one run dir (see the module docstring). lean (the study box, KITSUNE_JOB=study):
+    the logs, every weights dir, the marked full states and the ones the config uploads (uploaded_fulls), never the
+    newest full state for its own sake."""
     prefix = f"runs/{run_dir.name}"
     out = {}
     for f in files_under(run_dir):
@@ -137,6 +171,8 @@ def expected_files(run_dir: Path, expect_full: bool = True) -> dict[str, Path]:
     marked = sorted(p for p in ckpt.iterdir()
                     if FULL_RE.match(p.name) and (p / UPLOAD_MARK).is_file()) if ckpt.is_dir() else []
     picks = weights + (marked + [newest_checkpoint(ckpt, FULL_RE)] if expect_full else [])  # a dir twice: same keys
+    if lean:
+        picks += marked + uploaded_fulls(run_dir)
     for pick in picks:
         if pick is None:
             continue
@@ -204,14 +240,24 @@ def hf_api():
     return HfApi()
 
 
+def retryable(e: BaseException) -> bool:
+    """A hub error a retry can fix: 429, 408 or 5xx, or one without an HTTP status (a dropped connection, a timeout);
+    any other 4xx (a refused token, a missing repo or file) comes back the same."""
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    return not isinstance(status, int) or status in (408, 429) or status >= 500
+
+
 def hub_retry(fn, what: str):
-    """Call fn, retrying twice on any error: huggingface_hub does not retry the first page of list_repo_tree or the
-    create_commit POST, so one transient 5xx/429 would stop a verified run (its disk billed until a human looks) or
-    lose the box logs with the destroyed disk. A repeated infra commit is harmless."""
+    """Call fn, retrying with HUB_RETRY_WAITS' exponential back-off on a retryable error: huggingface_hub does not
+    retry the first page of list_repo_tree or the create_commit POST, so one transient 5xx/429 would stop a verified
+    run (its disk billed until a human looks) or lose the box logs with the destroyed disk. A repeated infra commit is
+    harmless."""
     for w in HUB_RETRY_WAITS:
         try:
             return fn()
         except Exception as e:
+            if not retryable(e):
+                raise
             log(f"{what} failed ({type(e).__name__}: {e}); retrying in {w} s")
             time.sleep(w)
     return fn()
@@ -259,7 +305,7 @@ def verify(api, repo: str, repo_type: str, expected: dict[str, Path], check_hash
     return problems
 
 
-def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_run: bool):
+def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_run: bool, lean: bool = False):
     """Upload the run dir (minus local-only checkpoints) plus the checkpoints finish will verify.
 
     Re-uploading files the trainer already pushed costs no network or commit: the hub skips content it already stores.
@@ -270,8 +316,9 @@ def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_r
     ~9 GB full state not yet on the hub can take all of (the final eval and verdict of a trainer still waiting on its
     end-state upload are on this disk only). Each part gets its own try, logs first: a checkpoint upload that raises
     must not cost the logs, nor a log upload that raises (the unretried repo_info GET of an unchanged snapshot, say)
-    the checkpoints, which may be the only copy off the box. Raises after both were tried if either failed."""
-    expected = expected_files(run_dir, expect_full)
+    the checkpoints, which may be the only copy off the box. Raises after both were tried if either failed. lean: the
+    study box's files (expected_files)."""
+    expected = expected_files(run_dir, expect_full, lean)
     rels = sorted(p[len(f"runs/{run_dir.name}/"):] for p in expected)
     ckpt = [r for r in rels if r.startswith("checkpoints/")]
     live = [r for r in rels if not r.startswith("checkpoints/")]
@@ -447,8 +494,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="do not require the full training states in the repo (the newest, and any whose trainer "
                          "upload failed)")
     ap.add_argument("--dry-run", action="store_true", help="print the actions; no upload, stop or destroy")
-    ap.add_argument("--job", choices=("train", "label"), default=os.environ.get("KITSUNE_JOB") or "train",
-                    help="train: runs/ in the output repo; label: the label root in the data repo (env KITSUNE_JOB)")
+    ap.add_argument("--job", choices=("train", "label", "study"), default=os.environ.get("KITSUNE_JOB") or "train",
+                    help="train: runs/ in the output repo; label: the label root in the data repo; study: runs/ in the "
+                         "output repo, lean (env KITSUNE_JOB)")
+    ap.add_argument("--lean", action="store_true",
+                    help="the study box's uploads (the default for --job study): logs, every weights dir and only the "
+                         "full states the run's config uploads (expected_files lean), not the newest one")
     ap.add_argument("--no-infra", action="store_true", help="label: skip the infra log upload")
     ap.add_argument("--allow-empty", action="store_true",
                     help="label: --destroy with no finished label file (nothing unique on the disk yet)")
@@ -457,7 +508,8 @@ def main(argv: list[str] | None = None) -> int:
         return label_main(args)
 
     dirs = [Path(d) for d in args.run_dir] if args.run_dir else run_dirs(Path(args.runs_root))
-    expect_full = not args.no_full
+    lean = args.lean or args.job == "study"
+    expect_full = not args.no_full and not lean
     api = None
     if args.repo:
         try:
@@ -470,11 +522,15 @@ def main(argv: list[str] | None = None) -> int:
     if api is not None and not args.no_sync and not args.verify_only:
         for d in dirs:
             try:
-                sync(api, args.repo, args.repo_type, d, expect_full, args.dry_run)
+                sync(api, args.repo, args.repo_type, d, expect_full, args.dry_run, lean)
             except Exception as e:  # a failed upload shows up as a verification problem below
                 log(f"sync of {d.name} failed: {type(e).__name__}: {e}")
                 event("sync_failed", run=d.name, error=f"{type(e).__name__}: {e}")
-    infra_dest = f"runs/{dirs[-1].name}/infra" if dirs else f"infra/{os.environ.get('CONTAINER_ID', 'local')}"
+    if args.job == "study":  # one box, many run dirs: its logs and queue state under the box's own folder
+        infra_dest = f"study/box-{os.environ.get('KITSUNE_BOX') or 'unknown'}/infra/" \
+                     f"{os.environ.get('CONTAINER_ID', 'local')}"
+    else:
+        infra_dest = f"runs/{dirs[-1].name}/infra" if dirs else f"infra/{os.environ.get('CONTAINER_ID', 'local')}"
 
     def push_infra():  # best effort and bounded; --no-sync too (a failed bootstrap's reason is in these files)
         if api is not None and not args.verify_only:
@@ -488,7 +544,7 @@ def main(argv: list[str] | None = None) -> int:
 
     expected = {}
     for d in dirs:
-        expected.update(expected_files(d, expect_full))
+        expected.update(expected_files(d, expect_full, lean))
     if api is None:
         problems = ["no HF output repo (KITSUNE_OUT_REPO unset) or huggingface_hub unavailable"]
     else:

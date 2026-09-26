@@ -85,6 +85,7 @@ EXTENT_KEYS = ("name", "root", "inputs")
 DISK_BASE_GB = 127
 DISK_MARGIN, DISK_STEP_GB = 1.1, 50
 LABEL_GB_PER_HOUR = 0.0016
+PARAKEET_GB_PER_HOUR = 0.00134  # parakeet_out npz + jsonl per audio hour (STUDY.md 3.4, K9)
 REBUILD_BYTES_PER_S, REBUILD_SLACK, REBUILD_BASE_MIN = 40e6, 1.5, 30
 
 
@@ -494,15 +495,27 @@ def _stem_bytes(record: dict, src: str, st: dict) -> float:
     return st["hours"] * s["bytes"] / s["hours"] if s["hours"] else 0.0
 
 
-def sizing(record: dict, cfg: dict, kept_hours: dict[str, float | dict] | None = None) -> dict:
+def stores(cfg: dict) -> int:
+    """How many label stores the box builds from the selected audio (each copies it into the trainer's cache): the
+    Cohere (AED) store of a transcribe run, the Parakeet (CTC) store of a CTC run, both when both label roots are pulled
+    (pull_parakeet: the size study's box, whose runs of both families share one data block)."""
+    return 2 if cfg.get("pull_parakeet") else 1
+
+
+def sizing(record: dict, cfg: dict, kept_hours: dict[str, float | dict] | None = None,
+           extra_gb: float = 0.0) -> dict:
     """The A100's rebuild of the extent `cfg` from the record, in GB (unrounded) and minutes:
     - down_gb: the upstream bytes every planned step downloads (tar 8 twice: the 300 h step cuts it, the rest reads it
       again);
     - shard_gb: the rebuilt stems of every planned step, dependencies included;
-    - sel_gb: the audio the trainer copies into its cache: `kept_hours` (by source, or make_selection's `kept` as it
-      is stored, {"<source>/<split>": {"utts", "hours"}}) at each source's shard GB per hour; None: every subset stem;
-    - hours: the audio of the subset stems; labels_gb: their label files, LABEL_GB_PER_HOUR each;
-    - disk_gb = DISK_MARGIN x (DISK_BASE_GB + shard + sel + labels), up to a multiple of DISK_STEP_GB;
+    - sel_gb: the audio the trainer copies into its cache, per store: `kept_hours` (by source, or make_selection's
+      `kept` as it is stored, {"<source>/<split>": {"utts", "hours"}}) at each source's shard GB per hour; None: every
+      subset stem. stores: how many stores hold it (stores(): two when both label roots are pulled);
+    - hours: the audio of the subset stems; labels_gb: their label files, LABEL_GB_PER_HOUR each, plus
+      PARAKEET_GB_PER_HOUR when parakeet_out is pulled (a CTC run or pull_parakeet);
+    - extra_gb: what the caller adds beyond one run's states (the study box: its concurrent runs' checkpoints);
+    - disk_gb = DISK_MARGIN x (DISK_BASE_GB + shard + stores x sel + labels + extra_gb), up to a multiple of
+      DISK_STEP_GB;
     - rebuild_timeout_min = REBUILD_BASE_MIN + REBUILD_SLACK x the download time at REBUILD_BYTES_PER_S."""
     plan = plan_steps(cfg)
     down = 0
@@ -526,8 +539,10 @@ def sizing(record: dict, cfg: dict, kept_hours: dict[str, float | dict] | None =
             src_hours = sum(st["hours"] for st in stems)
             if src_hours:
                 sel += h * sum(_stem_bytes(record, src, st) for st in stems) / src_hours
-    labels_gb = hours * LABEL_GB_PER_HOUR
-    need = DISK_MARGIN * (DISK_BASE_GB + shard / 1e9 + sel / 1e9 + labels_gb)
-    return dict(down_gb=down / 1e9, shard_gb=shard / 1e9, sel_gb=sel / 1e9, labels_gb=labels_gb, hours=hours,
-                disk_gb=int(math.ceil(need / DISK_STEP_GB) * DISK_STEP_GB),
+    parakeet = cfg.get("family", "aed") == "ctc" or bool(cfg.get("pull_parakeet"))
+    labels_gb = hours * (LABEL_GB_PER_HOUR + (PARAKEET_GB_PER_HOUR if parakeet else 0.0))
+    n_stores = stores(cfg)
+    need = DISK_MARGIN * (DISK_BASE_GB + shard / 1e9 + n_stores * sel / 1e9 + labels_gb + float(extra_gb))
+    return dict(down_gb=down / 1e9, shard_gb=shard / 1e9, sel_gb=sel / 1e9, stores=n_stores, labels_gb=labels_gb,
+                hours=hours, extra_gb=float(extra_gb), disk_gb=int(math.ceil(need / DISK_STEP_GB) * DISK_STEP_GB),
                 rebuild_timeout_min=int(math.ceil(REBUILD_BASE_MIN + REBUILD_SLACK * down / REBUILD_BYTES_PER_S / 60)))
