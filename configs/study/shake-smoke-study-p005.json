@@ -1,11 +1,11 @@
 {
- "run_name": "shake-eval",
+ "run_name": "shake-smoke-study-p005",
  "cache_dir": "cache",
  "runs_root": "runs",
  "mix": "natural",
  "subset": {
   "train_utts": null,
-  "eval_utts_per_set": 50,
+  "eval_utts_per_set": null,
   "train_audio_s": null,
   "eval_audio_s": null
  },
@@ -15,7 +15,8 @@
   "w_kl": 1.0,
   "w_ce": 0.8,
   "l2sp_lambda": 0.0,
-  "aux_ctc_weight": 0.0
+  "aux_ctc_weight": 0.0,
+  "w_ctc": 0.8
  },
  "specaug": {
   "enabled": true,
@@ -40,17 +41,17 @@
   "offload_fused": false
  },
  "schedule": {
-  "warmup_steps": 5,
+  "warmup_steps": 1000,
   "cooldown_frac": 0.2,
   "train_hours": 4.0,
   "clock": "steps",
-  "max_steps": 20,
+  "max_steps": 20000,
   "end_reserve_min": 30,
   "epochs": null
  },
  "batch": {
   "step_audio_s": 1500,
-  "micro_audio_s": 600,
+  "micro_audio_s": 1600,
   "pool_micro": 50,
   "max_dec_len": 200
  },
@@ -84,7 +85,7 @@
   "probe_greedy_audio_s": 600,
   "full_every_epochs": null,
   "mini": {
-   "every_steps": 5,
+   "every_steps": null,
    "val_per_set": 32,
    "train_utts": 64,
    "greedy": true
@@ -93,22 +94,18 @@
   "verdict_version": 2,
   "verdict_min_epoch_gap": 0.25,
   "reference": null,
-  "full_at_fracs": [
-   0.5
-  ]
+  "full_at_fracs": null
  },
  "ckpt": {
   "weights_every_min": null,
-  "full_local_every_min": 30,
+  "full_local_every_min": null,
   "weights_every_steps": null,
   "full_every_steps": null,
   "keep_local": 2,
   "upload_full_at": [],
   "full_after_smoke": false,
   "full_at_fracs": null,
-  "weights_at_fracs": [
-   0.5
-  ]
+  "weights_at_fracs": null
  },
  "log": {
   "layer_stats_every": 100,
@@ -124,7 +121,7 @@
  },
  "smoke": {
   "enabled": true,
-  "steps": 10,
+  "steps": 100,
   "min_audio_s_per_s": 600,
   "pad_utts": 32,
   "pad_max_mean_kl": 0.05,
@@ -190,8 +187,19 @@
    "neutral_max_cer": 0.5
   }
  },
- "student": "students/study/t06",
+ "student": "students/study/p005",
  "bn": {
   "mode": "frozen"
+ },
+ "family": "ctc",
+ "calibrate": {
+  "enabled": true,
+  "window": [
+   50,
+   100
+  ]
+ },
+ "lr_probe": {
+  "enabled": true
  }
 }

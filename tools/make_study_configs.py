@@ -27,11 +27,12 @@ Names (CONTRACT.md section 1):
                              step-time table over the pre-registered window), the planned micro-batch with the memory
                              probe, no checkpoints; max_steps CALIB_MAX_STEPS is a cap, the box ends a calibration group
                              with the STOP file once every run of it has its window
-  shake-*.json               the shakedown box (STUDY.md 6.1): per Cohere-box run a 100-step smoke at the planned micro
-                             with the run's warm-up and smoke gate (a calibration over steps 50-100, which the box ends
-                             after the smoke), a crash-and-resume run, a 50-step toy parent and its T/2
-                             branch, a complete eval on a subset with an in-loop complete eval, a mini eval and a lean
-                             upload
+  shake-*.json               the shakedown box (STUDY.md 6.1, both families: every run of boxes A and B): per run a
+                             100-step smoke at the planned micro with the run's warm-up (a calibration over steps 50-100,
+                             which the box ends after the smoke; the loss-trend gate on for the pruned runs, a note for
+                             the scratch ones), and per family (AED; CTC with the suffix -ctc) a crash-and-resume run,
+                             a 50-step toy parent and its T/2 branch, a complete eval on a subset with an in-loop
+                             complete eval, a mini eval and a lean upload
   anchor-b20.json            not a training config: scripts/05_evaluate.py reads its data and eval keys to re-score the
                              first run's 0.6B (decision 29) on the study's eval rows; its schedule and LR are inert
 CTC configs (the Parakeet students) carry family "ctc", parakeet_root and loss.w_ctc, which scripts/04_distill.py knows
@@ -68,6 +69,7 @@ SYNC_EVERY_MIN = 20  # STUDY.md 5.5: nine writers share the runs repo
 CALIB_MAX_STEPS = 20000  # a cap: the box stops a calibration group once every run of it has its window
 BRANCH_PARENT = "<the parent's local run dir: set by the study box (kitsune/study_queue.py)>"
 SHAKE_SMOKE_STEPS = 100  # STUDY.md 6.1: a 100-step smoke per config, its step time over steps 50-100
+SHAKE_CTC_SUFFIX = "-ctc"  # the CTC family's shakedown items: shake-resume-ctc, shake-parent-ctc(-half), shake-eval-ctc
 ANCHOR = "anchor-b20"
 
 
@@ -185,49 +187,57 @@ def _toy(cfg: dict, name: str, steps: int, warmup: int, lr: float, **over) -> di
 
 
 def shake_configs(box_runs: list[str], r: dict | None = None, out_repo: str = RUNS_REPO) -> dict[str, dict]:
-    """The shakedown box's configs (STUDY.md 6.1) for the runs of the first study box:
-      shake-smoke-<run>   the memory probe at the planned micro and a 100-step smoke with the study run's own smoke
-                          gate (finite and falling losses, the throughput floor, the undecodable rows): the run's
-                          student, seed, data order and warm-up, at its class's lowest grid LR (the slowest start any
-                          chosen LR gives), as a calibration over steps 50-100 capped by CALIB_MAX_STEPS; the box
-                          ends it with the STOP file once its smoke checks are logged (a scratch run's 2,000-step
-                          warm-up does not fit a 100-step schedule, and the smoke must see the start the main sees)
-      shake-resume        the smallest run for 60 steps as an LR probe with a full state every 20 steps; the box
-                          crashes it at step 45 (KITSUNE_CRASH_AT_STEP) and resumes it from step 40, and its end phase
-                          scores the complete gate sets teacher-forced (lr_probe_eval)
+    """The shakedown box's configs (STUDY.md 6.1) for the runs of both study boxes (study_queue.shakedown_runs):
+      shake-smoke-<run>   the memory probe at the planned micro and a 100-step smoke: the run's student, seed, data
+                          order and warm-up, at its class's lowest grid LR (the slowest start any chosen LR gives), as a
+                          calibration over steps 50-100 capped by CALIB_MAX_STEPS; the box ends it with the STOP file
+                          once its smoke checks are logged (a scratch run's 2,000-step warm-up does not fit a 100-step
+                          schedule, and the smoke must see the start the main sees). The smoke gate (finite losses,
+                          the throughput floor, the undecodable rows) is the study run's own; its loss-trend check is
+                          on for a pruned run (warm-up <= 1,000: a flat start there is a defect, and fails the
+                          shakedown) and off for a scratch run, whose flat start 100 steps into a 2,000-step warm-up
+                          the queue reports as a note (the study box's smoke_gate_guard handles it)
+    and per family (AED: no suffix, CTC: SHAKE_CTC_SUFFIX) of the runs:
+      shake-resume        the family's smallest run for 60 steps as an LR probe with a full state every 20 steps; the
+                          box crashes it at step 45 (KITSUNE_CRASH_AT_STEP) and resumes it from step 40, and its end
+                          phase scores the complete gate sets teacher-forced (lr_probe_eval)
       shake-parent / shake-parent-half   a 50-step toy run with the full state at 0.4 and its T/2 branch (steps 21-25,
-                          a final complete eval on the subset), on the scratch run (BN train mode, the aux-CTC head)
-      shake-eval          the largest run for 20 steps: a complete eval at step 10 (eval.full_at_fracs) and the final
-                          one on the subset, mini evals every 5 steps, weights at 0.5 and at the end; the box uploads
-                          and verifies its run dir (lean) like every other"""
+                          a final complete eval on the subset), on the family's smallest scratch run (BN train mode,
+                          the aux-CTC head), else its smallest
+      shake-eval          the family's largest run for 20 steps: a complete eval at step 10 (eval.full_at_fracs) and
+                          the final one on the subset, mini evals every 5 steps, weights at 0.5 and at the end; the box
+                          uploads and verifies its run dir (lean) like every other"""
     r = r or rules()
     runs = r["runs"]
     out = {}
     lr_of = {run: min(float(x) for x in r["lr_probes"]["classes"][runs[run]["lr_from"]]["grid"]) for run in box_runs}
     for run in box_runs:
         c = calib_config(run, r, out_repo)
-        gate = run_config(run, r, out_repo)["smoke"]["require_loss_decrease"]  # the study run's own gate
+        gate = bool(run_config(run, r, out_repo)["smoke"]["require_loss_decrease"]) and             runs[run]["init_class"] != "scratch"
         out[f"shake-smoke-{run}"] = _merge(c, {"run_name": f"shake-smoke-{run}",
                                                "smoke": {"steps": SHAKE_SMOKE_STEPS, "require_loss_decrease": gate},
                                                "calibrate": {"window": [50, SHAKE_SMOKE_STEPS]}})
-    by_size = sorted(box_runs, key=lambda x: int(runs[x]["params_total"]))
-    smallest, largest = by_size[0], by_size[-1]
-    scratch = next((x for x in by_size if runs[x]["init_class"] == "scratch"), smallest)
-    base = run_config(smallest, r, out_repo)
-    out["shake-resume"] = _metrics_only(_toy(base, "shake-resume", 60, 5, lr_of[smallest], smoke={"steps": 20},
-                                             subset={"eval_utts_per_set": None},  # lr_probe scores the complete sets
-                                             ckpt={"full_every_steps": 20, "keep_local": 5}))
-    parent = _toy(run_config(scratch, r, out_repo), "shake-parent", 50, 5, lr_of[scratch], smoke={"steps": 10},
-                  eval={"full_at_fracs": None, "mini": {"every_steps": None}},
-                  ckpt={"full_at_fracs": [0.4], "weights_at_fracs": None, "upload_full_at": []})
-    out["shake-parent"] = parent
-    out["shake-parent-half"] = _merge(parent, {"run_name": "shake-parent-half",
-                                               "branch": {"parent": BRANCH_PARENT,
-                                                          "resume_frac": float(r["branch"]["resume_frac"]),
-                                                          "end_frac": float(r["branch"]["end_frac"])}})
-    out["shake-eval"] = _toy(run_config(largest, r, out_repo), "shake-eval", 20, 5, lr_of[largest],
-                             smoke={"steps": 10}, eval={"full_at_fracs": [0.5], "mini": {"every_steps": 5}},
-                             ckpt={"full_at_fracs": None, "weights_at_fracs": [0.5], "upload_full_at": []})
+    for fam in dict.fromkeys(runs[x]["family"] for x in box_runs):
+        sfx = SHAKE_CTC_SUFFIX if fam == "ctc" else ""
+        by_size = sorted((x for x in box_runs if runs[x]["family"] == fam), key=lambda x: int(runs[x]["params_total"]))
+        smallest, largest = by_size[0], by_size[-1]
+        scratch = next((x for x in by_size if runs[x]["init_class"] == "scratch"), smallest)
+        base = run_config(smallest, r, out_repo)
+        out[f"shake-resume{sfx}"] = _metrics_only(_toy(
+            base, f"shake-resume{sfx}", 60, 5, lr_of[smallest], smoke={"steps": 20},
+            subset={"eval_utts_per_set": None},  # lr_probe scores the complete sets
+            ckpt={"full_every_steps": 20, "keep_local": 5}))
+        parent = _toy(run_config(scratch, r, out_repo), f"shake-parent{sfx}", 50, 5, lr_of[scratch],
+                      smoke={"steps": 10}, eval={"full_at_fracs": None, "mini": {"every_steps": None}},
+                      ckpt={"full_at_fracs": [0.4], "weights_at_fracs": None, "upload_full_at": []})
+        out[f"shake-parent{sfx}"] = parent
+        out[f"shake-parent{sfx}-half"] = _merge(parent, {"run_name": f"shake-parent{sfx}-half",
+                                                         "branch": {"parent": BRANCH_PARENT,
+                                                                    "resume_frac": float(r["branch"]["resume_frac"]),
+                                                                    "end_frac": float(r["branch"]["end_frac"])}})
+        out[f"shake-eval{sfx}"] = _toy(run_config(largest, r, out_repo), f"shake-eval{sfx}", 20, 5, lr_of[largest],
+                                       smoke={"steps": 10}, eval={"full_at_fracs": [0.5], "mini": {"every_steps": 5}},
+                                       ckpt={"full_at_fracs": None, "weights_at_fracs": [0.5], "upload_full_at": []})
     return out
 
 
@@ -253,9 +263,9 @@ def all_configs(r: dict | None = None, out_repo: str = RUNS_REPO, box_runs: list
     for cls, p in r["lr_probes"]["classes"].items():
         for lr in p["grid"]:
             out[prereg.probe_run_name(cls, lr)] = probe_config(cls, lr, r, out_repo)
-    from kitsune.study_queue import first_box_runs
+    from kitsune.study_queue import shakedown_runs
 
-    out.update(shake_configs(list(box_runs or first_box_runs(r)), r, out_repo))
+    out.update(shake_configs(list(box_runs or shakedown_runs(r)), r, out_repo))
     out[ANCHOR] = anchor_config(r, out_repo)
     return out
 

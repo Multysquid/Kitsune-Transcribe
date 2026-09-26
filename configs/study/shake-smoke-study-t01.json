@@ -125,7 +125,7 @@
   "pad_utts": 32,
   "pad_max_mean_kl": 0.05,
   "pad_min_argmax_agree": null,
-  "require_loss_decrease": true,
+  "require_loss_decrease": false,
   "decode_per_set": 8,
   "max_dropped_frac": 0.01
  },
@@ -150,7 +150,7 @@
   "name": "full",
   "root": "labels/full",
   "inputs": {
-   "reazon_large": 50,
+   "reazon_large": 53,
    "emilia_yodas": "300h",
    "emilia_nc": 8,
    "galgame": 3

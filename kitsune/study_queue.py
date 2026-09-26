@@ -302,16 +302,34 @@ def first_box_runs(rules: dict) -> list[str]:
             if rules["runs"][run]["family"] == "aed" and rules["runs"][run]["lr_from"] != "bridge"]
 
 
+def shakedown_runs(rules: dict) -> list[str]:
+    """The runs the shakedown exercises: every run of the study boxes A and B (CONTRACT.md 8: both families, as the two
+    boxes run at the same time), box A's first; before the rules carry box plans, first_box_runs."""
+    boxes = rules.get("boxes") or {}
+    runs = [run for b in ("A", "B") for run in (boxes.get(b) or {}).get("runs", [])]
+    return list(dict.fromkeys(runs)) if runs else first_box_runs(rules)
+
+
+SHAKE_CTC_SUFFIX = "-ctc"  # tools/make_study_configs.py: the CTC family's resume, toy parent/branch and eval items
+
+
+def shake_family_items(sfx: str) -> list[str]:
+    return [f"shake-resume{sfx}", f"shake-parent{sfx}", f"shake-parent{sfx}-half", f"shake-eval{sfx}"]
+
+
 def shakedown_plan(rules: dict) -> dict:
-    """STUDY.md 6.1 on a 1x box: the stores of the real extent, then per box-A run a 100-step smoke at the planned
-    micro (shake-smoke-<run>), a crash and resume (shake-resume), a toy parent and its T/2 branch (shake-parent,
-    shake-parent-half), a complete eval on a subset (shake-eval); every run dir uploaded and verified. No calibration,
-    no probes, no numbers: it may run on a PREREG with pending fields."""
-    runs = first_box_runs(rules)
+    """STUDY.md 6.1 on a 1x box, for both families (shakedown_runs: every run of boxes A and B): the stores of the real
+    extent (the AED store, and the CTC one with its frame preflight), then per run a 100-step smoke at the planned
+    micro (shake-smoke-<run>), and per family (AED; CTC with SHAKE_CTC_SUFFIX) a crash and resume (shake-resume), a toy
+    parent and its T/2 branch (shake-parent, shake-parent-half), a complete eval on a subset (shake-eval); every run
+    dir uploaded and verified. No calibration, no probes, no numbers: it may run on a PREREG with pending fields."""
+    runs = shakedown_runs(rules)
+    fams = list(dict.fromkeys(rules["runs"][r]["family"] for r in runs))
+    items = [f"shake-smoke-{r}" for r in runs]
+    for fam in fams:
+        items += shake_family_items(SHAKE_CTC_SUFFIX if fam == "ctc" else "")
     return dict(box="shakedown", runs=runs, probe_classes=[], calibrate=[], reference=None, numbers_file=None,
-                numbers_from=None, extras=[], shakedown=True,
-                items=[*(f"shake-smoke-{r}" for r in runs), "shake-resume", "shake-parent", "shake-parent-half",
-                       "shake-eval"])
+                numbers_from=None, extras=[], shakedown=True, items=items)
 
 
 def config_path(name: str) -> str:
@@ -358,7 +376,7 @@ def box_configs(box: str, rules: dict | None = None) -> list[str]:
 # them at once (keep_local 2, the kept 0.4 one, the 0.8 one of a small run, its branch's 2), and exports bf16 weights
 # (2 bytes a parameter) WEIGHTS_PER_RUN times; the probes running at once keep 2 each until the queue prunes them
 STATE_BYTES_PER_PARAM, STATES_PER_RUN, WEIGHTS_PER_RUN, PROBE_STATES = 16, 6, 4, 2
-SHAKEDOWN_EXTRA_GB = 30
+SHAKEDOWN_EXTRA_GB = 40  # both families' crash-and-resume full states, toy parents and eval weights
 
 
 def study_extra_gb(box: str, rules: dict | None = None, n_gpus: int | None = None) -> float:
@@ -543,7 +561,7 @@ class Queue:
     def _load_state(self) -> dict:
         fresh = dict(box=self.box, version=1, started=time.time(), items={}, calibration=None, num_workers=None,
                      probes={}, lr_choice=None, numbers=None, stores_done=False, final=None, abandoned=[], shm=None,
-                     smoke_gate_off=None)
+                     smoke_gate_off=None, shake_notes=None)
         if not self.state_path.is_file():
             return fresh
         st = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -1536,23 +1554,27 @@ class Queue:
     def phase_shakedown(self):
         """STUDY.md 6.1, one item after the other on the one GPU; every run dir uploaded and verified. A smoke
         (shake-smoke-<run>) is the run's own start - its warm-up, seed and data order, its smoke gate - at its class's
-        lowest grid LR; the queue ends it with the STOP file once its smoke checks are logged (a failed check fails
-        it, and the shakedown: the study box's main would stop the same way)."""
+        lowest grid LR; the queue ends it with the STOP file once its smoke checks are logged. A failed check fails it,
+        and the shakedown (the study box's main would stop the same way): for a pruned run a flat loss start is such a
+        failure (its config keeps the loss-trend check on); a scratch run's config has it off, and a flat start there
+        is a note in queue_summary.json (shake_notes: 100 steps are 5 % of its warm-up; smoke_gate_guard is the study
+        box's answer to it). Then each family's resume, toy parent and branch, and eval items (shake_family_items)."""
         todo = []
         for name in self.plan["items"]:
             kind, after, env, run = "shake", None, {}, None
-            if name == "shake-parent-half":
-                kind, after = "branch", "shake-parent"
-            if name == "shake-resume":
+            if name.startswith("shake-parent") and name.endswith("-half"):
+                kind, after = "branch", name[:-len("-half")]
+            if name.startswith("shake-resume"):
                 env = {"KITSUNE_CRASH_AT_STEP": "45"}  # a crash before step 45; the resume starts from step 40
             if name.startswith("shake-smoke-"):
                 run = name[len("shake-smoke-"):]
             self.add_item(name, kind, config_path(name), [], after=after, env=env, run=run)
             todo.append(name)
+        halves = {self.item(n)["after"]: n for n in todo if self.item(n)["kind"] == "branch"}
 
         def on_done(name: str):
-            if name == "shake-parent" and self.item(name)["status"] == "done":
-                self.item("shake-parent-half")["sets"] = [f"branch.parent={self.item(name)['run_dir']}"]
+            if name in halves and self.item(name)["status"] == "done":
+                self.item(halves[name])["sets"] = [f"branch.parent={self.item(name)['run_dir']}"]
                 self.save()
 
         def monitor(running):  # a smoke runs at its study warm-up, capped by CALIB_MAX_STEPS: ended after its checks
@@ -1564,11 +1586,34 @@ class Queue:
                         any(e.get("kind") == "smoke_steps" for e in read_events(rd)):
                     (rd / "STOP").write_text("the smoke checks are done\n", encoding="utf-8")
 
-        on_done("shake-parent")
+        for parent in halves:
+            on_done(parent)
         self.execute([n for n in todo if self.item(n)["status"] != "done"], on_done=on_done, monitor=monitor)
-        resumed = self.item("shake-resume")
-        if resumed["status"] == "done" and not any(a.get("resume") for a in resumed["attempts"]):
-            raise QueueError("shake-resume finished without the crash and resume it is there to exercise")
+        self.shake_flat_starts()
+        for name in (n for n in todo if n.startswith("shake-resume")):
+            resumed = self.item(name)
+            if resumed["status"] == "done" and not any(a.get("resume") for a in resumed["attempts"]):
+                raise QueueError(f"{name} finished without the crash and resume it is there to exercise")
+
+    def shake_flat_starts(self):
+        """The shakedown's notes: a scratch run's smoke whose loss did not fall over its 100 steps (its config has the
+        loss-trend check off, so it ran on). A pruned run's flat start failed its item already (SmokeFailed)."""
+        notes = {}
+        for name, it in self.state["items"].items():
+            run = it.get("run")
+            if not name.startswith("shake-smoke-") or it["status"] != "done" or not it["run_dir"] or \
+                    self.rules["runs"].get(run, {}).get("init_class") != "scratch":
+                continue
+            sm = next((e for e in reversed(read_events(self.root / it["run_dir"])) if e.get("kind") == "smoke_steps"),
+                      None)
+            if sm is not None and sm.get("loss_decreasing") is False:
+                notes[run] = dict(note="flat loss start over the smoke steps (a scratch run: reported, not a failure; "
+                                       "the study box's smoke_gate_guard runs its main without the loss-trend check)",
+                                  loss_first=sm.get("loss_first"), loss_last=sm.get("loss_last"),
+                                  steps=sm.get("steps"), run_dir=it["run_dir"])
+                self.event("shake_flat_start_note", run=run, **notes[run])
+        self.state["shake_notes"] = notes
+        self.save()
 
     # summary ----------------------------------------------------------------------------------------------
 
@@ -1578,7 +1623,8 @@ class Queue:
         summary = dict(box=self.box, status=status, reason=reason, rc=rc, gpus=self.gpus, items=items,
                        calibration=self.state["calibration"], num_workers=self.state["num_workers"],
                        probes=self.state["probes"], lr_choice=self.state["lr_choice"], numbers=self.state["numbers"],
-                       smoke_gate_off=self.state["smoke_gate_off"], shm=self.state["shm"],
+                       smoke_gate_off=self.state["smoke_gate_off"], shake_notes=self.state.get("shake_notes"),
+                       shm=self.state["shm"],
                        abandoned=self.state["abandoned"], started=self.state["started"], ended=time.time())
         path = Path(self.s.state_dir) / SUMMARY_FILE
         _atomic_json(path, summary)

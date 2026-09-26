@@ -149,10 +149,12 @@ STUDY_TIERS = [
 # box -> (central hours, watchdog cap before the rebuild timeout is added): boot and bootstrap with two stores ~0.55 h,
 # the calibration ~0.2-0.4 h, the probes ~0.8-1.4 h, the wave (the longest run + its branch, STUDY.md 5.2: 3.8 central,
 # 4.2 high), the anchor in a gap, the speed probes ~0.25 h (B), the end ~0.3 h; the replicate is one run + its branch;
-# the shakedown ~1.5 h (STUDY.md 6.1)
-STUDY_HOURS = {"A": (5.8, 8.0), "B": (6.3, 8.5), "replicate": (4.6, 6.0), "shakedown": (1.6, 3.0)}
+# the shakedown covers both families (CONTRACT.md 8): boot, bootstrap and the AED store ~0.55 h, the CTC store with its
+# frame preflight ~0.25 h (MP3 decode), 18 trainer starts (8 smokes, 2 x resume twice, parent, branch, eval) at
+# ~2.5 min set-up each ~0.75 h, their steps and evals ~0.35 h, the end ~0.1 h
+STUDY_HOURS = {"A": (5.8, 8.0), "B": (6.3, 8.5), "replicate": (4.6, 6.0), "shakedown": (2.0, 3.5)}
 STUDY_MAX_DPH = {4: 6.0, 1: 2.0}  # by GPU count
-STUDY_UP_GB = {"A": 12, "B": 10, "replicate": 3, "shakedown": 3}  # lean uploads (STUDY.md 5.5)
+STUDY_UP_GB = {"A": 12, "B": 10, "replicate": 3, "shakedown": 5}  # lean uploads (STUDY.md 5.5)
 STUDY_CONFIG = "study/data.json"
 
 

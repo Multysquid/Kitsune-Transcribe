@@ -165,13 +165,18 @@ def test_probe_and_calibration_configs(trainer):
     assert cal["calibrate"] == {"enabled": True, "window": list(prereg.CALIB_STEPS), "barrier": False}
     assert cal["batch"]["micro_audio_s"] == 600 and cal["smoke"]["enabled"] and cal["ckpt"]["full_after_smoke"] is False
     assert cal["lr_probe"]["enabled"]
-    # the shakedown's smoke is the study run's own start: its warm-up, seed and smoke gate (a falling loss), at its
-    # class's lowest grid LR; capped by the calibration's max_steps, ended by the box after the smoke
-    for run in Q.first_box_runs(r):
+    # the shakedown's smoke is the study run's own start: its warm-up, seed and smoke gate, at its class's lowest grid
+    # LR; capped by the calibration's max_steps, ended by the box after the smoke. Every run of boxes A and B (both
+    # families); the loss-trend check is on for the pruned runs (a flat start fails the shakedown) and off for the
+    # scratch ones (a flat start is the queue's note)
+    assert Q.shakedown_runs(r) == [*r["boxes"]["A"]["runs"], *r["boxes"]["B"]["runs"]]
+    for run in Q.shakedown_runs(r):
         main = trainer.load_config(str(ROOT / "configs" / "study" / f"{run}.json"), fill(ROOT / "configs" / "study" /
                                                                                           f"{run}.json"))
         sm = trainer.load_config(str(ROOT / "configs" / "study" / f"shake-smoke-{run}.json"), [])
-        assert sm["smoke"]["require_loss_decrease"] is main["smoke"]["require_loss_decrease"] is True
+        assert main["smoke"]["require_loss_decrease"] is True
+        assert sm["smoke"]["require_loss_decrease"] is (r["runs"][run]["init_class"] != "scratch")
+        assert sm.get("family", "aed") == r["runs"][run]["family"]
         assert sm["schedule"]["warmup_steps"] == main["schedule"]["warmup_steps"] and sm["seed"] == main["seed"]
         assert sm["schedule"]["max_steps"] > sm["schedule"]["warmup_steps"] and sm["smoke"]["steps"] == 100
         grid = r["lr_probes"]["classes"][r["runs"][run]["lr_from"]]["grid"]
@@ -764,12 +769,19 @@ def test_shakedown_runs_every_check_on_one_gpu(box):
     recs = [x for x in records() if x["mode"] == "train"]
     items = [x["item"] for x in recs]
     plan = Q.shakedown_plan(study_rules())
-    assert plan["runs"] == ["study-t06", "study-t03", "study-t01", "study-t005"]
-    assert [i for i in items if i != "shake-resume"] == [i for i in plan["items"] if i != "shake-resume"]
-    res = [x for x in recs if x["item"] == "shake-resume"]
-    assert [x["rc"] for x in res] == [1, 0] and res[1]["resumed"] and res[1]["resumed_from"] == 40
-    half = next(x for x in recs if x["item"] == "shake-parent-half")
-    assert half["parent"] == next(x for x in recs if x["item"] == "shake-parent")["run_dir"]
+    assert plan["runs"] == ["study-t06", "study-t03", "study-t01", "study-t005",
+                            "study-p03", "study-p01", "study-p005", "study-bridge"]
+    fam = ["shake-resume", "shake-parent", "shake-parent-half", "shake-eval"]
+    assert plan["items"] == [f"shake-smoke-{run}" for run in plan["runs"]] + fam + [
+        "shake-resume-ctc", "shake-parent-ctc", "shake-parent-ctc-half", "shake-eval-ctc"]
+    resumes = ("shake-resume", "shake-resume-ctc")
+    assert [i for i in items if i not in resumes] == [i for i in plan["items"] if i not in resumes]
+    for name in resumes:  # one AED and one CTC crash and resume
+        res = [x for x in recs if x["item"] == name]
+        assert [x["rc"] for x in res] == [1, 0] and res[1]["resumed"] and res[1]["resumed_from"] == 40
+    for parent in ("shake-parent", "shake-parent-ctc"):  # one AED and one CTC branch
+        half = next(x for x in recs if x["item"] == f"{parent}-half")
+        assert half["parent"] == next(x for x in recs if x["item"] == parent)["run_dir"]
     assert all(x["gpu"] == "0" for x in recs) and len(up.synced) == len(plan["items"])
     assert not (root / "study" / "PREREG_numbers_A.json").exists()
     st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
@@ -782,14 +794,17 @@ def test_a_shakedown_smoke_whose_loss_does_not_fall_fails_once(box):
     """A smoke that fails the study run's gate (here: no falling loss) fails the shakedown, without a second try (it
     would start the same way); the other checks go on."""
     make, records, root = box
-    assert make("shakedown", gpus=("0",), env=dict(FAKE_FLAT=json.dumps({"shake-smoke-study-t01": True}))).run() \
-        == Q.EXIT_FAIL
+    flat = {"shake-smoke-study-p01": True, "shake-smoke-study-t01": True, "shake-smoke-study-bridge": True}
+    assert make("shakedown", gpus=("0",), env=dict(FAKE_FLAT=json.dumps(flat))).run() == Q.EXIT_FAIL
     st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
-    it = st["items"]["shake-smoke-study-t01"]
+    it = st["items"]["shake-smoke-study-p01"]  # a pruned run (warm-up 1,000): a flat start is a failure
     assert it["status"] == "failed" and len(it["attempts"]) == 1
-    assert all(x["status"] == "done" for n, x in st["items"].items() if n != "shake-smoke-study-t01")
+    assert all(x["status"] == "done" for n, x in st["items"].items() if n != "shake-smoke-study-p01")
     summary = json.loads((root / "state" / "queue_summary.json").read_text(encoding="utf-8"))
-    assert summary["status"] == "failed" and "shake-smoke-study-t01" in summary["reason"]
+    assert summary["status"] == "failed" and "shake-smoke-study-p01" in summary["reason"]
+    # the scratch runs' flat starts are notes, not failures
+    assert set(summary["shake_notes"]) == {"study-t01", "study-bridge"}
+    assert summary["shake_notes"]["study-t01"]["loss_last"] >= summary["shake_notes"]["study-t01"]["loss_first"]
 
 
 def test_the_smoke_gate_guard_and_a_smoke_failure_without_a_second_try(box):

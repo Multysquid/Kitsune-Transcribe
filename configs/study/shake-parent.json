@@ -152,7 +152,7 @@
   "name": "full",
   "root": "labels/full",
   "inputs": {
-   "reazon_large": 50,
+   "reazon_large": 53,
    "emilia_yodas": "300h",
    "emilia_nc": 8,
    "galgame": 3

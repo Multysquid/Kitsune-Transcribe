@@ -1,5 +1,5 @@
 {
- "run_name": "shake-eval",
+ "run_name": "shake-eval-ctc",
  "cache_dir": "cache",
  "runs_root": "runs",
  "mix": "natural",
@@ -15,7 +15,8 @@
   "w_kl": 1.0,
   "w_ce": 0.8,
   "l2sp_lambda": 0.0,
-  "aux_ctc_weight": 0.0
+  "aux_ctc_weight": 0.0,
+  "w_ctc": 0.8
  },
  "specaug": {
   "enabled": true,
@@ -50,7 +51,7 @@
  },
  "batch": {
   "step_audio_s": 1500,
-  "micro_audio_s": 600,
+  "micro_audio_s": 1200,
   "pool_micro": 50,
   "max_dec_len": 200
  },
@@ -190,8 +191,9 @@
    "neutral_max_cer": 0.5
   }
  },
- "student": "students/study/t06",
+ "student": "students/study/p03",
  "bn": {
   "mode": "frozen"
- }
+ },
+ "family": "ctc"
 }
