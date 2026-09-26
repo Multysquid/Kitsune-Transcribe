@@ -17,7 +17,8 @@ step, default 0.002); FAKE_WAIT {run_name prefix: data-wait fraction; ".w12": th
 FAKE_OBJ {probe run name: objective or "nan" (diverges: FloatingPointError)}; FAKE_CRASH {run_name: fraction} (the
 first launch writes its states up to that fraction of max_steps, then exits 1); FAKE_MAIN_S (seconds a main run
 takes after writing its fraction states, or {run_name prefix: seconds}); KITSUNE_CRASH_AT_STEP as the trainer reads it
-(a crash before that step, full states every ckpt.full_every_steps).
+(a crash before that step, full states every ckpt.full_every_steps); FAKE_CALIB_CRASH {run_name prefix: step} (a
+calibration run's first try exits 1 at that step).
 """
 import json
 import os
@@ -195,10 +196,14 @@ def calibrate(run: Path, cfg: dict, name: str, M: int) -> int:
     frac = by_prefix(w12 if workers == 12 else plain, name, 0.01)
     (run / "metrics").mkdir(parents=True, exist_ok=True)
     t, s = 0.0, 0
+    crash = by_prefix(env_json("FAKE_CALIB_CRASH", {}), name) if "-try" not in name else None
     with open(run / "metrics" / "scalars.jsonl", "a", encoding="utf-8") as f:
         for s in range(1, M + 1):
             if (run / "STOP").exists():
                 break
+            if crash is not None and s >= crash:
+                write_json(run / "summary.json", {"status": "failed", "error": "RuntimeError: fake calibration crash"})
+                return 1
             time.sleep(step_s)
             dt = 1.0 + 0.001 * (s % 7)
             t += dt

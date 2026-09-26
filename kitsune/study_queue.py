@@ -552,9 +552,14 @@ class Queue:
                 self.phase_extras()
             self.drain_uploads()
             bad = sorted(n for n, it in self.state["items"].items()
-                         if it["status"] == "failed" or (it["status"] == "done" and it["verified"] is False))
+                         if (it["status"] == "failed" and it["kind"] not in ("anchor", "speed"))
+                         or (it["status"] == "done" and it["verified"] is False))
+            readouts = sorted(n for n, it in self.state["items"].items()
+                              if it["status"] == "failed" and it["kind"] in ("anchor", "speed"))
             if bad:
                 rc, status, reason = EXIT_FAIL, "failed", f"items failed or not verified on the Hub: {bad}"
+            elif readouts:  # a readout the owner can redo elsewhere: logged, never a reason to keep a box
+                reason = f"complete; readouts failed (redo them from the Hub): {readouts}"
         except ThroughputHalt as e:
             rc, status, reason = EXIT_THROUGHPUT, "halted", str(e)
         except Halt as e:
@@ -1025,6 +1030,9 @@ class Queue:
                 return out
             self.event("calibration_group_failed", round=rnd, group=gi, attempt=attempt,
                        status={k: self.item(k)["status"] for k in names}, windows=wins)
+            for k in names:  # the group runs again as a whole: this attempt's items are not the box's failures
+                self.item(k)["status"] = "superseded"
+            self.save()
         raise QueueError(f"calibration group {gi} (round {rnd}) failed twice: {[r for r, _ in group]}")
 
     def stop_group(self, names: dict, why: str):

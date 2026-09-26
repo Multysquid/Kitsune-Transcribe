@@ -535,6 +535,25 @@ def test_a_crashed_main_resumes_from_its_full_state(box):
     assert t01[0]["run_dir"] == t01[1]["run_dir"]
 
 
+def test_a_failed_calibration_group_runs_again_whole_and_a_diverged_probe_loses(box):
+    """A calibration run that crashes stops its group, which runs again as a whole (the failed try is superseded,
+    not a failure of the box); a probe whose trainer stops on non-finite gradients scores non-finite and loses."""
+    make, records, root = box
+    r = study_rules()
+    grid = sorted(r["lr_probes"]["classes"]["scratch"]["grid"])
+    obj = {**middle_wins("kept-t03", r), **middle_wins("scratch", r), prereg.probe_run_name("scratch", grid[-1]): "nan"}
+    env = dict(FAKE_CALIB_CRASH=json.dumps({"calib-study-t03": 60}), FAKE_OBJ=json.dumps(obj))
+    assert make("A", env=env).run() == Q.EXIT_OK
+    st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
+    assert st["items"]["calib-study-t03"]["status"] == "superseded"
+    assert st["items"]["calib-study-t03-try2"]["status"] == "done"
+    assert st["calibration"]["study-t03"]["run_dir"].startswith("runs/calib-study-t03-try2-")
+    first = [x for x in records() if x.get("item", "").startswith("calib-") and "-try" not in x["item"]]
+    assert all(x["t1"] <= min(y["t0"] for y in records() if "-try2" in y.get("item", "")) for x in first)
+    assert st["probes"]["scratch"][prereg.lr_tag(grid[-1])] is None
+    assert st["lr_choice"]["scratch"]["decision"] == "chosen"
+
+
 def test_box_b_plan_and_dry_run(box):
     """Box B: five calibrated runs on four GPUs (the reference study-t06 in a second group, the other three GPUs
     running unmeasured load), probes of three classes, the wave, the speed probes one model at a time at the end.
