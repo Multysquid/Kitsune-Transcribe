@@ -33,7 +33,13 @@ parameters and no compute, and it would add id-remapping risk.
 02b_second_opinion.py  second ASR opinion per utterance -> second_out/ (agreement-based label filter)
 make_selection.py    which utterances train / evaluate, and why -> selection/*.parquet (the size study's: + sidecar and
                      eval manifest; study/PREREG.{json,md} from `python -m kitsune.prereg`)
-03_build_student.py  prune the teacher to the student (20 enc layers, FFN 2560, 4 dec layers), init from teacher
+03_build_student.py  prune the teacher to the student (20 enc layers, FFN 2560, 4 dec layers), init from teacher;
+                     the size study's modes: --bn keep (the teacher's BN stats), --importance-layers all (one 48-layer
+                     importance pass every size reuses), --ffn-from (another student's FFN selection), --calib-ids
+                     (calibrate on a fixed id list), --scratch t01|t005|bridge (a seeded random init of the teacher's
+                     architecture at another size); every build asserts its parameter count
+03c_build_ctc_student.py  the Parakeet-family students: Parakeet's CTC path pruned (evenly spaced layers, FFN by
+                     importance, the teacher's BN stats), with the 60-utterance step-0 gate that sets the init class
 04_distill.py        KL on the stored top-16 + CE on the teacher tokens + L2-SP; TensorBoard (cards in three groups:
                      1_operational, 2_loss_accuracy, 3_misc; first the combined loss KL + 0.8 CE per step and on the
                      gate sets, under 2_loss_accuracy/00_combined and as one Custom Scalars chart, then every eval's
@@ -41,9 +47,15 @@ make_selection.py    which utterances train / evaluate, and why -> selection/*.p
 05_evaluate.py       a checkpoint -> the trainer's complete (final) eval of it, in the evals/step_<N>/ format;
                      resumable, with a GPU temperature guard (--max-temp / --resume-temp) for the laptop
 tools/               export_run.py: a run -> parquet/CSV tables + README; regroup_tb.py: rebuild an older run's
-                     TensorBoard files in the three groups
+                     TensorBoard files in the three groups; label_checks.py: the size study's label checks K1-K12 on
+                     a local pull of the label root (what the label box stored is what the study reads);
+                     study_report.py: the size study's pre-registered answer and readouts from every system's eval
+                     tables (statistics in kitsune/study_stats.py)
 vast/                training image, CI build and the vast.ai run scripts: the A100 training run and the RTX 5090
                      label box that labels the full download with both teachers (see vast/README.md)
+python -m kitsune.prereg  the size study's pre-registration: --write study/ regenerates study/PREREG.{json,md} from
+                     kitsune/prereg.py, --check study/ verifies the committed files; the study boxes write their
+                     numbers (calibrated max_steps, LR probe results) with its write_numbers
 ```
 
 ### Data
@@ -116,6 +128,20 @@ targets are in-training-data predictions. No trainer reads `parakeet_out` yet; t
 (`make_selection.py` with a `selection_recipe.study` block: both roots, the F1a agreement filter, CTC feasibility; see
 vast/README.md, "The size study's selection and pre-registration"). The same pass's TDT hypothesis is the
 second opinion that judges Galgame in `second_out` (the `model2` field of each row names the judge).
+
+## The size study
+
+Where does shrinking the student stop paying off? Seven students train on the same 1,000 h at equal A100 compute:
+Transcribe 0.6B and 0.3B pruned from Cohere, 0.1B and 0.05B from scratch; Parakeet 0.3B, 0.1B and 0.05B pruned from
+[Parakeet TDT-CTC 0.6B ja](https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja) (CTC students). Two control runs
+separate init from size (the bridge: the T-0.3B shape from scratch) and measure run-to-run noise (a second seed of
+T-0.1B). Every rule is fixed before the first study step and committed in [study/PREREG.md](study/PREREG.md)
+(generated from `kitsune/prereg.py`; PREREG.json is the binding form): the runs and their exact parameter counts, the
+two boxes that train them (Transcribe first, then Parakeet and the bridge), the init classes and the step-0 gate, the
+LR probe grids and the edge rule, the equal-compute calibration of max_steps, the T/2 branch, the selection and the
+eval manifest, the metric, the noise model and the limit rule: per family, the smallest size whose 4-set CER stays
+within 10 % of the family's largest student. Each box writes the numbers only it can measure
+(`PREREG_numbers_<box>.json`) before its first study step; `tools/study_report.py` computes the answer.
 
 ## Setup
 
