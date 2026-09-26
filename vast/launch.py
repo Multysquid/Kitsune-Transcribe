@@ -40,7 +40,7 @@ A100 40 GB then 80 GB, reliability >= STUDY_RELIABILITY), the box's hours (STUDY
 extent's sizing with both label stores and the box's checkpoints (study_queue.study_extra_gb), and study_preflight's
 refusals: a PREREG with pending fields (not for the shakedown), a selection whose sha256 is not PREREG's, a student of
 the box missing a file, a config of the box not committed, a numbers file of the box already written (or, for the
-replicate, box A's missing):
+replicate, box A's missing or written under other rules); the queue's GPU count goes along (KITSUNE_N_GPUS):
   python vast/launch.py --job study --box A --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs \\
       --image-tag main                                                                        # look only
 Needs the vastai CLI (`pip install vastai==1.8.0`, then `vastai set api-key <key>`); --help works without it.
@@ -881,7 +881,9 @@ def study_preflight(data_repo: str, data_rev: str | None, out_repo: str, sha: st
     - the box's students, and only those it pulls (study_queue.box_students), each with STUDENT_FILES and a
       Parakeet-derived one with CTC_CARD, its CC-BY-4.0 attribution; the other dirs it pulls (box_extra_dirs);
     - the runs repo: no numbers file of this box yet (a box writes its numbers once, before its first study step), and
-      for a box with numbers_from (the replicate) that box's numbers file present."""
+      for a box with numbers_from (the replicate) that box's numbers file present and written under this commit's
+      rules (its rules_sha256 = study/PREREG.json's at `sha`)."""
+    import hashlib
     import tempfile
 
     from kitsune import prereg
@@ -952,7 +954,20 @@ def study_preflight(data_repo: str, data_rev: str | None, out_repo: str, sha: st
                 problems.append(f"{out_repo} has no {src}: box {box} takes its max_steps and LR from box "
                                 f"{plan['numbers_from']}'s numbers; that box runs first")
             else:
-                notes.append(f"box {box} takes its numbers from {out_repo}/{src}")
+                # the numbers are written under the rules of this commit (prereg.write_numbers refuses otherwise, on
+                # the box, after its bootstrap and store build): check here, before anything is rented
+                _, download = _hub()
+                with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+                    src_rules = json.loads(Path(download(out_repo, src, local_dir=tmp)).read_text(
+                        encoding="utf-8")).get("rules_sha256")
+                here = hashlib.sha256(prereg.rules_json(pr)).hexdigest()
+                if src_rules != here:
+                    problems.append(f"{out_repo}/{src} was written under the rules {str(src_rules)[:12]}..., "
+                                    f"study/{prereg.RULES_JSON} at {sha[:12]} is {here[:12]}...: box {box} would take "
+                                    f"box {plan['numbers_from']}'s numbers under other rules (the box refuses them)")
+                else:
+                    notes.append(f"box {box} takes its numbers from {out_repo}/{src} (rules {here[:12]}... = "
+                                 f"this commit's)")
     except Exception as e:  # noqa: BLE001
         problems.append(f"cannot check the numbers files in {out_repo}: {type(e).__name__}: {e}")
     return problems, notes
@@ -1137,8 +1152,10 @@ def main(argv: list[str] | None = None) -> int:
         env = {"KITSUNE_JOB": "label", "KITSUNE_SHA": sha, "KITSUNE_CONFIG": config,
                "KITSUNE_LABEL_CONFIGS": ",".join(label_configs), "KITSUNE_DATA_REPO": args.data_repo}
     elif study:
-        env = {"KITSUNE_JOB": "study", "KITSUNE_BOX": args.box, "KITSUNE_SHA": sha, "KITSUNE_CONFIG": config,
-               "KITSUNE_DATA_REPO": args.data_repo, "KITSUNE_OUT_REPO": args.out_repo}
+        # KITSUNE_N_GPUS: the queue refuses to run on another GPU count than the box was rented with
+        env = {"KITSUNE_JOB": "study", "KITSUNE_BOX": args.box, "KITSUNE_N_GPUS": str(STUDY_GPUS[args.box]),
+               "KITSUNE_SHA": sha, "KITSUNE_CONFIG": config, "KITSUNE_DATA_REPO": args.data_repo,
+               "KITSUNE_OUT_REPO": args.out_repo}
     else:
         env = {"KITSUNE_SHA": sha, "KITSUNE_CONFIG": config, "KITSUNE_DATA_REPO": args.data_repo,
                "KITSUNE_OUT_REPO": args.out_repo}

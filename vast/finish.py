@@ -45,7 +45,8 @@ Study box (--job study, the default when KITSUNE_JOB=study; kitsune/study_queue.
 per run dir the logs, metrics, evals and summary, every exported weights dir and only the full states the run's config
 uploads (ckpt.upload_full_at "frac:<f>" / "end", uploaded_fulls; plus a marked one), never the newest full state for
 its own sake: the box keeps its resume states on its disk and the runs repo gets what the study reports (STUDY.md 5.5).
-The infra logs and the queue's state go to study/box-<KITSUNE_BOX>/infra/<container>/.
+The infra logs and the queue's state go to study/box-<KITSUNE_BOX>/infra/<container>/, with the queue's per-item logs
+($KITSUNE_STATE/logs/) and each re-armed state (rearm-<stamp>/) under it (infra_files deep).
 """
 import argparse
 import hashlib
@@ -68,6 +69,7 @@ VAST_API = "https://console.vast.ai/api/v0"
 STATE_DIR = Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state"))
 INFRA_LOGS = ["/workspace/kitsune.log", "/workspace/watchdog.log", "/workspace/portal.log", "/workspace/tensorboard.log"]
 INFRA_TIMEOUT_S = 180  # a hung infra upload must not keep a paid instance up
+INFRA_MAX_FILE_BYTES = 32 << 20  # a study box's per-item log goes up as its last 32 MB (upload_infra deep)
 # s before each retry of a hub call the library does not retry itself: exponential back-off from 5 s up to 10 min, ~21
 # min in all (STUDY.md 5.5: the study's runs share one repo, and a 429 needs the Hub's rate window to pass). Only what a
 # retry can fix is retried (retryable)
@@ -359,15 +361,39 @@ def scrub(data: bytes) -> bytes:
     return PRINTED_SECRET_RE.sub(rb"\1<redacted>", data)
 
 
-def upload_infra(api, repo: str, repo_type: str, dest: str, dry_run: bool):
+def infra_files(deep: bool = False) -> list[tuple[str, Path]]:
+    """(name under the infra folder, local file) of the infra upload: INFRA_LOGS and the top level of STATE_DIR; deep
+    (the study box) also its logs/ (the queue's per-item output: the store build, the anchor, every speed-probe call,
+    a trainer that died before its own logger started) and each rearm-<stamp>/ (the lifecycle state a re-arm moved
+    aside: the queue's events.jsonl with its prereg_numbers record among it)."""
+    out = [(Path(p).name, Path(p)) for p in INFRA_LOGS]
+    if STATE_DIR.is_dir():
+        out += [(f.name, f) for f in sorted(STATE_DIR.glob("*"))]
+        if deep:
+            for sub in [STATE_DIR / "logs", *sorted(STATE_DIR.glob("rearm-*"))]:
+                if sub.is_dir():
+                    out += [(f.relative_to(STATE_DIR).as_posix(), f) for f in sorted(sub.rglob("*"))]
+    return [(n, f) for n, f in out if f.is_file() and not f.name.endswith(".lock")]
+
+
+def _tail(f: Path, limit: int) -> bytes:
+    """The file's last `limit` bytes (a trainer's console log of a whole run can grow large; its end says why)."""
+    with open(f, "rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, size - limit))
+        return fh.read()
+
+
+def upload_infra(api, repo: str, repo_type: str, dest: str, dry_run: bool, deep: bool = False):
     """Best effort: supervisor/bootstrap/watchdog logs and state go next to the run for later extraction, scrubbed:
     portal.log (the base image's boot output: its CUDA selection is recorded nowhere else) holds the portal's password
-    and tokens as soon as a PORTAL_CONFIG reaches the box, and the runs repo keeps every file in its git history."""
+    and tokens as soon as a PORTAL_CONFIG reaches the box, and the runs repo keeps every file in its git history.
+    deep: the study box's subfolders too (infra_files), each file at most INFRA_MAX_FILE_BYTES (its end)."""
     from huggingface_hub import CommitOperationAdd
 
-    files = [Path(p) for p in INFRA_LOGS] + (sorted(STATE_DIR.glob("*")) if STATE_DIR.is_dir() else [])
-    ops = [CommitOperationAdd(path_in_repo=f"{dest}/{f.name}", path_or_fileobj=scrub(f.read_bytes()))
-           for f in files if f.is_file() and not f.name.endswith(".lock")]
+    ops = [CommitOperationAdd(path_in_repo=f"{dest}/{name}",
+                              path_or_fileobj=scrub(_tail(f, INFRA_MAX_FILE_BYTES) if "/" in name else f.read_bytes()))
+           for name, f in infra_files(deep)]
     log(f"upload {len(ops)} infra files -> {repo}:{dest}")
     if ops and not dry_run:  # retried inside best_effort's INFRA_TIMEOUT_S, which bounds every try together
         hub_retry(lambda: api.create_commit(repo_id=repo, repo_type=repo_type, operations=ops,
@@ -534,7 +560,8 @@ def main(argv: list[str] | None = None) -> int:
 
     def push_infra():  # best effort and bounded; --no-sync too (a failed bootstrap's reason is in these files)
         if api is not None and not args.verify_only:
-            best_effort(lambda: upload_infra(api, args.repo, args.repo_type, infra_dest, args.dry_run), "infra upload")
+            best_effort(lambda: upload_infra(api, args.repo, args.repo_type, infra_dest, args.dry_run,
+                                             deep=args.job == "study"), "infra upload")
 
     if args.sync_only:
         push_infra()

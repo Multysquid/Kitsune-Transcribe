@@ -40,11 +40,11 @@
   "offload_fused": false
  },
  "schedule": {
-  "warmup_steps": 10,
+  "warmup_steps": 2000,
   "cooldown_frac": 0.2,
   "train_hours": 4.0,
   "clock": "steps",
-  "max_steps": 100,
+  "max_steps": 20000,
   "end_reserve_min": 30,
   "epochs": null
  },
@@ -125,7 +125,7 @@
   "pad_utts": 32,
   "pad_max_mean_kl": 0.05,
   "pad_min_argmax_agree": null,
-  "require_loss_decrease": false,
+  "require_loss_decrease": true,
   "decode_per_set": 8,
   "max_dropped_frac": 0.01
  },

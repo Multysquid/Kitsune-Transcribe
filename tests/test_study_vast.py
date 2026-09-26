@@ -6,6 +6,7 @@ after a crash, stopped on a pre-registered halt, destroyed once done), the lean 
 network, no vastai CLI, no GPU.
 """
 import copy
+import hashlib
 import importlib
 import json
 import os
@@ -113,6 +114,7 @@ def test_launch_study_box_a_rents_four_a100s_with_the_relaxed_filter(study_launc
     create = next(c for c in fake.calls if c[1:3] == ["create", "instance"])
     env = env_of(create)
     assert env["KITSUNE_JOB"] == "study" and env["KITSUNE_BOX"] == "A" and env["KITSUNE_CONFIG"] == "study/data.json"
+    assert env["KITSUNE_N_GPUS"] == "4"  # the queue refuses another count
     assert env["KITSUNE_OUT_REPO"] == "Multy123/kitsune-runs" and env["TZ"] == "UTC"
     assert env["KITSUNE_MAX_HOURS"] == f"{launch.STUDY_HOURS['A'][1] + 54 / 60:g}"
     assert env["KITSUNE_REBUILD_TIMEOUT_MIN"] == "54" and "HF_TOKEN" not in " ".join(create)
@@ -178,16 +180,26 @@ def data_files(rules: dict, boxes=("A", "B", "replicate", "shakedown"), sel_sha=
 
 
 @pytest.fixture
-def preflight(monkeypatch):
+def preflight(monkeypatch, tmp_path):
     rules = study_rules()
 
-    def go(box_name, *, files=None, runs=(), prereg_json=None, missing_configs=()):
+    def go(box_name, *, files=None, runs=(), prereg_json=None, missing_configs=(), numbers_rules=None):
+        """numbers_rules: the rules_sha256 in the runs repo's numbers files (default: this PREREG's)."""
         pr = prereg_json if prereg_json is not None else dict(prereg.rules(), manifest=dict(
             prereg.rules()["manifest"], selection_sha256="ab" * 32))
         if prereg_json is None:  # a filled PREREG: nothing pending
             pr = json.loads(json.dumps(pr).replace('"pending"', '"x"'))
         hub = PreflightHub(files if files is not None else data_files(rules), set(runs))
-        monkeypatch.setattr(launch, "_hub", lambda: (hub, None))
+        here = hashlib.sha256(prereg.rules_json(pr)).hexdigest()
+
+        def download(repo, path, repo_type=None, revision=None, local_dir=None):
+            assert repo == "Multy123/kitsune-runs" and path in runs, (repo, path)
+            p = Path(local_dir) / path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"box": "A", "rules_sha256": numbers_rules or here}), encoding="utf-8")
+            return str(p)
+
+        monkeypatch.setattr(launch, "_hub", lambda: (hub, download))
 
         def git(*a):
             if a[:2] == ("cat-file", "-e") and any(a[2].endswith(m) for m in missing_configs):
@@ -227,6 +239,9 @@ def test_study_preflight_refusals(preflight):
     assert any("already holds study/PREREG_numbers_A.json" in p
                for p in go("A", runs={"study/PREREG_numbers_A.json"})[0])
     assert any("has no study/PREREG_numbers_A.json" in p for p in go("replicate")[0])
+    # box A's numbers written under other rules than this commit's: the replicate box would refuse them after its boot
+    assert any("written under the rules" in p
+               for p in go("replicate", runs={"study/PREREG_numbers_A.json"}, numbers_rules="0" * 64)[0])
     assert any("calib-study-t06.json does not exist" in p
                for p in go("A", missing_configs=("calib-study-t06.json",))[0])
 
@@ -456,12 +471,33 @@ def test_finish_study_job_is_lean_and_puts_its_infra_under_the_box(tmp_path, mon
     monkeypatch.setenv("KITSUNE_BOX", "A")
     (tmp_path / "state").mkdir()
     (tmp_path / "state" / "queue_summary.json").write_text("{}")
+    # the queue's per-item logs (the store build, the anchor, the speed probes: no run dir of their own) and the state
+    # a re-arm moved aside go up too; a big log as its end
+    (tmp_path / "state" / "logs").mkdir()
+    (tmp_path / "state" / "logs" / "speed-cohere.log").write_bytes(b"Traceback: CUDA error\n")
+    (tmp_path / "state" / "logs" / "stores-aed.log").write_bytes(b"x" * 100 + b"stores: train 12 utts\n")
+    (tmp_path / "state" / "rearm-20261001T000000Z").mkdir()
+    (tmp_path / "state" / "rearm-20261001T000000Z" / "events.jsonl").write_bytes(b'{"kind": "prereg_numbers"}\n')
+    monkeypatch.setattr(finish, "INFRA_MAX_FILE_BYTES", 30)
+    sent = {}
+
+    def create_commit(**kw):
+        commits.append([op.path_in_repo for op in kw["operations"]])
+        sent.update({op.path_in_repo: op.path_or_fileobj for op in kw["operations"]})
+
+    Hub.create_commit = staticmethod(create_commit)
     rc = finish.main(["--destroy", "--repo", "r", "--runs-root", str(tmp_path / "runs")])
     assert rc == 0 and actions == ["destroy"]
     ck = [p for pats in uploads for p in pats if p.startswith("checkpoints/")]
     assert "checkpoints/full_step_800/model.pt" in ck and not any("full_step_1000" in p or "full_step_700" in p
                                                                    for p in ck)
     assert any(p.startswith("study/box-A/infra/") and p.endswith("queue_summary.json") for c in commits for p in c)
+    infra = {p.split("/infra/", 1)[1].split("/", 1)[1]: v for p, v in sent.items() if "/infra/" in p}
+    assert infra["logs/speed-cohere.log"] == b"Traceback: CUDA error\n"
+    assert infra["logs/stores-aed.log"] == (b"x" * 100 + b"stores: train 12 utts\n")[-30:]
+    assert infra["rearm-20261001T000000Z/events.jsonl"].startswith(b'{"kind": "prereg_numbers"}')
+    # the train job's infra stays the top level only
+    assert [n for n, _ in finish.infra_files()] == [n for n, _ in finish.infra_files(deep=True) if "/" not in n]
 
 
 def test_hub_retry_backs_off_exponentially_and_only_on_what_a_retry_fixes(monkeypatch):

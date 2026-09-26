@@ -373,8 +373,10 @@ DEFAULTS = {
     "lr_probe": {"enabled": False},
     # the study box's calibration run (kitsune/study_queue.py; the block "the study box" at the end of this file): an
     # lr_probe run (metrics only) that ends with its step-time table - the median step time, logging included, over
-    # the steps (window[0], window[1]] and the data-wait share - instead of the teacher-forced objective
-    "calibrate": {"enabled": False, "window": [50, 250]},
+    # the steps (window[0], window[1]] and the data-wait share - instead of the teacher-forced objective. barrier:
+    # before its first step the run writes runs/<run_id>/READY and waits for runs/<run_id>/GO (or STOP), which the
+    # box writes into every run of a calibration group at once, so the group's windows all fall while all of it trains
+    "calibrate": {"enabled": False, "window": [50, 250], "barrier": False},
     "seed": 1234,
 }
 EARLY_STOP_METRICS = ("probe_kl", "heldout_kl", "train_loss")
@@ -3742,10 +3744,11 @@ def run_script(argv=None):
 # ------------------------------------------------------------------------------------------------ the study box
 # One contiguous block (CONTRACT.md section 7, WP6A): the validation of the box path's keys (pull_parakeet,
 # selection_recipe.study, calibrate, and optim.lr as a number, which the generated study configs leave null until the
-# box fills it from its PREREG_numbers file) and the calibration run's end phase. It hooks into the trainer by wrapping
-# validate() and end_lr_probe() at its end, not by editing them, so it merges cleanly with the CTC trainer's changes to
-# the rest of this file; a calibration run is an lr_probe run in every other respect (metrics only: no step-0, in-loop
-# or mini evals, no weights, no checkpoint uploads).
+# box fills it from its PREREG_numbers file), the calibration run's start barrier and its end phase. It hooks into the
+# trainer by wrapping validate(), stop_requested() (checked before every step: the barrier waits in the first check)
+# and end_lr_probe() at its end, not by editing them, so it merges cleanly with the CTC trainer's changes to the rest of
+# this file; a calibration run is an lr_probe run in every other respect (metrics only: no step-0, in-loop or mini
+# evals, no weights, no checkpoint uploads).
 
 
 def calibrate_on(cfg: dict) -> bool:
@@ -3756,7 +3759,8 @@ def validate_box(cfg: dict):
     """The box path's keys (DEFAULTS: pull_parakeet, selection_recipe.study, calibrate) and optim.lr. calibrate needs
     the steps clock and lr_probe.enabled (its loop is the LR probe's: metrics only), no branch, and a window (a, b] of
     whole steps with 0 <= a < b that the run reaches past a (max_steps > a; the study box ends its calibration runs
-    with the STOP file once every run of the group has its window, kitsune.study_queue)."""
+    with the STOP file once every run of the group has its window, kitsune.study_queue); barrier (a bool) only on a
+    calibration run."""
     from kitsune import prereg
 
     lr = cfg["optim"]["lr"]
@@ -3775,6 +3779,9 @@ def validate_box(cfg: dict):
     if not (isinstance(w, list) and len(w) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in w)
             and 0 <= w[0] < w[1]):
         raise SystemExit(f"calibrate.window must be [a, b], whole steps with 0 <= a < b, got {w!r}")
+    if not isinstance(cal["barrier"], bool) or (cal["barrier"] and not cal["enabled"]):
+        raise SystemExit(f"calibrate.barrier must be true or false, and true only with calibrate.enabled, got "
+                         f"{cal['barrier']!r}")
     if cal["enabled"]:
         sch = cfg["schedule"]
         if sch["clock"] != "steps" or not cfg["lr_probe"]["enabled"] or cfg["branch"]["parent"] is not None:
@@ -3814,12 +3821,41 @@ def end_calibrate(R: Run, step: int) -> int:
     return EXIT_OK
 
 
-_validate_trainer, _end_lr_probe_trainer = validate, end_lr_probe
+CALIBRATE_POLL_S = 0.05  # the barrier's check for GO: the group's trainers start their first steps within this
+
+
+def calibrate_barrier(R: Run):
+    """calibrate.barrier: the run is set up (model, memory probe, loader) and about to take its first step. It writes
+    runs/<run_id>/READY and waits for GO (or STOP) there: the study box writes GO into every run of a calibration group
+    in one pass once all of them are READY, so the group starts its steps together and every run's window falls while
+    the whole group trains (kitsune.study_queue.Queue.calibrate_group). The wait is outside every step's time (the
+    step clock starts after this check) and before the window."""
+    from kitsune import study_queue as Q
+
+    t0 = time.time()
+    (R.run_dir / Q.READY_FILE).write_text(json.dumps({"wall": t0, "step": R.st["step"]}) + "\n", encoding="utf-8")
+    R.log.event("calibrate_barrier", state="ready", at_step=R.st["step"])
+    print(f"[calibrate] ready at step {R.st['step']}: waiting for {R.run_dir / Q.GO_FILE}", flush=True)
+    while not ((R.run_dir / Q.GO_FILE).exists() or (R.run_dir / STOP_FILE).exists()):
+        time.sleep(CALIBRATE_POLL_S)
+    by = Q.GO_FILE if (R.run_dir / Q.GO_FILE).exists() else STOP_FILE
+    R.log.event("calibrate_barrier", state="released", by=by, waited_s=round(time.time() - t0, 3))
+
+
+_validate_trainer, _end_lr_probe_trainer, _stop_requested_trainer = validate, end_lr_probe, stop_requested
+_BARRIER_PASSED: set[str] = set()  # the run dirs whose first stop check has waited at the barrier
 
 
 def validate(cfg: dict):  # noqa: F811  the trainer's checks, then the box keys' (the block comment above)
     _validate_trainer(cfg)
     validate_box(cfg)
+
+
+def stop_requested(R: Run) -> bool:  # noqa: F811  a calibration group's first step waits at the barrier
+    if calibrate_on(R.cfg) and R.cfg["calibrate"]["barrier"] and str(R.run_dir) not in _BARRIER_PASSED:
+        _BARRIER_PASSED.add(str(R.run_dir))
+        calibrate_barrier(R)
+    return _stop_requested_trainer(R)
 
 
 def end_lr_probe(R: Run, step: int) -> int:  # noqa: F811  a calibration run ends with its step-time table instead

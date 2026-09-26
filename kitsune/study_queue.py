@@ -9,14 +9,16 @@ grids and the edge rule, max_steps, the branch fractions - comes from kitsune.pr
   stores       the label stores (the trainer's cache under cache_dir: the train and eval stores) are built ONCE, by one
                process alone (`build-stores`, the trainer's own store code), before any trainer starts; every run then
                finds its fingerprint and opens the shared cache read-only
-  calibrate    the box's calibrate list in groups of as many runs as GPUs (a short last group is filled with other runs
-               of the list as unmeasured load, so every run is measured under the same concurrency), 250 steps each at
-               the planned micro-batch: calib-<run> configs (lr_probe + calibrate: metrics only). A group's windows are
-               aligned (group_windows): each run's 200-step window starts at or after step 50 once EVERY run of the group
-               has reached step 50, so each is measured while the others train; once all have theirs the queue ends the
-               group with the STOP file. t_i = the median step time over the window, logging included (the difference
-               of consecutive steps' loop clocks), data_wait_frac = the loader's share of it; the literal steps
-               (50, 250] are kept next to it (fixed_window, for the record). A run at or above
+  calibrate    the box's calibrate list in groups of as many runs as GPUs, the box's wave runs first (STUDY.md 5.1: each
+               run measured with its wave's group running concurrently; a short last group - box B's reference run -
+               is filled with wave runs as unmeasured load), 250 steps each at the planned micro-batch: calib-<run>
+               configs (lr_probe + calibrate: metrics only). A group starts together: every trainer of it sets up (the
+               model, the memory probe, its loader) and then waits at its first step (calibrate.barrier: READY, then
+               GO) until the queue releases all of them at once, so each run's steps (50, 250] - the pre-registered
+               window, literally - fall while every other run of the group trains; the queue ends the group with the
+               STOP file once every run has logged step 250. t_i = the median step time over the window, logging
+               included (the difference of consecutive steps' loop clocks), data_wait_frac = the loader's share of it
+               (a skipped step inside the window is replaced by the next one: always 200 steps). A run at or above
                prereg.DATA_WAIT_MAX: perf.num_workers 12 for every run of the box and the whole calibration again; still
                loader-bound: the box halts
   probes       every grid point of the box's probe classes, packed onto the GPUs longest first (steps x the calibrated
@@ -32,14 +34,25 @@ grids and the edge rule, max_steps, the branch fractions - comes from kitsune.pr
   wave         per GPU a main run, then its T/2 branch (<run>-half with branch.parent = the main's local run dir), each
                filled with --set schedule.max_steps, optim.lr, eval.mini.every_steps (prereg's mini fraction of
                max_steps), the calibrated micro-batch and, after a loader-bound calibration, perf.num_workers; the
-               mains start SYNC_OFFSET_S apart, so their log syncs to the shared runs repo do not come together
+               mains start SYNC_OFFSET_S apart, so their log syncs to the shared runs repo do not come together. A main
+               whose smoke gate would stop it on a flat start (smoke_gate_guard: its calibration run - same student,
+               seed, data order and warm-up, at its class's lowest grid LR - showed no falling loss over the smoke
+               steps) runs without the loss-trend check (smoke.require_loss_decrease false, main and branch alike)
   extras       "anchor": re-score the first run's 0.6B (ANCHOR_CKPT in the runs repo) on the study's eval rows with
                scripts/05_evaluate.py, in a GPU gap (a free GPU during the probes or the wave's tail); "speed":
                tools/speed_probe.py for every student and both teachers, one model at a time on an idle host, at the
-               end (skipped with a logged note while the tool is absent)
+               end, each student with its TRAINED final weights (an AED greedy decode runs as long as its weights make
+               it: an untrained decoder runs on to max_new): this box's runs from their run dirs, the other boxes'
+               from the runs repo (skipped with a logged note while the tool is absent)
+Loader and /dev/shm: every trainer of a run gets the same perf.num_workers / perf.prefetch (loader_sets): the
+loader-bound retry's workers, cut so its in-flight micro-batches fit its share of the host's /dev/shm (the trainers of
+one box share it; each trainer's own shm_cap measures only the free space it sees when it starts).
 Every finished run dir is uploaded and verified at once (lean: vast/finish.py expected_files(lean=True) - the logs,
 metrics, evals and summary, the exported weights at 0.4 and at the end, the branch's, and the full states the config
-uploads: the 0.8 one of the runs of at most 0.1B). Local full states stay on the box.
+uploads: the 0.8 one of the runs of at most 0.1B). Local full states stay on the box. An item that fails its smoke
+checks (SmokeFailed) fails at once: the same start fails the same way again.
+GPUs: KITSUNE_GPUS (a comma list) or nvidia-smi's; a box that trains its runs in one wave needs a GPU per run, and
+KITSUNE_N_GPUS (vast/launch.py sets the count it rented) must match what the queue found - never a silent serial box.
 
 State: $KITSUNE_STATE/queue.json (atomic, fsynced) holds every item's status, attempts and run dir, the calibration
 table, the probe results, the LR choice and the numbers file's sha256. A restarted queue (vast/supervise.py restarts it
@@ -100,6 +113,16 @@ STOP_GRACE_S = 1800  # how long a stopped run may take to leave (its end phase)
 MAX_ATTEMPTS = 2  # per item: a run resumes (or a branch restarts) once; a second failure is final
 STAMP_RE = r"-\d{8}T\d{6}Z(?:-\d+)?"
 DIVERGED = ("FloatingPointError",)  # a probe whose trainer stopped on non-finite gradients: its objective is non-finite
+DETERMINISTIC = ("SmokeFailed",)  # a trainer's smoke checks: a second try from the same start fails the same way
+# the calibration barrier (scripts/04_distill.py, calibrate.barrier): a trainer writes READY in its run dir before its
+# first step and waits for GO (or STOP), which the queue writes into every run dir of the group at once
+READY_FILE, GO_FILE = "READY", "GO"
+# /dev/shm (loader_sets): scripts/04_distill.py shm_cap keeps up to num_workers x prefetch micro-batches of up to
+# micro_audio_s of padded float32 16 kHz audio (+25 % for the rest) within half the free space it sees at its start.
+# The queue starts up to one trainer per GPU at the same moment, so each would budget the same free space: the queue
+# gives each trainer an equal share of half the host's /dev/shm instead, cut in shm_cap's order
+SHM_BYTES_PER_AUDIO_S = 16000 * 4 * 1.25
+SHM_PATH = "/dev/shm"
 
 
 class QueueError(RuntimeError):
@@ -167,7 +190,8 @@ class StepTail:
     every run of a group every few seconds, and a small run's file grows by ~7 KB a step)."""
 
     def __init__(self, run_dir):
-        self.path = Path(run_dir) / "metrics" / "scalars.jsonl"
+        self.run_dir = Path(run_dir)
+        self.path = self.run_dir / "metrics" / "scalars.jsonl"
         self.pos, self.rest, self.rows = 0, b"", {}
 
     def poll(self) -> dict[int, dict]:
@@ -207,34 +231,36 @@ def calibration_stats(rows: dict[int, dict], a: int, b: int) -> dict:
                 steps_measured=len(dts), window=[int(a), max(done)], mean_step_s=round(sum(dts) / len(dts), 6))
 
 
-def group_windows(rows_by_run: dict[str, dict], a: int, n: int) -> dict[str, tuple[int, int] | None]:
-    """The aligned calibration windows of a group running concurrently: t_all = the wall time at which the LAST run
-    logged step a; each run's window (s0, e] starts at its first logged step s0 >= a with wall >= t_all and ends once
-    it holds n measured steps (a step and its predecessor both logged; calibration_stats), so every step of it falls
-    after every run of the group reached step a (the run that got there last measures exactly steps (a, a + n] unless
-    it skipped a step). None for a run whose window is not complete yet (or while some run has not reached step a)."""
-    walls = {}
-    for run, rows in rows_by_run.items():
-        w = (rows.get(a) or {}).get("wall")
-        if w is None:
-            return {r: None for r in rows_by_run}
-        walls[run] = float(w)
-    t_all = max(walls.values())
-    out = {}
-    for run, rows in rows_by_run.items():
-        s0 = min((s for s, r in rows.items() if s >= a and r.get("wall") is not None and float(r["wall"]) >= t_all),
-                 default=None)
-        out[run] = None
-        if s0 is None:
-            continue
-        got = 0
-        for s in range(s0 + 1, max(rows) + 1):
-            if (rows.get(s) or {}).get("train_s") is not None and (rows.get(s - 1) or {}).get("train_s") is not None:
-                got += 1
-                if got == n:
-                    out[run] = (s0, s)
-                    break
-    return out
+def window_end(rows: dict[int, dict], a: int, n: int) -> int | None:
+    """The end e of a run's calibration window (a, e]: the step at which n steps after step a are measured (a step and
+    its predecessor both logged, as calibration_stats counts them) - a + n, unless the run skipped a step inside, which
+    the next one replaces. None while the run has not got that far."""
+    got = 0
+    for s in range(int(a) + 1, max(rows, default=int(a)) + 1):
+        if (rows.get(s) or {}).get("train_s") is not None and (rows.get(s - 1) or {}).get("train_s") is not None:
+            got += 1
+            if got == n:
+                return s
+    return None
+
+
+def shm_fit(workers: int, prefetch: int, micro_audio_s: float, budget: float) -> tuple[int, int]:
+    """(workers, prefetch) whose in-flight micro-batches fit `budget` bytes of /dev/shm, cut in the order of
+    scripts/04_distill.py shm_cap: the prefetch down to 2, then the workers down to 1, then the prefetch down to 1 (what
+    still does not fit is the trainer's own cut: decoding in-process)."""
+    per, n, p = float(micro_audio_s) * SHM_BYTES_PER_AUDIO_S, int(workers), int(prefetch)
+    while n * p * per > budget and p > 2:
+        p -= 1
+    while n * p * per > budget and n > 1:
+        n -= 1
+    while n * p * per > budget and p > 1:
+        p -= 1
+    return n, p
+
+
+def auto_workers() -> int:
+    """perf.num_workers "auto" on the box, as kitsune.trainset.default_num_workers resolves it on Linux."""
+    return max(1, min(8, (os.cpu_count() or 2) // 2))
 
 
 # ============================================================================================================ plans
@@ -296,14 +322,12 @@ def _box_student_runs(box: str, r: dict) -> list[str]:
     plan = box_plan(box, r)
     runs = list(plan["runs"]) + list(plan["calibrate"])
     runs += [r["lr_probes"]["classes"][c]["probed_on"] for c in plan["probe_classes"]]
-    if "speed" in plan["extras"]:
-        runs += list(r["runs"])
     return list(dict.fromkeys(runs))
 
 
 def box_students(box: str, rules: dict | None = None) -> list[str]:
     """The student dirs (repo paths) the box pulls, and only those: the ones of its runs, its calibrated runs and its
-    probes' runs; with the speed extra every study student (the probe times them all)."""
+    probes' runs (the speed extra times trained weights, which it takes from the runs repo, not the init dirs)."""
     r = rules if rules is not None else prereg.rules()
     return list(dict.fromkeys(r["runs"][run]["student"] for run in _box_student_runs(box, r)))
 
@@ -418,6 +442,12 @@ class HubUploader:
                                                       allow_patterns=[f"{prefix}/*"]), f"download {prefix}")
         return Path(local_dir) / prefix
 
+    def list_dir(self, path_in_repo: str) -> list[str]:
+        """The names of the entries directly under a folder of the runs repo."""
+        entries = _finish().hub_retry(lambda: list(self.api().list_repo_tree(
+            self.repo, path_in_repo=path_in_repo, repo_type=self.repo_type)), f"list {path_in_repo}")
+        return [e.path.rsplit("/", 1)[-1] for e in entries]
+
 
 # ============================================================================================================ queue
 
@@ -429,6 +459,11 @@ class Settings:
     state_dir: Path = field(default_factory=lambda: Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state")))
     out_repo: str | None = field(default_factory=lambda: os.environ.get("KITSUNE_OUT_REPO") or None)
     gpus: list[str] | None = None  # None: KITSUNE_GPUS (comma list), else nvidia-smi's indices
+    # the GPUs the box was rented with (vast/launch.py KITSUNE_N_GPUS): the queue refuses to run on another count
+    n_gpus: int | None = field(default_factory=lambda: int(os.environ["KITSUNE_N_GPUS"])
+                               if os.environ.get("KITSUNE_N_GPUS") else None)
+    shm_bytes: int | None = None  # the host's /dev/shm size (None: measured at SHM_PATH; no such dir: no shm cut)
+    auto_workers: int | None = None  # perf.num_workers "auto" (None: auto_workers(), the trainer's own resolution)
     python: str = sys.executable
     train_cmd: list[str] | None = None  # default: python scripts/04_distill.py
     stores_cmd: list[str] | None = None  # default: python -m kitsune.study_queue build-stores
@@ -447,17 +482,17 @@ class Settings:
 
 
 def detect_gpus() -> list[str]:
+    """KITSUNE_GPUS (a comma list of CUDA_VISIBLE_DEVICES values), else nvidia-smi's indices; empty when neither says
+    (the queue then refuses: a box that silently ran on one assumed GPU would calibrate each run alone and train its
+    wave one run after the other)."""
     if os.environ.get("KITSUNE_GPUS"):
         return [g.strip() for g in os.environ["KITSUNE_GPUS"].split(",") if g.strip()]
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"], capture_output=True,
                              text=True, timeout=60).stdout
-        gpus = [x.strip() for x in out.splitlines() if x.strip().isdigit()]
-        if gpus:
-            return gpus
+        return [x.strip() for x in out.splitlines() if x.strip().isdigit()]
     except (OSError, subprocess.SubprocessError):
-        pass
-    return ["0"]
+        return []
 
 
 def _atomic_json(path: Path, obj):
@@ -487,6 +522,14 @@ class Queue:
         self.rules = self.s.rules if self.s.rules is not None else prereg.rules()
         self.plan = box_plan(box, self.rules)
         self.gpus = list(self.s.gpus or detect_gpus())
+        if not self.gpus:
+            raise QueueError("no GPU found: nvidia-smi listed none and KITSUNE_GPUS is not set")
+        if self.s.n_gpus is not None and len(self.gpus) != int(self.s.n_gpus):
+            raise QueueError(f"box {box} was rented with {self.s.n_gpus} GPU(s) (KITSUNE_N_GPUS), the queue found "
+                             f"{len(self.gpus)}: {self.gpus}")
+        if not self.plan.get("shakedown") and len(self.gpus) < len(self.plan["runs"]):
+            raise QueueError(f"box {box} trains its {len(self.plan['runs'])} runs in one wave, one per GPU, and "
+                             f"calibrates them concurrently: {len(self.gpus)} GPU(s) found ({self.gpus})")
         self.state_path = Path(self.s.state_dir) / STATE_FILE
         self.state = self._load_state()
         self.uploader = self.s.uploader if self.s.uploader is not None else (
@@ -499,7 +542,8 @@ class Queue:
 
     def _load_state(self) -> dict:
         fresh = dict(box=self.box, version=1, started=time.time(), items={}, calibration=None, num_workers=None,
-                     probes={}, lr_choice=None, numbers=None, stores_done=False, final=None, abandoned=[])
+                     probes={}, lr_choice=None, numbers=None, stores_done=False, final=None, abandoned=[], shm=None,
+                     smoke_gate_off=None)
         if not self.state_path.is_file():
             return fresh
         st = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -839,6 +883,9 @@ class Queue:
             it["status"] = "failed"  # a readout, never a reason to stop the box
         elif kind == "calib":
             it["status"] = "failed"  # the calibration group decides
+        elif str((summary or {}).get("error", "")).startswith(DETERMINISTIC):
+            it["status"] = "failed"  # the smoke checks fail the same way from the same start: no second try
+            self.event("item_failed", item=name, rc=rc, error=str(summary.get("error"))[:600], retried=False)
         elif sum(1 for a in it["attempts"] if a.get("rc") not in (None, 0)) < MAX_ATTEMPTS and kind != "stores":
             # failures only: an attempt a queue restart interrupted (no rc) is no failure of the item
             it["status"] = "retry"
@@ -947,9 +994,12 @@ class Queue:
     # calibration ------------------------------------------------------------------------------------------
 
     def calib_groups(self) -> list[list[tuple[str, bool]]]:
-        """The calibrate list in groups of len(gpus); a short last group is filled with other runs of the list as
-        unmeasured load (measured False)."""
-        runs, g = list(self.plan["calibrate"]), len(self.gpus)
+        """The calibrate list in groups of len(gpus), the box's wave runs first: they train together, so they are
+        measured together (STUDY.md 5.1: each wave's group running concurrently). A short last group - box B's
+        reference run, which the box calibrates but does not train - is filled with other runs of the list, the wave
+        runs first, as unmeasured load (measured False), so it is measured under the wave's concurrency too."""
+        cal, g = list(self.plan["calibrate"]), len(self.gpus)
+        runs = [r for r in self.plan["runs"] if r in cal] + [r for r in cal if r not in self.plan["runs"]]
         groups = [runs[i:i + g] for i in range(0, len(runs), g)]
         out = []
         for grp in groups:
@@ -982,19 +1032,23 @@ class Queue:
 
     def calibrate_group(self, rnd: int, gi: int, group: list[tuple[str, bool]], a: int, n: int,
                         workers: int | None) -> dict:
-        """Run one group concurrently (two tries); -> {run: calibration entry} for its measured runs."""
+        """Run one group concurrently (two tries); -> {run: calibration entry} for its measured runs. Its trainers wait
+        at their first step (calibrate.barrier) until every one of them is there, then the queue releases them all at
+        once (GO): the steps (a, a + n] of every run then fall while all the others train (the fastest keeps going
+        until the slowest has its window, when the queue stops the group), so the pre-registered window, literally,
+        is measured under the group's concurrency."""
         for attempt in (1, 2):
             names = {}
             for run, measured in group:
                 name = f"calib-{run}" + ("" if measured else f"-load{gi}") + (f"-w{workers}" if workers else "") + (
                     f"-try{attempt}" if attempt > 1 else "")
-                sets = [f"perf.num_workers={workers}"] if workers else []
+                sets = self.loader_sets(run, workers) + ["calibrate.barrier=true"]
                 self.add_item(name, "calib", config_path(f"calib-{run}"), sets, run=run, measured=measured)
                 for d in self.run_dirs_of(name):  # a restart: the group runs again as a whole, every run fresh
                     self.set_aside(d, "calibration group run again")
                 self.item(name).update(status="pending", run_dir=None, result=None)
                 names[name] = run
-            tails, stopped, t0 = {}, [False], time.time()
+            tails, gate, t0 = {}, dict(released=None, stopped=False), time.time()
 
             def monitor(running):
                 for r in running.values():
@@ -1002,48 +1056,56 @@ class Queue:
                         rd = self.find_run_dir(r["name"])
                         if rd is not None:
                             tails[r["name"]] = StepTail(rd)
-                if stopped[0]:
+                if gate["stopped"]:
                     return
-                if len(tails) == len(names):
-                    wins = group_windows({k: t.poll() for k, t in tails.items()}, a, n)
-                    if all(wins.values()):
-                        self.stop_group(names, "windows complete")
-                        stopped[0] = True
-                        return
-                if time.time() - t0 > self.s.calib_timeout_s:
-                    self.stop_group(names, f"no complete windows after {self.s.calib_timeout_s:.0f} s")
-                    stopped[0] = True
                 if any(self.item(k)["status"] == "failed" for k in names):
                     self.stop_group(names, "a run of the group failed")
-                    stopped[0] = True
+                    gate["stopped"] = True
+                elif gate["released"] is None:
+                    if len(tails) == len(names) and all((t.run_dir / READY_FILE).is_file() for t in tails.values()):
+                        gate["released"] = self.release_group(names)
+                elif len(tails) == len(names) and all(window_end(t.poll(), a, n) for t in tails.values()):
+                    self.stop_group(names, "windows complete")
+                    gate["stopped"] = True
+                    return
+                if not gate["stopped"] and time.time() - t0 > self.s.calib_timeout_s:
+                    self.stop_group(names, f"no complete windows after {self.s.calib_timeout_s:.0f} s")
+                    gate["stopped"] = True
 
             self.execute(list(names), monitor=monitor)
             rows = {k: read_step_rows(self.root / self.item(k)["run_dir"]) if self.item(k)["run_dir"] else {}
                     for k in names}
-            wins = group_windows(rows, a, n)
-            ok = all(self.item(k)["status"] == "done" for k in names) and all(wins.values())
+            ends = {k: window_end(rows[k], a, n) for k in names}
+            ok = gate["released"] is not None and all(self.item(k)["status"] == "done" for k in names) \
+                and all(ends.values())
             if ok:
                 out = {}
                 for k, run in names.items():
                     if not self.item(k)["measured"]:
                         continue
-                    s0, s1 = wins[k]
-                    st = calibration_stats(rows[k], s0, s1)
-                    fixed = calibration_stats(rows[k], a, a + n)  # the literal steps (50, 250], for the record
+                    st = calibration_stats(rows[k], a, ends[k])
                     res = self.item(k)["result"] or {}
                     micro = res.get("micro_audio_s") or self.rules["runs"][run]["micro_audio_s"]
                     out[run] = dict(t_step_s=st["t_step_s"], micro_audio_s=float(micro),
                                     data_wait_frac=st["data_wait_frac"], steps_measured=st["steps_measured"],
                                     window=st["window"], mean_step_s=st["mean_step_s"], workers=res.get("workers"),
-                                    run_dir=self.item(k)["run_dir"],
-                                    fixed_window={x: fixed[x] for x in ("window", "t_step_s", "data_wait_frac")})
+                                    run_dir=self.item(k)["run_dir"], released_wall=gate["released"],
+                                    group=[names[x] for x in names])
                 return out
-            self.event("calibration_group_failed", round=rnd, group=gi, attempt=attempt,
-                       status={k: self.item(k)["status"] for k in names}, windows=wins)
+            self.event("calibration_group_failed", round=rnd, group=gi, attempt=attempt, released=gate["released"],
+                       status={k: self.item(k)["status"] for k in names}, window_ends=ends)
             for k in names:  # the group runs again as a whole: this attempt's items are not the box's failures
                 self.item(k)["status"] = "superseded"
             self.save()
         raise QueueError(f"calibration group {gi} (round {rnd}) failed twice: {[r for r, _ in group]}")
+
+    def release_group(self, names: dict) -> float:
+        """Every trainer of the group waits at its first step (READY): GO into every run dir in one pass."""
+        wall = time.time()
+        for k in names:
+            (self.find_run_dir(k) / GO_FILE).write_text(f"{wall}\n", encoding="utf-8")
+        self.event("calibration_release", items=list(names), wall=wall)
+        return wall
 
     def stop_group(self, names: dict, why: str):
         for k in names:
@@ -1060,16 +1122,48 @@ class Queue:
         return float(p["max_steps"]) * float(t)
 
     def run_sets(self, run: str, calib: dict | None = None) -> list[str]:
-        """The calibrated micro-batch and loader workers every trainer of `run` gets: the calibration table's (the
-        numbers file's for a study run; the replicate's is the run it replicates)."""
+        """The calibrated micro-batch and the loader every trainer of `run` gets: the calibration table's micro-batch
+        (the numbers file's for a study run; the replicate's is the run it replicates) and loader_sets."""
         sets = []
         calib = calib if calib is not None else (self.state["calibration"] or {})
         c = calib.get(run) or calib.get(prereg.REPLICATE_OF if run == prereg.REPLICATE else "")
         if c and c.get("micro_audio_s"):
             sets.append(f"batch.micro_audio_s={float(c['micro_audio_s'])!r}")
-        if self.state["num_workers"]:
-            sets.append(f"perf.num_workers={int(self.state['num_workers'])}")
-        return sets
+        return sets + self.loader_sets(run, self.state["num_workers"])
+
+    def shm_budget(self) -> float | None:
+        """Each trainer's share of the host's /dev/shm: half of it (what scripts/04_distill.py shm_cap keeps free of
+        the rest) split evenly over the GPUs, measured once and kept in the state, so a restarted queue gives a branch
+        exactly its parent's loader. None without a /dev/shm (no cut)."""
+        if self.state["shm"] is None:
+            total = self.s.shm_bytes
+            if total is None and os.path.isdir(SHM_PATH):
+                try:
+                    total = shutil.disk_usage(SHM_PATH).total
+                except OSError:
+                    total = None
+            self.state["shm"] = dict(total_bytes=total, gpus=len(self.gpus),
+                                     per_trainer_bytes=0.5 * total / len(self.gpus) if total else None)
+            self.save()
+            self.event("shm", **self.state["shm"])
+        return self.state["shm"]["per_trainer_bytes"]
+
+    def loader_sets(self, run: str, workers: int | None = None) -> list[str]:
+        """perf.num_workers / perf.prefetch for every trainer of `run` (its calibration, its probes, its main and its
+        branch alike: a branch's config must equal its parent's): `workers` (the loader-bound retry's 12) or the
+        config's, cut so that its in-flight micro-batches at the planned micro-batch fit its shm_budget."""
+        sets = [f"perf.num_workers={int(workers)}"] if workers else []
+        budget = self.shm_budget()
+        if not budget:
+            return sets
+        perf = json.loads((self.root / config_path(run)).read_text(encoding="utf-8"))["perf"]
+        nw = workers or perf["num_workers"]
+        nw = int(nw) if nw != "auto" else int(self.s.auto_workers or auto_workers())
+        p = int(perf["prefetch"])
+        n2, p2 = shm_fit(nw, p, float(self.rules["runs"][run]["micro_audio_s"]), budget)
+        if (n2, p2) == (nw, p):
+            return sets
+        return [f"perf.num_workers={n2}", f"perf.prefetch={p2}"]
 
     def probe_item(self, cls: str, lr: float) -> str:
         p = self.rules["lr_probes"]["classes"][cls]
@@ -1263,9 +1357,57 @@ class Queue:
         n, lr = int(num["max_steps"][run]), float(num["lr"][run])
         mini = max(1, int(round(float(self.rules["evals"]["mini_every_frac"]) * n)))
         sets = [f"schedule.max_steps={n}", f"optim.lr={lr!r}", f"eval.mini.every_steps={mini}"]
-        return sets + self.run_sets(run, num.get("calibration") or self.state["calibration"] or {})
+        sets += self.run_sets(run, num.get("calibration") or self.state["calibration"] or {})
+        return sets + (["smoke.require_loss_decrease=false"] if run in (self.state["smoke_gate_off"] or {}) else [])
+
+    def smoke_gate_guard(self):
+        """Before the wave, once: a main run whose smoke gate (smoke.require_loss_decrease) would stop it at step
+        smoke.steps on a flat start runs without that one check. The evidence is its calibration run - the same
+        student, seed, data order and warm-up, at its class's lowest grid LR, the slowest start any chosen LR gives -
+        whose smoke logged loss_decreasing false (a scratch run is ~5 % into its 2,000-step warm-up at step 100). The
+        stop would come before the run's first full state, and its retry would start the same way: a lost main on the
+        paid box, for a check the probes of its class already answered. The replicate follows what box A decided for
+        the run it replicates. The other smoke checks (finite losses, throughput, undecodable rows) stay on."""
+        if self.state["smoke_gate_off"] is not None:
+            return
+        off = {}
+        for run in self.plan["runs"]:
+            sm = json.loads((self.root / config_path(run)).read_text(encoding="utf-8")).get("smoke") or {}
+            if not (sm.get("enabled") and sm.get("require_loss_decrease")):
+                continue
+            ev = self.smoke_evidence(run)
+            if ev is not None and ev.get("loss_decreasing") is False:
+                off[run] = ev
+                self.event("smoke_gate_off", run=run, **ev)
+        self.state["smoke_gate_off"] = off
+        self.save()
+
+    def smoke_evidence(self, run: str) -> dict | None:
+        """The smoke_steps record of the run's calibration run on this box, or (a box with numbers_from) the decision
+        its source box made for the run this one replicates (that box's queue summary in the runs repo)."""
+        c = (self.state["calibration"] or {}).get(run)
+        if c and c.get("run_dir"):
+            sm = next((e for e in reversed(read_events(self.root / c["run_dir"])) if e.get("kind") == "smoke_steps"),
+                      None)
+            return None if sm is None else dict(
+                source=c["run_dir"], loss_decreasing=bool(sm.get("loss_decreasing")),
+                loss_first=sm.get("loss_first"), loss_last=sm.get("loss_last"), steps=sm.get("steps"))
+        src = self.plan.get("numbers_from")
+        if src and self.uploader is not None:
+            of = prereg.REPLICATE_OF if run == prereg.REPLICATE else run
+            remote = f"{NUMBERS_DIR}/box-{src}/{SUMMARY_FILE}"
+            try:
+                summ = json.loads(self.uploader.download(remote, Path(self.s.state_dir) / "numbers_from")
+                                  .read_text(encoding="utf-8"))
+            except Exception as e:  # noqa: BLE001  no evidence: the gate stays on
+                log(f"no smoke evidence for {run}: {remote}: {type(e).__name__}: {e}")
+                return None
+            ev = (summ.get("smoke_gate_off") or {}).get(of)
+            return dict(ev, source=f"box {src}: {of}") if ev else None
+        return None
 
     def phase_wave(self):
+        self.smoke_gate_guard()
         todo = []
         for i, run in enumerate(self.plan["runs"]):
             gpu = self.gpus[i % len(self.gpus)]
@@ -1316,30 +1458,73 @@ class Queue:
         if "speed" in self.plan["extras"]:
             self.phase_speed()
 
+    def trained_weights(self, run: str) -> tuple[str | None, str]:
+        """(model dir, where from) of a study run's final exported weights, for the speed probe: an AED student's greedy
+        decode runs as long as its weights make it (an untrained decoder runs on to max_new), so its speed is its
+        trained weights' (a CTC decode costs the same whatever the weights; the rule is the same). This box's run: the
+        newest step_<N> of its run dir. Another box's: the run dir its queue summary (study/box-<box>/ in the runs
+        repo) names, its newest step_<N> downloaded. (None, why) when there are none - that system is not timed."""
+        fin = _finish()
+        if run in self.plan["runs"]:
+            it = self.state["items"].get(run) or {}
+            rd = self.root / it["run_dir"] if it.get("status") == "done" and it.get("run_dir") else None
+            w = fin.newest_checkpoint(rd / "checkpoints", fin.WEIGHTS_RE) if rd is not None else None
+            return (self._rel(w), "trained on this box") if w is not None else (
+                None, f"{run} has no finished run on this box")
+        box = next((b for b, p in (self.rules.get("boxes") or {}).items() if run in p["runs"]), None)
+        if box is None or self.uploader is None:
+            return None, f"{run}: no box trains it" if box is None else f"{run}: no runs repo to fetch it from"
+        dest = Path(self.s.state_dir) / "speed_models"
+        try:
+            summ = json.loads(self.uploader.download(f"{NUMBERS_DIR}/box-{box}/{SUMMARY_FILE}", dest / f"box-{box}")
+                              .read_text(encoding="utf-8"))
+            it = (summ.get("items") or {}).get(run) or {}
+            if it.get("status") != "done" or not it.get("run_dir"):
+                return None, f"{run}: box {box}'s queue summary has no finished run ({it.get('status')})"
+            steps = [int(m.group(1)) for x in self.uploader.list_dir(f"{it['run_dir']}/checkpoints")
+                     if (m := fin.WEIGHTS_RE.match(x))]
+            if not steps:
+                return None, f"{run}: no exported weights under {it['run_dir']}/checkpoints in the runs repo"
+            local = self.uploader.download_dir(f"{it['run_dir']}/checkpoints/step_{max(steps)}", dest)
+            return str(local), f"box {box}'s {it['run_dir']}, from the runs repo"
+        except Exception as e:  # noqa: BLE001  a readout: logged, the system is not timed
+            return None, f"{run}: box {box}'s weights not fetched ({type(e).__name__}: {e})"
+
     def phase_speed(self):
-        """The speed probe of every study student and both teachers, one model at a time on an idle host (nothing else
-        runs by now)."""
+        """The speed probe of every study student (its trained final weights: trained_weights) and both teachers, one
+        model at a time on an idle host (nothing else runs by now)."""
         tool = self.root / SPEED_TOOL
         if not tool.is_file() and self.s.speed_cmd is None:
             self.event("speed_skipped", why=f"{SPEED_TOOL} is not in this checkout (WP5b)")
             return
         out = self.root / "runs" / f"speed-{self.box}"
         out.mkdir(parents=True, exist_ok=True)
-        # a student's speed is its shape's: the init dir every box pulls stands for the trained weights
-        systems = [(run, spec["family"], spec["student"]) for run, spec in self.rules["runs"].items()]
+        systems = [(run, spec["family"], None) for run, spec in self.rules["runs"].items()]
         systems += [(k, kind, path) for k, (kind, path) in TEACHERS.items()]
         for sys_name, kind, path in systems:
-            args = ["--kind", kind, *(["--model", path] if path else []), "--system", sys_name,
-                    "--store", str(self.root / "cache" / "eval"), "--per-set", str(SPEED_PER_SET),
-                    "--out", str(out / "speed.json"), "--require-idle"]
-            name = self.add_item(f"speed-{sys_name}", "speed", None, args)
+            name = f"speed-{sys_name}"
+            if name not in self.state["items"]:
+                source = "teacher"
+                if kind in ("aed", "ctc"):  # a student: its trained final weights
+                    path, source = self.trained_weights(sys_name)
+                if kind in ("aed", "ctc") and path is None:
+                    self.add_item(name, "speed", None, [])
+                    self.item(name).update(status="failed", source=dict(model=None, why=source))
+                    self.event("speed_skipped", system=sys_name, why=source)
+                    self.save()
+                    continue
+                args = ["--kind", kind, *(["--model", path] if path else []), "--system", sys_name,
+                        "--store", str(self.root / "cache" / "eval"), "--per-set", str(SPEED_PER_SET),
+                        "--out", str(out / "speed.json"), "--require-idle"]
+                self.add_item(name, "speed", None, args)
+                self.item(name)["source"] = dict(model=path, why=source)
             if self.item(name)["status"] != "done":
                 self.execute([name])
         with open(out / "events.jsonl", "a", encoding="utf-8") as f:  # makes it a run dir for finish.py's uploads
             for sys_name, _, _ in systems:
                 it = self.item(f"speed-{sys_name}")
                 f.write(json.dumps({"kind": "speed", "system": sys_name, "status": it["status"],
-                                    "wall": time.time()}) + "\n")
+                                    **(it.get("source") or {}), "wall": time.time()}) + "\n")
         self.state["items"].setdefault("speed", dict(kind="speed-dir", config=None, sets=[], after=None, run=None,
                                                      affinity=None, env={}, measured=False, status="done",
                                                      attempts=[], run_dir=self._rel(out), verified=None, result=None))
@@ -1349,7 +1534,10 @@ class Queue:
     # shakedown --------------------------------------------------------------------------------------------
 
     def phase_shakedown(self):
-        """STUDY.md 6.1, one item after the other on the one GPU; every run dir uploaded and verified."""
+        """STUDY.md 6.1, one item after the other on the one GPU; every run dir uploaded and verified. A smoke
+        (shake-smoke-<run>) is the run's own start - its warm-up, seed and data order, its smoke gate - at its class's
+        lowest grid LR; the queue ends it with the STOP file once its smoke checks are logged (a failed check fails
+        it, and the shakedown: the study box's main would stop the same way)."""
         todo = []
         for name in self.plan["items"]:
             kind, after, env, run = "shake", None, {}, None
@@ -1367,8 +1555,17 @@ class Queue:
                 self.item("shake-parent-half")["sets"] = [f"branch.parent={self.item(name)['run_dir']}"]
                 self.save()
 
+        def monitor(running):  # a smoke runs at its study warm-up, capped by CALIB_MAX_STEPS: ended after its checks
+            for r in running.values():
+                if not r["name"].startswith("shake-smoke-"):
+                    continue
+                rd = self.find_run_dir(r["name"])
+                if rd is not None and not (rd / "STOP").exists() and \
+                        any(e.get("kind") == "smoke_steps" for e in read_events(rd)):
+                    (rd / "STOP").write_text("the smoke checks are done\n", encoding="utf-8")
+
         on_done("shake-parent")
-        self.execute([n for n in todo if self.item(n)["status"] != "done"], on_done=on_done)
+        self.execute([n for n in todo if self.item(n)["status"] != "done"], on_done=on_done, monitor=monitor)
         resumed = self.item("shake-resume")
         if resumed["status"] == "done" and not any(a.get("resume") for a in resumed["attempts"]):
             raise QueueError("shake-resume finished without the crash and resume it is there to exercise")
@@ -1381,6 +1578,7 @@ class Queue:
         summary = dict(box=self.box, status=status, reason=reason, rc=rc, gpus=self.gpus, items=items,
                        calibration=self.state["calibration"], num_workers=self.state["num_workers"],
                        probes=self.state["probes"], lr_choice=self.state["lr_choice"], numbers=self.state["numbers"],
+                       smoke_gate_off=self.state["smoke_gate_off"], shm=self.state["shm"],
                        abandoned=self.state["abandoned"], started=self.state["started"], ended=time.time())
         path = Path(self.s.state_dir) / SUMMARY_FILE
         _atomic_json(path, summary)

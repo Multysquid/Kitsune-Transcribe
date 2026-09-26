@@ -28,7 +28,8 @@ Names (CONTRACT.md section 1):
                              probe, no checkpoints; max_steps CALIB_MAX_STEPS is a cap, the box ends a calibration group
                              with the STOP file once every run of it has its window
   shake-*.json               the shakedown box (STUDY.md 6.1): per Cohere-box run a 100-step smoke at the planned micro
-                             (a calibration over steps 50-100), a crash-and-resume run, a 50-step toy parent and its T/2
+                             with the run's warm-up and smoke gate (a calibration over steps 50-100, which the box ends
+                             after the smoke), a crash-and-resume run, a 50-step toy parent and its T/2
                              branch, a complete eval on a subset with an in-loop complete eval, a mini eval and a lean
                              upload
   anchor-b20.json            not a training config: scripts/05_evaluate.py reads its data and eval keys to re-score the
@@ -185,8 +186,12 @@ def _toy(cfg: dict, name: str, steps: int, warmup: int, lr: float, **over) -> di
 
 def shake_configs(box_runs: list[str], r: dict | None = None, out_repo: str = RUNS_REPO) -> dict[str, dict]:
     """The shakedown box's configs (STUDY.md 6.1) for the runs of the first study box:
-      shake-smoke-<run>   the memory probe at the planned micro and a 100-step smoke (smoke.steps 100: its checks,
-                          finite losses, the throughput floor), as a calibration over steps 50-100
+      shake-smoke-<run>   the memory probe at the planned micro and a 100-step smoke with the study run's own smoke
+                          gate (finite and falling losses, the throughput floor, the undecodable rows): the run's
+                          student, seed, data order and warm-up, at its class's lowest grid LR (the slowest start any
+                          chosen LR gives), as a calibration over steps 50-100 capped by CALIB_MAX_STEPS; the box
+                          ends it with the STOP file once its smoke checks are logged (a scratch run's 2,000-step
+                          warm-up does not fit a 100-step schedule, and the smoke must see the start the main sees)
       shake-resume        the smallest run for 60 steps as an LR probe with a full state every 20 steps; the box
                           crashes it at step 45 (KITSUNE_CRASH_AT_STEP) and resumes it from step 40, and its end phase
                           scores the complete gate sets teacher-forced (lr_probe_eval)
@@ -201,9 +206,9 @@ def shake_configs(box_runs: list[str], r: dict | None = None, out_repo: str = RU
     lr_of = {run: min(float(x) for x in r["lr_probes"]["classes"][runs[run]["lr_from"]]["grid"]) for run in box_runs}
     for run in box_runs:
         c = calib_config(run, r, out_repo)
+        gate = run_config(run, r, out_repo)["smoke"]["require_loss_decrease"]  # the study run's own gate
         out[f"shake-smoke-{run}"] = _merge(c, {"run_name": f"shake-smoke-{run}",
-                                               "schedule": {"max_steps": SHAKE_SMOKE_STEPS, "warmup_steps": 10},
-                                               "smoke": {"steps": SHAKE_SMOKE_STEPS},
+                                               "smoke": {"steps": SHAKE_SMOKE_STEPS, "require_loss_decrease": gate},
                                                "calibrate": {"window": [50, SHAKE_SMOKE_STEPS]}})
     by_size = sorted(box_runs, key=lambda x: int(runs[x]["params_total"]))
     smallest, largest = by_size[0], by_size[-1]

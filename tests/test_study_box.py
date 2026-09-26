@@ -3,13 +3,15 @@
 - tools/make_study_configs.py: every config of every box from one base, the grids read from kitsune.prereg, each AED
   config valid for scripts/04_distill.py once the box fills its placeholders (and refused before), --check
 - the trainer's calibrate block (scripts/04_distill.py): the box keys' validation, a tiny CPU calibration run that ends
-  on its window or on the STOP file with its step-time table
-- kitsune/study_queue.py: the calibration statistics and the aligned windows of a group; a CPU dry run of the whole
-  Cohere box (stores once and alone, the calibration group concurrent on distinct GPUs, the probes with the edge
-  extension, the numbers written and uploaded before the first study step, main runs then their branches on the same
-  GPU, lean uploads), the halt paths (an LR edge after its extension, a calibration still loader-bound), a restart
-  after a kill mid-wave, box B's plan (five calibrated runs on four GPUs, the speed probes; CTC items stubbed by the fake
-  trainer until the CTC trainer is merged), the replicate's derived numbers, the shakedown
+  on its window or on the STOP file with its step-time table, and one that waits at its start barrier for GO
+- kitsune/study_queue.py: the calibration statistics and windows, the /dev/shm fit; a CPU dry run of the whole Cohere
+  box (stores once and alone, the calibration group released together on distinct GPUs and measured over the literal
+  window, the probes with the edge extension, the numbers written and uploaded before the first study step, main runs
+  then their branches on the same GPU, lean uploads), the halt paths (an LR edge after its extension, a calibration
+  still loader-bound), a restart after a kill mid-wave, the smoke gate guard and a smoke failure without a second try,
+  the GPU count and /dev/shm share, box B's plan (its wave calibrated together, the reference under the wave's load,
+  the speed probes on trained weights; CTC items stubbed by the fake trainer until the CTC trainer is merged), the
+  replicate's derived numbers, the shakedown
 Every process the queue starts is tests/fake_study_trainer.py here (fake GPUs = distinct CUDA_VISIBLE_DEVICES values,
 uploads recorded by a fake uploader); the real trainer runs in the calibrate-block test only. CPU only.
 """
@@ -23,6 +25,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 if not os.environ.get("CUDA_VISIBLE_DEVICES"):
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -159,8 +162,20 @@ def test_probe_and_calibration_configs(trainer):
         assert math.isclose(cfg["schedule"]["cooldown_frac"] * p["max_steps"], p["cooldown"])
         assert cfg["student"] == r["runs"][p["probed_on"]]["student"] and cfg["ckpt"]["upload_full_at"] == []
     cal = trainer.load_config(str(ROOT / "configs" / "study" / "calib-study-t06.json"), [])
-    assert cal["calibrate"] == {"enabled": True, "window": list(prereg.CALIB_STEPS)} and cal["lr_probe"]["enabled"]
+    assert cal["calibrate"] == {"enabled": True, "window": list(prereg.CALIB_STEPS), "barrier": False}
     assert cal["batch"]["micro_audio_s"] == 600 and cal["smoke"]["enabled"] and cal["ckpt"]["full_after_smoke"] is False
+    assert cal["lr_probe"]["enabled"]
+    # the shakedown's smoke is the study run's own start: its warm-up, seed and smoke gate (a falling loss), at its
+    # class's lowest grid LR; capped by the calibration's max_steps, ended by the box after the smoke
+    for run in Q.first_box_runs(r):
+        main = trainer.load_config(str(ROOT / "configs" / "study" / f"{run}.json"), fill(ROOT / "configs" / "study" /
+                                                                                          f"{run}.json"))
+        sm = trainer.load_config(str(ROOT / "configs" / "study" / f"shake-smoke-{run}.json"), [])
+        assert sm["smoke"]["require_loss_decrease"] is main["smoke"]["require_loss_decrease"] is True
+        assert sm["schedule"]["warmup_steps"] == main["schedule"]["warmup_steps"] and sm["seed"] == main["seed"]
+        assert sm["schedule"]["max_steps"] > sm["schedule"]["warmup_steps"] and sm["smoke"]["steps"] == 100
+        grid = r["lr_probes"]["classes"][r["runs"][run]["lr_from"]]["grid"]
+        assert sm["optim"]["lr"] == min(grid) and sm["calibrate"]["window"] == [50, 100]
 
 
 # ========================================================================================= the trainer's block
@@ -169,10 +184,12 @@ def test_probe_and_calibration_configs(trainer):
 def test_the_box_keys_are_validated(trainer):
     base = trainer.load_config(None, [])
     assert base["pull_parakeet"] is False and base["selection_recipe"]["study"] is None
-    assert base["calibrate"] == {"enabled": False, "window": [50, 250]}
+    assert base["calibrate"] == {"enabled": False, "window": [50, 250], "barrier": False}
     for sets, match in ((["pull_parakeet=true"], "parakeet_root"),
                         (['selection_recipe.study={"f1a_max": 0.5}'], "selection_recipe.study"),
                         (["calibrate.window=[5, 5]"], "calibrate.window"),
+                        (["calibrate.barrier=true"], "calibrate.barrier"),
+                        (["calibrate.barrier=1"], "calibrate.barrier"),
                         (["calibrate.enabled=true"], "calibrate.enabled needs"),
                         (["calibrate.enabled=true", "lr_probe.enabled=true", "schedule.clock=steps",
                           "schedule.max_steps=40", "schedule.warmup_steps=1"], "ends before the window"),
@@ -228,6 +245,32 @@ def test_calibration_run_ends_with_its_step_time_table(env, hub, trainer):
     s = json.loads((one_run(env["root"], "calib-b") / "summary.json").read_text(encoding="utf-8"))
     assert 15 <= s["steps"] < 400 and s["calibrate"]["steps_measured"] == 7
 
+    # the start barrier (the box's calibration groups): READY once set up, no step before GO
+    path = write_config(env, "calib-c", over)
+    released = {}
+
+    def releaser():
+        for _ in range(6000):
+            for d in runs.glob("calib-c-2*"):
+                if (d / Q.READY_FILE).is_file():
+                    time.sleep(0.5)  # the trainer waits meanwhile
+                    released["wall"] = time.time()
+                    (d / Q.GO_FILE).write_text("go\n")
+                    return
+            time.sleep(0.05)
+
+    th = threading.Thread(target=releaser, daemon=True)
+    th.start()
+    assert trainer.main(["--config", path, "--set", "calibrate.barrier=true"]) == 0
+    th.join(5)
+    run = one_run(env["root"], "calib-c")
+    bar = [e for e in events(run) if e["kind"] == "calibrate_barrier"]
+    assert [e["state"] for e in bar] == ["ready", "released"] and bar[1]["by"] == "GO" and bar[1]["waited_s"] >= 0.4
+    rows = Q.read_step_rows(run)
+    assert min(rows) == 1 and rows[1]["wall"] >= released["wall"]
+    s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert s["steps"] == 12 and s["calibrate"]["steps_measured"] == 7
+
 
 def test_build_stores_builds_what_the_trainer_then_reuses(env, capsys):
     """The box's store step (study_queue build-stores) builds the train and eval stores of a config's data keys with
@@ -279,16 +322,26 @@ def test_calibration_stats_is_the_median_step_time_and_the_wait_share():
     assert Q.calibration_stats({}, 5, 15)["t_step_s"] is None
 
 
-def test_group_windows_start_once_every_run_has_reached_step_a():
+def test_the_calibration_window_is_the_literal_one_and_a_skipped_step_is_replaced():
     a, n = 5, 10
-    slow = rows_of([100.0 + i for i in range(30)])  # step 5 at wall 104: the last to get there
-    fast = rows_of([90.0 + 0.1 * i for i in range(200)])  # step 5 at 90.4; wall >= 104 from step 141 on
-    assert Q.group_windows({"slow": slow}, a, n) == {"slow": (5, 15)}
-    w = Q.group_windows({"slow": slow, "fast": fast}, a, n)
-    assert w["slow"] == (5, 15) and w["fast"] == (141, 151)
-    assert Q.group_windows({"slow": slow, "late": {}}, a, n) == {"slow": None, "late": None}
-    short = rows_of([100.0 + i for i in range(12)])
-    assert Q.group_windows({"s": short}, a, n) == {"s": None}
+    rows = rows_of([100.0 + i for i in range(30)])
+    assert Q.window_end(rows, a, n) == 15 and Q.calibration_stats(rows, a, 15)["steps_measured"] == n
+    del rows[9]  # a skipped step: it and its successor are not measured, two more steps take their place
+    assert Q.window_end(rows, a, n) == 17 and Q.calibration_stats(rows, a, 17)["steps_measured"] == n
+    assert Q.window_end(rows_of([1.0] * 12), a, n) is None and Q.window_end({}, a, n) is None
+
+
+def test_shm_fit_cuts_as_the_trainers_shm_cap(trainer, monkeypatch, tmp_path):
+    per = 600 * Q.SHM_BYTES_PER_AUDIO_S  # one micro-batch of 600 s
+    assert Q.shm_fit(8, 4, 600, 32 * per) == (8, 4)
+    assert Q.shm_fit(8, 4, 600, 16 * per) == (8, 2)  # the prefetch first, down to 2
+    assert Q.shm_fit(8, 4, 600, 10 * per) == (5, 2)  # then the workers
+    assert Q.shm_fit(8, 4, 600, 1.5 * per) == (1, 1)  # then the prefetch to 1; below that the trainer's own cut
+    for k in (40, 16, 10, 3, 1.5):  # the trainer's shm_cap with the same budget (half its free space) agrees
+        monkeypatch.setattr(trainer.shutil, "disk_usage",
+                            lambda p, _f=2 * k * per: SimpleNamespace(free=_f, total=_f, used=0))
+        n, p, _ = trainer.shm_cap(8, 4, 600.0, shm=str(tmp_path))
+        assert (n, p) == Q.shm_fit(8, 4, 600, k * per), k
 
 
 def test_step_tail_reads_only_what_was_appended(tmp_path):
@@ -338,6 +391,15 @@ class FakeUploader:
         p.write_bytes(self.remote[path_in_repo])
         return p
 
+    def list_dir(self, path_in_repo) -> list[str]:
+        pre = path_in_repo.rstrip("/") + "/"
+        return sorted({k[len(pre):].split("/", 1)[0] for k in self.remote if k.startswith(pre)})
+
+    def download_dir(self, prefix, local_dir) -> Path:
+        for k in [k for k in self.remote if k.startswith(prefix.rstrip("/") + "/")]:
+            self.download(k, local_dir)
+        return Path(local_dir) / prefix
+
 
 def write_numbers_stub(path, calibration, probes, lrs, max_steps, *, rules_path=None, host=None,
                        allow_pending=False):
@@ -370,13 +432,15 @@ def box(tmp_path, monkeypatch):
         monkeypatch.setattr(prereg, "write_numbers", write_numbers_stub)
     log = tmp_path / "fake-log"
 
-    def make(name="A", gpus=("0", "1", "2", "3"), uploader=None, env=None):
+    def make(name="A", gpus=("0", "1", "2", "3"), uploader=None, env=None, **settings):
+        # shm_bytes: a /dev/shm no loader outgrows, unless a test sets it (the host's own is not the test's)
+        settings = dict(dict(shm_bytes=1 << 50, auto_workers=8, n_gpus=None), **settings)
         s = Q.Settings(root=tmp_path, state_dir=tmp_path / "state", out_repo=None, gpus=list(gpus), python=PY,
                        train_cmd=[PY, str(FAKE), "train"], stores_cmd=[PY, str(FAKE), "stores"],
                        anchor_cmd=[PY, str(FAKE), "anchor"], speed_cmd=[PY, str(FAKE), "speed"],
                        uploader=uploader if uploader is not None else FakeUploader(), rules=study_rules(),
                        rules_path=tmp_path / "study" / "PREREG.json", allow_pending=True, poll_s=0.02,
-                       sync_offset_s=0.05, host="test-host", env=dict(FAKE_LOG=str(log), **(env or {})))
+                       sync_offset_s=0.05, host="test-host", env=dict(FAKE_LOG=str(log), **(env or {})), **settings)
         return Q.Queue(name, s)
 
     def records():
@@ -423,20 +487,24 @@ def test_box_a_dry_run(box):
     stores = [x for x in recs if x["mode"] == "stores"]
     assert len(stores) == 1 and all(stores[0]["t1"] <= x["t0"] for x in recs if x is not stores[0])
 
-    # calibration: the four runs at once, one per GPU, each measured over an aligned window; t06 got to step 50 last
+    # calibration: the four runs at once, one per GPU, released together (t06 set up last: the others waited for it),
+    # each measured over the literal window (a, b] while every other run of the group trained
     cal = [by_item[f"calib-{run}"] for run in r["boxes"]["A"]["calibrate"]]
     assert sorted(x["gpu"] for x in cal) == ["0", "1", "2", "3"]
     assert max(x["t0"] for x in cal) < min(x["t1"] for x in cal)
+    assert all("calibrate.barrier=true" in x["argv"] for x in cal)
+    release = max(x["ready"] for x in cal)
+    assert all(x["released"] >= release and x["first_step"] >= release for x in cal)
+    assert by_item["calib-study-t06"]["ready"] == release  # the slow setup: the others waited at the barrier
     table = st["calibration"]
     a, b = prereg.CALIB_STEPS
     assert all(c["steps_measured"] == b - a and c["data_wait_frac"] < prereg.DATA_WAIT_MAX for c in table.values())
-    # aligned: every window starts once every run of the group has logged step a; the last one there measures (a, b]
+    assert all(c["window"] == [a, b] and c["released_wall"] <= min(x["first_step"] for x in cal) for c in table.values())
     rows = {run: Q.read_step_rows(root / c["run_dir"]) for run, c in table.items()}
-    t_all = max(r[a]["wall"] for r in rows.values())
-    last = max(rows, key=lambda run: rows[run][a]["wall"])
-    assert table[last]["window"] == [a, b]
-    assert all(rows[run][c["window"][0]]["wall"] >= t_all and c["window"][0] >= a for run, c in table.items())
-    assert all(c["fixed_window"]["window"] == [a, b] and c["fixed_window"]["t_step_s"] > 0 for c in table.values())
+    for run, c in table.items():  # every other run was stepping before this one's window and went on past it
+        for other, orows in rows.items():
+            assert orows[1]["wall"] <= rows[run][a]["wall"], (run, other)
+            assert rows[run][b]["wall"] <= max(x["wall"] for x in orows.values()), (run, other)
 
     # probes: the grids, the kept-t03 extension (its grid winner sat on the top edge), both chosen
     kept = sorted(r["lr_probes"]["classes"]["kept-t03"]["grid"])
@@ -589,39 +657,71 @@ def test_a_failed_calibration_group_runs_again_whole_and_a_diverged_probe_loses(
     assert st["lr_choice"]["scratch"]["decision"] == "chosen"
 
 
+def box_a_on_the_hub(r: dict) -> dict:
+    """The runs repo after box A: its queue summary (each run's run dir) and each run's exported weights."""
+    remote, items = {}, {}
+    for run in r["boxes"]["A"]["runs"]:
+        d = f"runs/{run}-20261001T000000Z"
+        items[run] = dict(kind="main", status="done", run_dir=d, verified=True)
+        for step in (3748, 9370):
+            remote[f"{d}/checkpoints/step_{step}/model.safetensors"] = f"{run}@{step}".encode()
+        remote[f"{d}/checkpoints/full_step_3748/model.pt"] = b"state"
+    remote["study/box-A/queue_summary.json"] = json.dumps(dict(box="A", status="complete", items=items)).encode()
+    return remote
+
+
 def test_box_b_plan_and_dry_run(box):
-    """Box B: five calibrated runs on four GPUs (the reference study-t06 in a second group, the other three GPUs
-    running unmeasured load), probes of three classes, the wave, the speed probes one model at a time at the end.
-    The CTC runs are the fake trainer's until the CTC trainer is merged (WP4b)."""
+    """Box B: five calibrated runs on four GPUs - its wave's four together first, then the reference study-t06 under
+    the load of three of them -, probes of three classes, the wave, the speed probes one model at a time at the end on
+    trained weights: box B's own from its run dirs, box A's from the runs repo, the replicate's (not trained yet)
+    skipped with a note. The CTC runs are the fake trainer's until the CTC trainer is merged (WP4b)."""
     make, records, root = box
     r = study_rules()
     items = Q.plan_items("B", r)
     groups = [x for x in items if x["phase"] == "calibrate"]
-    cal = r["boxes"]["B"]["calibrate"]
-    assert len(cal) == 5 and groups[0]["runs"] == cal[:4] and groups[0]["load"] == []
-    assert groups[1]["runs"] == cal[4:] and groups[1]["load"] == cal[:3]
+    cal, wave = r["boxes"]["B"]["calibrate"], r["boxes"]["B"]["runs"]
+    assert len(cal) == 5 and groups[0]["runs"] == wave and groups[0]["load"] == []
+    assert groups[1]["runs"] == ["study-t06"] and groups[1]["load"] == wave[:3]
     assert {x["cls"] for x in items if x["phase"] == "probe"} == {"lost", "kept-p03", "bridge"}
     assert [x["item"] for x in items if x["phase"] == "extras"] == ["speed"]
-    assert set(Q.box_students("B", r)) == {r["runs"][x]["student"] for x in r["runs"]}  # the speed probes: all
+    # the box's own students only (the speed probes time trained weights, not the init dirs)
+    assert set(Q.box_students("B", r)) == {r["runs"][x]["student"] for x in [*wave, "study-t06"]}
     assert Q.box_ctc_students("B", r) == [r["runs"][x]["student"] for x in ("study-p03", "study-p01", "study-p005")]
     obj = {**middle_wins("lost", r), **middle_wins("kept-p03", r), **middle_wins("bridge", r)}
-    assert make("B", env=dict(FAKE_OBJ=json.dumps(obj))).run() == Q.EXIT_OK
+    up = FakeUploader(remote=box_a_on_the_hub(r))
+    assert make("B", uploader=up, env=dict(FAKE_OBJ=json.dumps(obj))).run() == Q.EXIT_OK
     recs = records()
     st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
     assert set(st["calibration"]) == set(r["boxes"]["B"]["calibrate"])
+    first = [next(x for x in recs if x.get("item") == f"calib-{run}") for run in wave]
+    assert max(x["t0"] for x in first) < min(x["t1"] for x in first)  # the wave's four at once
     load = [x for x in recs if x.get("item", "").startswith("calib-") and "-load" in x["item"]]
-    last = next(x for x in recs if x.get("item") == f"calib-{cal[4]}")  # measured under the load of three others
+    last = next(x for x in recs if x.get("item") == "calib-study-t06")  # measured under the load of three others
     assert len(load) == 3 and all(x["t0"] < last["t1"] and x["t1"] >= last["t1"] - 1 for x in load)
+    t06 = Q.read_step_rows(root / st["calibration"]["study-t06"]["run_dir"])
+    a, b = prereg.CALIB_STEPS
+    assert all(x["first_step"] <= t06[a]["wall"] and x["t1"] >= t06[b]["wall"] for x in load)
     speed = [x for x in recs if x["mode"] == "speed"]
-    assert len(speed) == len(r["runs"]) + len(Q.TEACHERS) and all(a["t1"] <= b["t0"] for a, b in zip(speed, speed[1:]))
+    timed = [x for x in r["runs"] if x != prereg.REPLICATE]
+    assert len(speed) == len(timed) + len(Q.TEACHERS) and all(a["t1"] <= b["t0"] for a, b in zip(speed, speed[1:]))
     got = json.loads((root / "runs" / "speed-B" / "speed.json").read_text(encoding="utf-8"))["systems"]
-    assert set(got) == set(r["runs"]) | {"cohere", "parakeet-ctc", "parakeet-tdt"}
+    assert set(got) == set(timed) | {"cohere", "parakeet-ctc", "parakeet-tdt"}
     assert got["study-p03"]["kind"] == "ctc" and got["study-t06"]["kind"] == "aed" and got["cohere"]["model"] is None
+    for run in wave:  # box B's own: the final weights in its run dir
+        d = st["items"][run]["run_dir"]
+        assert got[run]["model"] == f"{d}/checkpoints/step_{st['numbers']['max_steps'][run]}"
+    for run in r["boxes"]["A"]["runs"]:  # box A's: its final weights from the runs repo
+        m = Path(got[run]["model"])
+        assert m.name == "step_9370" and (m / "model.safetensors").read_bytes() == f"{run}@9370".encode()
+    assert st["items"][f"speed-{prereg.REPLICATE}"]["status"] == "failed"
+    assert "box replicate" in st["items"][f"speed-{prereg.REPLICATE}"]["source"]["why"]
     assert all("--require-idle" in x["argv"] for x in speed)
     last_train = max(x["t1"] for x in recs if x["mode"] != "speed")
     assert all(x["t0"] >= last_train for x in speed)
     num = json.loads((root / "study" / "PREREG_numbers_B.json").read_text(encoding="utf-8"))
     assert set(num["max_steps"]) >= set(r["boxes"]["B"]["runs"]) and "study-t06" in num["calibration"]
+    summary = json.loads((root / "state" / "queue_summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "complete" and f"speed-{prereg.REPLICATE}" in summary["reason"]
 
 
 def test_replicate_takes_box_as_numbers(box):
@@ -630,7 +730,10 @@ def test_replicate_takes_box_as_numbers(box):
                  "max_steps": {"study-t01": 27400, "study-t06": 9370}, "lr": {"study-t01": 1e-3, "study-t06": 2e-4},
                  "calibration": {"study-t01": {"t_step_s": 0.4, "micro_audio_s": 800.0, "data_wait_frac": 0.01,
                                                "steps_measured": 200}}}
-    up = FakeUploader(remote={"study/PREREG_numbers_A.json": json.dumps(a_numbers).encode()})
+    # box A ran study-t01 without the loss-trend check (smoke_gate_guard): the replicate follows it
+    gate = {"study-t01": {"loss_decreasing": False, "source": "runs/calib-study-t01-20261001T000000Z"}}
+    up = FakeUploader(remote={"study/PREREG_numbers_A.json": json.dumps(a_numbers).encode(),
+                              "study/box-A/queue_summary.json": json.dumps({"smoke_gate_off": gate}).encode()})
     assert make("replicate", gpus=("0",), uploader=up).run() == Q.EXIT_OK
     num = json.loads((root / "study" / "PREREG_numbers_replicate.json").read_text(encoding="utf-8"))
     assert num["max_steps"] == {"study-t01-s1235": 27400} and num["lr"] == {"study-t01-s1235": 1e-3}
@@ -638,6 +741,8 @@ def test_replicate_takes_box_as_numbers(box):
     by_item = {x["item"]: x for x in records() if x.get("item")}
     m = by_item["study-t01-s1235"]
     assert "schedule.max_steps=27400" in m["argv"] and "batch.micro_audio_s=800.0" in m["argv"]
+    assert "smoke.require_loss_decrease=false" in m["argv"]
+    assert "smoke.require_loss_decrease=false" in by_item["study-t01-s1235-half"]["argv"]
     assert by_item["study-t01-s1235-half"]["gpu"] == "0" and "study/PREREG_numbers_replicate.json" in up.remote
     assert not any(x["item"].startswith(("calib-", "probe-")) for x in by_item.values() if x.get("item"))
 
@@ -667,6 +772,92 @@ def test_shakedown_runs_every_check_on_one_gpu(box):
     assert half["parent"] == next(x for x in recs if x["item"] == "shake-parent")["run_dir"]
     assert all(x["gpu"] == "0" for x in recs) and len(up.synced) == len(plan["items"])
     assert not (root / "study" / "PREREG_numbers_A.json").exists()
+    st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
+    for run in plan["runs"]:  # each smoke ran its checks at its study warm-up, then the box stopped it
+        s = json.loads((root / st["items"][f"shake-smoke-{run}"]["run_dir"] / "summary.json").read_text())
+        assert 100 <= s["steps"] < 20000
+
+
+def test_a_shakedown_smoke_whose_loss_does_not_fall_fails_once(box):
+    """A smoke that fails the study run's gate (here: no falling loss) fails the shakedown, without a second try (it
+    would start the same way); the other checks go on."""
+    make, records, root = box
+    assert make("shakedown", gpus=("0",), env=dict(FAKE_FLAT=json.dumps({"shake-smoke-study-t01": True}))).run() \
+        == Q.EXIT_FAIL
+    st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
+    it = st["items"]["shake-smoke-study-t01"]
+    assert it["status"] == "failed" and len(it["attempts"]) == 1
+    assert all(x["status"] == "done" for n, x in st["items"].items() if n != "shake-smoke-study-t01")
+    summary = json.loads((root / "state" / "queue_summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed" and "shake-smoke-study-t01" in summary["reason"]
+
+
+def test_the_smoke_gate_guard_and_a_smoke_failure_without_a_second_try(box):
+    """A main whose calibration run (same student, seed, data and warm-up) showed no falling loss runs without the
+    loss-trend check, its branch alike; a main whose smoke fails anyway fails at once (no identical second start), its
+    branch is skipped, the box ends failed and the others finish."""
+    make, records, root = box
+    r = study_rules()
+    env = dict(box_a_env(r), FAKE_FLAT=json.dumps({"calib-study-t005": True, "study-t005": True, "study-t01": True}))
+    assert make("A", env=env).run() == Q.EXIT_FAIL
+    st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
+    assert set(st["smoke_gate_off"]) == {"study-t005"}
+    ev = st["smoke_gate_off"]["study-t005"]
+    assert ev["loss_decreasing"] is False and ev["source"] == st["calibration"]["study-t005"]["run_dir"]
+    by_item = {x["item"]: x for x in records() if x.get("item")}
+    for name in ("study-t005", "study-t005-half"):
+        assert "smoke.require_loss_decrease=false" in by_item[name]["argv"] and by_item[name]["rc"] == 0
+    assert not any("smoke.require_loss_decrease" in a for a in by_item["study-t06"]["argv"])
+    t01 = [x for x in records() if x.get("item") == "study-t01"]
+    assert len(t01) == 1 and t01[0]["rc"] == 1 and st["items"]["study-t01"]["status"] == "failed"
+    assert st["items"]["study-t01-half"]["status"] == "skipped"
+    assert all(st["items"][x]["status"] == "done" for x in ("study-t06", "study-t06-half", "study-t03-half"))
+    summary = json.loads((root / "state" / "queue_summary.json").read_text(encoding="utf-8"))
+    assert summary["smoke_gate_off"] == st["smoke_gate_off"] and "study-t01" in summary["reason"]
+
+
+def test_the_gpu_count_is_the_rented_one(box, monkeypatch):
+    make, records, root = box
+    with pytest.raises(Q.QueueError, match="one wave"):
+        make("A", gpus=("0",))
+    with pytest.raises(Q.QueueError, match="KITSUNE_N_GPUS"):
+        make("A", n_gpus=8)
+    monkeypatch.setattr(Q, "detect_gpus", lambda: [])
+    with pytest.raises(Q.QueueError, match="no GPU found"):
+        make("A", gpus=())
+    assert make("shakedown", gpus=("0",), n_gpus=1).gpus == ["0"]
+    monkeypatch.undo()
+    monkeypatch.delenv("KITSUNE_GPUS", raising=False)
+
+    def no_smi(*a, **k):
+        raise OSError("nvidia-smi: not found")
+
+    monkeypatch.setattr(Q.subprocess, "run", no_smi)
+    assert Q.detect_gpus() == []
+    monkeypatch.setenv("KITSUNE_GPUS", "2,3")
+    assert Q.detect_gpus() == ["2", "3"]
+
+
+def test_every_trainer_of_a_run_gets_the_same_share_of_dev_shm(box):
+    """A /dev/shm the box's four trainers could overflow together: each gets half of it over the GPUs, its loader cut
+    to fit (the prefetch, then the workers) - the same for the run's calibration, probes, main and branch."""
+    make, records, root = box
+    r = study_rules()
+    q = make("A", env=box_a_env(r), shm_bytes=16_000_000_000)
+    assert q.run() == Q.EXIT_OK
+    by_item = {x["item"]: x for x in records() if x.get("item")}
+
+    def perf(item):
+        return sorted(a for a in by_item[item]["argv"] if a.startswith("perf."))
+
+    assert perf("calib-study-t06") == [] and perf("study-t06") == []  # 8 x 4 x 600 s fits its 2 GB
+    assert perf("calib-study-t03") == ["perf.num_workers=8", "perf.prefetch=2"]
+    want = ["perf.num_workers=7", "perf.prefetch=2"]  # micro 1600: the prefetch to 2 is not enough
+    scratch = [prereg.probe_run_name("scratch", lr) for lr in r["lr_probes"]["classes"]["scratch"]["grid"]]
+    for item in ["calib-study-t01", "study-t01", "study-t01-half", *scratch]:
+        assert perf(item) == want, item
+    st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
+    assert st["shm"] == dict(total_bytes=16_000_000_000, gpus=4, per_trainer_bytes=2_000_000_000.0)
 
 
 def test_box_plans_come_from_the_rules():

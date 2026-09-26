@@ -18,7 +18,8 @@ FAKE_OBJ {probe run name: objective or "nan" (diverges: FloatingPointError)}; FA
 first launch writes its states up to that fraction of max_steps, then exits 1); FAKE_MAIN_S (seconds a main run
 takes after writing its fraction states, or {run_name prefix: seconds}); KITSUNE_CRASH_AT_STEP as the trainer reads it
 (a crash before that step, full states every ckpt.full_every_steps); FAKE_CALIB_CRASH {run_name prefix: step} (a
-calibration run's first try exits 1 at that step).
+calibration run's first try exits 1 at that step); FAKE_FLAT {run_name prefix: true} (the smoke's loss does not fall:
+a calibration run logs it, a run with smoke.require_loss_decrease fails with SmokeFailed).
 """
 import json
 import os
@@ -137,8 +138,16 @@ def train(args: dict, record: dict) -> int:
     time.sleep(float(by_prefix(env_json("FAKE_SETUP_S", {}), name, 0.0)))
     M = int(cfg["schedule"]["max_steps"])
     if (cfg.get("calibrate") or {}).get("enabled"):
-        return calibrate(run, cfg, name, M)
+        return calibrate(run, cfg, name, M, record)
     crash_at = int(os.environ["KITSUNE_CRASH_AT_STEP"]) if os.environ.get("KITSUNE_CRASH_AT_STEP") else None
+    sm = cfg.get("smoke") or {}
+    if not resumed and not (cfg.get("lr_probe") or {}).get("enabled") and sm.get("enabled") and \
+            sm.get("require_loss_decrease") and by_prefix(env_json("FAKE_FLAT", {}), name, False):
+        event(run, "smoke_steps", steps=int(sm.get("steps", 100)), loss_first=9.7, loss_last=9.7,
+              loss_decreasing=False)
+        write_json(run / "summary.json", {"status": "failed",
+                                           "error": "SmokeFailed: loss did not fall over the smoke steps (9.7 -> 9.7)"})
+        return 1
     every = (cfg.get("ckpt") or {}).get("full_every_steps")
     if (cfg.get("lr_probe") or {}).get("enabled"):
         obj = by_prefix(env_json("FAKE_OBJ", {}), name, 1.0)
@@ -186,15 +195,30 @@ def train(args: dict, record: dict) -> int:
     return 0
 
 
-def calibrate(run: Path, cfg: dict, name: str, M: int) -> int:
-    """Steps until the STOP file or max_steps: per step the loop clock, its data wait, the wall time."""
+def calibrate(run: Path, cfg: dict, name: str, M: int, record: dict) -> int:
+    """Steps until the STOP file or max_steps: per step the loop clock, its data wait, the wall time. With
+    calibrate.barrier: READY, then wait for GO (or STOP) before the first step. The smoke checks at smoke.steps: a
+    smoke_steps event (FAKE_FLAT {run_name prefix: true}: the loss did not fall), and with smoke.require_loss_decrease a
+    flat loss fails the run as the trainer's SmokeFailed."""
     step_s = float(os.environ.get("FAKE_STEP_S", "0.002"))
     workers = (cfg.get("perf") or {}).get("num_workers")
     waits = env_json("FAKE_WAIT", {})
     w12 = {k[: -len(".w12")]: v for k, v in waits.items() if k.endswith(".w12")}
     plain = {k: v for k, v in waits.items() if not k.endswith(".w12")}
     frac = by_prefix(w12 if workers == 12 else plain, name, 0.01)
+    sm = cfg.get("smoke") or {}
+    smoke_n = int(sm.get("steps", 100)) if sm.get("enabled") else 0
+    flat = bool(by_prefix(env_json("FAKE_FLAT", {}), name, False))
     (run / "metrics").mkdir(parents=True, exist_ok=True)
+    if (cfg.get("calibrate") or {}).get("barrier"):
+        (run / "READY").write_text(f"{time.time()}\n", encoding="utf-8")
+        record["ready"] = time.time()
+        while not ((run / "GO").exists() or (run / "STOP").exists()):
+            if time.time() - record["ready"] > 120:
+                write_json(run / "summary.json", {"status": "failed", "error": "RuntimeError: no GO"})
+                return 1
+            time.sleep(0.002)
+        record["released"] = time.time()
     t, s = 0.0, 0
     crash = by_prefix(env_json("FAKE_CALIB_CRASH", {}), name) if "-try" not in name else None
     with open(run / "metrics" / "scalars.jsonl", "a", encoding="utf-8") as f:
@@ -208,9 +232,17 @@ def calibrate(run: Path, cfg: dict, name: str, M: int) -> int:
             dt = 1.0 + 0.001 * (s % 7)
             t += dt
             wall = time.time()
+            record.setdefault("first_step", wall)
             for tag, v in (("sched/train_s", t), ("time/data_wait_s", frac * dt), ("time/step_s", dt)):
                 f.write(json.dumps({"step": s, "wall": wall, "tag": tag, "value": v}) + "\n")
             f.flush()
+            if s == smoke_n:
+                event(run, "smoke_steps", steps=s, loss_first=9.7, loss_last=9.7 if flat else 8.1,
+                      loss_decreasing=not flat)
+                if flat and sm.get("require_loss_decrease"):
+                    write_json(run / "summary.json", {
+                        "status": "failed", "error": "SmokeFailed: loss did not fall over the smoke steps (9.7 -> 9.7)"})
+                    return 1
     micro = float(cfg["batch"]["micro_audio_s"])
     write_json(run / "summary.json", {"status": "complete", "steps": s, "calibrate": {
         "micro_audio_s": micro, "workers": workers if isinstance(workers, int) else 8}})
