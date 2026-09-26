@@ -90,18 +90,48 @@ def fake_sidecar() -> dict:
             "draw": {"budget_s": 3_600_000.0, "drawn_s": 3_599_990.0, "pool_s": 1010.0 * 3600, "pool_utts": 710000,
                      "drawn_utts": 700000},
             "baselines": {t: {**{k: dict(cer) for k in prereg.STRATA}, "m4": 0.05} for t in prereg.TEACHERS},
-            "details": {"pool_hours_if_capped": {"reazon_large": pool_by_cap()}}}
+            "details": {"pool_hours_if_capped": {"reazon_large": pool_by_cap()}},
+            "hours": {src: {"drawn": {"utts": 1000, "hours": hrs}} for src, hrs in DRAWN_HOURS.items()}}
+
+
+# the uploaded selection's drawn hours (study_1000h.json hours.<source>.drawn): the realised mix 41.6 / 26.8 / 19.6 / 12.0
+DRAWN_HOURS = {"reazon_small": 90.770, "reazon_large": 325.516, "emilia_yodas": 267.630, "emilia_nc": 195.987,
+               "galgame": 120.097}
 
 
 def test_the_committed_rules_are_the_generators():
     """study/PREREG.json and .md are what `python -m kitsune.prereg --write study/` writes (the filled parts, if any,
-    as committed); until the labels are sealed exactly the sidecar's fields are pending."""
+    as committed); only the sidecar's fields may be pending. Filled, they are the uploaded selection's (data repo
+    commit 4b0d801): its parquet and manifest sha256 and the cap 53 that study/data.json registers."""
     ok, r = prereg.check_rules(ROOT / "study")
     assert ok, "study/PREREG.* is stale: python -m kitsune.prereg --write study/"
     left = prereg.pending(r)
-    assert left and all(p.split(".")[0] in ("manifest", "baselines") or p == "data.extent.inputs.reazon_large"
-                        for p in left)
+    assert all(p.split(".")[0] in ("manifest", "baselines") or p == "data.extent.inputs.reazon_large" for p in left)
+    if not left:
+        m = r["manifest"]
+        assert m["selection_sha256"].startswith("5bbabcef") and m["manifest_sha256"].startswith("ef56dec2")
+        data = json.loads((ROOT / "study" / "data.json").read_text(encoding="utf-8"))
+        assert r["data"]["extent"]["inputs"]["reazon_large"] == data["extent"]["inputs"]["reazon_large"] == 53
     assert prereg.main(["--check", str(ROOT / "study")]) == 0
+
+
+def test_the_replicate_is_conditional_and_k3_ties_are_excepted():
+    """The owner's integration decisions: the replicate runs only if a family's delta 10 % limit call differs between
+    sigma_run 1.6 % and 3.2 % (then sigma_run = max(1.6 %, sigma_hat)); a K3 exact fp16 tie does not invalidate; the
+    realised mix of the uploaded selection is recorded next to the plan (mix D)."""
+    r = prereg.rules()
+    assert r["noise"]["sigma_grid"] == [0.016, 0.032]
+    trig = r["noise"]["replicate_trigger"]
+    assert "1.6 %" in trig and "3.2 %" in trig and "study-t01-s1235" in trig and "max(0.016, sigma_hat)" in trig
+    assert "delta 10 % walk result of transcribe or parakeet" in trig and "robust to sigma_run up to 3.2 %" in trig
+    assert "only if" in r["decisions"]["3"]["answer"] and "always run" in r["decisions"]["3"]["changed_2026_09_26"]["was"]
+    assert "runs only on the trigger" in r["calibration"]["replicate"]
+    assert any(x.startswith("K3 fails, exact fp16 ties excepted") for x in r["invalid_if"])
+    assert not any(x.startswith("K3 or K4 fails") for x in r["invalid_if"])
+    mix = r["data"]["mix"]
+    assert mix["plan"] == "mix D (decision 9)" and mix["realised_pct"] == {"reazon": 41.6, "emilia_yodas": 26.8,
+                                                                           "emilia_nc": 19.6, "galgame": 12.0}
+    assert prereg.realised_mix(fake_sidecar()) == mix["realised_pct"] and prereg.mix_problems(fake_sidecar()) == []
 
 
 def test_the_rules_carry_the_contract_and_the_design():
@@ -124,7 +154,7 @@ def test_the_rules_carry_the_contract_and_the_design():
     assert r["decisions"]["17"]["option"] == "c" and "B8x2560 + decoder {0,2,5,7}" in r["decisions"]["17"]["answer"]
     assert "B10x2560" in r["decisions"]["17"]["changed_2026_09_26"]["was"] and "was" in r["decisions"]["2"][
         "changed_2026_09_26"]
-    assert r["prereg_version"] == 2 and len(r["owner_changes"]["changes"]) == 5
+    assert r["prereg_version"] == 2 and len(r["owner_changes"]["changes"]) == 6
     assert r["noise"]["sigma_prior"] == 0.016 and r["branch"] == dict(r["branch"], resume_frac=0.4, end_frac=0.5)
     data = json.loads((ROOT / "study" / "data.json").read_text(encoding="utf-8"))
     assert data["selection_recipe"] == r["selection"]["recipe"], "study/data.json carries the registered recipe"
@@ -206,6 +236,8 @@ MUTATIONS = [  # (what, an edit of the registered sidecar, the refusal it must g
     ("not a sha256", lambda sc: sc["ids_sha256"].update(train="c" * 63), "train"),
     ("another file", lambda sc: sc["selection"].update(path="labels/full/selections/other.parquet"), "selection"),
     ("another schema", lambda sc: sc.update(schema=2), "schema"),
+    ("another mix", lambda sc: sc["hours"]["galgame"]["drawn"].update(hours=150.0), "the uploaded selection's is"),
+    ("no drawn hours", lambda sc: sc.pop("hours"), "no drawn hours"),
 ]
 
 
@@ -245,7 +277,8 @@ def test_the_analysis_block_is_what_study_stats_reads():
     r = prereg.rules()
     a = r["analysis"]
     assert (a["delta"], a["deltas"]) == (0.10, [0.05, 0.10, 0.20])
-    assert a["sigma_run"] == {"prior": 0.016, "factor": 0.886, "replicate": ["study-t01-s1235", "study-t01"]}
+    assert a["sigma_run"] == {"prior": 0.016, "factor": 0.886, "replicate": ["study-t01-s1235", "study-t01"],
+                              "grid": [0.016, 0.032], "trigger_families": ["transcribe", "parakeet"]}
     assert a["bootstrap"] == {"B": 10000, "seed": 1234, "z": 1.96}
     assert (a["teacher_bars"], a["anchor_flag_rel"]) == ([1.2, 1.5], 0.05)
     assert a["m4_strata"] == ["eval_jsut", "eval_cv8", "eval_reazon", "galgame_neutral"]

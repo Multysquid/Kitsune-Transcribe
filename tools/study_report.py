@@ -35,7 +35,11 @@ Inputs
   --boot-b N, --seed N  override the bootstrap (development only: the report marks them as not pre-registered)
 
 Output (--out, written atomically): report.json (everything study_stats.analyse returns, plus the inputs' paths, the
-manifest file's sha256, the summaries read and the settings' sources) and report.md.
+manifest file's sha256, the summaries read and the settings' sources) and report.md. report.md LEADS with the owner's
+question (how far the models compress and what to offer): the "what to offer" sentences generated from the calls and
+one offer table per family (study_stats.offers: rows = the own teacher and the sizes; params, M4 and its sets, the
+ratio to the teacher, Parakeet TDT better / within / worse, speed, VRAM, the delta 10 % call, the T/2 readout), then
+the sigma_run sensitivity (every call at 1.6 % and 3.2 %, replicate_needed), then the statistics.
 
 Usage:
   python tools/study_report.py --tables evals/study --manifest labels/full/selections/study_manifest.json \
@@ -204,6 +208,79 @@ def table(header: list[str], rows: list[list]) -> list[str]:
     return out
 
 
+def _mci(c: dict | None, nd: int = 2) -> str:
+    """ratio [CI] of an offer-table cell ({ratio, ci})."""
+    if not c:
+        return "n/a"
+    return f"{c['ratio']:.{nd}f} [{c['ci'][0]:.{nd}f}, {c['ci'][1]:.{nd}f}]"
+
+
+def _num(x, fmt: str) -> str:
+    return "n/a" if x is None else format(x, fmt)
+
+
+def render_offers(rep: dict) -> list[str]:
+    """The report's lead: what to offer (study_stats.offer_text), then one offer table per family (study_stats.offers):
+    rows = the own teacher (reference) and the sizes, largest first."""
+    off = rep.get("offers")
+    if not off:
+        return []
+    dp = next(iter(off.values()))["delta"]
+    L = ["## What to offer", ""] + [f"- {t}" for t in rep.get("offer_text", [])] + [""]
+    head = ["model", "params total / non-emb.", "x smaller than teacher", "M4 CER", "JSUT", "CV8", "Reazon",
+            "Galgame-neutral", "M4 / own teacher [CI]", "vs Parakeet TDT (JSUT+Galgame) [CI]", "batched RTF",
+            "batch-1 p50 / p95 s", "peak VRAM GB", f"call at delta {100 * dp:g} % (M4 / top [CI])", "T/2 readout"]
+    for fam, F in off.items():
+        rows = []
+        for r in F["rows"]:
+            sp = r.get("speed") or {}
+            sets = r.get("sets") or {}
+            name = r["display"] + (" (teacher)" if r["role"] == "teacher" else " (top)" if r["role"] == "top" else "")
+            if not r["available"]:
+                rows.append([name, f"{_num(r['params_total'], ',')} / {_num(r['params_non_embedding'], ',')}"]
+                            + ["no results"] + [""] * (len(head) - 3))
+                continue
+            tdt = r.get("vs_tdt")
+            vt = r.get("vs_top")
+            th = r.get("t_half")
+            rows.append([
+                name, f"{_num(r['params_total'], ',')} / {_num(r['params_non_embedding'], ',')}",
+                _num(r.get("smaller_than_teacher"), ".1f"), pct(r["m4"]),
+                *(pct(sets.get(k)) for k in ss.M4_SETS),
+                _mci(r.get("vs_teacher")), f"{tdt['verdict']} {_mci(tdt)}" if tdt else "n/a",
+                _num(sp.get("rtf"), ".4f"), f"{_num(sp.get('p50_s'), '.3f')} / {_num(sp.get('p95_s'), '.3f')}",
+                _num(sp.get("vram_gb"), ".2f"),
+                "top" if r["role"] == "top" else "" if r["role"] == "teacher" else
+                (f"{vt['call']} {_mci(vt, 3)}" if vt else "n/a"),
+                "" if r["role"] != "size" else
+                (f"{th['label']} (delta ln r {th['delta']:+.3f} [{th['ci'][0]:+.3f}, {th['ci'][1]:+.3f}]; "
+                 f"{th['call_at_T_half']} at T/2)" if th else "n/a")])
+        L += [f"### Offer table: {F['text']}", ""] + table(head, rows) + [""]
+    L += ["vs Parakeet TDT: better / worse = the CI of the JSUT + Galgame-neutral ratio lies below / above 1; within "
+          "= it holds 1. Speed from the A100 speed probe (n/a without --speed).", ""]
+    return L
+
+
+def render_sensitivity(rep: dict) -> list[str]:
+    """The conditional replicate: every call at each sigma_run of the grid, and whether the replicate is needed."""
+    sens = rep.get("sensitivity")
+    if not sens:
+        return []
+    grid = sens["grid"]
+    L = ["## Sensitivity to sigma_run (the conditional replicate)", "", sens["text"], ""]
+    rows = []
+    for f in ("transcribe", "parakeet", "scratch"):
+        rows.append([f + (" (triggers)" if f in sens["trigger_families"] else "")]
+                    + [sens["at"][ss._skey(g)]["families"][f]["sentence"] for g in grid])
+    L += table(["family: delta-primary walk"] + [f"sigma_run {100 * g:g} %" for g in grid], rows) + [""]
+    L += [f"replicate_needed: **{'yes' if sens['replicate_needed'] else 'no'}** (state {sens['state']})."]
+    moved = [d for v in sens["differences"].values() for d in v]
+    if moved:
+        L += ["", "Calls that move across the grid (any delta, the bars, the T/2 readout):", ""]
+        L += [f"- {d}" for d in moved[:40]] + (["- ..."] if len(moved) > 40 else [])
+    return L + [""]
+
+
 def render_md(rep: dict) -> str:
     st = rep["settings"]
     dp = ss._dkey(float(st["delta_primary"]))
@@ -219,6 +296,9 @@ def render_md(rep: dict) -> str:
               ""]
     if rep.get("missing_systems"):
         L += [f"Systems without results: {', '.join(rep['missing_systems'])}.", ""]
+
+    L += render_offers(rep)
+    L += render_sensitivity(rep)
 
     L += [f"## The answer (delta = {100 * float(st['delta_primary']):g} %, pre-registered)", ""]
     for f in ("transcribe", "parakeet", "scratch"):
