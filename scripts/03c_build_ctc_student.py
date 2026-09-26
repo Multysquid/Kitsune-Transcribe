@@ -118,7 +118,9 @@ def importance_key(args, ids_sha: str, n: int) -> dict:
 
 
 def load_or_compute_importance(anchor, feats, args, log=print):
-    """(importance over all anchor layers, info). Cached in args.importance (atomic write)."""
+    """(importance over all anchor layers, info, the calibration record, the calibration ids in order). Cached in
+    args.importance (atomic write); main writes the ids to <out>/calibration_ids.txt with the saved student, so a
+    rebuild that fails before its save leaves the previous student's id list in place."""
     import torch
 
     from kitsune import ctc_student as CS
@@ -144,8 +146,6 @@ def load_or_compute_importance(anchor, feats, args, log=print):
     if args.expect_calib_sha and key["ids_sha256"] != args.expect_calib_sha:
         sys.exit(f"calibration ids sha256 {key['ids_sha256']} != --expect-calib-sha {args.expect_calib_sha}: not the "
                  f"first run's calibration sample")
-    args.out.mkdir(parents=True, exist_ok=True)
-    m03.write_calibration_ids(args.out, utts)  # as 03 does: the ids this student's FFNs were ranked on
     calib = dict(sources=args.sources, seed=args.seed, per_group=args.calib_per_group, n=len(utts),
                  ids_sha256=key["ids_sha256"], hours=sum(u["duration"] for u in utts) / 3600,
                  per_source={s: sum(u["source"] == s for u in utts) for s in args.sources}, sample_s=sample_s,
@@ -160,7 +160,7 @@ def load_or_compute_importance(anchor, feats, args, log=print):
             log(f"  importance cache unreadable ({e}); recomputing")
         if ok:
             log(f"  importance: reusing {path} (computed {c['info']['created']})")
-            return S.importance_from_state(c["importance"]), dict(c["info"], reused=True, path=str(path)), calib
+            return S.importance_from_state(c["importance"]), dict(c["info"], reused=True, path=str(path)), calib, ids
         if c is not None:
             log(f"  importance cache {path} does not match (teacher files / calibration ids / features); recomputing")
     log(f"[3/7] FFN importance over all {n_layers} layers, {len(utts)} utts ({calib['hours']:.2f} h)")
@@ -176,7 +176,7 @@ def load_or_compute_importance(anchor, feats, args, log=print):
                     importance=S.importance_to_state(imp)), tmp)
     tmp.replace(path)
     log(f"  importance: {info['wall_s']:.0f} s -> {path}")
-    return imp, dict(info, reused=False, path=str(path)), calib
+    return imp, dict(info, reused=False, path=str(path)), calib, ids
 
 
 # ------------------------------------------------------------------------------------------------ step-0 gate
@@ -431,9 +431,10 @@ def main(argv=None) -> int:
 
     t = time.time()
     if args.ffn < t_ffn:
-        importance, imp_info, calib = load_or_compute_importance(anchor, feats, args)
+        importance, imp_info, calib, calib_ids = load_or_compute_importance(anchor, feats, args)
     else:
         importance, imp_info, calib = None, dict(skipped="ffn == the teacher's width: nothing to prune"), None
+        calib_ids = None
     dur["importance"] = round(time.time() - t, 1)
 
     t = time.time()
@@ -496,6 +497,8 @@ def main(argv=None) -> int:
     meta["stage"] = "saved"
     meta["timestamps"]["saved"] = now()
     CS.save_ctc_student(student, out, args.model_dir, meta)
+    if calib_ids:  # as 03 writes it: the ids this student's FFNs were ranked on, next to the weights ranked on them
+        build_script().write_calibration_ids(out, [{"id": x} for x in calib_ids])
     del student
     gc.collect()
     saved = CS.load_ctc_student(out, "cpu")

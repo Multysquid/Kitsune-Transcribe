@@ -460,12 +460,12 @@ def test_build_script_end_to_end_tiny(build_env):
         mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(tmp / "x"), "--expect-calib-sha", "0" * 64])
 
 
-def test_build_script_calib_ids(build_env):
+def test_build_script_calib_ids(build_env, monkeypatch):
     """--calib-ids calibrates on exactly the listed ids, in order (the importance key hashes the ordered ids), as
     03_build_student's does: the first run's 1,000 ids, which today's selection no longer draws. Every build writes the
-    ids it ranked the FFNs on to <out>/calibration_ids.txt; the same list reuses the shared cache, another order is
-    another calibration, and a list that is too short or names an id the selection does not keep for training stops
-    the build."""
+    ids it ranked the FFNs on to <out>/calibration_ids.txt with the saved student; the same list reuses the shared
+    cache, another order is another calibration, and a list that is too short or names an id the selection does not
+    keep for training stops the build."""
     mod, base, tmp = build_env
     m03 = mod.build_script()
     imp, a = tmp / "importance.pt", tmp / "a"
@@ -503,6 +503,18 @@ def test_build_script_calib_ids(build_env):
     with pytest.raises(SystemExit, match="expect-calib-sha"):
         mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(tmp / "y"), "--calib-ids", str(rev),
                          "--expect-calib-sha", m03.ids_sha(ids), "--gate-utts", "0", "--init-class", "pruned_kept"])
+
+    # the id list is written with the saved student: a --force rebuild on other ids that fails before its save leaves
+    # the previous student's list next to the previous student's weights
+    def failed_build(*_a, **_k):
+        raise RuntimeError("the build failed")
+
+    monkeypatch.setattr(CS, "build_ctc_student", failed_build)
+    with pytest.raises(RuntimeError, match="the build failed"):
+        mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(a), "--force", "--importance",
+                         str(tmp / "imp2.pt"), "--calib-ids", str(rev), "--gate-utts", "0", "--init-class",
+                         "pruned_kept"])
+    assert (a / "calibration_ids.txt").read_text(encoding="utf-8").split() == ids
 
 
 def test_build_script_golden_runs_on_the_built_and_the_saved_student(build_env, monkeypatch):
