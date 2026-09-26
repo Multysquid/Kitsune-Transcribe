@@ -170,8 +170,9 @@ EDGE_FACTOR = 2.0  # a winner at a grid edge gets one more point: x2 at the top,
 # teachers at its end, one model at a time. The two never clash: own run ids, state, queue and numbers files, and
 # backed-off commits into the one runs repo. The replicate is conditional (noise.replicate_trigger, after boxes A and B)
 # and trains on a 1x box with study-t01's max_steps and the scratch LR from box A's numbers. Each box measures
-# t_study-t06 on its own host, so every max_steps is equal compute on the host that trains the run. Consumers (vast/*, kitsune.study_queue)
-# read this block through rules()["boxes"]; its structure is part of the wave-2 contract (CONTRACT.md section 6).
+# t_study-t06 on its own host, so every max_steps is equal compute on the host that trains the run. Consumers
+# (vast/*, kitsune.study_queue) read this block through rules()["boxes"]; its structure is part of the wave-2 contract
+# (CONTRACT.md section 6).
 # The order of a "calibrate" list is part of the rule: it is measured in groups of the box's GPU count in list order
 # (calibration_groups), so each list names the box's own runs first - they are measured together, exactly as their
 # wave trains - and box B's reference study-t06, which it calibrates but never trains, last (beside three of B's runs
