@@ -315,7 +315,7 @@ TB_BUCKET_RULES = (
      r"2_loss_accuracy/eval_ctc/\g<mini>\g<kind>/\g<set>/\g<m>"),
     (rf"eval/(?P<mini>mini/)?(?P<kind>tf|probe)/{_SET}/(?P<m>n_frames)",
      r"1_operational/eval/\g<mini>\g<kind>/\g<set>/\g<m>"),
-    (r"(?P<t>ctc/(dense_frac|frames_per_token)|eval/(mini/)?(tf|probe)/[^/]+/(dense_frac|frames_per_token))",
+    (r"(?P<t>ctc/(frac_dense|frames_per_token)|eval/(mini/)?(tf|probe)/[^/]+/(frac_dense|frames_per_token))",
      r"3_misc/\g<t>"),
 )
 _TB_RULES = tuple((re.compile(p), t) for p, t in TB_BUCKET_RULES)

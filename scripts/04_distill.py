@@ -195,7 +195,7 @@ The size study (every default below is the trainer as it was before them; the st
                                  path) / N_u, the CTC target tokens of the whole step (T = 1, no T^2). loss/objective,
                                  loss/kl (= kl_dense + kl_blank), loss/kl_dense, loss/kl_blank and loss/ctc are per
                                  target token; ctc/argmax_agree, ctc/argmax_blank (the blank-collapse watch),
-                                 ctc/teacher_blank, ctc/dense_frac and ctc/kl_per_frame per valid frame
+                                 ctc/teacher_blank, ctc/frac_dense and ctc/kl_per_frame per valid frame
                       evals      kitsune.ctc_eval: one pass gives the teacher-forced frame metrics per set (the eval
                                  summaries' kl = KL per target token, ce = CTC per target token, top1 = frame argmax
                                  agreement, plus kl_dense, kl_blank, argmax_blank, teacher_blank, ...) and the greedy CTC
@@ -428,7 +428,7 @@ CTC_TERMS = ("kl", "ctc", "argmax_agree", "n_frames", "n_tokens", "kl_dense", "k
              "teacher_blank")
 CTC_TAGS = dict(kl="loss/kl", ctc="loss/ctc", kl_dense="loss/kl_dense", kl_blank="loss/kl_blank")  # per target token
 CTC_FRAME_TAGS = dict(argmax_agree="ctc/argmax_agree", argmax_blank="ctc/argmax_blank",
-                      teacher_blank="ctc/teacher_blank", n_dense="ctc/dense_frac")  # per valid frame
+                      teacher_blank="ctc/teacher_blank", n_dense="ctc/frac_dense")  # per valid frame
 
 
 class ThroughputTooLow(RuntimeError):
@@ -2203,7 +2203,7 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
     is the point of a train curve (what the optimizer sees), not something to correct.
     Family "ctc": the objective is w_kl * KL + w_ctc * CTC per CTC target token (N_u), logged with loss/kl (= kl_dense
     + kl_blank), loss/kl_dense, loss/kl_blank and loss/ctc per target token, and the frame metrics ctc/argmax_agree,
-    ctc/argmax_blank, ctc/teacher_blank, ctc/dense_frac, ctc/kl_per_frame per valid frame (ctc_step_rows)."""
+    ctc/argmax_blank, ctc/teacher_blank, ctc/frac_dense, ctc/kl_per_frame per valid frame (ctc_step_rows)."""
     from kitsune.runlog import system_stats
 
     cfg = R.cfg

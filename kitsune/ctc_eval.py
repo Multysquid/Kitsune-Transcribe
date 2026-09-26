@@ -19,7 +19,7 @@ over every valid frame / N_u, the CTC target tokens (the objective's normalisati
 token (the CTC family's second loss term, also under `ctc`), `top1` = the frame argmax agreement (also
 `argmax_agree`), n_tok = N_u. So the training objective on an eval is w_kl * kl + w_ctc * ce (combined_loss_ctc), the
 held-out KL of the history is the KL per target token, and the rest is under its own names (kl_dense, kl_blank,
-kl_per_frame, argmax_blank, teacher_blank, dense_frac, frames_per_token, n_frames).
+kl_per_frame, argmax_blank, teacher_blank, frac_dense, frames_per_token, n_frames).
 
 The model is put in eval mode for the pass and every module's training flag is restored afterwards (frozen BatchNorm
 stays frozen; a training BatchNorm uses its running stats). Under CUDA the encoder runs in bf16 autocast, the CTC head
@@ -175,47 +175,58 @@ def ctc_eval_records(model, store, featurizer, device, batch_s: float = 400.0, *
     return pd.DataFrame(recs), hyps, dropped
 
 
+def _div(a: float, b: float) -> float:
+    return a / b if b else float("nan")
+
+
 def _tf_set(df: pd.DataFrame, per_utt: pd.DataFrame) -> dict:
     ntok, nfr = float(df["n_tok"].sum()), float(df["n_frames"].sum())
-    tok, fr = max(ntok, 1.0), max(nfr, 1.0)
+    kl = float(df["sum_kl"].sum())
     s = dict(n_utts=int(len(df)), n_tok=int(ntok), n_frames=int(nfr), audio_s=float(df["duration"].sum()))
-    s["kl"] = float(df["sum_kl"].sum()) / tok
-    s["ce"] = s["ctc"] = float(df["sum_ctc"].sum()) / tok
-    s["kl_dense"] = float(df["sum_kl_dense"].sum()) / tok
-    s["kl_blank"] = float(df["sum_kl_blank"].sum()) / tok
-    s["kl_per_frame"] = float(df["sum_kl"].sum()) / fr
-    s["top1"] = s["argmax_agree"] = float(df["sum_argmax_agree"].sum()) / fr
-    s["argmax_blank"] = float(df["sum_argmax_blank"].sum()) / fr
-    s["teacher_blank"] = float(df["sum_teacher_blank"].sum()) / fr
-    s["dense_frac"] = float(df["sum_n_dense"].sum()) / fr
-    s["frames_per_token"] = nfr / tok
+    s["kl"] = _div(kl, ntok)
+    s["ce"] = s["ctc"] = _div(float(df["sum_ctc"].sum()), ntok)
+    s["top1"] = s["argmax_agree"] = _div(float(df["sum_argmax_agree"].sum()), nfr)
+    s["kl_per_frame"] = _div(kl, nfr)
+    s["kl_dense"] = _div(float(df["sum_kl_dense"].sum()), float(df["sum_n_dense"].sum()))
+    s["kl_blank"] = _div(float(df["sum_kl_blank"].sum()), float(df["sum_n_blank_frames"].sum()))
+    s["argmax_blank"] = _div(float(df["sum_argmax_blank"].sum()), nfr)
+    s["teacher_blank"] = _div(float(df["sum_teacher_blank"].sum()), nfr)
+    s["frac_dense"] = _div(float(df["sum_n_dense"].sum()), nfr)
+    s["frames_per_token"] = _div(nfr, ntok)
     for k in ("kl", "ce", "top1"):
-        s[f"{k}_utt_mean"] = float(per_utt[k].mean())
+        s[f"{k}_utt_mean"] = float(np.nanmean(per_utt[k].to_numpy(np.float64))) if len(per_utt) else float("nan")
     return s
 
 
 def summarise_ctc_tf(raw: pd.DataFrame, **extra) -> tuple[dict, pd.DataFrame]:
     """(summary, per_utt) of ctc_eval_records' raw rows, laid out as kitsune.evaluate.summarise_tf's (the module
-    docstring maps the keys). per_utt: id, source, n_tok, n_frames, kl / ce per target token of the utterance (a silent
-    one, U = 0: per 1), top1 = its frame argmax agreement, duration, kl_dense, kl_blank, kl_per_frame, argmax_blank,
-    teacher_blank."""
+    docstring maps the keys): per set and pooled ("all") the sums over the utterances divided by what each measure
+    counts - kl, ce (= ctc) per CTC target token (the objective's normalisation); top1 (= argmax_agree), kl_per_frame,
+    argmax_blank, teacher_blank, frac_dense per valid frame; kl_dense per dense frame, kl_blank per blank-only frame;
+    frames_per_token; n_utts, n_tok, n_frames, audio_s and the utterance means kl_utt_mean, ce_utt_mean,
+    top1_utt_mean (NaN where a count is 0). per_utt: id, source, n_tok, n_frames, kl, ce, top1, duration, kl_dense,
+    kl_blank, kl_per_frame, argmax_blank, teacher_blank, with the same normalisations per utterance (a silent one,
+    U = 0: kl and ce NaN)."""
     cols = ["id", "source", "n_tok", "n_frames", "kl", "ce", "top1", "duration", "kl_dense", "kl_blank",
             "kl_per_frame", "argmax_blank", "teacher_blank"]
     summary = dict(sets={}, n_utts=len(raw), **extra)
     if not len(raw):
         return summary, pd.DataFrame(columns=cols)
+
+    def ratio(num, den):
+        num, den = np.asarray(num, np.float64), np.asarray(den, np.float64)
+        return np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+
     per = raw[["id", "source", "n_tok", "n_frames"]].copy()
-    tok = raw["n_tok"].clip(lower=1).to_numpy(dtype=np.float64)
-    fr = raw["n_frames"].clip(lower=1).to_numpy(dtype=np.float64)
-    per["kl"] = raw["sum_kl"] / tok
-    per["ce"] = raw["sum_ctc"] / tok
-    per["top1"] = raw["sum_argmax_agree"] / fr
+    per["kl"] = ratio(raw["sum_kl"], raw["n_tok"])
+    per["ce"] = ratio(raw["sum_ctc"], raw["n_tok"])
+    per["top1"] = ratio(raw["sum_argmax_agree"], raw["n_frames"])
     per["duration"] = raw["duration"]
-    per["kl_dense"] = raw["sum_kl_dense"] / tok
-    per["kl_blank"] = raw["sum_kl_blank"] / tok
-    per["kl_per_frame"] = raw["sum_kl"] / fr
-    per["argmax_blank"] = raw["sum_argmax_blank"] / fr
-    per["teacher_blank"] = raw["sum_teacher_blank"] / fr
+    per["kl_dense"] = ratio(raw["sum_kl_dense"], raw["sum_n_dense"])
+    per["kl_blank"] = ratio(raw["sum_kl_blank"], raw["sum_n_blank_frames"])
+    per["kl_per_frame"] = ratio(raw["sum_kl"], raw["n_frames"])
+    per["argmax_blank"] = ratio(raw["sum_argmax_blank"], raw["n_frames"])
+    per["teacher_blank"] = ratio(raw["sum_teacher_blank"], raw["n_frames"])
     for src, g in raw.groupby("source", sort=True):
         summary["sets"][src] = _tf_set(g, per.loc[g.index])
     summary["all"] = _tf_set(raw, per)

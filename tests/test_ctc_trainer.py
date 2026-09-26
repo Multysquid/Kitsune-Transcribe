@@ -552,7 +552,7 @@ def test_ctc_reference_run(env, ref_run):
     np.testing.assert_allclose(obj, st["loss/kl"] + 0.8 * st["loss/ctc"], rtol=1e-6)
     np.testing.assert_allclose(st["loss/total"], obj, rtol=1e-12)  # L2-SP 0
     np.testing.assert_allclose(st["combined_loss/train"], obj, rtol=1e-12)
-    for tag in ("ctc/argmax_agree", "ctc/argmax_blank", "ctc/teacher_blank", "ctc/dense_frac"):
+    for tag in ("ctc/argmax_agree", "ctc/argmax_blank", "ctc/teacher_blank", "ctc/frac_dense"):
         assert ((st[tag] >= 0) & (st[tag] <= 1)).all(), tag
     assert "loss/ce" not in st and "perf/pad_eff_dec" not in st and (st["perf/mfu"] > 0).all()
     tags = set(pd.read_parquet(run / "metrics" / "scalars.parquet")["tag"])
@@ -575,7 +575,9 @@ def test_ctc_reference_run(env, ref_run):
         frames = sum(r[3].n_frames for r in mine)
         assert d["n_tok"] == sum(len(r[3].ctc_ids) for r in mine) and d["n_frames"] == frames
         assert d["ce"] == d["ctc"] and d["top1"] == d["argmax_agree"]
-        assert d["kl"] == pytest.approx(d["kl_dense"] + d["kl_blank"])
+        n_dense = sum(len(r[3].dense_frame) for r in mine)
+        assert d["frac_dense"] == pytest.approx(n_dense / frames)  # kl_dense per dense, kl_blank per blank-only frame
+        assert d["kl"] * d["n_tok"] == pytest.approx(d["kl_dense"] * n_dense + d["kl_blank"] * (frames - n_dense))
         assert d["teacher_blank"] == pytest.approx(sum(int((r[3].col0() == BLANK).sum()) for r in mine) / frames)
         g = s["greedy_full"]["sets"][x]
         assert g["n"] == 6 and g["trunc_rate"] == 0.0
