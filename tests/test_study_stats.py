@@ -713,6 +713,131 @@ def test_run_summaries_in_the_trainer_layout(tmp_path):
 # ------------------------------------------------------------------------------------------------ the tool
 
 
+# ------------------------------------------------------------------------------------------------ the conditional replicate
+
+
+def test_sensitivity_flags_the_replicate_when_a_limit_call_moves(report):
+    """The planted T-0.3B (1.02) is WITHIN at sigma_run 1.6 % (CI up to 1.02 e^0.0443 = 1.066) but UNRESOLVED at
+    3.2 % (up to 1.02 e^0.0887 = 1.115 > 1.10): Transcribe's delta 10 % limit call moves, so the replicate is needed.
+    Parakeet's P-0.1B (1.30) is OUTSIDE at both."""
+    sens = report["sensitivity"]
+    assert sens["grid"] == [0.016, 0.032] and sens["trigger_families"] == ["transcribe", "parakeet"]
+    lo, hi = sens["at"]["0.016"], sens["at"]["0.032"]
+    assert lo["families"]["transcribe"]["primary"] == ["unresolved", "study-t03", "study-t01"]
+    assert hi["families"]["transcribe"]["primary"] == ["unresolved", "study-t06", "study-t03"]
+    assert hi["families"]["transcribe"]["calls"]["study-t03"]["0.1"] == "UNRESOLVED"
+    assert lo["families"]["parakeet"]["primary"] == hi["families"]["parakeet"]["primary"]
+    # the scratch walk (T-0.1B / bridge = 1.10 / 1.08) moves too, but it is not a trigger family
+    assert sens["primary_moved"] == {"transcribe": ["0.032"], "parakeet": [], "scratch": ["0.032"]}
+    assert sens["replicate_needed"] and sens["state"] == "replicate_needed" and not sens["replicate_ran"]
+    assert sens["text"].startswith("REPLICATE NEEDED") and "transcribe" in sens["text"] and "1.6 %" in sens["text"]
+    assert any(d.startswith("families.transcribe.primary") for d in sens["differences"]["0.032"])
+    # the primary analysis keeps the prior (no replicate in the corpus)
+    assert report["sigma_run"]["sigma_run"] == 0.016
+    assert report["offer_text"][-1] == sens["text"]
+
+
+def test_sensitivity_says_robust_when_no_limit_call_moves():
+    """T-0.3B at 1.00 is WITHIN at both (CI up to e^0.0887 = 1.093 < 1.10), T-0.1B at 1.50 OUTSIDE at both: the calls
+    are robust to sigma_run up to 3.2 % and the replicate is not run, whatever moves outside the primary walks."""
+    plant = {**PLANT, "study-t03": 1.0, "study-t01": 1.5, "study-t005": 1.8, "study-t03-half": 1.05,
+             "study-t01-half": 1.5 * 1.05}
+    rep = ss.analyse(ss.build_corpus(*planted(plant)), dict(boot_b=200), imitation=False)
+    sens = rep["sensitivity"]
+    assert not sens["replicate_needed"] and sens["state"] == "robust"
+    assert sens["text"].startswith("The calls are robust to sigma_run up to 3.2 %")
+    for f in ("transcribe", "parakeet"):
+        assert sens["at"]["0.016"]["families"][f]["primary"] == sens["at"]["0.032"]["families"][f]["primary"]
+    assert rep["families"]["transcribe"]["primary"]["sentence"] == "limit reached between T-0.3B and T-0.1B"
+
+
+def test_the_replicate_when_it_ran_sets_sigma_run():
+    rep = ss.analyse(ss.build_corpus(*planted({**PLANT, "study-t01-s1235": 1.10 * 1.05})), dict(boot_b=200),
+                     imitation=False)
+    sens = rep["sensitivity"]
+    assert sens["replicate_ran"] and sens["state"] == "replicate_ran" and sens["text"].startswith("The replicate ran")
+    assert rep["sigma_run"]["sigma_run"] == pytest.approx(0.886 * math.log(1.05))
+    # the grid is still reported, and the calls at 1.6 % are the grid's, not the replicate's
+    assert sens["at"]["0.016"]["families"]["transcribe"]["calls"]["study-t03"]["0.1"] == "WITHIN"
+
+
+def test_the_sigma_grid_comes_from_the_prereg():
+    st, src = ss.settings_from_prereg({"analysis": {"sigma_run": {"prior": 0.016, "grid": [0.016, 0.04],
+                                                                  "trigger_families": ["transcribe"]}}})
+    assert st["sigma_grid"] == [0.016, 0.04] and src["sigma_grid"] == "PREREG.json:analysis.sigma_run.grid"
+    assert st["trigger_families"] == ["transcribe"]
+    with pytest.raises(ValueError, match="sigma_grid"):
+        ss.settings_from_prereg({"analysis": {"sigma_run": {"grid": [0.016, 3.2]}}})
+    with pytest.raises(ValueError, match="trigger_families"):
+        ss.settings_from_prereg({"analysis": {"sigma_run": {"trigger_families": ["whisper"]}}})
+
+
+# ------------------------------------------------------------------------------------------------ what to offer
+
+
+def test_the_offer_table_per_family(report):
+    """Rows = the own teacher, then the sizes from the top down; every column from the planted multipliers."""
+    off = report["offers"]
+    assert list(off) == ["transcribe", "parakeet"]
+    rows = {r["system"]: r for r in off["transcribe"]["rows"]}
+    assert [r["system"] for r in off["transcribe"]["rows"]] == ["cohere", "study-t06", "study-t03", "study-t01",
+                                                                "study-t005"]
+    assert [r["role"] for r in off["transcribe"]["rows"]] == ["teacher", "top", "size", "size", "size"]
+    t03 = rows["study-t03"]
+    assert (t03["params_total"], t03["params_non_embedding"]) == (301_822_208, 283_996_416)
+    assert t03["smaller_than_teacher"] == pytest.approx(2_065_647_872 / 301_822_208)
+    assert t03["m4"] == pytest.approx(1.02 * rows["study-t06"]["m4"])
+    assert set(t03["sets"]) == set(ss.M4_SETS)
+    assert t03["sets"]["eval_jsut"] == pytest.approx(report["systems"]["study-t03"]["sets"]["eval_jsut"]["cer"])
+    assert t03["vs_teacher"]["ratio"] == pytest.approx(1.02 / 0.90)
+    assert t03["vs_tdt"]["verdict"] == "better" and t03["vs_tdt"]["ratio"] == pytest.approx(1.02 / 1.35)
+    assert t03["vs_top"]["call"] == "WITHIN" and t03["vs_top"]["ratio"] == pytest.approx(1.02)
+    assert t03["vs_top"]["ci"][1] == pytest.approx(1.02 * math.exp(1.96 * math.sqrt(2) * 0.016))
+    assert rows["study-t01"]["vs_top"]["call"] == "UNRESOLVED"
+    assert rows["study-t01"]["t_half"]["label"] == "compute-limited: the gap closes with compute"
+    assert t03["t_half"]["label"] == "not compute-limited at T" and rows["study-t005"]["t_half"] is None
+    assert rows["cohere"]["vs_teacher"] is None and "vs_top" not in rows["study-t06"]
+    p = {r["system"]: r for r in off["parakeet"]["rows"]}
+    assert p["study-p01"]["vs_top"]["call"] == "OUTSIDE" and p["parakeet-ctc"]["role"] == "teacher"
+    # vs TDT (1.35): P-0.05B at 1.50 is worse; the teacher Parakeet CTC (0.85, a fixed model: v_boot only) is better
+    assert p["study-p005"]["vs_tdt"]["verdict"] == "worse" and p["parakeet-ctc"]["vs_tdt"]["verdict"] == "better"
+
+
+def test_the_offer_table_carries_the_speed_and_the_text_follows_the_calls():
+    tables, manifest = planted(PLANT)
+    speed = {"study-t03": {"rtf": 0.004, "vram_gb": 1.8, "p50_s": 0.05, "p95_s": 0.09},
+             "study-p01": {"rtf_batched": 0.002, "vram_peak_reserved_bytes": 1.2e9}}
+    rep = ss.analyse(ss.build_corpus(tables, manifest), dict(boot_b=200), speed=speed, imitation=False)
+    rows = {r["system"]: r for f in rep["offers"].values() for r in f["rows"]}
+    assert rows["study-t03"]["speed"] == {"rtf": 0.004, "vram_gb": 1.8, "p50_s": 0.05, "p95_s": 0.09}
+    assert rows["study-p01"]["speed"]["rtf"] == 0.002 and rows["study-p01"]["speed"]["vram_gb"] == pytest.approx(1.2)
+    assert rows["study-t06"]["speed"] is None
+    t, p = rep["offer_text"][0], rep["offer_text"][1]
+    assert t.startswith("Transcribe (Cohere-distilled AED): offer T-0.6B as the quality tier")
+    assert "T-0.3B keeps M4 within 10 % of it" in t and "offer it as the compact default" in t
+    assert "T-0.1B is UNRESOLVED at 10 %" in t and "T-0.05B (descriptive only)" in t
+    assert "Compute-limited at T (the gap to the top closes with training): T-0.1B." in t
+    assert p.startswith("Parakeet (CTC): offer P-0.3B as the quality tier") and "compact default" not in p
+    assert "P-0.1B is OUTSIDE" in p and "the limit is between P-0.3B and P-0.1B" in p and "and smaller" in p
+    assert rep["offer_text"][2] == ("Against Parakeet TDT 0.6B on JSUT + Galgame-neutral: the smallest student at or "
+                                    "below it (CI upper end) is T-0.05B.")
+    # without the tops there is nothing to offer, and the text says so
+    bare = ss.analyse(ss.build_corpus(*planted({k: v for k, v in PLANT.items() if k not in ("study-t06",
+                                                                                              "study-p03")})),
+                      dict(boot_b=200), imitation=False)
+    assert bare["offer_text"][0].endswith("no results for its largest student yet; nothing to offer.")
+
+
+def test_the_report_leads_with_the_offer(report):
+    md = study_tool().render_md(report)
+    heads = [line for line in md.splitlines() if line.startswith("## ")]
+    assert heads[:3] == ["## What to offer", "## Sensitivity to sigma_run (the conditional replicate)",
+                         "## The answer (delta = 10 %, pre-registered)"]
+    assert "### Offer table: Transcribe headline ladder" in md and "### Offer table: Parakeet ladder" in md
+    assert "| T-0.3B | 301,822,208 / 283,996,416 | 6.8 |" in md
+    assert "WITHIN 1.020 [" in md and "REPLICATE NEEDED" in md and "replicate_needed: **yes**" in md
+
+
 def test_study_report_end_to_end(tmp_path):
     """The three table layouts (one file per system, one per set, a 05_evaluate dir with text only), PREREG.json,
     PREREG_numbers.json, summaries and a speed JSON -> report.json and report.md with the planted calls."""
