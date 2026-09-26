@@ -520,13 +520,13 @@ instead of one trainer. The box's plan (runs, probe classes, calibrated runs, re
 |---|---|---|---|---|
 | `shakedown` | 1 | both families (every run of boxes A and B): the stores of the real extent (the AED store, the CTC store with its frame preflight); per run a 100-step smoke at its planned micro-batch with the run's own start (its warm-up, seed and data order, its smoke gate: finite losses, throughput; at its class's lowest grid LR) and a step time, where a flat loss start fails a pruned run (t06, t03, p03, p01, p005) and is a note (`shake_notes` in the queue summary) for a scratch one (t01, t005, bridge); per family (AED; CTC as `*-ctc`) a crash at step 45 and the resume from step 40, a 50-step toy run and its T/2 branch, a complete eval on a subset (T-0.6B, P-0.3B: in-loop, mini and final); every run dir uploaded and verified | ~2 h (3.5 h) | ~$1.5-2 at ~$0.7-0.9/h |
 | `A` (Cohere) | 4 | calibration of study-t06/t03/t01/t005 together, LR probes kept-t03 and scratch (one edge extension each at most), `PREREG_numbers_A.json`, then study-t06, -t03, -t01, -t005 in one wave, each followed by its T/2 branch on the same GPU; the anchor re-score in a GPU gap | ~5.8 h (8 h) | ~$12.5 at ~$2.14/h (4x SXM4 40 GB) |
-| `B` (Parakeet + bridge) | 4 | calibration of study-p03/p01/p005/bridge together, then of study-t06 as this host's reference (`calib-study-t06-boxB`) under the load of three of them, probes lost, kept-p03 and bridge, `PREREG_numbers_B.json`, the wave of p03/p01/p005/bridge + branches, then the speed probe of the students (their trained final weights: box A's from the runs repo) and both teachers, one model at a time | ~6.3 h (8.5 h) | ~$13.5 |
+| `B` (Parakeet + bridge) | 4 | calibration of study-p03/p01/p005/bridge together, then of study-t06 as this host's reference (`calib-study-t06-boxB`) under the load of three of them, probes lost, kept-p03 and bridge, `PREREG_numbers_B.json`, the wave of p03/p01/p005/bridge + branches, then the speed probe, one model at a time: its own students (their trained final weights), both teachers, then box A's students from the runs repo (after a wait of at most 45 min for box A) | ~6.3-7 h (9 h) | ~$13.5-15 |
 | `replicate` (conditional) | 1 | study-t01-s1235 and its branch, with study-t01's max_steps and LR from box A's numbers; only if the rule below asks for it | ~4.6 h (6 h) | ~$3-4 |
 
 Hours are the central estimate of STUDY.md 5.2-5.3 plus boot, bootstrap (two stores) and the end; the cap is the
 watchdog's (`KITSUNE_MAX_HOURS`, plus the extent's rebuild timeout). Traffic adds ~60 GB down and ~3-12 GB up (lean
 uploads) at the host's $/GB. launch.py prints the offer, the create command and the cost line; nothing is rented
-without `--yes`. Boxes A and B together: ~$26 central, ~$35 at both caps.
+without `--yes`. Boxes A and B together: ~$26-28 central, ~$40 at both caps (box B's bridge probes are 5,000 steps each; a review of the code's numbers puts box B at ~7 h central, ~9 h high).
 
 ### Before a study box (the owner's steps)
 
