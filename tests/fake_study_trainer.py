@@ -232,8 +232,11 @@ def main() -> int:
             out.mkdir(parents=True, exist_ok=True)
             (out / "events.jsonl").write_text(json.dumps({"kind": "summary"}) + "\n", encoding="utf-8")
             write_json(out / "summary.json", {"status": "complete", "anchor": True})
-        elif mode == "speed":
-            write_json(Path(args["out"]), {"model": args["model"], "rtf": 0.01})
+        elif mode == "speed":  # tools/speed_probe.py: one --out, merged per system
+            out = Path(args["out"])
+            got = json.loads(out.read_text(encoding="utf-8")) if out.is_file() else {"systems": {}}
+            got["systems"][args["system"]] = {"kind": args["kind"], "model": args.get("model"), "rtf": 0.01}
+            write_json(out, got)
         else:
             rc = 2
     finally:

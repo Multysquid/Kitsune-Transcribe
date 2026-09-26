@@ -88,8 +88,12 @@ ANCHOR_RUN = "viability-b20x2560-20260925T071746Z"  # decision 29: the first run
 ANCHOR_CKPT = f"runs/{ANCHOR_RUN}/checkpoints/step_9774"
 ANCHOR_CONFIG = f"{CONFIG_DIR}/anchor-b20.json"
 SPEED_TOOL = "tools/speed_probe.py"
-TEACHERS = {"cohere": ("aed", "CohereLabs/cohere-transcribe-03-2026"),
-            "parakeet": ("ctc", "models/parakeet-tdt_ctc-0.6b-ja-hf")}
+PARAKEET_DIR = "models/parakeet-tdt_ctc-0.6b-ja-hf"  # the converted teacher in the data repo (kitsune.parakeet)
+# the teachers' systems for the speed probe (tools/speed_probe.py --kind; the Cohere teacher comes from the HF cache):
+# system -> (kind, model dir or None)
+TEACHERS = {"cohere": ("cohere", None), "parakeet-ctc": ("parakeet-ctc", PARAKEET_DIR),
+            "parakeet-tdt": ("parakeet-tdt", PARAKEET_DIR)}
+SPEED_PER_SET = 40  # ids per eval set of the speed probe's fixed list (its default; one list for every system)
 CALIB_GROUP_TIMEOUT_S = 5400  # a group whose windows are not all in by then is stopped and counts as failed
 STOP_GRACE_S = 1800  # how long a stopped run may take to leave (its end phase)
 MAX_ATTEMPTS = 2  # per item: a run resumes (or a branch restarts) once; a second failure is final
@@ -246,6 +250,9 @@ def box_plan(box: str, rules: dict | None = None) -> dict:
         raise QueueError(f"kitsune.prereg.rules() has no boxes.{box} (the box plans of CONTRACT.md section 6: "
                          f"{', '.join(k for k in BOXES if k != 'shakedown')})")
     plan = dict(boxes[box])
+    plan.setdefault("numbers_from", None)  # only a box that takes its numbers from another names one
+    plan.setdefault("reference", None)  # a box without calibration has none
+    plan.setdefault("extras", [])
     if missing := [k for k in PLAN_KEYS if k not in plan]:
         raise QueueError(f"boxes.{box} lacks {missing}")
     unknown = [x for x in [*plan["runs"], *plan["calibrate"], *([plan["reference"]] if plan["reference"] else [])]
@@ -346,7 +353,7 @@ def study_extra_gb(box: str, rules: dict | None = None, n_gpus: int | None = Non
 def box_extra_dirs(box: str, rules: dict | None = None) -> list[str]:
     """Other repo dirs the box pulls: the Parakeet teacher's converted dir for the speed extra."""
     r = rules if rules is not None else prereg.rules()
-    return [TEACHERS["parakeet"][1]] if "speed" in box_plan(box, r)["extras"] else []
+    return [PARAKEET_DIR] if "speed" in box_plan(box, r)["extras"] else []
 
 
 # ============================================================================================================ hub
@@ -1179,25 +1186,34 @@ class Queue:
             self.event("prereg_numbers", sha256=num["sha256"], path=num["path"], remote=remote,
                        verified=num["verified"])
 
+    @staticmethod
+    def _per_box(fn) -> bool:
+        """The rules' per-box form of a numbers function (kitsune.prereg with the box plans: a `box` parameter)."""
+        return "box" in inspect.signature(fn).parameters
+
     def write_numbers(self, path: Path) -> tuple[str, dict]:
+        """The box's numbers by the rules' own functions: max_steps and the LR choice from the calibration table and
+        the probes, prereg.write_numbers for the file (per box when the rules have box plans)."""
         if self.plan.get("numbers_from"):
             return self.derived_numbers(path)
         calib = {run: {k: c[k] for k in prereg.CALIB_KEYS} for run, c in self.state["calibration"].items()}
-        steps = prereg.max_steps(calib, t_ref_run=self.plan["reference"])
+        box_kw = {"box": self.box} if self._per_box(prereg.write_numbers) else {}
+        steps = prereg.max_steps(calib, t_ref_run=self.plan["reference"],
+                                 **(box_kw if self._per_box(prereg.max_steps) else {}))
         probes = {cls: {float(lr): (math.inf if v is None else v) for lr, v in res.items()}
                   for cls, res in self.state["probes"].items()}
         choices = self.state["lr_choice"] or {}
-        lrs ={run: float(choices[self.rules["runs"][run]["lr_from"]]["lr"]) for run in self.plan["runs"]}
-        kw = dict(rules_path=self.rules_path, host=self.s.host, allow_pending=self.s.allow_pending)
-        if "box" in inspect.signature(prereg.write_numbers).parameters:
-            kw["box"] = self.box
-        sha = prereg.write_numbers(path, calib, probes, lrs, steps, **kw)
+        lrs = {run: float(choices[self.rules["runs"][run]["lr_from"]]["lr"]) for run in self.plan["runs"]}
+        sha = prereg.write_numbers(path, calib, probes, lrs, steps, rules_path=self.rules_path, host=self.s.host,
+                                   allow_pending=self.s.allow_pending, **box_kw)
         return sha, json.loads(path.read_text(encoding="utf-8"))
 
     def derived_numbers(self, path: Path) -> tuple[str, dict]:
         """A box with numbers_from (the replicate): its runs take the max_steps and LR of the run they replicate from
-        that box's uploaded numbers file (prereg.REPLICATE_OF for the replicate), written with the source's name and
-        sha256 in the same canonical form as prereg.write_numbers."""
+        that box's uploaded numbers file (prereg.REPLICATE_OF for the replicate) - by prereg.replicate_numbers and
+        prereg.write_numbers(box=..., numbers_from=...) when the rules have them, else written here with the source's
+        name and sha256 in the canonical form of prereg.write_numbers. The source's calibration comes along for the
+        fill (the micro-batch the replicated run was measured at)."""
         src = self.rules["boxes"][self.plan["numbers_from"]]["numbers_file"]
         remote = f"{NUMBERS_DIR}/{src}"
         if self.uploader is None:
@@ -1205,6 +1221,13 @@ class Queue:
         local = self.uploader.download(remote, Path(self.s.state_dir) / "numbers_from")
         data = local.read_bytes()
         srcn = json.loads(data)
+        if "numbers_from" in inspect.signature(prereg.write_numbers).parameters and \
+                hasattr(prereg, "replicate_numbers"):
+            steps, lrs, _ = prereg.replicate_numbers(local)
+            sha = prereg.write_numbers(path, {}, {}, lrs, steps, box=self.box, numbers_from=local,
+                                       rules_path=self.rules_path, host=self.s.host, allow_pending=self.s.allow_pending)
+            numbers = json.loads(path.read_text(encoding="utf-8"))
+            return sha, dict(numbers, calibration=numbers.get("calibration") or srcn.get("calibration") or {})
         steps, lrs = {}, {}
         for run in self.plan["runs"]:
             of = prereg.REPLICATE_OF if run == prereg.REPLICATE else run
@@ -1298,13 +1321,27 @@ class Queue:
             self.event("speed_skipped", why=f"{SPEED_TOOL} is not in this checkout (WP5b)")
             return
         out = self.root / "runs" / f"speed-{self.box}"
-        models = [(run, spec["family"], spec["student"]) for run, spec in self.rules["runs"].items()]
-        models += [(k, fam, path) for k, (fam, path) in TEACHERS.items()]
-        for sys_name, fam, path in models:
-            name = self.add_item(f"speed-{sys_name}", "speed", None,
-                                 ["--model", path, "--family", fam, "--out", str(out / f"{sys_name}.json")])
+        out.mkdir(parents=True, exist_ok=True)
+        # a student's speed is its shape's: the init dir every box pulls stands for the trained weights
+        systems = [(run, spec["family"], spec["student"]) for run, spec in self.rules["runs"].items()]
+        systems += [(k, kind, path) for k, (kind, path) in TEACHERS.items()]
+        for sys_name, kind, path in systems:
+            args = ["--kind", kind, *(["--model", path] if path else []), "--system", sys_name,
+                    "--store", str(self.root / "cache" / "eval"), "--per-set", str(SPEED_PER_SET),
+                    "--out", str(out / "speed.json"), "--require-idle"]
+            name = self.add_item(f"speed-{sys_name}", "speed", None, args)
             if self.item(name)["status"] != "done":
                 self.execute([name])
+        with open(out / "events.jsonl", "a", encoding="utf-8") as f:  # makes it a run dir for finish.py's uploads
+            for sys_name, _, _ in systems:
+                it = self.item(f"speed-{sys_name}")
+                f.write(json.dumps({"kind": "speed", "system": sys_name, "status": it["status"],
+                                    "wall": time.time()}) + "\n")
+        self.state["items"].setdefault("speed", dict(kind="speed-dir", config=None, sets=[], after=None, run=None,
+                                                     affinity=None, env={}, measured=False, status="done",
+                                                     attempts=[], run_dir=self._rel(out), verified=None, result=None))
+        self._pending_uploads.append("speed")
+        self.save()
 
     # shakedown --------------------------------------------------------------------------------------------
 
@@ -1386,9 +1423,10 @@ def _load_trainer():
 
 
 def build_stores(config: str, sets: list[str]) -> int:
-    """The label stores of `config`'s data keys, exactly as the trainer's setup_data builds them (train_store_spec,
-    trainset.build_stores, build_eval_store) and the CTC stores when the trainer has a builder for them: the box builds
-    them once, alone, and every run then reuses them (their fingerprint matches)."""
+    """The label stores of `config`'s data keys and family, exactly as the trainer's setup_data builds them (its
+    build_train_store and build_eval_store: a token store, or with the CTC trainer a frame store and its frame
+    preflight; before that trainer, train_store_spec + trainset.build_stores): the box builds them once, alone, and
+    every run then reuses them (their fingerprint matches)."""
     D = _load_trainer()
     from kitsune import trainset
 
@@ -1400,18 +1438,20 @@ def build_stores(config: str, sets: list[str]) -> int:
             print(json.dumps({"event": kind, **fields}, default=str)[:2000], flush=True)
 
     t0 = time.time()
-    name, ids = D.train_store_spec(cfg, _Log)
-    train = trainset.build_stores(D.rpath(cfg["selection"]), D.rpath(cfg["data_root"]), D.rpath(cfg["teacher_root"]),
-                                  D.rpath(cfg["cache_dir"]) / name, cfg["sources"], ["train"], ids=ids, log=print)
+    builder = getattr(D, "build_train_store", None)  # the trainer's own, of the config's family (the CTC trainer's)
+    if builder is not None:
+        train = builder(cfg, _Log)
+    elif cfg.get("family", "aed") == "ctc":
+        print("a CTC store needs the CTC trainer's build_train_store (WP4b): not in this checkout", flush=True)
+        return 2
+    else:
+        name, ids = D.train_store_spec(cfg, _Log)
+        train = trainset.build_stores(D.rpath(cfg["selection"]), D.rpath(cfg["data_root"]),
+                                      D.rpath(cfg["teacher_root"]), D.rpath(cfg["cache_dir"]) / name, cfg["sources"],
+                                      ["train"], ids=ids, log=print)
     ev = D.build_eval_store(cfg, _Log)
     print(f"stores: train {len(train)} utts ({train.hours:.1f} h), eval {len(ev)} utts, {time.time() - t0:.0f} s",
           flush=True)
-    if cfg.get("family", "aed") == "ctc":
-        builder = getattr(D, "build_ctc_stores", None)
-        if builder is None:
-            print("the CTC stores need the CTC trainer's builder (WP4b): not in this checkout", flush=True)
-            return 2
-        builder(cfg, _Log)
     return 0
 
 

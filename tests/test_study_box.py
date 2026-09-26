@@ -14,6 +14,7 @@ Every process the queue starts is tests/fake_study_trainer.py here (fake GPUs = 
 uploads recorded by a fake uploader); the real trainer runs in the calibrate-block test only. CPU only.
 """
 import copy
+import inspect
 import json
 import math
 import os
@@ -228,6 +229,34 @@ def test_calibration_run_ends_with_its_step_time_table(env, hub, trainer):
     assert 15 <= s["steps"] < 400 and s["calibrate"]["steps_measured"] == 7
 
 
+def test_build_stores_builds_what_the_trainer_then_reuses(env, capsys):
+    """The box's store step (study_queue build-stores) builds the train and eval stores of a config's data keys with
+    the trainer's own code; a trainer on the same data finds them and builds nothing."""
+    from test_study_trainer import write_config
+
+    path = write_config(env, "stores-a", {"lr_probe": {"enabled": True}, "calibrate": {"enabled": True,
+                                                                                       "window": [1, 2]},
+                                          "schedule": {"max_steps": 3, "warmup_steps": 1}})
+    cache = Path(env["base"]["cache_dir"])
+    shutil.rmtree(cache, ignore_errors=True)
+    assert Q.main(["build-stores", "--config", path]) == 0
+    assert (cache / "train" / "stores.json").is_file() and (cache / "eval" / "stores.json").is_file()
+    capsys.readouterr()
+    assert Q.main(["build-stores", "--config", path]) == 0
+    assert capsys.readouterr().out.count("stores: reusing") == 2
+
+
+def test_the_cli_lists_a_boxs_students_and_plan(monkeypatch, capsys):
+    monkeypatch.setattr(prereg, "rules", lambda sidecar=None, _r=prereg.rules: dict(
+        _r(sidecar), boxes=_r(sidecar).get("boxes") or copy.deepcopy(BOXES_CONTRACT)))
+    assert Q.main(["students", "--box", "A"]) == 0
+    assert capsys.readouterr().out.split() == [prereg.RUNS[x]["student"] for x in BOXES_CONTRACT["A"]["runs"]]
+    assert Q.main(["plan", "--box", "A"]) == 0
+    rows = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    assert [r["phase"] for r in rows][:2] == ["stores", "calibrate"] and rows[-1] == {"phase": "extras",
+                                                                                       "item": "anchor"}
+
+
 from test_study_trainer import env, grad_enabled, hub  # noqa: E402,F401  (the tiny corpus + student fixtures)
 
 
@@ -311,7 +340,7 @@ class FakeUploader:
 
 
 def write_numbers_stub(path, calibration, probes, lrs, max_steps, *, rules_path=None, host=None,
-                       allow_pending=False, box=None):
+                       allow_pending=False):
     """What a per-box prereg.write_numbers does (CONTRACT.md 6; D1): max_steps as the rules derive them from the
     box's calibration, the LRs as its probes choose them, canonical JSON; returns the sha256."""
     import hashlib
@@ -337,7 +366,7 @@ def box(tmp_path, monkeypatch):
     shutil.copytree(ROOT / "configs" / "study", tmp_path / "configs" / "study")
     (tmp_path / "study").mkdir()
     shutil.copy(ROOT / "study" / "PREREG.json", tmp_path / "study" / "PREREG.json")
-    if "box" not in __import__("inspect").signature(prereg.write_numbers).parameters:
+    if "box" not in inspect.signature(prereg.write_numbers).parameters:
         monkeypatch.setattr(prereg, "write_numbers", write_numbers_stub)
     log = tmp_path / "fake-log"
 
@@ -400,9 +429,13 @@ def test_box_a_dry_run(box):
     assert max(x["t0"] for x in cal) < min(x["t1"] for x in cal)
     table = st["calibration"]
     a, b = prereg.CALIB_STEPS
-    assert table["study-t06"]["window"] == [a, b]
     assert all(c["steps_measured"] == b - a and c["data_wait_frac"] < prereg.DATA_WAIT_MAX for c in table.values())
-    assert all(table[x]["window"][0] > a for x in ("study-t03", "study-t01", "study-t005"))
+    # aligned: every window starts once every run of the group has logged step a; the last one there measures (a, b]
+    rows = {run: Q.read_step_rows(root / c["run_dir"]) for run, c in table.items()}
+    t_all = max(r[a]["wall"] for r in rows.values())
+    last = max(rows, key=lambda run: rows[run][a]["wall"])
+    assert table[last]["window"] == [a, b]
+    assert all(rows[run][c["window"][0]]["wall"] >= t_all and c["window"][0] >= a for run, c in table.items())
 
     # probes: the grids, the kept-t03 extension (its grid winner sat on the top edge), both chosen
     kept = sorted(r["lr_probes"]["classes"]["kept-t03"]["grid"])
@@ -415,7 +448,8 @@ def test_box_a_dry_run(box):
 
     # the numbers: written, uploaded and logged before the first study step
     num = json.loads((root / "study" / "PREREG_numbers_A.json").read_text(encoding="utf-8"))
-    assert num["max_steps"] == prereg.max_steps({k: v for k, v in table.items()})
+    per_box = {"box": "A"} if "box" in inspect.signature(prereg.max_steps).parameters else {}
+    assert num["max_steps"] == prereg.max_steps({k: v for k, v in table.items()}, **per_box)
     put_t = next(t for t, p in up.put if p == "study/PREREG_numbers_A.json")
     mains = [by_item[run] for run in r["boxes"]["A"]["runs"]]
     assert put_t < min(x["t0"] for x in mains)
@@ -562,8 +596,9 @@ def test_box_b_plan_and_dry_run(box):
     r = study_rules()
     items = Q.plan_items("B", r)
     groups = [x for x in items if x["phase"] == "calibrate"]
-    assert groups[0]["runs"] == ["study-p03", "study-p01", "study-p005", "study-bridge"] and groups[0]["load"] == []
-    assert groups[1]["runs"] == ["study-t06"] and len(groups[1]["load"]) == 3
+    cal = r["boxes"]["B"]["calibrate"]
+    assert len(cal) == 5 and groups[0]["runs"] == cal[:4] and groups[0]["load"] == []
+    assert groups[1]["runs"] == cal[4:] and groups[1]["load"] == cal[:3]
     assert {x["cls"] for x in items if x["phase"] == "probe"} == {"lost", "kept-p03", "bridge"}
     assert [x["item"] for x in items if x["phase"] == "extras"] == ["speed"]
     assert set(Q.box_students("B", r)) == {r["runs"][x]["student"] for x in r["runs"]}  # the speed probes: all
@@ -574,19 +609,24 @@ def test_box_b_plan_and_dry_run(box):
     st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
     assert set(st["calibration"]) == set(r["boxes"]["B"]["calibrate"])
     load = [x for x in recs if x.get("item", "").startswith("calib-") and "-load" in x["item"]]
-    t06 = next(x for x in recs if x.get("item") == "calib-study-t06")
-    assert len(load) == 3 and all(x["t0"] < t06["t1"] and x["t1"] >= t06["t1"] - 1 for x in load)
+    last = next(x for x in recs if x.get("item") == f"calib-{cal[4]}")  # measured under the load of three others
+    assert len(load) == 3 and all(x["t0"] < last["t1"] and x["t1"] >= last["t1"] - 1 for x in load)
     speed = [x for x in recs if x["mode"] == "speed"]
-    assert len(speed) == len(r["runs"]) + 2 and all(a["t1"] <= b["t0"] for a, b in zip(speed, speed[1:]))
+    assert len(speed) == len(r["runs"]) + len(Q.TEACHERS) and all(a["t1"] <= b["t0"] for a, b in zip(speed, speed[1:]))
+    got = json.loads((root / "runs" / "speed-B" / "speed.json").read_text(encoding="utf-8"))["systems"]
+    assert set(got) == set(r["runs"]) | {"cohere", "parakeet-ctc", "parakeet-tdt"}
+    assert got["study-p03"]["kind"] == "ctc" and got["study-t06"]["kind"] == "aed" and got["cohere"]["model"] is None
+    assert all("--require-idle" in x["argv"] for x in speed)
     last_train = max(x["t1"] for x in recs if x["mode"] != "speed")
     assert all(x["t0"] >= last_train for x in speed)
     num = json.loads((root / "study" / "PREREG_numbers_B.json").read_text(encoding="utf-8"))
-    assert set(num["max_steps"]) >= set(r["boxes"]["B"]["runs"]) and num["max_steps"]["study-t06"] == prereg.REF_STEPS
+    assert set(num["max_steps"]) >= set(r["boxes"]["B"]["runs"]) and "study-t06" in num["calibration"]
 
 
 def test_replicate_takes_box_as_numbers(box):
     make, records, root = box
-    a_numbers = {"max_steps": {"study-t01": 27400, "study-t06": 9366}, "lr": {"study-t01": 1e-3, "study-t06": 2e-4},
+    a_numbers = {"box": "A", "rules_sha256": prereg.rules_sha256(root / "study" / "PREREG.json"),
+                 "max_steps": {"study-t01": 27400, "study-t06": 9370}, "lr": {"study-t01": 1e-3, "study-t06": 2e-4},
                  "calibration": {"study-t01": {"t_step_s": 0.4, "micro_audio_s": 800.0, "data_wait_frac": 0.01,
                                                "steps_measured": 200}}}
     up = FakeUploader(remote={"study/PREREG_numbers_A.json": json.dumps(a_numbers).encode()})
@@ -640,5 +680,5 @@ def test_box_plans_come_from_the_rules():
     with pytest.raises(Q.QueueError, match="reference run"):
         Q.box_plan("A", bad)
     assert Q.box_students("A", r) == [r["runs"][x]["student"] for x in r["boxes"]["A"]["runs"]]
-    assert Q.box_extra_dirs("A", r) == [] and Q.box_extra_dirs("B", r) == [Q.TEACHERS["parakeet"][1]]
+    assert Q.box_extra_dirs("A", r) == [] and Q.box_extra_dirs("B", r) == [Q.PARAKEET_DIR]
     assert Q.study_extra_gb("A", r) > Q.study_extra_gb("replicate", r) > 0
