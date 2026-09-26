@@ -30,7 +30,10 @@ grids and the edge rule, max_steps, the branch fractions - comes from kitsune.pr
                (study/<numbers_file>), verified on the Hub, and its sha256 logged (a `prereg_numbers` event) BEFORE the
                first study step. A box with numbers_from (the replicate) takes its runs' max_steps and LR from that
                box's uploaded file instead (derived_numbers). Once written, a box never writes its numbers again: a
-               restart reuses the file, and one already on the Hub that this box did not write halts it
+               restart reuses the file; a RELAUNCHED box (fresh state) whose file is on the Hub already reuses that
+               one when its rules_sha256 is the committed PREREG's, and skips its calibration and probes
+               (adopt_numbers; other rules halt it). The queue summary goes up right after the numbers: a relaunch
+               takes the loader retry's workers and the smoke gate guard's decision from it
   wave         per GPU a main run, then its T/2 branch (<run>-half with branch.parent = the main's local run dir), each
                filled with --set schedule.max_steps, optim.lr, eval.mini.every_steps (prereg's mini fraction of
                max_steps), the calibrated micro-batch and, after a loader-bound calibration, perf.num_workers; the
@@ -43,7 +46,13 @@ grids and the edge rule, max_steps, the branch fractions - comes from kitsune.pr
                tools/speed_probe.py for every student and both teachers, one model at a time on an idle host, at the
                end, each student with its TRAINED final weights (an AED greedy decode runs as long as its weights make
                it: an untrained decoder runs on to max_new): this box's runs from their run dirs, the other boxes'
-               from the runs repo (skipped with a logged note while the tool is absent)
+               from the runs repo (skipped with a logged note while the tool is absent). The replicate is conditional
+               (CONTRACT.md 8): without its final weights in the runs repo it is skipped with a note. The Cohere
+               teacher is read with the box's HF_TOKEN (the vast account env). A failed anchor or speed readout ends
+               the box complete, the failure recorded (queue_summary.json readouts_failed)
+Boxes A and B run at the same time against one runs repo: their items, run ids (a run one box calibrates as its
+reference only is calib-<run>-box<box>), state, queue summaries (study/box-<box>/) and numbers files are the box's
+own; every upload backs off on a 429 (finish.hub_retry), and each box's mains start SYNC_OFFSET_S apart
 Loader and /dev/shm: every trainer of a run gets the same perf.num_workers / perf.prefetch (loader_sets): the
 loader-bound retry's workers, cut so its in-flight micro-batches fit its share of the host's /dev/shm (the trainers of
 one box share it; each trainer's own shm_cap measures only the free space it sees when it starts).
@@ -68,6 +77,7 @@ Usage (the box runs it through vast/supervise.py; KITSUNE_BOX, KITSUNE_OUT_REPO 
   python -m kitsune.study_queue run --box A
   python -m kitsune.study_queue plan --box B              # the items it would run, nothing started
   python -m kitsune.study_queue students --box A          # the student dirs the box pulls (vast/bootstrap.sh)
+  python -m kitsune.study_queue check-students --box A    # after the pull: each is the registered build (exit 2 if not)
   python -m kitsune.study_queue build-stores --config configs/study/calib-study-t06.json
 Pure Python at import (stdlib + kitsune.prereg); the trainer's modules only inside build-stores.
 """
@@ -350,6 +360,28 @@ def box_students(box: str, rules: dict | None = None) -> list[str]:
     return list(dict.fromkeys(r["runs"][run]["student"] for run in _box_student_runs(box, r)))
 
 
+def student_checks(box: str, read_meta, rules: dict | None = None) -> list[str]:
+    """Why the student dirs the box pulls are not the ones the rules register (kitsune.prereg.student_problems: stage,
+    family, init class, seed, the exact parameter counts, and a pruned student's calibration ids), for every run the
+    box trains, calibrates or probes on. read_meta(student dir) -> its student_meta.json as a dict (launch.py reads the
+    data repo's, bootstrap.sh the pulled copy); a meta it cannot read is a problem too. Empty: every student is the
+    registered build. A stale build (the B10 T-0.3B, a P student ranked on re-drawn ids) is refused here, before the
+    box rents (launch) or trains (bootstrap), instead of training the wrong model at full price."""
+    r = rules if rules is not None else prereg.rules()
+    problems, metas = [], {}
+    for run in _box_student_runs(box, r):
+        s = r["runs"][run]["student"]
+        if s not in metas:
+            try:
+                metas[s] = read_meta(s)
+            except Exception as e:  # noqa: BLE001  a missing or unreadable meta refuses like a wrong one
+                metas[s] = None
+                problems.append(f"{s}/student_meta.json: cannot read it ({type(e).__name__}: {e})")
+        if metas[s] is not None:
+            problems += [f"{s}: {p}" for p in prereg.student_problems(run, metas[s])]
+    return problems
+
+
 def box_ctc_students(box: str, rules: dict | None = None) -> list[str]:
     """The Parakeet-derived ones among box_students: they carry the CC-BY-4.0 attribution (MODEL_CARD.md)."""
     r = rules if rules is not None else prereg.rules()
@@ -425,10 +457,15 @@ class HubUploader:
         return self._api
 
     def sync_run(self, run_dir: Path) -> list[str]:
-        """Upload the run dir (lean) and verify it; the problems (empty: every expected file is on the Hub)."""
+        """Upload the run dir (lean) and verify it; the problems (empty: every expected file is on the Hub). The upload
+        backs off (finish.hub_retry: 5 s doubling to 10 min) like every other write of the queue: boxes A and B run at
+        the same time, and their eight trainers and two queues commit into the one runs repo, where a 429 or a commit
+        that races another writer is the Hub asking for a later try, not a lost run (finish.sync raises after trying
+        both of its parts; a re-upload of what is there already costs no commit)."""
         fin = _finish()
         try:
-            fin.sync(self.api(), self.repo, self.repo_type, run_dir, False, False, lean=True)
+            fin.hub_retry(lambda: fin.sync(self.api(), self.repo, self.repo_type, run_dir, False, False, lean=True),
+                          f"sync {run_dir.name}")
         except Exception as e:  # noqa: BLE001  the verification below says what is missing
             log(f"sync of {run_dir.name} failed: {type(e).__name__}: {e}")
         return fin.verify(self.api(), self.repo, self.repo_type, fin.expected_files(run_dir, False, lean=True))
@@ -561,7 +598,7 @@ class Queue:
     def _load_state(self) -> dict:
         fresh = dict(box=self.box, version=1, started=time.time(), items={}, calibration=None, num_workers=None,
                      probes={}, lr_choice=None, numbers=None, stores_done=False, final=None, abandoned=[], shm=None,
-                     smoke_gate_off=None, shake_notes=None)
+                     smoke_gate_off=None, shake_notes=None, readouts_failed=None)
         if not self.state_path.is_file():
             return fresh
         st = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -615,21 +652,31 @@ class Queue:
             if self.plan.get("shakedown"):
                 self.phase_shakedown()
             else:
-                self.phase_calibrate()
-                self.phase_probes()
+                self.adopt_numbers()  # a relaunch whose numbers are on the Hub already: never measured again
+                if not (self.state["numbers"] or {}).get("reused"):
+                    self.phase_calibrate()
+                    self.phase_probes()
                 self.phase_numbers()
+                self.smoke_gate_guard()
+                # what a relaunch of this box needs besides the numbers file (the loader-bound retry's workers, the
+                # smoke gate guard's decision), in the runs repo before the first study step
+                self.write_summary("running", "the numbers are on the Hub; the wave starts", None)
                 self.phase_wave()
                 self.phase_extras()
             self.drain_uploads()
             bad = sorted(n for n, it in self.state["items"].items()
                          if (it["status"] == "failed" and it["kind"] not in ("anchor", "speed"))
                          or (it["status"] == "done" and it["verified"] is False))
-            readouts = sorted(n for n, it in self.state["items"].items()
-                              if it["status"] == "failed" and it["kind"] in ("anchor", "speed"))
+            # the owner's policy: a failed anchor or speed readout ends the box complete, the failure recorded (the
+            # summary's readouts_failed: item -> why); the owner redoes it from the Hub, never on a kept paid box
+            readouts = {n: (it.get("source") or {}).get("why") or f"exit {(it['attempts'] or [{}])[-1].get('rc')}"
+                        for n, it in sorted(self.state["items"].items())
+                        if it["status"] == "failed" and it["kind"] in ("anchor", "speed")}
+            self.state["readouts_failed"] = readouts
             if bad:
                 rc, status, reason = EXIT_FAIL, "failed", f"items failed or not verified on the Hub: {bad}"
             elif readouts:  # a readout the owner can redo elsewhere: logged, never a reason to keep a box
-                reason = f"complete; readouts failed (redo them from the Hub): {readouts}"
+                reason = f"complete; readouts failed (redo them from the Hub): {sorted(readouts)}"
         except ThroughputHalt as e:
             rc, status, reason = EXIT_THROUGHPUT, "halted", str(e)
         except Halt as e:
@@ -1028,6 +1075,12 @@ class Queue:
             out.append(members)
         return out
 
+    def calib_name(self, run: str) -> str:
+        """The calibration item's (and run's) name: calib-<run> for the box's own run, calib-<run>-box<box> for one it
+        calibrates as its reference only (box B's study-t06). Boxes A and B run at the same time and both calibrate
+        study-t06: their run ids (<name>-<UTC second>) must never meet in the one runs repo, whenever they start."""
+        return f"calib-{run}" + ("" if run in self.plan["runs"] else f"-box{self.box}")
+
     def phase_calibrate(self):
         if not self.plan["calibrate"] or self.state["calibration"]:
             return
@@ -1058,8 +1111,8 @@ class Queue:
         for attempt in (1, 2):
             names = {}
             for run, measured in group:
-                name = f"calib-{run}" + ("" if measured else f"-load{gi}") + (f"-w{workers}" if workers else "") + (
-                    f"-try{attempt}" if attempt > 1 else "")
+                name = self.calib_name(run) + ("" if measured else f"-load{gi}") + (
+                    f"-w{workers}" if workers else "") + (f"-try{attempt}" if attempt > 1 else "")
                 sets = self.loader_sets(run, workers) + ["calibrate.barrier=true"]
                 self.add_item(name, "calib", config_path(f"calib-{run}"), sets, run=run, measured=measured)
                 for d in self.run_dirs_of(name):  # a restart: the group runs again as a whole, every run fresh
@@ -1270,14 +1323,82 @@ class Queue:
     def numbers_path(self) -> Path:
         return self.root / NUMBERS_DIR / self.plan["numbers_file"]
 
+    def adopt_numbers(self):
+        """A relaunched box (a fresh queue.json: the earlier box died, or was destroyed, after its numbers went up):
+        the numbers are write-once - the pre-registration is the file uploaded before the box's first study step - so
+        the box REUSES study/<numbers_file> from the runs repo as it is, and skips its calibration and probes (never a
+        second measurement, never an overwrite). Only when it was written under the committed rules (its rules_sha256
+        = rules_sha256 of study/PREREG.json in this checkout) for this box, with max_steps and LR for every run of the
+        box; anything else halts the box for the owner (EXIT_HALT), as does a local copy with other bytes. The earlier
+        box's queue summary (study/box-<box>/queue_summary.json, uploaded right after its numbers) gives the
+        loader-bound retry's perf.num_workers and the smoke gate guard's decision; without it the box runs the configs'
+        workers and every smoke gate on (a logged note)."""
+        if self.state["numbers"] or self.uploader is None or not self.plan.get("numbers_file"):
+            return
+        remote = f"{NUMBERS_DIR}/{self.plan['numbers_file']}"
+        if not self.uploader.exists(remote):
+            return
+        data = Path(self.uploader.download(remote, Path(self.s.state_dir) / "numbers_reused")).read_bytes()
+        try:
+            numbers = json.loads(data)
+        except ValueError as e:
+            raise Halt(f"{remote} is in the runs repo but is not a numbers file ({e}): the numbers are written once; "
+                       f"relaunch decisions are the owner's") from e
+        here = prereg.rules_sha256(self.rules_path)
+        if numbers.get("rules_sha256") != here:
+            raise Halt(f"{remote} was written under the rules {str(numbers.get('rules_sha256'))[:12]}..., this "
+                       f"checkout's study/{prereg.RULES_JSON} is {here[:12]}...: a relaunch reuses the numbers only "
+                       f"under the rules they were written under (never recalibrated, never overwritten)")
+        if numbers.get("box") not in (None, self.box):
+            raise Halt(f"{remote} holds box {numbers.get('box')!r}'s numbers, not box {self.box}'s")
+        lacking = [r for r in self.plan["runs"]
+                   if r not in (numbers.get("max_steps") or {}) or r not in (numbers.get("lr") or {})]
+        if lacking:
+            raise Halt(f"{remote} has no max_steps / lr for {lacking}")
+        path = self.numbers_path()
+        if path.is_file() and path.read_bytes() != data:
+            raise Halt(f"{path} differs from {remote}: the numbers are fixed once uploaded")
+        if not path.is_file():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        sha = prereg.file_sha256(path)
+        prev = self.previous_summary()
+        self.state["num_workers"] = (prev or {}).get("num_workers")
+        if (prev or {}).get("smoke_gate_off") is not None:
+            self.state["smoke_gate_off"] = prev["smoke_gate_off"]
+        self.state["numbers"] = dict(path=self._rel(path), sha256=sha, remote=remote, uploaded=True, verified=True,
+                                     reused=True, max_steps=numbers["max_steps"], lr=numbers["lr"],
+                                     calibration=numbers.get("calibration"), written=numbers.get("written_utc"),
+                                     reused_wall=time.time(), summary_found=prev is not None)
+        self.save()
+        self.event("prereg_numbers_reused", remote=remote, sha256=sha, rules_sha256=here,
+                   num_workers=self.state["num_workers"], smoke_gate_off=self.state["smoke_gate_off"],
+                   summary_found=prev is not None)
+        # the pre-registration's record on this box too: before its first study step
+        self.event("prereg_numbers", sha256=sha, path=self.state["numbers"]["path"], remote=remote, verified=True,
+                   reused=True)
+
+    def previous_summary(self) -> dict | None:
+        """The earlier box's queue summary in the runs repo (None when it has none, or it cannot be read)."""
+        remote = f"{NUMBERS_DIR}/box-{self.box}/{SUMMARY_FILE}"
+        try:
+            if not self.uploader.exists(remote):
+                log(f"no {remote}: the configs' workers and every smoke gate on")
+                return None
+            return json.loads(Path(self.uploader.download(remote, Path(self.s.state_dir) / "numbers_reused"))
+                              .read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            log(f"{remote} not read ({type(e).__name__}: {e}): the configs' workers and every smoke gate on")
+            return None
+
     def phase_numbers(self):
         """The box's PREREG_numbers file: written once, uploaded, verified and its sha256 logged, before the wave."""
         num = self.state["numbers"]
         path, remote = self.numbers_path(), f"{NUMBERS_DIR}/{self.plan['numbers_file']}"
         if not (num and num.get("sha256")):
             if self.uploader is not None and self.uploader.exists(remote):
-                raise Halt(f"{remote} is already in the runs repo, but this box did not write it: a box writes its "
-                           f"numbers once, before its first study step (relaunch decisions are the owner's)")
+                raise Halt(f"{remote} came into the runs repo while this box calibrated and probed (another box "
+                           f"{self.box} is live?): a box writes its numbers once, before its first study step")
             try:
                 sha, numbers = self.write_numbers(path)
             except ValueError as e:
@@ -1526,9 +1647,24 @@ class Queue:
                 if kind in ("aed", "ctc"):  # a student: its trained final weights
                     path, source = self.trained_weights(sys_name)
                 if kind in ("aed", "ctc") and path is None:
+                    # the replicate is conditional (CONTRACT.md 8: it runs only if a limit call moves between
+                    # sigma_run 1.6 % and 3.2 %): without its final weights in the runs repo it is skipped with a note,
+                    # not a failed readout; any other student without weights is a failed readout
+                    cond = sys_name == prereg.REPLICATE
+                    why = (f"the replicate is conditional (CONTRACT.md 8) and has no final weights in the runs repo "
+                           f"yet ({source}); it is timed only once it has run") if cond else source
                     self.add_item(name, "speed", None, [])
-                    self.item(name).update(status="failed", source=dict(model=None, why=source))
-                    self.event("speed_skipped", system=sys_name, why=source)
+                    self.item(name).update(status="skipped" if cond else "failed", source=dict(model=None, why=why))
+                    self.event("speed_skipped", system=sys_name, why=why, conditional=cond)
+                    self.save()
+                    continue
+                if sys_name == "cohere" and not (self.s.env.get("HF_TOKEN") or os.environ.get("HF_TOKEN")):
+                    # the gated teacher is read with the box's own token (the vast account env HF_TOKEN, inherited
+                    # by every child; never written into queue.json): without one this readout fails, logged
+                    why = "no HF_TOKEN in the box's env: the gated Cohere teacher cannot be downloaded"
+                    self.add_item(name, "speed", None, [])
+                    self.item(name).update(status="failed", source=dict(model=None, why=why))
+                    self.event("speed_skipped", system=sys_name, why=why)
                     self.save()
                     continue
                 args = ["--kind", kind, *(["--model", path] if path else []), "--system", sys_name,
@@ -1624,7 +1760,7 @@ class Queue:
                        calibration=self.state["calibration"], num_workers=self.state["num_workers"],
                        probes=self.state["probes"], lr_choice=self.state["lr_choice"], numbers=self.state["numbers"],
                        smoke_gate_off=self.state["smoke_gate_off"], shake_notes=self.state.get("shake_notes"),
-                       shm=self.state["shm"],
+                       readouts_failed=self.state.get("readouts_failed"), shm=self.state["shm"],
                        abandoned=self.state["abandoned"], started=self.state["started"], ended=time.time())
         path = Path(self.s.state_dir) / SUMMARY_FILE
         _atomic_json(path, summary)
@@ -1720,10 +1856,12 @@ def anchor(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("run", "plan", "students"):
+    for c in ("run", "plan", "students", "check-students"):
         p = sub.add_parser(c)
         p.add_argument("--box", default=os.environ.get("KITSUNE_BOX"), choices=BOXES)
     sub.choices["run"].add_argument("--gpus", default=None, help="comma list of CUDA_VISIBLE_DEVICES values")
+    sub.choices["check-students"].add_argument("--root", default=str(REPO),
+                                               help="the dir the student dirs were pulled into (the box's checkout)")
     b = sub.add_parser("build-stores")
     b.add_argument("--config", required=True)
     b.add_argument("--set", action="append", default=[])
@@ -1742,6 +1880,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "students":
             print("\n".join(box_students(args.box)))
             return 0
+        if args.cmd == "check-students":  # vast/bootstrap.sh after the pull: exit 2 on a student not the rules' build
+            root = Path(args.root)
+            problems = student_checks(args.box, lambda s: json.loads(
+                (root / s / "student_meta.json").read_text(encoding="utf-8")))
+            for p in problems:
+                log(f"student refused: {p}")
+            if not problems:
+                log(f"box {args.box}: {len(box_students(args.box))} student(s) are the registered builds")
+            return 2 if problems else 0
         if args.cmd == "plan":
             for row in plan_items(args.box):
                 print(json.dumps(row))

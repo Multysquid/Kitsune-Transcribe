@@ -34,7 +34,8 @@
 # Study box (KITSUNE_JOB=study, KITSUNE_BOX=A|B|replicate|shakedown; KITSUNE_CONFIG is study/data.json, the data block,
 # which names no student): the students pulled are the box's own (kitsune.study_queue.box_students), each with
 # STUDENT_FILES and, for a Parakeet-derived one, its CC-BY-4.0 MODEL_CARD.md; plus box_extra_dirs (the Parakeet
-# teacher for the speed probes).
+# teacher for the speed probes). After the pull, `python -m kitsune.study_queue check-students` refuses (exit 2) a
+# pulled student that is not the registered build (kitsune.prereg.student_problems).
 # The rebuild is `01 --extent-config $KITSUNE_CONFIG`, the canonical ingest sequence the label box ran, so the ids and
 # stems are the labelled ones (KITSUNE_PREP_ARGS is ignored), and coverage is exact: every pulled stem's rebuilt id
 # sidecar hashes to the record's ids_sha256, its teacher ids are a subset of its ids, and every split joins at 1.0.
@@ -413,6 +414,13 @@ log "disk free before: $(df -h --output=avail "$KITSUNE_DIR" | tail -1 | tr -d '
 # files renamed when done, and snapshot_download skips what is already on disk (~2.3 GB in all)
 phase plan retry 3 timeout -k 30 10m "$PY" "$HELPER" plan
 phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull
+if [ "${KITSUNE_JOB:-}" = "study" ]; then
+    # every pulled student is the registered build (kitsune.prereg.student_problems through study_queue.student_checks:
+    # stage, family, init class, seed, the exact parameter counts, a pruned student's calibration ids). launch.py
+    # checked the data repo's metas before renting; this checks the files the box will train, before the audio rebuild
+    # it would otherwise pay for. Exit 2 (a refusal) stops the bootstrap
+    phase check_students "$PY" -m kitsune.study_queue check-students --box "$KITSUNE_BOX" --root "$KITSUNE_DIR"
+fi
 
 DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["data_root"])' "$STATE/bootstrap_plan.json")"
 mapfile -t REBUILD < <("$PY" -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1]))["rebuild"]))' "$STATE/bootstrap_plan.json" | sed '/^$/d')

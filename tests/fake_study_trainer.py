@@ -19,7 +19,9 @@ first launch writes its states up to that fraction of max_steps, then exits 1); 
 takes after writing its fraction states, or {run_name prefix: seconds}); KITSUNE_CRASH_AT_STEP as the trainer reads it
 (a crash before that step, full states every ckpt.full_every_steps); FAKE_CALIB_CRASH {run_name prefix: step} (a
 calibration run's first try exits 1 at that step); FAKE_FLAT {run_name prefix: true} (the smoke's loss does not fall:
-a calibration run logs it, a run with smoke.require_loss_decrease fails with SmokeFailed).
+a calibration run logs it, a run with smoke.require_loss_decrease fails with SmokeFailed); FAKE_FAIL {item prefix: rc}
+(an anchor or speed item exits rc: a failed readout); FAKE_HUB (a tests/fake_runs_repo.py dir: a main run commits its
+log syncs there, FAKE_SYNCS of them, FAKE_BOX its box, retried on a 429 after FAKE_SYNC_WAITS).
 """
 import json
 import os
@@ -93,6 +95,35 @@ def ckpt(run: Path, name: str, full: bool = False):
 def event(run: Path, kind: str, **f):
     with open(run / "events.jsonl", "a", encoding="utf-8") as fh:
         fh.write(json.dumps({"kind": kind, "wall": time.time(), **f}) + "\n")
+
+
+def hub_syncs(run: Path, seconds: float):
+    """A main run's log syncs into the shared fake runs repo (FAKE_HUB: tests/fake_runs_repo.py): FAKE_SYNCS commits of
+    runs/<run id>/events.jsonl spread over `seconds`, each retried on a 429 after the waits FAKE_SYNC_WAITS (JSON list),
+    as kitsune/runlog.py's upload_retries do; a sync whose retries all fail is a sync_failed event (the trainer's next
+    sync uploads the same files again). Without FAKE_HUB: just the time."""
+    if not os.environ.get("FAKE_HUB"):
+        time.sleep(seconds)
+        return
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from fake_runs_repo import DirHub, RateLimited
+
+    hub, n = DirHub(os.environ["FAKE_HUB"]), int(os.environ.get("FAKE_SYNCS", "3"))
+    waits = [0.0, *env_json("FAKE_SYNC_WAITS", [0.05, 0.2, 0.8])]
+    for i in range(n):
+        time.sleep(seconds / n)
+        event(run, "sync", i=i)
+        for attempt, w in enumerate(waits):
+            time.sleep(w)
+            try:
+                hub.commit({f"runs/{run.name}/events.jsonl": (run / "events.jsonl").read_bytes()}, writer=run.name,
+                           box=os.environ.get("FAKE_BOX"))
+                event(run, "sync_ok", i=i, attempt=attempt)
+                break
+            except RateLimited:
+                event(run, "sync_error", i=i, attempt=attempt)
+        else:
+            event(run, "sync_failed", i=i)
 
 
 def train(args: dict, record: dict) -> int:
@@ -188,7 +219,7 @@ def train(args: dict, record: dict) -> int:
     if resumed:
         record["resumed_from"] = max((int(p.name.rsplit("_", 1)[1]) for p in (run / "checkpoints").glob("full_step_*")),
                                      default=0)
-    time.sleep(main_s(name))
+    hub_syncs(run, main_s(name))
     ckpt(run, f"step_{M}")
     ckpt(run, f"full_step_{M}", full=True)
     write_json(run / "summary.json", {"status": "complete", "steps": M})
@@ -259,6 +290,8 @@ def main() -> int:
             rc = train(args, record)
         elif mode == "stores":
             time.sleep(float(os.environ.get("FAKE_STORES_S", "0.05")))
+        elif mode in ("anchor", "speed") and by_prefix(env_json("FAKE_FAIL", {}), record["item"] or "", None):
+            rc = int(by_prefix(env_json("FAKE_FAIL", {}), record["item"] or ""))  # a readout that fails
         elif mode == "anchor":
             out = Path(args["out"])
             out.mkdir(parents=True, exist_ok=True)
@@ -267,7 +300,8 @@ def main() -> int:
         elif mode == "speed":  # tools/speed_probe.py: one --out, merged per system
             out = Path(args["out"])
             got = json.loads(out.read_text(encoding="utf-8")) if out.is_file() else {"systems": {}}
-            got["systems"][args["system"]] = {"kind": args["kind"], "model": args.get("model"), "rtf": 0.01}
+            got["systems"][args["system"]] = {"kind": args["kind"], "model": args.get("model"), "rtf": 0.01,
+                                              "hf_token": bool(os.environ.get("HF_TOKEN"))}
             write_json(out, got)
         else:
             rc = 2

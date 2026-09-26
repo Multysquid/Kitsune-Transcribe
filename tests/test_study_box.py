@@ -11,7 +11,10 @@
   still loader-bound), a restart after a kill mid-wave, the smoke gate guard and a smoke failure without a second try,
   the GPU count and /dev/shm share, box B's plan (its wave calibrated together, the reference under the wave's load,
   the speed probes on trained weights; CTC items stubbed by the fake trainer until the CTC trainer is merged), the
-  replicate's derived numbers, the shakedown
+  replicate's derived numbers, the shakedown; a relaunched box reusing its numbers from the Hub (and refusing ones
+  written under other rules), the readout policy (a failed anchor or speed item: complete, recorded; the conditional
+  replicate skipped with a note), and boxes A and B run concurrently against one rate-limited runs repo
+  (tests/fake_runs_repo.py)
 Every process the queue starts is tests/fake_study_trainer.py here (fake GPUs = distinct CUDA_VISIBLE_DEVICES values,
 uploads recorded by a fake uploader); the real trainer runs in the calibrate-block test only. CPU only.
 """
@@ -694,14 +697,18 @@ def test_box_b_plan_and_dry_run(box):
     assert Q.box_ctc_students("B", r) == [r["runs"][x]["student"] for x in ("study-p03", "study-p01", "study-p005")]
     obj = {**middle_wins("lost", r), **middle_wins("kept-p03", r), **middle_wins("bridge", r)}
     up = FakeUploader(remote=box_a_on_the_hub(r))
-    assert make("B", uploader=up, env=dict(FAKE_OBJ=json.dumps(obj))).run() == Q.EXIT_OK
+    # HF_TOKEN: the vast account env's, which the Cohere teacher's speed item reads the gated repo with (a test value)
+    assert make("B", uploader=up, env=dict(FAKE_OBJ=json.dumps(obj), HF_TOKEN="hf_test_value")).run() == Q.EXIT_OK
     recs = records()
     st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
     assert set(st["calibration"]) == set(r["boxes"]["B"]["calibrate"])
     first = [next(x for x in recs if x.get("item") == f"calib-{run}") for run in wave]
     assert max(x["t0"] for x in first) < min(x["t1"] for x in first)  # the wave's four at once
     load = [x for x in recs if x.get("item", "").startswith("calib-") and "-load" in x["item"]]
-    last = next(x for x in recs if x.get("item") == "calib-study-t06")  # measured under the load of three others
+    # measured under the load of three others; box B's own name for it (box A calibrates study-t06 at the same time)
+    last = next(x for x in recs if x.get("item") == "calib-study-t06-boxB")
+    assert not any(x.get("item") == "calib-study-t06" for x in recs)
+    assert st["calibration"]["study-t06"]["run_dir"].startswith("runs/calib-study-t06-boxB-")
     assert len(load) == 3 and all(x["t0"] < last["t1"] and x["t1"] >= last["t1"] - 1 for x in load)
     t06 = Q.read_step_rows(root / st["calibration"]["study-t06"]["run_dir"])
     a, b = prereg.CALIB_STEPS
@@ -712,21 +719,23 @@ def test_box_b_plan_and_dry_run(box):
     got = json.loads((root / "runs" / "speed-B" / "speed.json").read_text(encoding="utf-8"))["systems"]
     assert set(got) == set(timed) | {"cohere", "parakeet-ctc", "parakeet-tdt"}
     assert got["study-p03"]["kind"] == "ctc" and got["study-t06"]["kind"] == "aed" and got["cohere"]["model"] is None
+    assert got["cohere"]["hf_token"] is True  # the box's token reaches the teacher's speed item
     for run in wave:  # box B's own: the final weights in its run dir
         d = st["items"][run]["run_dir"]
         assert got[run]["model"] == f"{d}/checkpoints/step_{st['numbers']['max_steps'][run]}"
     for run in r["boxes"]["A"]["runs"]:  # box A's: its final weights from the runs repo
         m = Path(got[run]["model"])
         assert m.name == "step_9370" and (m / "model.safetensors").read_bytes() == f"{run}@9370".encode()
-    assert st["items"][f"speed-{prereg.REPLICATE}"]["status"] == "failed"
-    assert "box replicate" in st["items"][f"speed-{prereg.REPLICATE}"]["source"]["why"]
+    # the replicate is conditional (CONTRACT.md 8): not trained, so skipped with a note - not a failed readout
+    assert st["items"][f"speed-{prereg.REPLICATE}"]["status"] == "skipped"
+    assert "conditional" in st["items"][f"speed-{prereg.REPLICATE}"]["source"]["why"]
     assert all("--require-idle" in x["argv"] for x in speed)
     last_train = max(x["t1"] for x in recs if x["mode"] != "speed")
     assert all(x["t0"] >= last_train for x in speed)
     num = json.loads((root / "study" / "PREREG_numbers_B.json").read_text(encoding="utf-8"))
     assert set(num["max_steps"]) >= set(r["boxes"]["B"]["runs"]) and "study-t06" in num["calibration"]
     summary = json.loads((root / "state" / "queue_summary.json").read_text(encoding="utf-8"))
-    assert summary["status"] == "complete" and f"speed-{prereg.REPLICATE}" in summary["reason"]
+    assert summary["status"] == "complete" and summary["reason"] is None and summary["readouts_failed"] == {}
 
 
 def test_replicate_takes_box_as_numbers(box):
@@ -752,14 +761,93 @@ def test_replicate_takes_box_as_numbers(box):
     assert not any(x["item"].startswith(("calib-", "probe-")) for x in by_item.values() if x.get("item"))
 
 
-def test_a_box_never_writes_its_numbers_twice(box):
-    """Numbers already in the runs repo that this box did not write halt it before any study step."""
+def earlier_box_a(root: Path, rules_sha: str | None = None) -> dict:
+    """The runs repo after an earlier box A that wrote and uploaded its numbers (then died): its numbers file, under
+    the committed rules unless rules_sha, and the queue summary it put up with them (the loader-bound retry's 12
+    workers, study-t01 run without the loss-trend check)."""
+    runs = ["study-t06", "study-t03", "study-t01", "study-t005"]
+    numbers = {"box": "A", "rules_sha256": rules_sha or prereg.rules_sha256(root / "study" / "PREREG.json"),
+               "max_steps": dict(zip(runs, [9370, 18520, 27400, 44010])),
+               "lr": dict(zip(runs, [2e-4, 2e-4, 1e-3, 1e-3])),
+               "calibration": {x: {"t_step_s": 0.4, "micro_audio_s": 777.0, "data_wait_frac": 0.01,
+                                   "steps_measured": 200} for x in runs},
+               "lr_probes": {}, "written_utc": "2026-10-01T00:00:00Z", "host": "earlier-host"}
+    gate = {"study-t01": {"loss_decreasing": False, "source": "runs/calib-study-t01-20261001T000000Z"}}
+    summary = {"box": "A", "status": "running", "num_workers": 12, "smoke_gate_off": gate}
+    return {"study/PREREG_numbers_A.json": (json.dumps(numbers, sort_keys=True, indent=1) + "\n").encode(),
+            "study/box-A/queue_summary.json": json.dumps(summary).encode()}
+
+
+def test_a_relaunched_box_reuses_its_numbers_and_never_measures_again(box):
+    """A relaunched box A (a fresh queue.json) finds its numbers file on the Hub, written under the committed rules: it
+    takes that file as it is - no calibration, no probe, no second write or upload of it - logs its sha256 before the
+    first study step, and runs its wave with the file's max_steps, LR and micro-batch, and the earlier box's loader
+    retry and smoke gate decision from its queue summary."""
     make, records, root = box
     r = study_rules()
-    up = FakeUploader(remote={"study/PREREG_numbers_A.json": b"{}"})
-    env = dict(FAKE_OBJ=json.dumps({**middle_wins("kept-t03", r), **middle_wins("scratch", r)}))
-    assert make("A", uploader=up, env=env).run() == Q.EXIT_HALT
-    assert not any(x.get("item") in r["boxes"]["A"]["runs"] for x in records())
+    up = FakeUploader(remote=earlier_box_a(root))
+    before = up.remote["study/PREREG_numbers_A.json"]
+    assert make("A", uploader=up).run() == Q.EXIT_OK
+    items = [x["item"] for x in records() if x.get("item")]
+    assert not any(i.startswith(("calib-", "probe-")) for i in items)
+    assert set(r["boxes"]["A"]["runs"]) <= set(items)
+    assert (root / "study" / "PREREG_numbers_A.json").read_bytes() == before == up.remote["study/PREREG_numbers_A.json"]
+    assert not any(p == "study/PREREG_numbers_A.json" for _, p in up.put)  # never overwritten
+    st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
+    assert st["numbers"]["reused"] and st["numbers"]["sha256"] == prereg.file_sha256(root / "study" /
+                                                                                       "PREREG_numbers_A.json")
+    assert st["calibration"] is None and st["lr_choice"] is None and st["num_workers"] == 12
+    by_item = {x["item"]: x for x in records() if x.get("item")}
+    t01 = by_item["study-t01"]["argv"]
+    assert "schedule.max_steps=27400" in t01 and "optim.lr=0.001" in t01 and "batch.micro_audio_s=777.0" in t01
+    assert "perf.num_workers=12" in t01 and "smoke.require_loss_decrease=false" in t01
+    assert "smoke.require_loss_decrease=false" not in by_item["study-t06"]["argv"]
+    ev = [json.loads(x) for x in (root / "state" / "events.jsonl").read_text().splitlines()]
+    first_main = min(i for i, e in enumerate(ev) if e["kind"] == "item_start" and e["item"] in r["boxes"]["A"]["runs"])
+    rec = next(i for i, e in enumerate(ev) if e["kind"] == "prereg_numbers")
+    assert rec < first_main and ev[rec]["reused"] and ev[rec]["sha256"] == st["numbers"]["sha256"]
+
+
+def test_a_relaunch_under_other_rules_refuses_and_a_foreign_file_halts(box):
+    """Numbers on the Hub written under other rules than the committed PREREG (or not a numbers file at all) halt the
+    relaunched box before it calibrates, probes or trains anything; the file stays as it was."""
+    make, records, root = box
+    for remote in (earlier_box_a(root, rules_sha="f" * 64), {"study/PREREG_numbers_A.json": b"{}"}):
+        shutil.rmtree(root / "state", ignore_errors=True)
+        up = FakeUploader(remote=remote)
+        before = up.remote["study/PREREG_numbers_A.json"]
+        n = len(records())
+        assert make("A", uploader=up).run() == Q.EXIT_HALT
+        st = json.loads((root / "state" / "queue.json").read_text(encoding="utf-8"))
+        assert "rules" in st["final"]["reason"] and st["numbers"] is None
+        assert all(x["mode"] == "stores" for x in records()[n:])  # nothing measured, nothing trained
+        assert up.remote["study/PREREG_numbers_A.json"] == before
+        assert not (root / "study" / "PREREG_numbers_A.json").exists()
+
+
+def test_a_failed_anchor_or_speed_readout_ends_the_box_complete_with_the_failure_recorded(box):
+    make, records, root = box
+    r = study_rules()
+    up = FakeUploader(remote=earlier_box_a(root))
+    assert make("A", uploader=up, env=dict(FAKE_FAIL=json.dumps({"anchor": 1}))).run() == Q.EXIT_OK
+    summary = json.loads((root / "state" / "queue_summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "complete" and "anchor" in summary["reason"]
+    assert set(summary["readouts_failed"]) == {"anchor"}
+    assert all(summary["items"][x]["status"] == "done" for x in r["boxes"]["A"]["runs"])
+    # box B: the Cohere teacher's speed item without the box's HF_TOKEN, and a student's probe exiting 1
+    shutil.rmtree(root / "state")
+    obj = {**middle_wins("lost", r), **middle_wins("kept-p03", r), **middle_wins("bridge", r)}
+    env = dict(FAKE_OBJ=json.dumps(obj), FAKE_FAIL=json.dumps({"speed-study-p01": 1}))
+    os_token = os.environ.pop("HF_TOKEN", None)
+    try:
+        assert make("B", uploader=FakeUploader(remote=box_a_on_the_hub(r)), env=env).run() == Q.EXIT_OK
+    finally:
+        if os_token is not None:
+            os.environ["HF_TOKEN"] = os_token
+    summary = json.loads((root / "state" / "queue_summary.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "complete" and set(summary["readouts_failed"]) == {"speed-cohere", "speed-study-p01"}
+    assert "HF_TOKEN" in summary["readouts_failed"]["speed-cohere"]
+    assert summary["items"][f"speed-{prereg.REPLICATE}"]["status"] == "skipped"
 
 
 def test_shakedown_runs_every_check_on_one_gpu(box):
@@ -889,3 +977,118 @@ def test_box_plans_come_from_the_rules():
     assert Q.box_students("A", r) == [r["runs"][x]["student"] for x in r["boxes"]["A"]["runs"]]
     assert Q.box_extra_dirs("A", r) == [] and Q.box_extra_dirs("B", r) == [Q.PARAKEET_DIR]
     assert Q.study_extra_gb("A", r) > Q.study_extra_gb("replicate", r) > 0
+
+
+# ================================================================================ boxes A and B at the same time
+
+
+def test_boxes_a_and_b_at_the_same_time_share_one_runs_repo_without_a_clash(tmp_path, monkeypatch):
+    """CONTRACT.md 8: boxes A and B run at the same time against ONE runs repo. Here both queues run concurrently (two
+    threads, each box its own checkout and state dir: two machines), their trainers are fake_study_trainer processes
+    whose mains commit their log syncs into the same on-disk runs repo, and the queues' uploads go through the real
+    HubUploader and vast/finish.py (sync, verify, put_file) over it. The repo answers more than LIMIT commits in any
+    WINDOW_S with a 429. Proven: both boxes end complete and verified; no path of the repo is committed by both boxes
+    (run ids - box B calibrates study-t06 as calib-study-t06-boxB -, queue summaries, numbers files are each box's
+    own); the 8 mains' syncs and the queues' uploads were rate-limited (429) and backed off: every queue upload (the
+    lean run dirs, the numbers files, the queue summaries) got through and verified, and a trainer sync whose retries
+    all met the limit (kitsune/runlog.py drops it) is caught up by its next sync and by the queue's verified upload of
+    the finished run dir; each box's mains start SYNC_OFFSET_S apart."""
+    import finish
+    import huggingface_hub
+    from fake_runs_repo import DirHub, FakeApi, downloads
+
+    LIMIT, WINDOW_S = 4, 0.25
+    hub = DirHub.create(tmp_path / "hub", limit=LIMIT, window_s=WINDOW_S)
+    monkeypatch.setattr(finish, "HUB_RETRY_WAITS", (0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2))
+    dl, snap = downloads(hub)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", dl)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snap)
+    r = study_rules()
+    obj = {**middle_wins("kept-t03", r), **middle_wins("scratch", r), **middle_wins("lost", r),
+           **middle_wins("kept-p03", r), **middle_wins("bridge", r)}
+    queues, logs = {}, {}
+    for name in ("A", "B"):
+        root = tmp_path / f"box{name}"
+        shutil.copytree(ROOT / "configs" / "study", root / "configs" / "study")
+        (root / "study").mkdir(parents=True)
+        shutil.copy(ROOT / "study" / "PREREG.json", root / "study" / "PREREG.json")
+        up = Q.HubUploader("u/kitsune-runs")
+        up._api = FakeApi(hub, name)
+        logs[name] = tmp_path / f"fake-log-{name}"
+        env = dict(FAKE_LOG=str(logs[name]), FAKE_OBJ=json.dumps(obj), FAKE_HUB=str(hub.dir), FAKE_BOX=name,
+                   FAKE_SYNCS="3", FAKE_MAIN_S="1.5", FAKE_SYNC_WAITS=json.dumps([0.1, 0.3, 0.9, 2.0]),
+                   HF_TOKEN="hf_test_value")
+        s = Q.Settings(root=root, state_dir=root / "state", out_repo=None, gpus=["0", "1", "2", "3"], python=PY,
+                       train_cmd=[PY, str(FAKE), "train"], stores_cmd=[PY, str(FAKE), "stores"],
+                       anchor_cmd=[PY, str(FAKE), "anchor"], speed_cmd=[PY, str(FAKE), "speed"], uploader=up,
+                       rules=r, rules_path=root / "study" / "PREREG.json", allow_pending=True, poll_s=0.02,
+                       sync_offset_s=0.05, host=f"host-{name}", env=env, shm_bytes=1 << 50, auto_workers=8,
+                       n_gpus=4)
+        queues[name] = Q.Queue(name, s)
+    rcs, errors = {}, []
+
+    def run(name):
+        try:
+            rcs[name] = queues[name].run()
+        except BaseException as e:  # noqa: BLE001  reported below
+            errors.append((name, repr(e)))
+
+    threads = [threading.Thread(target=run, args=(n,)) for n in queues]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(600)
+    assert not errors and rcs == {"A": Q.EXIT_OK, "B": Q.EXIT_OK}, (errors, rcs)
+
+    states = {n: json.loads((tmp_path / f"box{n}" / "state" / "queue.json").read_text(encoding="utf-8"))
+              for n in queues}
+    run_ids = {n: {Path(it["run_dir"]).name for it in st["items"].values() if it["run_dir"]}
+               for n, st in states.items()}
+    assert not run_ids["A"] & run_ids["B"]
+    assert any(x.startswith("calib-study-t06-boxB-") for x in run_ids["B"])
+    assert not any(x.startswith("calib-study-t06-box") for x in run_ids["A"])
+    for n, st in states.items():  # every run dir verified on the Hub
+        assert all(it["verified"] for it in st["items"].values()
+                   if it["status"] == "done" and it["run_dir"] and it["kind"] not in ("stores", "speed")), n
+
+    def owner(path: str) -> str | None:
+        for n in queues:
+            if path.startswith((f"study/box-{n}/", f"study/{r['boxes'][n]['numbers_file']}")) or \
+                    path.split("/")[:2][-1] in run_ids[n]:
+                return n
+        return None
+
+    commits = hub.commits()
+    accepted = [c for c in commits if c["accepted"]]
+    for c in accepted:  # each box commits only its own paths, and every path has one owner
+        assert {owner(p) for p in c["paths"]} == {c["box"]}, c
+    paths = {n: {p for c in accepted if c["box"] == n for p in c["paths"]} for n in queues}
+    assert paths["A"] and paths["B"] and not paths["A"] & paths["B"]
+    for n in queues:
+        assert f"study/box-{n}/queue_summary.json" in paths[n]
+        num = json.loads(hub.path(f"study/{r['boxes'][n]['numbers_file']}").read_text(encoding="utf-8"))
+        assert num["box"] == n and num["rules_sha256"] == prereg.rules_sha256(ROOT / "study" / "PREREG.json")
+
+    # the commit rate: never more than LIMIT in a window; the limit was hit (429s), and the back-offs got through
+    walls = sorted(c["wall"] for c in accepted)
+    assert all(walls[i + LIMIT] - walls[i] >= WINDOW_S for i in range(len(walls) - LIMIT))
+    assert any(not c["accepted"] for c in commits)
+    mains = {n: r["boxes"][n]["runs"] for n in queues}
+    trainer_ev = [e for n in queues for m in mains[n]
+                  for e in Q.read_events(tmp_path / f"box{n}" / states[n]["items"][m]["run_dir"])]
+    assert any(e["kind"] == "sync_ok" and e["attempt"] > 0 for e in trainer_ev)  # a trainer sync through its back-off
+    writers = {c["writer"] for c in accepted if not c["writer"].startswith("queue-")}
+    main_dirs = {Path(states[n]["items"][m]["run_dir"]).name for n in queues for m in mains[n]}
+    assert main_dirs <= writers and len(main_dirs) == 8  # the 8 mains synced into the one repo
+    for n in queues:
+        recs = [json.loads(p.read_text(encoding="utf-8")) for p in logs[n].glob("*.json")]
+        by_item = {x["item"]: x for x in recs if x.get("item")}
+        for m in mains[n]:
+            rd = tmp_path / f"box{n}" / states[n]["items"][m]["run_dir"]
+            ev = Q.read_events(rd)
+            assert sum(e["kind"] == "sync" for e in ev) == 3 and len(states[n]["items"][m]["attempts"]) == 1
+            # whatever its in-loop syncs met, the run dir in the repo is the finished one (the queue's upload)
+            remote = hub.path(f"{states[n]['items'][m]['run_dir']}/events.jsonl")
+            assert remote.read_bytes() == (rd / "events.jsonl").read_bytes()
+        starts = sorted(by_item[m]["t0"] for m in mains[n])
+        assert all(b - a >= 0.04 for a, b in zip(starts, starts[1:]))
