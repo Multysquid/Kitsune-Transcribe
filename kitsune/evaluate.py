@@ -22,6 +22,21 @@ target t at position len(prompt)-1+t. The reference and teacher hypothesis per i
 The model is put in eval mode for the duration and every module's training flag is restored afterwards (so frozen
 BatchNorm stays frozen). Under CUDA the body runs in bf16 autocast; the LM head always runs in fp32 outside autocast,
 as in training and in the teacher pass (a bf16 head moves argmax on near-ties).
+
+Two student families (the size study, CONTRACT.md 1): "aed" (Cohere Transcribe students, everything above) and "ctc"
+(Parakeet CTC students, kitsune.ctc_student). ctc_eval is the CTC family's one pass over a store: the encoder once per
+batch, greedy CTC (argmax, collapse, drop blanks) for the text, and - given the stored Parakeet frame targets - the
+teacher-forced frame metrics of kitsune.ctc_kd on the same log-probs. Its greedy per-utterance frame has greedy_eval's
+columns (the teacher is Parakeet's stored CTC path: ctc_teacher_rows), so summarise_greedy, headline and the verdict
+read both families alike. The own teacher of a family: FAMILY_TEACHER; its pre-registered gate CER:
+family_teacher_prereg (Cohere: TEACHER_CER_PREREG; Parakeet CTC: PARAKEET_CTC_CER_PREREG from study/PREREG.json once
+the PREREG fill wrote it, None while pending).
+
+The study's per-utterance tables (CONTRACT.md 5; utterance_table): id, set, ref, hyp and, from ONE jiwer alignment of
+the normalize_ja strings (the alignment corpus_cer counts), edits, ref_len, hyp_len, sub, del, ins, and the no-style
+count edits_nostyle = edits minus the edits of the error regions that only change the script or the numeral style
+(STYLE_KINDS; region_kind, the first run's error analysis). Summed over the rows with a reference they are corpus_cer's
+edits and reference chars exactly, so tools/study_report.py (kitsune.study_stats) reproduces every corpus CER here.
 """
 import json
 import math
@@ -51,6 +66,9 @@ GATE_SETS = tuple(EVAL_SETS)  # the D32a gate: JSUT / CV8 / Reazon-test; eval_em
 # and refuses to proceed if they drift by more than 0.05 pp - a changed eval set would silently move every threshold.
 TEACHER_CER_PREREG = {"eval_jsut": 0.0830, "eval_cv8": 0.0407, "eval_reazon": 0.0628}
 BASELINE_TOL = 0.0005
+FAMILIES = ("aed", "ctc")
+FAMILY_TEACHER = {"aed": "cohere", "ctc": "parakeet-ctc"}  # a family's own teacher, by its CONTRACT.md 5 system name
+PREREG_JSON = Path(__file__).resolve().parents[1] / "study" / "PREREG.json"
 
 
 # ----------------------------------------------------------------------------------------------------------- CER
@@ -103,6 +121,87 @@ def teacher_baselines(teacher_root, sets: Iterable[str] = GATE_SETS, check: bool
         if check and s in TEACHER_CER_PREREG and abs(c["cer"] - TEACHER_CER_PREREG[s]) > BASELINE_TOL:
             raise ValueError(f"{s}: teacher corpus CER {100 * c['cer']:.3f} % differs from the pre-registered "
                              f"{100 * TEACHER_CER_PREREG[s]:.2f} % by more than {100 * BASELINE_TOL:.2f} pp")
+    return out
+
+
+def _cer_value(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 <= v <= 1
+
+
+def prereg_teacher_cer(system: str, prereg=None) -> dict[str, float] | None:
+    """A teacher's pre-registered corpus CER per GATE set from the size study's PREREG.json "baselines" block, which
+    the PREREG fill (python -m kitsune.prereg --write study/ --sidecar ...) copies from the study selection's sidecar:
+    the teacher's stored hypotheses scored on the manifest rows, as fractions. None while the block is pending, and
+    when the file is missing or unreadable or lacks a number for a gate set: nothing is registered then, and nothing
+    can be checked against it. `prereg`: the parsed PREREG.json or a path to one (default: the committed
+    study/PREREG.json). `system` by its CONTRACT.md 5 name (parakeet-ctc; the parakeet_ctc spelling is read too)."""
+    if prereg is None or isinstance(prereg, (str, Path)):
+        try:
+            prereg = json.loads(Path(prereg or PREREG_JSON).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+    b = (prereg or {}).get("baselines") if isinstance(prereg, dict) else None
+    if not isinstance(b, dict) or b.get("status") == "pending":
+        return None
+    row = b.get(system) or b.get(system.replace("-", "_"))
+    if not isinstance(row, dict) or not all(_cer_value(row.get(s)) for s in GATE_SETS):
+        return None
+    return {s: float(row[s]) for s in GATE_SETS}
+
+
+# Parakeet's CTC path, the teacher and ratio baseline of the P students (STUDY.md 4.1): its corpus CER on the manifest's
+# gate sets as study/PREREG.json registers it. None until the PREREG fill writes the baselines ("pending").
+PARAKEET_CTC_CER_PREREG = prereg_teacher_cer("parakeet-ctc")
+
+
+def family_teacher_prereg(family: str = "aed") -> dict[str, float] | None:
+    """The pre-registered gate CER of a family's own teacher: Cohere's D32a numbers for "aed" (TEACHER_CER_PREREG),
+    PARAKEET_CTC_CER_PREREG for "ctc" (None while the study's PREREG baselines are pending)."""
+    if family == "aed":
+        return dict(TEACHER_CER_PREREG)
+    if family == "ctc":
+        return dict(PARAKEET_CTC_CER_PREREG) if PARAKEET_CTC_CER_PREREG else None
+    raise ValueError(f"family must be one of {FAMILIES}, got {family!r}")
+
+
+def ctc_teacher_rows(parakeet_rows: dict[str, dict], refs: dict[str, str] | None = None) -> dict[str, dict]:
+    """Parakeet's stored CTC path as the teacher of a CTC student's greedy eval (greedy_eval / ctc_eval teacher_rows):
+    hyp = the jsonl's ctc_hyp, cer = its ctc_cer, never truncated (CTC has no length cut). `refs` (id -> reference)
+    replaces the jsonl's reference, so a CTC student is scored on the very text every other system is (the eval store's
+    teacher_out reference; the caller checks the two agree)."""
+    out = {}
+    for i, r in parakeet_rows.items():
+        out[i] = dict(ref=refs[i] if refs is not None and i in refs else r["ref"], hyp=r["ctc_hyp"],
+                      cer=float(r["ctc_cer"]), truncated=False)
+    return out
+
+
+def parakeet_baselines(parakeet_root, sets: Iterable[str] = GATE_SETS, *, ids: Iterable[str] | None = None,
+                       prereg: dict | None = None, check: bool = True) -> dict[str, dict]:
+    """Parakeet's stored eval hypotheses per set from parakeet_out/<set>/eval-*.jsonl: the corpus CER of its CTC path
+    (ctc_hyp: the CTC students' own teacher, `cer_corpus`) and of its TDT path (hyp: the off-the-shelf bar,
+    `tdt_cer_corpus`), on every row or on `ids` (the study manifest's rows, on which PREREG registered them). prereg:
+    {set: CER} of the CTC path (default PARAKEET_CTC_CER_PREREG; None or missing = pending: nothing checked). With
+    check=True a registered set whose recomputed CTC corpus CER is off by more than 0.05 pp raises ValueError, as
+    teacher_baselines does for Cohere: a changed label set would silently move every ratio."""
+    prereg = PARAKEET_CTC_CER_PREREG if prereg is None else prereg
+    keep = None if ids is None else set(ids)
+    out = {}
+    for s in sets:
+        rows = [r for r in load_teacher_rows(parakeet_root, [s], split="eval").values()
+                if keep is None or r["id"] in keep]
+        if not rows:
+            raise FileNotFoundError(f"no parakeet_out/{s}/eval-*.jsonl rows under {parakeet_root}")
+        ctc = corpus_cer([r["ctc_hyp"] for r in rows], [r["ref"] for r in rows])
+        tdt = corpus_cer([r["hyp"] for r in rows], [r["ref"] for r in rows])
+        p = (prereg or {}).get(s)
+        out[s] = dict(cer_corpus=ctc["cer"], tdt_cer_corpus=tdt["cer"],
+                      cer_mean=float(np.mean([r["ctc_cer"] for r in rows])), n=len(rows),
+                      n_empty_ref=ctc["n_empty_ref"], prereg=p,
+                      tdt_trunc_rate=float(np.mean([bool(r.get("truncated")) for r in rows])))
+        if check and p is not None and abs(ctc["cer"] - p) > BASELINE_TOL:
+            raise ValueError(f"{s}: Parakeet CTC corpus CER {100 * ctc['cer']:.3f} % differs from the pre-registered "
+                             f"{100 * p:.2f} % by more than {100 * BASELINE_TOL:.2f} pp")
     return out
 
 
@@ -333,6 +432,43 @@ def _teacher_text(store, teacher_rows: dict | None) -> dict[str, tuple]:
 
 
 @torch.no_grad()
+def greedy_generate(model, feats: torch.Tensor, fmask: torch.Tensor, max_duration_s: float, *,
+                    prompt_ids: Sequence[int], eos: int, pad: int, amp: bool,
+                    pin_new: int | None = None) -> list[tuple[list[int], bool]]:
+    """One batch of an AED model's greedy decode with the teacher pass's settings (scripts/02_teacher_pass.py:
+    num_beams 1, RepetitionStop, max_new = 16 + 10 x the longest row's seconds): per row the generated ids after the
+    prompt up to and including EOS, and whether the row ended with EOS (not truncated). The caller holds eval mode and
+    the fp32 head (greedy_eval; tools/speed_probe.py times this very call).
+
+    pin_new (the speed probe's length-pinned timing only; the evaluator never pins): exactly min(pin_new, max_new)
+    decoder steps for the batch - EOS suppressed until then (min_new_tokens), no RepetitionStop - so the time is the
+    model shape's at that output length whatever the weights emit: an untrained init dir would otherwise run to max_new,
+    or stop at random. Every step is the same KV-cached forward and argmax as the free decode's."""
+    P = len(prompt_ids)
+    n = feats.shape[0]
+    # identical to 02_teacher_pass: ~3.6 tok/s observed (max ~6.5), 16 + 10 s is a 1.5x margin on the max
+    max_new = min(int(16 + 10 * float(max_duration_s)), model.config.max_position_embeddings - P - 1)
+    stop = dict(stopping_criteria=StoppingCriteriaList([RepetitionStop(P)]))
+    if pin_new is not None:
+        max_new = max(1, min(int(pin_new), max_new))
+        stop = dict(min_new_tokens=max_new)
+    prompt = torch.tensor([list(prompt_ids)] * n, dtype=torch.long, device=feats.device)
+    with torch.autocast(device_type=feats.device.type, dtype=torch.bfloat16, enabled=amp):
+        seq = model.generate(input_features=feats, attention_mask=fmask, decoder_input_ids=prompt,
+                             max_new_tokens=max_new, do_sample=False, num_beams=1, eos_token_id=eos,
+                             pad_token_id=pad, **stop)
+    gen = (seq.sequences if hasattr(seq, "sequences") else seq)[:, P:].cpu().numpy()
+    out = []
+    for r in range(n):
+        row = gen[r]
+        stop = np.flatnonzero((row == eos) | (row == pad))  # generate pads a row after EOS / RepetitionStop
+        ended = bool(len(stop) and row[stop[0]] == eos)
+        k = int(stop[0]) + int(ended) if len(stop) else len(row)  # a max-length row keeps all its tokens
+        out.append((row[:k].tolist(), ended))
+    return out
+
+
+@torch.no_grad()
 def greedy_eval(model, store, ids: Iterable[str] | None, featurizer, device, batch_s: float = 400.0, *,
                 tokenizer=None, teacher_rows: dict[str, dict] | None = None,
                 amp: bool | None = None) -> tuple[dict, pd.DataFrame]:
@@ -346,7 +482,6 @@ def greedy_eval(model, store, ids: Iterable[str] | None, featurizer, device, bat
     t0 = time.time()
     prompt_ids = [int(x) for x in store.info.get("prompt", PROMPT)]
     eos, pad = int(store.info.get("eos", EOS)), int(store.info.get("pad", PAD))
-    P = len(prompt_ids)
     ds = AudioBatchDataset(store)
     batches = eval_batches(store.utts, batch_s, _indices(store, ids))
     recs, dropped = [], []
@@ -357,32 +492,12 @@ def greedy_eval(model, store, ids: Iterable[str] | None, featurizer, device, bat
             if not n:
                 continue
             feats, fmask = _features(featurizer, item, device)
-            # identical to 02_teacher_pass: ~3.6 tok/s observed (max ~6.5), 16 + 10 s is a 1.5x margin on the max
-            max_new = min(int(16 + 10 * float(item["durations"].max())), model.config.max_position_embeddings - P - 1)
-            prompt = torch.tensor([prompt_ids] * n, dtype=torch.long, device=device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=_amp(device, amp)):
-                seq = model.generate(input_features=feats, attention_mask=fmask, decoder_input_ids=prompt,
-                                     max_new_tokens=max_new, do_sample=False, num_beams=1, eos_token_id=eos,
-                                     pad_token_id=pad, stopping_criteria=StoppingCriteriaList([RepetitionStop(P)]))
-            gen = (seq.sequences if hasattr(seq, "sequences") else seq)[:, P:].cpu().numpy()
-            for r in range(n):
-                row = gen[r]
-                stop = np.flatnonzero((row == eos) | (row == pad))  # generate pads a row after EOS / RepetitionStop
-                ended = bool(len(stop) and row[stop[0]] == eos)
-                k = int(stop[0]) + int(ended) if len(stop) else len(row)  # a max-length row keeps all its tokens
+            rows = greedy_generate(model, feats, fmask, float(item["durations"].max()), prompt_ids=prompt_ids,
+                                   eos=eos, pad=pad, amp=_amp(device, amp))
+            for r, (hyp_ids, ended) in enumerate(rows):
                 recs.append(dict(id=item["ids"][r], source=item["sources"][r], duration=float(item["durations"][r]),
-                                 hyp_ids=row[:k].tolist(), truncated=not ended, n_tok=k))
-    text = _teacher_text(store, teacher_rows)
-    hyps = tokenizer.batch_decode([r["hyp_ids"] for r in recs], skip_special_tokens=True) if recs else []
-    for r, h in zip(recs, hyps):
-        t = text.get(r["id"])
-        r.update(hyp=h, ref=t[0] if t else "", teacher_hyp=t[1] if t else "", teacher_cer=t[2] if t else float("nan"),
-                 teacher_truncated=t[3] if t else None, has_teacher=t is not None)
-        r["cer_ref"] = utt_cer(h, r["ref"] or "")
-        r["cer_teacher"] = utt_cer(h, r["teacher_hyp"] or "")
-    cols = ["id", "source", "duration", "ref", "teacher_hyp", "hyp", "cer_ref", "cer_teacher", "truncated", "n_tok",
-            "teacher_cer", "teacher_truncated", "hyp_ids", "has_teacher"]
-    per_utt = pd.DataFrame(recs, columns=cols)
+                                 hyp_ids=hyp_ids, truncated=not ended, n_tok=len(hyp_ids)))
+    per_utt = _greedy_frame(recs, store, teacher_rows, lambda b: tokenizer.batch_decode(b, skip_special_tokens=True))
     wall = time.time() - t0
     audio_s = float(per_utt["duration"].sum()) if len(per_utt) else 0.0
     return summarise_greedy(per_utt, n_bad_audio=len(dropped), bad_audio=dropped[:50],
@@ -433,6 +548,346 @@ def pick_samples(per_utt: pd.DataFrame, n: int = 8, seed: int = 0) -> list[dict]
     pick = pd.concat([worst, rest.sample(min(n - len(worst), len(rest)), random_state=seed)])
     keep = ["id", "source", "duration", "ref", "teacher_hyp", "hyp", "cer_ref", "cer_teacher", "truncated"]
     return pick[keep].to_dict("records")
+
+
+# ------------------------------------------------------------------------------------------------- CTC family
+
+GREEDY_COLUMNS = ("id", "source", "duration", "ref", "teacher_hyp", "hyp", "cer_ref", "cer_teacher", "truncated",
+                  "n_tok", "teacher_cer", "teacher_truncated", "hyp_ids", "has_teacher")
+# the per-utterance sums of ctc_eval's teacher-forced part (kitsune.ctc_kd.ctc_kd_losses per_utt), summarise_ctc_tf's
+# input; n_tok = the utterance's CTC target tokens (the objective's N_u)
+CTC_TF_SUMS = ("kl_dense", "kl_blank", "ctc", "n_dense", "n_blank_frames", "n_frames", "argmax_agree",
+               "argmax_blank", "teacher_blank")
+# the frame-target fields of a frame store's micro-batch (kitsune.trainset.FrameBatchDataset, the CTC trainer's
+# collate: kitsune.ctc_targets.collate_frame_targets of its rows), what kitsune.ctc_kd.ctc_kd_losses reads
+FRAME_BATCH_KEYS = ("frame_mask", "dense_mask", "blank_lp", "topk_idx", "topk_lp", "ctc_targets", "ctc_target_lengths",
+                    "n_frames")
+
+
+def batch_dataset(store):
+    """The micro-batch dataset of a store as the trainer reads it: kitsune.trainset.dataset_for (the CTC trainer's: a
+    FrameBatchDataset for a frame store, its rows' stored Parakeet frame targets collated into every batch, else an
+    AudioBatchDataset) where kitsune.trainset has it, else an AudioBatchDataset (a token store: the only kind before
+    the CTC trainer's frame stores). ctc_eval reads either."""
+    from kitsune import trainset
+
+    make = getattr(trainset, "dataset_for", None)
+    return make(store) if make is not None else AudioBatchDataset(store)
+
+
+def _greedy_frame(recs: list[dict], store, teacher_rows: dict | None, decode) -> pd.DataFrame:
+    """greedy_eval's per-utterance frame from records with hyp_ids (decode: ids list -> texts)."""
+    text = _teacher_text(store, teacher_rows)
+    hyps = decode([r["hyp_ids"] for r in recs]) if recs else []
+    for r, h in zip(recs, hyps):
+        t = text.get(r["id"])
+        r.update(hyp=h, ref=t[0] if t else "", teacher_hyp=t[1] if t else "", teacher_cer=t[2] if t else float("nan"),
+                 teacher_truncated=t[3] if t else None, has_teacher=t is not None)
+        r["cer_ref"] = utt_cer(h, r["ref"] or "")
+        r["cer_teacher"] = utt_cer(h, r["teacher_hyp"] or "")
+    return pd.DataFrame(recs, columns=list(GREEDY_COLUMNS))
+
+
+@torch.no_grad()
+def ctc_eval(model, store, ids: Iterable[str] | None, featurizer, device, batch_s: float = 400.0, *, tokenizer,
+             teacher_rows: dict[str, dict] | None = None, targets: dict | None = None,
+             amp: bool | None = None) -> dict:
+    """A CTC student (transformers ParakeetForCTC) over `ids` of a store (None = all), in the trainer's eval batches:
+    per batch the encoder once (bf16 autocast under CUDA; the CTC head in fp32, kitsune.ctc_student.ctc_log_probs),
+    then
+      greedy    argmax per frame, collapse repeats, drop the blank (greedy_ctc_ids), detokenised as the label pass
+                wrote ctc_hyp (decode_ids): scored against the reference and the teacher (teacher_rows: Parakeet's
+                stored CTC path, ctc_teacher_rows) exactly as greedy_eval scores an AED student; never truncated
+      tf        the training objective's terms on the same log-probs against the stored Parakeet frame targets
+                (kitsune.ctc_kd.ctc_kd_losses per utterance): dense and blank-frame KL, CTC on the teacher's greedy
+                path, argmax agreement and blank shares. The targets come from
+                  a frame store (the CTC trainer's: batch_dataset gives its FrameBatchDataset, whose batches carry their
+                    rows' targets as the trainer's do): every row of a batch; the store's frame preflight dropped each
+                    row whose frames do not align at its build (a hard fail for an eval row, decision 15), and the
+                    dataset drops one whose audio changed since (item["dropped"], like an undecodable one)
+                  a token store with `targets` (id -> kitsune.ctc_targets.FrameTargets, collated here): a row whose
+                    student frame count differs from its stored n_frames cannot be aligned: it is left out of tf and
+                    listed in frame_mismatch (the preflight's condition; the caller applies decision 15); a row without
+                    targets in no_targets
+                  a token store without `targets`: no tf
+    featurizer: (wave, lengths) -> (feats, mask) on the device, the student's LogMel (ctc_features(...).logmel).
+    Returns {"greedy": greedy_eval's per_utt columns, "tf": one row per utterance with id, source, duration, n_tok
+    (its CTC target tokens) and sum_<term> of CTC_TF_SUMS (summarise_ctc_tf's input), "dropped": undecodable ids,
+    "frame_mismatch": [{id, student, stored}], "no_targets": ids, "wall_s"}."""
+    from kitsune import ctc_student as CS
+    from kitsune.ctc_kd import ctc_kd_losses
+    from kitsune.ctc_targets import collate_frame_targets
+
+    device = torch.device(device)
+    t0 = time.time()
+    ds = batch_dataset(store)
+    batches = eval_batches(store.utts, batch_s, _indices(store, ids))
+    g_recs, tf_recs, dropped, mismatch, no_targets = [], [], [], [], []
+    with _eval_mode(model):
+        for item in _prefetched(ds, batches):
+            dropped += item["dropped"]
+            n = len(item["ids"])
+            if not n:
+                continue
+            feats, fmask = _features(featurizer, item, device)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=_amp(device, amp)):
+                lp, n_frames = CS.ctc_log_probs(model, feats, fmask)
+            hyp_ids = CS.greedy_ctc_ids(lp, n_frames)
+            frames = n_frames.cpu().tolist()
+            for r in range(n):
+                g_recs.append(dict(id=item["ids"][r], source=item["sources"][r], duration=float(item["durations"][r]),
+                                   hyp_ids=hyp_ids[r], truncated=False, n_tok=len(hyp_ids[r])))
+            if "frame_mask" in item:  # a frame store's batch: its targets as the trainer's step and eval read them
+                ok = list(range(n))
+                L = ctc_kd_losses(lp, {k: item[k] for k in FRAME_BATCH_KEYS}, per_utt=True)
+            else:
+                if targets is None:
+                    continue
+                ok = []
+                for r, uid in enumerate(item["ids"]):
+                    t = targets.get(uid)
+                    if t is None:
+                        no_targets.append(uid)
+                    elif int(t.n_frames) != int(frames[r]):
+                        mismatch.append(dict(id=uid, student=int(frames[r]), stored=int(t.n_frames)))
+                    else:
+                        ok.append(r)
+                if not ok:
+                    continue
+                batch = collate_frame_targets([targets[item["ids"][r]] for r in ok], t_max=int(lp.shape[1]))
+                L = ctc_kd_losses(lp[torch.tensor(ok, device=lp.device)], batch, per_utt=True)
+            L = {k: v.detach().double().cpu().numpy() for k, v in L.items()}
+            for j, r in enumerate(ok):
+                rec = dict(id=item["ids"][r], source=item["sources"][r], n_tok=int(L["n_tokens"][j]),
+                           duration=float(item["durations"][r]))
+                rec.update({f"sum_{k}": float(L[k][j]) for k in CTC_TF_SUMS})
+                tf_recs.append(rec)
+    greedy = _greedy_frame(g_recs, store, teacher_rows, lambda b: [CS.decode_ids(tokenizer, x) for x in b])
+    tf_cols = ["id", "source", "n_tok", "duration", *(f"sum_{k}" for k in CTC_TF_SUMS)]
+    return dict(greedy=greedy, tf=pd.DataFrame(tf_recs, columns=tf_cols), dropped=dropped, frame_mismatch=mismatch,
+                no_targets=no_targets, wall_s=time.time() - t0)
+
+
+def summarise_ctc_tf(raw: pd.DataFrame, **extra) -> tuple[dict, pd.DataFrame]:
+    """ctc_eval's teacher-forced summary for any rows of its tf frame: per set ("sets") and pooled ("all"), sums over
+    the utterances divided by what each measure counts (STUDY.md 4.2's CTC teacher-forced metrics):
+      kl            frame KL (dense + blank frames) per CTC target token, and ce = the CTC loss per target token:
+                    the training objective's two terms with its normalisation (kitsune.ctc_kd.ctc_kd_objective divides
+                    by the step's target tokens), so combined_loss(summary, w_kl, w_ctc) is the CTC objective and the
+                    headline's val_loss / eval_record's heldout_kl are the frame KL per target token (ctc: the same
+                    number as ce, by its own name)
+      top1          frame argmax agreement with the teacher's argmax (col0), per valid frame (also argmax_agree)
+      kl_per_frame, kl_dense (per dense frame), kl_blank (per blank-only frame)
+      argmax_blank  the student's argmax-blank share of the frames (the blank-collapse watch), teacher_blank the
+                    teacher's (59-72 % on the real sets), frac_dense the teacher's dense frames, frames_per_token
+      n_utts, n_tok (target tokens), n_frames, audio_s, and the utterance means kl_utt_mean, ce_utt_mean, top1_utt_mean
+    per_utt: id, source, n_tok, n_frames, kl, ce, top1, duration, kl_dense, kl_blank, kl_per_frame, argmax_blank,
+    teacher_blank (per utterance, with the same normalisations; NaN where a count is 0). The keys, the columns and the
+    order of every sum are the CTC trainer's (kitsune.ctc_eval.summarise_ctc_tf, which the trainer's CTC evals write):
+    the same rows give the same numbers to the bit. `extra` goes into the summary after n_utts."""
+    per_utt = _ctc_tf_per_utt(raw)
+    summary = dict(sets={}, n_utts=len(raw), **extra)
+    if len(raw):
+        for src, g in raw.groupby("source", sort=True):
+            summary["sets"][src] = _ctc_tf_summarise(g, per_utt.loc[g.index])
+        summary["all"] = _ctc_tf_summarise(raw, per_utt)
+    return summary, per_utt
+
+
+def _ratio(num, den):
+    num, den = np.asarray(num, np.float64), np.asarray(den, np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+
+
+CTC_TF_COLUMNS = ("id", "source", "n_tok", "n_frames", "kl", "ce", "top1", "duration", "kl_dense", "kl_blank",
+                  "kl_per_frame", "argmax_blank", "teacher_blank")  # tf_<set>.parquet of a CTC eval
+
+
+def _ctc_tf_per_utt(df: pd.DataFrame) -> pd.DataFrame:
+    cols = list(CTC_TF_COLUMNS)
+    if not len(df):
+        return pd.DataFrame(columns=cols)
+    out = df[["id", "source", "n_tok"]].copy()
+    out["n_frames"] = df["sum_n_frames"].astype(np.int64)
+    kl = df["sum_kl_dense"] + df["sum_kl_blank"]  # each row's frame KL, then any sum over rows (the trainer's sum_kl)
+    out["kl"] = _ratio(kl, df["n_tok"])
+    out["ce"] = _ratio(df["sum_ctc"], df["n_tok"])
+    out["top1"] = _ratio(df["sum_argmax_agree"], df["sum_n_frames"])
+    out["duration"] = df["duration"]
+    out["kl_dense"] = _ratio(df["sum_kl_dense"], df["sum_n_dense"])
+    out["kl_blank"] = _ratio(df["sum_kl_blank"], df["sum_n_blank_frames"])
+    out["kl_per_frame"] = _ratio(kl, df["sum_n_frames"])
+    out["argmax_blank"] = _ratio(df["sum_argmax_blank"], df["sum_n_frames"])
+    out["teacher_blank"] = _ratio(df["sum_teacher_blank"], df["sum_n_frames"])
+    return out[cols]
+
+
+def _ctc_tf_summarise(df: pd.DataFrame, per_utt: pd.DataFrame) -> dict:
+    tot = {k: float(df[f"sum_{k}"].sum()) for k in CTC_TF_SUMS}
+    ntok, nfr = float(df["n_tok"].sum()), tot["n_frames"]
+    kl = float((df["sum_kl_dense"] + df["sum_kl_blank"]).sum())  # per row first, as the trainer's sum_kl
+
+    def div(a, b):
+        return a / b if b else float("nan")
+
+    s = dict(n_utts=int(len(df)), n_tok=int(ntok), n_frames=int(nfr), audio_s=float(df["duration"].sum()),
+             kl=div(kl, ntok), ce=div(tot["ctc"], ntok), ctc=div(tot["ctc"], ntok), top1=div(tot["argmax_agree"], nfr),
+             argmax_agree=div(tot["argmax_agree"], nfr), kl_per_frame=div(kl, nfr),
+             kl_dense=div(tot["kl_dense"], tot["n_dense"]), kl_blank=div(tot["kl_blank"], tot["n_blank_frames"]),
+             argmax_blank=div(tot["argmax_blank"], nfr), teacher_blank=div(tot["teacher_blank"], nfr),
+             frac_dense=div(tot["n_dense"], nfr), frames_per_token=div(nfr, ntok))
+    for k in ("kl", "ce", "top1"):
+        s[f"{k}_utt_mean"] = float(np.nanmean(per_utt[k].to_numpy(np.float64))) if len(per_utt) else float("nan")
+    return s
+
+
+# --------------------------------------------------------------------------------- study per-utterance tables
+
+# the error regions that only change how a word is written, not what was said (the first run's error analysis,
+# STUDY.md 4.2 / 4.3 "no-style"): numerals written as kanji or digits, the same kana in hiragana or katakana, a word
+# in kanji or in kana. An UPPER bound on style: a kanji <-> kana region is not reading-checked
+STYLE_KINDS = ("numeral", "hira<->kata", "kanji->kana", "kana->kanji", "kana-other")
+TABLE_COLUMNS = ("id", "set", "ref", "hyp", "edits", "ref_len", "hyp_len", "sub", "del", "ins", "edits_style",
+                 "edits_nostyle", "truncated")
+_KANJI_NUM = set("〇零一二三四五六七八九十百千万億兆")
+
+
+def _char_class(c: str) -> str:
+    o = ord(c)
+    if 0x3041 <= o <= 0x309F:
+        return "H"  # hiragana
+    if 0x30A0 <= o <= 0x30FF or 0x31F0 <= o <= 0x31FF:
+        return "K"  # katakana (with the long-vowel mark)
+    if c.isdigit() and o < 128:
+        return "D"
+    if "a" <= c <= "z":
+        return "L"  # normalize_ja lowercases latin
+    if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or c in "々〆〇" or 0xF900 <= o <= 0xFAFF or 0x20000 <= o:
+        return "J"  # kanji
+    return "O"
+
+
+def _kata2hira(s: str) -> str:
+    return "".join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in s)
+
+
+def region_kind(ref: str, hyp: str) -> str:
+    """The class of one error region (a maximal run of non-matching alignment chunks: its reference and hypothesis
+    substrings, normalize_ja text), as the first run's error analysis classified them: insertion, deletion, numeral,
+    latin, hira<->kata, kana-other, kanji->kana, kana->kanji, kanji->kanji(+len), hira->hira, kata->kata, mixed-kanji,
+    other. STYLE_KINDS are the no-style CER's."""
+    if not ref:
+        return "insertion"
+    if not hyp:
+        return "deletion"
+    cr, ch = {_char_class(c) for c in ref}, {_char_class(c) for c in hyp}
+    if (cr | ch) & {"D"} or (set(ref) & _KANJI_NUM and ch & {"D"}) or (set(hyp) & _KANJI_NUM and cr & {"D"}):
+        return "numeral"
+    if (set(ref) | set(hyp)) & _KANJI_NUM and (cr == {"J"} or ch == {"J"}) and (
+            all(c in _KANJI_NUM for c in ref) or all(c in _KANJI_NUM for c in hyp)):
+        return "numeral"
+    if "L" in cr or "L" in ch:
+        return "latin"
+    if _kata2hira(ref) == _kata2hira(hyp):
+        return "hira<->kata"
+    if cr <= {"H", "K"} and ch <= {"H", "K"} and ("K" in cr) != ("K" in ch) and cr != ch:
+        return "kana-other"
+    if "J" in cr and ch <= {"H", "K"}:
+        return "kanji->kana"
+    if cr <= {"H", "K"} and "J" in ch:
+        return "kana->kanji"
+    if cr == {"J"} and ch == {"J"}:
+        return "kanji->kanji" if len(ref) == len(hyp) else "kanji->kanji(len)"
+    if cr <= {"H"} and ch <= {"H"}:
+        return "hira->hira"
+    if cr <= {"K"} and ch <= {"K"}:
+        return "kata->kata"
+    if "J" in cr and "J" in ch:
+        return "mixed-kanji"
+    return "other"
+
+
+def _text(x) -> str:
+    """A text cell as a string: None or NaN (a missing value read back from parquet) is the empty string."""
+    return x if isinstance(x, str) else ""
+
+
+def utterance_scores(refs: Sequence[str], hyps: Sequence[str]) -> pd.DataFrame:
+    """Per utterance on normalize_ja strings, from ONE jiwer character alignment of every row with a reference (the
+    alignment corpus_cer counts, so the sums over those rows are its edits and ref_chars): edits (S + D + I), ref_len,
+    hyp_len, sub, del, ins, edits_style (the edits of the error regions whose region_kind is in STYLE_KINDS) and
+    edits_nostyle = edits - edits_style. An empty reference scores ref_len 0 and its hypothesis' characters as
+    insertions (not style); corpus sums leave such rows out."""
+    R = [normalize_ja(_text(r)) for r in refs]
+    H = [normalize_ja(_text(h)) for h in hyps]
+    n = len(R)
+    sub, dele, ins, style = (np.zeros(n, np.int64) for _ in range(4))
+    keep = [i for i in range(n) if R[i]]
+    if keep:
+        out = jiwer.process_characters([R[i] for i in keep], [H[i] for i in keep])
+        for i, chunks in zip(keep, out.alignments):
+            regions = []  # [ref start, ref end, hyp start, hyp end, edits] per error region
+            open_region = False
+            for c in chunks:
+                if c.type == "equal":
+                    open_region = False
+                    continue
+                if c.type == "substitute":
+                    e = c.ref_end_idx - c.ref_start_idx
+                    sub[i] += e
+                elif c.type == "delete":
+                    e = c.ref_end_idx - c.ref_start_idx
+                    dele[i] += e
+                else:  # insert
+                    e = c.hyp_end_idx - c.hyp_start_idx
+                    ins[i] += e
+                if open_region:  # adjacent non-matching chunks form one region
+                    g = regions[-1]
+                    g[1], g[3], g[4] = c.ref_end_idx, c.hyp_end_idx, g[4] + e
+                else:
+                    regions.append([c.ref_start_idx, c.ref_end_idx, c.hyp_start_idx, c.hyp_end_idx, e])
+                    open_region = True
+            style[i] = sum(g[4] for g in regions if region_kind(R[i][g[0]:g[1]], H[i][g[2]:g[3]]) in STYLE_KINDS)
+    for i in range(n):
+        if not R[i]:
+            ins[i] = len(H[i])
+    edits = sub + dele + ins
+    return pd.DataFrame({"edits": edits, "ref_len": np.array([len(r) for r in R], np.int64),
+                         "hyp_len": np.array([len(h) for h in H], np.int64), "sub": sub, "del": dele, "ins": ins,
+                         "edits_style": style, "edits_nostyle": edits - style})
+
+
+def utterance_table(ids: Sequence[str], sets, refs: Sequence[str], hyps: Sequence[str],
+                    truncated: Sequence[bool] | None = None) -> pd.DataFrame:
+    """A system's per-utterance table in CONTRACT.md 5's format, the input of tools/study_report.py: id, set (the eval
+    set; one string for all rows or one per row), ref and hyp as given (raw text), the counts of utterance_scores and
+    truncated (False when not given: CTC decoding has no length cut). Row order as given."""
+    ids = [str(x) for x in ids]
+    sets = [str(sets)] * len(ids) if isinstance(sets, str) else [str(x) for x in sets]
+    if not (len(sets) == len(refs) == len(hyps) == len(ids)):
+        raise ValueError("ids, sets, refs and hyps must have the same length")
+    sc = utterance_scores(refs, hyps)
+    trunc = np.zeros(len(ids), bool) if truncated is None else np.asarray(
+        [bool(x) if x is not None and x == x else False for x in truncated], bool)
+    df = pd.DataFrame({"id": ids, "set": sets, "ref": [_text(r) for r in refs], "hyp": [_text(h) for h in hyps]})
+    for c in sc.columns:
+        df[c] = sc[c].to_numpy()
+    df["truncated"] = trunc
+    return df[list(TABLE_COLUMNS)]
+
+
+def table_cer(df: pd.DataFrame, ids: Iterable[str] | None = None, nostyle: bool = False) -> dict:
+    """Corpus CER of a per-utterance table (or of its rows `ids`): sum edits / sum ref_len over the rows with a
+    reference, as corpus_cer; edits_nostyle with nostyle=True. Returns cer, edits, ref_chars, n, n_empty_ref."""
+    if ids is not None:
+        want = set(ids)
+        df = df[df["id"].isin(want)]
+    has_ref = df["ref_len"].to_numpy(np.int64) > 0
+    e = int(df[("edits_nostyle" if nostyle else "edits")].to_numpy(np.int64)[has_ref].sum())
+    n_ref = int(df["ref_len"].to_numpy(np.int64)[has_ref].sum())
+    return dict(cer=e / n_ref if n_ref else float("nan"), edits=e, ref_chars=n_ref, n=int(has_ref.sum()),
+                n_empty_ref=int((~has_ref).sum()))
 
 
 # ------------------------------------------------------------------------------------------ logging helpers
@@ -674,7 +1129,8 @@ def _cooldown_gain(records: list[dict]) -> dict | None:
 
 def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.5, max_trunc: float = 0.005,
             tail_frac: float = 0.2, min_points: int = 3, improving_rel: float = 0.01, widening_rel: float = 0.02,
-            overfit_rel: float = 0.01, version: int = 1, min_epoch_gap: float = 0.25) -> dict:
+            overfit_rel: float = 0.01, version: int = 1, min_epoch_gap: float = 0.25, family: str = "aed",
+            teacher_prereg: dict | None = None) -> dict:
     """Gate D32a, pre-registered.
 
     results = {"final":   greedy_eval summary of the FULL eval sets at the end of the run (its bad_audio_per_set:
@@ -729,7 +1185,18 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
          complete sets when both have them: the measure before and after, its relative change, and each gate set's
          CER before and after (null without an eval on each side)
     A record's lr_phase is the trainer's (eval_record); lr_phase_at gives it for a history written before the trainer
-    recorded one. Records without it never count as pre-cooldown (a reason counts them)."""
+    recorded one. Records without it never count as pre-cooldown (a reason counts them).
+
+    family: whose teacher the ratios are to (the size study). "aed" (default) is everything above, with Cohere: its
+    output is unchanged by this option. "ctc" judges a Parakeet CTC student against ITS teacher, Parakeet's stored CTC
+    path: the final summary's teacher_cer_ref_corpus is that teacher's CER on the same ids when ctc_eval scored it
+    (ctc_teacher_rows), and the registered numbers are PARAKEET_CTC_CER_PREREG (teacher_prereg overrides them); while
+    they are pending, per_set's teacher_prereg and baseline_drift are None and a set without a same-ids teacher CER
+    cannot be judged (a reason says so). The tiers, thresholds and trends are the same; the output also carries
+    family, teacher and teacher_prereg_status ("registered" / "pending")."""
+    if family not in FAMILIES:
+        raise ValueError(f"family must be one of {FAMILIES}, got {family!r}")
+    prereg = (family_teacher_prereg(family) if teacher_prereg is None else dict(teacher_prereg)) or {}
     fin = results.get("final") or {}
     fsets = fin.get("sets", {})
     bad = fin.get("bad_audio_per_set") or {}
@@ -747,8 +1214,12 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
             teacher, src = float(tover[s]), "results.teacher"
         elif tc is not None and not math.isnan(tc):
             teacher, src = float(tc), "same ids"
+        elif s in prereg:
+            teacher, src = prereg[s], "pre-registered"
         else:
-            teacher, src = TEACHER_CER_PREREG[s], "pre-registered"
+            reasons.append(f"{s}: no {FAMILY_TEACHER[family]} CER on these ids and none pre-registered yet (pending): "
+                           f"not judged")
+            continue
         student = float(d["cer_ref_corpus"])
         # a perfect teacher on these ids (tiny sets only): the student passes only by being perfect too
         ratio = student / teacher if teacher > 0 else (0.0 if student == 0 else math.inf)
@@ -756,8 +1227,9 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
         n_prom += ratio <= promising_ratio
         n_out += int(d["n"])
         n_trunc += int(d["n_truncated"])
+        p = prereg.get(s)
         per_set[s] = dict(student=student, teacher=teacher, teacher_source=src, ratio=ratio,
-                          teacher_prereg=TEACHER_CER_PREREG[s], baseline_drift=teacher - TEACHER_CER_PREREG[s],
+                          teacher_prereg=p, baseline_drift=teacher - p if p is not None else None,
                           threshold_go=go_ratio * teacher, threshold_promising=promising_ratio * teacher,
                           n=int(d["n"]), n_bad_audio=k)
         if k:
@@ -864,6 +1336,9 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
                      n_pre_cooldown=len(pre))
         thresholds.update(min_epoch_gap=float(min_epoch_gap))
         out = dict(verdict=v, version=2, **{k: x for k, x in out.items() if k != "verdict"}, **extra)
+    if family != "aed":  # the Cohere verdict's keys stay exactly as they were
+        out.update(family=family, teacher=FAMILY_TEACHER[family],
+                   teacher_prereg_status="registered" if prereg else "pending")
     if results.get("reference"):  # reported next to the tiers, never part of them
         out["reference"] = reference_bar(fin, results["reference"])
     return out
