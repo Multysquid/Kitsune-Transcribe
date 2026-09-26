@@ -62,23 +62,28 @@ NUMBERS_KEYS = ("box", "calibration", "max_steps", "lr_probes", "lr", "rules_sha
 
 T_REF_RUN, REF_STEPS = "study-t06", 9366  # T = the T-0.6B's 4 epochs of 1,000 h (STUDY.md 5.1)
 REPLICATE, REPLICATE_OF = "study-t01-s1235", "study-t01"  # the replicate trains T-0.1B's shape and steps, seed 1235
+# importance_ids_sha256 of the first run's 1,000 calibration utterances (recovered 2026-09-26): every pruned student's
+# FFNs are ranked on them (T-0.6B keeps the first run's selection, made on them; the others were rebuilt on them)
+CALIB_IDS_SHA256 = "5e31cd68bebc2180a89089187b559e4b164a2394046c619a477b14c169a2a956"
 
 # run -> what the study fixes about it (CONTRACT.md section 1, STUDY.md 1.1 and 2.2). params_* are the exact meta-device
 # counts every builder asserts; lr_from is the LR probe class whose winner the run takes; box is the host that trains
-# it (BOXES). T-0.3B and the bridge are B8x2560 + decoder {0,2,5,7} by the owner's decision of 2026-09-26 (OWNER_CHANGES)
+# it (BOXES); calib_ids_sha256 (pruned students) the ids their FFNs were ranked on. student_problems checks a built
+# student's meta against its entry. T-0.3B and the bridge are B8x2560 + decoder {0,2,5,7} by the owner's decision of
+# 2026-09-26 (OWNER_CHANGES)
 RUNS = {
     "study-t06": dict(family="aed", init_class="pruned_kept", student="students/study/t06", seed=1234,
                       shape="encoder 20 of 48 layers [0,2,5,7,10,12,15,17,20,22,25,27,30,32,35,37,40,42,45,47], "
                             "d 1280, FFN 5120 -> 2560; decoder layers {0,2,5,7}, D 1024; vocab 16,384 tied",
                       params_total=616_963_328, params_non_embedding=599_137_536, lr_from="kept-t03",
                       warmup_steps=300, weight_decay=0.0, bn="teacher stats, frozen (decision 16)", aux_ctc=0.0,
-                      micro_audio_s=600, box="A"),
+                      micro_audio_s=600, box="A", calib_ids_sha256=CALIB_IDS_SHA256),
     "study-t03": dict(family="aed", init_class="pruned_kept", student="students/study/t03", seed=1234,
                       shape="encoder 8 of 48 layers [0,7,13,20,27,34,40,47] (evenly_spaced(8, 48)), d 1280, FFN 5120 "
                             "-> 2560; T-0.6B's decoder layers {0,2,5,7}, D 1024; vocab 16,384 tied",
                       params_total=301_822_208, params_non_embedding=283_996_416, lr_from="kept-t03",
                       warmup_steps=300, weight_decay=0.0, bn="teacher stats, frozen (decision 16)", aux_ctc=0.0,
-                      micro_audio_s=1200, box="A"),
+                      micro_audio_s=1200, box="A", calib_ids_sha256=CALIB_IDS_SHA256),
     "study-bridge": dict(family="aed", init_class="scratch", student="students/study/bridge", seed=1234,
                          shape="the T-0.3B shape (encoder 8 layers, d 1280, 8 x 160, FFN 2560; decoder 4 layers, "
                                "D 1024, 8 x 128, FFN 4096; vocab 16,384 tied), from scratch",
@@ -105,17 +110,17 @@ RUNS = {
                             "FFN 4096 -> 2560; the Parakeet CTC head verbatim (3,073 classes)",
                       params_total=308_524_033, params_non_embedding=305_374_208, lr_from="kept-p03",
                       warmup_steps=300, weight_decay=0.0, bn="teacher stats, frozen (decision 16)", aux_ctc=0.0,
-                      micro_audio_s=1200, box="B"),
+                      micro_audio_s=1200, box="B", calib_ids_sha256=CALIB_IDS_SHA256),
     "study-p01": dict(family="ctc", init_class="pruned_lost", student="students/study/p01", seed=1234,
                       shape="Parakeet encoder 8 layers [0,3,7,10,13,16,20,23], FFN 768; CTC head",
                       params_total=98_468_865, params_non_embedding=95_319_040, lr_from="lost",
                       warmup_steps=1000, weight_decay=0.0, bn="teacher stats, frozen (decision 16)", aux_ctc=0.0,
-                      micro_audio_s=1600, box="B"),
+                      micro_audio_s=1600, box="B", calib_ids_sha256=CALIB_IDS_SHA256),
     "study-p005": dict(family="ctc", init_class="pruned_lost", student="students/study/p005", seed=1234,
                        shape="Parakeet encoder 4 layers [0,8,15,23], FFN 768; CTC head",
                        params_total=52_190_209, params_non_embedding=49_040_384, lr_from="lost",
                        warmup_steps=1000, weight_decay=0.0, bn="teacher stats, frozen (decision 16)", aux_ctc=0.0,
-                       micro_audio_s=1600, box="B"),
+                       micro_audio_s=1600, box="B", calib_ids_sha256=CALIB_IDS_SHA256),
 }
 # the fixed models the size ladder also measures against (STUDY.md 1.1 and 1.3; kitsune.study_stats.PARAMS_TOTAL):
 # Cohere Transcribe itself and Parakeet's unpruned CTC path (24 x 4096), the two distillation gaps' far ends
@@ -163,17 +168,22 @@ EDGE_FACTOR = 2.0  # a winner at a grid edge gets one more point: x2 at the top,
 # box A with study-t01's max_steps and the scratch LR from box A's numbers. Each box measures t_study-t06 on its own
 # host, so every max_steps is equal compute on the host that trains the run. Consumers (vast/*, kitsune.study_queue)
 # read this block through rules()["boxes"]; its structure is part of the wave-2 contract (CONTRACT.md section 6).
+# The order of a "calibrate" list is part of the rule: it is measured in groups of the box's GPU count in list order
+# (calibration_groups), so each list names the box's own runs first - they are measured together, exactly as their
+# wave trains - and box B's reference study-t06, which it calibrates but never trains, last (beside three of B's runs
+# as unmeasured load)
 BOXES = {
     "A": {"runs": ["study-t06", "study-t03", "study-t01", "study-t005"], "probe_classes": ["kept-t03", "scratch"],
           "calibrate": ["study-t06", "study-t03", "study-t01", "study-t005"], "reference": "study-t06",
           "numbers_file": "PREREG_numbers_A.json", "extras": ["anchor"]},
     "B": {"runs": ["study-p03", "study-p01", "study-p005", "study-bridge"],
           "probe_classes": ["lost", "kept-p03", "bridge"],
-          "calibrate": ["study-t06", "study-p03", "study-p01", "study-p005", "study-bridge"], "reference": "study-t06",
+          "calibrate": ["study-p03", "study-p01", "study-p005", "study-bridge", "study-t06"], "reference": "study-t06",
           "numbers_file": "PREREG_numbers_B.json", "extras": ["speed"]},
     "replicate": {"runs": ["study-t01-s1235"], "probe_classes": [], "calibrate": [], "numbers_from": "A",
                   "numbers_file": "PREREG_numbers_replicate.json", "extras": []},
 }
+BOX_GPUS = {"A": 4, "B": 4, "replicate": 1}  # 4x A100 SXM4 for A and B, a 1x box for the replicate (the owner's split)
 
 # --------------------------------------------------------------------------------------------- calibration
 
@@ -347,6 +357,46 @@ def probe_box(cls: str) -> str:
     return next(b for b, spec in BOXES.items() if cls in spec["probe_classes"])
 
 
+def calibration_groups(box: str, n_gpus: int | None = None) -> list[dict]:
+    """How a box measures its step times (the rule of calibration.groups): its 'calibrate' list in list order, in groups
+    of n_gpus (default BOX_GPUS[box]) runs that train at the same time, one per GPU; a short last group is filled with
+    the list's first runs that are not in it, as unmeasured load, so every run is measured with as many runs training
+    as its wave has. -> [{"measured": [...], "load": [...]}, ...]; [] for a box that calibrates nothing."""
+    runs = list(BOXES[box]["calibrate"])
+    g = int(n_gpus if n_gpus is not None else BOX_GPUS[box])
+    if g < 1:
+        raise ValueError(f"box {box}: {g} GPUs")
+    out = []
+    for i in range(0, len(runs), g):
+        grp = runs[i:i + g]
+        out.append({"measured": grp, "load": [r for r in runs if r not in grp][:g - len(grp)]})
+    return out
+
+
+def student_problems(run: str, meta: dict) -> list[str]:
+    """Why a built student (its student_meta.json) is not the one the rules register for `run`: not complete, another
+    family, init class, seed or parameter count (total, non-embedding, and the builder's closed form), or - for a
+    pruned student - FFNs ranked on other calibration ids than the first run's (calibration.importance_ids_sha256 of a
+    Transcribe student, calibration.ids_sha256 of a Parakeet one). A box can check every student it pulls with this
+    before its first step: a stale build (the B10 T-0.3B of 320.75M, the P students on the re-drawn ids) fails here."""
+    spec = RUNS[run]
+    p = []
+    if meta.get("stage") != "complete":
+        p.append(f"{run}: stage {meta.get('stage')!r}, not complete")
+    for k in ("family", "init_class", "seed", "params_total", "params_non_embedding"):
+        if meta.get(k) != spec[k]:
+            p.append(f"{run}: {k} {meta.get(k)!r}, registered {spec[k]!r}")
+    if meta.get("closed_form_params") != spec["params_total"]:
+        p.append(f"{run}: closed_form_params {meta.get('closed_form_params')!r}, registered {spec['params_total']!r}")
+    if spec["init_class"] != "scratch":
+        cal = meta.get("calibration") or {}
+        ids = cal.get("importance_ids_sha256") or cal.get("ids_sha256")
+        if ids != spec["calib_ids_sha256"]:
+            p.append(f"{run}: FFNs ranked on calibration ids {str(ids)[:12]}..., registered "
+                     f"{spec['calib_ids_sha256'][:12]}...")
+    return p
+
+
 def params_of(system: str) -> int:
     """Total parameters of a study run or of a teacher (TEACHER_PARAMS)."""
     return RUNS[system]["params_total"] if system in RUNS else TEACHER_PARAMS[system]
@@ -504,15 +554,25 @@ def rules(sidecar: dict | None = None) -> dict:
                          f"1/2), both step times measured on the host that trains run i ({T_REF_RUN} itself: "
                          f"{round_to(REF_STEPS):,})",
             "t_i": f"the median step time over steps {CALIB_STEPS[0]}-{CALIB_STEPS[1]} at the planned micro_audio_s, "
-                   f"logging included, on the box's host with the box's calibrated runs running concurrently",
+                   f"logging included, on the box's host, measured in its calibration group (groups) while every other "
+                   f"run of the group trains",
             "per_box": f"each box calibrates its 'calibrate' list (BOXES) and measures {T_REF_RUN} on its own host: "
                        f"box B calibrates {T_REF_RUN} for {CALIB_STEPS[1]} steps without training it",
+            "grouping": "a box's 'calibrate' list, in list order, in groups of the box's GPU count (A and B: 4): the "
+                        "runs of a group train at the same time, one per GPU; a short last group is filled with the "
+                        "list's first runs that are not in it, as unmeasured load, so every run is measured with as "
+                        "many runs training as its wave has. Each list names the box's own runs first: they are "
+                        "measured together, exactly as their wave trains. Box B measures study-t06 last, beside "
+                        "study-p03, study-p01 and study-p005 as load",
+            "gpus": dict(BOX_GPUS),
+            "groups": {b: calibration_groups(b) for b in BOXES},
             "min_steps_measured": CALIB_STEPS[1] - CALIB_STEPS[0], "data_wait_max": DATA_WAIT_MAX,
             "loader_bound": f"data_wait_frac >= {DATA_WAIT_MAX}: perf.num_workers 12 and calibrate again; still "
                             f">= {DATA_WAIT_MAX}: the box halts",
             "excluded": "evals, checkpoints and the T/2 branch do not count toward T",
             "replicate": f"{REPLICATE} is not calibrated: it takes {REPLICATE_OF}'s max_steps and the scratch LR from "
-                         f"box A's numbers file",
+                         f"box A's numbers file, and trains at the micro_audio_s of {REPLICATE_OF}'s calibration entry "
+                         f"there",
         },
         "branch": {"resume_frac": 0.4, "end_frac": 0.5, "t_c": "the resume step",
                    "what": "<run>-half resumes the local full state at 0.4 x max_steps and cools down to 0.5 x "
@@ -653,8 +713,10 @@ def rules(sidecar: dict | None = None) -> dict:
                             "study step (write_numbers(..., box=<A|B|replicate>))",
                     "per_box": "a box's file holds its own calibration table, the max_steps and LRs of the runs it "
                                "trains and the probes it ran; the replicate's holds no calibration and no probes, and "
-                               "names box A's file (numbers_from: its sha256) whose study-t01 max_steps and LR it "
-                               "takes"},
+                               "names box A's file (numbers_from: its sha256) whose study-t01 max_steps, LR and "
+                               "calibrated micro_audio_s it takes",
+                    "report": "tools/study_report.py --numbers reads all three files, each run against the file of the "
+                              "box that trains it"},
     }
     if sidecar is not None:
         _fill(r, sidecar)
@@ -884,7 +946,8 @@ def rules_md(r: dict) -> str:
                      f"{s['params_non_embedding']:,} | {s['lr_from']} | {s['warmup_steps']} | {_fmt(s['weight_decay'])}"
                      f" | {_fmt(s['aux_ctc'])} | {s['micro_audio_s']} | {s['box']} |")
     lines += ["", "Shapes:", ""] + [f"- **{run}**: {s['shape']}; seed {s['seed']}; BN {s['bn']}"
-                                    for run, s in r["runs"].items()]
+                                    + (f"; FFNs ranked on the calibration ids {s['calib_ids_sha256']}"
+                                       if s.get("calib_ids_sha256") else "") for run, s in r["runs"].items()]
     lines += ["", "## Size ladder (STUDY.md 1.3)", "", "| step | params | halvings h | what changes besides size |",
               "|---|---|---|---|"]
     lines += [f"| {s['big']} -> {s['small']} | {s['params'][0]:,} -> {s['params'][1]:,} | {s['h']:.3f} | "

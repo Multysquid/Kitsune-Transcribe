@@ -110,11 +110,11 @@
   },
   "B": {
    "calibrate": [
-    "study-t06",
     "study-p03",
     "study-p01",
     "study-p005",
-    "study-bridge"
+    "study-bridge",
+    "study-t06"
    ],
    "extras": [
     "speed"
@@ -167,6 +167,47 @@
  "calibration": {
   "data_wait_max": 0.05,
   "excluded": "evals, checkpoints and the T/2 branch do not count toward T",
+  "gpus": {
+   "A": 4,
+   "B": 4,
+   "replicate": 1
+  },
+  "grouping": "a box's 'calibrate' list, in list order, in groups of the box's GPU count (A and B: 4): the runs of a group train at the same time, one per GPU; a short last group is filled with the list's first runs that are not in it, as unmeasured load, so every run is measured with as many runs training as its wave has. Each list names the box's own runs first: they are measured together, exactly as their wave trains. Box B measures study-t06 last, beside study-p03, study-p01 and study-p005 as load",
+  "groups": {
+   "A": [
+    {
+     "load": [],
+     "measured": [
+      "study-t06",
+      "study-t03",
+      "study-t01",
+      "study-t005"
+     ]
+    }
+   ],
+   "B": [
+    {
+     "load": [],
+     "measured": [
+      "study-p03",
+      "study-p01",
+      "study-p005",
+      "study-bridge"
+     ]
+    },
+    {
+     "load": [
+      "study-p03",
+      "study-p01",
+      "study-p005"
+     ],
+     "measured": [
+      "study-t06"
+     ]
+    }
+   ],
+   "replicate": []
+  },
   "loader_bound": "data_wait_frac >= 0.05: perf.num_workers 12 and calibrate again; still >= 0.05: the box halts",
   "max_steps": "max_steps_i = round_to_10(9366 x t_study-t06 / t_i) = 10 x floor(9366 x t_study-t06 / t_i / 10 + 1/2), both step times measured on the host that trains run i (study-t06 itself: 9,370)",
   "max_steps_multiple": 10,
@@ -174,8 +215,8 @@
   "per_box": "each box calibrates its 'calibrate' list (BOXES) and measures study-t06 on its own host: box B calibrates study-t06 for 250 steps without training it",
   "reference_run": "study-t06",
   "reference_steps": 9366,
-  "replicate": "study-t01-s1235 is not calibrated: it takes study-t01's max_steps and the scratch LR from box A's numbers file",
-  "t_i": "the median step time over steps 50-250 at the planned micro_audio_s, logging included, on the box's host with the box's calibrated runs running concurrently"
+  "replicate": "study-t01-s1235 is not calibrated: it takes study-t01's max_steps and the scratch LR from box A's numbers file, and trains at the micro_audio_s of study-t01's calibration entry there",
+  "t_i": "the median step time over steps 50-250 at the planned micro_audio_s, logging included, on the box's host, measured in its calibration group (groups) while every other run of the group trains"
  },
  "cohere_prereg": {
   "eval_cv8": 0.0407,
@@ -650,7 +691,8 @@
    "written_utc",
    "host"
   ],
-  "per_box": "a box's file holds its own calibration table, the max_steps and LRs of the runs it trains and the probes it ran; the replicate's holds no calibration and no probes, and names box A's file (numbers_from: its sha256) whose study-t01 max_steps and LR it takes",
+  "per_box": "a box's file holds its own calibration table, the max_steps and LRs of the runs it trains and the probes it ran; the replicate's holds no calibration and no probes, and names box A's file (numbers_from: its sha256) whose study-t01 max_steps, LR and calibrated micro_audio_s it takes",
+  "report": "tools/study_report.py --numbers reads all three files, each run against the file of the box that trains it",
   "when": "written and uploaded by each box, its sha256 logged as an event, before that box's first study step (write_numbers(..., box=<A|B|replicate>))"
  },
  "owner_changes": {
@@ -699,6 +741,7 @@
    "aux_ctc": 0.0,
    "bn": "teacher stats, frozen (decision 16)",
    "box": "B",
+   "calib_ids_sha256": "5e31cd68bebc2180a89089187b559e4b164a2394046c619a477b14c169a2a956",
    "family": "ctc",
    "init_class": "pruned_lost",
    "lr_from": "lost",
@@ -715,6 +758,7 @@
    "aux_ctc": 0.0,
    "bn": "teacher stats, frozen (decision 16)",
    "box": "B",
+   "calib_ids_sha256": "5e31cd68bebc2180a89089187b559e4b164a2394046c619a477b14c169a2a956",
    "family": "ctc",
    "init_class": "pruned_lost",
    "lr_from": "lost",
@@ -731,6 +775,7 @@
    "aux_ctc": 0.0,
    "bn": "teacher stats, frozen (decision 16)",
    "box": "B",
+   "calib_ids_sha256": "5e31cd68bebc2180a89089187b559e4b164a2394046c619a477b14c169a2a956",
    "family": "ctc",
    "init_class": "pruned_kept",
    "lr_from": "kept-p03",
@@ -795,6 +840,7 @@
    "aux_ctc": 0.0,
    "bn": "teacher stats, frozen (decision 16)",
    "box": "A",
+   "calib_ids_sha256": "5e31cd68bebc2180a89089187b559e4b164a2394046c619a477b14c169a2a956",
    "family": "aed",
    "init_class": "pruned_kept",
    "lr_from": "kept-t03",
@@ -811,6 +857,7 @@
    "aux_ctc": 0.0,
    "bn": "teacher stats, frozen (decision 16)",
    "box": "A",
+   "calib_ids_sha256": "5e31cd68bebc2180a89089187b559e4b164a2394046c619a477b14c169a2a956",
    "family": "aed",
    "init_class": "pruned_kept",
    "lr_from": "kept-t03",

@@ -23,13 +23,15 @@ CONTRACT_RUNS = {"study-t06": ("aed", "pruned_kept"), "study-t03": ("aed", "prun
                  "study-p005": ("ctc", "pruned_lost")}
 
 
-OWNER_BOXES = {  # the owner's two-box split of 2026-09-26, verbatim as the wave-2 contract gives it (CONTRACT.md 6)
+# the owner's two-box split of 2026-09-26 as the wave-2 contract gives it (CONTRACT.md 6), with box B's calibrate list
+# in its measuring order: the box's own runs first, its reference study-t06 last (prereg.calibration_groups)
+OWNER_BOXES = {
     "A": {"runs": ["study-t06", "study-t03", "study-t01", "study-t005"], "probe_classes": ["kept-t03", "scratch"],
           "calibrate": ["study-t06", "study-t03", "study-t01", "study-t005"], "reference": "study-t06",
           "numbers_file": "PREREG_numbers_A.json", "extras": ["anchor"]},
     "B": {"runs": ["study-p03", "study-p01", "study-p005", "study-bridge"],
           "probe_classes": ["lost", "kept-p03", "bridge"],
-          "calibrate": ["study-t06", "study-p03", "study-p01", "study-p005", "study-bridge"], "reference": "study-t06",
+          "calibrate": ["study-p03", "study-p01", "study-p005", "study-bridge", "study-t06"], "reference": "study-t06",
           "numbers_file": "PREREG_numbers_B.json", "extras": ["speed"]},
     "replicate": {"runs": ["study-t01-s1235"], "probe_classes": [], "calibrate": [], "numbers_from": "A",
                   "numbers_file": "PREREG_numbers_replicate.json", "extras": []}}
@@ -511,8 +513,66 @@ def test_the_boxes_are_the_owners_split():
     for run, spec in prereg.RUNS.items():  # the LR a run takes comes from its own box, or (the replicate) box A
         assert prereg.probe_box(spec["lr_from"]) == (spec["box"] if spec["box"] != "replicate" else "A")
     assert set(OWNER_BOXES["B"]["calibrate"]) - set(OWNER_BOXES["B"]["runs"]) == {"study-t06"}  # the reference only
+    for spec in OWNER_BOXES.values():  # the box's own runs first: measured together, as their wave trains
+        assert spec["calibrate"][:len(spec["runs"])] == spec["runs"] or not spec["calibrate"]
     assert r["numbers"]["files"] == {"A": "PREREG_numbers_A.json", "B": "PREREG_numbers_B.json",
                                      "replicate": "PREREG_numbers_replicate.json"}
+
+
+def test_the_calibration_groups_are_registered():
+    """How each box times its runs is fixed before box A writes its numbers (the replicate refuses A's file under other
+    rules): box A measures its wave in one group; box B measures its wave exactly as it trains, then study-t06 beside
+    three of its runs as unmeasured load, so every t_i is taken with four runs training. The rule is the list order in
+    groups of the GPU count, as kitsune.study_queue runs it."""
+    r = prereg.rules()
+    groups = r["calibration"]["groups"]
+    assert groups == {
+        "A": [{"measured": ["study-t06", "study-t03", "study-t01", "study-t005"], "load": []}],
+        "B": [{"measured": ["study-p03", "study-p01", "study-p005", "study-bridge"], "load": []},
+              {"measured": ["study-t06"], "load": ["study-p03", "study-p01", "study-p005"]}],
+        "replicate": []}
+    assert r["calibration"]["gpus"] == {"A": 4, "B": 4, "replicate": 1}
+    for box, grps in groups.items():
+        assert [x for g in grps for x in g["measured"]] == OWNER_BOXES[box]["calibrate"]  # each run measured once
+        assert all(len(g["measured"]) + len(g["load"]) == r["calibration"]["gpus"][box] for g in grps)
+        if grps:  # the wave's runs are measured together, with nothing else training
+            assert sorted(grps[0]["measured"]) == sorted(OWNER_BOXES[box]["runs"]) and grps[0]["load"] == []
+    # the same rule on another GPU count: a short last group is filled from the list's head
+    assert prereg.calibration_groups("B", 3) == [
+        {"measured": ["study-p03", "study-p01", "study-p005"], "load": []},
+        {"measured": ["study-bridge", "study-t06"], "load": ["study-p03"]}]
+    with pytest.raises(ValueError, match="GPUs"):
+        prereg.calibration_groups("A", 0)
+
+
+def test_student_problems_checks_a_built_student_against_the_rules():
+    """A box can refuse a stale student before its first step: every registered field of the student's meta (stage,
+    family, init class, seed, the three counts) and, for a pruned student, the calibration ids its FFNs were ranked on
+    (the Transcribe builder's calibration.importance_ids_sha256, the Parakeet builder's calibration.ids_sha256)."""
+    def meta(run, **over):
+        s = prereg.RUNS[run]
+        m = dict(stage="complete", family=s["family"], init_class=s["init_class"], seed=s["seed"],
+                 params_total=s["params_total"], params_non_embedding=s["params_non_embedding"],
+                 closed_form_params=s["params_total"])
+        if s["init_class"] != "scratch":
+            key = "importance_ids_sha256" if s["family"] == "aed" else "ids_sha256"
+            m["calibration"] = {key: prereg.CALIB_IDS_SHA256}
+        return dict(m, **over)
+
+    for run in prereg.RUNS:
+        assert prereg.student_problems(run, meta(run)) == [], run
+    assert {r for r, s in prereg.RUNS.items() if s.get("calib_ids_sha256")} == {
+        "study-t06", "study-t03", "study-p03", "study-p01", "study-p005"}
+    b10 = meta("study-t03", params_total=320_752_384, closed_form_params=320_752_384, params_non_embedding=302_926_592)
+    assert [p.split(" ")[1] for p in prereg.student_problems("study-t03", b10)] == [
+        "params_total", "params_non_embedding", "closed_form_params"]
+    redrawn = meta("study-p01", calibration={"ids_sha256": "b06deb35" + "0" * 56})
+    assert prereg.student_problems("study-p01", redrawn) == [
+        "study-p01: FFNs ranked on calibration ids b06deb350000..., registered 5e31cd68bebc..."]
+    assert prereg.student_problems("study-t01-s1235", meta("study-t01-s1235", seed=1234)) == [
+        "study-t01-s1235: seed 1234, registered 1235"]
+    assert prereg.student_problems("study-p03", meta("study-p03", stage="saved", init_class="pruned_lost")) == [
+        "study-p03: stage 'saved', not complete", "study-p03: init_class 'pruned_lost', registered 'pruned_kept'"]
 
 
 def test_box_aware_calibration_and_max_steps():
