@@ -305,7 +305,8 @@ BUCKETS = (("p1_gt_0.99", lambda p1: p1 > 0.99), ("p1_lt_0.9", lambda p1: p1 < 0
 # relative to the repo root.
 DEFAULTS = {
     # family: "aed" (a Cohere-family student, CohereAsr AED) or "ctc" (a Parakeet-family student, ParakeetForCTC, on
-    # the frame targets under parakeet_root; the module docstring's "family" entry)
+    # the frame targets under parakeet_root; the module docstring's "family" entry). A CTC run requires parakeet_root
+    # (below: the local dir with parakeet_out's <src>/<stem>.{npz,jsonl} and meta.json), the one run that reads it
     "family": "aed",
     "run_name": "viability-b20x2560", "student": "students/b20x2560-d4", "data_root": "data",
     "teacher_root": "teacher_out", "second_root": "second_out", "selection": "selection/viability.parquet",
@@ -320,9 +321,8 @@ DEFAULTS = {
     "selection_recipe": {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "eval_emilia=0.2"],
                          "filter_eval_sets": ["eval_emilia", "galgame"], "partial_second_opinion": ["galgame"]},
     # the label extent (kitsune/extent.py; make_selection.py, vast/launch.py and bootstrap.sh read it), the Parakeet
-    # soft-target root and the label box's settings (vast/label.py): configs/full.json sets them. The trainer reads
-    # parakeet_root (the local dir with <src>/<stem>.{npz,jsonl} + meta.json of parakeet_out) for family "ctc" only,
-    # which requires it. None, so a config's object replaces the default whole (_merge does not recurse into None)
+    # soft-target root and the label box's settings (vast/label.py): configs/full.json sets them, the trainer never
+    # reads them. None, so a config's object replaces the default whole (_merge does not recurse into None)
     "extent": None, "parakeet_root": None, "label": None,
     # smoke runs: seeded id subsets, small caches. *_audio_s: seeded subsets of about that many seconds of audio
     # (audio_subset; the overfit runs), the eval one pooled over eval_sets and decoded greedily in full at every eval
