@@ -277,13 +277,18 @@ DEFAULTS = {
     # (SOURCE=A, as that flag takes it: a list, so a config replaces it whole), --filter-eval-sets and
     # --partial-second-opinion (sources that train on their judged shards only, by decision: galgame for the viability
     # run, whose 02b pass the laptop GPU could not finish). Read by scripts/make_selection.py --config and checked by
-    # vast/launch.py against the selection's own record; not by the trainer
+    # vast/launch.py against the selection's own record; not by the trainer. study: the size study's selection rules
+    # (kitsune.prereg.STUDY_SELECTION, which study/data.json carries verbatim; null: not a study selection); a dict of
+    # exactly those keys (validate_box)
     "selection_recipe": {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "eval_emilia=0.2"],
-                         "filter_eval_sets": ["eval_emilia", "galgame"], "partial_second_opinion": ["galgame"]},
+                         "filter_eval_sets": ["eval_emilia", "galgame"], "partial_second_opinion": ["galgame"],
+                         "study": None},
     # the label extent (kitsune/extent.py; make_selection.py, vast/launch.py and bootstrap.sh read it), the Parakeet
     # soft-target root and the label box's settings (vast/label.py): configs/full.json sets them, the trainer never
-    # reads them. None, so a config's object replaces the default whole (_merge does not recurse into None)
-    "extent": None, "parakeet_root": None, "label": None,
+    # reads them. None, so a config's object replaces the default whole (_merge does not recurse into None).
+    # pull_parakeet: the box also pulls parakeet_root's labels for this run (kitsune.extent.pull_plan; the size study's
+    # box pulls both teachers for every run, study/data.json); needs parakeet_root; the trainer does not read it
+    "extent": None, "parakeet_root": None, "label": None, "pull_parakeet": False,
     # smoke runs: seeded id subsets, small caches. *_audio_s: seeded subsets of about that many seconds of audio
     # (audio_subset; the overfit runs), the eval one pooled over eval_sets and decoded greedily in full at every eval
     "subset": {"train_utts": None, "eval_utts_per_set": None, "train_audio_s": None, "eval_audio_s": None},
@@ -366,6 +371,10 @@ DEFAULTS = {
     # the LR probe (steps clock; the module docstring): metrics only, and at the end the training objective
     # teacher-forced on the complete gate sets (lr_probe_eval)
     "lr_probe": {"enabled": False},
+    # the study box's calibration run (kitsune/study_queue.py; the block "the study box" at the end of this file): an
+    # lr_probe run (metrics only) that ends with its step-time table - the median step time, logging included, over
+    # the steps (window[0], window[1]] and the data-wait share - instead of the teacher-forced objective
+    "calibrate": {"enabled": False, "window": [50, 250]},
     "seed": 1234,
 }
 EARLY_STOP_METRICS = ("probe_kl", "heldout_kl", "train_loss")
@@ -3728,6 +3737,93 @@ def run_script(argv=None):
         else:
             print(e.code, file=sys.stderr)
     exit_process(rc)
+
+
+# ------------------------------------------------------------------------------------------------ the study box
+# One contiguous block (CONTRACT.md section 7, WP6A): the validation of the box path's keys (pull_parakeet,
+# selection_recipe.study, calibrate, and optim.lr as a number, which the generated study configs leave null until the
+# box fills it from its PREREG_numbers file) and the calibration run's end phase. It hooks into the trainer by wrapping
+# validate() and end_lr_probe() at its end, not by editing them, so it merges cleanly with the CTC trainer's changes to
+# the rest of this file; a calibration run is an lr_probe run in every other respect (metrics only: no step-0, in-loop
+# or mini evals, no weights, no checkpoint uploads).
+
+
+def calibrate_on(cfg: dict) -> bool:
+    return bool((cfg.get("calibrate") or {}).get("enabled"))
+
+
+def validate_box(cfg: dict):
+    """The box path's keys (DEFAULTS: pull_parakeet, selection_recipe.study, calibrate) and optim.lr. calibrate needs
+    the steps clock and lr_probe.enabled (its loop is the LR probe's: metrics only), no branch, and a window (a, b] of
+    whole steps with 0 <= a < b that the run reaches past a (max_steps > a; the study box ends its calibration runs
+    with the STOP file once every run of the group has its window, kitsune.study_queue)."""
+    from kitsune import prereg
+
+    lr = cfg["optim"]["lr"]
+    if not (_number(lr) and lr >= 0):  # 0: weights that never move (tests/test_evaluate_script.py)
+        raise SystemExit(f"optim.lr must be a number >= 0, got {lr!r} (a generated study config leaves it null until "
+                         "the box fills it from its PREREG_numbers file: kitsune/study_queue.py)")
+    if cfg["pull_parakeet"] and not cfg.get("parakeet_root"):
+        raise SystemExit("pull_parakeet needs parakeet_root (the label root the box pulls the Parakeet targets from)")
+    study = cfg["selection_recipe"].get("study")
+    if study is not None and not (isinstance(study, dict) and set(study) == set(prereg.STUDY_SELECTION)
+                                  and all(_number(v) for v in study.values())):
+        raise SystemExit(f"selection_recipe.study must be null or the study's selection block with the keys "
+                         f"{sorted(prereg.STUDY_SELECTION)} (numbers; study/data.json), got {study!r}")
+    cal = cfg["calibrate"]
+    w = cal["window"]
+    if not (isinstance(w, list) and len(w) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in w)
+            and 0 <= w[0] < w[1]):
+        raise SystemExit(f"calibrate.window must be [a, b], whole steps with 0 <= a < b, got {w!r}")
+    if cal["enabled"]:
+        sch = cfg["schedule"]
+        if sch["clock"] != "steps" or not cfg["lr_probe"]["enabled"] or cfg["branch"]["parent"] is not None:
+            raise SystemExit("calibrate.enabled needs schedule.clock 'steps' and lr_probe.enabled (a calibration run "
+                             "is an LR-probe-shaped run: metrics only), and no branch.parent")
+        if int(sch["max_steps"]) <= w[0]:
+            raise SystemExit(f"calibrate.enabled: max_steps {sch['max_steps']} ends before the window "
+                             f"({w[0]}, {w[1]}] starts")
+
+
+def end_calibrate(R: Run, step: int) -> int:
+    """A calibration run's end phase (calibrate.enabled; the loop ended at max_steps or on the STOP file): its step-time
+    table from its own metrics (kitsune.study_queue.calibration_stats over calibrate.window: the median step time,
+    logging included, and the data-wait share), the micro-batch size the memory probe chose and the loader's
+    workers; a `calibrate_result` event and summary.json's calibrate. No full state (a calibration is never resumed,
+    the box runs it again), no eval."""
+    from kitsune import study_queue as Q
+
+    cfg, log = R.cfg, R.log
+    a, b = (int(x) for x in cfg["calibrate"]["window"])
+    rows = Q.read_step_rows(R.run_dir)
+    result = dict(Q.calibration_stats(rows, a, b), micro_audio_s=float(R.planner.micro_audio_s), steps=int(step),
+                  workers=next((e.get("workers") for e in reversed(Q.read_events(R.run_dir))
+                                if e.get("kind") == "phase" and e.get("name") == "train"), None),
+                  memory=R.st["memory"])
+    log.event("calibrate_result", **result)
+    print(f"[calibrate] {step} steps | window {result['window']} | t_step {result['t_step_s']} s | data wait "
+          f"{result['data_wait_frac']} | micro {result['micro_audio_s']:g} s", flush=True)
+    verdict = dict(verdict="N/A", reason="calibration: the step-time table only")
+    log.write_summary(make_summary(R, "complete", verdict=verdict, final=None, uploads="pending", calibrate=result))
+    if log.wait_sync(END_SYNC_JOIN_S):
+        log.sync(force=True, wait=False)
+    uploads = R.uploader.wait(UPLOAD_WAIT_S)
+    summary = make_summary(R, "complete", verdict=verdict, final=None, uploads=uploads, calibrate=result)
+    R.uploader.shutdown()
+    log.close(summary=summary)
+    return EXIT_OK
+
+
+_validate_trainer, _end_lr_probe_trainer = validate, end_lr_probe
+
+
+def validate(cfg: dict):  # noqa: F811  the trainer's checks, then the box keys' (the block comment above)
+    _validate_trainer(cfg)
+    validate_box(cfg)
+
+
+def end_lr_probe(R: Run, step: int) -> int:  # noqa: F811  a calibration run ends with its step-time table instead
+    return end_calibrate(R, step) if calibrate_on(R.cfg) else _end_lr_probe_trainer(R, step)
 
 
 if __name__ == "__main__":
