@@ -620,10 +620,25 @@ def test_hub_retry_backs_off_exponentially_and_only_on_what_a_retry_fixes(monkey
             raise err(429)
         return "ok"
 
-    assert finish.hub_retry(flaky, "x") == "ok" and waits == list(finish.HUB_RETRY_WAITS[:3])
+    assert finish.hub_retry(flaky, "x") == "ok" and len(waits) == 3
+    # each wait is the schedule's plus up to HUB_RETRY_JITTER of it (two racing writers do not retry in lockstep)
+    assert all(w <= got <= w * (1 + finish.HUB_RETRY_JITTER) for w, got in zip(finish.HUB_RETRY_WAITS, waits))
     waits.clear()
     with pytest.raises(RuntimeError, match="401"):
         finish.hub_retry(lambda: (_ for _ in ()).throw(err(401)), "x")
     assert waits == []  # a refused token is not retried
     assert finish.retryable(err(503)) and finish.retryable(RuntimeError("connection reset"))
     assert not finish.retryable(err(404))
+    # a commit that raced another writer (409 "another commit is in progress", 412 "a commit has happened since") is
+    # the Hub asking for a later try: boxes A and B commit into one runs repo at the same time
+    assert finish.retryable(err(409)) and finish.retryable(err(412)) and finish.retryable(err(408))
+    waits.clear()
+    tries.clear()
+
+    def racing():
+        tries.append(1)
+        if len(tries) < 3:
+            raise err(409 if len(tries) == 1 else 412)
+        return "committed"
+
+    assert finish.hub_retry(racing, "x") == "committed" and len(waits) == 2

@@ -52,6 +52,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -72,8 +73,10 @@ INFRA_TIMEOUT_S = 180  # a hung infra upload must not keep a paid instance up
 INFRA_MAX_FILE_BYTES = 32 << 20  # a study box's per-item log goes up as its last 32 MB (upload_infra deep)
 # s before each retry of a hub call the library does not retry itself: exponential back-off from 5 s up to 10 min, ~21
 # min in all (STUDY.md 5.5: the study's runs share one repo, and a 429 needs the Hub's rate window to pass). Only what a
-# retry can fix is retried (retryable)
+# retry can fix is retried (retryable). Each wait gets up to HUB_RETRY_JITTER of itself added at random: boxes A and B
+# commit into one runs repo at the same time, and two writers whose commits raced must not retry in lockstep
 HUB_RETRY_WAITS = (5, 10, 20, 40, 80, 160, 320, 600)
+HUB_RETRY_JITTER = 0.25
 # an env var whose name holds one of these is a secret: a mirror of kitsune/runlog.py's SECRET_MARKERS (finish stays
 # stdlib-only; runlog imports pyarrow)
 SECRET_MARKERS = ("TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CRED", "COOKIE")
@@ -242,11 +245,17 @@ def hf_api():
     return HfApi()
 
 
+# the 4xx a retry fixes: 408 timeout, 409 "another commit is in progress" (the datasets library retries create_commit on
+# exactly this), 412 "a commit has happened since" (a commit's parent moved under it), 429 rate limit. Boxes A and B
+# commit into one runs repo at once (8 trainers and 2 queues), which is when two commits race
+RETRYABLE_4XX = (408, 409, 412, 429)
+
+
 def retryable(e: BaseException) -> bool:
-    """A hub error a retry can fix: 429, 408 or 5xx, or one without an HTTP status (a dropped connection, a timeout);
-    any other 4xx (a refused token, a missing repo or file) comes back the same."""
+    """A hub error a retry can fix: RETRYABLE_4XX or 5xx, or one without an HTTP status (a dropped connection, a
+    timeout); any other 4xx (a refused token, a missing repo or file) comes back the same."""
     status = getattr(getattr(e, "response", None), "status_code", None)
-    return not isinstance(status, int) or status in (408, 429) or status >= 500
+    return not isinstance(status, int) or status in RETRYABLE_4XX or status >= 500
 
 
 def hub_retry(fn, what: str):
@@ -260,7 +269,8 @@ def hub_retry(fn, what: str):
         except Exception as e:
             if not retryable(e):
                 raise
-            log(f"{what} failed ({type(e).__name__}: {e}); retrying in {w} s")
+            w *= 1 + HUB_RETRY_JITTER * random.random()
+            log(f"{what} failed ({type(e).__name__}: {e}); retrying in {w:.1f} s")
             time.sleep(w)
     return fn()
 
