@@ -390,21 +390,33 @@ def data_problems(files: list[str], cfg: dict) -> list[str]:
     opinion for EVERY train source teacher shard. make_selection drops the rows of a shard without one as no_agree, so
     a partial 02b pass silently shrinks the train set. The run config's selection_recipe.partial_second_opinion lists
     the sources that train on their judged shards only, by decision: for them one judged shard is enough (the
-    selection check makes sure the selection was built that way, with not_judged rows instead of no_agree)."""
+    selection check makes sure the selection was built that way, with not_judged rows instead of no_agree).
+    A CTC student (family "ctc") or pull_parakeet true also needs parakeet_root's meta.json and Parakeet npz for every
+    train source and eval set (kitsune.extent.pull_plan's rule for extent configs), and a CTC run without
+    pull_parakeet needs teacher npz only for its eval sets."""
     teacher_root, second_root = cfg.get("teacher_root", "teacher_out"), cfg.get("second_root", "second_out")
     have = set(files)
     student = cfg["student"].rstrip("/")
     problems = [f"no {f}" for f in (f"{teacher_root}/meta.json", f"{second_root}/meta.json", cfg["selection"],
                                     *(f"{student}/{n}" for n in STUDENT_FILES)) if f not in have]
+    ctc = cfg.get("family", "aed") == "ctc"
+    parakeet_root = cfg.get("parakeet_root") if ctc or cfg.get("pull_parakeet") else None
+    if (ctc or cfg.get("pull_parakeet")) and not parakeet_root:
+        problems.append("the config needs Parakeet targets (family ctc or pull_parakeet) but has no parakeet_root")
+    elif parakeet_root and f"{parakeet_root}/meta.json" not in have:
+        problems.append(f"no {parakeet_root}/meta.json")
 
     def stems(root: str, s: str, ext: str) -> set[str]:
         return {f.rsplit("/", 1)[1][: -len(ext)] for f in files if f.startswith(f"{root}/{s}/") and f.endswith(ext)}
 
     sources = list(cfg.get("sources", []))
+    eval_sets = set(cfg.get("eval_sets", []))
     partial = set((cfg.get("selection_recipe") or {}).get("partial_second_opinion", []))
     for s in dict.fromkeys(sources + list(cfg.get("eval_sets", []))):
+        if parakeet_root and not stems(parakeet_root, s, ".npz"):
+            problems.append(f"no {parakeet_root}/{s}/*.npz")
         teacher = stems(teacher_root, s, ".npz")
-        if not teacher:
+        if not teacher and (s in eval_sets or not ctc or cfg.get("pull_parakeet")):
             problems.append(f"no {teacher_root}/{s}/*.npz")
         elif s in partial and s in sources and not teacher & stems(second_root, s, ".jsonl"):
             problems.append(f"{second_root}/{s}: none of its {len(teacher)} teacher shards has a second opinion")
@@ -431,9 +443,19 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
     in silence). And a selection built before the second-opinion pass finished drops those rows as no_agree.
     With `have` (the data repo's file list) every kept row's teacher_file must be there as .npz and .jsonl: the
     trainer's build_stores raises on a missing one, after the paid bootstrap, and data_problems only asks for SOME
-    teacher shard per source (a train npz also satisfies the galgame hold-out)."""
+    teacher shard per source (a train npz also satisfies the galgame hold-out).
+    Drop reasons must be ones the recipe produces: the study's (kitsune.prereg.STUDY_REASONS) only with a
+    selection_recipe.study block, which must equal the one the selection was built with and the pre-registered one
+    (kitsune.prereg.STUDY_SELECTION), with the pre-registered seed (SELECTION_SEED). A study selection also
+    keeps every eval row in both label roots (an eval row not_in_parakeet means the Parakeet pass did not label the
+    set whole, K6), leaves at most kitsune.prereg.ONE_ROOT_MAX_FRAC of its train rows in teacher_out only (K5), and,
+    with `have`, has its sidecar (<selection>.json) and manifest (study_manifest.json) uploaded next to it. A CTC
+    student (family "ctc") or pull_parakeet also needs parakeet_out's npz and jsonl of every kept row; a CTC run
+    without pull_parakeet needs the teacher files of its kept eval rows only."""
     import pandas as pd
     import pyarrow.parquet as pq
+
+    from kitsune import prereg
 
     rebuild = "rebuild it with scripts/make_selection.py --config <the run config> and upload it"
     problems = []
@@ -449,18 +471,26 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
                    agree_max=args.get("agree_max"), agree_max_source=_by_source(args.get("agree_max_source")),
                    filter_eval_sets=set(args.get("filter_eval_sets") or []),
                    partial_second_opinion=set(args.get("partial_second_opinion") or []),
-                   extent=args.get("extent") or None)
+                   extent=args.get("extent") or None, study=args.get("study") or None)
         ext = cfg.get("extent") or None  # make_selection records {name, inputs} of the config's extent (None: none)
         want = dict(sources=set(cfg.get("sources", [])), eval_sets=set(cfg.get("eval_sets", [])),
                     agree_max=float(recipe["agree_max"]), agree_max_source=_by_source(recipe["agree_max_source"]),
                     filter_eval_sets=set(recipe["filter_eval_sets"]),
                     partial_second_opinion=set(recipe.get("partial_second_opinion", [])),
-                    extent=dict(name=ext.get("name"), inputs=ext.get("inputs") or {}) if ext else None)
+                    extent=dict(name=ext.get("name"), inputs=ext.get("inputs") or {}) if ext else None,
+                    study=recipe.get("study") or None)
         for k, v in want.items():
             if got[k] != v:
                 shown = [sorted(x.items()) if isinstance(x, dict) else sorted(x) if isinstance(x, set) else x
                          for x in (got[k], v)]
                 problems.append(f"{name} was built with {k} {shown[0]}, the run config says {shown[1]}: {rebuild}")
+        if want["study"] is not None:  # the study's data is pre-registered: one recipe, one seed for every run
+            if want["study"] != prereg.STUDY_SELECTION:
+                problems.append(f"the run config's selection_recipe.study {want['study']} is not the pre-registered "
+                                f"{prereg.STUDY_SELECTION} (kitsune.prereg; study/data.json carries it)")
+            if args.get("seed") != prereg.SELECTION_SEED:
+                problems.append(f"{name} was built with seed {args.get('seed')!r}, the study selection's is "
+                                f"pre-registered as {prereg.SELECTION_SEED}: {rebuild}")
 
     sel = pd.read_parquet(path, columns=["source", "split", "keep", "reason", "teacher_file"])
     kept = sel[sel["keep"]].groupby(["source", "split"]).size()
@@ -472,15 +502,44 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
     if not bad.empty:
         problems.append(f"{name} drops {len(bad)} rows as no_agree ({bad['source'].value_counts().to_dict()}): rebuild "
                         f"it with scripts/make_selection.py after the second-opinion pass and upload it")
+    study = isinstance(recipe, dict) and recipe.get("study") is not None
+    allowed = {"kept", "truncated", "not_judged", "no_agree", "no_audio"}
+    allowed |= set(prereg.STUDY_REASONS) if study else set()
+    if odd := sorted(r for r in sel["reason"].unique() if r not in allowed and not str(r).startswith("agree>")):
+        problems.append(f"{name} drops rows as {odd}, which {'the study' if study else 'this'} recipe never does: "
+                        f"{rebuild}")
+    if study:
+        ev = sel[(sel["split"] == "eval") & (sel["reason"] == "not_in_parakeet")]
+        if not ev.empty:
+            problems.append(f"{name}: {len(ev)} eval rows have no Parakeet labels "
+                            f"({ev['source'].value_counts().to_dict()}): the eval sets must be labelled whole by both "
+                            f"passes (K6)")
+        train = sel[sel["split"] == "train"]
+        n_one = int((train["reason"] == "not_in_parakeet").sum())
+        if n_one > prereg.ONE_ROOT_MAX_FRAC * len(train):
+            problems.append(f"{name}: {n_one} of {len(train)} train rows are in teacher_out only, more than "
+                            f"{100 * prereg.ONE_ROOT_MAX_FRAC:g} % (K5): the Parakeet pass is incomplete")
     if have is not None:
         teacher_root = cfg.get("teacher_root", "teacher_out")
-        need = sorted({f"{teacher_root}/{tf}{ext}" for tf in sel.loc[sel["keep"], "teacher_file"].unique()
+        ctc = cfg.get("family", "aed") == "ctc"
+        rows = sel[sel["keep"] & ((sel["split"] == "eval") | (not ctc) | bool(cfg.get("pull_parakeet")))]
+        need = sorted({f"{teacher_root}/{tf}{ext}" for tf in rows["teacher_file"].unique()
                        for ext in (".npz", ".jsonl")})
         absent = [f for f in need if f not in have]
         if absent:
             problems.append(f"{name} keeps rows whose teacher output is not in the data repo: {len(absent)} of "
                             f"{len(need)} files missing (e.g. {absent[0]}): upload the teacher_out the selection was "
                             f"built from")
+        if (ctc or cfg.get("pull_parakeet")) and cfg.get("parakeet_root"):
+            need = sorted({f"{cfg['parakeet_root']}/{tf}{ext}" for tf in sel.loc[sel["keep"], "teacher_file"].unique()
+                           for ext in (".npz", ".jsonl")})
+            if absent := [f for f in need if f not in have]:
+                problems.append(f"{name} keeps rows whose Parakeet targets are not in the data repo: {len(absent)} of "
+                                f"{len(need)} files missing (e.g. {absent[0]})")
+        if study:
+            for f in prereg.study_files(name):
+                if f not in have:
+                    problems.append(f"no {f}: upload the study selection's sidecar and manifest with it")
     return problems
 
 
