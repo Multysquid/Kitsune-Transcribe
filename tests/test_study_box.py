@@ -724,7 +724,7 @@ def test_box_b_plan_and_dry_run(box):
     # no watchdog deadline in a dry run: box A's summary is read once, no wait
     waits = [json.loads(x) for x in (root / "state" / "events.jsonl").read_text(encoding="utf-8").splitlines()
              if '"speed_wait"' in x]
-    assert [(w["box"], w["limit_s"], w["ready"]) for w in waits] == [("A", 0.0, True)]
+    assert [(w["box"], w["waited_for"], w["limit_s"], w["ready"]) for w in waits] == [("B", "A", 0.0, True)]
     got = json.loads((root / "runs" / "speed-B" / "speed.json").read_text(encoding="utf-8"))["systems"]
     assert set(got) == set(timed) | {"cohere", "parakeet-ctc", "parakeet-tdt"}
     assert got["study-p03"]["kind"] == "ctc" and got["study-t06"]["kind"] == "aed" and got["cohere"]["model"] is None
@@ -772,6 +772,7 @@ def test_box_b_waits_for_box_a_bounded_by_the_watchdog_deadline(box):
     ev = [json.loads(x) for x in (state / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     waits = [e for e in ev if e["kind"] == "speed_wait"]
     assert len(waits) == 1 and waits[0]["ready"] is True and waits[0]["box_status"] == "complete"
+    assert waits[0]["box"] == "B" and waits[0]["waited_for"] == "A" and 0.3 <= waits[0]["waited_s"] < 10
     assert q.trained_weights("study-t01")[0] is not None
     # past the deadline less the margin: no wait at all; box A still running is then a failed readout
     up.remote["study/box-A/queue_summary.json"] = json.dumps(running).encode()

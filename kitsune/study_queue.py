@@ -1678,7 +1678,7 @@ class Queue:
             if left <= 0:
                 break
             time.sleep(min(float(self.s.speed_poll_s), left))
-        self.event("speed_wait", box=box, waited_s=round(time.time() - t0, 1), limit_s=round(limit, 1),
+        self.event("speed_wait", waited_for=box, waited_s=round(time.time() - t0, 1), limit_s=round(limit, 1),
                    box_status=status, ready=ready)
 
     def phase_speed(self):
