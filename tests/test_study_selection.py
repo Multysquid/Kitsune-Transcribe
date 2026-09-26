@@ -612,8 +612,8 @@ def test_data_problems_know_the_parakeet_requirement():
     set; a CTC student needs teacher npz only for the eval sets; configs without either are unchanged."""
     cfg = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"], "student": "students/s",
            "selection": "selection/s.parquet", "parakeet_root": "parakeet_out"}
-    base = ["teacher_out/meta.json", "second_out/meta.json", "selection/s.parquet",
-            *(f"students/s/{n}" for n in launch.STUDENT_FILES)]
+    base = ["teacher_out/meta.json", "second_out/meta.json", "selection/s.parquet",  # a CTC student: + its CC-BY card
+            *(f"students/s/{n}" for n in launch.STUDENT_FILES + (launch.CTC_CARD,))]
     teacher = [f"teacher_out/{s}/{st}.npz" for s, st in (("reazon_small", "train-00000"), ("galgame", "train-00000"),
                                                           ("galgame", "eval-00000"), ("eval_jsut", "eval-00000"))]
     second = ["second_out/reazon_small/train-00000.jsonl", "second_out/galgame/train-00000.jsonl",

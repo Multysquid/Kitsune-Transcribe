@@ -22,7 +22,8 @@ sys.path.insert(0, str(ROOT))
 from kitsune.store import ShardWriter, ids_sha256  # noqa: E402
 
 STUDENT = "students/s"
-STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json")
+STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json",
+                 "student_meta.json", "README.md")  # vast/launch.py STUDENT_FILES
 LR = "labels/full"
 
 

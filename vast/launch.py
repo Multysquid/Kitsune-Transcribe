@@ -33,6 +33,16 @@ then reads <extent.root>/extent.json at the pinned revision, requires COMPLETE.j
 filter, a 250 GB disk, offers ranked by the estimated total (GPU hours + traffic), machines that failed a label run
 avoided, and a read-only preflight of the label root (lease, COMPLETE.json, seeds, Parakeet pins, extents):
   python vast/launch.py --job label --data-repo Multy123/kitsune-data --image-tag main        # look only
+
+--job study --box A|B|replicate|shakedown rents a size-study box (kitsune/study_queue.py runs it; vast/README.md "Size
+study"): the relaxed per-launch filter (study_filter: 4 GPUs for A and B, 1 for the replicate and the shakedown, any
+A100 40 GB then 80 GB, reliability >= STUDY_RELIABILITY), the box's hours (STUDY_HOURS) as its cap, the disk from the
+extent's sizing with both label stores and the box's checkpoints (study_queue.study_extra_gb), and study_preflight's
+refusals: a PREREG with pending fields (not for the shakedown), a selection whose sha256 is not PREREG's, a student of
+the box missing a file, a config of the box not committed, a numbers file of the box already written (or, for the
+replicate, box A's missing or written under other rules); the queue's GPU count goes along (KITSUNE_N_GPUS):
+  python vast/launch.py --job study --box A --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs \\
+      --image-tag main                                                                        # look only
 Needs the vastai CLI (`pip install vastai==1.8.0`, then `vastai set api-key <key>`); --help works without it.
 """
 import argparse
@@ -71,9 +81,13 @@ ONSTART = Path(__file__).resolve().parent / "onstart_stub.sh"
 # 16 KB, and neither says whether a longer script is truncated or rejected: stay under the smaller limit
 ONSTART_MAX_BYTES = 4000
 DEFAULT_MAX_DPH = 2.0
-# the student dir files the trainer loads (03_build_student saves them all; the trainer has no processor fallback). The
-# same list is STUDENT_FILES in vast/bootstrap.sh's helper
-STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json")
+# the student dir files the trainer loads (03_build_student saves them all; the trainer has no processor fallback and
+# reads student_meta.json; README.md is the model card with the modification notice the uploads carry). The same list
+# is STUDENT_FILES in vast/bootstrap.sh's helper. A Parakeet-derived student also carries CTC_CARD (its CC-BY-4.0
+# attribution)
+STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json",
+                 "student_meta.json", "README.md")
+CTC_CARD = "MODEL_CARD.md"
 # D45a strict filter; vast converts cpu_ram/gpu_ram GB to MB itself. rentable/verified are also CLI defaults, spelled
 # out so the printed query is the whole truth. inet_up: the end phase's ~9.9 GB of checkpoint uploads must drain inside
 # fit_budget's fixed end reserve (scripts/04_distill.py) before finish.py can destroy the box; a slow uplink overruns it
@@ -118,6 +132,36 @@ LABEL_REPO_ADD_GB = 49
 REPO_WARN_GB = 80
 
 
+# --job study (STUDY.md 5.3-5.5, CONTRACT.md section 6): one size-study box, run by kitsune/study_queue.py. Boxes A and B
+# rent 4 GPUs (one wave of four runs, each then its T/2 branch), the replicate and the shakedown one. Any A100, SXM4 or
+# PCIe, 40 GB first: equal compute is measured on the box's own host (every box calibrates its reference run there), so
+# the variant does not bias max_steps. The filter is relaxed per launch: reliability >= STUDY_RELIABILITY instead of the
+# strict 0.98 (STUDY.md 5.3: at 0.95 the snapshot held 2 qualifying 1x offers and no 4x one; the 4x box it priced had
+# 0.941); a box that dies costs a relaunch, and the queue's uploads keep everything it finished. Cores, RAM and the
+# uplink scale with the GPUs (each trainer runs ~8 loader workers; every run uploads its logs and weights).
+STUDY_RELIABILITY = 0.93
+STUDY_BOXES = ("A", "B", "replicate", "shakedown")
+STUDY_GPUS = {"A": 4, "B": 4, "replicate": 1, "shakedown": 1}
+STUDY_TIERS = [
+    ("A100 40 GB (SXM4 or PCIe)", ["gpu_name in [A100_SXM4,A100_PCIE]", "gpu_ram<=48"]),
+    ("A100 80 GB (SXM4 or PCIe; fallback)", ["gpu_name in [A100_SXM4,A100_PCIE]", "gpu_ram>=70"]),
+]
+# box -> (central hours, watchdog cap before the rebuild timeout is added): boot and bootstrap with two stores ~0.55 h,
+# the calibration ~0.2-0.4 h, the probes ~0.8-1.4 h, the wave (the longest run + its branch, STUDY.md 5.2: 3.8 central,
+# 4.2 high), the anchor in a gap, the speed probes ~0.25 h (B), the end ~0.3 h; the replicate is one run + its branch;
+# the shakedown ~1.5 h (STUDY.md 6.1)
+STUDY_HOURS = {"A": (5.8, 8.0), "B": (6.3, 8.5), "replicate": (4.6, 6.0), "shakedown": (1.6, 3.0)}
+STUDY_MAX_DPH = {4: 6.0, 1: 2.0}  # by GPU count
+STUDY_UP_GB = {"A": 12, "B": 10, "replicate": 3, "shakedown": 3}  # lean uploads (STUDY.md 5.5)
+STUDY_CONFIG = "study/data.json"
+
+
+def study_filter(n_gpus: int, disk_gb: int = DISK_GB) -> list[str]:
+    return [f"num_gpus={n_gpus}", "verified=true", "rentable=true", f"reliability>={STUDY_RELIABILITY}",
+            "cuda_vers>=13.0", f"cpu_cores_effective>={12 * n_gpus}", f"cpu_ram>={64 * n_gpus}", "disk_bw>=500",
+            "inet_down>=500", f"inet_up>={100 * n_gpus}", "direct_port_count>=1", f"disk_space>={disk_gb}"]
+
+
 @dataclass(frozen=True)
 class JobSpec:
     """What one kind of box rents: offer tiers and host filter, disk, the traffic and hours of its cost line, its
@@ -138,6 +182,14 @@ JOBS = {
     "train": JobSpec(TIERS, HOST_FILTER, DISK_GB, EST_DOWN_GB, EST_UP_GB, None, 5.5, DEFAULT_MAX_DPH, "dph", "kitsune"),
     "label": JobSpec(LABEL_TIERS, LABEL_FILTER, LABEL_DISK_GB, 590, 45, 16, 30, 1.0, "est_total", "kitsune-label"),
 }
+
+
+def study_job(box: str) -> JobSpec:
+    """The JobSpec of a size-study box: its GPU count in the relaxed filter, its hours, lean uploads."""
+    n = STUDY_GPUS[box]
+    est, cap = STUDY_HOURS[box]
+    return JobSpec(STUDY_TIERS, study_filter(n), DISK_GB, EST_DOWN_GB, STUDY_UP_GB[box], est, cap, STUDY_MAX_DPH[n],
+                   "dph", f"kitsune-study-{box}")
 
 
 class LaunchError(RuntimeError):
@@ -397,9 +449,10 @@ def data_problems(files: list[str], cfg: dict) -> list[str]:
     teacher_root, second_root = cfg.get("teacher_root", "teacher_out"), cfg.get("second_root", "second_out")
     have = set(files)
     student = cfg["student"].rstrip("/")
-    problems = [f"no {f}" for f in (f"{teacher_root}/meta.json", f"{second_root}/meta.json", cfg["selection"],
-                                    *(f"{student}/{n}" for n in STUDENT_FILES)) if f not in have]
     ctc = cfg.get("family", "aed") == "ctc"
+    problems = [f"no {f}" for f in (f"{teacher_root}/meta.json", f"{second_root}/meta.json", cfg["selection"],
+                                    *(f"{student}/{n}" for n in STUDENT_FILES + ((CTC_CARD,) if ctc else ())))
+                if f not in have]
     parakeet_root = cfg.get("parakeet_root") if ctc or cfg.get("pull_parakeet") else None
     if (ctc or cfg.get("pull_parakeet")) and not parakeet_root:
         problems.append("the config needs Parakeet targets (family ctc or pull_parakeet) but has no parakeet_root")
@@ -625,10 +678,12 @@ def _selection_kept(path: Path) -> dict | None:
     return json.loads(raw).get("kept") if raw else None
 
 
-def extent_preflight(data_repo: str, data_rev: str | None, cfg: dict) -> tuple[list[str], dict | None]:
+def extent_preflight(data_repo: str, data_rev: str | None, cfg: dict,
+                     extra_gb: float = 0.0) -> tuple[list[str], dict | None]:
     """-> (problems, sizing) for a train config with an `extent`, read-only with the laptop's login at the pinned
     revision: <root>/extent.json must be there, extent_problems() empty, and kitsune.extent.sizing() (with the kept
-    hours of the selection's metadata) gives the disk, the download and the rebuild timeout of the A100's bootstrap."""
+    hours of the selection's metadata; extra_gb: a study box's checkpoints) gives the disk, the download and the
+    rebuild timeout of the A100's bootstrap."""
     import tempfile
 
     from kitsune import extent
@@ -652,7 +707,7 @@ def extent_preflight(data_repo: str, data_rev: str | None, cfg: dict) -> tuple[l
                                                      revision=data_rev, local_dir=tmp)))
         problems += [f"{data_repo}@{(data_rev or 'head')[:12]}: {p}" for p in extent_problems(files, cfg, record)]
         if not extent.record_problems(record, cfg):
-            sizing = extent.sizing(record, cfg, kept)
+            sizing = extent.sizing(record, cfg, kept, extra_gb=extra_gb)
     except Exception as e:
         problems.append(f"cannot check the extent {record_path} of {data_repo}: {type(e).__name__}: {e}")
     return problems, sizing
@@ -811,6 +866,113 @@ def avoided_machines(data_repo: str, rev: str | None) -> tuple[set[str], list[st
     return out, notes
 
 
+def git_show(sha: str, path: str) -> bytes:
+    return subprocess.run(["git", "-C", str(ROOT), "show", f"{sha}:{path}"], capture_output=True, check=True).stdout
+
+
+def study_preflight(data_repo: str, data_rev: str | None, out_repo: str, sha: str, box: str,
+                    cfg: dict) -> tuple[list[str], list[str]]:
+    """-> (problems, notes) for --job study, read-only (local git and the laptop's HF login), on top of the extent and
+    selection checks every extent config gets (hf_preflight, extent_preflight):
+    - the box's plan (kitsune.prereg.rules()["boxes"], kitsune.study_queue.box_plan) and every config its queue reads
+      (study_queue.box_configs) committed at `sha` (tools/make_study_configs.py writes them);
+    - study/PREREG.json at `sha` without pending fields (the shakedown may run on a pending one), and the selection
+      in the data repo (its Hub sha256 at the pinned revision) equal to PREREG's manifest.selection_sha256;
+    - the box's students, and only those it pulls (study_queue.box_students), each with STUDENT_FILES and a
+      Parakeet-derived one with CTC_CARD, its CC-BY-4.0 attribution; the other dirs it pulls (box_extra_dirs);
+    - the runs repo: no numbers file of this box yet (a box writes its numbers once, before its first study step), and
+      for a box with numbers_from (the replicate) that box's numbers file present and written under this commit's
+      rules (its rules_sha256 = study/PREREG.json's at `sha`)."""
+    import hashlib
+    import tempfile
+
+    from kitsune import prereg
+    from kitsune import study_queue as Q
+
+    problems, notes = [], []
+    rules = prereg.rules()
+    try:
+        plan = Q.box_plan(box, rules)
+        configs = Q.box_configs(box, rules)
+    except (Q.QueueError, KeyError) as e:
+        return [f"box {box}: {e}"], notes
+    for c in configs:
+        try:
+            git("cat-file", "-e", f"{sha}:{c}")
+        except (subprocess.CalledProcessError, OSError):
+            problems.append(f"{c} does not exist at {sha[:12]}: python tools/make_study_configs.py, commit and push")
+    try:
+        pr = json.loads(git_show(sha, f"study/{prereg.RULES_JSON}").decode("utf-8"))
+    except (subprocess.CalledProcessError, OSError, ValueError) as e:
+        return problems + [f"cannot read study/{prereg.RULES_JSON} at {sha[:12]} ({type(e).__name__})"], notes
+    left = prereg.pending(pr)
+    shake = bool(plan.get("shakedown"))
+    if left:
+        msg = (f"study/{prereg.RULES_JSON} at {sha[:12]} has {len(left)} pending field(s) (e.g. {left[:3]}): the "
+               f"filled rules (python -m kitsune.prereg --write study/ --sidecar ...) are committed before a study box")
+        (notes if shake else problems).append(("the shakedown runs on it anyway: " if shake else "") + msg)
+    want = (pr.get("manifest") or {}).get("selection_sha256")
+    try:
+        api, download = _hub()
+        files = api.list_repo_files(data_repo, repo_type="dataset", revision=data_rev)
+        have = set(files)
+        ctc = set(Q.box_ctc_students(box, rules))
+        for s in Q.box_students(box, rules):
+            names = STUDENT_FILES + ((CTC_CARD,) if s in ctc else ())
+            if missing := [n for n in names if f"{s}/{n}" not in have]:
+                problems.append(f"{data_repo}: {s} lacks {missing}: upload the student dir (hf upload {data_repo} "
+                                f". . --repo-type dataset --include '{s}/*')")
+        for d in Q.box_extra_dirs(box, rules):
+            if not any(f.startswith(f"{d}/") for f in files):
+                problems.append(f"{data_repo}: no {d}/ (the box pulls it)")
+        sel = cfg["selection"]
+        if sel in have and want not in (None, prereg.PENDING):
+            info = api.get_paths_info(data_repo, [sel], repo_type="dataset", revision=data_rev)
+            got = _lfs_sha256(info[0]) if info else None
+            if got is None:  # a small file in git, not LFS/Xet: hash it
+                with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+                    got = prereg.file_sha256(download(data_repo, sel, repo_type="dataset", revision=data_rev,
+                                                      local_dir=tmp))
+            if got != want:
+                problems.append(f"{data_repo}@{(data_rev or 'head')[:12]}: {sel} has sha256 {str(got)[:12]}..., "
+                                f"PREREG's manifest.selection_sha256 is {want[:12]}...: the box would train on another "
+                                f"selection than the pre-registered one")
+            else:
+                notes.append(f"selection {sel}: sha256 {got[:12]}... = PREREG's")
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"cannot check the study data in {data_repo}: {type(e).__name__}: {e}")
+    try:
+        api, _ = _hub()
+        mine = f"{Q.NUMBERS_DIR}/{plan['numbers_file']}" if plan.get("numbers_file") else None
+        if mine and api.file_exists(out_repo, mine):
+            problems.append(f"{out_repo} already holds {mine}: box {box} wrote its numbers on an earlier box, and a "
+                            f"box writes them once, before its first study step (a relaunch after that is the owner's "
+                            f"call: see vast/README.md, Size study)")
+        if plan.get("numbers_from"):
+            src = f"{Q.NUMBERS_DIR}/{rules['boxes'][plan['numbers_from']]['numbers_file']}"
+            if not api.file_exists(out_repo, src):
+                problems.append(f"{out_repo} has no {src}: box {box} takes its max_steps and LR from box "
+                                f"{plan['numbers_from']}'s numbers; that box runs first")
+            else:
+                # the numbers are written under the rules of this commit (prereg.write_numbers refuses otherwise, on
+                # the box, after its bootstrap and store build): check here, before anything is rented
+                _, download = _hub()
+                with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+                    src_rules = json.loads(Path(download(out_repo, src, local_dir=tmp)).read_text(
+                        encoding="utf-8")).get("rules_sha256")
+                here = hashlib.sha256(prereg.rules_json(pr)).hexdigest()
+                if src_rules != here:
+                    problems.append(f"{out_repo}/{src} was written under the rules {str(src_rules)[:12]}..., "
+                                    f"study/{prereg.RULES_JSON} at {sha[:12]} is {here[:12]}...: box {box} would take "
+                                    f"box {plan['numbers_from']}'s numbers under other rules (the box refuses them)")
+                else:
+                    notes.append(f"box {box} takes its numbers from {out_repo}/{src} (rules {here[:12]}... = "
+                                 f"this commit's)")
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"cannot check the numbers files in {out_repo}: {type(e).__name__}: {e}")
+    return problems, notes
+
+
 def sanitize_tag(branch: str) -> str:
     """The branch tag docker/metadata-action writes: '/' and other invalid characters become '-'."""
     return re.sub(r"[^A-Za-z0-9_.-]", "-", branch)[:128]
@@ -818,8 +980,12 @@ def sanitize_tag(branch: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--job", choices=sorted(JOBS), default="train",
-                    help="train: the A100 run (default); label: the RTX 5090 label box (vast/label.py)")
+    ap.add_argument("--job", choices=sorted([*JOBS, "study"]), default="train",
+                    help="train: the A100 run (default); label: the RTX 5090 label box (vast/label.py); study: a "
+                         "size-study box (--box; kitsune/study_queue.py)")
+    ap.add_argument("--box", choices=STUDY_BOXES, default=None,
+                    help="study: A (the Cohere runs, 4 GPUs), B (Parakeet + bridge, 4 GPUs), replicate (1 GPU, after "
+                         "A) or shakedown (1 GPU, first)")
     ap.add_argument("--data-repo", required=True, help="private HF dataset with the derived data (KITSUNE_DATA_REPO)")
     ap.add_argument("--out-repo", default=None, help="private HF model repo for runs/ (KITSUNE_OUT_REPO; train only)")
     ap.add_argument("--config", default=None,
@@ -858,13 +1024,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="never create, even with --yes")
     ap.add_argument("--yes", action="store_true", help="actually create the instance (this spends money)")
     args = ap.parse_args(argv)
-    label_job = args.job == "label"
-    job = JOBS[args.job]
+    label_job, study = args.job == "label", args.job == "study"
+    if study and not args.box:
+        ap.error("--job study needs --box (A, B, replicate or shakedown)")
+    job = study_job(args.box) if study else JOBS[args.job]
     if not label_job and not args.out_repo:
         ap.error("the following arguments are required: --out-repo")
     if args.cohere_procs is not None and args.cohere_procs < 1:
         ap.error("--cohere-procs must be >= 1")
-    config = args.config or ("configs/full.json" if label_job else "configs/viability.json")
+    config = args.config or ("configs/full.json" if label_job else STUDY_CONFIG if study else "configs/viability.json")
     label_configs = list(dict.fromkeys([config] + [c for c in args.label_configs.split(",") if c])) \
         if label_job else []
     max_dph = args.max_dph if args.max_dph is not None else job.max_dph
@@ -902,6 +1070,9 @@ def main(argv: list[str] | None = None) -> int:
         if label_job:
             errors.append("--job label needs the HF preflight (it pins KITSUNE_DATA_REVISION and checks the lease): "
                           "drop --no-hf-check")
+        elif study:
+            errors.append("--job study needs the HF preflight (the extent's sizing, the PREREG and selection hashes, "
+                          "the box's students, the numbers files): drop --no-hf-check")
         else:
             try:  # local git only: an extent config's sizing cannot be skipped with the Hub checks
                 # --skip-git-checks: the sha may not be local; the working tree's config is the best guess
@@ -931,9 +1102,23 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 data_rev, problems = hf_preflight(args.data_repo, args.out_repo, cfg)
                 errors += problems
-                if cfg.get("extent"):
-                    problems, sizing = extent_preflight(args.data_repo, data_rev, cfg)
+                extra_gb = 0.0
+                if study:
+                    from kitsune import study_queue
+
+                    try:
+                        extra_gb = study_queue.study_extra_gb(args.box, n_gpus=STUDY_GPUS[args.box])
+                    except (study_queue.QueueError, KeyError) as e:
+                        errors.append(f"box {args.box}: {e}")
+                    problems, pre_notes = study_preflight(args.data_repo, data_rev, args.out_repo, sha, args.box,
+                                                          cfg)
                     errors += problems
+                    notes += pre_notes
+                if cfg.get("extent"):
+                    problems, sizing = extent_preflight(args.data_repo, data_rev, cfg, extra_gb=extra_gb)
+                    errors += problems
+                elif study:
+                    errors.append(f"{config} has no extent: a study box rebuilds the sealed label extent")
     stub = ONSTART.read_bytes()
     if len(stub) > ONSTART_MAX_BYTES:
         errors.append(f"{ONSTART.name} is {len(stub)} bytes (> {ONSTART_MAX_BYTES}): vast may truncate the on-start "
@@ -948,10 +1133,12 @@ def main(argv: list[str] | None = None) -> int:
     max_hours = args.max_hours if args.max_hours is not None else \
         job.max_hours + (sizing["rebuild_timeout_min"] / 60 if sizing else 0)
     if sizing:
+        stores = f" x {sizing['stores']} stores" if sizing.get("stores", 1) > 1 else ""
+        extra = f", checkpoints ~{sizing['extra_gb']:.0f} GB" if sizing.get("extra_gb") else ""
         notes.append(f"extent sizing: ~{sizing['down_gb']:.0f} GB upstream down, shards ~{sizing['shard_gb']:.0f} GB, "
-                     f"selected audio ~{sizing['sel_gb']:.0f} GB, labels ~{sizing['labels_gb']:.1f} GB -> disk "
-                     f"{sizing['disk_gb']} GB, rebuild timeout {sizing['rebuild_timeout_min']} min, max hours "
-                     f"{max_hours:g}")
+                     f"selected audio ~{sizing['sel_gb']:.0f} GB{stores}, labels ~{sizing['labels_gb']:.1f} GB"
+                     f"{extra} -> disk {sizing['disk_gb']} GB, rebuild timeout {sizing['rebuild_timeout_min']} min, "
+                     f"max hours {max_hours:g}")
     for n in notes:
         print(n)
 
@@ -964,6 +1151,11 @@ def main(argv: list[str] | None = None) -> int:
     if label_job:
         env = {"KITSUNE_JOB": "label", "KITSUNE_SHA": sha, "KITSUNE_CONFIG": config,
                "KITSUNE_LABEL_CONFIGS": ",".join(label_configs), "KITSUNE_DATA_REPO": args.data_repo}
+    elif study:
+        # KITSUNE_N_GPUS: the queue refuses to run on another GPU count than the box was rented with
+        env = {"KITSUNE_JOB": "study", "KITSUNE_BOX": args.box, "KITSUNE_N_GPUS": str(STUDY_GPUS[args.box]),
+               "KITSUNE_SHA": sha, "KITSUNE_CONFIG": config, "KITSUNE_DATA_REPO": args.data_repo,
+               "KITSUNE_OUT_REPO": args.out_repo}
     else:
         env = {"KITSUNE_SHA": sha, "KITSUNE_CONFIG": config, "KITSUNE_DATA_REPO": args.data_repo,
                "KITSUNE_OUT_REPO": args.out_repo}
@@ -988,8 +1180,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nsearch ({tier or 'nothing found'}): vastai "
           f"{shlex.join(search_args(query or job_query(job, job.tiers[0][1], disk_gb), disk_gb))}")
     if not offers:
-        errors.append("no offer matches the strict filter (D45a); try again later or relax it by hand" if not label_job
-                      else "no RTX 5090 offer matches the label filter (see the hint above); try again later")
+        errors.append("no RTX 5090 offer matches the label filter (see the hint above); try again later" if label_job
+                      else f"no {STUDY_GPUS[args.box]}x A100 offer matches the study filter; try again later"
+                      if study else "no offer matches the strict filter (D45a); try again later or relax it by hand")
         offer = None
     else:
         print(offer_table(offers, job=job if label_job else None))
@@ -1019,6 +1212,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"expected cost: ~${dph:.3f}/h (GPU + {disk_gb} GB) x ~{job.est_hours:g} h (12-24; cap {max_hours:g} h) "
               f"+ ~{job.est_down_gb:g} GB down x ${down:.3f}/GB + ~{job.est_up_gb:g} GB up x ${up:.3f}/GB "
               f"= ~${est_total(offer, job):.2f} (cap = ~${dph * max_hours + traffic:.2f})")
+    elif offer and study:
+        dph = offer.get("dph_total", 0)
+        down, up = _gb_cost(offer, "inet_down_cost"), _gb_cost(offer, "inet_up_cost")
+        traffic = est_down * down + job.est_up_gb * up
+        print(f"expected cost: ~${dph:.3f}/h ({STUDY_GPUS[args.box]}x A100 + {disk_gb} GB) x ~{job.est_hours:g} h "
+              f"(box {args.box}; watchdog cap {max_hours:g} h) + ~{est_down:.0f} GB down x ${down:.3f}/GB + "
+              f"~{job.est_up_gb:g} GB up x ${up:.3f}/GB = ~${dph * job.est_hours + traffic:.2f} "
+              f"(cap = ~${dph * max_hours + traffic:.2f})")
     elif offer:
         dph = offer.get("dph_total", 0)
         down, up = (offer.get(k) if isinstance(offer.get(k), (int, float)) else None

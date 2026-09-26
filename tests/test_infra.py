@@ -986,7 +986,8 @@ VIAB_CFG ={"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "g
 DATA_FILES = ["teacher_out/meta.json", "second_out/meta.json", "selection/viability.parquet",
               "students/b20x2560-d4/config.json", "students/b20x2560-d4/model.safetensors",
               "students/b20x2560-d4/processor_config.json", "students/b20x2560-d4/tokenizer.json",
-              "students/b20x2560-d4/tokenizer_config.json", "teacher_out/reazon_small/train-00000.npz", "teacher_out/reazon_small/train-00000.jsonl",
+              "students/b20x2560-d4/tokenizer_config.json", "students/b20x2560-d4/student_meta.json",
+              "students/b20x2560-d4/README.md", "teacher_out/reazon_small/train-00000.npz", "teacher_out/reazon_small/train-00000.jsonl",
               "second_out/reazon_small/train-00000.jsonl",
               "teacher_out/galgame/train-00000.npz", "teacher_out/galgame/train-00001.npz",
               "teacher_out/galgame/eval-00000.npz", "second_out/galgame/train-00000.jsonl",
@@ -1031,9 +1032,11 @@ def test_data_problems_need_the_students_processor_and_tokenizer():
     files = [f for f in DATA_FILES if f != "students/b20x2560-d4/tokenizer.json"]
     assert launch.data_problems(files, VIAB_CFG) == ["no students/b20x2560-d4/tokenizer.json"]
     text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
-    box = re.search(r"^STUDENT_FILES = (\(.*\))$", text, re.M)
+    box = re.search(r"^STUDENT_FILES = (\(.*?\))$", text, re.M | re.S)
     assert box and eval(box.group(1)) == launch.STUDENT_FILES
-    assert 'required = [f"{selection}", *(f"{student}/{n}" for n in STUDENT_FILES)]' in text
+    assert "student_meta.json" in launch.STUDENT_FILES and "README.md" in launch.STUDENT_FILES
+    assert 'required = [f"{selection}", *(f for s in students for f in student_files(s))]' in text
+    assert 'return [f"{s}/{n}" for n in STUDENT_FILES + ((CTC_CARD,) if s in ctc_students else ())]' in text
 
 
 SEL_CFG = dict(VIAB_CFG, selection_recipe={"agree_max": 0.5, "agree_max_source": ["galgame=0.4"],

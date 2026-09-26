@@ -45,9 +45,19 @@ Contract with scripts/04_distill.py: CLI `--config <json> [--set hf.output_repo=
 0 ok / 3 throughput too low / anything else failure; it writes runs/<run_id>/config.json at start,
 runs/<run_id>/metrics/scalars.jsonl rows {"step": ...}, and full states as runs/<run_id>/checkpoints/full_step_<N>[.ext].
 
+The study box (KITSUNE_JOB=study, vast/launch.py --job study): the supervisor runs the box's queue
+(`python -m kitsune.study_queue run --box $KITSUNE_BOX`, kitsune/study_queue.py) instead of one trainer, with its own
+policy (decide_queue): exit 0 -> finish.py --destroy (lean: KITSUNE_JOB=study); exit 4 (a pre-registered halt: the
+calibration still loader-bound, an LR edge after its extension, refused numbers) and exit 3 (a trainer's throughput
+floor) -> --stop; any other exit, or a container restart during the queue, -> the queue again (it resumes from its
+state file: finished items skipped, runs resumed from their local full states) up to MAX_QUEUE_RESTARTS times, then
+--stop. The queue resumes its runs itself; the supervisor restarts only the queue. Same history file, lock, bounded
+final finish and halt-marker handling as the trainer path.
+
 Usage (started by vast/onstart.sh; KITSUNE_CONFIG / KITSUNE_OUT_REPO come from the instance env):
   python vast/supervise.py
   python vast/supervise.py --dry-run --train-cmd "python -c 'import sys; sys.exit(3)'"   # exercise the policy locally
+  KITSUNE_JOB=study KITSUNE_BOX=A python vast/supervise.py                               # the study box's queue
 """
 import argparse
 import json
@@ -63,7 +73,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from finish import FULL_RE, newest_checkpoint  # noqa: E402
 
-EXIT_OK, EXIT_THROUGHPUT = 0, 3
+EXIT_OK, EXIT_THROUGHPUT, EXIT_HALT = 0, 3, 4  # EXIT_HALT: kitsune.study_queue's pre-registered halt
+MAX_QUEUE_RESTARTS = 2  # the study queue: restarted after a crash at most this often, then the box stops
 MIN_RESUME_STEP = 100
 MAX_FAILURES = 2
 SYNC_TIMEOUT_S = 1800
@@ -96,6 +107,81 @@ def decide(rc: int | None, step: int, n_failures: int, full_state: Path | None,
     if full_state is None:
         return "stop", f"failed at step {step} ({what}) with no local full state to resume from"
     return "resume", f"first failure ({what}) at step {step}; resuming from {full_state.name}"
+
+
+def decide_queue(rc: int | None, n_failures: int, reason: str | None = None) -> tuple[str, str]:
+    """The study queue's policy -> (action, reason), action in {"destroy", "stop", "restart"}. rc None = the queue was
+    interrupted by a container restart; reason = its queue_summary.json's (a halt says why)."""
+    if rc == EXIT_OK:
+        return "destroy", "study queue finished (exit 0)"
+    if rc == EXIT_HALT:
+        return "stop", f"study queue halted by a pre-registered rule: {reason or 'see queue_summary.json'}"
+    if rc == EXIT_THROUGHPUT:
+        return "stop", f"study queue: throughput below the floor (exit 3): {reason or ''}".rstrip(": ")
+    what = "interrupted by a container restart" if rc is None else f"exit {rc}"
+    if n_failures > MAX_QUEUE_RESTARTS:
+        return "stop", f"study queue failed {n_failures} times ({what}): {reason or 'see queue_summary.json'}"
+    return "restart", f"study queue failed ({what}); restarting it (it resumes from its state)"
+
+
+def queue_reason(state_dir: Path) -> str | None:
+    try:
+        return json.loads((state_dir / "queue_summary.json").read_text(encoding="utf-8")).get("reason")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = False) -> int:
+    """The study box: run the queue, restart it after a failure (decide_queue), then the final finish.py call. The
+    history (attempts with rc, the final decision) and its crash handling are the trainer path's (supervise)."""
+    lock = acquire_lock(state_path.with_suffix(".lock"))
+    if lock is None:
+        log(f"another supervisor holds {state_path.with_suffix('.lock')}; not starting a second one")
+        return 0
+    state = load_state(state_path)
+    dry = ["--dry-run"] if dry_run else []
+    aside = state.pop("corrupt", None)
+    if aside:
+        reason = f"supervise.json unreadable (moved to {aside}); attempt history unknown"
+        state["final"] = {"action": "stop", "reason": reason, "wall": time.time(), "corrupt_state": aside}
+        save_state(state_path, state)
+        log(f"decision: stop ({reason})")
+        final_finish("stop", reason, dry)
+        return 1
+    final = state.get("final")
+    if final:
+        log(f"a final decision is already recorded ({final}); not starting the queue again")
+        if not state_path.with_name("halt").exists():
+            log("no halt marker: the container restarted before finish acted on that decision; running it again")
+            final_finish(final["action"], final.get("reason", ""), dry)
+        return 0
+    for a in state["attempts"]:
+        if "rc" not in a:  # the container died while the queue ran
+            a.update(rc=None, interrupted=True)
+    while True:
+        if state["attempts"]:
+            last = state["attempts"][-1]
+            failures = sum(1 for a in state["attempts"] if a["rc"] != EXIT_OK)
+            action, reason = decide_queue(last["rc"], failures, queue_reason(state_path.parent))
+            log(f"decision after queue attempt {len(state['attempts'])}: {action} ({reason})")
+            if action != "restart":
+                state["final"] = {"action": action, "reason": reason, "wall": time.time()}
+                save_state(state_path, state)
+                final_finish(action, reason, dry)
+                return last["rc"] if last["rc"] is not None else 1
+        attempt = {"t0": time.time(), "queue": True}
+        state["attempts"].append(attempt)
+        save_state(state_path, state)
+        env = dict(os.environ, KITSUNE_ATTEMPT=str(len(state["attempts"])))
+        oom0 = oom_kills()
+        rc = run_trainer(queue_cmd, env)
+        oom1 = oom_kills()
+        attempt.update(rc=rc, t1=time.time(),
+                       oom_kills=oom1 - oom0 if oom0 is not None and oom1 is not None else None)
+        save_state(state_path, state)
+        log(f"queue attempt {len(state['attempts'])} exited {rc} after {(attempt['t1'] - attempt['t0']) / 60:.1f} min")
+        if rc not in (EXIT_OK, EXIT_HALT, EXIT_THROUGHPUT):  # the stop path syncs everything anyway
+            call_finish(["--sync-only", *dry], timeout=SYNC_TIMEOUT_S)
 
 
 def find_run_dir(runs_root: Path, since: float) -> Path | None:
@@ -357,8 +443,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--state", default=str(Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state")) / "supervise.json"))
     ap.add_argument("--train-cmd", default=None, help="override the trainer command (default: python scripts/04_distill.py)")
     ap.add_argument("--dry-run", action="store_true", help="run the trainer, but finish.py only prints (no stop/destroy)")
+    ap.add_argument("--queue", action="store_true", default=os.environ.get("KITSUNE_JOB") == "study",
+                    help="the study box: run kitsune.study_queue for KITSUNE_BOX (default when KITSUNE_JOB=study)")
     args = ap.parse_args(argv)
 
+    if args.queue:
+        box = os.environ.get("KITSUNE_BOX") or ""
+        queue_cmd = shlex.split(args.train_cmd) if args.train_cmd else [sys.executable, "-m", "kitsune.study_queue",
+                                                                         "run", "--box", box]
+        log(f"study queue: box={box} out_repo={args.out_repo} state={args.state} dry_run={args.dry_run}")
+        return supervise_queue(queue_cmd, Path(args.state), args.dry_run)
     train_cmd = shlex.split(args.train_cmd) if args.train_cmd else [sys.executable, str(ROOT / "scripts" / "04_distill.py")]
     log(f"config={args.config} out_repo={args.out_repo} state={args.state} dry_run={args.dry_run}")
     return supervise(args.config, args.out_repo, Path(args.runs_root), train_cmd, Path(args.state), args.dry_run)

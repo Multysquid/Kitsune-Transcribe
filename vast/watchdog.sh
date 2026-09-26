@@ -16,6 +16,10 @@
 # does, it fires at 2 x ORPHAN_S. A halt marker (finish.py has taken over) disables it. ORPHAN_S=0 (the train job)
 # leaves the watchdog exactly as it was.
 #
+# Study box (KITSUNE_JOB=study): the same cap, per box (vast/launch.py STUDY_HOURS plus the rebuild timeout); its syncs
+# are lean (finish.py reads KITSUNE_JOB: logs, weights and the uploaded full states of every run dir, never the resume
+# states), and the queue's trainers stop with the instance.
+#
 # Usage: vast/watchdog.sh            (loop until the deadline)
 #        vast/watchdog.sh --dry-run  (print the deadline and the planned actions, then exit)
 set -euo pipefail

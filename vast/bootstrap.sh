@@ -28,7 +28,13 @@
 # Extent mode (a run config with an "extent" block, labels from the label box under <extent root>/, e.g. labels/full):
 # the plan requires <root>/COMPLETE.json and <root>/extent.json in the listing (else it refuses, exit 3), downloads the
 # record into $KITSUNE_STATE and asks kitsune.extent.pull_plan for exactly the extent's label files: directory globs for
-# an uncapped source, explicit <stem>.npz/.jsonl files for a capped one (a prefix of a big source), never parakeet_out.
+# an uncapped source, explicit <stem>.npz/.jsonl files for a capped one (a prefix of a big source), parakeet_out only
+# for a CTC student or with pull_parakeet (the size study pulls both label roots).
+#
+# Study box (KITSUNE_JOB=study, KITSUNE_BOX=A|B|replicate|shakedown; KITSUNE_CONFIG is study/data.json, the data block,
+# which names no student): the students pulled are the box's own (kitsune.study_queue.box_students), each with
+# STUDENT_FILES and, for a Parakeet-derived one, its CC-BY-4.0 MODEL_CARD.md; plus box_extra_dirs (the Parakeet
+# teacher for the speed probes).
 # The rebuild is `01 --extent-config $KITSUNE_CONFIG`, the canonical ingest sequence the label box ran, so the ids and
 # stems are the labelled ones (KITSUNE_PREP_ARGS is ignored), and coverage is exact: every pulled stem's rebuilt id
 # sidecar hashes to the record's ids_sha256, its teacher ids are a subset of its ids, and every split joins at 1.0.
@@ -118,9 +124,27 @@ teacher_root = cfg.get("teacher_root", "teacher_out")
 second_root = cfg.get("second_root", "second_out")
 data_root = cfg.get("data_root", "data")
 selection = cfg["selection"]
-student = cfg["student"].rstrip("/")
-# the student dir files the trainer loads (it has no processor fallback): the same list as vast/launch.py STUDENT_FILES
-STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json")
+# the student dir files the trainer loads (it has no processor fallback; it reads student_meta.json, and README.md is
+# the model card with the modification notice): the same list as vast/launch.py STUDENT_FILES
+STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json",
+                 "student_meta.json", "README.md")
+CTC_CARD = "MODEL_CARD.md"  # a Parakeet-derived student's CC-BY-4.0 attribution (kitsune.ctc_student)
+if os.environ.get("KITSUNE_JOB") == "study":
+    # a size-study box (kitsune/study_queue.py): the data block has no student; the box pulls the student dirs of its
+    # own runs only (box_students), with the Parakeet students' attribution card, and any other dir it needs
+    sys.path.insert(0, str(root))
+    from kitsune import study_queue as _q
+    _box = os.environ["KITSUNE_BOX"]
+    students = _q.box_students(_box)
+    ctc_students = set(_q.box_ctc_students(_box))
+    extra_dirs = _q.box_extra_dirs(_box)
+else:
+    students, ctc_students, extra_dirs = [cfg["student"].rstrip("/")], set(), []
+student = students[0] if students else ""
+
+
+def student_files(s: str) -> list:
+    return [f"{s}/{n}" for n in STUDENT_FILES + ((CTC_CARD,) if s in ctc_students else ())]
 plan_path = state / "bootstrap_plan.json"
 NO_RETRY = 3  # the exit code bootstrap's retry() does not repeat: the Hub would refuse again
 
@@ -174,8 +198,8 @@ def plan():
     def has(pat: str) -> bool:
         return any(fnmatch.fnmatch(f, pat) for f in files)
 
-    patterns = [f"{teacher_root}/meta.json", f"{second_root}/meta.json", selection, f"{student}/*"]
-    required = [f"{selection}", *(f"{student}/{n}" for n in STUDENT_FILES)]
+    patterns = [f"{teacher_root}/meta.json", f"{second_root}/meta.json", selection, *(f"{s}/*" for s in students)]
+    required = [f"{selection}", *(f for s in students for f in student_files(s))]
     for s in names:
         patterns += [f"{teacher_root}/{s}/*", f"{second_root}/{s}/*"]
         required.append(f"{teacher_root}/{s}/*.npz")
@@ -229,9 +253,12 @@ def plan_extent(files: list):
     p = pull_plan(cfg, load_record(path), files)
     problems = list(p["problems"])
     have = set(files)
-    problems += [f"no {student}/{n}" for n in STUDENT_FILES if f"{student}/{n}" not in have]
+    problems += [f"no {f}" for s in students for f in student_files(s) if f not in have]
+    problems += [f"no {d}/*" for d in extra_dirs if not any(f.startswith(f"{d}/") for f in files)]
     if problems:
         refuse(f"data repo {repo}@{rev} cannot serve extent {cfg['extent'].get('name')!r}: {problems}")
+    # a study box's students (pull_plan pulls the config's one student, and the data block has none) and other dirs
+    p["dir_patterns"] += [f"{d}/*" for d in [*students, *extra_dirs] if f"{d}/*" not in p["dir_patterns"]]
     # the files the pull must leave on disk: the globs by snapshot_download's own matcher, plus the explicit files
     want = list(dict.fromkeys([*filter_repo_objects(files, allow_patterns=p["dir_patterns"]), *p["explicit"]]))
     rebuild = extent_names(cfg)
@@ -294,7 +321,7 @@ def pull():
     if missing:
         sys.exit(f"pull incomplete: {len(missing)} of {len(p['files'])} planned files missing, e.g. {missing[:3]}")
     register_parked(p["parked"])
-    dirs = [root / d for d in (teacher_root, second_root, student, f"{data_root}/shards") if (root / d).is_dir()]
+    dirs = [root / d for d in (teacher_root, second_root, *students, f"{data_root}/shards") if (root / d).is_dir()]
     size = sum(f.stat().st_size for d in dirs for f in d.rglob("*") if f.is_file())
     print(f"pulled in {time.time() - t0:.0f} s; derived data + parked shards on disk: {size / 1e9:.2f} GB")
 
