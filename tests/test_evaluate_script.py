@@ -93,7 +93,7 @@ def env(tmp_path_factory):
     common = {
         "run_name": "tiny-eval", "sources": ["src_a", "src_b"], "eval_sets": SETS, "device": "cpu", "autocast": "none",
         "optim": {"lr": 0.0},  # the weights stay the student init's bf16 values: the checkpoint holds them exactly
-        "schedule": {"warmup_steps": 1, "cooldown_frac": 0.3, "clock": "steps", "max_steps": 1},
+        "schedule": {"warmup_steps": 0, "cooldown_frac": 0.3, "clock": "steps", "max_steps": 1},
         "batch": {"step_audio_s": 6, "micro_audio_s": 3, "pool_micro": 4},
         "perf": {"num_workers": 0, "prefetch": 2, "tf32": False},
         # greedy_subset 3 of the 4 in_greedy_subset rows: the seeded draw of greedy_subset_ids; full_every_epochs:
@@ -239,7 +239,7 @@ def test_verdict_v2_is_the_trainers_too(env, tmp_path):
     assert m.main(["--config", str(path)]) == 0
     (run,) = list((env["root"] / "runs").glob("tiny-eval-v2-*"))
     ckpt = run / "checkpoints" / "step_1"
-    assert S.load_meta(ckpt)["trained"]["lr_phase"] == "stable"  # warmup_steps 1: step 1 is at the peak LR
+    assert S.load_meta(ckpt)["trained"]["lr_phase"] == "stable"  # warmup_steps 0: step 1 is at the peak LR
     got = load(run / "evals" / "step_1" / "verdict.json")
     assert got["version"] == 2 and "version" not in load(env["run"] / "evals" / "step_1" / "verdict.json")
     assert summary_history(run)[-1]["lr_phase"] == "stable" and "greedy_full" in summary_history(run)[-1]

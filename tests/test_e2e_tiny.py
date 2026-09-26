@@ -764,7 +764,8 @@ def test_undecodable_eval_rows_are_reported_and_named_in_the_verdict(env, hub, m
     monkeypatch.setattr(trainset.AudioBatchDataset, "audio_bytes",
                         lambda self, i: b"not audio" if self.ids[i] == bad else real_bytes(self, i))
     assert m.main(["--config", str(env["config"]), "--set", "run_name=tiny-evaldrop", "--set", "smoke.enabled=false",
-                   "--set", "schedule.max_steps=2", "--set", "eval.every_steps=1000", "--set", "hf.output_repo=null",
+                   "--set", "schedule.max_steps=2", "--set", "schedule.warmup_steps=1",  # ends before the cooldown
+                   "--set", "eval.every_steps=1000", "--set", "hf.output_repo=null",
                    "--set", "ckpt.weights_every_steps=1000", "--set", "ckpt.full_every_steps=1000"]) == 0
     run = next((env["root"] / "runs").glob("tiny-evaldrop-*"))
     drops = [e for e in events(run) if e["kind"] == "eval_dropped_audio"]
@@ -794,7 +795,8 @@ def test_skipped_steps_and_dropped_audio_are_logged_with_ids(env, hub, monkeypat
     monkeypatch.setattr(m, "train_step", train_step)
     monkeypatch.setattr(m, "kd_objective", lambda *a: orig_obj(*a) * (float("nan") if seen["nan"] else 1.0))
     assert m.main(["--config", str(env["config"]), "--set", "run_name=tiny-skip", "--set", "smoke.enabled=false",
-                   "--set", "schedule.max_steps=4", "--set", "eval.every_steps=1000", "--set", "hf.output_repo=null",
+                   "--set", "schedule.max_steps=4", "--set", "schedule.warmup_steps=2",  # ends before the cooldown
+                   "--set", "eval.every_steps=1000", "--set", "hf.output_repo=null",
                    "--set", "ckpt.weights_every_steps=1000", "--set", "ckpt.full_every_steps=1000",
                    "--set", "eval.final_full_greedy=false"]) == 0
     run = next((env["root"] / "runs").glob("tiny-skip-*"))
