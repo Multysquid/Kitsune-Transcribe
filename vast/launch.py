@@ -39,8 +39,10 @@ study"): the relaxed per-launch filter (study_filter: 4 GPUs for A and B, 1 for 
 A100 40 GB then 80 GB, reliability >= STUDY_RELIABILITY), the box's hours (STUDY_HOURS) as its cap, the disk from the
 extent's sizing with both label stores and the box's checkpoints (study_queue.study_extra_gb), and study_preflight's
 refusals: a PREREG with pending fields (not for the shakedown), a selection whose sha256 is not PREREG's, a student of
-the box missing a file, a config of the box not committed, a numbers file of the box already written (or, for the
-replicate, box A's missing or written under other rules); the queue's GPU count goes along (KITSUNE_N_GPUS):
+the box missing a file or not the registered build (kitsune.prereg.student_problems on its student_meta.json), a config
+of the box not committed, a numbers file of the box already written under other rules than the commit's (under the
+same rules a relaunched box reuses it), for the replicate box A's missing or written under other rules; the queue's GPU
+count goes along (KITSUNE_N_GPUS). Boxes A and B may be live at the same time: nothing here refuses a second box:
   python vast/launch.py --job study --box A --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs \\
       --image-tag main                                                                        # look only
 Needs the vastai CLI (`pip install vastai==1.8.0`, then `vastai set api-key <key>`); --help works without it.
@@ -882,9 +884,15 @@ def study_preflight(data_repo: str, data_rev: str | None, out_repo: str, sha: st
       in the data repo (its Hub sha256 at the pinned revision) equal to PREREG's manifest.selection_sha256;
     - the box's students, and only those it pulls (study_queue.box_students), each with STUDENT_FILES and a
       Parakeet-derived one with CTC_CARD, its CC-BY-4.0 attribution; the other dirs it pulls (box_extra_dirs);
-    - the runs repo: no numbers file of this box yet (a box writes its numbers once, before its first study step), and
-      for a box with numbers_from (the replicate) that box's numbers file present and written under this commit's
-      rules (its rules_sha256 = study/PREREG.json's at `sha`)."""
+    - each of those students the registered build: kitsune.prereg.student_problems on its student_meta.json in the data
+      repo (study_queue.student_checks: stage, family, init class, seed, the exact parameter counts, a pruned
+      student's calibration ids); bootstrap.sh checks the pulled copies again;
+    - the runs repo: this box's numbers file, if it is there already (a relaunch), written under this commit's rules
+      (the box then reuses it: numbers are written once, before a box's first study step), and for a box with
+      numbers_from (the replicate) that box's numbers file present and written under this commit's rules (its
+      rules_sha256 = study/PREREG.json's at `sha`).
+    Nothing here looks at other live boxes: boxes A and B run at the same time (CONTRACT.md 8), each with its own run
+    ids, queue summary and numbers file in the one runs repo."""
     import hashlib
     import tempfile
 
@@ -927,6 +935,18 @@ def study_preflight(data_repo: str, data_rev: str | None, out_repo: str, sha: st
         for d in Q.box_extra_dirs(box, rules):
             if not any(f.startswith(f"{d}/") for f in files):
                 problems.append(f"{data_repo}: no {d}/ (the box pulls it)")
+        # each student is the registered build (kitsune.prereg.student_problems on the data repo's student_meta.json:
+        # counts, seed, init class, a pruned student's calibration ids): a stale upload is refused before renting
+        with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+            def read_meta(s: str) -> dict:
+                return json.loads(Path(download(data_repo, f"{s}/student_meta.json", repo_type="dataset",
+                                                revision=data_rev, local_dir=tmp)).read_text(encoding="utf-8"))
+
+            bad = Q.student_checks(box, read_meta, rules)
+        problems += [f"{data_repo}: {p}" for p in bad]
+        if not bad:
+            notes.append(f"box {box}'s {len(Q.box_students(box, rules))} student(s) are the registered builds "
+                         f"(kitsune.prereg.student_problems)")
         sel = cfg["selection"]
         if sel in have and want not in (None, prereg.PENDING):
             info = api.get_paths_info(data_repo, [sel], repo_type="dataset", revision=data_rev)
@@ -945,11 +965,23 @@ def study_preflight(data_repo: str, data_rev: str | None, out_repo: str, sha: st
         problems.append(f"cannot check the study data in {data_repo}: {type(e).__name__}: {e}")
     try:
         api, _ = _hub()
+        here = hashlib.sha256(prereg.rules_json(pr)).hexdigest()
         mine = f"{Q.NUMBERS_DIR}/{plan['numbers_file']}" if plan.get("numbers_file") else None
         if mine and api.file_exists(out_repo, mine):
-            problems.append(f"{out_repo} already holds {mine}: box {box} wrote its numbers on an earlier box, and a "
-                            f"box writes them once, before its first study step (a relaunch after that is the owner's "
-                            f"call: see vast/README.md, Size study)")
+            # a relaunch: the numbers are write-once, and the box reuses them (study_queue adopt_numbers: no second
+            # calibration, no probes) - only under the rules they were written under, which the box checks again
+            _, download = _hub()
+            with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+                got = json.loads(Path(download(out_repo, mine, local_dir=tmp)).read_text(encoding="utf-8"))
+            if got.get("rules_sha256") != here:
+                problems.append(f"{out_repo}/{mine} was written under the rules "
+                                f"{str(got.get('rules_sha256'))[:12]}..., study/{prereg.RULES_JSON} at {sha[:12]} is "
+                                f"{here[:12]}...: a relaunched box {box} "
+                                f"reuses its numbers only under the rules they were written under (it never writes "
+                                f"them twice); relaunch from the commit they were written at")
+            else:
+                notes.append(f"relaunch: {out_repo}/{mine} is there (rules {here[:12]}... = this commit's): box {box} "
+                             f"REUSES it and skips its calibration and probes")
         if plan.get("numbers_from"):
             src = f"{Q.NUMBERS_DIR}/{rules['boxes'][plan['numbers_from']]['numbers_file']}"
             if not api.file_exists(out_repo, src):
@@ -962,7 +994,6 @@ def study_preflight(data_repo: str, data_rev: str | None, out_repo: str, sha: st
                 with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
                     src_rules = json.loads(Path(download(out_repo, src, local_dir=tmp)).read_text(
                         encoding="utf-8")).get("rules_sha256")
-                here = hashlib.sha256(prereg.rules_json(pr)).hexdigest()
                 if src_rules != here:
                     problems.append(f"{out_repo}/{src} was written under the rules {str(src_rules)[:12]}..., "
                                     f"study/{prereg.RULES_JSON} at {sha[:12]} is {here[:12]}...: box {box} would take "

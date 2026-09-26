@@ -1,7 +1,9 @@
 """The size study's box on vast (vast/launch.py --job study, bootstrap.sh, supervise.py, finish.py, kitsune.extent's
 sizing): the relaxed per-launch host filter and GPU count per box, the disk with both label stores and the box's
 checkpoints, the refusals before renting (a pending PREREG, a selection hash that is not PREREG's, a student file or a
-config missing, numbers already written), the box's students pulled and only those, the queue supervised (restarted
+config missing, a student that is not the registered build, a relaunch's numbers written under other rules; the same
+rules: reused), box B rented while box A is live, the box's students pulled and only those and checked again after the
+pull, the queue supervised (restarted
 after a crash, stopped on a pre-registered halt, destroyed once done), the lean uploads and the Hub back-off. No
 network, no vastai CLI, no GPU.
 """
@@ -150,6 +152,23 @@ def test_launch_study_refuses_what_its_preflight_finds(study_launch, monkeypatch
     assert not any(c[1:3] == ["create", "instance"] for c in fake.calls)
 
 
+def test_launch_rents_box_b_while_box_a_is_live(study_launch, capsys):
+    """CONTRACT.md 8: boxes A and B run at the same time. launch.py never looks for other live boxes for a study job
+    (no lease, no `vastai show instances`; FakeVastai fails on any call but search and create): box B rents right after
+    box A, from the same commit, with its own box, label and GPU count."""
+    envs, labels = {}, {}
+    for name in ("A", "B"):
+        rc, fake, _ = study_launch([OFFERS_4X], "--box", name, "--yes")
+        assert rc == 0, capsys.readouterr().out
+        assert [c[1:3] for c in fake.calls] == [["search", "offers"], ["create", "instance"]]
+        create = fake.calls[-1]
+        envs[name], labels[name] = env_of(create), create[create.index("--label") + 1]
+    assert envs["A"]["KITSUNE_BOX"] == "A" and envs["B"]["KITSUNE_BOX"] == "B"
+    assert envs["A"]["KITSUNE_SHA"] == envs["B"]["KITSUNE_SHA"] == SHA
+    assert envs["A"]["KITSUNE_OUT_REPO"] == envs["B"]["KITSUNE_OUT_REPO"]  # one runs repo for both
+    assert labels["A"] != labels["B"] and labels["B"].startswith("kitsune-study-B-")
+
+
 # ------------------------------------------------------------------------------------------------ study_preflight
 
 
@@ -179,23 +198,47 @@ def data_files(rules: dict, boxes=("A", "B", "replicate", "shakedown"), sel_sha=
     return files
 
 
+def registered_meta(run: str) -> dict:
+    """A student_meta.json that is the build kitsune.prereg registers for `run` (what 03 / 03c write, in the keys
+    student_problems reads)."""
+    spec = prereg.RUNS[run]
+    meta = {k: spec[k] for k in ("family", "init_class", "seed", "params_total", "params_non_embedding")}
+    meta.update(stage="complete", closed_form_params=spec["params_total"])
+    if spec["init_class"] != "scratch":
+        key = "importance_ids_sha256" if spec["family"] == "aed" else "ids_sha256"
+        meta["calibration"] = {key: spec["calib_ids_sha256"]}
+    return meta
+
+
+def registered_metas() -> dict:
+    return {spec["student"]: registered_meta(run) for run, spec in prereg.RUNS.items()}
+
+
 @pytest.fixture
 def preflight(monkeypatch, tmp_path):
     rules = study_rules()
 
-    def go(box_name, *, files=None, runs=(), prereg_json=None, missing_configs=(), numbers_rules=None):
-        """numbers_rules: the rules_sha256 in the runs repo's numbers files (default: this PREREG's)."""
+    def go(box_name, *, files=None, runs=(), prereg_json=None, missing_configs=(), numbers_rules=None, metas=None):
+        """numbers_rules: the rules_sha256 in the runs repo's numbers files (default: this PREREG's); metas: student
+        dir -> its student_meta.json in the data repo (default: every student the registered build)."""
         pr = prereg_json if prereg_json is not None else dict(prereg.rules(), manifest=dict(
             prereg.rules()["manifest"], selection_sha256="ab" * 32))
         if prereg_json is None:  # a filled PREREG: nothing pending
             pr = json.loads(json.dumps(pr).replace('"pending"', '"x"'))
         hub = PreflightHub(files if files is not None else data_files(rules), set(runs))
         here = hashlib.sha256(prereg.rules_json(pr)).hexdigest()
+        student_metas = dict(registered_metas(), **(metas or {}))
 
         def download(repo, path, repo_type=None, revision=None, local_dir=None):
-            assert repo == "Multy123/kitsune-runs" and path in runs, (repo, path)
             p = Path(local_dir) / path
             p.parent.mkdir(parents=True, exist_ok=True)
+            if repo == "Multy123/kitsune-data" and path.endswith("/student_meta.json"):
+                assert repo_type == "dataset" and revision == "d" * 40
+                if student_metas.get(path.rsplit("/", 1)[0]) is None:
+                    raise FileNotFoundError(f"404: {path}")
+                p.write_text(json.dumps(student_metas[path.rsplit("/", 1)[0]]), encoding="utf-8")
+                return str(p)
+            assert repo == "Multy123/kitsune-runs" and path in runs, (repo, path)
             p.write_text(json.dumps({"box": "A", "rules_sha256": numbers_rules or here}), encoding="utf-8")
             return str(p)
 
@@ -217,8 +260,32 @@ def test_study_preflight_passes_a_ready_box(preflight):
     go, rules = preflight
     problems, notes = go("A")
     assert problems == [] and any("= PREREG's" in n for n in notes)
+    assert any("registered builds" in n for n in notes)
     problems, notes = go("replicate", runs={"study/PREREG_numbers_A.json"})
     assert problems == [] and any("takes its numbers" in n for n in notes)
+    # a relaunched box A: its numbers are there, written under this commit's rules - it reuses them, not a refusal
+    problems, notes = go("A", runs={"study/PREREG_numbers_A.json"})
+    assert problems == [] and any("REUSES" in n for n in notes)
+
+
+def test_study_preflight_checks_every_student_of_the_box_against_the_rules(preflight):
+    """kitsune.prereg.student_problems on the data repo's student_meta.json of each student the box pulls, before
+    renting: a stale build (the B10 T-0.3B of 320.75M params, a P student ranked on re-drawn calibration ids) or a
+    missing meta refuses; another box's stale student does not."""
+    go, rules = preflight
+    stale_t03 = dict(registered_meta("study-t03"), params_total=320_750_000)
+    problems, _ = go("A", metas={"students/study/t03": stale_t03})
+    assert any("students/study/t03" in p and "params_total" in p for p in problems)
+    assert go("B", metas={"students/study/t03": stale_t03})[0] == []  # box B does not pull t03
+    redrawn = registered_meta("study-p01")
+    redrawn["calibration"] = {"ids_sha256": "b06deb35" * 8}
+    problems, _ = go("B", metas={"students/study/p01": redrawn})
+    assert any("students/study/p01" in p and "calibration ids" in p for p in problems)
+    problems, _ = go("A", metas={"students/study/t06": None})
+    assert any("students/study/t06/student_meta.json: cannot read it" in p for p in problems)
+    seed = dict(registered_meta(prereg.REPLICATE), seed=1234)  # the replicate's own seed is 1235
+    assert any("seed" in p for p in go("replicate", runs={"study/PREREG_numbers_A.json"},
+                                       metas={prereg.RUNS[prereg.REPLICATE]["student"]: seed})[0])
 
 
 def test_study_preflight_refusals(preflight):
@@ -236,8 +303,9 @@ def test_study_preflight_refusals(preflight):
     del files["students/study/p03/MODEL_CARD.md"]
     assert any("p03 lacks ['MODEL_CARD.md']" in p for p in go("B", files=files)[0])
     assert not any("p03" in p for p in go("A", files=files)[0])  # box A does not pull the Parakeet students
-    assert any("already holds study/PREREG_numbers_A.json" in p
-               for p in go("A", runs={"study/PREREG_numbers_A.json"})[0])
+    # a relaunch whose numbers were written under other rules: the box would refuse them after its boot
+    assert any("a relaunched box A reuses its numbers only under the rules" in p
+               for p in go("A", runs={"study/PREREG_numbers_A.json"}, numbers_rules="0" * 64)[0])
     assert any("has no study/PREREG_numbers_A.json" in p for p in go("replicate")[0])
     # box A's numbers written under other rules than this commit's: the replicate box would refuse them after its boot
     assert any("written under the rules" in p
@@ -298,6 +366,39 @@ def test_bootstrap_study_pulls_both_label_roots_and_only_the_boxs_students(tmp_p
     (boxmod.remote_dir / "students/study/p01/MODEL_CARD.md").unlink()
     r = boxmod.helper("plan", KITSUNE_JOB="study", KITSUNE_BOX="B")
     assert r.returncode == 3 and "students/study/p01/MODEL_CARD.md" in r.stderr
+
+
+def test_bootstrap_checks_the_pulled_students_before_the_audio_rebuild(tmp_path):
+    """bootstrap.sh runs `python -m kitsune.study_queue check-students` for a study box after the pull and before the
+    audio rebuild; the command passes the registered builds and exits 2 on a stale one (a pruned student on other
+    calibration ids, a missing meta)."""
+    text = (ROOT / "vast" / "bootstrap.sh").read_text(encoding="utf-8")
+    pull, check = text.index("phase pull_derived"), text.index("phase check_students")
+    assert pull < check < text.index("phase rebuild_audio")
+    assert 'if [ "${KITSUNE_JOB:-}" = "study" ]' in text[pull:check]
+    assert '--box "$KITSUNE_BOX" --root "$KITSUNE_DIR"' in text[check:check + 200]
+
+    def cli(box_name: str, metas: dict) -> subprocess.CompletedProcess:
+        root = tmp_path / f"root-{box_name}-{len(list(tmp_path.iterdir()))}"
+        for s, meta in metas.items():
+            if meta is not None:
+                (root / s).mkdir(parents=True, exist_ok=True)
+                (root / s / "student_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        root.mkdir(parents=True, exist_ok=True)
+        return subprocess.run([sys.executable, "-m", "kitsune.study_queue", "check-students", "--box", box_name,
+                               "--root", str(root)], cwd=str(ROOT), capture_output=True, text=True, timeout=120,
+                              env=dict(os.environ, CUDA_VISIBLE_DEVICES="-1"))
+
+    for b in ("A", "B", "replicate", "shakedown"):
+        r = cli(b, registered_metas())
+        assert r.returncode == 0, r.stdout + r.stderr
+    bad = dict(registered_metas())
+    bad["students/study/p03"] = dict(bad["students/study/p03"], calibration={"ids_sha256": "b06deb35" * 8})
+    r = cli("B", bad)
+    assert r.returncode == 2 and "students/study/p03" in r.stdout + r.stderr
+    assert cli("A", bad).returncode == 0  # box A does not pull p03
+    r = cli("A", dict(registered_metas(), **{"students/study/t005": None}))
+    assert r.returncode == 2 and "t005/student_meta.json: cannot read it" in r.stdout + r.stderr
 
 
 def _make_box(tmp_path, tb, rules):
