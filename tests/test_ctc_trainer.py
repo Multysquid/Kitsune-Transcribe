@@ -481,7 +481,8 @@ def test_gradient_checkpointing_gives_the_same_gradients(env):
 # kept full state at 40 % (the T/2 branch's), weights at 50 %, histograms and layer stats, the final eval and verdict
 REF_OVER = {"smoke": {"enabled": True, "steps": 3, "min_audio_s_per_s": 0, "require_loss_decrease": False,
                       "pad_utts": 4, "decode_per_set": 2},
-            "eval": {"full_at_fracs": [0.5], "mini": {"every_steps": 5, "val_per_set": 2, "train_utts": 3}},
+            "eval": {"full_at_fracs": [0.5], "mini": {"every_steps": 5, "val_per_set": 2, "train_utts": 3},
+                     "probe_greedy_audio_s": 4},
             "ckpt": {"full_at_fracs": [0.4], "weights_at_fracs": [0.5], "full_every_steps": 4, "keep_local": 5},
             "log": {"layer_stats_every": 4, "hist_every": 8}}
 
@@ -588,6 +589,13 @@ def test_ctc_reference_run(env, ref_run):
     ntok = sum(d["n_tok"] for d in gate)
     assert comb["value"] == pytest.approx(sum(d["kl"] * d["n_tok"] + 0.8 * d["ctc"] * d["n_tok"] for d in gate) / ntok)
     assert comb["w_ctc"] == 0.8 and comb["sets"] == sorted(EVAL)
+    # the train probe: teacher-forced on its rows, greedy CTC on the probe-greedy ones, against the teacher's text
+    pg = pd.read_parquet(run / "evals" / "step_20" / "probe_greedy.parquet")
+    pg_ids = next(e for e in evs if e["kind"] == "subset" and e.get("split") == "probe_greedy")["ids"]
+    assert sorted(pg["id"]) == sorted(pg_ids) and (pg["teacher_hyp"] == pg["id"].map(
+        lambda i: env["po"].rows[i]["ctc_hyp"])).all()
+    assert s["probe"]["all"]["n_tok"] > 0 and s["probe_greedy"]["all"]["n"] == len(pg_ids)
+    assert "train_cer_vs_teacher" in s["headline"]
     greedy = pd.read_parquet(run / "evals" / "step_20" / "greedy_eval_jsut.parquet")
     assert len(greedy) == 6 and (greedy["teacher_hyp"] == greedy["id"].map(lambda i: rows[i][2])).all()
     assert (greedy["hyp"] == greedy["hyp_ids"].map(lambda ids: CS.decode_ids(tokenizer, ids))).all()
