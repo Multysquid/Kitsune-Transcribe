@@ -1005,13 +1005,17 @@ def parakeet_data(cfg: dict, store, log, what: str = "eval") -> tuple[dict, dict
 
 def setup_ctc(R, ckpt: Path, fallback: str | None, log):
     """family ctc: the student in fp32 with sdpa attention, in eval mode (its BatchNorm on the running stats: the
-    evaluator never trains), its features (Parakeet's LogMel, no dither: kitsune.ctc_student.ctc_features) and its
+    evaluator never trains), with the rel-pos-once-per-batch patch under perf.relpos_patch as the aed path has it (the
+    same FastConformer encoder), its features (Parakeet's LogMel, no dither: kitsune.ctc_student.ctc_features) and its
     tokenizer, from the checkpoint dir - or, without processor files there, from the config's own student dir."""
     from transformers import AutoProcessor
 
     from kitsune import ctc_student as CS
+    from kitsune.patches import patch_relpos_once_per_batch
 
     R.model = CS.load_ctc_student(ckpt, R.device, dtype=torch.float32)
+    if R.cfg["perf"]["relpos_patch"]:
+        patch_relpos_once_per_batch(R.model)
     R.student_meta = CS.load_meta(ckpt)
     proc = next((Path(d) for d in (ckpt, fallback) if d and (Path(d) / "processor_config.json").is_file()), None)
     if proc is None:

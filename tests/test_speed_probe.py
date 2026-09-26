@@ -29,6 +29,7 @@ from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa:
 
 from kitsune import study_stats as ss  # noqa: E402
 from kitsune import trainset  # noqa: E402
+from kitsune.patches import patch_relpos_once_per_batch  # noqa: E402
 from kitsune.store import ids_sha256  # noqa: E402
 
 SETS = ["eval_jsut", "eval_cv8"]
@@ -61,7 +62,7 @@ def check_record(r: dict, n: int):
     assert r["device"] == "cpu" and r["dtype"] == "fp32" and r["gpu"] is None and r["idle"] is None
     assert r["vram_gb"] is None and r["vram_peak_reserved_bytes"] is None  # CPU: no VRAM
     assert r["params_total"] > 0 and r["weights_bytes"] >= 4 * r["params_total"]
-    assert 0 <= r["cer_ref_corpus"] and r["warmup_batches"] == 1 and r["warmup_1"] == 1
+    assert 0 <= r["cer_ref_corpus"] and r["warmup_batches"] == 1 and r["warmup_1"] == 1 and r["relpos_patch"]
 
 
 def test_ctc_and_parakeet_paths_and_the_merged_file(env, tmp_path):
@@ -120,6 +121,7 @@ def test_the_timed_decode_is_the_evaluators(env, tmp_path):
     doc = json.loads(out.read_text(encoding="utf-8"))
     store = env["store"]
     model = CS.load_ctc_student(env["ctc"], "cpu")
+    patch_relpos_once_per_batch(model)  # as the probe and the evaluator run it
     res = ev.ctc_eval(model, store, doc["ids"], CS.ctc_features(env["ctc"], "cpu").logmel, "cpu", 6.0,
                       tokenizer=AutoProcessor.from_pretrained(str(env["ctc"])).tokenizer)
     g = res["greedy"]
@@ -214,6 +216,7 @@ def test_transcribe_kinds(env, aed_dir, tmp_path):
     assert doc["systems"]["cohere-tiny"]["kind"] == "cohere"
     proc = AutoProcessor.from_pretrained(str(aed_dir))
     model = S.load_student(aed_dir, "cpu")
+    patch_relpos_once_per_batch(model)
     summ, g = ev.greedy_eval(model, env["store"], doc["ids"], LogMel.from_feature_extractor(proc.feature_extractor),
                              "cpu", 6.0, tokenizer=proc.tokenizer)
     assert doc["systems"]["study-t005"]["cer_ref_corpus"] == ev.corpus_cer(g["hyp"].tolist(), g["ref"].tolist())["cer"]

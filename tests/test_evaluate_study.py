@@ -298,18 +298,29 @@ def save_varied_student(d: Path, seed: int = 0) -> Path:
     return d
 
 
+def load_patched(student_dir: Path):
+    """The student as 05_evaluate loads it (perf.relpos_patch, the default: rel-pos once per batch)."""
+    from kitsune import ctc_student as CS
+    from kitsune.patches import patch_relpos_once_per_batch
+
+    model = CS.load_ctc_student(student_dir, "cpu")
+    patch_relpos_once_per_batch(model)
+    return model
+
+
 def exact_targets(student_dir: Path, store, batch_s: float) -> tuple[dict, dict]:
     """The student's own stored-format targets (kitsune.ctc_targets.targets_from_log_probs, as the label pass stores
     them) and greedy CTC text for every row of `store`, from log-probs computed on exactly the batches ctc_eval cuts
-    over that store (kitsune.trainset.eval_batches of batch_s, the dataset's collate, the eval featuriser): the very
-    log-probs the eval computes, so student and stored teacher agree on every frame to the bit."""
+    over that store (kitsune.trainset.eval_batches of batch_s, the dataset's collate, the eval featuriser) by the model
+    05_evaluate loads: the very log-probs the eval computes, so student and stored teacher agree on every frame to the
+    bit."""
     from transformers import AutoProcessor
 
     from kitsune import ctc_student as CS
     from kitsune import trainset
     from kitsune.ctc_targets import targets_from_log_probs
 
-    model = CS.load_ctc_student(student_dir, "cpu")
+    model = load_patched(student_dir)
     feat = CS.ctc_features(student_dir, "cpu").logmel
     tok = AutoProcessor.from_pretrained(str(student_dir)).tokenizer
     ds = trainset.AudioBatchDataset(store)
@@ -434,7 +445,7 @@ def test_ctc_eval_on_its_own_targets(ctc_env):
     store = env["eval_store"]
     ids = [u.id for u in store.utts]
     targets, text = dict(env["targets"]), env["text"]
-    model = CS.load_ctc_student(env["student"], "cpu")
+    model = load_patched(env["student"])
     feat = CS.ctc_features(env["student"], "cpu").logmel
     tok = AutoProcessor.from_pretrained(str(env["student"])).tokenizer
     refs = {u.id: r for u, r in zip(store.utts, store.frame()["ref"])}

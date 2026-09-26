@@ -17,6 +17,8 @@ Kinds (--kind), each decoded exactly as the study scores it:
                 max-symbols guard (kitsune.parakeet.greedy_tdt, k_tdt 1, max_symbols 10), the processor's batch_decode
                 as the label pass wrote `hyp`
 Both Parakeet paths and the CTC students take Parakeet's own features (ctc_features: 80 mel, no dither) on the device.
+Every encoder (all five kinds are FastConformers) runs with kitsune.patches.patch_relpos_once_per_batch, as the trainer
+and the evaluator run it (perf.relpos_patch; --no-relpos-patch times it without, and the record says which).
 
 What the clock covers: from the decoded 16 kHz waveforms in host memory (the FLAC decode and resampling happen before,
 off the clock) to the text - host->device copy, log-mel features on the device, the model, the decode loop and
@@ -48,7 +50,8 @@ Idle host: before loading, nvidia-smi lists the GPU's compute processes (and uti
 Output (--out, JSON, merged, written atomically): {"schema": 1, "ids": [...], "ids_sha256": ..., "systems": {name:
 record}}. A record: kind, model, device, gpu, dtype, batch_s, n_utts, audio_s, batches, rtf, wall_s, the batch-1
 fields (n_latency, p50_s, p95_s, mean_s, rtf_1_p50), vram_peak_allocated_bytes / _reserved_bytes for each pass,
-vram_gb, params_total, weights_bytes, cer_ref_corpus, idle, versions, time_utc. tools/study_report.py --speed reads it
+vram_gb, params_total, weights_bytes, relpos_patch, cer_ref_corpus, idle, versions, time_utc. tools/study_report.py
+--speed reads it
 (the Pareto view: rtf, vram_gb, p50_s, p95_s; kitsune.study_stats.speed_entry).
 
 Usage (on the box, after training, one call per system):
@@ -252,9 +255,19 @@ class TdtRunner:
         return t.processor.batch_decode([r.tolist() for r in tdt["tokens"]], skip_special_tokens=True)
 
 
-def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, store, revision: str):
-    """The runner of one kind and its model's description."""
-    info = store.info or {}
+def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, store, revision: str,
+                relpos_patch: bool = True):
+    """The runner of one kind and its model's description; relpos_patch: kitsune.patches.patch_relpos_once_per_batch
+    on its encoder, as the trainer and the evaluator run every one of these encoders (perf.relpos_patch)."""
+    runner, desc = _runner(kind, model, device, dtype, store.info or {}, revision)
+    if relpos_patch:
+        from kitsune.patches import patch_relpos_once_per_batch
+
+        patch_relpos_once_per_batch(runner.teacher.model if isinstance(runner, TdtRunner) else runner.model)
+    return runner, desc
+
+
+def _runner(kind: str, model: str | None, device: torch.device, dtype: str, info: dict, revision: str):
     if kind in ("aed", "cohere"):
         from transformers import AutoProcessor
 
@@ -410,6 +423,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--revision", default=TEACHER_REVISION, help="the Cohere teacher's revision (kind cohere)")
     ap.add_argument("--require-idle", action="store_true",
                     help="refuse (exit 3) while another compute process is on the GPU")
+    ap.add_argument("--no-relpos-patch", action="store_true",
+                    help="time the encoder without the rel-pos-once-per-batch patch (the trainer and evaluator use it)")
     args = ap.parse_args(argv)
     if args.kind in ("aed", "ctc", "parakeet-ctc", "parakeet-tdt") and not args.model:
         ap.error(f"--kind {args.kind} needs --model")
@@ -451,11 +466,13 @@ def main(argv=None) -> int:
     durations = [float(store.utts[pos[i]].duration) for i in ids]
     refs = store.frame().set_index("id").loc[ids, "ref"].tolist()
     t0 = time.time()
-    runner, desc = load_runner(args.kind, args.model, device, dtype, store, args.revision)
+    runner, desc = load_runner(args.kind, args.model, device, dtype, store, args.revision,
+                               relpos_patch=not args.no_relpos_patch)
     load_s = time.time() - t0
     rec = dict(kind=args.kind, model=desc, device=str(device),
                gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None, dtype=dtype,
-               params_total=int(runner.params), weights_bytes=int(runner.weights_bytes), load_s=round(load_s, 2))
+               params_total=int(runner.params), weights_bytes=int(runner.weights_bytes), load_s=round(load_s, 2),
+               relpos_patch=not args.no_relpos_patch)
     rec.update(probe(runner, waves, durations, refs, device, batch_s=args.batch_s, warmup=args.warmup,
                      warmup_1=args.warmup_1, latency_n=args.latency_n))
     rec.update(idle=idle, gpu_state=gpu, versions=_versions(), store=str(args.store), time_utc=_now())
