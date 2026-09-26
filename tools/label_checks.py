@@ -20,8 +20,10 @@ Every check returns {"status": "pass" | "fail" | "pending" | "skipped", "reason"
       the same order with the fields the study reads (JSONL_KEYS), n_frames and truncated equal to the npz's.
   K3  decode(ctc_greedy(ctc_col0(n_frames, ctc_dense_frame, ctc_topk_idx))) equals the jsonl ctc_hyp on every pulled
       row: the CTC target (decision 22) can be derived from the npz alone. Decoded with the pinned Parakeet
-      processor, as scripts/02p_parakeet_pass.py decodes.
-  K4  frame parity, about 50 rows per train source and eval set: the audio of the --data roots (only shards whose ids
+      processor, as scripts/02p_parakeet_pass.py decodes. Tie rule (CONTRACT section 8): a row whose ctc_hyp is the
+      path with the stored top-2 on a frame where the stored fp16 top-1 and top-2 log-probs are exactly equal is an
+      fp16 tie (02p's fp32 argmax decided it), counted and listed under "ties", not a failure (k3_tie).
+  K4 frame parity, about 50 rows per train source and eval set: the audio of the --data roots (only shards whose ids
       digest equals the npz's shard_ids_sha256, i.e. the audio that was labelled, under any stem name) through (a) the
       ParakeetFeatureExtractor of --model-dir and (b) kitsune.features.LogMel on that extractor's filterbank with
       dither 0, each followed by the encoder's 8x subsampling length formula (subsampled_length), must give the
@@ -483,33 +485,73 @@ def k2_format(ctx: Ctx) -> dict:
     return result("pass", f"{len(pairs)} shards sound", **common)
 
 
+def k3_tie(ctx: Ctx, src: str, stem: str, i: int, stored) -> dict | None:
+    """The K3 tie rule (CONTRACT section 8): a mismatch is an exact fp16 tie, not a failure, when the stored ctc_hyp
+    is what the npz path gives with the stored top-2 in place of the top-1 on frame(s) whose stored top-1 and top-2
+    log-probs are EXACTLY equal. 02p took ctc_hyp from the fp32 argmax while the npz keeps fp16 log-probs, so on such a
+    frame the stored order cannot tell which class won (the sealed root's one case: blank = comma = -0.7334). Tried
+    in frame order: each tied frame alone, then the first j tied frames together; the first frame of the swap that
+    reproduces ctc_hyp is the first differing frame. None when no tied swap reproduces it (a real mismatch)."""
+    z = ctx.pk(src, stem).z
+    do = z["dense_offsets"]
+    frames = z["ctc_dense_frame"][do[i]:do[i + 1]].astype(np.int64)
+    idx, lp = z["ctc_topk_idx"][do[i]:do[i + 1]], z["ctc_topk_lp"][do[i]:do[i + 1]]
+    if idx.ndim != 2 or idx.shape[1] < 2:
+        return None
+    tied = [d for d in np.argsort(frames, kind="stable") if lp[d, 0] == lp[d, 1]]
+    if not tied:
+        return None
+    col0 = pt.ctc_col0(int(z["n_frames"][i]), frames, idx)
+    trials = [[d] for d in tied] + [tied[:j] for j in range(2, len(tied) + 1)]
+    seqs = []
+    for swap in trials:
+        col = col0.copy()
+        col[frames[swap]] = idx[swap, 1]
+        seqs.append(pt.ctc_greedy(col))
+    for swap, text in zip(trials, ctx.decode(seqs)):
+        if text == stored:
+            d = swap[0]
+            return {"frame": int(frames[d]), "top1": int(idx[d, 0]), "top2": int(idx[d, 1]),
+                    "lp": float(lp[d, 0]), "frames_swapped": len(swap)}
+    return None
+
+
 def k3_ctc_target(ctx: Ctx) -> dict:
     if ctx.decode is None:
         return result("skipped", ctx.unavailable.get("decode", "no Parakeet processor (--model-dir)"))
     pairs = ctx.pulled()
     if not pairs:
         return result("pending", "no parakeet_out shard pulled")
-    per, examples, unaligned = {}, [], []
+    per, examples, ties, unaligned = {}, [], [], []
     for src, stem in pairs:
         rows, ids = ctx.pk_rows(src, stem), ctx.ctc_ids(src, stem)
         if [r.get("id") for r in rows] != ctx.pk(src, stem).ids:
             unaligned.append(f"{src}/{stem}")  # K2 reports it; the rows cannot be paired
             continue
         texts = ctx.decode(ids)
-        g = per.setdefault(group_of(src, stem), {"rows": 0, "mismatch": 0})
-        for r, t in zip(rows, texts):
+        g = per.setdefault(group_of(src, stem), {"rows": 0, "mismatch": 0, "ties": 0})
+        for i, (r, t) in enumerate(zip(rows, texts)):
             g["rows"] += 1
             if t != r.get("ctc_hyp"):
+                tie = k3_tie(ctx, src, stem, i, r.get("ctc_hyp"))
+                if tie is not None:  # counted and listed, not a failure
+                    g["ties"] += 1
+                    ties.append({"id": r["id"], "shard": f"{src}/{stem}", **tie})
+                    continue
                 g["mismatch"] += 1
                 if len(examples) < MAX_LISTED:
                     examples.append({"id": r["id"], "stored": r.get("ctc_hyp"), "derived": t})
     n = sum(g["rows"] for g in per.values())
     bad = sum(g["mismatch"] for g in per.values())
-    common = dict(rows=n, mismatch=bad, identical_frac=(n - bad) / n if n else None, per_group=per,
+    common = dict(rows=n, mismatch=bad, n_ties=len(ties), ties=ties[:MAX_LISTED],
+                  identical_frac=(n - bad - len(ties)) / n if n else None, per_group=per,
                   unaligned_shards=unaligned, examples=examples)
+    tie_note = f"; {len(ties)} exact fp16 tie(s), listed, not failures" if ties else ""
     if bad or unaligned:
-        return result("fail", f"{bad} of {n} rows differ from the stored ctc_hyp" +
+        return result("fail", f"{bad} of {n} rows differ from the stored ctc_hyp" + tie_note +
                       (f"; {len(unaligned)} shard(s) with unaligned jsonl" if unaligned else ""), **common)
+    if ties:
+        return result("pass", f"identical on {n - len(ties)} of {n} rows" + tie_note, **common)
     return result("pass", f"identical on all {n} rows", **common)
 
 
