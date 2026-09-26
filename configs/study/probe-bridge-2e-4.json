@@ -1,5 +1,5 @@
 {
- "run_name": "calib-study-bridge",
+ "run_name": "probe-bridge-2e-4",
  "cache_dir": "cache",
  "runs_root": "runs",
  "mix": "natural",
@@ -44,7 +44,7 @@
   "cooldown_frac": 0.2,
   "train_hours": 4.0,
   "clock": "steps",
-  "max_steps": 20000,
+  "max_steps": 5000,
   "end_reserve_min": 30,
   "epochs": null
  },
@@ -97,12 +97,12 @@
  },
  "ckpt": {
   "weights_every_min": null,
-  "full_local_every_min": null,
+  "full_local_every_min": 30,
   "weights_every_steps": null,
   "full_every_steps": null,
   "keep_local": 2,
   "upload_full_at": [],
-  "full_after_smoke": false,
+  "full_after_smoke": true,
   "full_at_fracs": null,
   "weights_at_fracs": null
  },
@@ -189,13 +189,6 @@
  "student": "students/study/bridge",
  "bn": {
   "mode": "train"
- },
- "calibrate": {
-  "enabled": true,
-  "window": [
-   50,
-   250
-  ]
  },
  "lr_probe": {
   "enabled": true

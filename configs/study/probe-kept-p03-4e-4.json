@@ -1,5 +1,5 @@
 {
- "run_name": "calib-study-bridge",
+ "run_name": "probe-kept-p03-4e-4",
  "cache_dir": "cache",
  "runs_root": "runs",
  "mix": "natural",
@@ -15,7 +15,8 @@
   "w_kl": 1.0,
   "w_ce": 0.8,
   "l2sp_lambda": 0.0,
-  "aux_ctc_weight": 0.3
+  "aux_ctc_weight": 0.0,
+  "w_ctc": 0.8
  },
  "specaug": {
   "enabled": true,
@@ -26,13 +27,13 @@
   "time_width": 0.05
  },
  "optim": {
-  "lr": 0.0002,
+  "lr": 0.0004,
   "betas": [
    0.9,
    0.98
   ],
   "eps": 1e-08,
-  "weight_decay": 0.001,
+  "weight_decay": 0.0,
   "clip": 1.0,
   "fused": true,
   "max_nonfinite_skips": 3,
@@ -40,11 +41,11 @@
   "offload_fused": false
  },
  "schedule": {
-  "warmup_steps": 2000,
+  "warmup_steps": 300,
   "cooldown_frac": 0.2,
   "train_hours": 4.0,
   "clock": "steps",
-  "max_steps": 20000,
+  "max_steps": 2000,
   "end_reserve_min": 30,
   "epochs": null
  },
@@ -97,12 +98,12 @@
  },
  "ckpt": {
   "weights_every_min": null,
-  "full_local_every_min": null,
+  "full_local_every_min": 30,
   "weights_every_steps": null,
   "full_every_steps": null,
   "keep_local": 2,
   "upload_full_at": [],
-  "full_after_smoke": false,
+  "full_after_smoke": true,
   "full_at_fracs": null,
   "weights_at_fracs": null
  },
@@ -186,17 +187,11 @@
    "neutral_max_cer": 0.5
   }
  },
- "student": "students/study/bridge",
+ "student": "students/study/p03",
  "bn": {
-  "mode": "train"
+  "mode": "frozen"
  },
- "calibrate": {
-  "enabled": true,
-  "window": [
-   50,
-   250
-  ]
- },
+ "family": "ctc",
  "lr_probe": {
   "enabled": true
  }
