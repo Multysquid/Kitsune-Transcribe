@@ -454,7 +454,8 @@ def build_report(args) -> dict:
     rep["settings_sources"] = sources
     rep["inputs"] = dict(tables=str(args.tables), manifest=str(args.manifest),
                          manifest_sha256=file_sha256(args.manifest), prereg=_s(args.prereg),
-                         numbers=numbers_files, numbers_sha256=numbers_sha, speed=_s(args.speed), params=_s(args.params),
+                         numbers=numbers_files, numbers_sha256=numbers_sha, speed=_s(args.speed),
+                         params=_s(args.params),
                          run_summaries=_s(args.run_summaries), summaries_read=summ_notes["read"],
                          summaries_superseded=summ_notes["superseded"], ignored_files=ignored,
                          written_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
