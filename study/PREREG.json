@@ -20,10 +20,18 @@
   ],
   "sigma_run": {
    "factor": 0.886,
+   "grid": [
+    0.016,
+    0.032
+   ],
    "prior": 0.016,
    "replicate": [
     "study-t01-s1235",
     "study-t01"
+   ],
+   "trigger_families": [
+    "transcribe",
+    "parakeet"
    ]
   },
   "strata": [
@@ -52,37 +60,37 @@
  },
  "baselines": {
   "cohere": {
-   "eval_cv8": "pending",
-   "eval_emilia": "pending",
-   "eval_jsut": "pending",
-   "eval_reazon": "pending",
-   "galgame_all": "pending",
-   "galgame_label_box": "pending",
-   "galgame_neutral": "pending",
-   "m4": "pending"
+   "eval_cv8": 0.04074034449556007,
+   "eval_emilia": 0.3695676687490133,
+   "eval_jsut": 0.08300559813841453,
+   "eval_reazon": 0.06282022180426747,
+   "galgame_all": 0.21418098031001256,
+   "galgame_label_box": 0.1732640053673264,
+   "galgame_neutral": 0.14749519986035958,
+   "m4": 0.08351534107465042
   },
   "parakeet-ctc": {
-   "eval_cv8": "pending",
-   "eval_emilia": "pending",
-   "eval_jsut": "pending",
-   "eval_reazon": "pending",
-   "galgame_all": "pending",
-   "galgame_label_box": "pending",
-   "galgame_neutral": "pending",
-   "m4": "pending"
+   "eval_cv8": 0.07576762597624906,
+   "eval_emilia": 0.40614780902550685,
+   "eval_jsut": 0.06705870982610829,
+   "eval_reazon": 0.09706368765808418,
+   "galgame_all": 0.19637620444072057,
+   "galgame_label_box": 0.1639270938163927,
+   "galgame_neutral": 0.13318205620527143,
+   "m4": 0.09326801991642825
   },
   "parakeet-tdt": {
-   "eval_cv8": "pending",
-   "eval_emilia": "pending",
-   "eval_jsut": "pending",
-   "eval_reazon": "pending",
-   "galgame_all": "pending",
-   "galgame_label_box": "pending",
-   "galgame_neutral": "pending",
-   "m4": "pending"
+   "eval_cv8": 0.07501872258478656,
+   "eval_emilia": 0.42013035339753274,
+   "eval_jsut": 0.06622605178835617,
+   "eval_reazon": 0.10202509890394967,
+   "galgame_all": 0.19517176372015083,
+   "galgame_label_box": 0.1633679973163368,
+   "galgame_neutral": 0.1320183859894106,
+   "m4": 0.09382206481662575
   },
   "source": "the sidecar's baselines: corpus CER (kitsune.evaluate.corpus_cer) on the manifest rows; m4 = the macro mean over eval_jsut, eval_cv8, eval_reazon, galgame_neutral",
-  "status": "pending"
+  "status": "filled"
  },
  "boxes": {
   "A": {
@@ -215,7 +223,7 @@
   "per_box": "each box calibrates its 'calibrate' list (BOXES) and measures study-t06 on its own host: box B calibrates study-t06 for 250 steps without training it",
   "reference_run": "study-t06",
   "reference_steps": 9366,
-  "replicate": "study-t01-s1235 is not calibrated: it takes study-t01's max_steps and the scratch LR from box A's numbers file, and trains at the micro_audio_s of study-t01's calibration entry there",
+  "replicate": "study-t01-s1235 runs only on the trigger (noise.replicate_trigger); it is not calibrated: it takes study-t01's max_steps and the scratch LR from box A's numbers file, and trains at the micro_audio_s of study-t01's calibration entry there",
   "t_i": "the median step time (the difference of consecutive steps' loop clocks: data wait, forward, backward, optimizer and logging included) at the planned micro_audio_s on the box's host, over 200 steps that start at the first step >= 50 logged after every run of its calibration group (groups) has reached step 50, so each of them is timed while every other run of the group trains; the group stops once every run has its window (the run that reaches step 50 last is timed over steps 50-250); data_wait_frac is the loader's share of the window's time"
  },
  "cohere_prereg": {
@@ -238,10 +246,35 @@
     "emilia_nc": 8,
     "emilia_yodas": "300h",
     "galgame": 3,
-    "reazon_large": "pending"
+    "reazon_large": 53
    },
    "name": "full",
    "root": "labels/full"
+  },
+  "mix": {
+   "groups": {
+    "emilia_nc": [
+     "emilia_nc"
+    ],
+    "emilia_yodas": [
+     "emilia_yodas"
+    ],
+    "galgame": [
+     "galgame"
+    ],
+    "reazon": [
+     "reazon_small",
+     "reazon_large"
+    ]
+   },
+   "plan": "mix D (decision 9)",
+   "realised_pct": {
+    "emilia_nc": 19.6,
+    "emilia_yodas": 26.8,
+    "galgame": 12.0,
+    "reazon": 41.6
+   },
+   "what": "a recorded fact, not a rule: the shares of the drawn hours of the uploaded selection (data repo commit 4b0d801, study_1000h.json hours.<source>.drawn, 1,000 h), at 0.1 pp; the fill refuses a sidecar whose drawn hours give another mix (mix_problems)"
   },
   "reazon_large_cap": "the smallest reazon_large input count whose pool after all filters holds >= 1010 h (expected 50-55), read from the sealed labels (the sidecar's details.pool_hours_if_capped; the fill refuses any other count)",
   "sources": [
@@ -350,7 +383,10 @@
    "option": "rescore"
   },
   "3": {
-   "answer": "control runs: the bridge and a replicate of T-0.1B with seed 1235",
+   "answer": "control runs: the bridge, and a replicate of T-0.1B with seed 1235 only if a family's limit call depends on sigma_run (1.6 % vs 3.2 %; noise.replicate_trigger)",
+   "changed_2026_09_26": {
+    "was": "a: control runs: the bridge and a replicate of T-0.1B with seed 1235 (always run)"
+   },
    "option": "a"
   },
   "30": {
@@ -457,7 +493,7 @@
   "a run misses its max_steps, or resumes with a changed config",
   "a selection or manifest hash differs between runs (on one box or across boxes)",
   "the teacher baselines do not reproduce",
-  "K3 or K4 fails, or the frame preflight exceeds its threshold",
+  "K3 fails, exact fp16 ties excepted (the stored top-1 and top-2 CTC log-probs equal on the first differing frame: counted and listed, 1 row on the sealed root), or K4 fails, or the frame preflight exceeds its threshold",
   "this rules commit comes after any study result, or a box's numbers file after that box's first study step",
   "the anchor regression flag fires and stays unexplained",
   "an LR winner sits at a grid edge after its one extension",
@@ -493,7 +529,7 @@
    }
   },
   "ratio": "r_s = M4_s / M4_top",
-  "replicate_role": "study-t01-s1235 feeds sigma_run only; the walk uses study-t01",
+  "replicate_role": "study-t01-s1235 (run only on the trigger, noise.replicate_trigger) feeds sigma_run only; the walk uses study-t01",
   "walk": "down the sizes: the limit is the smallest size WITHIN with every larger size WITHIN; the first OUTSIDE ends it (limit between X and Y); an UNRESOLVED gives 'at or below X, Y unresolved' and the smaller sizes are descriptive; one decisive claim per family, no Holm correction"
  },
  "lr_probes": {
@@ -591,55 +627,55 @@
  "manifest": {
   "galgame_views": {
    "all": {
-    "ids_sha256": "pending",
-    "n": "pending"
+    "ids_sha256": "798dce908667c9e71757fc0ca5cccc3b64083f52e71da36efaf616901b47a3c4",
+    "n": 1000
    },
    "label_box": {
-    "ids_sha256": "pending",
-    "n": "pending"
+    "ids_sha256": "7f37bd115e0e4a307747bb163a983c3e4931a36d310753c78f61aaae16f047a2",
+    "n": 883
    },
    "neutral": {
-    "ids_sha256": "pending",
-    "n": "pending"
+    "ids_sha256": "5473e364d339d5c90a591aed93bbacdefbb56b2e55965b6671b62e533e2ab023",
+    "n": 810
    }
   },
   "manifest_file": "labels/full/selections/study_manifest.json",
-  "manifest_sha256": "pending",
-  "pool_hours": "pending",
+  "manifest_sha256": "ef56dec2b69bfe54f96a5ad1df36bde38255b68799873ab5f12346da78ac3796",
+  "pool_hours": 1016.217812726895,
   "probe": {
-   "ids_sha256": "pending",
-   "n": "pending"
+   "ids_sha256": "7211dbb6cd14f9f69b9a6ab6535122c0d1d2e09306656ed396f5754657ddc09e",
+   "n": 1500
   },
   "selection_file": "labels/full/selections/study_1000h.parquet",
-  "selection_sha256": "pending",
+  "selection_sha256": "5bbabcef431d97cfdad7cec495186a88e5d73624e36dcfdd8b706edb50d70c65",
   "sets": {
    "eval_cv8": {
-    "ids_sha256": "pending",
-    "n": "pending"
+    "ids_sha256": "b9d0fecb22d4c08707ac0d769f35694d1e2eb7dbd3074a6bd940bd48639ed6f0",
+    "n": 4483
    },
    "eval_emilia": {
-    "ids_sha256": "pending",
-    "n": "pending"
+    "ids_sha256": "2828af7b006155e5211db2165ae6d072b7eb1c670f4158317d6affaa28806f34",
+    "n": 1000
    },
    "eval_jsut": {
-    "ids_sha256": "pending",
-    "n": "pending"
+    "ids_sha256": "e6208447028ce95f66255c29f72b4a83dc57f087eaa10740a7b3392b3a2b909d",
+    "n": 5000
    },
    "eval_reazon": {
-    "ids_sha256": "pending",
-    "n": "pending"
+    "ids_sha256": "b993e26295d1256933c0701859b0c805e11a49c2fe5d76f1e280bf54d937d540",
+    "n": 5263
    },
    "galgame": {
-    "ids_sha256": "pending",
-    "n": "pending"
+    "ids_sha256": "798dce908667c9e71757fc0ca5cccc3b64083f52e71da36efaf616901b47a3c4",
+    "n": 1000
    }
   },
-  "source": "python -m kitsune.prereg --write study/ --sidecar labels/full/selections/study_1000h.json, from the selection built on the sealed labels (scripts/make_selection.py --config study/data.json)",
-  "status": "pending",
+  "source": "the study selection's sidecar (scripts/make_selection.py --config study/data.json, sealed labels)",
+  "status": "filled",
   "train": {
-   "hours": "pending",
-   "ids_sha256": "pending",
-   "n": "pending"
+   "hours": 999.9997058921639,
+   "ids_sha256": "35ab0efc426988ab70f5039f319b2c3706efcb72bf2abb9813037b516287876b",
+   "n": 542679
   }
  },
  "metrics": {
@@ -672,8 +708,13 @@
   "ci_student_ratio": "ln r +- 1.96 sqrt(v_boot + 2 sigma_run^2)",
   "ci_student_vs_teacher": "ln r +- 1.96 sqrt(v_boot + sigma_run^2)",
   "replicate_estimate": "0.886 x |ln(M4_study-t01-s1235 / M4_study-t01)|",
+  "replicate_trigger": "after boxes A and B every call (both families' walks, the scratch ladder, all three deltas, the practical bars) is computed at sigma_run = 1.6 % and at 3.2 %; the replicate (study-t01-s1235, box 'replicate', study-t01's max_steps and the scratch LR from box A's numbers) runs only if any family's limit call (the delta 10 % walk result of transcribe or parakeet) differs between the two (kitsune.study_stats: replicate_needed); then sigma_run = max(0.016, sigma_hat). Otherwise it is not run and the report states that the calls are robust to sigma_run up to 3.2 %",
+  "sigma_grid": [
+   0.016,
+   0.032
+  ],
   "sigma_prior": 0.016,
-  "sigma_rule": "sigma_run = max(0.016, the replicate's estimate)"
+  "sigma_rule": "without the replicate: sigma_run = 0.016 (the prior), every call also reported at 0.032; with it: sigma_run = max(0.016, the replicate's estimate)"
  },
  "numbers": {
   "files": {
@@ -701,7 +742,8 @@
    "The pruned Transcribe students (T-0.6B, T-0.3B) keep the function-kept settings (warm-up 300, probe class kept-t03) although their step-0 CER against the teacher is >= 90 %: an AED decoder derails at step 0, and the first run trained this recipe fine. The 90 % step-0 rule classifies the Parakeet students only.",
    "Every LR-probe grid has 3 points up front: kept-t03 and kept-p03 1e-4 / 2e-4 / 4e-4, bridge 2e-4 / 4e-4 / 1e-3 (scratch and lost unchanged); the edge rule is unchanged.",
    "The first run's 1,000 calibration ids (importance_ids_sha256 5e31cd68...) were recovered from the HF dataset's history, and every pruned student (T-0.3B, P-0.3B, P-0.1B, P-0.05B) was rebuilt on them; T-0.6B keeps the first run's FFN selection.",
-   "The study runs on two boxes, Cohere first (BOXES): box A trains the Transcribe students, box B the Parakeet students and the bridge, the replicate a 1x box after box A; each box measures study-t06's step time on its own host and writes its own numbers file (decision 2)."
+   "The study runs on two boxes, Cohere first (BOXES): box A trains the Transcribe students, box B the Parakeet students and the bridge, the replicate a 1x box after box A; each box measures study-t06's step time on its own host and writes its own numbers file (decision 2).",
+   "The replicate is conditional (decision 3; noise.replicate_trigger): every call is computed at sigma_run 1.6 % and 3.2 % after boxes A and B, and study-t01-s1235 runs only if a family's delta 10 % limit call differs between the two; then sigma_run = max(1.6 %, sigma_hat) as before, otherwise the calls are reported robust to sigma_run up to 3.2 %."
   ],
   "date": "2026-09-26"
  },
@@ -996,7 +1038,7 @@
    "small": "study-t06"
   }
  ],
- "study": "Kitsune size study: 7 students + bridge + replicate on the same 1,000 h at equal A100 compute",
+ "study": "Kitsune size study: 7 students + bridge (+ a conditional replicate) on the same 1,000 h at equal A100 compute",
  "training": {
   "aed_loss": {
    "aux_ctc": {
