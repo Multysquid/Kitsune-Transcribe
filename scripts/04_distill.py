@@ -188,8 +188,10 @@ The size study (every default below is the trainer as it was before them; the st
                       data       frame stores (kitsune.trainset.build_frame_stores; cache dirs ctc_train / ctc_eval /
                                  ctc_*_sub*: store_dir) of the selection's rows with their parakeet_out targets, built with
                                  the FRAME PREFLIGHT: every row's decoded audio must give its stored n_frames (decision 15:
-                                 a mismatch is dropped and counted, more than 0.1 % of the train rows or any eval row fails
-                                 the run; a `frame_preflight` event per store, a reused cache's too). The planner packs
+                                 a mismatch - or a row that does not decode - is dropped and counted, more than 0.1 % of
+                                 the train rows or any eval row fails the run; a `frame_preflight` event per store, a
+                                 reused cache's too; the decode runs in processes by shard, kitsune.ctc_preflight). The
+                                 planner packs
                                  by padded audio (no decoder lengths). The run reads no teacher_out; scripts/05_evaluate.py
                                  scores a CTC student on the token eval store (build_eval_store's default builds both)
                       loss       kitsune.ctc_kd: (w_kl x KL on every frame + loss.w_ctc x CTC on the teacher's greedy CTC
@@ -202,7 +204,9 @@ The size study (every default below is the trainer as it was before them; the st
                                  agreement, plus kl_dense, kl_blank, argmax_blank, teacher_blank, ...) and the greedy CTC
                                  decode (kitsune.ctc_student.greedy_ctc_ids), scored vs the reference and vs the teacher's
                                  stored ctc_hyp. The teacher baselines (at start) and the verdict's teacher are Parakeet
-                                 CTC's (ctc_hyp) on the same ids; the combined loss and the LR probe's objective are
+                                 CTC's (ctc_hyp) on the same ids, checked against kitsune.evaluate's registered numbers
+                                 (study/PREREG.json; K6 while pending); the verdict is kitsune.evaluate.verdict(...,
+                                 family="ctc"); the combined loss and the LR probe's objective are
                                  w_kl x KL + w_ctc x CTC per target token
                       smoke      LogMel vs the Parakeet extractor, the longest micro-batch's forward+backward, padded rows
                                  vs alone on the frame log-probs, the FLOP count of the CTC model; the memory probe's
@@ -4008,17 +4012,18 @@ def verdict_results(final: dict, history: list[dict], reference: dict | None = N
 
 
 def family_verdict(cfg: dict, final: dict, history: list[dict], reference: dict | None = None) -> dict:
-    """kitsune.evaluate.verdict of the run's family: AED as before; "ctc" against its own teacher, Parakeet's CTC path
-    - its corpus CER on the same ids as the student's final numbers (kitsune.ctc_eval.verdict_teacher; never the
-    verdict's fallback to Cohere's pre-registered numbers), each set's record named for it (relabel_verdict:
-    teacher_system, the Parakeet CTC PREREG numbers as teacher_prereg / baseline_drift)."""
+    """kitsune.evaluate.verdict of the run's family: AED as before; "ctc" is verdict(..., family="ctc"), against its own
+    teacher, Parakeet's CTC path - its corpus CER on the same ids as the student's final numbers, never Cohere's
+    pre-registered numbers; the registered Parakeet numbers (teacher_prereg / baseline_drift) are kitsune.evaluate's,
+    from study/PREREG.json. A set without a same-ids teacher CER gets kitsune.ctc_eval.verdict_teacher's (the PREREG
+    number, K6 while pending). Each set's record is named for its teacher (relabel_verdict: teacher_system)."""
     from kitsune import evaluate as ev
 
     if not is_ctc(cfg):
         return ev.verdict(verdict_results(final, history, reference), **verdict_options(cfg))
     from kitsune.ctc_eval import relabel_verdict, verdict_teacher
 
-    out = ev.verdict(verdict_results(final, history, reference, teacher=verdict_teacher(final)),
+    out = ev.verdict(verdict_results(final, history, reference, teacher=verdict_teacher(final)), family="ctc",
                      **verdict_options(cfg))
     return relabel_verdict(out)
 

@@ -196,8 +196,8 @@ def test_token_planner_unchanged_and_the_frame_planner():
 
 def test_frame_preflight_rule():
     """Decision 15 on its own: a row whose decoded audio gives another frame count is a mismatch; up to 0.1 % of the
-    train rows are dropped and counted, more fails, and so does a single eval row; an undecodable row is counted, not
-    checked and not a mismatch."""
+    train rows are dropped and counted, more fails, and so does a single eval row; a row that does not decode is a
+    mismatch too (counted as undecodable as well): dropped in train within the 0.1 %, a hard fail in eval."""
     from kitsune import trainset as T
 
     n = 1000
@@ -210,14 +210,64 @@ def test_frame_preflight_rule():
         st = [t + (1 if i in bad_rows else 0) for i, t in enumerate(stored)]
         return T.frame_preflight(ids, ["src"] * n, [split] * n, [0.2] * n, st, dec)
 
-    ok = run("train", {5}, undecodable={9})
-    assert ok["ok"] and ok["n_mismatch"] == 1 and ok["_rows"] == [5] and ok["n_undecodable"] == 1
+    ok = run("train", {5})
+    assert ok["ok"] and ok["n_mismatch"] == 1 and ok["_rows"] == [5] and ok["n_undecodable"] == 0
     assert ok["mismatches"][0] == dict(id="r5", source="src", split="train", stored=stored[5] + 1, expected=stored[5],
                                        n_samples=samples[5], duration=0.2)
-    assert ok["by_split"] == {"train": dict(rows=1000, mismatch=1, undecodable=1)} and ok["train_mismatch_frac"] == 0.001
+    assert ok["by_split"] == {"train": dict(rows=1000, mismatch=1, undecodable=0)} and ok["train_mismatch_frac"] == 0.001
+    und = run("train", set(), undecodable={9})  # an undecodable row: dropped and counted as a mismatch
+    assert und["ok"] and und["n_mismatch"] == 1 and und["_rows"] == [9] and und["n_undecodable"] == 1
+    assert und["by_split"] == {"train": dict(rows=1000, mismatch=1, undecodable=1)} and und["n_checked"] == 999
+    assert und["mismatches"][0] == dict(id="r9", source="src", split="train", stored=stored[9], expected=None,
+                                        n_samples=None, duration=0.2, error="RuntimeError: no")
+    assert not run("train", {5}, undecodable={9})["ok"]  # together 0.2 % > 0.1 %
     assert not run("train", {5, 6})["ok"]  # 0.2 % > 0.1 %
     assert not run("eval", {5})["ok"] and run("eval", set())["ok"]
+    assert not run("eval", set(), undecodable={3})["ok"]  # any eval row: a hard fail
     assert run("train", set())["ok"] and run("train", set())["n_checked"] == 1000
+
+
+def test_one_source_for_the_parakeet_ctc_baseline(env, monkeypatch):
+    """The Parakeet CTC teacher's registered gate CER is kitsune.evaluate's (study/PREREG.json's filled baselines);
+    kitsune.ctc_eval falls back to the K6 numbers only while those are pending. The trainer's start-up check
+    (ctc_teacher_baselines) and the verdict's fallback for a set without a same-ids teacher CER read it at call time;
+    the family verdict is kitsune.evaluate.verdict(..., family="ctc")."""
+    from kitsune import ctc_eval as ce
+    from kitsune import evaluate as ev
+
+    m = load_script("04_distill")
+    monkeypatch.setattr(ev, "PARAKEET_CTC_CER_PREREG", None)  # pending
+    assert ce.teacher_prereg() == (ce.PARAKEET_CTC_CER_K6, "pending: K6")
+    po = env["po"].root
+    base = ce.ctc_teacher_baselines(po, EVAL, check=False)
+    got = {x: base[x]["cer_corpus"] for x in EVAL}
+    assert all(base[x]["prereg"] == ce.PARAKEET_CTC_CER_K6[x] and base[x]["prereg_source"] == "pending: K6"
+               for x in EVAL)
+    monkeypatch.setattr(ev, "PARAKEET_CTC_CER_PREREG", dict(got))  # registered: exactly the recomputed numbers
+    assert ce.teacher_prereg() == (got, "registered")
+    base = ce.ctc_teacher_baselines(po, EVAL, check=True)
+    assert all(base[x]["prereg"] == got[x] and base[x]["prereg_source"] == "registered" for x in EVAL)
+    monkeypatch.setattr(ev, "PARAKEET_CTC_CER_PREREG", dict(got, eval_cv8=got["eval_cv8"] + 0.001))
+    with pytest.raises(ValueError, match=r"eval_cv8: Parakeet CTC corpus CER .* \(registered\)"):
+        ce.ctc_teacher_baselines(po, EVAL, check=True)
+
+    # the verdict: same-ids teacher CER where the final has one, the registered (or K6) number where not
+    final = dict(sets={x: dict(cer_ref_corpus=0.1, teacher_cer_ref_corpus=0.08, n=6, n_truncated=0) for x in EVAL})
+    final["sets"]["eval_cv8"]["teacher_cer_ref_corpus"] = float("nan")
+    cfg = m.load_config(None, [])
+    cfg["family"] = "ctc"
+    monkeypatch.setattr(ev, "PARAKEET_CTC_CER_PREREG", None)
+    v = m.family_verdict(cfg, final, [])
+    assert v["family"] == "ctc" and v["teacher"] == "parakeet-ctc" and v["teacher_prereg_status"] == "pending"
+    assert v["sets"]["eval_jsut"]["teacher"] == 0.08 and v["sets"]["eval_jsut"]["teacher_source"] == "same ids"
+    assert v["sets"]["eval_cv8"]["teacher"] == ce.PARAKEET_CTC_CER_K6["eval_cv8"]
+    assert v["sets"]["eval_cv8"]["teacher_source"] == "results.teacher"
+    assert all(d["teacher_prereg"] is None and d["teacher_system"] == "parakeet-ctc" for d in v["sets"].values())
+    reg = {x: 0.07 for x in EVAL}
+    monkeypatch.setattr(ev, "PARAKEET_CTC_CER_PREREG", reg)
+    v = m.family_verdict(cfg, final, [])
+    assert v["teacher_prereg_status"] == "registered" and v["sets"]["eval_cv8"]["teacher"] == 0.07
+    assert v["sets"]["eval_jsut"]["baseline_drift"] == pytest.approx(0.08 - 0.07)
 
 
 def test_validate_the_family_keys(env):
@@ -710,11 +760,15 @@ def test_ctc_reference_run(env, ref_run):
     assert started.tzinfo is not None and started <= datetime.now(timezone.utc)
     ver = summ["verdict"]
     assert ver["verdict"] in ("GO", "PROMISING", "NO-GO", "INCONCLUSIVE") and set(ver["sets"]) == set(EVAL)
+    # kitsune.evaluate.verdict(..., family="ctc"): its registered numbers are kitsune.evaluate's (PREREG.json)
+    reg = ev.family_teacher_prereg("ctc")
+    assert ver["family"] == "ctc" and ver["teacher"] == "parakeet-ctc"
+    assert ver["teacher_prereg_status"] == ("registered" if reg else "pending")
     for x in EVAL:
         v = ver["sets"][x]
-        assert v["teacher_system"] == "parakeet-ctc" and v["teacher_prereg"] == ce.PARAKEET_CTC_CER_PREREG[x]
+        assert v["teacher_system"] == "parakeet-ctc" and v["teacher_prereg"] == (reg or {}).get(x)
         assert v["teacher"] == pytest.approx(s["greedy_full"]["sets"][x]["teacher_cer_ref_corpus"])
-        assert v["teacher_source"] == "results.teacher"
+        assert v["teacher_source"] == "same ids"
     assert [r["step"] for r in summ["history"]] == [0, 10, 20] and all("heldout_kl" in r for r in summ["history"])
     assert summ["history"][1]["greedy_full"] and summ["history"][0]["tf"]["eval_jsut"]["ce"] > 0
     assert [r["step"] for r in summ["mini_history"]] == [5, 15]
