@@ -438,8 +438,12 @@ def test_invalidation_checks_from_the_numbers():
                                "study-t03": {"selection_sha256": "y"}})["status"] == "fail"
 
 
-def test_teacher_baseline_check():
-    """Cohere's pre-registered gate baselines (8.30 / 4.07 / 6.28 %) must reproduce within 0.05 pp."""
+def test_teacher_baseline_check(monkeypatch):
+    """Cohere's pre-registered gate baselines (8.30 / 4.07 / 6.28 %) must reproduce within 0.05 pp. (The evaluator's
+    Parakeet CTC registration, read from the committed PREREG.json, is taken as pending: the logic is under test.)"""
+    import kitsune.evaluate as ev
+
+    monkeypatch.setattr(ev, "PARAKEET_CTC_CER_PREREG", None)
     tables, manifest = planted({"cohere": 1.0, "study-t06": 1.2})
     st = ss.Study(ss.build_corpus(tables, manifest), dict(boot_b=100))
     assert ss.teacher_baseline_check(st, None)["status"] == "fail"  # the planted CERs are not the real ones

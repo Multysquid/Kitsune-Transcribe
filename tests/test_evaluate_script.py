@@ -39,7 +39,32 @@ import torch  # noqa: E402
 
 from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa: E402
 
-GATE = ["eval_jsut", "eval_cv8", "eval_reazon"]
+
+@pytest.fixture(scope="module", autouse=True)
+def pending_prereg(tmp_path_factory):
+    """The toy corpora here are not the study's selection: 05_evaluate's default --prereg (the committed
+    study/PREREG.json, filled from the uploaded selection) would refuse their manifests and teachers. Every 05 loaded
+    by this module defaults to the rules with their sidecar fields pending instead."""
+    from kitsune import evaluate as ev
+    from kitsune import prereg
+
+    path = tmp_path_factory.mktemp("prereg") / "PREREG.json"
+    path.write_bytes(prereg.rules_json(prereg.rules()))
+    real = load_script
+
+    def load_pending(name: str):
+        mod = real(name)
+        if hasattr(mod, "PREREG_JSON"):
+            mod.PREREG_JSON = path
+        return mod
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(globals(), "load_script", load_pending)
+        mp.setattr(ev, "PARAKEET_CTC_CER_PREREG", None)
+        yield path
+
+
+GATE =["eval_jsut", "eval_cv8", "eval_reazon"]
 SETS = [*GATE, "eval_emilia"]  # eval_emilia: a monitor-only hold-out, as in the viability run
 BATCH_S = 6.0
 TIMING = {"wall_s", "rtf"}  # measured, not computed: they differ between any two evals

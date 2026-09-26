@@ -49,7 +49,33 @@ from kitsune.text import cer as utt_cer  # noqa: E402
 sys.path.insert(0, str(ROOT / "tools"))
 import study_report  # noqa: E402
 
-_KANA = list("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん")
+
+@pytest.fixture(scope="module", autouse=True)
+def pending_prereg(tmp_path_factory):
+    """The toy corpora here are not the study's selection: 05_evaluate's default --prereg (the committed
+    study/PREREG.json, filled from the uploaded selection) would refuse their manifests and teachers. Every 05 loaded
+    by this module defaults to the rules with their sidecar fields pending instead, and the Parakeet CTC registration
+    kitsune.evaluate read from the committed file at import is taken as pending; a test that needs a filled PREREG
+    passes --prereg or sets PARAKEET_CTC_CER_PREREG itself."""
+    from kitsune import prereg
+
+    path = tmp_path_factory.mktemp("prereg") / "PREREG.json"
+    path.write_bytes(prereg.rules_json(prereg.rules()))
+    real = load_script
+
+    def load_pending(name: str):
+        mod = real(name)
+        if hasattr(mod, "PREREG_JSON"):
+            mod.PREREG_JSON = path
+        return mod
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(globals(), "load_script", load_pending)
+        mp.setattr(ev, "PARAKEET_CTC_CER_PREREG", None)
+        yield path
+
+
+_KANA =list("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん")
 _KATA = list("アイウエオカキクケコサシスセソタチツテトナニヌネノ")
 _KANJI = list("日本語今明晴雨漢字書読三百千万円")
 
@@ -228,12 +254,19 @@ def test_verdict_family_ctc_judges_against_parakeets_ctc_path(monkeypatch):
         ev.verdict(dict(final=_final(stud, pk), history=hist), family="rnnt")
 
 
-def test_prereg_teacher_cer_reads_the_filled_baselines(tmp_path):
-    """PARAKEET_CTC_CER_PREREG comes from study/PREREG.json's baselines once filled: the committed file is pending
-    (None); a filled block gives the gate sets' numbers; a partly filled or unreadable one gives None."""
+def test_prereg_teacher_cer_reads_the_filled_baselines(tmp_path, pending_prereg):
+    """PARAKEET_CTC_CER_PREREG comes from study/PREREG.json's baselines once filled: the committed file (filled from
+    the uploaded selection) gives its gate numbers, a pending one None; a filled block gives the gate sets' numbers; a
+    partly filled or unreadable one gives None."""
     committed = json.loads((ROOT / "study" / "PREREG.json").read_text(encoding="utf-8"))
-    assert committed["baselines"]["status"] == "pending" and ev.prereg_teacher_cer("parakeet-ctc") is None
-    assert ev.PARAKEET_CTC_CER_PREREG is None and ev.family_teacher_prereg("ctc") is None
+    if committed["baselines"]["status"] == "pending":
+        assert ev.prereg_teacher_cer("parakeet-ctc") is None
+    else:
+        assert ev.prereg_teacher_cer("parakeet-ctc") == {s: committed["baselines"]["parakeet-ctc"][s]
+                                                         for s in ev.GATE_SETS}
+    pending = json.loads(pending_prereg.read_text(encoding="utf-8"))
+    assert pending["baselines"]["status"] == "pending" and ev.prereg_teacher_cer("parakeet-ctc", pending) is None
+    assert ev.family_teacher_prereg("ctc") is None  # this module takes the registration as pending
     assert ev.family_teacher_prereg("aed") == ev.TEACHER_CER_PREREG
     pk = {"eval_jsut": 0.0671, "eval_cv8": 0.0758, "eval_reazon": 0.0971, "m4": 0.1}
     filled = dict(committed, baselines=dict(status="filled", **{"parakeet-ctc": pk}))
