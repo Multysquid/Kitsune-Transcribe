@@ -709,3 +709,52 @@ def test_selection_from_the_run_config_and_the_launch_check(corpus, tmp_path):
             ms.main(["--config", str(cfg_path), *flag, *paths])
     with pytest.raises(SystemExit):  # neither --config nor --sources
         ms.main(paths)
+
+
+class _ShutdownDiesIter:
+    """A DataLoader iterator stand-in: yields the sampler's micro-batches, then its worker pool dies in the shutdown
+    join as the A100 shakedown's did (torch's SIGCHLD handler raising inside _shutdown_workers)."""
+
+    def __init__(self, sampler, message):
+        self.src, self.message = iter(sampler), message
+
+    def __next__(self):
+        return next(self.src)
+
+    def _shutdown_workers(self):
+        raise RuntimeError(self.message)
+
+
+def _fake_loader(message):
+    class Loader:
+        def __init__(self, dataset, *, sampler, **kw):
+            self.sampler = sampler
+
+        def __iter__(self):
+            return _ShutdownDiesIter(self.sampler, message)
+
+    return Loader
+
+
+def test_loader_close_survives_a_worker_dying_in_shutdown(monkeypatch):
+    """A worker that dies while the pool shuts down (after the consumer is done) is a warning, not an error: the
+    trainer's final loader.close() after a STOP must not turn a finished run into a failed one."""
+    import kitsune.trainset as T
+
+    monkeypatch.setattr(T.torch.utils.data, "DataLoader",
+                        _fake_loader("DataLoader worker (pid 11267) is killed by signal: Aborted. "))
+    loader = make_loader(None, [[[0], [1]], [[2]]], num_workers=0)
+    first = next(loader)
+    assert first[0] == 0 and len(first[1]) == 2
+    with pytest.warns(RuntimeWarning, match="died while the loader shut down"):
+        loader.close()
+
+
+def test_loader_close_still_raises_other_shutdown_errors(monkeypatch):
+    import kitsune.trainset as T
+
+    monkeypatch.setattr(T.torch.utils.data, "DataLoader", _fake_loader("something else broke"))
+    loader = make_loader(None, [[[0]], [[1]]], num_workers=0)
+    next(loader)
+    with pytest.raises(RuntimeError, match="something else broke"):
+        loader.close()

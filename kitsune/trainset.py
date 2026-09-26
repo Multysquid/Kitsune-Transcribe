@@ -36,6 +36,7 @@ import json
 import os
 import sys
 import time
+import warnings
 import zipfile
 from collections import deque
 from dataclasses import dataclass, field, fields
@@ -1253,6 +1254,17 @@ def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepP
         finally:
             shutdown = getattr(it, "_shutdown_workers", None)
             if shutdown is not None:
-                shutdown()
+                try:
+                    shutdown()
+                except RuntimeError as e:
+                    # a worker that dies while the pool is being shut down (seen on an A100 box: SIGABRT in a worker's
+                    # exit after the trainer's STOP, reported by torch's SIGCHLD handler inside the join) cannot have
+                    # lost anything: every micro-batch the consumer took was whole, and torch's own finally still
+                    # terminates the other workers and drops their pids. Raising here would mark a finished run (or
+                    # an eval) failed; a death while batches are still wanted raises from fetch() above instead
+                    if "DataLoader worker" not in str(e):
+                        raise
+                    warnings.warn(f"make_loader: a worker died while the loader shut down ({e.args[0].strip()}); "
+                                  "nothing it yielded was lost", RuntimeWarning, stacklevel=2)
 
     return gen()
