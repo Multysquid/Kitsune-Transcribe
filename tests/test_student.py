@@ -873,9 +873,13 @@ def test_model_card_describes_the_student():
     random. The card's wording is what model_card rewrites (a changed card would only warn)."""
     from dataclasses import asdict
 
-    card = S.MODEL_CARD.read_bytes().decode("utf-8")
+    card = S.MODEL_CARD.read_bytes().decode("utf-8").replace("\r\n", "\n")  # LF, whatever the checkout's endings
     assert S._CARD_CHANGES.search(card)
     assert S.model_card({}) == card and S.model_card({"format": 1, "bn": {"n_utts": 1000}}) == card
+    study = S.study_card_data(card)  # a study student's card: the first run's plus the study's training data
+    assert study is not None and "laion/Emolia" not in card and "reazonspeech.large" not in card
+    assert "- japanese-asr/whisper_transcriptions.reazonspeech.large\n- laion/Emolia\n---\n" in study
+    assert study.count("Emilia, Japanese non-YODAS part") == 1 and study.count("CDLA-Sharing-1.0") == 1
 
     def split(text):  # (the card outside the notice's what-was-done part, that part with whitespace normalised)
         head, rest = text.split("LICENSE-2.0). ", 1)
@@ -884,7 +888,7 @@ def test_model_card_describes_the_student():
 
     def notice(meta):
         outside, part = split(S.model_card(meta))
-        assert outside == split(card)[0]  # everything else is the card's, byte for byte
+        assert outside == split(study)[0]  # everything else is the study card's, byte for byte
         return part
 
     pruned = dict(init_class="pruned_kept", enc_layers=S.evenly_spaced(20, 48), ffn=2560, dec_layers=[0, 2, 5, 7],
@@ -901,6 +905,25 @@ def test_model_card_describes_the_student():
     assert scratch.startswith("It has that model's architecture at another size (encoder: 12 layers, width 512, FFN "
                               "2048; decoder: 4 layers, width 512, FFN 2048;") and "randomly initialised" in scratch
     assert "pruned" not in scratch and "FFN neurons kept" not in scratch
+
+
+STUDY_STUDENTS = Path(os.environ.get("KITSUNE_STUDY_STUDENTS", "D:/kitsune-students/study"))
+
+
+@pytest.mark.parametrize("name", ["t06", "t03", "bridge", "t01", "t01-s1235", "t005"])
+def test_model_card_is_the_uploaded_readme(name):
+    """model_card renders exactly the README.md uploaded with each Transcribe student init of the size study
+    (Multy123/kitsune-data students/study/<name>/, local copies under D:/kitsune-students/study; skipped without
+    them), from its student_meta.json alone; a checkpoint trained from it (its meta plus the trainer's `trained`
+    block, 04_distill save_weights) gets the same card."""
+    d = STUDY_STUDENTS / name
+    if not (d / "README.md").is_file() or not (d / "student_meta.json").is_file():
+        pytest.skip(f"no uploaded student {d}")
+    meta = json.loads((d / "student_meta.json").read_text(encoding="utf-8"))
+    want = (d / "README.md").read_bytes().decode("utf-8")
+    assert S.model_card(meta) == want
+    trained = dict(meta, trained=dict(run_id=f"study-{name}", step=9370, reason="final", lr_phase="cooldown"))
+    assert S.model_card(trained) == want
 
 
 def test_importance_state_roundtrip(tmp_path):
