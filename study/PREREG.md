@@ -65,17 +65,17 @@ Shapes:
   - The pruned Transcribe students (T-0.6B, T-0.3B) keep the function-kept settings (warm-up 300, probe class kept-t03) although their step-0 CER against the teacher is >= 90 %: an AED decoder derails at step 0, and the first run trained this recipe fine. The 90 % step-0 rule classifies the Parakeet students only.
   - Every LR-probe grid has 3 points up front: kept-t03 and kept-p03 1e-4 / 2e-4 / 4e-4, bridge 2e-4 / 4e-4 / 1e-3 (scratch and lost unchanged); the edge rule is unchanged.
   - The first run's 1,000 calibration ids (importance_ids_sha256 5e31cd68...) were recovered from the HF dataset's history, and every pruned student (T-0.3B, P-0.3B, P-0.1B, P-0.05B) was rebuilt on them; T-0.6B keeps the first run's FFN selection.
-  - The study runs on two boxes, Cohere first (BOXES): box A trains the Transcribe students, box B the Parakeet students and the bridge, the replicate a 1x box after box A; each box measures study-t06's step time on its own host and writes its own numbers file (decision 2).
+  - The study runs on two boxes at the same time (BOXES): box A trains the Transcribe students, box B the Parakeet students and the bridge, launched together from one commit, with their own run ids, state, queue and numbers files and backed-off commits into the one runs repo; each box measures study-t06's step time on its own host and writes its own numbers file, once (decision 2). The replicate is a 1x box after both, only on its trigger.
   - The replicate is conditional (decision 3; noise.replicate_trigger): every call is computed at sigma_run 1.6 % and 3.2 % after boxes A and B, and study-t01-s1235 runs only if a family's delta 10 % limit call differs between the two; then sigma_run = max(1.6 %, sigma_hat) as before, otherwise the calls are reported robust to sigma_run up to 3.2 %.
 
-## Owner decisions (all at the recommendation; 2 and 17 changed on 2026-09-26)
+## Owner decisions (all at the recommendation; 2, 3 and 17 changed on 2026-09-26)
 
 - **1**
   - **option**: a
   - **answer**: the limit: tolerance delta 10 % against the family's largest student; delta 5 and 20 % also reported
 - **2**
   - **option**: AB
-  - **answer**: two 4x A100 boxes, Cohere first: box A the Transcribe students, box B the Parakeet students and the bridge, each calibrating on its own host; the replicate on a 1x box after box A (BOXES)
+  - **answer**: two 4x A100 boxes that run at the same time, launched together: box A the Transcribe students, box B the Parakeet students and the bridge, each calibrating on its own host and writing its own numbers file; the replicate on a 1x box after both, only on its trigger (decision 3; BOXES)
   - **changed_2026_09_26**
     - **was**: S3: one 4x A100 SXM4 40 GB box, calibration + probes + 2 waves; S3b, then S1p as fallbacks
 - **3**
@@ -292,7 +292,7 @@ Shapes:
 - **max_steps_multiple**: 10
 - **max_steps**: max_steps_i = round_to_10(9366 x t_study-t06 / t_i) = 10 x floor(9366 x t_study-t06 / t_i / 10 + 1/2), both step times measured on the host that trains run i (study-t06 itself: 9,370)
 - **t_i**: the median step time (the difference of consecutive steps' loop clocks: data wait, forward, backward, optimizer and logging included) at the planned micro_audio_s on the box's host, over 200 steps that start at the first step >= 50 logged after every run of its calibration group (groups) has reached step 50, so each of them is timed while every other run of the group trains; the group stops once every run has its window (the run that reaches step 50 last is timed over steps 50-250); data_wait_frac is the loader's share of the window's time
-- **per_box**: each box calibrates its 'calibrate' list (BOXES) and measures study-t06 on its own host: box B calibrates study-t06 for 250 steps without training it
+- **per_box**: each box calibrates its 'calibrate' list (BOXES) and measures study-t06 on its own host: box B calibrates study-t06 for 250 steps without training it (as calib-study-t06-boxB: boxes A and B calibrate at the same time into one runs repo)
 - **grouping**: a box's 'calibrate' list, in list order, in groups of the box's GPU count (A and B: 4): the runs of a group train at the same time, one per GPU; a short last group is filled with the list's first runs that are not in it, as unmeasured load, so every run is measured with as many runs training as its wave has. Each list names the box's own runs first: they are measured together, exactly as their wave trains. Box B measures study-t06 last, beside study-p03, study-p01 and study-p005 as load
 - **gpus**
   - **A**: 4
@@ -385,7 +385,7 @@ Shapes:
   - 7 eval sets: every row present in both roots, unfiltered (filter_eval_sets []); views at scoring
 - **reasons**: kept, truncated, no_agree, agree>A, no_audio, not_in_parakeet, f1a_disagree, eval_dup, ctc_infeasible, not_drawn
 - **coverage**: launch refuses a selection with any eval row not_in_parakeet (K6: both passes label the eval sets whole) or more than 0.1 % of its train rows not_in_parakeet (K5)
-- **frame_preflight**: at store build, for every row: the ParakeetFeatureExtractor length of the rebuilt, decoded audio, 8x subsampled, equals the stored n_frames (never a length derived from the stored duration: K4, decision 15); mismatches are dropped and counted, the box fails above 0.1 % of train rows or on any eval row (decision 15)
+- **frame_preflight**: at store build, for every row: the ParakeetFeatureExtractor length of the rebuilt, decoded audio, 8x subsampled, equals the stored n_frames (never a length derived from the stored duration: K4, decision 15); a row whose audio does not decode is a mismatch too; mismatches are dropped and counted, the box fails above 0.1 % of train rows or on any eval row (decision 15)
 
 ## Manifest and hashes
 
@@ -565,8 +565,10 @@ Shapes:
 - an LR probe winner at a grid edge after its one extension
 - the frame preflight above 0.1 % of train rows or on any eval row
 - a selection, manifest or PREREG hash that differs from this file
+- a student init whose student_meta.json fails its runs entry (student_problems: parameter counts, seed, calibration ids), checked before renting and again after the box's pull
 - any rule field still pending
 - the replicate box without box A's numbers file, or with one written under other rules
+- a relaunched box whose numbers file in the runs repo was written under other rules or for another box (numbers.write_once)
 
 ## The conclusion is invalid if
 
@@ -596,5 +598,6 @@ Shapes:
   - **replicate**: PREREG_numbers_replicate.json
 - **keys**: box, calibration, max_steps, lr_probes, lr, rules_sha256, written_utc, host
 - **when**: written and uploaded by each box, its sha256 logged as an event, before that box's first study step (write_numbers(..., box=<A|B|replicate>))
+- **write_once**: a relaunched box whose file is already in the runs repo reuses it as it is and skips its calibration and probes (never measured twice, never overwritten), only when the file was written under these rules (its rules_sha256) for that box; any other file halts the box for the owner
 - **per_box**: a box's file holds its own calibration table, the max_steps and LRs of the runs it trains and the probes it ran; the replicate's holds no calibration and no probes, and names box A's file (numbers_from: its sha256) whose study-t01 max_steps, LR and calibrated micro_audio_s it takes
 - **report**: tools/study_report.py --numbers reads all three files, each run against the file of the box that trains it

@@ -10,10 +10,11 @@ Two layers, so that no number the study reports can be chosen after its results 
              study/PREREG.json (canonical JSON, the hashed form) and study/PREREG.md (the same content for reading).
              Both are committed to main by PR before the first study box launches.
   numbers    what only a study host can measure: the calibration table, max_steps per run, the LR probe objectives
-             and the chosen LRs. The study runs on two boxes and a 1x box for the replicate (BOXES, the owner's
-             decision of 2026-09-26); each computes its numbers mechanically with max_steps(box=...) and choose_lr() on
-             its own host, then write_numbers(..., box=...) writes PREREG_numbers_<box>.json and returns its sha256,
-             which the box logs as an event and uploads before its first study step. The replicate box writes its
+             and the chosen LRs. The study runs on two boxes at the same time and, only on its trigger, a 1x box for
+             the replicate (BOXES, the owner's decisions of 2026-09-26); each computes its numbers mechanically with
+             max_steps(box=...) and choose_lr() on its own host, then write_numbers(..., box=...) writes
+             PREREG_numbers_<box>.json and returns its sha256, which the box logs as an event and uploads before its
+             first study step; the file is written once (a relaunched box reuses it). The replicate box writes its
              file from box A's (replicate_numbers). write_numbers refuses numbers that do not follow from the
              measurements by these rules, and rules that are still pending.
 
@@ -161,13 +162,15 @@ EDGE_FACTOR = 2.0  # a winner at a grid edge gets one more point: x2 at the top,
 
 # ------------------------------------------------------------------------------------------------ the boxes
 
-# The owner's decision of 2026-09-26 ("Cohere box first"): box A (4x A100) trains the four Transcribe students in one
-# wave, each followed by its T/2 branch on the same GPU, probes kept-t03 and scratch, and re-scores the anchor in a gap;
-# box B (4x A100, later) trains the three Parakeet students and the bridge the same way, probes lost, kept-p03 and
-# bridge, calibrates study-t06 for CALIB_STEPS as its host's reference step time (without training it) and runs the
-# speed probes of all 9 students + both teachers at its end, one model at a time; the replicate trains on a 1x box after
-# box A with study-t01's max_steps and the scratch LR from box A's numbers. Each box measures t_study-t06 on its own
-# host, so every max_steps is equal compute on the host that trains the run. Consumers (vast/*, kitsune.study_queue)
+# The owner's decisions of 2026-09-26 (two boxes; then "Box A and Box B run at the same time", CONTRACT.md 8): box A
+# (4x A100) trains the four Transcribe students in one wave, each followed by its T/2 branch on the same GPU, probes
+# kept-t03 and scratch, and re-scores the anchor in a gap; box B (4x A100, launched together with box A) trains the
+# three Parakeet students and the bridge the same way, probes lost, kept-p03 and bridge, calibrates study-t06 for
+# CALIB_STEPS as its host's reference step time (without training it) and runs the speed probes of all 9 students + both
+# teachers at its end, one model at a time. The two never clash: own run ids, state, queue and numbers files, and
+# backed-off commits into the one runs repo. The replicate is conditional (noise.replicate_trigger, after boxes A and B)
+# and trains on a 1x box with study-t01's max_steps and the scratch LR from box A's numbers. Each box measures
+# t_study-t06 on its own host, so every max_steps is equal compute on the host that trains the run. Consumers (vast/*, kitsune.study_queue)
 # read this block through rules()["boxes"]; its structure is part of the wave-2 contract (CONTRACT.md section 6).
 # The order of a "calibrate" list is part of the rule: it is measured in groups of the box's GPU count in list order
 # (calibration_groups), so each list names the box's own runs first - they are measured together, exactly as their
@@ -236,9 +239,10 @@ OWNER_CHANGES = [
     "The first run's 1,000 calibration ids (importance_ids_sha256 5e31cd68...) were recovered from the HF dataset's "
     "history, and every pruned student (T-0.3B, P-0.3B, P-0.1B, P-0.05B) was rebuilt on them; T-0.6B keeps the first "
     "run's FFN selection.",
-    "The study runs on two boxes, Cohere first (BOXES): box A trains the Transcribe students, box B the Parakeet "
-    "students and the bridge, the replicate a 1x box after box A; each box measures study-t06's step time on its own "
-    "host and writes its own numbers file (decision 2).",
+    "The study runs on two boxes at the same time (BOXES): box A trains the Transcribe students, box B the Parakeet "
+    "students and the bridge, launched together from one commit, with their own run ids, state, queue and numbers "
+    "files and backed-off commits into the one runs repo; each box measures study-t06's step time on its own host and "
+    "writes its own numbers file, once (decision 2). The replicate is a 1x box after both, only on its trigger.",
     "The replicate is conditional (decision 3; noise.replicate_trigger): every call is computed at sigma_run 1.6 % and "
     "3.2 % after boxes A and B, and study-t01-s1235 runs only if a family's delta 10 % limit call differs between the "
     "two; then sigma_run = max(1.6 %, sigma_hat) as before, otherwise the calls are reported robust to sigma_run up to "
@@ -309,11 +313,12 @@ ANCHOR_FLAG_REL = 0.05  # 4.1: T-0.6B worse than the anchor by more than 5 % rel
 # ------------------------------------------------------------------------------------------------ the decisions
 
 # decision -> (the accepted option, what it means); the owner accepted every recommendation (study/decisions.json),
-# then changed decisions 2 and 17 on 2026-09-26 (CHANGED_DECISIONS holds what they said before; OWNER_CHANGES why)
+# then changed decisions 2, 3 and 17 on 2026-09-26 (CHANGED_DECISIONS holds what they said before; OWNER_CHANGES why)
 DECISIONS = {
     1: ("a", "the limit: tolerance delta 10 % against the family's largest student; delta 5 and 20 % also reported"),
-    2: ("AB", "two 4x A100 boxes, Cohere first: box A the Transcribe students, box B the Parakeet students and the "
-              "bridge, each calibrating on its own host; the replicate on a 1x box after box A (BOXES)"),
+    2: ("AB", "two 4x A100 boxes that run at the same time, launched together: box A the Transcribe students, box B "
+              "the Parakeet students and the bridge, each calibrating on its own host and writing its own numbers "
+              "file; the replicate on a 1x box after both, only on its trigger (decision 3; BOXES)"),
     3: ("a", "control runs: the bridge, and a replicate of T-0.1B with seed 1235 only if a family's limit call "
              "depends on sigma_run (1.6 % vs 3.2 %; noise.replicate_trigger)"),
     4: ("a", "budget cuts in this order: the replicate, T at 3 epochs, the contingency; never stage away 0.05B"),
@@ -581,7 +586,8 @@ def rules(sidecar: dict | None = None) -> dict:
                    f"window (the run that reaches step {CALIB_STEPS[0]} last is timed over steps "
                    f"{CALIB_STEPS[0]}-{CALIB_STEPS[1]}); data_wait_frac is the loader's share of the window's time",
             "per_box": f"each box calibrates its 'calibrate' list (BOXES) and measures {T_REF_RUN} on its own host: "
-                       f"box B calibrates {T_REF_RUN} for {CALIB_STEPS[1]} steps without training it",
+                       f"box B calibrates {T_REF_RUN} for {CALIB_STEPS[1]} steps without training it (as "
+                       f"calib-{T_REF_RUN}-boxB: boxes A and B calibrate at the same time into one runs repo)",
             "grouping": "a box's 'calibrate' list, in list order, in groups of the box's GPU count (A and B: 4): the "
                         "runs of a group train at the same time, one per GPU; a short last group is filled with the "
                         "list's first runs that are not in it, as unmeasured load, so every run is measured with as "
@@ -648,8 +654,9 @@ def rules(sidecar: dict | None = None) -> dict:
                         f"(K5)",
             "frame_preflight": "at store build, for every row: the ParakeetFeatureExtractor length of the rebuilt, "
                                "decoded audio, 8x subsampled, equals the stored n_frames (never a length derived from "
-                               "the stored duration: K4, decision 15); mismatches are dropped and counted, the box "
-                               "fails above 0.1 % of train rows or on any eval row (decision 15)",
+                               "the stored duration: K4, decision 15); a row whose audio does not decode is a "
+                               "mismatch too; mismatches are dropped and counted, the box fails above 0.1 % of train "
+                               "rows or on any eval row (decision 15)",
         },
         "manifest": _pending_manifest(),
         "metrics": {
@@ -736,8 +743,12 @@ def rules(sidecar: dict | None = None) -> dict:
                   "an LR probe winner at a grid edge after its one extension",
                   "the frame preflight above 0.1 % of train rows or on any eval row",
                   "a selection, manifest or PREREG hash that differs from this file",
+                  "a student init whose student_meta.json fails its runs entry (student_problems: parameter counts, "
+                  "seed, calibration ids), checked before renting and again after the box's pull",
                   "any rule field still pending",
-                  "the replicate box without box A's numbers file, or with one written under other rules"],
+                  "the replicate box without box A's numbers file, or with one written under other rules",
+                  "a relaunched box whose numbers file in the runs repo was written under other rules or for another "
+                  "box (numbers.write_once)"],
         "invalid_if": ["a run misses its max_steps, or resumes with a changed config",
                        "a selection or manifest hash differs between runs (on one box or across boxes)",
                        "the teacher baselines do not reproduce",
@@ -758,6 +769,10 @@ def rules(sidecar: dict | None = None) -> dict:
                     "keys": list(NUMBERS_KEYS),
                     "when": "written and uploaded by each box, its sha256 logged as an event, before that box's first "
                             "study step (write_numbers(..., box=<A|B|replicate>))",
+                    "write_once": "a relaunched box whose file is already in the runs repo reuses it as it is and "
+                                  "skips its calibration and probes (never measured twice, never overwritten), only "
+                                  "when the file was written under these rules (its rules_sha256) for that box; any "
+                                  "other file halts the box for the owner",
                     "per_box": "a box's file holds its own calibration table, the max_steps and LRs of the runs it "
                                "trains and the probes it ran; the replicate's holds no calibration and no probes, and "
                                "names box A's file (numbers_from: its sha256) whose study-t01 max_steps, LR and "
@@ -1034,7 +1049,7 @@ def rules_md(r: dict) -> str:
     lines += ["", f"- **objective**: {r['lr_probes']['objective']}", f"- **edge rule**: {r['lr_probes']['edge_rule']}",
               f"- **grids**: {r['lr_probes']['grids']}", ""]
     titles = [("owner_changes", "The owner's changes of 2026-09-26"),
-              ("decisions", "Owner decisions (all at the recommendation; 2 and 17 changed on 2026-09-26)"),
+              ("decisions", "Owner decisions (all at the recommendation; 2, 3 and 17 changed on 2026-09-26)"),
               ("boxes", "Boxes (who trains, probes and calibrates what)"),
               ("init_class", "Init class and the step-0 gate"),
               ("training", "Training"), ("calibration", "Calibration and max_steps"), ("branch", "The T/2 branch"),
