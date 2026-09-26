@@ -75,31 +75,41 @@ The size study (study/STUDY.md 4.1-4.3; CONTRACT.md 1, 5):
             above, unchanged (the first run's numbers reproduce). ctc: a Parakeet CTC student (a ParakeetForCTC dir,
             kitsune.ctc_student.load_ctc_student) with its own features (ctc_features: Parakeet's 80-mel LogMel, no
             dither) through kitsune.evaluate.ctc_eval: one encoder pass per batch gives the greedy CTC text (argmax,
-            collapse, drop blanks; decode_ids) and, from the stored Parakeet frame targets under the config's
-            parakeet_root (parakeet_out/<set>/eval-*.npz), the teacher-forced frame metrics (KL on dense and blank
-            frames, CTC per target token, argmax agreement, argmax-blank share); the probe likewise on its train
-            shards. The CTC student's teacher is Parakeet's stored CTC path (parakeet_out ctc_hyp): the greedy tables'
-            teacher_hyp, the baselines (kitsune.evaluate.parakeet_baselines, checked against PARAKEET_CTC_CER_PREREG
-            from study/PREREG.json once it is filled, not while it is pending) and the verdict's ratios
-            (verdict(family="ctc")). The student is scored against the eval store's reference, which must equal
-            parakeet_out's. A student frame count that differs from its stored n_frames leaves that row out of the
-            teacher-forced metrics and is counted (tf.n_frame_mismatch); the greedy text does not depend on it
+            collapse, drop blanks; decode_ids) and, against the stored Parakeet frame targets, the teacher-forced frame
+            metrics (KL on dense and blank frames, CTC per target token, argmax agreement, argmax-blank share); the
+            probe likewise on its train rows. The stores are the trainer's for the family (04_distill.build_eval_store;
+            the probe's family_store): with the CTC trainer's frame stores (kitsune.trainset.build_frame_stores, built
+            with the frame preflight of decision 15: a mismatched eval row fails the build) the targets ride in every
+            batch, exactly as the trainer evaluates; on a token store they are read from parakeet_root
+            (parakeet_out/<set>/<stem>.npz) and a student frame count other than the stored n_frames refuses the eval
+            (decision 15: any eval row; the probe's train rows above 0.1 %). The CTC student's teacher is Parakeet's
+            stored CTC path (parakeet_out ctc_hyp): the greedy tables' teacher_hyp, the baselines
+            (kitsune.evaluate.parakeet_baselines, checked against PARAKEET_CTC_CER_PREREG from study/PREREG.json once
+            it is filled, not while it is pending) and the verdict's ratios (verdict(family="ctc")). The student is
+            scored against the eval store's reference, which must equal parakeet_out's
   manifest  with --manifest (default: study_manifest.json next to the config's selection, when it exists; "none":
             none) the eval is checked against the study's frozen eval manifest (kitsune.study_stats.parse_manifest:
-            every set's ids hash to its sha256; against study/PREREG.json's manifest block once filled): each evaluated
-            set's rows in the eval store must be exactly the manifest's ids, else the eval refuses before any model is
-            loaded. Afterwards it writes
+            every set's ids hash to its sha256; against study/PREREG.json's manifest block once filled): the config's
+            eval_sets hold every manifest set (unless --sets names a part), and each evaluated set's rows in the eval
+            store must be exactly the manifest's ids, else the eval refuses before any model is loaded. A study eval
+            without a manifest refuses too (study_intent: --tables / --system / --anchor, a ctc student, a study
+            selection or a study run name; --manifest none evaluates a study config without tables). Afterwards it
+            writes
               tables/<system>/<set>.parquet  the per-utterance table of CONTRACT.md 5 (kitsune.evaluate.
                                utterance_table: id, set, ref, hyp, edits, ref_len, hyp_len, sub, del, ins, edits_style,
                                edits_nostyle, truncated), in manifest order, one file per set: --tables DIR is what
-                               tools/study_report.py --tables reads. --system names it (default the config's
-                               run_name). A set whose decoded rows are not all of its manifest ids gets no table and
-                               the run exits non-zero
+                               tools/study_report.py --tables reads. --system names it (default: the run's name,
+                               default_system - the config's run_name, a T/2 branch's <parent>-half as the trainer names
+                               it). A system's tables are one eval's: a set without a table now loses an older one. A
+                               set whose decoded rows are not all of its manifest ids gets no table and the run exits
+                               non-zero, as does a manifest set not evaluated (except those a --sets eval left out)
               study.json       per stratum (the eval sets, Galgame as its views galgame_neutral / galgame_all /
                                galgame_label_box) the system's corpus CER (raw and no-style) and its own teacher's on
-                               the same rows, M4 and the gate-pooled CER, the manifest's hashes and the tables written
+                               the same rows, M4 and the gate-pooled CER, the manifest's hashes, the tables written,
+                               the sets refused or missing
   --anchor  the first run's 0.6B (its checkpoint dir, e.g. step_9774) re-scored on the manifest (decision 29) as system
-            anchor-b20: an aed eval with the study config's eval settings, no history, no verdict, no probe
+            anchor-b20: an aed eval with the study config's eval settings, no history, no verdict, no probe. A config
+            whose run_name is anchor-b20 (configs/study/anchor-b20.json) is this mode without the flag
   --teachers  no model: the teachers' tables from their stored hypotheses on the manifest rows - cohere (teacher_out
             hyp), parakeet-ctc (parakeet_out ctc_hyp), parakeet-tdt (parakeet_out hyp) - after checking that both roots
             hold every manifest row with the same reference, that the stored per-utterance cer / ctc_cer are this
@@ -107,16 +117,20 @@ The size study (study/STUDY.md 4.1-4.3; CONTRACT.md 1, 5):
             them; every teacher and stratum against PREREG.json's baselines once filled, 0.05 pp): a drift refuses,
             unless eval.check_baselines is false. Writes tables/<teacher>/<set>.parquet and teachers.json
   --from-evals DIR  no model: the tables of a system from an eval dir that already holds its greedy_<set>.parquet
-            (the trainer's runs/<run_id>/evals/step_<N>/, or a 05 --out), checked against the manifest; with --system
+            (the trainer's runs/<run_id>/evals/step_<N>/, or a 05 --out), checked against the manifest; with --system.
+            Every manifest set (or the --sets named) must be there and match, else it exits non-zero; study.json's
+            family is the --config's, else the eval dir's own (evals_family)
 Wave-2 config keys that another package adds to 04_distill.DEFAULTS (family, loss.w_ctc, pull_parakeet,
 selection_recipe.study) are accepted here before that package lands: they are set aside for the merge (LATER_KEYS).
+A generated study config whose schedule.max_steps is still null (its box fills it) is validated with a stand-in; the
+eval never reads it.
 
 Usage:
   python scripts/05_evaluate.py --root D:/Shizu-ko-distill --config configs/viability.json \
       --ckpt runs/<run_id>/checkpoints/step_<N> --out <dir> [--probe] [--sets eval_jsut eval_cv8] [--vram-frac 0.95]
   python scripts/05_evaluate.py --config configs/study/study-p01.json --ckpt <step dir> --out <dir> --probe \
       --tables evals/study                                       # a CTC student on the manifest, its tables
-  python scripts/05_evaluate.py --config configs/study/study-t06.json --anchor \
+  python scripts/05_evaluate.py --config configs/study/anchor-b20.json \
       --ckpt runs/viability-b20x2560-20260925T071746Z/checkpoints/step_9774 --out evals/anchor --tables evals/study
   python scripts/05_evaluate.py --config configs/study/study-t06.json --teachers --out evals/teachers \
       --tables evals/study
@@ -130,6 +144,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -486,9 +501,24 @@ def load_cfg(D, args) -> tuple[dict, Path]:
         D.apply_set(cfg, s)
     if args.batch_s is not None:
         cfg["eval"]["batch_s"] = float(args.batch_s)
-    D.validate(cfg)
-    cfg.setdefault("family", later.get("family", LATER_KEYS["family"]))
-    cfg["loss"].setdefault("w_ctc", later.get("loss.w_ctc", LATER_KEYS["loss.w_ctc"]))
+    sch = cfg["schedule"]
+    # a generated study config (tools/make_study_configs.py) leaves max_steps to its box, which fills it from the
+    # PREREG numbers when it starts the run: the trainer's validate needs one on the steps clock, the eval reads none,
+    # so it is validated with a stand-in and stays null
+    unset = sch.get("clock") == "steps" and sch.get("max_steps") is None
+    if unset:
+        sch["max_steps"] = VALIDATE_MAX_STEPS
+    try:
+        D.validate(cfg)
+    finally:
+        if unset:
+            sch["max_steps"] = None
+    for key, default in LATER_KEYS.items():  # back in, with their values (the file's, or the default)
+        *path, last = key.split(".")
+        node = cfg
+        for part in path:
+            node = node.setdefault(part, {})
+        node.setdefault(last, later.get(key, default))
     if family_of(cfg) not in ("aed", "ctc"):
         raise SystemExit(f"family must be 'aed' or 'ctc', got {cfg['family']!r}")
     root = Path(args.root).resolve()
@@ -1230,18 +1260,20 @@ def tables_from_frames(man, frames: dict[str, pd.DataFrame], hyp_col: str = "hyp
     return tables, refused
 
 
-def publish_tables(tables_dir: Path, system: str, tables: dict[str, pd.DataFrame], refused: dict[str, str]) -> dict:
-    """<tables_dir>/<system>/<set>.parquet for every table, durable; a refused set's older table goes (the report must
-    not read a stale one). Returns {set: path}."""
+def publish_tables(tables_dir: Path, system: str, tables: dict[str, pd.DataFrame]) -> tuple[dict, list[str]]:
+    """<tables_dir>/<system>/<set>.parquet for every table, durable. A system's tables are one source's: every other
+    <set>.parquet there (a set refused or missing now, left by an earlier call from another eval) goes first, so the
+    report never reads one system made of two checkpoints. Returns ({set: path}, the sets whose older table went)."""
     d = tables_dir / system
     d.mkdir(parents=True, exist_ok=True)
-    for s in refused:
+    stale = sorted(p.stem for p in d.glob("*.parquet") if p.stem not in tables)
+    for s in stale:
         (d / f"{s}.parquet").unlink(missing_ok=True)
     paths = {}
     for s, t in tables.items():
         _table(t, d / f"{s}.parquet")
         paths[s] = str(d / f"{s}.parquet")
-    return paths
+    return paths, stale
 
 
 def study_block(man, tables: dict[str, pd.DataFrame], teacher: dict[str, pd.DataFrame] | None = None) -> dict:
@@ -1303,19 +1335,22 @@ def study_record(system: str, family: str | None, M: dict, block: dict, paths: d
 
 
 def write_study(ctx: Ctx, tables_dir: Path) -> dict:
-    """The system's tables and study.json from the evaluated sets' greedy_<set>.parquet (their teacher_hyp column is
-    the family's teacher on the same rows). Returns study.json's record; a set without a table is in its refused."""
+    """The system's tables and study.json from the evaluated sets' greedy_<set>.parquet in --out (their teacher_hyp
+    column is the family's teacher on the same rows). Returns study.json's record: a set whose rows are not its
+    manifest ids is in refused, a manifest set not evaluated in --out (yet: a --sets eval) in missing_sets; neither
+    has a table (publish_tables removes an older one)."""
     man = ctx.manifest["manifest"]
     present = [s for s in ctx.cfg["eval_sets"] if s in man.sets and set_done(ctx.out, s)]
+    missing = [s for s in man.sets if s not in present]
     frames = {s: pd.read_parquet(ctx.out / f"greedy_{s}.parquet") for s in present}
     tables, refused = tables_from_frames(man, frames)
     teacher, _ = tables_from_frames(man, frames, hyp_col="teacher_hyp", trunc_col="teacher_truncated")
-    paths = publish_tables(tables_dir, ctx.system, tables, refused)
+    paths, stale = publish_tables(tables_dir, ctx.system, tables)
     rec = study_record(ctx.system, ctx.family, ctx.manifest, study_block(man, tables, teacher), paths, refused,
-                       out=str(ctx.out))
+                       missing_sets=missing, stale_removed=stale, out=str(ctx.out))
     _write_output_json(ctx.out / "study.json", rec)
-    ctx.log.event("study_tables", system=ctx.system, sets=sorted(tables), refused=refused, m4=rec["metrics"].get("m4"),
-                  tables=str(tables_dir / ctx.system))
+    ctx.log.event("study_tables", system=ctx.system, sets=sorted(tables), refused=refused, missing_sets=missing,
+                  stale_removed=stale, m4=rec["metrics"].get("m4"), tables=str(tables_dir / ctx.system))
     return rec
 
 
@@ -1454,7 +1489,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override a config key as 04_distill.py --set does (repeatable; JSON values)")
     ap.add_argument("--sets", nargs="+", default=None,
-                    help="eval sets to evaluate (default: the config's eval_sets)")
+                    help="eval sets to evaluate (default: the config's eval_sets); --teachers / --from-evals: the "
+                         "manifest sets to table (default: all of them)")
     ap.add_argument("--probe", action="store_true",
                     help="also the train probe (teacher-forced) and its greedy part, as the trainer's evals")
     ap.add_argument("--batch-s", type=float, default=None,
@@ -1519,6 +1555,47 @@ def _versions() -> dict:
 
 def _tables_dir(args, out: Path) -> Path:
     return Path(args.tables).resolve() if args.tables else out / "tables"
+
+
+def default_system(cfg: dict, args, trained: dict) -> str:
+    """The tables' system name without --system: anchor-b20 with --anchor, else the run's name as the trainer gave it -
+    the config's run_name, and for a T/2 branch config (branch.parent) the name of the checkpoint's run (its trained
+    run_id less the -<stamp>): <parent run_name>-half when the config kept its parent's run_name (04_distill.build),
+    so a branch's tables never land on its parent's. A branch checkpoint without that run id needs a -half run_name
+    or --system."""
+    if args.anchor:
+        return ANCHOR
+    name = cfg["run_name"]
+    if (cfg.get("branch") or {}).get("parent"):
+        m = re.fullmatch(r"(.+)-\d{8}T\d{6}Z(?:-\d+)?", str(trained.get("run_id") or ""))
+        if m:
+            return m.group(1)
+        if not name.endswith(HALF):
+            raise SystemExit(f"a T/2 branch config (branch.parent) with run_name {name!r} and a checkpoint without the "
+                             f"trainer's run id: the trainer names such a run {name}{HALF} unless its run_name differs "
+                             "from the parent's - name its tables with --system")
+    return name
+
+
+def study_intent(cfg: dict, args) -> str | None:
+    """Why an eval without a manifest would be a study eval that cannot be one (main refuses it), or None: --tables,
+    --system or --anchor ask for the study's tables; a CTC student, a study selection (selection_recipe.study) or a
+    study run name (kitsune.study_stats.is_study_run, or the anchor's) are the study's. --manifest none turns the check
+    off, except for what asks for tables."""
+    from kitsune import study_stats as ss
+
+    asks = [f for f, on in (("--tables", args.tables), ("--system", args.system), ("--anchor", args.anchor)) if on]
+    if asks:
+        return f"{' and '.join(asks)} write the study's tables"
+    if args.manifest and args.manifest.lower() == "none":
+        return None
+    if family_of(cfg) == "ctc":
+        return "a ctc (Parakeet) student is a study run"
+    if (cfg.get("selection_recipe") or {}).get("study"):
+        return "the config's selection is the study's (selection_recipe.study)"
+    if ss.is_study_run(cfg["run_name"]) or cfg["run_name"] == ANCHOR:
+        return f"run_name {cfg['run_name']} is a study run"
+    return None
 
 
 def main_teachers(args) -> int:
@@ -1588,7 +1665,7 @@ def main_teachers(args) -> int:
     if drift and check:
         raise SystemExit("REFUSED: teacher baselines drift from PREREG.json by more than 0.05 pp: " + "; ".join(drift))
     tdir = _tables_dir(args, out)
-    paths = {name: publish_tables(tdir, name, t, {}) for name, t in tables.items()}
+    paths = {name: publish_tables(tdir, name, t)[0] for name, t in tables.items()}
     rec = dict(manifest=manifest_record(M), config=str(cfg_path),
                teacher_root=cfg["teacher_root"], parakeet_root=str(parakeet_root(cfg)), sets=sets,
                teachers={name: dict(blocks[name], tables=paths[name], stored_cer_mismatches=stored[name])
@@ -1601,37 +1678,58 @@ def main_teachers(args) -> int:
     return 0
 
 
+def evals_family(src: Path) -> str | None:
+    """The family of the system whose eval dir `src` is: a 05 --out's evaluator.json (its last invocation's family; an
+    aed eval without a manifest records none), else the run's config.json two levels up (runs/<run_id>/evals/step_<N>/:
+    its config's family, "aed" when it has none, as the trainer reads it), else None."""
+    rec = _load_json(src / "evaluator.json")
+    if isinstance(rec, dict) and rec.get("invocations"):
+        return str(rec["invocations"][-1].get("family") or "aed")
+    run = _load_json(src.parent.parent / "config.json") if src.parent.name == "evals" else None
+    if isinstance(run, dict) and isinstance(run.get("config"), dict):
+        return str(run["config"].get("family") or "aed")
+    return None
+
+
 def main_from_evals(args) -> int:
     """--from-evals DIR: a system's tables and study.json from the greedy_<set>.parquet an eval dir holds (the
     trainer's evals/step_<N>/ or a 05 --out), checked against the manifest; the family's teacher is the tables'
-    teacher_hyp column. Exits non-zero when a set of the manifest could not be tabled."""
+    teacher_hyp column. Every set of the manifest is tabled (or the --sets named): exits non-zero when one could not
+    be - its rows are not the manifest's (refused), or the dir has none (missing_sets) - and a set without a table
+    now has none in the tables dir either (publish_tables)."""
     src = Path(args.from_evals).resolve()
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     log = EvalLog(out / "events.jsonl")
     cfg = None
-    if not args.manifest:
+    if not args.manifest or args.config != DEFAULT_CONFIG:
         cfg, _ = load_cfg(load_trainer(), args)
     mpath = manifest_path(args, cfg)
     if mpath is None:
         raise SystemExit("--from-evals needs the study manifest (--manifest, or a --config whose selection has one)")
     M = load_manifest(mpath, args.prereg, log)
     man = M["manifest"]
-    frames = {s: pd.read_parquet(src / f"greedy_{s}.parquet") for s in man.sets
-              if (src / f"greedy_{s}.parquet").is_file()}
+    want = list(dict.fromkeys(args.sets or man.sets))
+    if absent := [s for s in want if s not in man.sets]:
+        raise SystemExit(f"REFUSED: {absent} are not sets of the manifest {sorted(man.sets)}")
+    frames = {s: pd.read_parquet(src / f"greedy_{s}.parquet") for s in want if (src / f"greedy_{s}.parquet").is_file()}
     if not frames:
         raise SystemExit(f"{src}: no greedy_<set>.parquet of a manifest set")
+    missing = [s for s in want if s not in frames]
     tables, refused = tables_from_frames(man, frames)
     teacher, _ = tables_from_frames(man, frames, hyp_col="teacher_hyp", trunc_col="teacher_truncated")
-    paths = publish_tables(_tables_dir(args, out), args.system, tables, refused)
-    fam = family_of(cfg) if cfg else None
+    paths, stale = publish_tables(_tables_dir(args, out), args.system, tables)
+    fam = family_of(cfg) if cfg else evals_family(src)
     rec = study_record(args.system, fam, M, study_block(man, tables, teacher), paths, refused, source=str(src),
-                       missing_sets=sorted(set(man.sets) - set(frames)))
+                       missing_sets=missing, stale_removed=stale)
     _write_output_json(out / "study.json", rec)
-    log.event("study_tables", system=args.system, sets=sorted(tables), refused=refused, m4=rec["metrics"].get("m4"),
-              source=str(src))
-    if refused:
-        raise SystemExit(f"REFUSED: no table for {sorted(refused)}: " + "; ".join(refused.values()))
+    log.event("study_tables", system=args.system, sets=sorted(tables), refused=refused, missing_sets=missing,
+              stale_removed=stale, m4=rec["metrics"].get("m4"), source=str(src))
+    if refused or missing:
+        raise SystemExit("REFUSED: no table for " + "; ".join(
+            [*(f"{s}: {why}" for s, why in refused.items()),
+             *(f"{s}: no greedy_{s}.parquet in {src}" for s in missing)])
+            + " (name the sets to table with --sets for a partial one)")
     return 0
 
 
@@ -1656,20 +1754,27 @@ def main(argv=None) -> int:
     family = family_of(cfg)
     if (fc := ckpt_family(ckpt)) not in (None, family):
         raise SystemExit(f"{ckpt} is a {fc} model, the config's family is {family}")
+    anchor_implied = not args.anchor and cfg["run_name"] == ANCHOR
+    if anchor_implied:  # the anchor's study config (configs/study/anchor-b20.json; the box's queue passes no --anchor)
+        if args.probe:
+            raise SystemExit(f"run_name {ANCHOR} is the anchor re-score, which has no probe: drop --probe")
+        args.anchor = True
     if args.anchor and family != "aed":
         raise SystemExit("--anchor re-scores the first run's 0.6B (a Transcribe model): it needs an aed config")
     if args.anchor:
         args.history = "none"  # the anchor's history is another run's, on other eval sets
-    system = args.system or (ANCHOR if args.anchor else cfg["run_name"])
     trained = S.load_meta(ckpt).get("trained") or {}
+    system = args.system or default_system(cfg, args, trained)
     step = int(args.step if args.step is not None else trained.get("step", 0))
     sets = list(dict.fromkeys(args.sets or cfg["eval_sets"]))
     unknown = [s for s in sets if s not in cfg["eval_sets"]]
     if unknown:
         raise SystemExit(f"--sets {unknown} not among the config's eval_sets {cfg['eval_sets']}")
     mpath = manifest_path(args, cfg)
-    if args.anchor and mpath is None:
-        raise SystemExit("--anchor scores on the study manifest: pass --manifest (or a config whose selection has one)")
+    if mpath is None and (why := study_intent(cfg, args)):
+        raise SystemExit(f"REFUSED: {why}, and there is no study manifest (--manifest, or {MANIFEST_FILE} next to the "
+                         f"config's selection {cfg.get('selection')}): a study eval scores the manifest or does not "
+                         "run (--manifest none evaluates a study config without tables)")
     dev = cfg["device"]
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if dev in (None, "auto") else dev)
     inv = dict(time_utc=_now(), argv=list(argv) if argv is not None else sys.argv[1:], ckpt=str(ckpt), step=step,
@@ -1681,7 +1786,8 @@ def main(argv=None) -> int:
         inv.update(family=family, system=system, manifest=str(mpath) if mpath else None, anchor=bool(args.anchor))
     log.event("evaluate_start", ckpt=str(ckpt), step=step, sets=sets, probe=args.probe, device=str(device),
               autocast=cfg["autocast"], batch_s=float(cfg["eval"]["batch_s"]), config=str(cfg_path),
-              root=inv["root"], out=str(out), **({"family": family, "system": system} if "family" in inv else {}))
+              root=inv["root"], out=str(out), **({"family": family, "system": system} if "family" in inv else {}),
+              **({"anchor_implied": True} if anchor_implied else {}))
     ctx = None
     refused = {}
     try:
@@ -1691,14 +1797,20 @@ def main(argv=None) -> int:
         random.seed(seed)
         if device.type == "cuda":
             torch.set_float32_matmul_precision("high" if cfg["perf"]["tf32"] else "highest")
+        M = None
+        if mpath is not None:  # the study: the eval scores the frozen manifest or refuses here, before any store
+            M = load_manifest(mpath, args.prereg, log)
+            if not args.sets and (absent := [s for s in M["manifest"].sets if s not in cfg["eval_sets"]]):
+                raise SystemExit(f"REFUSED: the manifest's sets {absent} are not among the config's eval_sets "
+                                 f"{cfg['eval_sets']}: a study eval scores every set of the manifest (a partial one "
+                                 "names its sets with --sets)")
         t0 = time.time()
         store = D.build_eval_store(cfg, log)
         greedy_ids = D.greedy_subset_ids(cfg, store)
         log.event("data", eval_utts=len(store), eval_h=round(store.hours, 3), per_set=store.info.get("per_source"),
-                  dropped=store.info.get("dropped"), greedy=len(greedy_ids), build_s=round(time.time() - t0, 1))
-        M = None
-        if mpath is not None:  # the study: the eval scores the frozen manifest or refuses here
-            M = load_manifest(mpath, args.prereg, log)
+                  dropped=store.info.get("dropped"), greedy=len(greedy_ids), build_s=round(time.time() - t0, 1),
+                  **({"kind": store.info.get("kind")} if store.info.get("kind") else {}))
+        if M is not None:
             check_store_against_manifest(M["manifest"], store, sets, cfg)
         teacher_rows = targets = None
         pk_files = []
@@ -1768,15 +1880,23 @@ def main(argv=None) -> int:
                 run_probe(ctx)
         end_force(ctx)
         sweep_work(ctx)  # passes that hold a set done now can never continue
+        check_frame_alignment(ctx)
         summary = write_summary(ctx, step, trained, ckpt)
+        partial = []
         if M is not None:
             study = write_study(ctx, _tables_dir(args, out))
-            refused = study["refused"]
-            inv.update(tables=study["tables"], refused=refused, m4=study["metrics"].get("m4"))
-        inv.update(status="complete" if not refused else "tables_refused", headline=(summary or {}).get("headline"))
+            refused = dict(study["refused"])
+            if args.sets:  # a partial eval: the sets not evaluated yet have no table, as asked
+                partial = study["missing_sets"]
+            else:
+                refused.update({s: "not evaluated in --out" for s in study["missing_sets"]})
+            inv.update(tables=study["tables"], refused=refused, missing_sets=study["missing_sets"],
+                       m4=study["metrics"].get("m4"))
+        inv.update(status="tables_refused" if refused else "tables_partial" if partial else "complete",
+                   headline=(summary or {}).get("headline"))
         if refused:
             raise SystemExit(f"REFUSED: no table for {sorted(refused)} (the eval itself is complete): "
-                             + "; ".join(refused.values()))
+                             + "; ".join(f"{s}: {why}" for s, why in refused.items()))
         return 0
     except BaseException as e:
         inv.update(status="failed" if inv["status"] == "running" else inv["status"],
