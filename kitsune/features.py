@@ -102,7 +102,7 @@ class LogMel(nn.Module):
     def from_feature_extractor(cls, fe, **kw) -> "LogMel":
         """Copy every setting (and the filterbank tensor itself) from an HF CohereAsrFeatureExtractor instance."""
         return cls(fe.mel_filters, n_fft=fe.n_fft, hop_length=fe.hop_length, win_length=fe.win_length,
-                   preemphasis=fe.preemphasis, dither=fe.dither, sampling_rate=fe.sampling_rate,
+                   preemphasis=fe.preemphasis, dither=getattr(fe, "dither", 0.0), sampling_rate=fe.sampling_rate,
                    n_mels=fe.feature_size, **kw)
 
     @classmethod
