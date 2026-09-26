@@ -460,6 +460,51 @@ def test_build_script_end_to_end_tiny(build_env):
         mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(tmp / "x"), "--expect-calib-sha", "0" * 64])
 
 
+def test_build_script_calib_ids(build_env):
+    """--calib-ids calibrates on exactly the listed ids, in order (the importance key hashes the ordered ids), as
+    03_build_student's does: the first run's 1,000 ids, which today's selection no longer draws. Every build writes the
+    ids it ranked the FFNs on to <out>/calibration_ids.txt; the same list reuses the shared cache, another order is
+    another calibration, and a list that is too short or names an id the selection does not keep for training stops
+    the build."""
+    mod, base, tmp = build_env
+    m03 = mod.build_script()
+    imp, a = tmp / "importance.pt", tmp / "a"
+    assert mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(a), "--importance", str(imp),
+                            "--gate-utts", "0", "--init-class", "pruned_kept"]) == 0
+    ma = CS.load_meta(a)
+    ids = (a / "calibration_ids.txt").read_text(encoding="utf-8").split()
+    assert len(ids) == 12 and ids == torch.load(imp, weights_only=True)["ids"]
+    assert ma["calibration"]["ids_sha256"] == m03.ids_sha(ids) and ma["calibration"]["ids_from"] == "seeded sample"
+
+    listed = tmp / "ids.txt"
+    listed.write_text("\n".join(ids + ["spare-never-read"]) + "\n", encoding="utf-8")  # only the first 12 are read
+    b = tmp / "b"
+    mtime = imp.stat().st_mtime_ns
+    assert mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(b), "--importance", str(imp),
+                            "--seed", "99", "--calib-ids", str(listed), "--expect-calib-sha", m03.ids_sha(ids),
+                            "--gate-utts", "0", "--init-class", "pruned_kept"]) == 0
+    mb = CS.load_meta(b)
+    assert mb["importance"]["reused"] and imp.stat().st_mtime_ns == mtime  # another seed, the same ids: one cache
+    assert mb["calibration"]["ids_from"] == str(listed) and mb["calibration"]["ids_sha256"] == m03.ids_sha(ids)
+    assert (b / "calibration_ids.txt").read_text(encoding="utf-8").split() == ids and mb["kept"] == ma["kept"]
+
+    rev = tmp / "rev.txt"
+    rev.write_text("\n".join(ids[::-1]) + "\n", encoding="utf-8")
+    c = tmp / "c"
+    assert mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(c), "--importance", str(tmp / "imp2.pt"),
+                            "--calib-ids", str(rev), "--gate-utts", "0", "--init-class", "pruned_kept"]) == 0
+    mc = CS.load_meta(c)
+    assert not mc["importance"]["reused"] and mc["calibration"]["ids_sha256"] == m03.ids_sha(ids[::-1])
+    for bad, match in ((ids[:5], "5 ids, this build needs 12"), (ids[:11] + ["no-such-id"], "not kept train rows")):
+        (tmp / "bad.txt").write_text("\n".join(bad) + "\n", encoding="utf-8")
+        with pytest.raises(SystemExit, match=match):
+            mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(tmp / "x"), "--calib-ids",
+                             str(tmp / "bad.txt"), "--gate-utts", "0", "--init-class", "pruned_kept"])
+    with pytest.raises(SystemExit, match="expect-calib-sha"):
+        mod.main(base + ["--enc-layers", "2", "--ffn", "40", "--out", str(tmp / "y"), "--calib-ids", str(rev),
+                         "--expect-calib-sha", m03.ids_sha(ids), "--gate-utts", "0", "--init-class", "pruned_kept"])
+
+
 def test_build_script_golden_runs_on_the_built_and_the_saved_student(build_env, monkeypatch):
     """--golden checks the fp32 build (the reproduction claim) and the bf16 copy (the storage rounding) separately.
     The golden rows themselves are real JSUT audio, so the reader is stubbed here (tests/test_ctc_real.py runs it)."""
