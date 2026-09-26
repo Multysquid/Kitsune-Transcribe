@@ -65,8 +65,45 @@ def logits_of(model, batch):
     return model(**batch, use_cache=False).logits
 
 
-def test_relpos_patch_parity_padded_batch():
+GRAD_TOL = 1e-5  # relative gradient difference allowed (fp32; the patch changes the GEMM shapes, so the rounding)
+GRAD_FLOOR = 1e-6  # parameters whose max |g| is below this x the global max are compared at the global scale only
+
+
+def parity_model():
+    """tiny_model with its subsampling convs re-initialised to the PyTorch default (seeded), as
+    kitsune.student.build_scratch_student does: HF's N(0, 0.02) shrinks the subsampling output to ~1e-5, so every
+    encoder attention gradient - the part the patch changes - sits at 1e-11..1e-8, at the float32 noise floor of the
+    backward pass; with the default init the patched relative_k_proj gets gradients of ~1e-5..1e-4 whose run-to-run
+    noise is ~1e-7 relative, so a wrong gradient through the patch shows."""
     model = tiny_model()
+    with torch.no_grad(), torch.random.fork_rng(devices=[]):
+        torch.manual_seed(1)
+        for m in model.model.encoder.subsampling.modules():
+            if isinstance(m, nn.Conv2d):
+                m.reset_parameters()
+    return model
+
+
+def grad_parity(ref: dict, got: dict) -> dict:
+    """How far the gradients `got` are from `ref` ({name: grad}), measured where float32 rounding cannot dominate:
+    global = max |dg| over all parameters / max |g| over all parameters; per_param = the worst max |dg| / max |g| over
+    the parameters whose max |g| >= GRAD_FLOOR x the global max; patched = the same for the parameters the patch
+    changes the backward of (relative_k_proj: expand's backward sums the broadcast rows into one projection), each at
+    its own scale. Structurally ~zero gradients (a k_proj bias, which softmax cancels; a layernorm bias the head barely
+    reaches: max |g| ~1e-11 of the global max) differ by the rounding of the large terms around them, which depends on
+    the thread count's summation order - dividing by their own max made the test fail with OMP_NUM_THREADS=4."""
+    scale = {n: g.abs().max().item() for n, g in ref.items()}
+    diff = {n: (got[n] - g).abs().max().item() for n, g in ref.items()}
+    top = max(scale.values())
+    big = [n for n in ref if scale[n] >= GRAD_FLOOR * top]
+    patched = [n for n in ref if "relative_k_proj" in n]
+    return dict(global_rel=max(diff.values()) / top, per_param=max(diff[n] / scale[n] for n in big),
+                patched=max(diff[n] / max(scale[n], 1e-30) for n in patched), n_big=len(big), n=len(ref),
+                patched_scale=min(scale[n] for n in patched) / top)
+
+
+def test_relpos_patch_parity_padded_batch():
+    model = parity_model()
     batch = padded_batch()
     valid = batch["decoder_attention_mask"].bool()
     for mode in ("eval", "train"):
@@ -88,10 +125,14 @@ def test_relpos_patch_parity_padded_batch():
         print(f"  {mode}: max |logit diff| {diff:.3g}")
         assert diff <= 1e-5
         assert torch.isfinite(out[valid]).all()
-        grad_diff = max(((model.get_parameter(n).grad - g).abs().max() / g.abs().max().clamp_min(1e-12)).item()
-                        for n, g in ref_grads.items())
-        print(f"  {mode}: max relative grad diff {grad_diff:.3g}")
-        assert grad_diff <= 1e-5
+        grads = {n: model.get_parameter(n).grad for n in ref_grads}
+        assert all(g is not None for g in grads.values())
+        gp = grad_parity(ref_grads, grads)
+        print(f"  {mode}: grad diff / global max {gp['global_rel']:.3g}, worst relative over the {gp['n_big']} of "
+              f"{gp['n']} parameters above {GRAD_FLOOR:g} x the global max {gp['per_param']:.3g}, relative_k_proj "
+              f"{gp['patched']:.3g}")
+        assert gp["global_rel"] <= GRAD_TOL and gp["per_param"] <= GRAD_TOL and gp["patched"] <= GRAD_TOL
+        assert gp["patched_scale"] > 1e-9  # the patched path carries a gradient well above the fp32 noise floor
         assert model.model.encoder.layers[0].self_attn.relative_k_proj.weight.grad.abs().sum() > 0
 
 
