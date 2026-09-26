@@ -179,17 +179,20 @@ def _cache_complete(cache_dir: Path) -> bool:
 
 
 def _pack_audio(sel: pd.DataFrame, shard_files: list[Path], data_root: Path, shard_size: dict[str, int],
-                audio_tmp: Path) -> tuple[list[int], list[int], dict[str, int], pd.DataFrame]:
+                audio_tmp: Path, shard_rows: list[int] | None = None
+                ) -> tuple[list[int], list[int], dict[str, int], pd.DataFrame]:
     """The audio pass of a store build: the selected rows' container bytes, joined BY ID from the data shards (the
     first copy of an id wins), written back to back into `audio_tmp` in the order they are found. Returns (order: the
     selection row of each written utterance, lens: its byte count, used: the shards that contributed -> their size,
-    lost: the selected rows without audio). No audio at all is an error."""
+    lost: the selected rows without audio). No audio at all is an error. shard_rows (a list, filled in place): the
+    rows each contributing shard wrote, in packing order (the frame preflight's decode tasks are cut by shard)."""
     want = dict(zip(sel["id"].tolist(), range(len(sel))))
     order, lens, used = [], [], {}
     with open(audio_tmp, "wb") as f:
         for path in shard_files:
             if not want:
                 break
+            first = len(order)
             pf = pq.ParquetFile(path)
             for g in range(pf.num_row_groups):
                 ids = pf.read_row_group(g, columns=["id"]).column("id").to_pylist()
@@ -203,6 +206,8 @@ def _pack_audio(sel: pd.DataFrame, shard_files: list[Path], data_root: Path, sha
                     f.write(b)
                     order.append(r)
                     lens.append(len(b))
+            if shard_rows is not None and len(order) > first:
+                shard_rows.append(len(order) - first)
         f.flush()
         os.fsync(f.fileno())
     lost = sel.iloc[sorted(want.values())]
@@ -400,8 +405,10 @@ def eval_store(selection_path, data_root, teacher_root, cache_dir, eval_sets: Se
 # checks every row at build time by decoding its audio - the duration field is not exact (K4: n_frames from the stored
 # duration differs on 11.6 % of CV8 rows, from the decoded audio on none) - and applies decision 15: a mismatched row
 # is dropped and counted; more than FRAME_MISMATCH_MAX_FRAC of the train rows, or any eval row, fails the build
-# (FramePreflightFailed; its report is also written to <cache_dir>/frame_preflight.json). The report is in stores.json
-# (info["frame_preflight"]), so the trainer logs it for a reused cache too.
+# (FramePreflightFailed; its report is also written to <cache_dir>/frame_preflight.json). A row whose audio does not
+# decode cannot be shown to align: it counts as a frame mismatch (dropped and counted in train, a hard fail in eval).
+# The report is in stores.json (info["frame_preflight"]), so the trainer logs it for a reused cache too. The decode
+# runs in processes, by shard (kitsune.ctc_preflight: threads serialise on the GIL).
 
 FRAME_FORMAT_VERSION = 1  # bump when the frame store layout changes
 FRAME_MISMATCH_MAX_FRAC = 0.001  # decision 15: above this share of the train rows the build fails
@@ -473,36 +480,14 @@ def parakeet_meta(parakeet_root: Path) -> dict:
     return meta
 
 
-def _decoded_lengths(audio_path: Path, offsets: np.ndarray, workers: int, block: int = 64) -> list:
-    """The decoded length in samples of every packed utterance of audio_path (offsets: (n+1,) byte offsets), or the
-    error text of one that does not decode. Threads: libsndfile and soxr release the GIL. Each task reads its block of
-    rows through its own file handle (no memory map, which on Windows would keep the file from being renamed)."""
-    n = len(offsets) - 1
-
-    def run(lo: int) -> list:
-        out = []
-        with open(audio_path, "rb") as f:
-            for i in range(lo, min(lo + block, n)):
-                f.seek(int(offsets[i]))
-                try:
-                    out.append(len(decode_audio(f.read(int(offsets[i + 1] - offsets[i])))))
-                except Exception as e:  # noqa: BLE001 - counted, not fatal (the dataset drops it at batch time)
-                    out.append(f"{type(e).__name__}: {e}"[:200])
-        return out
-
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
-        return [x for part in pool.map(run, range(0, n, block)) for x in part]
-
-
 def frame_preflight(ids: Sequence[str], sources: Sequence[str], splits: Sequence[str], durations, stored: Sequence[int],
                     decoded: Sequence, *, max_frac: float = FRAME_MISMATCH_MAX_FRAC) -> dict:
     """Decision 15 on the rows of one store build: `stored` = the teacher's n_frames, `decoded` = the decoded audio's
-    length in samples (or an error text: the row is not checked, and counted as undecodable). A row whose
-    ctc_frames(length) differs is a mismatch. Returns the report: counts per split, the mismatched rows (dropped, with
-    their stored and expected frames), the undecodable ones, and ok = no eval row mismatched and at most max_frac of
-    the train rows."""
+    length in samples, or an error text. A row whose ctc_frames(length) differs is a mismatch, and so is a row that
+    does not decode (its frames cannot be shown to align; also counted as undecodable, with its error). Returns the
+    report: counts per split (mismatch includes undecodable), the mismatched rows (dropped, with their stored and
+    expected frames; expected None and the error for an undecodable one), the undecodable ones, and ok = no eval row
+    mismatched and at most max_frac of the train rows."""
     mism, bad = [], []
     by_split: dict[str, dict] = {}
     for i, (uid, src, sp, dur, t, ns) in enumerate(zip(ids, sources, splits, durations, stored, decoded)):
@@ -510,7 +495,10 @@ def frame_preflight(ids: Sequence[str], sources: Sequence[str], splits: Sequence
         b["rows"] += 1
         if not isinstance(ns, (int, np.integer)):
             b["undecodable"] += 1
+            b["mismatch"] += 1
             bad.append(dict(id=uid, source=src, split=sp, error=str(ns)))
+            mism.append(dict(i=i, id=uid, source=src, split=sp, stored=int(t), expected=None, n_samples=None,
+                             duration=round(float(dur), 4), error=str(ns)))
             continue
         want = ctc_frames(int(ns))
         if want != int(t):
@@ -522,8 +510,9 @@ def frame_preflight(ids: Sequence[str], sources: Sequence[str], splits: Sequence
     m_other = sum(b["mismatch"] for sp, b in by_split.items() if sp != "train")
     frac = m_train / n_train if n_train else 0.0
     ok = m_other == 0 and frac <= max_frac
-    return dict(policy=f"decision 15: a row whose decoded audio gives another frame count than its stored n_frames is "
-                       f"dropped and counted; more than {100 * max_frac:g} % of the train rows, or any eval row, fails",
+    return dict(policy=f"decision 15: a row whose decoded audio gives another frame count than its stored n_frames, "
+                       f"or whose audio does not decode, is dropped and counted; more than {100 * max_frac:g} % of the "
+                       f"train rows, or any eval row, fails",
                 max_frac=float(max_frac), ok=bool(ok), n_rows=len(ids), n_checked=len(ids) - len(bad),
                 n_mismatch=len(mism), train_mismatch_frac=frac, by_split=by_split, n_undecodable=len(bad),
                 undecodable=bad[:50], mismatches=[{k: v for k, v in m.items() if k != "i"} for m in mism],
@@ -545,7 +534,8 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
     missing or other-settings meta.json (parakeet_meta), a shard's missing .jsonl and a selected row without its jsonl
     line (its reference and teacher text: a partial pull must stop the build, not score CERs against empty strings); a
     frame mismatch is dropped (info["dropped"]["frame_mismatch"]) or fails the build (FramePreflightFailed) as
-    frame_preflight decides. workers: the preflight's decode threads (default: min(32, cpu count))."""
+    frame_preflight decides (an undecodable row is a mismatch). workers: the preflight's decode processes
+    (kitsune.ctc_preflight.decoded_lengths, by shard; default: every core up to 64)."""
     selection_path, data_root, parakeet_root, cache_dir = map(Path, (selection_path, data_root, parakeet_root,
                                                                      cache_dir))
     sources, splits = list(sources), list(splits)
@@ -568,7 +558,8 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
                   npz=[(p.relative_to(parakeet_root).as_posix(), p.stat().st_size, _npz_members(p)) for p in npz_files],
                   jsonl=[_sha256(p.with_suffix(".jsonl")) for p in npz_files],
                   settings={k: pmeta.get(k) for k in ("format_version", "k_ctc", "ctc_dense_thr", "blank", "vocab")},
-                  preflight=dict(max_mismatch_frac=float(max_mismatch_frac), fail_on_eval=True))
+                  # undecodable "mismatch": a cache built when an undecodable row was kept unchecked is rebuilt
+                  preflight=dict(max_mismatch_frac=float(max_mismatch_frac), fail_on_eval=True, undecodable="mismatch"))
     fingerprint = hashlib.sha256(json.dumps(fp_src, sort_keys=True).encode()).hexdigest()
     shard_size = {p.relative_to(data_root).as_posix(): p.stat().st_size for p in shard_files}
     info_path = cache_dir / "stores.json"
@@ -589,7 +580,8 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
 
     # 1. audio, joined by id, written in the order it is found (as build_stores)
     audio_tmp = cache_dir / "audio.bin.tmp"
-    order, lens, used, lost = _pack_audio(sel, shard_files, data_root, shard_size, audio_tmp)
+    shard_rows: list[int] = []
+    order, lens, used, lost = _pack_audio(sel, shard_files, data_root, shard_size, audio_tmp, shard_rows)
     t_audio = time.time() - t0
     idx = sel.iloc[order].reset_index(drop=True)
     n = len(idx)
@@ -639,14 +631,18 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
         raise ValueError(f"{len(missing)} selected rows not found in their parakeet_out shard, e.g. {missing[0]} - "
                          f"selection and parakeet_out do not match")
 
-    # 3. the frame preflight: decode every row, compare its frame count with the stored one (decision 15)
+    # 3. the frame preflight: decode every row (processes, by shard), compare its frame count with the stored one
+    from kitsune.ctc_preflight import decoded_lengths
+
     t1 = time.time()
-    nw = workers or min(32, os.cpu_count() or 1)
-    decoded = _decoded_lengths(audio_tmp, audio_offsets, nw)
+    decoded, how = decoded_lengths(audio_tmp, audio_offsets, workers, shard_rows=shard_rows)
+    nw = how["workers"]
     report = frame_preflight(idx["id"].tolist(), idx["source"].tolist(), idx["split"].tolist(),
                              idx["duration"].to_numpy(), [p[0] for p in per_row], decoded, max_frac=max_mismatch_frac)
     drop = set(report.pop("_rows"))
-    report.update(workers=nw, wall_s=round(time.time() - t1, 2), cache_dir=str(cache_dir))
+    wall = time.time() - t1
+    report.update(workers=nw, decode=how["mode"], tasks=how["tasks"], wall_s=round(wall, 2),
+                  rows_per_s=round(n / wall, 1) if wall > 0 else None, cache_dir=str(cache_dir))
     if not report["ok"]:
         tmp = cache_dir / "frame_preflight.json.tmp"
         tmp.write_text(json.dumps(report, indent=1), encoding="utf-8")
@@ -700,9 +696,7 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
         in_probe=kidx["in_probe"].to_numpy(bool), in_greedy_subset=kidx["in_greedy_subset"].to_numpy(bool),
         ref=[t.get("ref") for t in ktext], hyp=[t.get("ctc_hyp") for t in ktext], tdt_hyp=[t.get("hyp") for t in ktext],
         n_frames=np.array([p[0] for p in kept], dtype=np.int64),
-        # -1: the preflight could not decode it (kept, unchecked; the dataset drops it if it still fails)
-        n_samples=np.array([int(decoded[r]) if isinstance(decoded[r], (int, np.integer)) else -1 for r in keep],
-                           dtype=np.int64),
+        n_samples=np.array([int(decoded[r]) for r in keep], dtype=np.int64),  # every kept row decoded
     )
     tmp = cache_dir / "index.parquet.tmp"
     pq.write_table(pa.table(cols), tmp)
@@ -734,7 +728,7 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
     fsync_path(tmp)
     tmp.replace(info_path)
     log(f"frame stores: built {cache_dir} in {info['build_s']:.1f} s (audio pass {t_audio:.1f} s, preflight "
-        f"{report['wall_s']:.1f} s on {nw} threads): {nk} utts, {info['hours']:.2f} h, {info['n_frames']} frames, "
+        f"{report['wall_s']:.1f} s, {nw} {report['decode']}): {nk} utts, {info['hours']:.2f} h, {info['n_frames']} frames, "
         f"{info['n_ctc_tokens']} CTC target tokens; preflight {report['n_checked']} rows checked, "
         f"{report['n_mismatch']} dropped, {report['n_undecodable']} undecodable"
         + (f"; DROPPED {len(lost)} rows without audio" if len(lost) else ""))

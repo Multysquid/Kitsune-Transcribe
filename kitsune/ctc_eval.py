@@ -25,6 +25,13 @@ kl_per_frame, argmax_blank, teacher_blank, frac_dense, frames_per_token, n_frame
 The model is put in eval mode for the pass and every module's training flag is restored afterwards (frozen BatchNorm
 stays frozen; a training BatchNorm uses its running stats). Under CUDA the encoder runs in bf16 autocast, the CTC head
 always in fp32 (kitsune.ctc_student.ctc_log_probs), as in training and as in the label pass.
+
+One source for what both evaluators share: the teacher-forced summary IS kitsune.evaluate.summarise_ctc_tf (this
+module's summarise_ctc_tf only renames the trainer's n_frames column), and the Parakeet CTC teacher's registered
+numbers are kitsune.evaluate's (teacher_prereg: study/PREREG.json's baselines, the K6 numbers only while those are
+pending). The pass itself stays two implementations - this one reads a frame store only and can skip the decode;
+kitsune.evaluate.ctc_eval also scores a token store against separately loaded targets - and
+tests/test_evaluate_study.py asserts that both give the same sums, summaries and greedy paths on the same batches.
 """
 from __future__ import annotations
 
@@ -41,20 +48,32 @@ import numpy as np
 import pandas as pd
 import torch
 
+from kitsune import evaluate as ev
 from kitsune.ctc_kd import CTC_BLANK, ctc_kd_losses
 from kitsune.trainset import dataset_for, eval_batches
 
-GATE_SETS = ("eval_jsut", "eval_cv8", "eval_reazon")  # == kitsune.evaluate.GATE_SETS
-# The Parakeet CTC teacher's corpus CER (fractions) on the complete gate sets, as the label box stored them
+GATE_SETS = ev.GATE_SETS
+BASELINE_TOL = ev.BASELINE_TOL
+TEACHER_SYSTEM = ev.FAMILY_TEACHER["ctc"]  # "parakeet-ctc", CONTRACT.md 5's system name of this teacher
+# The Parakeet CTC teacher's corpus CER (fractions) on the complete gate sets as the label box stored them
 # (parakeet_out/<set>/eval-*.jsonl ctc_hyp vs ref under kitsune.evaluate.corpus_cer): WP0's K6 on labels/full,
-# 0.06706 / 0.07577 / 0.09706. ctc_teacher_baselines recomputes them at trainer start and refuses to proceed if one
-# drifts by more than BASELINE_TOL (as kitsune.evaluate.teacher_baselines does for Cohere's): a changed eval set would
-# silently move every ratio. STUDY.md 4.1's PARAKEET_CTC_CER_PREREG.
-PARAKEET_CTC_CER_PREREG = {"eval_jsut": 0.0671, "eval_cv8": 0.0758, "eval_reazon": 0.0971}
+# 0.06706 / 0.07577 / 0.09706 (every eval row, which for the gate sets are exactly the manifest's). Only the stand-in
+# while study/PREREG.json's baselines are pending: teacher_prereg.
+PARAKEET_CTC_CER_K6 = {"eval_jsut": 0.0671, "eval_cv8": 0.0758, "eval_reazon": 0.0971}
 # the TDT hypothesis ("hyp") on the same sets, K6: the off-the-shelf bar, reported only
 PARAKEET_TDT_CER = {"eval_jsut": 0.0662, "eval_cv8": 0.0750, "eval_reazon": 0.1020}
-BASELINE_TOL = 0.0005
-TEACHER_SYSTEM = "parakeet-ctc"  # CONTRACT.md 5's system name of this teacher
+
+
+def teacher_prereg() -> tuple[dict[str, float], str]:
+    """(the Parakeet CTC teacher's gate CER per set, its source): kitsune.evaluate's PARAKEET_CTC_CER_PREREG, which
+    reads study/PREREG.json's filled baselines ("registered"), else the K6 numbers ("pending: K6"). Read at call time,
+    so a PREREG fill (or a test's monkeypatch of kitsune.evaluate) is seen without a re-import. ctc_teacher_baselines
+    checks the recomputed CER against it at trainer start; the verdict's own teacher_prereg is kitsune.evaluate's
+    (None while pending)."""
+    reg = ev.family_teacher_prereg("ctc")
+    return (reg, "registered") if reg else (dict(PARAKEET_CTC_CER_K6), "pending: K6")
+
+
 # the per-utterance sums of one pass (ctc_kd_losses' per_utt terms)
 SUMS = ("kl_dense", "kl_blank", "ctc", "n_dense", "n_blank_frames", "argmax_agree", "argmax_blank", "teacher_blank")
 FRAME_KEYS = ("frame_mask", "dense_mask", "blank_lp", "topk_idx", "topk_lp", "ctc_targets", "ctc_target_lengths",
@@ -176,62 +195,12 @@ def ctc_eval_records(model, store, featurizer, device, batch_s: float = 400.0, *
     return pd.DataFrame(recs), hyps, dropped
 
 
-def _div(a: float, b: float) -> float:
-    return a / b if b else float("nan")
-
-
-def _tf_set(df: pd.DataFrame, per_utt: pd.DataFrame) -> dict:
-    ntok, nfr = float(df["n_tok"].sum()), float(df["n_frames"].sum())
-    kl = float(df["sum_kl"].sum())
-    s = dict(n_utts=int(len(df)), n_tok=int(ntok), n_frames=int(nfr), audio_s=float(df["duration"].sum()))
-    s["kl"] = _div(kl, ntok)
-    s["ce"] = s["ctc"] = _div(float(df["sum_ctc"].sum()), ntok)
-    s["top1"] = s["argmax_agree"] = _div(float(df["sum_argmax_agree"].sum()), nfr)
-    s["kl_per_frame"] = _div(kl, nfr)
-    s["kl_dense"] = _div(float(df["sum_kl_dense"].sum()), float(df["sum_n_dense"].sum()))
-    s["kl_blank"] = _div(float(df["sum_kl_blank"].sum()), float(df["sum_n_blank_frames"].sum()))
-    s["argmax_blank"] = _div(float(df["sum_argmax_blank"].sum()), nfr)
-    s["teacher_blank"] = _div(float(df["sum_teacher_blank"].sum()), nfr)
-    s["frac_dense"] = _div(float(df["sum_n_dense"].sum()), nfr)
-    s["frames_per_token"] = _div(nfr, ntok)
-    for k in ("kl", "ce", "top1"):
-        s[f"{k}_utt_mean"] = float(np.nanmean(per_utt[k].to_numpy(np.float64))) if len(per_utt) else float("nan")
-    return s
-
-
 def summarise_ctc_tf(raw: pd.DataFrame, **extra) -> tuple[dict, pd.DataFrame]:
-    """(summary, per_utt) of ctc_eval_records' raw rows, laid out as kitsune.evaluate.summarise_tf's (the module
-    docstring maps the keys): per set and pooled ("all") the sums over the utterances divided by what each measure
-    counts - kl, ce (= ctc) per CTC target token (the objective's normalisation); top1 (= argmax_agree), kl_per_frame,
-    argmax_blank, teacher_blank, frac_dense per valid frame; kl_dense per dense frame, kl_blank per blank-only frame;
-    frames_per_token; n_utts, n_tok, n_frames, audio_s and the utterance means kl_utt_mean, ce_utt_mean,
-    top1_utt_mean (NaN where a count is 0). per_utt: id, source, n_tok, n_frames, kl, ce, top1, duration, kl_dense,
-    kl_blank, kl_per_frame, argmax_blank, teacher_blank, with the same normalisations per utterance (a silent one,
-    U = 0: kl and ce NaN)."""
-    cols = ["id", "source", "n_tok", "n_frames", "kl", "ce", "top1", "duration", "kl_dense", "kl_blank",
-            "kl_per_frame", "argmax_blank", "teacher_blank"]
-    summary = dict(sets={}, n_utts=len(raw), **extra)
-    if not len(raw):
-        return summary, pd.DataFrame(columns=cols)
-
-    def ratio(num, den):
-        num, den = np.asarray(num, np.float64), np.asarray(den, np.float64)
-        return np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
-
-    per = raw[["id", "source", "n_tok", "n_frames"]].copy()
-    per["kl"] = ratio(raw["sum_kl"], raw["n_tok"])
-    per["ce"] = ratio(raw["sum_ctc"], raw["n_tok"])
-    per["top1"] = ratio(raw["sum_argmax_agree"], raw["n_frames"])
-    per["duration"] = raw["duration"]
-    per["kl_dense"] = ratio(raw["sum_kl_dense"], raw["sum_n_dense"])
-    per["kl_blank"] = ratio(raw["sum_kl_blank"], raw["sum_n_blank_frames"])
-    per["kl_per_frame"] = ratio(raw["sum_kl"], raw["n_frames"])
-    per["argmax_blank"] = ratio(raw["sum_argmax_blank"], raw["n_frames"])
-    per["teacher_blank"] = ratio(raw["sum_teacher_blank"], raw["n_frames"])
-    for src, g in raw.groupby("source", sort=True):
-        summary["sets"][src] = _tf_set(g, per.loc[g.index])
-    summary["all"] = _tf_set(raw, per)
-    return summary, per[cols]
+    """(summary, per_utt) of ctc_eval_records' raw rows: kitsune.evaluate.summarise_ctc_tf (its docstring defines every
+    key; kitsune.evaluate.CTC_TF_COLUMNS the per_utt columns), after renaming the raw frame's n_frames to the
+    sum_n_frames it reads - one summariser for the trainer's and 05's CTC evals. Per set and pooled ("all"): kl, ce
+    (= ctc) per CTC target token, top1 (= argmax_agree) per valid frame, and the rest."""
+    return ev.summarise_ctc_tf(raw.rename(columns={"n_frames": "sum_n_frames"}), **extra)
 
 
 def greedy_frame(raw: pd.DataFrame, hyps: dict[str, list[int]], text: dict[str, dict], tokenizer) -> pd.DataFrame:
@@ -343,11 +312,13 @@ def load_parakeet_rows(parakeet_root, sets: Iterable[str], split: str = "eval") 
 def ctc_teacher_baselines(parakeet_root, sets: Iterable[str] = GATE_SETS, check: bool = True) -> dict[str, dict]:
     """The CTC students' teacher baselines, recomputed from parakeet_out/<set>/eval-*.jsonl: per set the Parakeet CTC
     corpus CER (ctc_hyp vs ref; the teacher and ratio baseline) and mean CER, the TDT hypothesis's corpus CER (the
-    off-the-shelf bar), rows, empty references, truncation, hours. With check=True a set of PARAKEET_CTC_CER_PREREG
-    whose recomputed CTC corpus CER is off by more than BASELINE_TOL raises ValueError (at trainer start-up, as
-    kitsune.evaluate.teacher_baselines does for Cohere's); a set without rows is FileNotFoundError."""
+    off-the-shelf bar), rows, empty references, truncation, hours, and `prereg` / `prereg_source` (teacher_prereg: the
+    PREREG.json number, or K6 while pending). With check=True a gate set whose recomputed CTC corpus CER is off that
+    number by more than BASELINE_TOL raises ValueError (at trainer start-up, as kitsune.evaluate.teacher_baselines does
+    for Cohere's): a changed eval set would silently move every ratio. A set without rows is FileNotFoundError."""
     from kitsune.evaluate import corpus_cer
 
+    prereg, source = teacher_prereg()
     out = {}
     for s, rows in load_parakeet_rows(parakeet_root, sets).items():
         if not rows:
@@ -358,11 +329,11 @@ def ctc_teacher_baselines(parakeet_root, sets: Iterable[str] = GATE_SETS, check:
         out[s] = dict(system=TEACHER_SYSTEM, cer_corpus=c["cer"], cer_mean=float(np.mean([r["ctc_cer"] for r in rows])),
                       tdt_cer_corpus=t["cer"], n=len(rows), n_empty_ref=c["n_empty_ref"],
                       trunc_rate=float(np.mean([bool(r.get("truncated")) for r in rows])),
-                      hours=float(sum(r["duration"] for r in rows)) / 3600, prereg=PARAKEET_CTC_CER_PREREG.get(s),
-                      tdt_card=PARAKEET_TDT_CER.get(s))
-        if check and s in PARAKEET_CTC_CER_PREREG and abs(c["cer"] - PARAKEET_CTC_CER_PREREG[s]) > BASELINE_TOL:
+                      hours=float(sum(r["duration"] for r in rows)) / 3600, prereg=prereg.get(s),
+                      prereg_source=source if s in prereg else None, tdt_card=PARAKEET_TDT_CER.get(s))
+        if check and s in prereg and abs(c["cer"] - prereg[s]) > BASELINE_TOL:
             raise ValueError(f"{s}: Parakeet CTC corpus CER {100 * c['cer']:.3f} % differs from the pre-registered "
-                             f"{100 * PARAKEET_CTC_CER_PREREG[s]:.2f} % by more than {100 * BASELINE_TOL:.2f} pp")
+                             f"{100 * prereg[s]:.2f} % ({source}) by more than {100 * BASELINE_TOL:.2f} pp")
     return out
 
 
@@ -370,33 +341,31 @@ def ctc_teacher_baselines(parakeet_root, sets: Iterable[str] = GATE_SETS, check:
 
 
 def verdict_teacher(final: dict | None) -> dict[str, float]:
-    """kitsune.evaluate.verdict's results["teacher"] for a CTC student: per gate set the Parakeet CTC teacher's corpus
-    CER on the same ids as the student's final numbers (their teacher_cer_ref_corpus: the teacher text of a frame store
-    is ctc_hyp), or its pre-registered full-set CER where those have none - never Cohere's, the verdict's own
-    fallback."""
+    """The pending fallback of kitsune.evaluate.verdict(..., family="ctc")'s teacher: for each gate set of the final
+    numbers WITHOUT a same-ids Parakeet CTC CER (their teacher_cer_ref_corpus; the teacher text of a frame store is
+    ctc_hyp, so the trainer's always have one), teacher_prereg's number - the registered one, or K6 while PREREG is
+    pending, where the verdict alone would leave the set unjudged. Sets with a same-ids CER are left to the verdict
+    ("same ids"). Pass it as results["teacher"]."""
     out = {}
     sets = (final or {}).get("sets") or {}
+    prereg, _ = teacher_prereg()
     for s in GATE_SETS:
         tc = (sets.get(s) or {}).get("teacher_cer_ref_corpus")
-        if tc is not None and math.isfinite(float(tc)):
-            out[s] = float(tc)
-        elif s in sets:
-            out[s] = PARAKEET_CTC_CER_PREREG[s]
+        if s in sets and not (tc is not None and math.isfinite(float(tc))) and s in prereg:
+            out[s] = prereg[s]
     return out
 
 
 def relabel_verdict(verdict: dict) -> dict:
-    """kitsune.evaluate.verdict's per-set record of a CTC student with its teacher's names: teacher_system
-    "parakeet-ctc", teacher_prereg / baseline_drift against PARAKEET_CTC_CER_PREREG instead of Cohere's (the numbers
-    compared, the tiers and the thresholds are the verdict's own, on the teacher it was given). In place; returns it."""
-    for s, d in (verdict.get("sets") or {}).items():
-        pre = PARAKEET_CTC_CER_PREREG.get(s)
+    """kitsune.evaluate.verdict(..., family="ctc")'s per-set records named for their teacher: teacher_system
+    "parakeet-ctc" (the verdict's own teacher_prereg / baseline_drift are kitsune.evaluate's PARAKEET_CTC_CER_PREREG,
+    None while pending; the top level says family, teacher and teacher_prereg_status). In place; returns it."""
+    for d in (verdict.get("sets") or {}).values():
         d["teacher_system"] = TEACHER_SYSTEM
-        d["teacher_prereg"] = pre
-        d["baseline_drift"] = float(d["teacher"]) - pre if pre is not None else None
     return verdict
 
 
-__all__ = ["BASELINE_TOL", "CTC_BLANK", "GATE_SETS", "PARAKEET_CTC_CER_PREREG", "PARAKEET_TDT_CER", "TEACHER_SYSTEM",
+__all__ = ["BASELINE_TOL", "CTC_BLANK", "GATE_SETS", "PARAKEET_CTC_CER_K6", "PARAKEET_TDT_CER", "TEACHER_SYSTEM",
            "combined_loss_ctc", "ctc_eval", "ctc_eval_records", "ctc_forward", "ctc_teacher_baselines", "frame_batch",
-           "frame_headline", "gate_sums", "greedy_frame", "relabel_verdict", "store_text", "summarise_ctc_tf", "verdict_teacher"]
+           "frame_headline", "gate_sums", "greedy_frame", "relabel_verdict", "store_text", "summarise_ctc_tf",
+           "teacher_prereg", "verdict_teacher"]
