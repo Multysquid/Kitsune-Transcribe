@@ -59,7 +59,7 @@ def feats(lengths: list[int], seed: int = 0) -> tuple[torch.Tensor, torch.Tensor
 
 
 @pytest.mark.parametrize("name,total,non_emb", [("t01", 103_996_416, 95_083_520), ("t005", 51_209_600, 44_524_928),
-                                                ("bridge", 320_752_384, 302_926_592)])
+                                                ("bridge", 301_822_208, 283_996_416)])
 def test_named_shapes_have_the_studys_counts(name, total, non_emb):
     """STUDY.md 1.1, exactly: total (tied head counted once) and non-embedding (minus embed and pos_emb)."""
     assert S.SCRATCH_EXPECTED_PARAMS[name] == total
@@ -77,12 +77,13 @@ def test_named_shapes_have_the_studys_counts(name, total, non_emb):
 
 
 def test_the_bridge_is_the_t03_shape():
-    """The bridge config is exactly T-0.3B's (B10x2560 + decoder {0,7}): only the init differs."""
+    """The bridge config is exactly T-0.3B's (B8x2560 + decoder {0,2,5,7}, the owner's decision of 2026-09-26): only
+    the init differs."""
     tc = teacher_config()
-    t03 = S.student_config(tc, S.StudentSpec(S.evenly_spaced(10, 48), 2560, [0, 7]))
+    t03 = S.student_config(tc, S.StudentSpec(S.evenly_spaced(8, 48), 2560, [0, 2, 5, 7]))
     assert S.scratch_config(tc, S.SCRATCH_SHAPES["bridge"]).to_dict() == t03.to_dict()
-    assert S.PRUNED_EXPECTED_PARAMS[(10, 2560, (0, 7))] == S.SCRATCH_EXPECTED_PARAMS["bridge"]
-    assert n_params(meta_model(t03)) == 320_752_384
+    assert S.PRUNED_EXPECTED_PARAMS[(8, 2560, (0, 2, 5, 7))] == S.SCRATCH_EXPECTED_PARAMS["bridge"]
+    assert n_params(meta_model(t03)) == 301_822_208
 
 
 def _naive(tc: CohereAsrConfig, shape: S.ScratchShape) -> CohereAsrConfig:

@@ -126,11 +126,12 @@ DISPLAY = {"study-t06": "T-0.6B", "study-t03": "T-0.3B", "study-bridge": "bridge
 # exact total / non-embedding counts, STUDY.md 1.1 (meta-device builds; every builder asserts total == closed form).
 # The anchor is the first run's B20x2560-d4 = the T-0.6B shape; parakeet-ctc is the unpruned CTC path (24 x 4096);
 # cohere is the teacher itself (tests/test_student.py pins it), the far end of the Transcribe distillation gap.
-PARAMS_TOTAL = {"study-t06": 616_963_328, "study-t03": 320_752_384, "study-bridge": 320_752_384,
+# T-0.3B and the bridge are B8x2560 + decoder {0,2,5,7} (the owner's decision of 2026-09-26; kitsune.prereg.RUNS).
+PARAMS_TOTAL = {"study-t06": 616_963_328, "study-t03": 301_822_208, "study-bridge": 301_822_208,
                 "study-t01": 103_996_416, "study-t01-s1235": 103_996_416, "study-t005": 51_209_600,
                 "study-p03": 308_524_033, "study-p01": 98_468_865, "study-p005": 52_190_209,
                 "parakeet-ctc": 610_898_945, ANCHOR: 616_963_328, "cohere": 2_065_647_872}
-PARAMS_NON_EMBEDDING = {"study-t06": 599_137_536, "study-t03": 302_926_592, "study-bridge": 302_926_592,
+PARAMS_NON_EMBEDDING = {"study-t06": 599_137_536, "study-t03": 283_996_416, "study-bridge": 283_996_416,
                         "study-t01": 95_083_520, "study-t01-s1235": 95_083_520, "study-t005": 44_524_928,
                         "study-p03": 305_374_208, "study-p01": 95_319_040, "study-p005": 49_040_384,
                         "parakeet-ctc": 607_749_120, ANCHOR: 599_137_536}
@@ -916,22 +917,48 @@ def teacher_baseline_check(study: Study, prereg_baselines: Mapping[str, Mapping[
                  missing=missing)
 
 
+# the keys of a kitsune.prereg numbers file (prereg.NUMBERS_KEYS): what tells one file from a {box: file} mapping
+NUMBERS_FIELDS = ("box", "calibration", "max_steps", "lr_probes", "lr", "rules_sha256", "written_utc", "host")
+
+
+def numbers_by_box(numbers: Mapping | None) -> dict[str, Mapping]:
+    """The pre-registered numbers as {box: numbers file}. The study writes one file per box (kitsune.prereg:
+    PREREG_numbers_A.json, _B.json and _replicate.json, each naming its "box"; tools/study_report.py --numbers reads
+    them all); one file on its own (the whole study on one host, or a single box's) is keyed by its "box", "all" when it
+    has none; a {box: file} mapping is taken as it is. Each run is checked against the file of the box that trains it:
+    the one whose max_steps names it."""
+    if not numbers:
+        return {}
+    if any(k in numbers for k in NUMBERS_FIELDS):
+        return {str(numbers.get("box") or "all"): numbers}
+    return {str(k): v for k, v in numbers.items() if isinstance(v, Mapping)}
+
+
+def _per_box(files: Mapping[str, Mapping], field: str) -> list[tuple[str, str, object]]:
+    """(key, box, value) for every entry of `field` over the files, keyed by the entry's name, or "<name> (<box>)" when
+    two files hold it (box B calibrates study-t06 too, as its host's reference)."""
+    rows = [(box, k, v) for box, f in files.items() for k, v in (f.get(field) or {}).items()]
+    names = [k for _, k, _ in rows]
+    return [(k if names.count(k) == 1 else f"{k} ({box})", box, v) for box, k, v in rows]
+
+
 def lr_edge_check(numbers: Mapping | None) -> dict:
     """An LR winner at a grid edge after its one extension invalidates (7): the winner of every class's probes
-    (lowest objective) must not be the smallest or largest LR probed. PREREG_numbers.json lr_probes {class: {lr:
-    objective}} holds the extension point too, so an edge winner there is an edge winner after the extension."""
-    probes = (numbers or {}).get("lr_probes")
+    (lowest objective) must not be the smallest or largest LR probed. A numbers file's lr_probes {class: {lr:
+    objective}} holds the extension point too, so an edge winner there is an edge winner after the extension. Every
+    box's file counts (numbers_by_box: each probes its own classes)."""
+    probes = _per_box(numbers_by_box(numbers), "lr_probes")
     if not probes:
-        return check("lr_edge", "not_checked", "no lr_probes in PREREG_numbers.json")
+        return check("lr_edge", "not_checked", "no lr_probes in the numbers files")
     bad, rows = [], {}
-    for cls, grid in probes.items():
+    for cls, box, grid in probes:
         pts = sorted((float(lr), float(obj)) for lr, obj in grid.items() if obj is not None)
         if len(pts) < 2:
             bad.append(f"{cls}: fewer than 2 probed LRs")
             continue
         win = min(pts, key=lambda p: p[1])[0]
         edge = win in (pts[0][0], pts[-1][0])
-        rows[cls] = dict(winner=win, grid=[p[0] for p in pts], at_edge=edge)
+        rows[cls] = dict(winner=win, grid=[p[0] for p in pts], at_edge=edge, box=box)
         if edge:
             bad.append(f"{cls}: winner {win:g} at the edge of {[p[0] for p in pts]}")
     return check("lr_edge", "fail" if bad else "pass",
@@ -939,14 +966,54 @@ def lr_edge_check(numbers: Mapping | None) -> dict:
 
 
 def loader_check(numbers: Mapping | None, limit: float = DATA_WAIT_MAX) -> dict:
-    cal = (numbers or {}).get("calibration")
+    """No run was calibrated loader-bound (7), on any box: every calibration entry of every numbers file (box B's
+    study-t06 as "study-t06 (B)" next to box A's)."""
+    cal = _per_box(numbers_by_box(numbers), "calibration")
     if not cal:
-        return check("loader_bound", "not_checked", "no calibration in PREREG_numbers.json")
-    bad = {r: v.get("data_wait_frac") for r, v in cal.items()
+        return check("loader_bound", "not_checked", "no calibration in the numbers files")
+    bad = {r: v.get("data_wait_frac") for r, _, v in cal
            if v.get("data_wait_frac") is None or float(v["data_wait_frac"]) >= limit}
     return check("loader_bound", "fail" if bad else "pass",
                  f"data_wait >= {limit:.0%} (or missing) for {sorted(bad)}" if bad
                  else f"data_wait < {limit:.0%} for all {len(cal)} calibrated runs", runs=bad)
+
+
+def numbers_check(numbers: Mapping | None, rules_sha256: str | None = None,
+                  file_sha256: Mapping[str, str] | None = None) -> dict:
+    """The numbers files belong to this pre-registration (7: a numbers file written under other rules; the replicate
+    box refuses box A's file under other rules): every file's rules_sha256 is the committed PREREG.json's (rules_sha256:
+    kitsune.prereg.rules_sha256 of it, when given) and the other files'; the replicate's numbers_from names box A's
+    file by that file's sha256 (file_sha256: {box: sha256 of the file's bytes}, when given). A file without
+    rules_sha256 is not compared; nothing compared is not_checked."""
+    files = numbers_by_box(numbers)
+    if not files:
+        return check("numbers", "not_checked", "no numbers files")
+    shas = {b: f.get("rules_sha256") for b, f in files.items() if f.get("rules_sha256")}
+    bad, compared = [], 0
+    if len(shas) > 1:
+        compared += 1
+        if len(set(shas.values())) > 1:
+            bad.append("the files were written under different rules: "
+                       + ", ".join(f"{b} {s[:12]}..." for b, s in sorted(shas.items())))
+    if rules_sha256 and shas:
+        compared += 1
+        bad += [f"{b}: written under rules {s[:12]}..., PREREG.json is {rules_sha256[:12]}..."
+                for b, s in sorted(shas.items()) if s != rules_sha256]
+    for b, f in sorted(files.items()):
+        src = f.get("numbers_from")
+        if isinstance(src, Mapping) and (have := (file_sha256 or {}).get(str(src.get("box")))):
+            compared += 1
+            if src.get("sha256") != have:
+                bad.append(f"{b}: takes its numbers from box {src.get('box')}'s file with sha256 "
+                           f"{str(src.get('sha256'))[:12]}..., that file is {have[:12]}...")
+    boxes = sorted(files)
+    if bad:
+        return check("numbers", "fail", "; ".join(bad), boxes=boxes)
+    if not compared:
+        return check("numbers", "not_checked", f"nothing to compare in the numbers files of {boxes} (no rules_sha256 "
+                                               f"beside another file's or PREREG.json's)", boxes=boxes)
+    return check("numbers", "pass", f"the numbers files of {boxes} were written under the same rules"
+                 + (" as PREREG.json" if rules_sha256 else "") + " and name their sources by sha256", boxes=boxes)
 
 
 def _study_summaries(summaries: Mapping[str, Mapping] | None) -> tuple[dict, list[str]]:
@@ -957,17 +1024,25 @@ def _study_summaries(summaries: Mapping[str, Mapping] | None) -> tuple[dict, lis
 
 def max_steps_check(numbers: Mapping | None, summaries: Mapping[str, Mapping] | None,
                     end_frac: float = 0.5) -> dict:
-    """Every study run reached its pre-registered max_steps (7): PREREG_numbers.json max_steps against the summary's
-    "steps". A T/2 branch ends at round(end_frac x M) (PREREG.json branch.end_frac, not the branch's own config, which
-    could say otherwise; Python's round, as the trainer's frac_step). A study run with a summary but no pre-registered
-    number fails too. Only the study runs count: LR probes, the anchor and other runs in the same runs root are listed
-    as skipped. A pre-registered run without a summary leaves the check not_checked (unless another run fails)."""
-    ms = (numbers or {}).get("max_steps")
+    """Every study run reached its pre-registered max_steps (7): the numbers files' max_steps (every box's; a run named
+    by two files with different numbers fails) against the summary's "steps". A T/2 branch ends at round(end_frac x M)
+    (PREREG.json branch.end_frac, not the branch's own config, which could say otherwise; Python's round, as the
+    trainer's frac_step). A study run with a summary but no pre-registered number fails too. Only the study runs count:
+    LR probes, the anchor and other runs in the same runs root are listed as skipped. A pre-registered run without a
+    summary leaves the check not_checked (unless another run fails)."""
+    ms, bad = {}, []
+    for box, f in numbers_by_box(numbers).items():
+        for run, m in (f.get("max_steps") or {}).items():
+            if run in ms and int(ms[run]) != int(m):
+                bad.append(f"{run}: max_steps {ms[run]} and {m} in two numbers files")
+            ms.setdefault(run, m)
     runs, skipped = _study_summaries(summaries)
     if not ms or not runs:
-        return check("max_steps", "not_checked", "needs PREREG_numbers.json max_steps and the study runs' summaries",
+        if bad:
+            return check("max_steps", "fail", "; ".join(bad), skipped=skipped)
+        return check("max_steps", "not_checked", "needs the numbers files' max_steps and the study runs' summaries",
                      skipped=skipped)
-    bad, rows = [], {}
+    rows = {}
     for run, summ in runs.items():
         target = ms.get(base_run(run))
         steps = summ.get("steps")
@@ -1086,10 +1161,13 @@ def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[
             speed: Mapping[str, Mapping] | None = None, numbers: Mapping | None = None,
             summaries: Mapping[str, Mapping] | None = None, prereg_baselines: Mapping | None = None,
             prereg_manifest: Mapping | None = None, manifest_file_sha256: str | None = None,
-            imitation: bool = True) -> dict:
+            imitation: bool = True, rules_sha256: str | None = None,
+            numbers_file_sha256: Mapping[str, str] | None = None) -> dict:
     """Everything the study reports from its eval results, as one JSON-able dict (tools/study_report.py renders it).
 
-    speed: {system: {"rtf": float, "vram_gb": float, ...}} (the A100 speed probe); numbers: PREREG_numbers.json;
+    speed: {system: {"rtf": float, "vram_gb": float, ...}} (the A100 speed probe); numbers: the numbers files, {box:
+    PREREG_numbers_<box>.json} or one file (numbers_by_box); rules_sha256 / numbers_file_sha256: the committed
+    PREREG.json's rules sha256 and the numbers files' byte sha256s per box, for numbers_check;
     summaries: {run name: the trainer's summary.json} (tools/study_report.load_summaries keys the trainer's stamped run
     dirs by run name); prereg_baselines: prereg_baselines(PREREG.json); prereg_manifest: prereg_manifest(PREREG.json);
     manifest_file_sha256: the sha256 of the manifest file's bytes, compared with PREREG's manifest_sha256."""
@@ -1136,6 +1214,7 @@ def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[
                else "T-0.6B is not worse than the anchor by > 5 % with a CI excluding 0")),
         lr_edge_check(numbers),
         loader_check(numbers),
+        numbers_check(numbers, rules_sha256, numbers_file_sha256),
     ]
     out["invalid"] = any(c["status"] == "fail" for c in out["checks"])
     return _clean(out)
@@ -1159,25 +1238,35 @@ def parse_utc(x) -> datetime | None:
 
 
 def _timing_check(numbers: Mapping | None, summaries: Mapping[str, Mapping] | None) -> dict:
-    """PREREG_numbers.json before the first study step (7): its written_utc against each study run's started_utc
+    """A box's numbers file before that box's first study step (7): the written_utc of the file of the box that trains
+    a run (the file whose max_steps names it; with one file, that file) against each study run's started_utc
     (tools/study_report.load_summaries fills that from the run dir's config.json created_utc, or its stamp, when the
     summary has none; both precede the run's first step). The rules commit's own order is git's record, not visible
     here."""
-    w = parse_utc((numbers or {}).get("written_utc"))
+    files = numbers_by_box(numbers)
+    written = {b: parse_utc(f.get("written_utc")) for b, f in files.items()}
+
+    def written_for(run: str):
+        boxes = [b for b, f in files.items() if base_run(run) in (f.get("max_steps") or {})]
+        if not boxes and len(files) == 1:
+            boxes = list(files)
+        return written[boxes[0]] if boxes else None
+
     runs, _ = _study_summaries(summaries)
-    starts = {r: parse_utc(s.get("started_utc")) for r, s in runs.items()}
-    known = {r: t for r, t in starts.items() if t is not None}
-    if w is None or not known:
-        return check("prereg_timing", "not_checked", "needs PREREG_numbers.json written_utc and the study runs' start "
+    pairs = {r: (parse_utc(s.get("started_utc")), written_for(r)) for r, s in runs.items()}
+    known = {r: tw for r, tw in pairs.items() if None not in tw}
+    if not any(written.values()) or not known:
+        return check("prereg_timing", "not_checked", "needs the numbers files' written_utc and the study runs' start "
                                                      "times")
-    early = sorted(r for r, t in known.items() if t < w)
-    unknown = sorted(r for r, t in starts.items() if t is None)
-    tail = f"; no start time for {unknown}" if unknown else ""
+    early = sorted(r for r, (t, w) in known.items() if t < w)
+    unknown = sorted(r for r in pairs if r not in known)
+    tail = f"; no start time or numbers file for {unknown}" if unknown else ""
+    when = ", ".join(f"{b} {w.isoformat()}" for b, w in sorted(written.items()) if w is not None)
     if early:
-        return check("prereg_timing", "fail", f"runs started before PREREG_numbers.json was written ({w.isoformat()}): "
+        return check("prereg_timing", "fail", f"runs started before their box's numbers file was written ({when}): "
                                               f"{early}" + tail)
     return check("prereg_timing", "not_checked" if unknown else "pass",
-                 f"PREREG_numbers.json ({w.isoformat()}) precedes all {len(known)} study run starts" + tail)
+                 f"the numbers files ({when}) precede all {len(known)} study run starts of their boxes" + tail)
 
 
 def _systems(st: Study, imitation: bool) -> dict:

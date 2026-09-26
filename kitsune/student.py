@@ -69,9 +69,13 @@ FFN_NAMES = ("feed_forward1", "feed_forward2")
 EXPECTED_DEFAULT_PARAMS = 616_963_328  # closed form for B20x2560 / dec4 / V16384 tied (report_model.md section 2)
 # The size study's pruned shapes, (kept encoder layers, FFN width, kept decoder layers) -> total parameters (STUDY.md
 # 1.1). 03_build_student.py asserts a build of one of these shapes from the 48-layer teacher lands on its count.
+# T-0.3B is B8x2560 with T-0.6B's decoder {0,2,5,7} (the owner's decision of 2026-09-26, replacing decision 17's
+# B10x2560 + decoder {0,7}, 320,752,384): the two-layer decoder {0,7} started at a step-0 KL of 15.7 on the gate, worse
+# than a random guess over 16,384 tokens (ln 16384 = 9.7), B8 with the four-layer decoder at 8.1. So T 0.6 -> 0.3
+# changes only the encoder's depth (20 -> 8 of 48 layers, evenly_spaced(8, 48) = [0,7,13,20,27,34,40,47]).
 PRUNED_EXPECTED_PARAMS = {
     (20, 2560, (0, 2, 5, 7)): EXPECTED_DEFAULT_PARAMS,  # T-0.6B, the first run's student
-    (10, 2560, (0, 7)): 320_752_384,  # T-0.3B
+    (8, 2560, (0, 2, 5, 7)): 301_822_208,  # T-0.3B
 }
 # save_student writes it next to the weights as README.md, its modification notice fitted to the student (model_card)
 MODEL_CARD = Path(__file__).resolve().parents[1] / "MODEL_CARD.md"
@@ -431,14 +435,14 @@ class ScratchShape:
             raise ValueError(f"the depthwise conv kernel must be odd ('same' padding): {self}")
 
 
-# STUDY.md 1.1 (decision 18, shapes W). The bridge is the T-0.3B shape (B10x2560 + decoder {0,7}) from scratch: the
-# teacher's widths, 10 encoder and 2 decoder layers.
+# STUDY.md 1.1 (decision 18, shapes W). The bridge is the T-0.3B shape (B8x2560 + decoder {0,2,5,7}, the owner's
+# decision of 2026-09-26) from scratch: the teacher's widths, 8 encoder and 4 decoder layers.
 SCRATCH_SHAPES = {
     "t01": ScratchShape(512, 12, 8, 2048, 512, 4, 8, 2048),
     "t005": ScratchShape(384, 10, 6, 1536, 384, 3, 6, 1536),
-    "bridge": ScratchShape(1280, 10, 8, 2560, 1024, 2, 8, 4096),
+    "bridge": ScratchShape(1280, 8, 8, 2560, 1024, 4, 8, 4096),
 }
-SCRATCH_EXPECTED_PARAMS = {"t01": 103_996_416, "t005": 51_209_600, "bridge": 320_752_384}
+SCRATCH_EXPECTED_PARAMS = {"t01": 103_996_416, "t005": 51_209_600, "bridge": 301_822_208}  # bridge == T-0.3B's
 
 
 def scratch_config(teacher_config: CohereAsrConfig, shape: ScratchShape) -> CohereAsrConfig:

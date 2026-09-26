@@ -2,10 +2,11 @@
 
 The shape and the reasons for each step are in kitsune/ctc_student.py. The pipeline:
   1. check the model dir against kitsune.parakeet's sha256 pins; load the anchor (ParakeetForCTC 24x4096, fp32)
-  2. FFN importance over ALL teacher layers on the first run's calibration utterances - the same 1,000 ids
-     scripts/03_build_student.py draws (its sample_calibration: the selection's kept train rows of the viability
-     sources, seed 1234), featurised on Parakeet's path. Cached in --importance and reused by every size: the cache
-     key is the teacher files, the ids and the feature path, never the student shape.
+  2. FFN importance over ALL teacher layers on the first run's calibration utterances (--calib-ids: exactly the ids
+     T-0.3B calibrates on, read by scripts/03_build_student.py's read_calibration_ids; without it, today's draw of
+     03's sample_calibration: the selection's kept train rows of the viability sources, seed 1234), featurised on
+     Parakeet's path; the ids go to <out>/calibration_ids.txt. Cached in --importance and reused by every size: the
+     cache key is the teacher files, the ids and the feature path, never the student shape.
   3. build: kept layers (evenly spaced, the last always), FFN width, the teacher's BN stats; params == closed form
   4. step-0 gate of the built (fp32) student; --golden: the 32 golden JSUT rows through it; for the unpruned shape
      the reproduction check below (a failure exits non-zero before anything is saved)
@@ -17,8 +18,10 @@ The shape and the reasons for each step are in kitsune/ctc_student.py. The pipel
 The step-0 gate is the study's 60-utterance CPU gate (STUDY 2.2): 20 utterances of <= 15 s from the first shard of each
 of eval_jsut, eval_reazon, eval_cv8 (seeded row-group/row order, seed 2), through the anchor and the student. The init
 class is fixed in advance: "pruned_lost" when the mean per-utterance CER of the student's greedy CTC output against the
-teacher's is >= 90 %, else "pruned_kept". Also reported: corpus CERs, CER against the reference, the full-vocab frame
-KL, the CTC-KD objective on the teacher's own targets (kitsune.ctc_kd), argmax agreement and blank shares.
+teacher's is >= 90 %, else "pruned_kept" (this rule classifies the Parakeet students only: the pruned Transcribe
+students are "function kept" by the owner's decision of 2026-09-26, scripts/03_build_student.py). Also reported: corpus
+CERs, CER against the reference, the full-vocab frame KL, the CTC-KD objective on the teacher's own targets
+(kitsune.ctc_kd), argmax agreement and blank shares.
 
 `--enc-layers all --ffn 4096` must reproduce the teacher: the built student's gate log-probs equal the anchor's (max
 abs diff 0, frame KL 0) and --golden gives the 32 golden CTC transcripts of kitsune/parakeet_golden.json. The script
@@ -29,16 +32,21 @@ copy is bf16, like the encoder that made the label box's targets; that rounding 
 the anchor: frame KL 0.0008, 59/60 gate hypotheses and 31/32 golden transcripts identical - the other one drops a
 Japanese comma, so its normalised CER is 0).
 
-Calibration ids. The first run's exact 1,000 ids (importance_ids_sha256 5e31cd68...) cannot be drawn again on the
-laptop: selection/viability.parquet was rewritten on 2026-09-25 and emilia_yodas / galgame gained shards after that
-build. The P students use today's draw of the same code with the same sources, seed and count; --expect-calib-sha pins
-it, and the ids are stored in the importance cache.
+Calibration ids. The first run's exact 1,000 ids (importance_ids_sha256 5e31cd68...) cannot be drawn again from the
+laptop's selection: selection/viability.parquet was rewritten on 2026-09-25 and emilia_yodas / galgame gained shards
+after that build. They were recovered from the HF dataset's history (the selection at revision 704d1eeace, the draw
+replayed over the shards that existed at the first build; owner-approved 2026-09-26) and every pruned student of the
+study calibrates on them: --calib-ids <file> (one id per line, in order; each a kept train row of --selection with
+audio under --data). --expect-calib-sha pins the ids either way, and they are stored in the importance cache and in
+<out>/calibration_ids.txt.
 
-Usage (laptop, CPU):
+Usage (laptop, CPU; IDS = the first run's calibration_ids.txt, e.g. D:/kitsune-students/study/t03/calibration_ids.txt):
   python scripts/03c_build_ctc_student.py --enc-layers 16 --ffn 2560 --name P-0.3B --out D:/kitsune-students/study/p03 \
-      --importance D:/kitsune-students/study/parakeet_importance.pt
-  python scripts/03c_build_ctc_student.py --enc-layers 8 --ffn 768 --name P-0.1B --out .../p01 --importance ...
-  python scripts/03c_build_ctc_student.py --enc-layers 4 --ffn 768 --name P-0.05B --out .../p005 --importance ...
+      --importance D:/kitsune-students/study/parakeet_importance.pt --calib-ids IDS --expect-calib-sha 5e31cd68...
+  python scripts/03c_build_ctc_student.py --enc-layers 8 --ffn 768 --name P-0.1B --out .../p01 --importance ... \
+      --calib-ids IDS
+  python scripts/03c_build_ctc_student.py --enc-layers 4 --ffn 768 --name P-0.05B --out .../p005 --importance ... \
+      --calib-ids IDS
   python scripts/03c_build_ctc_student.py --enc-layers all --ffn 4096 --golden --out D:/kitsune-tmp/anchor   # the check
 """
 import argparse
@@ -110,7 +118,9 @@ def importance_key(args, ids_sha: str, n: int) -> dict:
 
 
 def load_or_compute_importance(anchor, feats, args, log=print):
-    """(importance over all anchor layers, info). Cached in args.importance (atomic write)."""
+    """(importance over all anchor layers, info, the calibration record, the calibration ids in order). Cached in
+    args.importance (atomic write); main writes the ids to <out>/calibration_ids.txt with the saved student, so a
+    rebuild that fails before its save leaves the previous student's id list in place."""
     import torch
 
     from kitsune import ctc_student as CS
@@ -120,9 +130,16 @@ def load_or_compute_importance(anchor, feats, args, log=print):
     path = Path(args.importance)
     n_layers = anchor.config.encoder_config.num_hidden_layers
     t0 = time.time()
-    log(f"[2/7] calibration sample: {args.calib_utts} utts of {args.sources} from {args.selection}")
-    utts = m03.sample_calibration(args.selection, args.data, args.sources, args.calib_utts, args.seed,
-                                  args.calib_per_group, log=log)
+    if args.calib_ids:
+        ids = m03.read_ids_file(args.calib_ids)
+        if len(ids) < args.calib_utts:
+            sys.exit(f"--calib-ids {args.calib_ids}: {len(ids)} ids, this build needs {args.calib_utts}")
+        log(f"[2/7] calibration: the first {args.calib_utts} of {len(ids)} ids in {args.calib_ids}")
+        utts = m03.read_calibration_ids(args.selection, args.data, args.sources, ids[:args.calib_utts], log=log)
+    else:
+        log(f"[2/7] calibration sample: {args.calib_utts} utts of {args.sources} from {args.selection}")
+        utts = m03.sample_calibration(args.selection, args.data, args.sources, args.calib_utts, args.seed,
+                                      args.calib_per_group, log=log)
     ids = [u["id"] for u in utts]
     key = importance_key(args, m03.ids_sha(ids), len(utts))
     sample_s = round(time.time() - t0, 1)
@@ -131,7 +148,8 @@ def load_or_compute_importance(anchor, feats, args, log=print):
                  f"first run's calibration sample")
     calib = dict(sources=args.sources, seed=args.seed, per_group=args.calib_per_group, n=len(utts),
                  ids_sha256=key["ids_sha256"], hours=sum(u["duration"] for u in utts) / 3600,
-                 per_source={s: sum(u["source"] == s for u in utts) for s in args.sources}, sample_s=sample_s)
+                 per_source={s: sum(u["source"] == s for u in utts) for s in args.sources}, sample_s=sample_s,
+                 ids_from=str(args.calib_ids) if args.calib_ids else "seeded sample", ids_file="calibration_ids.txt")
     if path.exists():
         try:
             c = torch.load(path, map_location="cpu", weights_only=True)
@@ -142,7 +160,7 @@ def load_or_compute_importance(anchor, feats, args, log=print):
             log(f"  importance cache unreadable ({e}); recomputing")
         if ok:
             log(f"  importance: reusing {path} (computed {c['info']['created']})")
-            return S.importance_from_state(c["importance"]), dict(c["info"], reused=True, path=str(path)), calib
+            return S.importance_from_state(c["importance"]), dict(c["info"], reused=True, path=str(path)), calib, ids
         if c is not None:
             log(f"  importance cache {path} does not match (teacher files / calibration ids / features); recomputing")
     log(f"[3/7] FFN importance over all {n_layers} layers, {len(utts)} utts ({calib['hours']:.2f} h)")
@@ -158,7 +176,7 @@ def load_or_compute_importance(anchor, feats, args, log=print):
                     importance=S.importance_to_state(imp)), tmp)
     tmp.replace(path)
     log(f"  importance: {info['wall_s']:.0f} s -> {path}")
-    return imp, dict(info, reused=False, path=str(path)), calib
+    return imp, dict(info, reused=False, path=str(path)), calib, ids
 
 
 # ------------------------------------------------------------------------------------------------ step-0 gate
@@ -345,6 +363,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--calib-batch-s", type=float, default=240.0, help="padded audio seconds per importance batch")
     ap.add_argument("--expect-calib-sha", default=None,
                     help="exit unless the calibration ids hash to this (the first run's importance_ids_sha256)")
+    ap.add_argument("--calib-ids", default=None,
+                    help="calibrate on exactly these ids (one per line, in order; the first --calib-utts of them; e.g. "
+                         "the first run's calibration_ids.txt) instead of the seeded sample, which a changed selection "
+                         "or shard list no longer reproduces")
     ap.add_argument("--gate-sets", nargs="+", default=GATE_SETS)
     ap.add_argument("--gate-utts", type=int, default=GATE_UTTS, help="per gate set; 0 skips the step-0 gate")
     ap.add_argument("--gate-seed", type=int, default=GATE_SEED)
@@ -358,6 +380,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     args = ap.parse_args(argv)
     for k in ("model_dir", "out", "selection", "data"):
         setattr(args, k, Path(getattr(args, k)))
+    args.calib_ids = Path(args.calib_ids) if args.calib_ids else None
     args.importance = Path(args.importance) if args.importance else args.out / "importance.pt"
     if args.gate_utts <= 0 and args.init_class is None:
         ap.error("--gate-utts 0 needs --init-class (the gate is what measures it)")
@@ -408,9 +431,10 @@ def main(argv=None) -> int:
 
     t = time.time()
     if args.ffn < t_ffn:
-        importance, imp_info, calib = load_or_compute_importance(anchor, feats, args)
+        importance, imp_info, calib, calib_ids = load_or_compute_importance(anchor, feats, args)
     else:
         importance, imp_info, calib = None, dict(skipped="ffn == the teacher's width: nothing to prune"), None
+        calib_ids = None
     dur["importance"] = round(time.time() - t, 1)
 
     t = time.time()
@@ -473,6 +497,8 @@ def main(argv=None) -> int:
     meta["stage"] = "saved"
     meta["timestamps"]["saved"] = now()
     CS.save_ctc_student(student, out, args.model_dir, meta)
+    if calib_ids:  # as 03 writes it: the ids this student's FFNs were ranked on, next to the weights ranked on them
+        build_script().write_calibration_ids(out, [{"id": x} for x in calib_ids])
     del student
     gc.collect()
     saved = CS.load_ctc_student(out, "cpu")

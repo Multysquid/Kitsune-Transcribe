@@ -21,7 +21,10 @@ Inputs
                    ("baselines", parakeet_ctc and galgame:<view> keys included) and the manifest block (the eval sets'
                    and Galgame views' id hashes, the manifest file's and the selection's sha256), all compared by the
                    invalidation checks. Out-of-range settings or unreadable JSON: exit 2.
-  --numbers FILE   PREREG_numbers.json (max_steps, lr_probes, calibration, written_utc) for the invalidation checks
+  --numbers FILE|DIR ...  the boxes' numbers files (max_steps, lr_probes, calibration, written_utc, rules_sha256) for
+                   the invalidation checks: PREREG_numbers_A.json, _B.json and _replicate.json (a DIR: every
+                   PREREG_numbers*.json in it), each keyed by its "box"; every run is checked against the file of the
+                   box that trains it, and every file's rules_sha256 against --prereg's (study_stats.numbers_check)
   --run-summaries DIR  the trainer's summaries: its runs root as it is (DIR/<run_name>-<stamp>/summary.json, keyed
                    by config.run_name; the newest start of a run name counts), or DIR/<run>/summary.json, DIR/<run>.json
                    (steps, resumes, config.selection, started_utc or the run dir's config.json created_utc). LR probes
@@ -36,7 +39,8 @@ manifest file's sha256, the summaries read and the settings' sources) and report
 
 Usage:
   python tools/study_report.py --tables evals/study --manifest labels/full/selections/study_manifest.json \
-      --prereg study/PREREG.json --numbers PREREG_numbers.json --speed speed.json --out reports/study
+      --prereg study/PREREG.json --numbers study/PREREG_numbers_A.json study/PREREG_numbers_B.json \
+      study/PREREG_numbers_replicate.json --speed speed.json --out reports/study
 CPU only. The statistics of 22 systems at B = 10,000 take about 5 s, the imitation CER about a second per system
 (--no-imitation skips it); the torch import behind kitsune.evaluate is the slowest part.
 """
@@ -388,6 +392,41 @@ def file_sha256(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def load_numbers(paths) -> tuple[dict | None, dict, list[str]]:
+    """({box: numbers file}, {box: the file's sha256}, the files read) from --numbers: files, or dirs whose
+    PREREG_numbers*.json are read. Each file is keyed by its "box" ("all" when it has none, the single-host layout);
+    two files of one box, or a file that is not a JSON object, is an InputError."""
+    if not paths:
+        return None, {}, []
+    files = []
+    for p in map(Path, paths):
+        files += sorted(p.glob("PREREG_numbers*.json")) if p.is_dir() else [p]
+    if not files:
+        raise InputError(f"--numbers {[str(p) for p in paths]}: no numbers file")
+    out, shas = {}, {}
+    for f in files:
+        try:
+            data = read_json(f)
+        except (OSError, ValueError) as e:
+            raise InputError(f"numbers file {f}: {e}") from e
+        if not isinstance(data, dict):
+            raise InputError(f"numbers file {f}: not a JSON object")
+        box = str(data.get("box") or "all")
+        if box in out:
+            raise InputError(f"numbers files: two files of box {box} ({f})")
+        out[box], shas[box] = data, file_sha256(f)
+    return out, shas, [str(f) for f in files]
+
+
+def prereg_rules_sha256(path) -> str | None:
+    """kitsune.prereg.rules_sha256 of --prereg (the canonical bytes every numbers file carries as rules_sha256)."""
+    if not path:
+        return None
+    from kitsune import prereg as kp
+
+    return kp.rules_sha256(path)
+
+
 def build_report(args) -> dict:
     manifest = ss.parse_manifest(read_json(args.manifest))
     tables, ignored = load_tables(args.tables, manifest.sets)
@@ -406,14 +445,17 @@ def build_report(args) -> dict:
         if val is not None:
             settings[key], sources[key] = int(val), "command line (NOT the pre-registered value)"
     summaries, summ_notes = load_summaries(args.run_summaries)
+    numbers, numbers_sha, numbers_files = load_numbers(args.numbers)
     rep = ss.analyse(corpus, settings, params=load_params(args.params), speed=load_speed(args.speed),
-                     numbers=read_json(args.numbers) if args.numbers else None, summaries=summaries,
+                     numbers=numbers, summaries=summaries,
                      prereg_baselines=ss.prereg_baselines(prereg), prereg_manifest=ss.prereg_manifest(prereg),
-                     manifest_file_sha256=file_sha256(args.manifest), imitation=not args.no_imitation)
+                     manifest_file_sha256=file_sha256(args.manifest), imitation=not args.no_imitation,
+                     rules_sha256=prereg_rules_sha256(args.prereg), numbers_file_sha256=numbers_sha)
     rep["settings_sources"] = sources
     rep["inputs"] = dict(tables=str(args.tables), manifest=str(args.manifest),
                          manifest_sha256=file_sha256(args.manifest), prereg=_s(args.prereg),
-                         numbers=_s(args.numbers), speed=_s(args.speed), params=_s(args.params),
+                         numbers=numbers_files, numbers_sha256=numbers_sha, speed=_s(args.speed),
+                         params=_s(args.params),
                          run_summaries=_s(args.run_summaries), summaries_read=summ_notes["read"],
                          summaries_superseded=summ_notes["superseded"], ignored_files=ignored,
                          written_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -429,7 +471,7 @@ def main(argv=None) -> int:
     ap.add_argument("--tables", type=Path, required=True)
     ap.add_argument("--manifest", type=Path, required=True)
     ap.add_argument("--prereg", type=Path)
-    ap.add_argument("--numbers", type=Path)
+    ap.add_argument("--numbers", type=Path, nargs="+", help="the boxes' PREREG_numbers_<box>.json, or a dir of them")
     ap.add_argument("--run-summaries", type=Path)
     ap.add_argument("--speed", type=Path)
     ap.add_argument("--params", type=Path)
