@@ -5,15 +5,20 @@ the Parakeet baselines, and scripts/05_evaluate.py's family switch, manifest che
               own scorer, and load in tools/study_report.py; the no-style count forgives exactly the style regions
   CTC eval    a tiny Parakeet CTC student (tests/fixtures_ctc.py) whose stored "teacher" targets are its own: ctc_eval
               gives frame argmax agreement 1, a KL of the fp16 storage only, the teacher's text on every row; a row
-              whose stored n_frames differs is left out of the frame metrics and counted
+              whose stored n_frames differs is left out of the frame metrics and counted; a frame store's batches
+              (their own targets, as the CTC trainer's FrameBatchDataset collates them) give the same numbers, and
+              where the CTC trainer's frame stores exist, ctc_eval on one is its kitsune.ctc_eval pass to the bit
   verdict     family "ctc" judges against Parakeet's CTC path, registered or pending; the Cohere verdict is unchanged
   05 (ctc)    the same student through scripts/05_evaluate.py on a study manifest, with the probe: tables, study.json,
               verdict v2 with family ctc; --teachers and --from-evals; the refusals: a manifest that does not hash to
               itself, one that does not hold the store's rows, one that differs from PREREG.json, an aed config on a
-              CTC checkpoint - each before any model is loaded
+              CTC checkpoint - each before any model is loaded; decision 15: an eval row whose frames do not align
+              with its stored targets refuses (again on the same command, before the rest is evaluated), and so do
+              more than 0.1 % of the probe's rows
   real data   (skipped without it) the stored ctc_hyp of the label box's eval shards scores to its stored ctc_cer on
               every row and to the measured corpus CERs (Parakeet TDT / CTC JSUT 6.62 / 6.71, CV8 7.50 / 7.58, Reazon
-              10.20 / 9.71 %; Cohere 8.30 / 4.07 / 6.28 %); the first A100 run's per-set CER from its eval parquets
+              10.20 / 9.71 %; Cohere 8.30 / 4.07 / 6.28 %); the first A100 run's per-set CER from its eval parquets;
+              ctc_eval of the real Parakeet CTC teacher on real eval rows against its stored frame targets and text
 CPU only, synthetic data in the repo's formats; nothing needs the network.
 """
 import json
@@ -479,6 +484,80 @@ def test_ctc_eval_on_its_own_targets(ctc_env):
     assert c["value"] == pytest.approx(sum((d["kl"] + 0.8 * d["ce"]) * d["n_tok"] for d in gate) / n)
 
 
+def _student(env):
+    from transformers import AutoProcessor
+
+    from kitsune import ctc_student as CS
+
+    return (load_patched(env["student"]), CS.ctc_features(env["student"], "cpu").logmel,
+            AutoProcessor.from_pretrained(str(env["student"])).tokenizer)
+
+
+def test_ctc_eval_reads_a_frame_stores_batches(ctc_env, monkeypatch):
+    """A frame store's batches carry their rows' targets (the CTC trainer's FrameBatchDataset: collate_frame_targets of
+    the rows, padded to the batch's longest n_frames; here its twin over the token store): ctc_eval takes them from the
+    batch (batch_dataset) and gives the targets-dict path's per-utterance sums and text to the bit."""
+    from kitsune import trainset
+    from kitsune.ctc_targets import collate_frame_targets
+
+    env = ctc_env
+    store, targets = env["eval_store"], env["targets"]
+    model, feat, tok = _student(env)
+
+    class FrameLike:  # FrameBatchDataset's items over a token store
+        def __init__(self, st):
+            self.ds = trainset.AudioBatchDataset(st)
+
+        def __getitem__(self, idx):
+            item = self.ds[idx]
+            if item["ids"]:
+                item.update(collate_frame_targets([targets[i] for i in item["ids"]]))
+            return item
+
+    a = ev.ctc_eval(model, store, None, feat, "cpu", BATCH_S, tokenizer=tok, targets=targets)
+    monkeypatch.setattr(ev, "batch_dataset", FrameLike)
+    b = ev.ctc_eval(model, store, None, feat, "cpu", BATCH_S, tokenizer=tok)  # no targets: the batches have them
+    assert len(a["tf"]) == len(store) and not b["frame_mismatch"] and not b["no_targets"]
+    pd.testing.assert_frame_equal(a["tf"], b["tf"], check_exact=True)
+    assert a["greedy"]["hyp"].tolist() == b["greedy"]["hyp"].tolist()
+    sa, pa_ = ev.summarise_ctc_tf(a["tf"])
+    sb, pb = ev.summarise_ctc_tf(b["tf"])
+    assert sa == sb and tuple(pb.columns) == ev.CTC_TF_COLUMNS
+    assert {"argmax_agree", "frames_per_token", "kl_per_frame", "teacher_blank"} <= set(sb["all"])
+
+
+def test_the_ctc_eval_is_the_ctc_trainers_on_its_frame_store(ctc_env, tmp_path):
+    """Where the CTC trainer's frame stores exist (kitsune.trainset.build_frame_stores, kitsune.ctc_eval; skipped
+    before they do): ctc_eval over a frame store of the eval sets gives, row for row, the sums of the trainer's own
+    pass (ctc_eval_records), and summarise_ctc_tf its summary and per-utterance table to the bit, key for key; the
+    greedy CTC paths are the same."""
+    from kitsune import trainset
+
+    if not hasattr(trainset, "build_frame_stores"):
+        pytest.skip("no frame stores in kitsune.trainset (the CTC trainer's, wave 2)")
+    CE = pytest.importorskip("kitsune.ctc_eval")
+    env = ctc_env
+    fc = env["fc"]
+    fstore = trainset.build_frame_stores(env["sel"], fc.data, env["root"] / "corpus" / "parakeet_out", tmp_path / "fs",
+                                         EVAL_SETS, ["eval"], log=print)
+    model, feat, tok = _student(env)
+    res = ev.ctc_eval(model, fstore, None, feat, "cpu", BATCH_S, tokenizer=tok)
+    raw, hyps, dropped = CE.ctc_eval_records(model, fstore, feat, "cpu", BATCH_S)
+    assert not res["dropped"] and not dropped and len(res["tf"]) == len(raw) == len(fstore)
+    tf = res["tf"]
+    assert tf["id"].tolist() == raw["id"].tolist() and tf["n_tok"].tolist() == raw["n_tok"].tolist()
+    for k in ("kl_dense", "kl_blank", "ctc", "n_dense", "n_blank_frames", "argmax_agree", "argmax_blank",
+              "teacher_blank"):
+        assert tf[f"sum_{k}"].tolist() == raw[f"sum_{k}"].tolist(), k
+    mine, mine_per = ev.summarise_ctc_tf(tf)
+    theirs, theirs_per = CE.summarise_ctc_tf(raw)
+    assert mine["sets"] == theirs["sets"] and mine["all"] == theirs["all"]
+    pd.testing.assert_frame_equal(mine_per, theirs_per, check_exact=True, check_dtype=False)
+    g = res["greedy"]
+    assert [list(x) for x in g["hyp_ids"]] == [list(hyps[i]) for i in g["id"]]
+    assert (g["hyp"] == g["teacher_hyp"]).all()  # the frame store's text is the stored ctc_hyp: its own here
+
+
 def test_parakeet_baselines_and_the_stored_ctc_cer(ctc_env, tmp_path):
     """parakeet_baselines: the corpus CER of the stored ctc_hyp and hyp per set (on every row, or the manifest's), and
     a drift of more than 0.05 pp from the registered numbers refuses; the stored per-utterance ctc_cer is this
@@ -676,6 +755,49 @@ def test_05_refuses_a_manifest_that_does_not_match(ctc_env, tmp_path, monkeypatc
                   str(tmp_path / "o2")])
 
 
+def test_05_refuses_frames_that_do_not_align(ctc_env, tmp_path, monkeypatch):
+    """Decision 15 on a token store: an eval row whose student frame count is not its stored n_frames refuses the eval
+    at the chunk that holds it (the finished chunks kept); the same command refuses again before it evaluates any
+    other chunk. A probe row does too (1 of 4 is above 0.1 % of the probe's train rows), after the sets are done."""
+    from kitsune.ctc_targets import FrameTargets
+
+    m05 = load_script("05_evaluate")
+    real = m05.parakeet_data
+    env = ctc_env
+    bad_eval = env["manifest"]["sets"]["eval_cv8"]["ids"][1]
+
+    def off_by_one(t):
+        return FrameTargets(t.n_frames + 1, np.concatenate([t.blank_lp, [0.0]]).astype(np.float16), t.dense_frame,
+                            t.topk_idx, t.topk_lp, t.ctc_ids)
+
+    def corrupt(which):
+        def parakeet_data(cfg, store, log, what="eval"):
+            rows, targets, files = real(cfg, store, log, what)
+            if targets is not None and what == which:
+                bad = bad_eval if which == "eval" else sorted(targets)[0]
+                targets = dict(targets, **{bad: off_by_one(targets[bad])})
+            return rows, targets, files
+        return parakeet_data
+
+    argv = ["--root", str(env["root"]), "--config", str(env["config"]), "--ckpt", str(env["student"]), "--history",
+            "none", "--chunk-s", "3"]
+    out = tmp_path / "o"
+    monkeypatch.setattr(m05, "parakeet_data", corrupt("eval"))
+    with pytest.raises(SystemExit, match=r"REFUSED \(decision 15\): 1 eval row"):
+        m05.main([*argv, "--out", str(out)])
+    n_chunks = len(events(out, "chunk"))
+    assert events(out, "frame_mismatch_refused")[0]["mismatch"][0]["id"] == bad_eval
+    with pytest.raises(SystemExit, match="decision 15"):
+        m05.main([*argv, "--out", str(out)])
+    assert len(events(out, "chunk")) == n_chunks and len(events(out, "frame_mismatch_refused")) == 2
+    assert not (out / "summary.json").exists() and not (out / "study.json").exists()
+    monkeypatch.setattr(m05, "parakeet_data", corrupt("probe"))
+    out2 = tmp_path / "p"
+    with pytest.raises(SystemExit, match=r"REFUSED \(decision 15\): 1 probe row\(s\) of 4 .*more than 0.1 %"):
+        m05.main([*argv, "--out", str(out2), "--probe"])
+    assert all((out2 / f"greedy_{e}.parquet").exists() for e in EVAL_SETS)  # the sets were done first
+
+
 def test_later_keys_are_set_aside_only_while_the_trainer_lacks_them():
     """A study config's family / loss.w_ctc / pull_parakeet / selection_recipe.study pass the trainer's merge before
     04_distill.DEFAULTS has them, and come back with their values; a key DEFAULTS knows is merged as usual."""
@@ -717,6 +839,51 @@ def test_the_label_boxs_stored_hyps_score_to_their_stored_cers_and_the_measured_
         assert base[s]["tdt_cer_corpus"] == pytest.approx(tdt, abs=5e-5)
         assert base[s]["cer_corpus"] == pytest.approx(ctc, abs=5e-5)
     ev.teacher_baselines(co, ev.GATE_SETS, check=True)  # Cohere's D32a numbers, 0.05 pp
+
+
+def test_the_real_parakeet_ctc_teacher_through_ctc_eval(tmp_path):
+    """kitsune.evaluate.ctc_eval with the real Parakeet CTC teacher (the unpruned 24x4096 anchor, fp32 on CPU) as the
+    student, on real eval rows of the three gate sets (the first run's selection and data shards, the label box's
+    stored targets and text): every row's frames align, the greedy text is the stored ctc_hyp on (nearly) every row
+    (the label box ran the encoder in bf16 on a GPU), the frame argmax agrees on > 99 % of the frames, the KL is small
+    and the argmax-blank share is the teacher's."""
+    import json as _json
+
+    from transformers import AutoProcessor
+
+    from kitsune import ctc_student as CS
+    from kitsune import trainset
+    from kitsune.ctc_targets import load_ctc_targets
+    from kitsune.patches import patch_relpos_once_per_batch
+
+    sel_path, data = REAL / "selection" / "viability.parquet", REAL / "data"
+    pk_dir = REAL / "cache" / "parakeet-tdt_ctc-0.6b-ja-hf"
+    need_real(sel_path, data / "shards" / "eval_jsut", pk_dir / "ctc_head.safetensors",
+              *(LABELS / "parakeet_out" / s for s in ev.GATE_SETS), *(LABELS / "teacher_out" / s for s in ev.GATE_SETS))
+    sel = pd.read_parquet(sel_path)
+    e = sel[(sel["split"] == "eval") & sel["keep"] & sel["source"].isin(ev.GATE_SETS)]
+    ids = [i for s in ev.GATE_SETS for i in e["id"][e["source"] == s].tolist()[:8]]
+    store = trainset.build_stores(sel_path, data, LABELS / "teacher_out", tmp_path / "store", list(ev.GATE_SETS),
+                                  ["eval"], ids=ids, log=print)
+    targets, rows = {}, {}
+    for f in sorted(set(e["teacher_file"][e["id"].isin(ids)])):
+        targets.update({k: v for k, v in load_ctc_targets(LABELS / "parakeet_out" / f"{f}.npz").items() if k in ids})
+        for line in (LABELS / "parakeet_out" / f"{f}.jsonl").read_text(encoding="utf-8").splitlines():
+            if line.strip() and (r := _json.loads(line))["id"] in set(ids):
+                rows[r["id"]] = r
+    refs = {u.id: r for u, r in zip(store.utts, store.frame()["ref"].tolist())}
+    torch.set_num_threads(4)
+    model = CS.load_parakeet_ctc(pk_dir, "cpu")
+    patch_relpos_once_per_batch(model)
+    res = ev.ctc_eval(model, store, None, CS.ctc_features(pk_dir, "cpu").logmel, "cpu", 60.0,
+                      tokenizer=AutoProcessor.from_pretrained(str(pk_dir), local_files_only=True).tokenizer,
+                      teacher_rows=ev.ctc_teacher_rows(rows, refs=refs), targets=targets)
+    g = res["greedy"]
+    assert len(g) == len(ids) and not res["frame_mismatch"] and not res["no_targets"] and not res["dropped"]
+    assert (g["hyp"] == g["teacher_hyp"]).mean() >= 0.9
+    a = ev.summarise_ctc_tf(res["tf"])[0]["all"]
+    assert a["top1"] > 0.99 and a["kl_per_frame"] < 0.05 and abs(a["argmax_blank"] - a["teacher_blank"]) < 0.01
+    assert 0.5 < a["teacher_blank"] < 0.8
 
 
 def test_the_first_a100_runs_per_set_cer_from_its_eval_parquets():

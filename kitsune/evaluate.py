@@ -548,6 +548,21 @@ GREEDY_COLUMNS = ("id", "source", "duration", "ref", "teacher_hyp", "hyp", "cer_
 # input; n_tok = the utterance's CTC target tokens (the objective's N_u)
 CTC_TF_SUMS = ("kl_dense", "kl_blank", "ctc", "n_dense", "n_blank_frames", "n_frames", "argmax_agree",
                "argmax_blank", "teacher_blank")
+# the frame-target fields of a frame store's micro-batch (kitsune.trainset.FrameBatchDataset, the CTC trainer's
+# collate: kitsune.ctc_targets.collate_frame_targets of its rows), what kitsune.ctc_kd.ctc_kd_losses reads
+FRAME_BATCH_KEYS = ("frame_mask", "dense_mask", "blank_lp", "topk_idx", "topk_lp", "ctc_targets", "ctc_target_lengths",
+                    "n_frames")
+
+
+def batch_dataset(store):
+    """The micro-batch dataset of a store as the trainer reads it: kitsune.trainset.dataset_for (the CTC trainer's: a
+    FrameBatchDataset for a frame store, its rows' stored Parakeet frame targets collated into every batch, else an
+    AudioBatchDataset) where kitsune.trainset has it, else an AudioBatchDataset (a token store: the only kind before
+    the CTC trainer's frame stores). ctc_eval reads either."""
+    from kitsune import trainset
+
+    make = getattr(trainset, "dataset_for", None)
+    return make(store) if make is not None else AudioBatchDataset(store)
 
 
 def _greedy_frame(recs: list[dict], store, teacher_rows: dict | None, decode) -> pd.DataFrame:
@@ -573,11 +588,18 @@ def ctc_eval(model, store, ids: Iterable[str] | None, featurizer, device, batch_
       greedy    argmax per frame, collapse repeats, drop the blank (greedy_ctc_ids), detokenised as the label pass
                 wrote ctc_hyp (decode_ids): scored against the reference and the teacher (teacher_rows: Parakeet's
                 stored CTC path, ctc_teacher_rows) exactly as greedy_eval scores an AED student; never truncated
-      tf        with `targets` (id -> kitsune.ctc_targets.FrameTargets: the stored Parakeet frame targets), the
-                training objective's terms on the same log-probs (kitsune.ctc_kd.ctc_kd_losses per utterance): dense
-                and blank-frame KL, CTC on the teacher's greedy path, argmax agreement and blank shares. A row whose
-                student frame count differs from its stored n_frames cannot be aligned: it is left out of tf and listed
-                in frame_mismatch (the frame preflight's condition, decision 15); a row without targets in no_targets
+      tf        the training objective's terms on the same log-probs against the stored Parakeet frame targets
+                (kitsune.ctc_kd.ctc_kd_losses per utterance): dense and blank-frame KL, CTC on the teacher's greedy
+                path, argmax agreement and blank shares. The targets come from
+                  a frame store (the CTC trainer's: batch_dataset gives its FrameBatchDataset, whose batches carry their
+                    rows' targets as the trainer's do): every row of a batch; the store's frame preflight dropped each
+                    row whose frames do not align at its build (a hard fail for an eval row, decision 15), and the
+                    dataset drops one whose audio changed since (item["dropped"], like an undecodable one)
+                  a token store with `targets` (id -> kitsune.ctc_targets.FrameTargets, collated here): a row whose
+                    student frame count differs from its stored n_frames cannot be aligned: it is left out of tf and
+                    listed in frame_mismatch (the preflight's condition; the caller applies decision 15); a row without
+                    targets in no_targets
+                  a token store without `targets`: no tf
     featurizer: (wave, lengths) -> (feats, mask) on the device, the student's LogMel (ctc_features(...).logmel).
     Returns {"greedy": greedy_eval's per_utt columns, "tf": one row per utterance with id, source, duration, n_tok
     (its CTC target tokens) and sum_<term> of CTC_TF_SUMS (summarise_ctc_tf's input), "dropped": undecodable ids,
@@ -588,7 +610,7 @@ def ctc_eval(model, store, ids: Iterable[str] | None, featurizer, device, batch_
 
     device = torch.device(device)
     t0 = time.time()
-    ds = AudioBatchDataset(store)
+    ds = batch_dataset(store)
     batches = eval_batches(store.utts, batch_s, _indices(store, ids))
     g_recs, tf_recs, dropped, mismatch, no_targets = [], [], [], [], []
     with _eval_mode(model):
@@ -605,21 +627,25 @@ def ctc_eval(model, store, ids: Iterable[str] | None, featurizer, device, batch_
             for r in range(n):
                 g_recs.append(dict(id=item["ids"][r], source=item["sources"][r], duration=float(item["durations"][r]),
                                    hyp_ids=hyp_ids[r], truncated=False, n_tok=len(hyp_ids[r])))
-            if targets is None:
-                continue
-            ok = []
-            for r, uid in enumerate(item["ids"]):
-                t = targets.get(uid)
-                if t is None:
-                    no_targets.append(uid)
-                elif int(t.n_frames) != int(frames[r]):
-                    mismatch.append(dict(id=uid, student=int(frames[r]), stored=int(t.n_frames)))
-                else:
-                    ok.append(r)
-            if not ok:
-                continue
-            batch = collate_frame_targets([targets[item["ids"][r]] for r in ok], t_max=int(lp.shape[1]))
-            L = ctc_kd_losses(lp[torch.tensor(ok, device=lp.device)], batch, per_utt=True)
+            if "frame_mask" in item:  # a frame store's batch: its targets as the trainer's step and eval read them
+                ok = list(range(n))
+                L = ctc_kd_losses(lp, {k: item[k] for k in FRAME_BATCH_KEYS}, per_utt=True)
+            else:
+                if targets is None:
+                    continue
+                ok = []
+                for r, uid in enumerate(item["ids"]):
+                    t = targets.get(uid)
+                    if t is None:
+                        no_targets.append(uid)
+                    elif int(t.n_frames) != int(frames[r]):
+                        mismatch.append(dict(id=uid, student=int(frames[r]), stored=int(t.n_frames)))
+                    else:
+                        ok.append(r)
+                if not ok:
+                    continue
+                batch = collate_frame_targets([targets[item["ids"][r]] for r in ok], t_max=int(lp.shape[1]))
+                L = ctc_kd_losses(lp[torch.tensor(ok, device=lp.device)], batch, per_utt=True)
             L = {k: v.detach().double().cpu().numpy() for k, v in L.items()}
             for j, r in enumerate(ok):
                 rec = dict(id=item["ids"][r], source=item["sources"][r], n_tok=int(L["n_tokens"][j]),
@@ -640,13 +666,15 @@ def summarise_ctc_tf(raw: pd.DataFrame, **extra) -> tuple[dict, pd.DataFrame]:
                     by the step's target tokens), so combined_loss(summary, w_kl, w_ctc) is the CTC objective and the
                     headline's val_loss / eval_record's heldout_kl are the frame KL per target token (ctc: the same
                     number as ce, by its own name)
-      top1          frame argmax agreement with the teacher's argmax (col0), per valid frame
+      top1          frame argmax agreement with the teacher's argmax (col0), per valid frame (also argmax_agree)
       kl_per_frame, kl_dense (per dense frame), kl_blank (per blank-only frame)
       argmax_blank  the student's argmax-blank share of the frames (the blank-collapse watch), teacher_blank the
-                    teacher's (59-72 % on the real sets), frac_dense the teacher's dense frames
+                    teacher's (59-72 % on the real sets), frac_dense the teacher's dense frames, frames_per_token
       n_utts, n_tok (target tokens), n_frames, audio_s, and the utterance means kl_utt_mean, ce_utt_mean, top1_utt_mean
-    per_utt: id, source, n_tok, n_frames, kl, ce, top1, duration, kl_dense, kl_blank, argmax_blank (per utterance, with
-    the same normalisations; NaN where a count is 0). `extra` goes into the summary after n_utts."""
+    per_utt: id, source, n_tok, n_frames, kl, ce, top1, duration, kl_dense, kl_blank, kl_per_frame, argmax_blank,
+    teacher_blank (per utterance, with the same normalisations; NaN where a count is 0). The keys, the columns and the
+    order of every sum are the CTC trainer's (kitsune.ctc_eval.summarise_ctc_tf, which the trainer's CTC evals write):
+    the same rows give the same numbers to the bit. `extra` goes into the summary after n_utts."""
     per_utt = _ctc_tf_per_utt(raw)
     summary = dict(sets={}, n_utts=len(raw), **extra)
     if len(raw):
@@ -662,37 +690,43 @@ def _ratio(num, den):
         return np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
 
 
+CTC_TF_COLUMNS = ("id", "source", "n_tok", "n_frames", "kl", "ce", "top1", "duration", "kl_dense", "kl_blank",
+                  "kl_per_frame", "argmax_blank", "teacher_blank")  # tf_<set>.parquet of a CTC eval
+
+
 def _ctc_tf_per_utt(df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["id", "source", "n_tok", "n_frames", "kl", "ce", "top1", "duration", "kl_dense", "kl_blank",
-            "argmax_blank"]
+    cols = list(CTC_TF_COLUMNS)
     if not len(df):
         return pd.DataFrame(columns=cols)
     out = df[["id", "source", "n_tok"]].copy()
     out["n_frames"] = df["sum_n_frames"].astype(np.int64)
-    kl = df["sum_kl_dense"] + df["sum_kl_blank"]
+    kl = df["sum_kl_dense"] + df["sum_kl_blank"]  # each row's frame KL, then any sum over rows (the trainer's sum_kl)
     out["kl"] = _ratio(kl, df["n_tok"])
     out["ce"] = _ratio(df["sum_ctc"], df["n_tok"])
     out["top1"] = _ratio(df["sum_argmax_agree"], df["sum_n_frames"])
     out["duration"] = df["duration"]
     out["kl_dense"] = _ratio(df["sum_kl_dense"], df["sum_n_dense"])
     out["kl_blank"] = _ratio(df["sum_kl_blank"], df["sum_n_blank_frames"])
+    out["kl_per_frame"] = _ratio(kl, df["sum_n_frames"])
     out["argmax_blank"] = _ratio(df["sum_argmax_blank"], df["sum_n_frames"])
+    out["teacher_blank"] = _ratio(df["sum_teacher_blank"], df["sum_n_frames"])
     return out[cols]
 
 
 def _ctc_tf_summarise(df: pd.DataFrame, per_utt: pd.DataFrame) -> dict:
     tot = {k: float(df[f"sum_{k}"].sum()) for k in CTC_TF_SUMS}
     ntok, nfr = float(df["n_tok"].sum()), tot["n_frames"]
-    kl = tot["kl_dense"] + tot["kl_blank"]
+    kl = float((df["sum_kl_dense"] + df["sum_kl_blank"]).sum())  # per row first, as the trainer's sum_kl
 
     def div(a, b):
         return a / b if b else float("nan")
 
     s = dict(n_utts=int(len(df)), n_tok=int(ntok), n_frames=int(nfr), audio_s=float(df["duration"].sum()),
-             kl=div(kl, ntok), ce=div(tot["ctc"], ntok), top1=div(tot["argmax_agree"], nfr),
-             ctc=div(tot["ctc"], ntok), kl_per_frame=div(kl, nfr), kl_dense=div(tot["kl_dense"], tot["n_dense"]),
-             kl_blank=div(tot["kl_blank"], tot["n_blank_frames"]), argmax_blank=div(tot["argmax_blank"], nfr),
-             teacher_blank=div(tot["teacher_blank"], nfr), frac_dense=div(tot["n_dense"], nfr))
+             kl=div(kl, ntok), ce=div(tot["ctc"], ntok), ctc=div(tot["ctc"], ntok), top1=div(tot["argmax_agree"], nfr),
+             argmax_agree=div(tot["argmax_agree"], nfr), kl_per_frame=div(kl, nfr),
+             kl_dense=div(tot["kl_dense"], tot["n_dense"]), kl_blank=div(tot["kl_blank"], tot["n_blank_frames"]),
+             argmax_blank=div(tot["argmax_blank"], nfr), teacher_blank=div(tot["teacher_blank"], nfr),
+             frac_dense=div(tot["n_dense"], nfr), frames_per_token=div(nfr, ntok))
     for k in ("kl", "ce", "top1"):
         s[f"{k}_utt_mean"] = float(np.nanmean(per_utt[k].to_numpy(np.float64))) if len(per_utt) else float("nan")
     return s
