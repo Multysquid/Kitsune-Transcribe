@@ -216,7 +216,7 @@
   "reference_run": "study-t06",
   "reference_steps": 9366,
   "replicate": "study-t01-s1235 is not calibrated: it takes study-t01's max_steps and the scratch LR from box A's numbers file, and trains at the micro_audio_s of study-t01's calibration entry there",
-  "t_i": "the median step time over steps 50-250 at the planned micro_audio_s, logging included, on the box's host, measured in its calibration group (groups) while every other run of the group trains"
+  "t_i": "the median step time (the difference of consecutive steps' loop clocks: data wait, forward, backward, optimizer and logging included) at the planned micro_audio_s on the box's host, over 200 steps that start at the first step >= 50 logged after every run of its calibration group (groups) has reached step 50, so each of them is timed while every other run of the group trains; the group stops once every run has its window (the run that reaches step 50 last is timed over steps 50-250); data_wait_frac is the loader's share of the window's time"
  },
  "cohere_prereg": {
   "eval_cv8": 0.0407,

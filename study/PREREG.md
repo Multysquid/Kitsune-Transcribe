@@ -288,7 +288,7 @@ Shapes:
 - **reference_steps**: 9366
 - **max_steps_multiple**: 10
 - **max_steps**: max_steps_i = round_to_10(9366 x t_study-t06 / t_i) = 10 x floor(9366 x t_study-t06 / t_i / 10 + 1/2), both step times measured on the host that trains run i (study-t06 itself: 9,370)
-- **t_i**: the median step time over steps 50-250 at the planned micro_audio_s, logging included, on the box's host, measured in its calibration group (groups) while every other run of the group trains
+- **t_i**: the median step time (the difference of consecutive steps' loop clocks: data wait, forward, backward, optimizer and logging included) at the planned micro_audio_s on the box's host, over 200 steps that start at the first step >= 50 logged after every run of its calibration group (groups) has reached step 50, so each of them is timed while every other run of the group trains; the group stops once every run has its window (the run that reaches step 50 last is timed over steps 50-250); data_wait_frac is the loader's share of the window's time
 - **per_box**: each box calibrates its 'calibrate' list (BOXES) and measures study-t06 on its own host: box B calibrates study-t06 for 250 steps without training it
 - **grouping**: a box's 'calibrate' list, in list order, in groups of the box's GPU count (A and B: 4): the runs of a group train at the same time, one per GPU; a short last group is filled with the list's first runs that are not in it, as unmeasured load, so every run is measured with as many runs training as its wave has. Each list names the box's own runs first: they are measured together, exactly as their wave trains. Box B measures study-t06 last, beside study-p03, study-p01 and study-p005 as load
 - **gpus**

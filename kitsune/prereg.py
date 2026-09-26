@@ -188,7 +188,9 @@ BOX_GPUS = {"A": 4, "B": 4, "replicate": 1}  # 4x A100 SXM4 for A and B, a 1x bo
 # --------------------------------------------------------------------------------------------- calibration
 
 CALIB_KEYS = ("t_step_s", "micro_audio_s", "data_wait_frac", "steps_measured")
-CALIB_STEPS = (50, 250)  # t_i = the median step time over these steps, logging included
+# t_i = the median step time (logging included) over a window of 200 steps from step 50 on, aligned across the
+# calibration group: it starts once every run of the group has reached step 50 (rules()["calibration"]["t_i"])
+CALIB_STEPS = (50, 250)
 DATA_WAIT_MAX = 0.05  # at or above: perf.num_workers 12 and calibrate again; still at or above: the box halts
 # max_steps are rounded (half up) to a multiple of this: then the T/2 branch's resume step 0.4 M, its end 0.5 M and the
 # cooldown start of a run whose budget is M/2, 0.8 x M/2, are all exact integers, so the branch's WSD schedule is
@@ -553,9 +555,13 @@ def rules(sidecar: dict | None = None) -> dict:
                          f"{MAX_STEPS_MULTIPLE} x floor({REF_STEPS} x t_{T_REF_RUN} / t_i / {MAX_STEPS_MULTIPLE} + "
                          f"1/2), both step times measured on the host that trains run i ({T_REF_RUN} itself: "
                          f"{round_to(REF_STEPS):,})",
-            "t_i": f"the median step time over steps {CALIB_STEPS[0]}-{CALIB_STEPS[1]} at the planned micro_audio_s, "
-                   f"logging included, on the box's host, measured in its calibration group (groups) while every other "
-                   f"run of the group trains",
+            "t_i": f"the median step time (the difference of consecutive steps' loop clocks: data wait, forward, "
+                   f"backward, optimizer and logging included) at the planned micro_audio_s on the box's host, over "
+                   f"{CALIB_STEPS[1] - CALIB_STEPS[0]} steps that start at the first step >= {CALIB_STEPS[0]} logged "
+                   f"after every run of its calibration group (groups) has reached step {CALIB_STEPS[0]}, so each of "
+                   f"them is timed while every other run of the group trains; the group stops once every run has its "
+                   f"window (the run that reaches step {CALIB_STEPS[0]} last is timed over steps "
+                   f"{CALIB_STEPS[0]}-{CALIB_STEPS[1]}); data_wait_frac is the loader's share of the window's time",
             "per_box": f"each box calibrates its 'calibrate' list (BOXES) and measures {T_REF_RUN} on its own host: "
                        f"box B calibrates {T_REF_RUN} for {CALIB_STEPS[1]} steps without training it",
             "grouping": "a box's 'calibrate' list, in list order, in groups of the box's GPU count (A and B: 4): the "
