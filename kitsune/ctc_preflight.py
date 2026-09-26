@@ -12,9 +12,16 @@ The work is cut by shard: each task is a contiguous row range of ONE data shard 
 packs rows shard by shard), split into blocks of at most `block` rows so a 2,048-row shard spreads over several
 workers. Results come back in row order. Small builds (fewer than PROCESS_MIN_ROWS rows, or one worker) decode in
 threads in this process, where a pool's start would cost more than it saves.
+
+On a vast container os.cpu_count() is the HOST's CPU count (the first A100 run: 128, with a cgroup cpu.max of 15.36
+CPUs), so the pool is sized by the CPUs this process may use (default_workers: affinity and the cgroup quota), and
+each decoder starts with its BLAS/OpenMP pools at one thread (ONE_THREAD_ENV): numpy's OpenBLAS starts a pool of
+nproc threads at import, and 64 decoders x 64 threads on a host with a low pids.max (vast/onstart.sh caps the pools
+only below 16 pids per CPU) would fail a thread start in a worker and break the pool - box B's first phase.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -27,12 +34,46 @@ PROCESS_MIN_ROWS = 2000  # below this a build decodes in threads (a pool's ~3 s 
 BLOCK = 256  # rows per task: a shard of 2,048 rows becomes 8 tasks
 MAX_PROCESSES = 64  # the box has 192 cores; 64 decoders read ~10k Emilia rows/s, more only adds start-up and memory
 WIN_MAX_PROCESSES = 61  # ProcessPoolExecutor's limit on Windows
+# the thread pools a decoder process starts with one thread: it decodes one row at a time, and a pool sized to the
+# host's nproc in each of 64 processes would spend the container's pids budget (spawned children inherit the env)
+ONE_THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                  "NUMBA_NUM_THREADS", "RAYON_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
+
+
+def usable_cpus() -> int:
+    """The CPUs this process may use: its affinity (os.cpu_count() where there is none), and at most the cgroup v2
+    cpu.max quota rounded up (a vast container's quota is often far below the host's nproc)."""
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    try:
+        quota, period = CPU_MAX.read_text().split()[:2]
+        if quota != "max":
+            n = min(n, -(-int(quota) // int(period)))
+    except (OSError, ValueError):
+        pass
+    return max(1, n)
 
 
 def default_workers() -> int:
-    """Decode processes of a build: every core up to MAX_PROCESSES (61 on Windows)."""
+    """Decode processes of a build: every usable CPU (usable_cpus) up to MAX_PROCESSES (61 on Windows)."""
     cap = WIN_MAX_PROCESSES if sys.platform == "win32" else MAX_PROCESSES
-    return max(1, min(cap, os.cpu_count() or 1))
+    return max(1, min(cap, usable_cpus()))
+
+
+@contextlib.contextmanager
+def one_thread_children():
+    """ONE_THREAD_ENV set to 1 while the pool starts its processes (spawned children copy the env at their start, and
+    OpenBLAS reads it when numpy loads, before any initializer could run); the previous values restored after."""
+    old = {k: os.environ.get(k) for k in ONE_THREAD_ENV}
+    os.environ.update({k: "1" for k in ONE_THREAD_ENV})
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def shard_tasks(shard_rows: Sequence[int], block: int = BLOCK) -> list[tuple[int, int]]:
@@ -81,8 +122,9 @@ def decoded_lengths(audio_path: Path, offsets: np.ndarray, workers: int | None =
     if use_procs:
         import multiprocessing as mp
 
-        # spawn, never fork: the trainer calling this holds torch (and maybe CUDA) and logger threads
-        with ProcessPoolExecutor(max_workers=nw, mp_context=mp.get_context("spawn")) as pool:
+        # spawn, never fork: the trainer calling this holds torch (and maybe CUDA) and logger threads. The pool starts
+        # its processes as map submits the tasks, so the one-thread env covers the whole block
+        with one_thread_children(), ProcessPoolExecutor(max_workers=nw, mp_context=mp.get_context("spawn")) as pool:
             parts = list(pool.map(decode_range, *zip(*args), chunksize=1)) if args else []
     else:
         with ThreadPoolExecutor(max_workers=nw) as pool:
@@ -91,5 +133,5 @@ def decoded_lengths(audio_path: Path, offsets: np.ndarray, workers: int | None =
                                                 tasks=len(tasks))
 
 
-__all__ = ["BLOCK", "MAX_PROCESSES", "PROCESS_MIN_ROWS", "decode_range", "decoded_lengths", "default_workers",
-           "shard_tasks"]
+__all__ = ["BLOCK", "MAX_PROCESSES", "ONE_THREAD_ENV", "PROCESS_MIN_ROWS", "decode_range", "decoded_lengths",
+           "default_workers", "one_thread_children", "shard_tasks", "usable_cpus"]

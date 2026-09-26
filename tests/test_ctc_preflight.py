@@ -39,6 +39,32 @@ def test_tasks_are_cut_by_shard():
     assert 1 <= P.default_workers() <= P.MAX_PROCESSES
 
 
+def _child_env(names):
+    return {k: os.environ.get(k) for k in names}
+
+
+def test_the_pool_is_sized_by_the_cgroup_quota_and_its_children_start_one_thread_pools(tmp_path, monkeypatch):
+    """A vast container's os.cpu_count() is the host's (the first A100 run: 128 with cpu.max 15.36 CPUs): the pool
+    takes the quota, rounded up; each decoder's BLAS/OpenMP pools start at one thread, and the parent's env is back
+    after the pool."""
+    cpu_max = tmp_path / "cpu.max"
+    monkeypatch.setattr(P, "CPU_MAX", cpu_max)
+    base = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    cpu_max.write_text("1536000 100000\n")
+    assert P.usable_cpus() == min(16, base) and P.default_workers() <= 16
+    cpu_max.write_text("max 100000\n")
+    assert P.usable_cpus() == base
+    monkeypatch.setenv("OMP_NUM_THREADS", "7")
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    with P.one_thread_children(), ProcessPoolExecutor(1, mp_context=mp.get_context("spawn")) as pool:
+        child = pool.submit(_child_env, P.ONE_THREAD_ENV).result()
+    assert child == {k: "1" for k in P.ONE_THREAD_ENV}
+    assert os.environ["OMP_NUM_THREADS"] == "7" and "OPENBLAS_NUM_THREADS" not in os.environ
+
+
 def test_processes_threads_and_a_loop_agree(tmp_path):
     blobs = [_wav(16000, 0.5 + 0.1 * i, "FLAC") for i in range(4)] + [_wav(24000, 0.73, "WAV"),
                                                                         _wav(48000, 0.61, "WAV"), b"not audio"]
