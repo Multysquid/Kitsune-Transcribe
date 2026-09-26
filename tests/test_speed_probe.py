@@ -60,8 +60,9 @@ def run(env, out: Path, *argv) -> int:
 def check_record(r: dict, n: int):
     assert r["n_utts"] == n and r["n_latency"] == n and len(r["latencies_s"]) == n and r["batches"] >= 1
     assert r["rtf"] > 0 and r["wall_s"] > 0 and 0 < r["p50_s"] <= r["p95_s"] and r["mean_s"] > 0
-    # wall_s is rounded to 0.1 ms in the record, rtf is not: equal up to that rounding
-    assert r["rtf"] == pytest.approx(r["wall_s"] / r["audio_s"], abs=0.51e-4 / r["audio_s"]) and r["rtf_1_p50"] > 0
+    # the record rounds wall_s to 0.1 ms and audio_s to 1 ms, rtf is computed unrounded: equal up to those roundings
+    tol = (0.51e-4 + 0.51e-3 * r["rtf"]) / r["audio_s"]
+    assert r["rtf"] == pytest.approx(r["wall_s"] / r["audio_s"], abs=tol) and r["rtf_1_p50"] > 0
     assert r["device"] == "cpu" and r["dtype"] == "fp32" and r["gpu"] is None and r["idle"] is None
     assert r["vram_gb"] is None and r["vram_peak_reserved_bytes"] is None  # CPU: no VRAM
     assert r["params_total"] > 0 and r["weights_bytes"] >= 4 * r["params_total"]
