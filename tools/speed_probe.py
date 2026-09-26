@@ -5,7 +5,7 @@ an idle host (the queue calls it once per system).
 Kinds (--kind), each decoded exactly as the study scores it:
   aed           a Transcribe student dir (kitsune.student.load_student): the greedy AED decode with the teacher pass's
                 settings (kitsune.evaluate.greedy_generate: num_beams 1, RepetitionStop, max_new 16 + 10 s), the LM head
-                in fp32 (kitsune.evaluate._fp32_head), the student's own LogMel
+                in fp32 (kitsune.evaluate._fp32_head), the student's own LogMel; its decode length: --decode-len below
   cohere        the Cohere teacher (CohereLabs/cohere-transcribe-03-2026 at the revision its labels came from, or
                 --model), the same decode
   ctc           a Parakeet CTC student dir (kitsune.ctc_student.load_ctc_student): the encoder, the CTC head in fp32,
@@ -27,11 +27,22 @@ detokenisation - with torch.cuda.synchronize at both ends.
             --batch-s padded seconds): rtf = wall seconds / audio seconds
   batch-1   each of the first --latency-n ids alone: p50_s / p95_s / mean_s seconds per utterance (numpy's linear
             percentile), and rtf_1_p50, the median of their per-utterance RTFs
-Warm-up, never timed: the first --warmup batches of the batched plan (the longest: the allocator grows to them) and
---warmup-1 single utterances. VRAM (CUDA): after the warm-up the allocator's cache is emptied and its peak counters
-reset, before the batched pass and again before the batch-1 pass; each pass's peak allocated and reserved bytes are
-kept, and vram_gb = the larger reserved peak / 1e9, what the model took from the card at that batch size. On CPU the
-VRAM fields are null.
+Warm-up, never timed, and no allocator growth inside a clock: before the batched pass its first --warmup batches (the
+longest: the plan is duration-sorted, so the caching allocator grows to the pass's size), then only the peak counters
+are reset; after it the allocator's cache is emptied (batch-1 measures its own VRAM), the batch-1 warm-up runs - the
+longest of the latency ids, then the first --warmup-1 ids (--warmup-1 0: none) - and the peak counters are reset again.
+VRAM (CUDA): each pass's peak allocated and reserved bytes are kept, and vram_gb = the larger reserved peak / 1e9, what
+the model took from the card at that batch size. On CPU the VRAM fields are null.
+
+AED decode length (--decode-len; aed and cohere kinds): an AED decode's time grows with the tokens it emits, so a model
+that does not stop where a trained one would (an untrained init dir: a scratch decoder runs to max_new, a pruned one
+derails at step 0) times its weights, not its shape. "teacher" pins every batch to exactly the teacher's token count of
+its longest row (the store's n_tok: the stored greedy tokens with EOS; batch-1: the utterance's own; greedy_generate's
+pin_new: EOS held off until then, no RepetitionStop), which is what a student that has learnt to stop decodes. "greedy":
+the free decode, as the evaluator runs it. "auto" (default): teacher for a student dir without the trainer's "trained"
+record in student_meta.json (a study student's init dir, which the study box times as its shape), greedy otherwise (a
+trained checkpoint, the Cohere teacher). The record says which (decode_len), whether the weights were trained, and the
+tokens decoded per utterance (tokens_per_utt; CTC and TDT: the output tokens).
 
 Numerics (--dtype): auto = bf16 on CUDA, fp32 on CPU. bf16: the weights in bf16 and bf16 autocast (the heads computed
 in fp32 as above; the TDT path's encoder in bf16, the rest fp32, as the label box ran it). fp32: fp32 weights, no
@@ -50,16 +61,17 @@ Idle host: before loading, nvidia-smi lists the GPU's compute processes (and uti
 Output (--out, JSON, merged, written atomically): {"schema": 1, "ids": [...], "ids_sha256": ..., "systems": {name:
 record}}. A record: kind, model, device, gpu, dtype, batch_s, n_utts, audio_s, batches, rtf, wall_s, the batch-1
 fields (n_latency, p50_s, p95_s, mean_s, rtf_1_p50), vram_peak_allocated_bytes / _reserved_bytes for each pass,
-vram_gb, params_total, weights_bytes, relpos_patch, cer_ref_corpus, idle, versions, time_utc. tools/study_report.py
---speed reads it
-(the Pareto view: rtf, vram_gb, p50_s, p95_s; kitsune.study_stats.speed_entry).
+vram_gb, params_total, weights_bytes, relpos_patch, decode_len, trained, tokens_per_utt, cer_ref_corpus, idle,
+versions, time_utc. tools/study_report.py --speed reads it (the Pareto view: rtf, vram_gb, p50_s, p95_s;
+kitsune.study_stats.speed_entry).
 
-Usage (on the box, after training, one call per system):
-  python tools/speed_probe.py --kind aed --model runs/<run_id>/checkpoints/step_<N> --system study-t03 \
-      --store cache/eval --per-set 40 --out reports/speed.json --require-idle
-  python tools/speed_probe.py --kind cohere --store cache/eval --out reports/speed.json --require-idle
-  python tools/speed_probe.py --kind parakeet-tdt --model models/parakeet-tdt_ctc-0.6b-ja-hf --store cache/eval \
-      --out reports/speed.json
+Usage (on the box, at its end, one call per system; kitsune/study_queue.py phase_speed passes these):
+  python tools/speed_probe.py --kind aed --model students/study/t03 --system study-t03 \
+      --store cache/eval --per-set 40 --out runs/speed-B/speed.json --require-idle
+  python tools/speed_probe.py --kind cohere --system cohere --store cache/eval --per-set 40 \
+      --out runs/speed-B/speed.json --require-idle
+  python tools/speed_probe.py --kind parakeet-tdt --model models/parakeet-tdt_ctc-0.6b-ja-hf --system parakeet-tdt \
+      --store cache/eval --per-set 40 --out runs/speed-B/speed.json --require-idle
 """
 import argparse
 import json
@@ -84,6 +96,8 @@ from kitsune.store import ids_sha256  # noqa: E402
 
 SCHEMA = 1
 KINDS = ("aed", "cohere", "ctc", "parakeet-ctc", "parakeet-tdt")
+AED_KINDS = ("aed", "cohere")  # the autoregressive decodes: their time depends on the tokens they emit
+DECODE_LENS = ("auto", "greedy", "teacher")
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 TEACHER_REVISION = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"  # == scripts/03_build_student.TEACHER_REVISION (tested)
 MAX_SYMBOLS = 10  # the label pass's TDT guard (kitsune.parakeet; vast/label.py)
@@ -161,13 +175,16 @@ def _weights_bytes(model) -> int:
 
 
 class AedRunner:
-    """A Cohere ASR model (a Transcribe student or the teacher): greedy_generate on the eval's LogMel features."""
+    """A Cohere ASR model (a Transcribe student or the teacher): greedy_generate on the eval's LogMel features; with
+    pin (decode_len "teacher") every batch decodes exactly its longest row's teacher token count."""
 
-    def __init__(self, model, processor, device, dtype: str, prompt, eos: int, pad: int):
+    tokens = 0  # tokens decoded since the last reset (every runner counts them)
+
+    def __init__(self, model, processor, device, dtype: str, prompt, eos: int, pad: int, pin: bool = False):
         from kitsune import evaluate as ev
         from kitsune.features import LogMel
 
-        self.ev, self.device, self.amp = ev, device, _amp(device, dtype)
+        self.ev, self.device, self.amp, self.pin = ev, device, _amp(device, dtype), bool(pin)
         self.model = model.to(device, dtype=torch.bfloat16 if dtype == "bf16" else torch.float32).eval()
         self.feat = LogMel.from_feature_extractor(processor.feature_extractor).to(device)
         self.tokenizer = processor.tokenizer
@@ -184,7 +201,7 @@ class AedRunner:
         stack.enter_context(self.ev._fp32_head(self.model))
         return stack
 
-    def decode(self, waves: list[np.ndarray], durations: list[float]) -> list[str]:
+    def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
         from kitsune.features import pad_waves
 
         wave, lengths = pad_waves(waves)
@@ -193,12 +210,15 @@ class AedRunner:
             feats, fmask = self.feat(wave, lengths)
         # max_new from the store's durations, as greedy_eval takes them
         rows = self.ev.greedy_generate(self.model, feats, fmask, max(durations), prompt_ids=self.prompt, eos=self.eos,
-                                       pad=self.pad, amp=self.amp)
+                                       pad=self.pad, amp=self.amp, pin_new=max(n_tok) if self.pin else None)
+        self.tokens += sum(len(ids) for ids, _ in rows)
         return self.tokenizer.batch_decode([ids for ids, _ in rows], skip_special_tokens=True)
 
 
 class CtcRunner:
     """A ParakeetForCTC (a CTC student or the teacher's CTC path): encoder, fp32 CTC head, greedy CTC."""
+
+    tokens = 0
 
     def __init__(self, model, feat_dir, tokenizer, device, dtype: str):
         from kitsune import ctc_student as CS
@@ -213,17 +233,21 @@ class CtcRunner:
     def context(self):
         return torch.inference_mode()
 
-    def decode(self, waves: list[np.ndarray], durations: list[float]) -> list[str]:
+    def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
         feats, lens = self.feat(waves)
         mask = self.CS.lengths_to_mask(lens, feats.shape[1])
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.amp):
             lp, n = self.CS.ctc_log_probs(self.model, feats, mask)
-        return [self.CS.decode_ids(self.tokenizer, x) for x in self.CS.greedy_ctc_ids(lp, n)]
+        paths = self.CS.greedy_ctc_ids(lp, n)
+        self.tokens += sum(len(x) for x in paths)
+        return [self.CS.decode_ids(self.tokenizer, x) for x in paths]
 
 
 class TdtRunner:
     """The Parakeet teacher's TDT path: ParakeetTeacher's modules (encoder in bf16 on CUDA), greedy TDT with the
     max-symbols guard, its processor's batch_decode."""
+
+    tokens = 0
 
     def __init__(self, model_dir, device, dtype: str):
         from kitsune import ctc_student as CS
@@ -241,7 +265,7 @@ class TdtRunner:
     def context(self):
         return torch.inference_mode()
 
-    def decode(self, waves: list[np.ndarray], durations: list[float]) -> list[str]:
+    def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
         P, t = self.P, self.teacher
         feats, lens = self.feat(waves)
         mask = self.CS.lengths_to_mask(lens, feats.shape[1]).long()
@@ -252,14 +276,39 @@ class TdtRunner:
         f = t.model.encoder_projector(h)
         tdt = P.greedy_tdt(f, valid, t.decoder, t.model.joint.head, t.act, blank=P.BLANK, durations=P.DURATIONS,
                            k_tdt=1, max_symbols=MAX_SYMBOLS, hard_cap=(MAX_SYMBOLS + 1) * T + 1)
-        return t.processor.batch_decode([r.tolist() for r in tdt["tokens"]], skip_special_tokens=True)
+        seqs = [r.tolist() for r in tdt["tokens"]]
+        self.tokens += sum(len(x) for x in seqs)
+        return t.processor.batch_decode(seqs, skip_special_tokens=True)
+
+
+def trained_weights(kind: str, model: str | None) -> bool | None:
+    """Whether a student dir holds trained weights: the trainer's "trained" record in its student_meta.json (a
+    checkpoint the trainer exported has it, a student init dir from 03 / 03c does not); None for the teachers."""
+    if kind not in ("aed", "ctc") or not model:
+        return None
+    try:
+        meta = json.loads((Path(model) / "student_meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(meta.get("trained"))
+
+
+def decode_len_of(kind: str, choice: str, trained: bool | None) -> str | None:
+    """The AED decode length a probe runs (module docstring): None for the non-autoregressive kinds; "auto" is
+    "teacher" for an untrained student dir, "greedy" otherwise."""
+    if kind not in AED_KINDS:
+        return None
+    if choice != "auto":
+        return choice
+    return "teacher" if kind == "aed" and trained is False else "greedy"
 
 
 def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, store, revision: str,
-                relpos_patch: bool = True):
+                relpos_patch: bool = True, decode_len: str | None = None):
     """The runner of one kind and its model's description; relpos_patch: kitsune.patches.patch_relpos_once_per_batch
-    on its encoder, as the trainer and the evaluator run every one of these encoders (perf.relpos_patch)."""
-    runner, desc = _runner(kind, model, device, dtype, store.info or {}, revision)
+    on its encoder, as the trainer and the evaluator run every one of these encoders (perf.relpos_patch); decode_len
+    "teacher": an AED runner pinned to the teacher's token counts."""
+    runner, desc = _runner(kind, model, device, dtype, store.info or {}, revision, pin=decode_len == "teacher")
     if relpos_patch:
         from kitsune.patches import patch_relpos_once_per_batch
 
@@ -267,7 +316,8 @@ def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, 
     return runner, desc
 
 
-def _runner(kind: str, model: str | None, device: torch.device, dtype: str, info: dict, revision: str):
+def _runner(kind: str, model: str | None, device: torch.device, dtype: str, info: dict, revision: str,
+            pin: bool = False):
     if kind in ("aed", "cohere"):
         from transformers import AutoProcessor
 
@@ -285,7 +335,7 @@ def _runner(kind: str, model: str | None, device: torch.device, dtype: str, info
             proc = AutoProcessor.from_pretrained(str(model))
             desc = str(model)
         return AedRunner(m, proc, device, dtype, info.get("prompt", trainset.PROMPT), info.get("eos", trainset.EOS),
-                         info.get("pad", trainset.PAD)), desc
+                         info.get("pad", trainset.PAD), pin=pin), desc
     if kind in ("ctc", "parakeet-ctc"):
         from transformers import AutoProcessor
 
@@ -309,33 +359,41 @@ def _peak(device: torch.device) -> dict:
                 reserved=int(torch.cuda.max_memory_reserved(device)))
 
 
-def _reset(device: torch.device):
+def reset_peak(device: torch.device):
+    """The peak counters only: what the allocator holds stays (no cudaMalloc inside the clock that follows)."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
 
 
+def free_cache(device: torch.device):
+    """The allocator's cached blocks back to the card (between the passes, never right before a clock)."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+
+
 def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[str], device: torch.device, *,
-          batch_s: float, warmup: int, warmup_1: int, latency_n: int | None) -> dict:
-    """The timed passes over `waves` (module docstring): warm-up, batched, batch-1. durations: the store's seconds of
-    each wave (the batching and the RTF's audio seconds). Returns the record's numbers."""
+          batch_s: float, warmup: int, warmup_1: int, latency_n: int | None, n_tok: list[int] | None = None) -> dict:
+    """The timed passes over `waves` (module docstring): the batched pass after its warm-up, then the batch-1 pass
+    after its own. durations: the store's seconds of each wave (the batching and the RTF's audio seconds); n_tok: the
+    teacher's tokens of each (an AED runner pinned to them reads them). Returns the record's numbers."""
     from kitsune.evaluate import corpus_cer
 
     dur = np.asarray(durations, dtype=np.float64)
+    tok = [1] * len(waves) if n_tok is None else [int(x) for x in n_tok]
     order = np.argsort(-dur, kind="stable")
     plan = trainset.pack_micro_batches(order, dur, float(batch_s))
     n1 = len(waves) if latency_n is None else min(int(latency_n), len(waves))
 
     def run(idx):
-        return runner.decode([waves[i] for i in idx], [float(dur[i]) for i in idx])
+        return runner.decode([waves[i] for i in idx], [float(dur[i]) for i in idx], [tok[i] for i in idx])
 
     with runner.context():
-        for b in plan[:warmup]:
+        for b in plan[:warmup]:  # the longest batches: the allocator grows to the pass's size here
             run(b)
-        for i in range(min(warmup_1, len(waves))):
-            run([i])
-        _reset(device)
+        reset_peak(device)
+        runner.tokens = 0
         hyps: list[str | None] = [None] * len(waves)
         sync(device)
         t0 = time.perf_counter()
@@ -345,7 +403,13 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
         sync(device)
         wall = time.perf_counter() - t0
         peak_b = _peak(device)
-        _reset(device)
+        tokens_b = int(runner.tokens)
+        free_cache(device)  # the batched pass's blocks go: batch-1's own reserved VRAM is measured
+        warm_1 = ([max(range(n1), key=lambda i: dur[i])] if n1 and warmup_1 else []) + list(
+            range(min(int(warmup_1), len(waves))))
+        for i in warm_1:  # the longest latency id first: the allocator grows to batch-1's largest need
+            run([i])
+        reset_peak(device)
         lat = []
         for i in range(n1):
             sync(device)
@@ -360,7 +424,7 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
     reserved = [p["reserved"] for p in (peak_b, peak_1) if p["reserved"] is not None]
     return dict(n_utts=len(waves), audio_s=round(audio, 3), batches=len(plan), batch_s=float(batch_s),
                 wall_s=round(wall, 4), rtf=wall / audio if audio else None, warmup_batches=min(warmup, len(plan)),
-                warmup_1=min(warmup_1, len(waves)), n_latency=n1,
+                warmup_1=len(warm_1), n_latency=n1, tokens_per_utt=tokens_b / len(waves) if waves else None,
                 p50_s=float(np.percentile(lat_a, 50)) if n1 else None,
                 p95_s=float(np.percentile(lat_a, 95)) if n1 else None,
                 mean_s=float(lat_a.mean()) if n1 else None,
@@ -425,6 +489,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="refuse (exit 3) while another compute process is on the GPU")
     ap.add_argument("--no-relpos-patch", action="store_true",
                     help="time the encoder without the rel-pos-once-per-batch patch (the trainer and evaluator use it)")
+    ap.add_argument("--decode-len", default="auto", choices=DECODE_LENS,
+                    help="aed / cohere: teacher = every batch decodes its longest row's teacher token count, greedy = "
+                         "the free decode, auto = teacher for an untrained student dir, else greedy (default "
+                         "%(default)s)")
     args = ap.parse_args(argv)
     if args.kind in ("aed", "ctc", "parakeet-ctc", "parakeet-tdt") and not args.model:
         ap.error(f"--kind {args.kind} needs --model")
@@ -462,19 +530,26 @@ def main(argv=None) -> int:
     if missing := [i for i in ids if i not in pos]:
         print(f"REFUSED: {len(missing)} ids are not in {args.store}, e.g. {missing[:3]}", file=sys.stderr)
         return EXIT_REFUSED
+    trained = trained_weights(args.kind, args.model)
+    decode_len = decode_len_of(args.kind, args.decode_len, trained)
+    if decode_len == "teacher" and (store.info or {}).get("kind") == "frames":
+        print(f"REFUSED: {args.store} is a frame store, whose token counts are the CTC targets': an AED decode pinned "
+              "to the teacher's length needs a token store (the eval store, cache/eval)", file=sys.stderr)
+        return EXIT_REFUSED
     waves = [store.wave(pos[i]) for i in ids]  # decoded before any clock starts
     durations = [float(store.utts[pos[i]].duration) for i in ids]
+    n_tok = [int(store.utts[pos[i]].n_tok) for i in ids]  # the teacher's tokens with EOS (a token store's)
     refs = store.frame().set_index("id").loc[ids, "ref"].tolist()
     t0 = time.time()
     runner, desc = load_runner(args.kind, args.model, device, dtype, store, args.revision,
-                               relpos_patch=not args.no_relpos_patch)
+                               relpos_patch=not args.no_relpos_patch, decode_len=decode_len)
     load_s = time.time() - t0
     rec = dict(kind=args.kind, model=desc, device=str(device),
                gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None, dtype=dtype,
                params_total=int(runner.params), weights_bytes=int(runner.weights_bytes), load_s=round(load_s, 2),
-               relpos_patch=not args.no_relpos_patch)
+               relpos_patch=not args.no_relpos_patch, decode_len=decode_len, trained=trained)
     rec.update(probe(runner, waves, durations, refs, device, batch_s=args.batch_s, warmup=args.warmup,
-                     warmup_1=args.warmup_1, latency_n=args.latency_n))
+                     warmup_1=args.warmup_1, latency_n=args.latency_n, n_tok=n_tok))
     rec.update(idle=idle, gpu_state=gpu, versions=_versions(), store=str(args.store), time_utc=_now())
     merge_out(out, ids, system, rec)
     print(f"{system}: RTF {rec['rtf']:.5f} batched ({rec['n_utts']} utts, {rec['audio_s']:.0f} s), batch-1 p50 "

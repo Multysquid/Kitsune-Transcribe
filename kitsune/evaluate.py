@@ -433,20 +433,30 @@ def _teacher_text(store, teacher_rows: dict | None) -> dict[str, tuple]:
 
 @torch.no_grad()
 def greedy_generate(model, feats: torch.Tensor, fmask: torch.Tensor, max_duration_s: float, *,
-                    prompt_ids: Sequence[int], eos: int, pad: int, amp: bool) -> list[tuple[list[int], bool]]:
+                    prompt_ids: Sequence[int], eos: int, pad: int, amp: bool,
+                    pin_new: int | None = None) -> list[tuple[list[int], bool]]:
     """One batch of an AED model's greedy decode with the teacher pass's settings (scripts/02_teacher_pass.py:
     num_beams 1, RepetitionStop, max_new = 16 + 10 x the longest row's seconds): per row the generated ids after the
     prompt up to and including EOS, and whether the row ended with EOS (not truncated). The caller holds eval mode and
-    the fp32 head (greedy_eval; tools/speed_probe.py times this very call)."""
+    the fp32 head (greedy_eval; tools/speed_probe.py times this very call).
+
+    pin_new (the speed probe's length-pinned timing only; the evaluator never pins): exactly min(pin_new, max_new)
+    decoder steps for the batch - EOS suppressed until then (min_new_tokens), no RepetitionStop - so the time is the
+    model shape's at that output length whatever the weights emit: an untrained init dir would otherwise run to max_new,
+    or stop at random. Every step is the same KV-cached forward and argmax as the free decode's."""
     P = len(prompt_ids)
     n = feats.shape[0]
     # identical to 02_teacher_pass: ~3.6 tok/s observed (max ~6.5), 16 + 10 s is a 1.5x margin on the max
     max_new = min(int(16 + 10 * float(max_duration_s)), model.config.max_position_embeddings - P - 1)
+    stop = dict(stopping_criteria=StoppingCriteriaList([RepetitionStop(P)]))
+    if pin_new is not None:
+        max_new = max(1, min(int(pin_new), max_new))
+        stop = dict(min_new_tokens=max_new)
     prompt = torch.tensor([list(prompt_ids)] * n, dtype=torch.long, device=feats.device)
     with torch.autocast(device_type=feats.device.type, dtype=torch.bfloat16, enabled=amp):
         seq = model.generate(input_features=feats, attention_mask=fmask, decoder_input_ids=prompt,
                              max_new_tokens=max_new, do_sample=False, num_beams=1, eos_token_id=eos,
-                             pad_token_id=pad, stopping_criteria=StoppingCriteriaList([RepetitionStop(P)]))
+                             pad_token_id=pad, **stop)
     gen = (seq.sequences if hasattr(seq, "sequences") else seq)[:, P:].cpu().numpy()
     out = []
     for r in range(n):
