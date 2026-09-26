@@ -186,11 +186,12 @@ The size study (every default below is the trainer as it was before them; the st
                       features   kitsune.ctc_student.ctc_features' LogMel: 80 mel, pre-emphasis 0.97, per-feature
                                  normalisation, NO dither (the Parakeet extractor has none); SpecAugment masks only
                       data       frame stores (kitsune.trainset.build_frame_stores; cache dirs ctc_train / ctc_eval /
-                                 ctc_*_sub*) of the selection's rows with their parakeet_out targets, built with the FRAME
-                                 PREFLIGHT: every row's decoded audio must give its stored n_frames (decision 15: a
-                                 mismatch is dropped and counted, more than 0.1 % of the train rows or any eval row fails
+                                 ctc_*_sub*: store_dir) of the selection's rows with their parakeet_out targets, built with
+                                 the FRAME PREFLIGHT: every row's decoded audio must give its stored n_frames (decision 15:
+                                 a mismatch is dropped and counted, more than 0.1 % of the train rows or any eval row fails
                                  the run; a `frame_preflight` event per store, a reused cache's too). The planner packs
-                                 by padded audio (no decoder lengths)
+                                 by padded audio (no decoder lengths). The run reads no teacher_out; scripts/05_evaluate.py
+                                 scores a CTC student on the token eval store (build_eval_store's default builds both)
                       loss       kitsune.ctc_kd: (w_kl x KL on every frame + loss.w_ctc x CTC on the teacher's greedy CTC
                                  path) / N_u, the CTC target tokens of the whole step (T = 1, no T^2). loss/objective,
                                  loss/kl (= kl_dense + kl_blank), loss/kl_dense, loss/kl_blank and loss/ctc are per
@@ -1478,14 +1479,15 @@ def _subset_dir(prefix: str, budget_s: float, seed: int, ids: list[str]) -> str:
 
 
 def train_store_spec(cfg: dict, log) -> tuple[str, list[str] | None]:
-    """The train store setup_data builds: its cache dir name under cache_dir and the ids it holds (None: every kept
-    train row of cfg["sources"]). subset.train_audio_s draws a seeded duration subset (a `subset` event with every
-    id), subset.train_utts a seeded one that starts with probe rows. scripts/05_evaluate.py takes its probe rows from
-    the same ids. Family "ctc": the frame store's names start with "ctc_" (they share cache_dir with the token stores
-    on the study box), and a duration subset draws from every row (the frame planner excludes none)."""
+    """The train store setup_data builds: its name under cache_dir and the ids it holds (None: every kept train row of
+    cfg["sources"]). subset.train_audio_s draws a seeded duration subset (a `subset` event with every id; the name
+    carries the ids' hash), subset.train_utts a seeded one that starts with probe rows. scripts/05_evaluate.py takes
+    its probe rows from the same ids and packs them into TOKEN stores named after this name. Family "ctc": a duration
+    subset draws from every row (the frame planner excludes none), and the frame store lives under
+    store_dir(cfg, name) = cache_dir/"ctc_"<name>, so a token store built under the plain name (05's) never touches
+    it."""
     sel, teach = rpath(cfg["selection"]), rpath(cfg["teacher_root"])
     sub, seed = cfg["subset"], int(cfg["seed"])
-    pre = "ctc_" if is_ctc(cfg) else ""
     if sub["train_audio_s"] is not None:
         rows = trainset.read_selection(sel, cfg["sources"], ["train"])
         if not is_ctc(cfg):
@@ -1494,29 +1496,67 @@ def train_store_spec(cfg: dict, log) -> tuple[str, list[str] | None]:
         ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["train_audio_s"]),
                                 np.random.default_rng([seed, 11]))
         log.event("subset", split="train", sources=cfg["sources"], seed=seed, pool=len(rows), **rec)
-        return pre + _subset_dir("train", rec["budget_s"], seed, ids), ids
+        return _subset_dir("train", rec["budget_s"], seed, ids), ids
     if sub["train_utts"]:
         n = int(sub["train_utts"])
         rows = trainset.read_selection(sel, cfg["sources"], ["train"])
         rng = np.random.default_rng([seed, 1])
         probe = rows["id"][rows["in_probe"]].tolist()[: max(1, n // 4)]
         rest = _seeded_ids(rows["id"][~rows["id"].isin(probe)].tolist(), n - len(probe), rng)
-        return f"{pre}train_sub{n}_s{seed}", probe + rest
-    return f"{pre}train", None
+        return f"train_sub{n}_s{seed}", probe + rest
+    return "train", None
 
 
-def _store(cfg: dict, cache_dir: Path, sources: list[str], split: str, ids: list[str] | None = None,
-           log=None) -> trainset.Stores:
-    """One store of the run's family: a token store (kitsune.trainset.build_stores, teacher_root) or, family "ctc", a
-    frame store with its frame preflight (build_frame_stores, parakeet_root). A preflight that fails the build is
-    logged as a `frame_preflight` event (ok false, its counts) before it stops the run."""
+def eval_store_spec(cfg: dict, log) -> tuple[str, list[str] | None]:
+    """The eval store's name under cache_dir and the ids it holds (None: every kept row of cfg["eval_sets"]): the
+    seeded subset subset.eval_audio_s (pooled over the sets; a `subset` event) or subset.eval_utts_per_set asks for.
+    Both families' eval stores of a config hold these rows (the frame store under store_dir's "ctc_" name)."""
+    sel = rpath(cfg["selection"])
+    sub, seed = cfg["subset"], int(cfg["seed"])
+    if sub["eval_audio_s"] is not None:  # pooled over the eval sets
+        rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
+        ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["eval_audio_s"]),
+                                np.random.default_rng([seed, 12]))
+        log.event("subset", split="eval", sources=cfg["eval_sets"], seed=seed, pool=len(rows), **rec)
+        return _subset_dir("eval", rec["budget_s"], seed, ids), ids
+    if sub["eval_utts_per_set"]:
+        n = int(sub["eval_utts_per_set"])
+        rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
+        rng = np.random.default_rng([seed, 2])
+        ids = []
+        for s in cfg["eval_sets"]:
+            r = rows[rows["source"] == s]
+            greedy = _seeded_ids(r["id"][r["in_greedy_subset"]].tolist(), min(n, int(cfg["eval"]["greedy_subset"])), rng)
+            ids += greedy + _seeded_ids(r["id"][~r["id"].isin(greedy)].tolist(), max(0, n - len(greedy)), rng)
+        return f"eval_sub{n}_s{seed}", ids
+    return "eval", None
+
+
+FRAME_STORE_PREFIX = "ctc_"  # a frame store's cache dir: this + the token store's name (store_dir)
+
+
+def store_dir(cfg: dict, name: str, frames: bool | None = None) -> Path:
+    """The cache dir of the store `name` (train_store_spec's / eval_store_spec's): cache_dir/<name> for a token store,
+    cache_dir/ctc_<name> for a frame store (frames None: the run's family's). The two kinds of one config's rows never
+    share a directory: they share cache_dir on the study box, and a build of the other kind would replace the files."""
+    frames = is_ctc(cfg) if frames is None else frames
+    return rpath(cfg["cache_dir"]) / ((FRAME_STORE_PREFIX if frames else "") + name)
+
+
+def _store(cfg: dict, name: str, sources: list[str], split: str, ids: list[str] | None = None, log=None, *,
+           frames: bool) -> trainset.Stores:
+    """One store: a token store (kitsune.trainset.build_stores, teacher_root) or a frame store with its frame preflight
+    (build_frame_stores, parakeet_root; family "ctc" only), under store_dir. A preflight that fails the build is logged
+    as a `frame_preflight` event (ok false, its counts) before it stops the run."""
     sel, data = rpath(cfg["selection"]), rpath(cfg["data_root"])
+    where = store_dir(cfg, name, frames)
+    if not frames:
+        return trainset.build_stores(sel, data, rpath(cfg["teacher_root"]), where, sources, [split], ids=ids, log=print)
     if not is_ctc(cfg):
-        return trainset.build_stores(sel, data, rpath(cfg["teacher_root"]), cache_dir, sources, [split], ids=ids,
-                                     log=print)
+        raise ValueError(f"a frame store is family ctc's: this config's family is {family(cfg)!r}")
     try:
-        return trainset.build_frame_stores(sel, data, rpath(cfg["parakeet_root"]), cache_dir, sources, [split],
-                                           ids=ids, log=print)
+        return trainset.build_frame_stores(sel, data, rpath(cfg["parakeet_root"]), where, sources, [split], ids=ids,
+                                           log=print)
     except trainset.FramePreflightFailed as e:
         if log is not None:
             log.event("frame_preflight", store=split, **e.report)
@@ -1534,37 +1574,26 @@ def log_frame_preflight(log, split: str, store: trainset.Stores):
 
 
 def build_train_store(cfg: dict, log) -> trainset.Stores:
-    """The train store of cfg["sources"] (cached under cache_dir): train_store_spec's rows, of the run's family.
-    setup_data's; the box can build it ahead of the runs."""
+    """The train store of cfg["sources"] (cached under cache_dir): train_store_spec's rows, of the run's family (family
+    "ctc": the frame store, under store_dir). setup_data's; the box's store step builds it ahead of the runs."""
     name, ids = train_store_spec(cfg, log)
-    return _store(cfg, rpath(cfg["cache_dir"]) / name, cfg["sources"], "train", ids=ids, log=log)
+    return _store(cfg, name, cfg["sources"], "train", ids=ids, log=log, frames=is_ctc(cfg))
 
 
-def build_eval_store(cfg: dict, log) -> trainset.Stores:
-    """The eval store of cfg["eval_sets"] (cached under cache_dir, shared with 03's eval cache): every kept eval row,
-    or the seeded subset subset.eval_audio_s (pooled over the sets; a `subset` event) or subset.eval_utts_per_set
-    asks for. setup_data's, and scripts/05_evaluate.py's. Family "ctc": a frame store (ctc_eval, ctc_eval_...)."""
-    sel, cache = rpath(cfg["selection"]), rpath(cfg["cache_dir"])
-    sub, seed = cfg["subset"], int(cfg["seed"])
-    pre = "ctc_" if is_ctc(cfg) else ""
-    if sub["eval_audio_s"] is not None:  # pooled over the eval sets
-        rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
-        ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["eval_audio_s"]),
-                                np.random.default_rng([seed, 12]))
-        log.event("subset", split="eval", sources=cfg["eval_sets"], seed=seed, pool=len(rows), **rec)
-        return _store(cfg, cache / (pre + _subset_dir("eval", rec["budget_s"], seed, ids)), cfg["eval_sets"], "eval",
-                      ids=ids, log=log)
-    if sub["eval_utts_per_set"]:
-        n = int(sub["eval_utts_per_set"])
-        rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
-        rng = np.random.default_rng([seed, 2])
-        ids = []
-        for s in cfg["eval_sets"]:
-            r = rows[rows["source"] == s]
-            greedy = _seeded_ids(r["id"][r["in_greedy_subset"]].tolist(), min(n, int(cfg["eval"]["greedy_subset"])), rng)
-            ids += greedy + _seeded_ids(r["id"][~r["id"].isin(greedy)].tolist(), max(0, n - len(greedy)), rng)
-        return _store(cfg, cache / f"{pre}eval_sub{n}_s{seed}", cfg["eval_sets"], "eval", ids=ids, log=log)
-    return _store(cfg, cache / f"{pre}eval", cfg["eval_sets"], "eval", log=log)
+def build_eval_store(cfg: dict, log, frames: bool | None = None) -> trainset.Stores:
+    """The eval store of cfg["eval_sets"] (cached under cache_dir, shared with 03's eval cache): eval_store_spec's rows.
+      frames None  (the default: scripts/05_evaluate.py's and the box's store step, kitsune/study_queue.py) the TOKEN
+                   store (teacher_root), the one the evaluator scores every system on, of either family and in either
+                   evaluator path (its CTC eval takes the frame targets from parakeet_out itself), and the speed
+                   probe's cache/eval. For a family-ctc config the trainer's frame store of the same rows is built (or
+                   reused) first, so this one call pre-builds every eval store the config's runs and evals open: a box
+                   must never leave it to runs that start in parallel (a store build takes no lock).
+      frames True  the frame store alone, with its frame preflight (family ctc: setup_data's)
+      frames False the token store alone"""
+    name, ids = eval_store_spec(cfg, log)
+    if frames is None and is_ctc(cfg):
+        _store(cfg, name, cfg["eval_sets"], "eval", ids=ids, log=log, frames=True)
+    return _store(cfg, name, cfg["eval_sets"], "eval", ids=ids, log=log, frames=bool(frames))
 
 
 def probe_greedy_subset(cfg: dict, probe_ids: list[str], duration: dict[str, float], log) -> list[str]:
@@ -1605,7 +1634,7 @@ def setup_data(R: Run):
     R.train = build_train_store(cfg, log)
     if is_ctc(cfg):  # decision 15's counts of each store (a reused cache's too), before the next one is built
         log_frame_preflight(log, "train", R.train)
-    R.evalstore = build_eval_store(cfg, log)
+    R.evalstore = build_eval_store(cfg, log, frames=is_ctc(cfg))  # never the token store a ctc run does not read
     if is_ctc(cfg):
         log_frame_preflight(log, "eval", R.evalstore)
 

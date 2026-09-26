@@ -408,6 +408,8 @@ FRAME_MISMATCH_MAX_FRAC = 0.001  # decision 15: above this share of the train ro
 HOP = 160  # the Parakeet extractor's hop (10 ms at 16 kHz): valid mel frames = samples // HOP
 CTC_SUBSAMPLING_CONVS = 3  # the encoder's three stride-2 convolutions (kernel 3, padding 1): 8x subsampling
 CTC_BLANK = 3072  # == kitsune.parakeet_targets.BLANK
+CTC_VOCAB = 3073  # == kitsune.parakeet_targets.VOCAB
+CTC_DENSE_THR = 0.95  # the label pass's dense-frame threshold (STUDY.md 2.1): below it p(blank) a frame keeps its top-k
 FRAME_FILES = ("index.parquet", "audio.bin", "audio_offsets.npy", "frames_offsets.npy", "frames_blank_lp.npy",
                "dense_offsets.npy", "dense_frame.npy", "dense_topk_idx.npy", "dense_topk_lp.npy", "ctc_offsets.npy",
                "ctc_ids.npy")
@@ -445,6 +447,30 @@ def dataset_for(stores: "Stores") -> "AudioBatchDataset | FrameBatchDataset":
 
 def _frame_cache_complete(cache_dir: Path) -> bool:
     return all((cache_dir / n).exists() for n in FRAME_FILES)
+
+
+def parakeet_meta(parakeet_root: Path) -> dict:
+    """parakeet_out/meta.json (kitsune.parakeet_targets.build_meta), checked against what a frame store assumes: the
+    format version, blank 3072 of a 3073-class vocabulary, the dense threshold 0.95 and a k_ctc (each npz must carry
+    the same k_ctc; build_frame_stores checks). A missing file or another setting is an error, never a default: a
+    root written with other settings (or a partial pull) would give the loss and every CER the wrong targets."""
+    from kitsune import parakeet_targets as PT
+
+    path = Path(parakeet_root) / "meta.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} missing: a parakeet_out root carries its settings there (a partial pull?)")
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    bad = {k: meta.get(k) for k, want in (("format_version", PT.FORMAT_VERSION), ("blank", CTC_BLANK),
+                                          ("vocab", CTC_VOCAB)) if meta.get(k) != want}
+    thr, k = meta.get("ctc_dense_thr"), meta.get("k_ctc")
+    if not isinstance(thr, (int, float)) or abs(float(thr) - CTC_DENSE_THR) > 1e-9:
+        bad["ctc_dense_thr"] = thr
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        bad["k_ctc"] = k
+    if bad:
+        raise ValueError(f"{path}: {bad} - a frame store needs format_version {PT.FORMAT_VERSION}, blank {CTC_BLANK}, "
+                         f"vocab {CTC_VOCAB}, ctc_dense_thr {CTC_DENSE_THR} and an integer k_ctc")
+    return meta
 
 
 def _decoded_lengths(audio_path: Path, offsets: np.ndarray, workers: int, block: int = 64) -> list:
@@ -515,9 +541,11 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
     Idempotent like build_stores: nothing is rebuilt if stores.json carries the same fingerprint (kind, format version,
     selection file hash, sources, splits, the npz members' CRCs, the .jsonl hashes, meta.json's settings, the preflight
     threshold) and the audio shards are unchanged. Selected rows without audio are dropped (info["dropped"]["no_audio"]);
-    a selected row without Parakeet targets is an error (a selection made from another label root); a frame mismatch is
-    dropped (info["dropped"]["frame_mismatch"]) or fails the build (FramePreflightFailed) as frame_preflight decides.
-    workers: the preflight's decode threads (default: min(32, cpu count))."""
+    a selected row without Parakeet targets is an error (a selection made from another label root), and so are a
+    missing or other-settings meta.json (parakeet_meta), a shard's missing .jsonl and a selected row without its jsonl
+    line (its reference and teacher text: a partial pull must stop the build, not score CERs against empty strings); a
+    frame mismatch is dropped (info["dropped"]["frame_mismatch"]) or fails the build (FramePreflightFailed) as
+    frame_preflight decides. workers: the preflight's decode threads (default: min(32, cpu count))."""
     selection_path, data_root, parakeet_root, cache_dir = map(Path, (selection_path, data_root, parakeet_root,
                                                                      cache_dir))
     sources, splits = list(sources), list(splits)
@@ -527,18 +555,18 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
         sel = sel[sel["id"].isin(ids)].reset_index(drop=True)
     if sel.empty:
         raise ValueError(f"{selection_path}: no kept rows for sources={sources} splits={splits}")
-    pmeta_path = parakeet_root / "meta.json"
-    pmeta = json.loads(pmeta_path.read_text(encoding="utf-8")) if pmeta_path.exists() else {}
+    pmeta = parakeet_meta(parakeet_root)
     shard_files = [p for s in sources for sp in splits for p in sorted((data_root / "shards" / s).glob(f"{sp}-*.parquet"))]
     npz_files = [parakeet_root / f"{f}.npz" for f in sorted(set(sel["teacher_file"]))]
-    missing_npz = [p for p in npz_files if not p.exists()]
-    if missing_npz:
-        raise FileNotFoundError(f"parakeet_out missing for selected rows: {missing_npz[:3]}")
+    # the pair of each shard: the npz holds the targets, its jsonl the reference and the teacher's text every CER reads
+    missing = [q for p in npz_files for q in (p, p.with_suffix(".jsonl")) if not q.is_file()]
+    if missing:
+        raise FileNotFoundError(f"parakeet_out missing for selected rows ({len(missing)} files): {missing[:3]}")
 
     fp_src = dict(kind="frames", version=FRAME_FORMAT_VERSION, selection=_sha256(selection_path), sources=sources,
                   splits=splits, ids=None if ids is None else hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest(),
                   npz=[(p.relative_to(parakeet_root).as_posix(), p.stat().st_size, _npz_members(p)) for p in npz_files],
-                  jsonl=[_sha256(q) if q.exists() else None for q in (p.with_suffix(".jsonl") for p in npz_files)],
+                  jsonl=[_sha256(p.with_suffix(".jsonl")) for p in npz_files],
                   settings={k: pmeta.get(k) for k in ("format_version", "k_ctc", "ctc_dense_thr", "blank", "vocab")},
                   preflight=dict(max_mismatch_frac=float(max_mismatch_frac), fail_on_eval=True))
     fingerprint = hashlib.sha256(json.dumps(fp_src, sort_keys=True).encode()).hexdigest()
@@ -571,28 +599,27 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
     row_of = dict(zip(idx["id"].tolist(), range(n)))
     per_row: list = [None] * n
     text: list = [None] * n
-    k = None
+    k = int(pmeta["k_ctc"])
     for npz in npz_files:
         with np.load(npz) as zf:
             z = {key: zf[key] for key in _PARAKEET_KEYS}
-        kk = int(z["k_ctc"])
-        if k is None:
-            k = kk
-        elif kk != k:
-            raise ValueError(f"{npz}: k_ctc {kk} differs from the other shards' {k}")
+        if int(z["k_ctc"]) != k:
+            raise ValueError(f"{npz}: k_ctc {int(z['k_ctc'])} differs from {parakeet_root / 'meta.json'}'s {k}")
         rows_json = {}
         jl = npz.with_suffix(".jsonl")
-        if jl.exists():
-            with open(jl, encoding="utf-8") as fj:
-                for line in fj:
-                    if line.strip():
-                        r = json.loads(line)
-                        rows_json[r["id"]] = r
+        with open(jl, encoding="utf-8") as fj:
+            for line in fj:
+                if line.strip():
+                    r = json.loads(line)
+                    rows_json[r["id"]] = r
         fo, do = z["frame_offsets"], z["dense_offsets"]
         for j, x in enumerate(str(u) for u in z["ids"]):
             r = row_of.get(x)
             if r is None:
                 continue
+            if x not in rows_json:  # the label pass writes one jsonl line per npz row: not one pass's output
+                raise ValueError(f"{jl}: no line for {x}, which its npz holds - the reference and the teacher's text "
+                                 f"of a selected row are missing")
             T = int(z["n_frames"][j])
             fs, ds_ = slice(int(fo[j]), int(fo[j + 1])), slice(int(do[j]), int(do[j + 1]))
             if fs.stop - fs.start != T:
@@ -606,13 +633,11 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
             ctc = col0[(col0 != prev) & (col0 != CTC_BLANK)].astype(np.int16)  # == parakeet_targets.ctc_greedy
             per_row[r] = (T, z["ctc_blank_lp"][fs].astype(np.float16), dense, tidx,
                           z["ctc_topk_lp"][ds_].astype(np.float16), ctc)
-            text[r] = rows_json.get(x)
+            text[r] = rows_json[x]
     missing = [idx["id"][r] for r in range(n) if per_row[r] is None]
     if missing:
         raise ValueError(f"{len(missing)} selected rows not found in their parakeet_out shard, e.g. {missing[0]} - "
                          f"selection and parakeet_out do not match")
-    if k is None:
-        raise ValueError("no parakeet_out shard read")
 
     # 3. the frame preflight: decode every row, compare its frame count with the stored one (decision 15)
     t1 = time.time()
@@ -637,7 +662,7 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
     dropped_rows = idx.iloc[sorted(drop)]
     kidx = idx.iloc[keep].reset_index(drop=True)
     kept = [per_row[r] for r in keep]
-    ktext = [text[r] or {} for r in keep]
+    ktext = [text[r] for r in keep]
     nk = len(kept)
     if not nk:
         raise ValueError(f"{selection_path}: no row left after the frame preflight")

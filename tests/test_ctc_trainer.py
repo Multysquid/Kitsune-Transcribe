@@ -252,7 +252,8 @@ def test_frame_store_holds_the_label_pass_targets(env):
     m = load_script("04_distill")
     cfg, log = cfg_of(env), Log()
     po = env["po"]
-    for split, store in (("train", m.build_train_store(cfg, log)), ("eval", m.build_eval_store(cfg, log))):
+    stores = (("train", m.build_train_store(cfg, log)), ("eval", m.build_eval_store(cfg, log, frames=True)))
+    for split, store in stores:
         assert trainset.is_frame_store(store) and store.cache_dir.name == f"ctc_{split}"
         want = {i for i, u in env["fc"].utts.items() if u.has_teacher and u.split == split
                 and (u.source in cfg["sources"] if split == "train" else u.source in EVAL)}
@@ -281,6 +282,100 @@ def test_frame_store_holds_the_label_pass_targets(env):
     again = m.build_train_store(cfg, log)
     assert again.info.get("reused") and len(again) == len(m.build_train_store(cfg, log))
     assert m.make_planner(SimpleNamespace(cfg=cfg, train=again), 3.0).frames  # the frame planner for family ctc
+
+
+def test_the_evaluator_and_the_box_get_the_token_eval_store(env, tmp_path):
+    """What scripts/05_evaluate.py and the box's store step (kitsune/study_queue.py build-stores) call for a family-ctc
+    config: build_eval_store(cfg, log) returns the TOKEN eval store (the evaluator scores every system on it and reads
+    the frame targets from parakeet_out itself; the speed probe opens cache/eval) and builds the trainer's frame eval
+    store of the same rows alongside, which the trainer then reuses; train_store_spec gives the plain name, under which
+    05 packs its token probe stores, and the trainer's frame train store lives under ctc_<name>, so a token store built
+    there (05's probe_is_train path) leaves the frame store as it was."""
+    from kitsune import trainset
+
+    m = load_script("04_distill")
+    cache = tmp_path / "cache"
+    cfg, log = cfg_of(env, {"cache_dir": str(cache)}), Log()
+    ev = m.build_eval_store(cfg, log)
+    assert not trainset.is_frame_store(ev) and ev.cache_dir == cache / "eval"
+    item = trainset.AudioBatchDataset(ev)[[0, 1]]  # as 05's CTC eval opens it: the token targets are there
+    assert not item["dropped"] and item["decoder_input_ids"].shape[0] == 2 and len(item["top_idx"])
+    frames = m.build_eval_store(cfg, log, frames=True)
+    assert trainset.is_frame_store(frames) and frames.info.get("reused") and frames.cache_dir == cache / "ctc_eval"
+    assert [u.id for u in frames.utts] == [u.id for u in ev.utts]  # the same rows, in the same order
+    assert m.greedy_subset_ids(cfg, frames) == m.greedy_subset_ids(cfg, ev)
+    assert not trainset.is_frame_store(m.build_eval_store(cfg, log, frames=False))
+    with pytest.raises(ValueError, match="family ctc"):
+        m.build_eval_store(m.load_config(write_config(env, "aed-unit", {"family": "aed"}), []), log, frames=True)
+
+    name, ids = m.train_store_spec(cfg, log)
+    assert name == "train" and ids is None and m.store_dir(cfg, name) == cache / "ctc_train"
+    train = m.build_train_store(cfg, log)
+    assert trainset.is_frame_store(train) and train.cache_dir == cache / "ctc_train"
+    tok = trainset.build_stores(cfg["selection"], cfg["data_root"], cfg["teacher_root"], cache / name, cfg["sources"],
+                                ["train"], ids=ids, log=lambda s: None)  # as 05's probe_store with probe_is_train
+    assert not trainset.is_frame_store(tok) and len(tok) == len(train)
+    again = m.build_train_store(cfg, log)
+    assert again.info.get("reused") and trainset.is_frame_store(again)
+
+    # a duration subset: the frame store's ids are every row's draw, its name carries their hash under ctc_
+    sub = cfg_of(env, {"cache_dir": str(cache), "subset": {"train_audio_s": 20, "eval_audio_s": 6}})
+    sname, sids = m.train_store_spec(sub, log)
+    assert sname.startswith("train_20s_") and m.build_train_store(sub, log).cache_dir == cache / f"ctc_{sname}"
+    ename, eids = m.eval_store_spec(sub, log)
+    assert m.build_eval_store(sub, log).cache_dir == cache / ename and (cache / f"ctc_{ename}" / "stores.json").is_file()
+
+
+def test_frame_store_refuses_incomplete_label_files(env, tmp_path):
+    """A partial or foreign parakeet_out stops the frame store build instead of a silent default: a missing meta.json,
+    a meta.json with another blank / vocabulary / dense threshold / k_ctc than the shards', a shard without its .jsonl,
+    and a selected row without its jsonl line (its reference and teacher text: every CER would read an empty string)."""
+    import shutil
+
+    from kitsune import trainset
+
+    fc, sel = env["fc"], env["sel"]
+
+    def build(po, name):
+        return trainset.build_frame_stores(sel, fc.data, po, tmp_path / "cache" / name, EVAL, ["eval"],
+                                           log=lambda s: None)
+
+    def copy(name):
+        dst = tmp_path / name
+        shutil.copytree(env["po"].root, dst)
+        return dst
+
+    assert len(build(copy("ok"), "ok")) == 18
+    po = copy("no_meta")
+    (po / "meta.json").unlink()
+    with pytest.raises(FileNotFoundError, match="meta.json"):
+        build(po, "no_meta")
+    for key, value in (("blank", 3071), ("vocab", 4097), ("ctc_dense_thr", 0.9), ("k_ctc", None)):
+        po = copy(f"meta_{key}")
+        meta = json.loads((po / "meta.json").read_text(encoding="utf-8"))
+        meta[key] = value
+        (po / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        with pytest.raises(ValueError, match=key):
+            build(po, f"meta_{key}")
+    po = copy("meta_k")
+    meta = json.loads((po / "meta.json").read_text(encoding="utf-8"))
+    meta["k_ctc"] = 4  # the shards hold k 8
+    (po / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="k_ctc 8 differs"):
+        build(po, "meta_k")
+    po = copy("no_jsonl")
+    (po / "eval_cv8" / "eval-00000.jsonl").unlink()
+    with pytest.raises(FileNotFoundError, match="eval-00000.jsonl"):
+        build(po, "no_jsonl")
+    po = copy("short_jsonl")
+    jl = po / "eval_cv8" / "eval-00000.jsonl"
+    lines = [x for x in jl.read_text(encoding="utf-8").splitlines() if x.strip()]
+    kept = set(pd.read_parquet(sel).query("keep")["id"])
+    drop = next(i for i, x in enumerate(lines) if json.loads(x)["id"] in kept)
+    gone = json.loads(lines[drop])["id"]
+    jl.write_text("\n".join(lines[:drop] + lines[drop + 1:]) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=f"no line for {gone}"):
+        build(po, "short_jsonl")
 
 
 @pytest.fixture(scope="module")
@@ -652,7 +747,7 @@ def test_the_export_reloads_and_decodes_as_trained(env, ref_run):
     rounded = CS.load_ctc_student(env["student"], "cpu")
     rounded.load_state_dict({k: as_saved(k, v) for k, v in trained.items()})
     m = load_script("04_distill")
-    store = m.build_eval_store(cfg_of(env), Log())
+    store = m.build_eval_store(cfg_of(env), Log(), frames=True)
     assert trainset.is_frame_store(store)
     feat = CS.ctc_features(w).logmel
     assert isinstance(feat, LogMel)
@@ -737,7 +832,7 @@ def test_lr_probe_ctc(env):
     assert res["objective"] == pytest.approx(s["lr_probe"]["kl"] + 0.8 * s["lr_probe"]["ctc"])
     model = CS.load_ctc_student(env["student"], "cpu")
     model.load_state_dict(torch.load(run / "checkpoints" / "full_step_6" / "model.pt", weights_only=True))
-    store = m.build_eval_store(cfg_of(env), Log())
+    store = m.build_eval_store(cfg_of(env), Log(), frames=True)
     tf, _, _, _ = ce.ctc_eval(model, store, CS.ctc_features(env["student"]).logmel, "cpu", 20.0, amp=False,
                               decode=False)
     assert res["objective"] == pytest.approx(ce.combined_loss_ctc(tf, 1.0, 0.8)["value"], rel=1e-6)
