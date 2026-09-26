@@ -77,16 +77,16 @@ The size study (study/STUDY.md 4.1-4.3; CONTRACT.md 1, 5):
             dither) through kitsune.evaluate.ctc_eval: one encoder pass per batch gives the greedy CTC text (argmax,
             collapse, drop blanks; decode_ids) and, against the stored Parakeet frame targets, the teacher-forced frame
             metrics (KL on dense and blank frames, CTC per target token, argmax agreement, argmax-blank share); the
-            probe likewise on its train rows. The stores are the trainer's for the family (04_distill.build_eval_store;
-            the probe's family_store): with the CTC trainer's frame stores (kitsune.trainset.build_frame_stores, built
-            with the frame preflight of decision 15: a mismatched eval row fails the build) the targets ride in every
-            batch, exactly as the trainer evaluates; on a token store they are read from parakeet_root
-            (parakeet_out/<set>/<stem>.npz) and a student frame count other than the stored n_frames refuses the eval
-            (decision 15: any eval row; the probe's train rows above 0.1 %). The CTC student's teacher is Parakeet's
-            stored CTC path (parakeet_out ctc_hyp): the greedy tables' teacher_hyp, the baselines
-            (kitsune.evaluate.parakeet_baselines, checked against PARAKEET_CTC_CER_PREREG from study/PREREG.json once
-            it is filled, not while it is pending) and the verdict's ratios (verdict(family="ctc")). The student is
-            scored against the eval store's reference, which must equal parakeet_out's
+            probe likewise on its train rows. The stores are token stores for either family (04_distill.
+            build_eval_store, which for a ctc config first builds the trainer's frame store of the same rows with its
+            frame preflight; the probe's token_store), the frame targets read from parakeet_root
+            (parakeet_out/<set>/<stem>.npz): a student frame count other than the stored n_frames refuses the eval
+            (decision 15: any eval row; the probe's train rows above 0.1 %). kitsune.evaluate.ctc_eval reads a frame
+            store's batches too, as the trainer does. The CTC student's teacher is Parakeet's stored CTC path
+            (parakeet_out ctc_hyp): the greedy tables' teacher_hyp, the baselines (kitsune.evaluate.parakeet_baselines,
+            checked against PARAKEET_CTC_CER_PREREG from study/PREREG.json once it is filled, not while it is pending)
+            and the verdict's ratios (verdict(family="ctc")). The student is scored against the eval store's
+            reference, which must equal parakeet_out's
   manifest  with --manifest (default: study_manifest.json next to the config's selection, when it exists; "none":
             none) the eval is checked against the study's frozen eval manifest (kitsune.study_stats.parse_manifest:
             every set's ids hash to its sha256; against study/PREREG.json's manifest block once filled): the config's
@@ -914,31 +914,26 @@ def finish_pass(ctx: Ctx, sets: list[str], n_chunks: int, work: Path):
     _rmdir_if_empty(out / WORK)
 
 
-def family_store(ctx: Ctx, cache_dir: Path, ids: list[str] | None):
-    """A train-split store of the config's sources for the eval, of the kind the trainer builds for the run's family:
-    family "ctc" where kitsune.trainset has the CTC trainer's frame stores, a frame store (build_frame_stores: the
-    Parakeet frame targets packed with the audio, its frame preflight, decision 15), else a token store
-    (build_stores: the teacher_out targets and text)."""
+def token_store(ctx: Ctx, cache_dir: Path, ids: list[str] | None):
+    """A token store (kitsune.trainset.build_stores: audio, teacher_out targets and text) of the config's train rows
+    `ids` for the probe, of either family: a CTC eval takes its frame targets from parakeet_out (parakeet_data), and
+    the CTC trainer keeps its frame stores under their own ctc_<name> dirs (04_distill.store_dir), which a store built
+    here under the plain name never touches."""
     cfg = ctx.cfg
-    sel, data = Path(cfg["selection"]), Path(cfg["data_root"])
-    if ctx.family == "ctc" and hasattr(trainset, "build_frame_stores"):
-        return trainset.build_frame_stores(sel, data, parakeet_root(cfg), cache_dir, cfg["sources"], ["train"],
-                                           ids=ids, log=print)
-    return trainset.build_stores(sel, data, Path(cfg["teacher_root"]), cache_dir, cfg["sources"], ["train"], ids=ids,
-                                 log=print)
+    return trainset.build_stores(Path(cfg["selection"]), Path(cfg["data_root"]), Path(cfg["teacher_root"]), cache_dir,
+                                 cfg["sources"], ["train"], ids=ids, log=print)
 
 
 def probe_store(ctx: Ctx):
     """The trainer's probe (run_eval's R.probe_ids) without its whole train store: the in_probe rows of the train
     store setup_data builds (train_store_spec), packed into a store of their own, whose order is the train store's
     (the shards are read in the same order); eval.probe_is_train: that train store itself (a small subset in the
-    configs that use it). A frame store for a CTC run where the trainer builds those (family_store). Returns (store,
-    probe ids) or (None, [])."""
+    configs that use it). Token stores for either family (token_store). Returns (store, probe ids) or (None, [])."""
     D, cfg = ctx.D, ctx.cfg
     sel, cache = Path(cfg["selection"]), Path(cfg["cache_dir"])
     name, ids = D.train_store_spec(cfg, ctx.log)
     if cfg["eval"]["probe_is_train"]:
-        st = family_store(ctx, cache / name, ids)
+        st = token_store(ctx, cache / name, ids)
         return st, [u.id for u in st.utts]
     rows = trainset.read_selection(sel, cfg["sources"], ["train"])
     probe = rows["id"][rows["in_probe"]]
@@ -948,7 +943,7 @@ def probe_store(ctx: Ctx):
     if not probe:
         return None, []
     tag = hashlib.sha256("\n".join(sorted(probe)).encode()).hexdigest()[:8]
-    st = family_store(ctx, cache / f"probe_{name}_{tag}", probe)
+    st = token_store(ctx, cache / f"probe_{name}_{tag}", probe)
     return st, [u.id for u in st.utts]
 
 
@@ -1018,18 +1013,12 @@ def parakeet_fingerprint(files: list[Path]) -> str:
     return h.hexdigest()[:16]
 
 
-def is_frame_store(store) -> bool:
-    """A frame store (the CTC trainer's kitsune.trainset.build_frame_stores): its batches carry the frame targets."""
-    return (store.info or {}).get("kind") == "frames"
-
-
-def parakeet_data(cfg: dict, store, log, what: str = "eval") -> tuple[dict, dict | None, list[Path]]:
+def parakeet_data(cfg: dict, store, log, what: str = "eval") -> tuple[dict, dict, list[Path]]:
     """A CTC eval's teacher over `store`: (teacher_rows, targets, files). teacher_rows: Parakeet's stored CTC text of
     every row (kitsune.evaluate.ctc_teacher_rows) with the store's reference, which must equal parakeet_out's under
-    normalize_ja; targets: id -> its stored frame targets (kitsune.ctc_targets.load_ctc_targets), None for a frame
-    store (its batches carry them: kitsune.evaluate.ctc_eval). A row missing from parakeet_out or with another
-    reference refuses the eval: the study manifest holds only rows present in both roots, and every system must be
-    scored on the same text."""
+    normalize_ja; targets: id -> its stored frame targets (kitsune.ctc_targets.load_ctc_targets). A row missing from
+    parakeet_out or with another reference refuses the eval: the study manifest holds only rows present in both
+    roots, and every system must be scored on the same text."""
     from kitsune import evaluate as ev
     from kitsune.ctc_targets import load_ctc_targets
     from kitsune.text import normalize_ja
@@ -1040,8 +1029,7 @@ def parakeet_data(cfg: dict, store, log, what: str = "eval") -> tuple[dict, dict
         raise SystemExit(f"REFUSED: parakeet_out lacks {len(absent)} npz/jsonl file(s) of the {what} rows, e.g. "
                          f"{absent[:2]}")
     want = {u.id for u in store.utts}
-    frames = is_frame_store(store)
-    rows, targets = {}, ({} if not frames else None)
+    rows, targets = {}, {}
     for p in files:
         with open(p.with_suffix(".jsonl"), encoding="utf-8") as fh:
             for line in fh:
@@ -1049,23 +1037,15 @@ def parakeet_data(cfg: dict, store, log, what: str = "eval") -> tuple[dict, dict
                     r = json.loads(line)
                     if r["id"] in want:
                         rows[r["id"]] = r
-        if not frames:
-            targets.update({i: t for i, t in load_ctc_targets(p).items() if i in want})
+        targets.update({i: t for i, t in load_ctc_targets(p).items() if i in want})
     if lost := sorted(want - set(rows)):
         raise SystemExit(f"REFUSED: {len(lost)} {what} row(s) have no Parakeet row in parakeet_out, e.g. {lost[:3]}")
     refs = {u.id: r for u, r in zip(store.utts, store.frame()["ref"].tolist())}
     if differ := sorted(i for i in rows if normalize_ja(refs.get(i) or "") != normalize_ja(rows[i].get("ref") or "")):
         raise SystemExit(f"REFUSED: {len(differ)} {what} row(s) have another reference in parakeet_out than in "
                          f"teacher_out, e.g. {differ[:3]}: the systems would not be scored on the same text")
-    if frames:
-        log.event("parakeet", what=what, files=len(files), rows=len(rows), targets="in the frame store",
-                  store=str(store.cache_dir), frame_preflight={k: v for k, v in (store.info.get("frame_preflight")
-                                                                                 or {}).items()
-                                                               if k in ("ok", "n_checked", "n_mismatch", "by_split",
-                                                                        "n_undecodable", "train_mismatch_frac")})
-    else:
-        log.event("parakeet", what=what, files=len(files), rows=len(rows), targets=len(targets),
-                  no_targets=len(want - set(targets)))
+    log.event("parakeet", what=what, files=len(files), rows=len(rows), targets=len(targets),
+              no_targets=len(want - set(targets)))
     return ev.ctc_teacher_rows(rows, refs=refs), targets, files
 
 
@@ -1097,10 +1077,11 @@ def setup_ctc(R, ckpt: Path, fallback: str | None, log):
 
 
 def refuse_frame_mismatch(ctx: Ctx, what: str, mismatch: list[dict], n_rows: int):
-    """Decision 15 on a CTC eval over a token store (a frame store's build applies it itself, before any model is
-    loaded): a row whose student frame count differs from its stored n_frames has no aligned targets. Any eval row is
-    a hard fail; the probe's rows are train rows, a fail above PROBE_MISMATCH_MAX_FRAC of them. SystemExit, the
-    finished chunks kept (the same command refuses again; the data, not the eval, has to change)."""
+    """Decision 15 on a CTC eval (a token store and parakeet_out's targets; the CTC trainer's frame store build, which
+    04_distill.build_eval_store runs for a ctc config before it hands 05 the token store, applies it too, to the eval
+    rows): a row whose student frame count differs from its stored n_frames has no aligned targets. Any eval row is a
+    hard fail; the probe's rows are train rows, a fail above PROBE_MISMATCH_MAX_FRAC of them. SystemExit, the finished
+    chunks kept (the same command refuses again; the data, not the eval, has to change)."""
     if not mismatch:
         return
     frac = len(mismatch) / max(int(n_rows), 1)
@@ -1128,8 +1109,8 @@ def check_frame_alignment(ctx: Ctx):
 
 def ctc_probe(ctx: Ctx, st, probe_ids: list[str], pg_ids: list[str]):
     """run_probe for a CTC student: one ctc_eval pass over the probe with its stored frame targets (its train shards'
-    parakeet_out, or the frame store's own) gives the teacher-forced probe (summarise_ctc_tf) and the greedy rows of
-    the probe_greedy subset. Refuses more mismatched frame counts than decision 15 allows the train rows."""
+    parakeet_out) gives the teacher-forced probe (summarise_ctc_tf) and the greedy rows of the probe_greedy subset.
+    Refuses more mismatched frame counts than decision 15 allows the train rows."""
     ev, R = ctx.ev, ctx.R
     rows, targets, _ = parakeet_data(ctx.cfg, st, ctx.log, "probe")
     res = ev.ctc_eval(R.model, st, probe_ids, ctx.feat, R.device, ctx.bs, tokenizer=R.tokenizer, teacher_rows=rows,

@@ -758,7 +758,8 @@ def test_05_refuses_a_manifest_that_does_not_match(ctc_env, tmp_path, monkeypatc
 def test_05_refuses_frames_that_do_not_align(ctc_env, tmp_path, monkeypatch):
     """Decision 15 on a token store: an eval row whose student frame count is not its stored n_frames refuses the eval
     at the chunk that holds it (the finished chunks kept); the same command refuses again before it evaluates any
-    other chunk. A probe row does too (1 of 4 is above 0.1 % of the probe's train rows), after the sets are done."""
+    other chunk. A probe row does too (1 of 4 is above 0.1 % of the probe's train rows), after the sets are done. (The
+    stored targets are right here; the eval reads others: the CTC trainer's frame preflight on the real files passes.)"""
     from kitsune.ctc_targets import FrameTargets
 
     m05 = load_script("05_evaluate")
