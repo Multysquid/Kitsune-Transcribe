@@ -126,11 +126,12 @@ DISPLAY = {"study-t06": "T-0.6B", "study-t03": "T-0.3B", "study-bridge": "bridge
 # exact total / non-embedding counts, STUDY.md 1.1 (meta-device builds; every builder asserts total == closed form).
 # The anchor is the first run's B20x2560-d4 = the T-0.6B shape; parakeet-ctc is the unpruned CTC path (24 x 4096);
 # cohere is the teacher itself (tests/test_student.py pins it), the far end of the Transcribe distillation gap.
-PARAMS_TOTAL = {"study-t06": 616_963_328, "study-t03": 320_752_384, "study-bridge": 320_752_384,
+# T-0.3B and the bridge are B8x2560 + decoder {0,2,5,7} (the owner's decision of 2026-09-26; kitsune.prereg.RUNS).
+PARAMS_TOTAL = {"study-t06": 616_963_328, "study-t03": 301_822_208, "study-bridge": 301_822_208,
                 "study-t01": 103_996_416, "study-t01-s1235": 103_996_416, "study-t005": 51_209_600,
                 "study-p03": 308_524_033, "study-p01": 98_468_865, "study-p005": 52_190_209,
                 "parakeet-ctc": 610_898_945, ANCHOR: 616_963_328, "cohere": 2_065_647_872}
-PARAMS_NON_EMBEDDING = {"study-t06": 599_137_536, "study-t03": 302_926_592, "study-bridge": 302_926_592,
+PARAMS_NON_EMBEDDING = {"study-t06": 599_137_536, "study-t03": 283_996_416, "study-bridge": 283_996_416,
                         "study-t01": 95_083_520, "study-t01-s1235": 95_083_520, "study-t005": 44_524_928,
                         "study-p03": 305_374_208, "study-p01": 95_319_040, "study-p005": 49_040_384,
                         "parakeet-ctc": 607_749_120, ANCHOR: 599_137_536}

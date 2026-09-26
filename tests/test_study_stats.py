@@ -132,15 +132,15 @@ def test_metrics_leave_empty_references_out_and_use_the_neutral_view(report):
 def test_g_per_halving_delta_g_init_effect_and_gaps(report):
     steps = {(s["big"], s["small"]): s for s in report["steps"]}
     st = steps[("study-t03", "study-t01")]
-    h = math.log2(320_752_384 / 103_996_416)
-    assert st["h"] == pytest.approx(1.625, abs=1e-3) and st["h"] == pytest.approx(h)
+    h = math.log2(301_822_208 / 103_996_416)  # T-0.3B = B8x2560 + decoder {0,2,5,7} (the owner, 2026-09-26)
+    assert st["h"] == pytest.approx(1.537, abs=1e-3) and st["h"] == pytest.approx(h)
     assert st["g"] == pytest.approx((1.10 / 1.02) ** (1 / h) - 1)
     lo, hi = st["ci_g"]
     half = 1.96 * math.sqrt(2) * 0.016
     assert lo == pytest.approx(math.expm1((math.log(1.10 / 1.02) - half) / h))
     assert hi == pytest.approx(math.expm1((math.log(1.10 / 1.02) + half) / h))
     dg = report["delta_g"]
-    h1, h2 = math.log2(320_752_384 / 103_996_416), math.log2(103_996_416 / 51_209_600)
+    h1, h2 = math.log2(301_822_208 / 103_996_416), math.log2(103_996_416 / 51_209_600)
     assert dg["delta_g"] == pytest.approx((1.30 / 1.10) ** (1 / h2) - (1.10 / 1.08) ** (1 / h1))
     assert dg["v_boot"] == pytest.approx(0.0, abs=1e-18) and dg["ci"][0] < dg["delta_g"] < dg["ci"][1]
     assert report["init_effect"]["comparison"]["ratio"] == pytest.approx(1.08 / 1.02)
@@ -170,8 +170,12 @@ def test_practical_bars(report):
     assert bars["tdt"]["smallest"] == "study-t005"
     assert bars["tdt"]["per_student"]["study-p005"]["meets"] is False
     sm = bars["teacher"]["smallest"]
-    # 1.2x: P-0.3B (1 / 0.85 = 1.176) by the point ratio; its CI reaches past 1.2, so T-0.3B (1.133) with the CI
-    assert sm["1.2x"] == {"point": "study-p03", "ci": "study-t03"}
+    # 1.2x: T-0.3B (1.02 / 0.90 = 1.133) by the point ratio and with the CI: with the B8 shape of 2026-09-26 it is
+    # smaller (301.8M) than P-0.3B (308.5M), which is within 1.2x by the point ratio only (1 / 0.85 = 1.176; its CI
+    # reaches past 1.2)
+    assert sm["1.2x"] == {"point": "study-t03", "ci": "study-t03"}
+    p03 = bars["teacher"]["per_student"]["study-p03"]
+    assert p03["point_within"]["1.2x"] is True and p03["ci_within"]["1.2x"] is False
     assert sm["1.5x"] == {"point": "study-t005", "ci": "study-t005"}
 
 
