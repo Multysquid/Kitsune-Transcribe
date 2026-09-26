@@ -25,6 +25,11 @@ Cache layout (<cache_dir>/, written by build_stores, atomic per file, stores.jso
 
 Teacher step t of an utterance (tokens[t]) is predicted by the decoder output at position len(prompt)-1+t when the
 decoder input is prompt + tokens[:-1]; see AudioBatchDataset for the exact batch contract.
+
+The CTC family (the size study's Parakeet students) trains on the Parakeet teacher's per-frame targets instead: a FRAME
+store (build_frame_stores; layout and frame preflight in the "frame stores" section below) holds the same audio and,
+per utterance, kitsune.ctc_targets.FrameTargets; FrameBatchDataset collates it, and StepPlanner(max_dec_len=None) plans
+it without a decoder. dataset_for(stores) picks the dataset of a store.
 """
 import hashlib
 import json
@@ -87,9 +92,9 @@ class Stores:
     def __len__(self) -> int:
         return len(self.utts)
 
-    def _dataset(self) -> "AudioBatchDataset":
+    def _dataset(self) -> "AudioBatchDataset | FrameBatchDataset":
         if self._ds is None:
-            self._ds = AudioBatchDataset(self)
+            self._ds = dataset_for(self)
         return self._ds
 
     def wave(self, i: int) -> np.ndarray:
@@ -97,8 +102,9 @@ class Stores:
         uses. Maps the cache files into this process (on Windows a mapped cache cannot be rebuilt in place)."""
         return decode_audio(self._dataset().audio_bytes(i))
 
-    def targets(self, i: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """(tokens (T,) int16, topk_idx (T,k) int16, topk_logprob (T,k) float16) of utts[i], as in the npz."""
+    def targets(self, i: int):
+        """(tokens (T,) int16, topk_idx (T,k) int16, topk_logprob (T,k) float16) of utts[i], as in the npz; for a
+        frame store (build_frame_stores) its kitsune.ctc_targets.FrameTargets."""
         return self._dataset().targets(i)
 
     def indices(self, *, source: str | None = None, split: str | None = None, in_probe: bool | None = None,
@@ -172,6 +178,39 @@ def _cache_complete(cache_dir: Path) -> bool:
     return all((cache_dir / n).exists() for n in names)
 
 
+def _pack_audio(sel: pd.DataFrame, shard_files: list[Path], data_root: Path, shard_size: dict[str, int],
+                audio_tmp: Path) -> tuple[list[int], list[int], dict[str, int], pd.DataFrame]:
+    """The audio pass of a store build: the selected rows' container bytes, joined BY ID from the data shards (the
+    first copy of an id wins), written back to back into `audio_tmp` in the order they are found. Returns (order: the
+    selection row of each written utterance, lens: its byte count, used: the shards that contributed -> their size,
+    lost: the selected rows without audio). No audio at all is an error."""
+    want = dict(zip(sel["id"].tolist(), range(len(sel))))
+    order, lens, used = [], [], {}
+    with open(audio_tmp, "wb") as f:
+        for path in shard_files:
+            if not want:
+                break
+            pf = pq.ParquetFile(path)
+            for g in range(pf.num_row_groups):
+                ids = pf.read_row_group(g, columns=["id"]).column("id").to_pylist()
+                hits = [(j, want.pop(x)) for j, x in enumerate(ids) if x in want]  # pop: first copy of an id wins
+                if not hits:
+                    continue
+                audio = pf.read_row_group(g, columns=["audio"]).column("audio")
+                used[path.relative_to(data_root).as_posix()] = shard_size[path.relative_to(data_root).as_posix()]
+                for j, r in hits:
+                    b = audio[j].as_py()
+                    f.write(b)
+                    order.append(r)
+                    lens.append(len(b))
+        f.flush()
+        os.fsync(f.fileno())
+    lost = sel.iloc[sorted(want.values())]
+    if not order:
+        raise ValueError(f"no audio found under {data_root / 'shards'} for any of the {len(sel)} selected rows")
+    return order, lens, used, lost
+
+
 def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Sequence[str], splits: Sequence[str],
                  *, ids: Iterable[str] | None = None, log: Callable[[str], None] = print) -> Stores:
     """Pack the kept selection rows of `sources` x `splits` into <cache_dir> (layout in the module docstring).
@@ -224,32 +263,9 @@ def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Se
     info_path.unlink(missing_ok=True)  # invalidate first: a crash mid-build must not leave a cache that looks valid
 
     # 1. audio, joined by id, written in the order it is found
-    want = dict(zip(sel["id"].tolist(), range(len(sel))))
-    order, lens, used = [], [], {}
+    order, lens, used, lost = _pack_audio(sel, shard_files, data_root, shard_size, cache_dir / "audio.bin.tmp")
     audio_tmp = cache_dir / "audio.bin.tmp"
-    with open(audio_tmp, "wb") as f:
-        for path in shard_files:
-            if not want:
-                break
-            pf = pq.ParquetFile(path)
-            for g in range(pf.num_row_groups):
-                ids = pf.read_row_group(g, columns=["id"]).column("id").to_pylist()
-                hits = [(j, want.pop(x)) for j, x in enumerate(ids) if x in want]  # pop: first copy of an id wins
-                if not hits:
-                    continue
-                audio = pf.read_row_group(g, columns=["audio"]).column("audio")
-                used[path.relative_to(data_root).as_posix()] = shard_size[path.relative_to(data_root).as_posix()]
-                for j, r in hits:
-                    b = audio[j].as_py()
-                    f.write(b)
-                    order.append(r)
-                    lens.append(len(b))
-        f.flush()
-        os.fsync(f.fileno())
     t_audio = time.time() - t0
-    lost = sel.iloc[sorted(want.values())]
-    if not order:
-        raise ValueError(f"no audio found under {data_root / 'shards'} for any of the {len(sel)} selected rows")
 
     idx = sel.iloc[order].reset_index(drop=True)
     n = len(idx)
@@ -365,6 +381,341 @@ def eval_store(selection_path, data_root, teacher_root, cache_dir, eval_sets: Se
     return build_stores(selection_path, data_root, teacher_root, cache_dir, eval_sets, ["eval"], log=log)
 
 
+# ---------------------------------------------------------------------------------------------------- frame stores
+#
+# The CTC family (the Parakeet students of the size study, scripts/04_distill.py family "ctc") trains on per-frame
+# targets of the Parakeet teacher (parakeet_out, kitsune/parakeet_targets.py FORMAT), not on Cohere's token targets.
+# A frame store holds the same audio as a token store and, per utterance, what kitsune.ctc_targets.FrameTargets holds:
+#   index.parquet          the Utt fields (n_tok = U, the CTC target tokens; tok_off = the row offset into ctc_ids;
+#                          teacher_cer / truncated = the Parakeet CTC pass's ctc_cer / truncated) + ref, hyp (the
+#                          teacher's CTC hypothesis ctc_hyp, what "CER vs teacher" compares with), tdt_hyp, n_frames,
+#                          n_samples (the decoded audio's length, measured by the frame preflight)
+#   audio.bin, audio_offsets.npy       as in a token store (every packed row; a dropped row's bytes stay unused)
+#   frames_offsets.npy (n+1,) int64 + frames_blank_lp.npy (F,) float16   log p(blank) at every valid frame
+#   dense_offsets.npy (n+1,) int64 + dense_frame.npy (D,) int16 + dense_topk_idx.npy (D,k) int16 + dense_topk_lp.npy
+#                          (D,k) float16                     the frames with p(blank) < 0.95 and their top-k
+#   ctc_offsets.npy (n+1,) int64 + ctc_ids.npy (U,) int16     the greedy CTC path (decision 22: the CTC target)
+# The offsets are indexed by Utt.row. The frames must align 1:1 with the student's: its frame count is a function of
+# the decoded audio's length (ctc_frames), and the stored n_frames is the teacher's. The FRAME PREFLIGHT (STUDY.md 3.2)
+# checks every row at build time by decoding its audio - the duration field is not exact (K4: n_frames from the stored
+# duration differs on 11.6 % of CV8 rows, from the decoded audio on none) - and applies decision 15: a mismatched row
+# is dropped and counted; more than FRAME_MISMATCH_MAX_FRAC of the train rows, or any eval row, fails the build
+# (FramePreflightFailed; its report is also written to <cache_dir>/frame_preflight.json). The report is in stores.json
+# (info["frame_preflight"]), so the trainer logs it for a reused cache too.
+
+FRAME_FORMAT_VERSION = 1  # bump when the frame store layout changes
+FRAME_MISMATCH_MAX_FRAC = 0.001  # decision 15: above this share of the train rows the build fails
+HOP = 160  # the Parakeet extractor's hop (10 ms at 16 kHz): valid mel frames = samples // HOP
+CTC_SUBSAMPLING_CONVS = 3  # the encoder's three stride-2 convolutions (kernel 3, padding 1): 8x subsampling
+CTC_BLANK = 3072  # == kitsune.parakeet_targets.BLANK
+FRAME_FILES = ("index.parquet", "audio.bin", "audio_offsets.npy", "frames_offsets.npy", "frames_blank_lp.npy",
+               "dense_offsets.npy", "dense_frame.npy", "dense_topk_idx.npy", "dense_topk_lp.npy", "ctc_offsets.npy",
+               "ctc_ids.npy")
+_PARAKEET_KEYS = ("ids", "n_frames", "frame_offsets", "ctc_blank_lp", "dense_offsets", "ctc_dense_frame",
+                  "ctc_topk_idx", "ctc_topk_lp", "k_ctc")
+
+
+class FramePreflightFailed(ValueError):
+    """The frame preflight's hard fail (decision 15); `report` is its record (also in frame_preflight.json)."""
+
+    def __init__(self, message: str, report: dict):
+        super().__init__(message)
+        self.report = report
+
+
+def ctc_frames(n_samples: int) -> int:
+    """Encoder frames of a 16 kHz waveform of n_samples samples: the Parakeet extractor's valid mel frames
+    (n // HOP, kitsune.features.feature_lengths with n_fft 512), then L -> (L - 1) // 2 + 1 per stride-2 convolution.
+    Equal to kitsune.ctc_student.expected_n_frames (tests/test_ctc_trainer.py), computed here without importing it:
+    the loader's worker processes check every row with it and should only pay for torch."""
+    n = max(int(n_samples) // HOP, 0)
+    for _ in range(CTC_SUBSAMPLING_CONVS):
+        n = (n - 1) // 2 + 1
+    return n
+
+
+def is_frame_store(stores: "Stores") -> bool:
+    return (stores.info or {}).get("kind") == "frames"
+
+
+def dataset_for(stores: "Stores") -> "AudioBatchDataset | FrameBatchDataset":
+    """The micro-batch dataset of a store: FrameBatchDataset for a frame store, else AudioBatchDataset."""
+    return FrameBatchDataset(stores) if is_frame_store(stores) else AudioBatchDataset(stores)
+
+
+def _frame_cache_complete(cache_dir: Path) -> bool:
+    return all((cache_dir / n).exists() for n in FRAME_FILES)
+
+
+def _decoded_lengths(audio_path: Path, offsets: np.ndarray, workers: int, block: int = 64) -> list:
+    """The decoded length in samples of every packed utterance of audio_path (offsets: (n+1,) byte offsets), or the
+    error text of one that does not decode. Threads: libsndfile and soxr release the GIL. Each task reads its block of
+    rows through its own file handle (no memory map, which on Windows would keep the file from being renamed)."""
+    n = len(offsets) - 1
+
+    def run(lo: int) -> list:
+        out = []
+        with open(audio_path, "rb") as f:
+            for i in range(lo, min(lo + block, n)):
+                f.seek(int(offsets[i]))
+                try:
+                    out.append(len(decode_audio(f.read(int(offsets[i + 1] - offsets[i])))))
+                except Exception as e:  # noqa: BLE001 - counted, not fatal (the dataset drops it at batch time)
+                    out.append(f"{type(e).__name__}: {e}"[:200])
+        return out
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+        return [x for part in pool.map(run, range(0, n, block)) for x in part]
+
+
+def frame_preflight(ids: Sequence[str], sources: Sequence[str], splits: Sequence[str], durations, stored: Sequence[int],
+                    decoded: Sequence, *, max_frac: float = FRAME_MISMATCH_MAX_FRAC) -> dict:
+    """Decision 15 on the rows of one store build: `stored` = the teacher's n_frames, `decoded` = the decoded audio's
+    length in samples (or an error text: the row is not checked, and counted as undecodable). A row whose
+    ctc_frames(length) differs is a mismatch. Returns the report: counts per split, the mismatched rows (dropped, with
+    their stored and expected frames), the undecodable ones, and ok = no eval row mismatched and at most max_frac of
+    the train rows."""
+    mism, bad = [], []
+    by_split: dict[str, dict] = {}
+    for i, (uid, src, sp, dur, t, ns) in enumerate(zip(ids, sources, splits, durations, stored, decoded)):
+        b = by_split.setdefault(sp, dict(rows=0, mismatch=0, undecodable=0))
+        b["rows"] += 1
+        if not isinstance(ns, (int, np.integer)):
+            b["undecodable"] += 1
+            bad.append(dict(id=uid, source=src, split=sp, error=str(ns)))
+            continue
+        want = ctc_frames(int(ns))
+        if want != int(t):
+            b["mismatch"] += 1
+            mism.append(dict(i=i, id=uid, source=src, split=sp, stored=int(t), expected=want, n_samples=int(ns),
+                             duration=round(float(dur), 4)))
+    n_train = by_split.get("train", {}).get("rows", 0)
+    m_train = by_split.get("train", {}).get("mismatch", 0)
+    m_other = sum(b["mismatch"] for sp, b in by_split.items() if sp != "train")
+    frac = m_train / n_train if n_train else 0.0
+    ok = m_other == 0 and frac <= max_frac
+    return dict(policy=f"decision 15: a row whose decoded audio gives another frame count than its stored n_frames is "
+                       f"dropped and counted; more than {100 * max_frac:g} % of the train rows, or any eval row, fails",
+                max_frac=float(max_frac), ok=bool(ok), n_rows=len(ids), n_checked=len(ids) - len(bad),
+                n_mismatch=len(mism), train_mismatch_frac=frac, by_split=by_split, n_undecodable=len(bad),
+                undecodable=bad[:50], mismatches=[{k: v for k, v in m.items() if k != "i"} for m in mism],
+                _rows=[m["i"] for m in mism])
+
+
+def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sources: Sequence[str],
+                       splits: Sequence[str], *, ids: Iterable[str] | None = None, log: Callable[[str], None] = print,
+                       workers: int | None = None, max_mismatch_frac: float = FRAME_MISMATCH_MAX_FRAC) -> Stores:
+    """Pack the kept selection rows of `sources` x `splits` with their Parakeet frame targets into <cache_dir> (the
+    layout above), running the frame preflight over every row. The selection's teacher_file (<source>/<stem>) names
+    the parakeet_out shard too: the label box runs both passes over the same shards. teacher_out is never read (a CTC
+    run need not have it for its train rows: kitsune.extent.pull_plan).
+
+    Idempotent like build_stores: nothing is rebuilt if stores.json carries the same fingerprint (kind, format version,
+    selection file hash, sources, splits, the npz members' CRCs, the .jsonl hashes, meta.json's settings, the preflight
+    threshold) and the audio shards are unchanged. Selected rows without audio are dropped (info["dropped"]["no_audio"]);
+    a selected row without Parakeet targets is an error (a selection made from another label root); a frame mismatch is
+    dropped (info["dropped"]["frame_mismatch"]) or fails the build (FramePreflightFailed) as frame_preflight decides.
+    workers: the preflight's decode threads (default: min(32, cpu count))."""
+    selection_path, data_root, parakeet_root, cache_dir = map(Path, (selection_path, data_root, parakeet_root,
+                                                                     cache_dir))
+    sources, splits = list(sources), list(splits)
+    sel = read_selection(selection_path, sources, splits)
+    if ids is not None:
+        ids = set(ids)
+        sel = sel[sel["id"].isin(ids)].reset_index(drop=True)
+    if sel.empty:
+        raise ValueError(f"{selection_path}: no kept rows for sources={sources} splits={splits}")
+    pmeta_path = parakeet_root / "meta.json"
+    pmeta = json.loads(pmeta_path.read_text(encoding="utf-8")) if pmeta_path.exists() else {}
+    shard_files = [p for s in sources for sp in splits for p in sorted((data_root / "shards" / s).glob(f"{sp}-*.parquet"))]
+    npz_files = [parakeet_root / f"{f}.npz" for f in sorted(set(sel["teacher_file"]))]
+    missing_npz = [p for p in npz_files if not p.exists()]
+    if missing_npz:
+        raise FileNotFoundError(f"parakeet_out missing for selected rows: {missing_npz[:3]}")
+
+    fp_src = dict(kind="frames", version=FRAME_FORMAT_VERSION, selection=_sha256(selection_path), sources=sources,
+                  splits=splits, ids=None if ids is None else hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest(),
+                  npz=[(p.relative_to(parakeet_root).as_posix(), p.stat().st_size, _npz_members(p)) for p in npz_files],
+                  jsonl=[_sha256(q) if q.exists() else None for q in (p.with_suffix(".jsonl") for p in npz_files)],
+                  settings={k: pmeta.get(k) for k in ("format_version", "k_ctc", "ctc_dense_thr", "blank", "vocab")},
+                  preflight=dict(max_mismatch_frac=float(max_mismatch_frac), fail_on_eval=True))
+    fingerprint = hashlib.sha256(json.dumps(fp_src, sort_keys=True).encode()).hexdigest()
+    shard_size = {p.relative_to(data_root).as_posix(): p.stat().st_size for p in shard_files}
+    info_path = cache_dir / "stores.json"
+    if info_path.exists() and _frame_cache_complete(cache_dir):
+        old = json.loads(info_path.read_text(encoding="utf-8"))
+        same_audio = all(shard_size.get(r) == sz for r, sz in old.get("shards", {}).items()) and (
+            old["dropped"]["no_audio"]["n"] == 0 or sorted(shard_size) == old.get("all_shards"))
+        if old.get("kind") == "frames" and old.get("fingerprint") == fingerprint and same_audio:
+            st = load_stores(cache_dir)
+            st.info["reused"] = True  # in memory only: this call did not build (nor preflight) it
+            log(f"frame stores: reusing {cache_dir} ({len(st)} utts, {st.hours:.2f} h, built {old.get('created')})")
+            return st
+
+    t0 = time.time()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    info_path.unlink(missing_ok=True)  # invalidate first: a crash mid-build must not leave a cache that looks valid
+    (cache_dir / "frame_preflight.json").unlink(missing_ok=True)
+
+    # 1. audio, joined by id, written in the order it is found (as build_stores)
+    audio_tmp = cache_dir / "audio.bin.tmp"
+    order, lens, used, lost = _pack_audio(sel, shard_files, data_root, shard_size, audio_tmp)
+    t_audio = time.time() - t0
+    idx = sel.iloc[order].reset_index(drop=True)
+    n = len(idx)
+    audio_offsets = np.concatenate([[0], np.cumsum(np.array(lens, dtype=np.int64))])
+
+    # 2. frame targets, joined by id (only the CTC arrays of each npz are read)
+    row_of = dict(zip(idx["id"].tolist(), range(n)))
+    per_row: list = [None] * n
+    text: list = [None] * n
+    k = None
+    for npz in npz_files:
+        with np.load(npz) as zf:
+            z = {key: zf[key] for key in _PARAKEET_KEYS}
+        kk = int(z["k_ctc"])
+        if k is None:
+            k = kk
+        elif kk != k:
+            raise ValueError(f"{npz}: k_ctc {kk} differs from the other shards' {k}")
+        rows_json = {}
+        jl = npz.with_suffix(".jsonl")
+        if jl.exists():
+            with open(jl, encoding="utf-8") as fj:
+                for line in fj:
+                    if line.strip():
+                        r = json.loads(line)
+                        rows_json[r["id"]] = r
+        fo, do = z["frame_offsets"], z["dense_offsets"]
+        for j, x in enumerate(str(u) for u in z["ids"]):
+            r = row_of.get(x)
+            if r is None:
+                continue
+            T = int(z["n_frames"][j])
+            fs, ds_ = slice(int(fo[j]), int(fo[j + 1])), slice(int(do[j]), int(do[j + 1]))
+            if fs.stop - fs.start != T:
+                raise ValueError(f"{npz.name}: {x} has {fs.stop - fs.start} CTC frames for n_frames {T}")
+            dense = z["ctc_dense_frame"][ds_].astype(np.int16)
+            tidx = z["ctc_topk_idx"][ds_].astype(np.int16)
+            col0 = np.full(T, CTC_BLANK, dtype=np.int64)
+            if len(dense):
+                col0[dense.astype(np.int64)] = tidx[:, 0]
+            prev = np.concatenate([[-1], col0[:-1]])
+            ctc = col0[(col0 != prev) & (col0 != CTC_BLANK)].astype(np.int16)  # == parakeet_targets.ctc_greedy
+            per_row[r] = (T, z["ctc_blank_lp"][fs].astype(np.float16), dense, tidx,
+                          z["ctc_topk_lp"][ds_].astype(np.float16), ctc)
+            text[r] = rows_json.get(x)
+    missing = [idx["id"][r] for r in range(n) if per_row[r] is None]
+    if missing:
+        raise ValueError(f"{len(missing)} selected rows not found in their parakeet_out shard, e.g. {missing[0]} - "
+                         f"selection and parakeet_out do not match")
+    if k is None:
+        raise ValueError("no parakeet_out shard read")
+
+    # 3. the frame preflight: decode every row, compare its frame count with the stored one (decision 15)
+    t1 = time.time()
+    nw = workers or min(32, os.cpu_count() or 1)
+    decoded = _decoded_lengths(audio_tmp, audio_offsets, nw)
+    report = frame_preflight(idx["id"].tolist(), idx["source"].tolist(), idx["split"].tolist(),
+                             idx["duration"].to_numpy(), [p[0] for p in per_row], decoded, max_frac=max_mismatch_frac)
+    drop = set(report.pop("_rows"))
+    report.update(workers=nw, wall_s=round(time.time() - t1, 2), cache_dir=str(cache_dir))
+    if not report["ok"]:
+        tmp = cache_dir / "frame_preflight.json.tmp"
+        tmp.write_text(json.dumps(report, indent=1), encoding="utf-8")
+        tmp.replace(cache_dir / "frame_preflight.json")
+        by = report["by_split"]
+        raise FramePreflightFailed(
+            f"frame preflight failed (decision 15) for {cache_dir}: {report['n_mismatch']} of {n} rows have another "
+            f"frame count than their stored n_frames ("
+            + ", ".join(f"{sp} {b['mismatch']}/{b['rows']}" for sp, b in sorted(by.items()))
+            + f"; train share {100 * report['train_mismatch_frac']:.3f} %, limit {100 * max_mismatch_frac:g} %, any "
+            f"eval row fails), e.g. {report['mismatches'][:3]}", report)
+    keep = [r for r in range(n) if r not in drop]
+    dropped_rows = idx.iloc[sorted(drop)]
+    kidx = idx.iloc[keep].reset_index(drop=True)
+    kept = [per_row[r] for r in keep]
+    ktext = [text[r] or {} for r in keep]
+    nk = len(kept)
+    if not nk:
+        raise ValueError(f"{selection_path}: no row left after the frame preflight")
+
+    # 4. publish: data files first, index + stores.json last
+    def offsets(sizes):
+        return np.concatenate([[0], np.cumsum(np.asarray(sizes, dtype=np.int64))]).astype(np.int64)
+
+    fr_off = offsets([p[0] for p in kept])
+    de_off = offsets([len(p[2]) for p in kept])
+    ctc_off = offsets([len(p[5]) for p in kept])
+    _write_npy(cache_dir / "audio_offsets.npy", audio_offsets)
+    _write_npy(cache_dir / "frames_offsets.npy", fr_off)
+    _write_npy(cache_dir / "frames_blank_lp.npy", np.concatenate([p[1] for p in kept]).astype(np.float16))
+    _write_npy(cache_dir / "dense_offsets.npy", de_off)
+    _write_npy(cache_dir / "dense_frame.npy", np.concatenate([p[2] for p in kept]).astype(np.int16))
+    _write_npy(cache_dir / "dense_topk_idx.npy",
+               np.concatenate([p[3] for p in kept]).reshape(-1, k).astype(np.int16))
+    _write_npy(cache_dir / "dense_topk_lp.npy",
+               np.concatenate([p[4] for p in kept]).reshape(-1, k).astype(np.float16))
+    _write_npy(cache_dir / "ctc_offsets.npy", ctc_off)
+    _write_npy(cache_dir / "ctc_ids.npy", np.concatenate([p[5] for p in kept]).astype(np.int16))
+    audio_tmp.replace(cache_dir / "audio.bin")
+
+    agree = kidx["agree"].astype("float64").to_numpy() if "agree" in kidx else np.full(nk, np.nan)
+    n_tok = np.array([len(p[5]) for p in kept], dtype=np.int64)
+    a_off = audio_offsets[:-1][keep]  # a kept row's bytes in audio.bin (a dropped row's stay there, unused)
+    a_len = np.diff(audio_offsets)[keep]
+    cols = dict(
+        id=kidx["id"].tolist(), source=kidx["source"].tolist(), duration=kidx["duration"].to_numpy(np.float32),
+        n_tok=n_tok, audio_off=a_off.astype(np.int64), audio_len=a_len.astype(np.int64), tok_off=ctc_off[:-1],
+        row=np.arange(nk, dtype=np.int64), split=kidx["split"].tolist(), agree=agree.astype(np.float32),
+        teacher_cer=np.array([float(t.get("ctc_cer", np.nan)) for t in ktext], dtype=np.float32),
+        truncated=np.array([bool(t.get("truncated", False)) for t in ktext], dtype=bool),
+        in_probe=kidx["in_probe"].to_numpy(bool), in_greedy_subset=kidx["in_greedy_subset"].to_numpy(bool),
+        ref=[t.get("ref") for t in ktext], hyp=[t.get("ctc_hyp") for t in ktext], tdt_hyp=[t.get("hyp") for t in ktext],
+        n_frames=np.array([p[0] for p in kept], dtype=np.int64),
+        # -1: the preflight could not decode it (kept, unchecked; the dataset drops it if it still fails)
+        n_samples=np.array([int(decoded[r]) if isinstance(decoded[r], (int, np.integer)) else -1 for r in keep],
+                           dtype=np.int64),
+    )
+    tmp = cache_dir / "index.parquet.tmp"
+    pq.write_table(pa.table(cols), tmp)
+    fsync_path(tmp)
+    tmp.replace(cache_dir / "index.parquet")
+
+    per_source = {s: dict(utts=int((kidx["source"] == s).sum()),
+                          hours=float(kidx["duration"][kidx["source"] == s].sum() / 3600)) for s in sources}
+    report["dropped"] = [m["id"] for m in report["mismatches"]]
+
+    def dropped_rec(df: pd.DataFrame) -> dict:
+        return dict(n=len(df), hours=float(df["duration"].sum() / 3600), by_source=df["source"].value_counts().to_dict(),
+                    ids=df["id"].tolist()[:50])
+
+    info = dict(
+        kind="frames", fingerprint=fingerprint, format_version=FRAME_FORMAT_VERSION,
+        created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), selection=str(selection_path),
+        selection_sha256=fp_src["selection"], sources=sources, splits=splits, parakeet_root=str(parakeet_root),
+        parakeet_settings=fp_src["settings"], k=k, blank=CTC_BLANK, n_utts=nk, hours=float(kidx["duration"].sum() / 3600),
+        n_frames=int(fr_off[-1]), n_dense=int(de_off[-1]), n_ctc_tokens=int(ctc_off[-1]),
+        audio_bytes=int(audio_offsets[-1]),
+        target_bytes=int(fr_off[-1] * 2 + de_off[-1] * (2 + 4 * k) + ctc_off[-1] * 2), per_source=per_source,
+        dropped=dict(no_audio=dropped_rec(lost), frame_mismatch=dropped_rec(dropped_rows)),
+        frame_preflight=report, build_s=round(time.time() - t0, 2), audio_s=round(t_audio, 2),
+        shards=used, all_shards=sorted(shard_size) if len(lost) else None,
+    )
+    tmp = info_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(info, indent=1), encoding="utf-8")
+    fsync_path(tmp)
+    tmp.replace(info_path)
+    log(f"frame stores: built {cache_dir} in {info['build_s']:.1f} s (audio pass {t_audio:.1f} s, preflight "
+        f"{report['wall_s']:.1f} s on {nw} threads): {nk} utts, {info['hours']:.2f} h, {info['n_frames']} frames, "
+        f"{info['n_ctc_tokens']} CTC target tokens; preflight {report['n_checked']} rows checked, "
+        f"{report['n_mismatch']} dropped, {report['n_undecodable']} undecodable"
+        + (f"; DROPPED {len(lost)} rows without audio" if len(lost) else ""))
+    return load_stores(cache_dir)
+
+
 # -------------------------------------------------------------------------------------------------------- planner
 
 
@@ -412,21 +763,26 @@ class StepPlanner:
     duration-homogeneous (little padding) while the epoch order stays random. Deterministic per (seed, epoch).
 
     Utterances whose decoder input (prompt_len - 1 + n_tok) exceeds max_dec_len are excluded (self.n_excluded).
+    max_dec_len None is the frame planner of the CTC family (a frame store: no decoder, n_tok = the CTC target
+    tokens): nothing is excluded and micro-batches are cut by padded audio alone - the CTC student's activations and
+    its (frames x 3073) logits both scale with the padded frames, which scale with the padded audio.
     Position for resume is (epoch, step_in_epoch): the next step to run. The trainer calls step_done(epoch, step)
     after each optimizer step and saves state_dict() with its checkpoint; make_loader(ds, planner, ...) then starts
     from that position. epoch_stats[e] holds plan_stats() of every epoch planned so far.
     """
 
     def __init__(self, utts: Sequence[Utt], step_audio_s: float = 1500.0, micro_audio_s: float = 400.0,
-                 max_dec_len: int = 200, pool_micro: int = 50, seed: int = 0,
+                 max_dec_len: int | None = 200, pool_micro: int = 50, seed: int = 0,
                  weights: dict[str, float] | Sequence[float] | None = None, *, prompt_len: int = len(PROMPT),
                  max_micro_tokens: int | None = None):
         self.step_audio_s, self.micro_audio_s = float(step_audio_s), float(micro_audio_s)
-        self.max_dec_len, self.pool_micro, self.seed = int(max_dec_len), int(pool_micro), int(seed)
+        self.frames = max_dec_len is None
+        self.max_dec_len = None if self.frames else int(max_dec_len)
+        self.pool_micro, self.seed = int(pool_micro), int(seed)
         self.max_micro_tokens = max_micro_tokens
         self.dur = np.array([u.duration for u in utts], dtype=np.float64)
         self.n_tok = np.array([u.n_tok for u in utts], dtype=np.int64)
-        self.dec_len = prompt_len - 1 + self.n_tok
+        self.dec_len = None if self.frames else prompt_len - 1 + self.n_tok
         if weights is None:
             w = np.ones(len(utts))
         elif isinstance(weights, dict):
@@ -435,7 +791,7 @@ class StepPlanner:
             w = np.asarray(weights, dtype=np.float64)
         if len(w) != len(utts) or (w < 0).any():
             raise ValueError("weights must be non-negative, one per utterance (or a dict source -> weight)")
-        eligible = self.dec_len <= self.max_dec_len
+        eligible = np.ones(len(utts), dtype=bool) if self.frames else self.dec_len <= self.max_dec_len
         self.n_excluded = int((~eligible).sum())
         self.w = np.where(eligible, w, 0.0)
         self.epoch, self.step_in_epoch = 0, 0
@@ -499,9 +855,19 @@ class StepPlanner:
             return dict(steps=0, micro_batches=0)
         real = np.array([self.dur[mb].sum() for mb in mbs])
         padded = np.array([self.dur[mb].max() * len(mb) for mb in mbs])
+        step_s = np.array([sum(self.dur[mb].sum() for mb in step) for step in plan])
+        if self.frames:  # no decoder: the CTC target tokens are the targets, padded frames follow the padded audio
+            return dict(
+                steps=len(plan), micro_batches=len(mbs), utts=int(sum(len(mb) for mb in mbs)), excluded_dec_len=0,
+                real_h=float(real.sum() / 3600), pad_eff_audio=float(real.sum() / padded.sum()),
+                micro_per_step=float(len(mbs) / len(plan)), step_real_s_mean=float(step_s.mean()),
+                step_real_s_min=float(step_s.min()), step_real_s_max=float(step_s.max()),
+                micro_padded_s_max=float(padded.max()), micro_utts_max=int(max(len(mb) for mb in mbs)),
+                micro_targets_max=int(max(self.n_tok[mb].sum() for mb in mbs)),
+                targets=int(sum(self.n_tok[mb].sum() for mb in mbs)),
+            )
         dec_real = np.array([self.dec_len[mb].sum() for mb in mbs])
         dec_pad = np.array([self.dec_len[mb].max() * len(mb) for mb in mbs])
-        step_s = np.array([sum(self.dur[mb].sum() for mb in step) for step in plan])
         return dict(
             steps=len(plan), micro_batches=len(mbs), utts=int(sum(len(mb) for mb in mbs)),
             excluded_dec_len=self.n_excluded, real_h=float(real.sum() / 3600),
@@ -517,11 +883,17 @@ class StepPlanner:
     def worst_micro_batches(self, plan: list[list[list[int]]] | None = None) -> dict[str, list[int]]:
         """Micro-batches of a plan (default epoch 0) that stress memory differently, for the smoke-phase probe:
         the one with the longest padded audio (encoder), and the ones with the most padded decoder positions and
-        the most target positions (decoder activations and the (N, V) logits - these are the SHORT utterances)."""
+        the most target positions (decoder activations and the (N, V) logits - these are the SHORT utterances).
+        The frame planner (max_dec_len None): the longest and the one with the most padded audio, whose padded
+        frames x 3073 CTC logits (fp32, with their log-softmax and gradient) are the CTC student's worst case."""
         plan = self.epoch_plan(0) if plan is None else plan
         mbs = [mb for step in plan for mb in step]
+        longest = max(mbs, key=lambda mb: (self.dur[mb].max(), self.dur[mb].max() * len(mb)))
+        if self.frames:
+            return dict(longest=longest,
+                        most_padded_frames=max(mbs, key=lambda mb: float(self.dur[mb].max()) * len(mb)))
         return dict(
-            longest=max(mbs, key=lambda mb: (self.dur[mb].max(), self.dur[mb].max() * len(mb))),
+            longest=longest,
             most_dec_positions=max(mbs, key=lambda mb: self.dec_len[mb].max() * len(mb)),
             most_targets=max(mbs, key=lambda mb: self.n_tok[mb].sum()),
         )
@@ -656,6 +1028,114 @@ class AudioBatchDataset(torch.utils.data.Dataset):
 
 def _cat(parts: list[np.ndarray], dtype, empty_shape: tuple) -> torch.Tensor:
     return torch.from_numpy(np.concatenate(parts).astype(dtype) if parts else np.zeros(empty_shape, dtype))
+
+
+class FrameBatchDataset(torch.utils.data.Dataset):
+    """dataset[list of store indices] -> one collated micro-batch of a FRAME store (build_frame_stores), the CTC
+    family's twin of AudioBatchDataset:
+
+      wave, lengths                    as AudioBatchDataset
+      frame_mask, dense_mask, blank_lp, topk_idx, topk_lp, ctc_targets, ctc_target_lengths, n_frames
+                                       kitsune.ctc_targets.collate_frame_targets of the rows' FrameTargets, padded to
+                                       the batch's longest n_frames (the loss cuts the student's padding frames)
+      n_tok (B,) int64                 the CTC target tokens U of each row (= ctc_target_lengths)
+      durations, agree, index, ids, sources, dropped   as AudioBatchDataset
+
+    A row whose audio does not decode, or whose decoded length does not give its stored n_frames (ctc_frames), is
+    dropped and named in `dropped`. The build's frame preflight removed every mismatched row, so the second case means
+    the audio changed since the build (a message on stderr says which). B can be 0: skip such a micro-batch.
+    Picklable without the data; the memmaps open lazily in each process."""
+
+    ARRAYS = ("frames_blank_lp", "dense_frame", "dense_topk_idx", "dense_topk_lp", "ctc_ids")
+
+    def __init__(self, stores: Stores):
+        u = stores.utts
+        d = Path(stores.cache_dir)
+        self.cache_dir = str(d)
+        self.ids = [x.id for x in u]
+        self.sources = [x.source for x in u]
+        self.duration = np.array([x.duration for x in u], dtype=np.float32)
+        self.agree = np.array([x.agree for x in u], dtype=np.float32)
+        self.audio_off = np.array([x.audio_off for x in u], dtype=np.int64)
+        self.audio_len = np.array([x.audio_len for x in u], dtype=np.int64)
+        rows = np.array([x.row for x in u], dtype=np.int64)
+        offs = {name: np.load(d / f"{name}_offsets.npy") for name in ("frames", "dense", "ctc")}
+        self.frame_off, self.n_frames = offs["frames"][rows], np.diff(offs["frames"])[rows]
+        self.dense_off, self.n_dense = offs["dense"][rows], np.diff(offs["dense"])[rows]
+        self.ctc_off, self.n_tok = offs["ctc"][rows], np.diff(offs["ctc"])[rows]
+        self._mm = None
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_mm"] = None  # never pickle memmaps: each process maps the files itself
+        return state
+
+    def _open(self) -> dict:
+        if self._mm is None:
+            d = Path(self.cache_dir)
+            audio = (np.memmap(d / "audio.bin", dtype=np.uint8, mode="r") if (d / "audio.bin").stat().st_size
+                     else np.zeros(0, np.uint8))
+            self._mm = dict(audio=audio, **{name: np.load(d / f"{name}.npy", mmap_mode="r") for name in self.ARRAYS})
+        return self._mm
+
+    def audio_bytes(self, i: int) -> bytes:
+        o = int(self.audio_off[i])
+        return self._open()["audio"][o:o + int(self.audio_len[i])].tobytes()
+
+    def targets(self, i: int):
+        """kitsune.ctc_targets.FrameTargets of store index i (copies of the stored arrays, stored dtypes)."""
+        from kitsune.ctc_targets import FrameTargets
+
+        mm = self._open()
+        f0, T = int(self.frame_off[i]), int(self.n_frames[i])
+        d0, D = int(self.dense_off[i]), int(self.n_dense[i])
+        c0, U = int(self.ctc_off[i]), int(self.n_tok[i])
+        return FrameTargets(T, np.array(mm["frames_blank_lp"][f0:f0 + T]),
+                            np.array(mm["dense_frame"][d0:d0 + D], dtype=np.int32),
+                            np.array(mm["dense_topk_idx"][d0:d0 + D]), np.array(mm["dense_topk_lp"][d0:d0 + D]),
+                            np.array(mm["ctc_ids"][c0:c0 + U], dtype=np.int32))
+
+    def __getitem__(self, idx: Sequence[int]) -> dict:
+        from kitsune.ctc_targets import collate_frame_targets
+
+        keep, waves, dropped = [], [], []
+        for i in idx:
+            i = int(i)
+            try:
+                w = decode_audio(self.audio_bytes(i))
+            except Exception as e:
+                print(f"trainset: undecodable audio, dropping {self.ids[i]}: {e}", file=sys.stderr)
+                dropped.append(self.ids[i])
+                continue
+            if ctc_frames(len(w)) != int(self.n_frames[i]):
+                print(f"trainset: {self.ids[i]} decodes to {len(w)} samples = {ctc_frames(len(w))} frames, its targets "
+                      f"have {int(self.n_frames[i])}: dropping it (the store's frame preflight passed it)",
+                      file=sys.stderr)
+                dropped.append(self.ids[i])
+                continue
+            waves.append(w)
+            keep.append(i)
+        B = len(keep)
+        lengths = np.array([len(w) for w in waves], dtype=np.int64)
+        wave = np.zeros((B, int(lengths.max()) if B else 0), dtype=np.float32)
+        for b, w in enumerate(waves):
+            wave[b, :len(w)] = w
+        out = dict(wave=torch.from_numpy(wave), lengths=torch.from_numpy(lengths),
+                   durations=torch.from_numpy(self.duration[keep]), agree=torch.from_numpy(self.agree[keep]),
+                   index=torch.tensor(keep, dtype=torch.int64), ids=[self.ids[i] for i in keep],
+                   sources=[self.sources[i] for i in keep], dropped=dropped)
+        if B:
+            out.update(collate_frame_targets([self.targets(i) for i in keep]))
+        else:  # the empty batch's shapes (the trainer skips it)
+            out.update(frame_mask=torch.zeros(0, 0, dtype=torch.bool), dense_mask=torch.zeros(0, 0, dtype=torch.bool),
+                       blank_lp=torch.zeros(0, 0), topk_idx=torch.zeros(0, 0, 0, dtype=torch.long),
+                       topk_lp=torch.zeros(0, 0, 0), ctc_targets=torch.zeros(0, dtype=torch.long),
+                       ctc_target_lengths=torch.zeros(0, dtype=torch.long), n_frames=torch.zeros(0, dtype=torch.long))
+        out["n_tok"] = out["ctc_target_lengths"].clone()
+        return out
 
 
 # --------------------------------------------------------------------------------------------------------- loader
