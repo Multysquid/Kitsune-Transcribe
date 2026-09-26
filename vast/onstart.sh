@@ -9,7 +9,11 @@
 # vast/watchdog.sh (hard cost cap), then detached: vast/bootstrap.sh (data) and vast/supervise.py (training +
 # stop/destroy), all logging to /workspace/kitsune.log. With KITSUNE_JOB=label (the label box, launch.py --job label)
 # the detached part is vast/label.py alone: it holds supervise.lock, runs its own idempotent steps and resumes from
-# $KITSUNE_STATE/label.json, so bootstrap.sh and supervise.py are not run.
+# $KITSUNE_STATE/label.json, so bootstrap.sh and supervise.py are not run. With KITSUNE_JOB=study (a size-study box,
+# launch.py --job study --box A|B|replicate|shakedown) the path is the train job's - bootstrap.sh (the extent, both
+# label roots, the box's students) then supervise.py, which runs the box's queue (kitsune/study_queue.py) instead of
+# one trainer; KITSUNE_BOX names the box. --rearm leaves $KITSUNE_STATE/queue.json in place: the queue resumes where it
+# stopped (its PREREG numbers are written once; deleting the file by hand starts the box's study over).
 #
 # Restarts: the watchdog deadline is fixed at first boot; a `halt` marker (written by finish.py or by a failure here)
 # means the run is over, so a restarted container only brings up the env and the portal for inspection. An interrupted
@@ -257,7 +261,9 @@ if [ -f "$KITSUNE_STATE/halt" ]; then
     exit 0
 fi
 
-for var in KITSUNE_SHA KITSUNE_DATA_REPO; do
+required="KITSUNE_SHA KITSUNE_DATA_REPO"
+[ "${KITSUNE_JOB:-train}" != study ] || required="$required KITSUNE_BOX KITSUNE_OUT_REPO"
+for var in $required; do
     if [ -z "${!var:-}" ]; then
         log "$var is not set (vast/launch.py passes it)"
         false  # -> ERR trap: halt marker + stop

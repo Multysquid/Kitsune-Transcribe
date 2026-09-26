@@ -38,20 +38,27 @@ student_meta.json (format 2) carries the size study's fields next to the build r
 ("pruned_kept" | "scratch"), params_total, params_non_embedding, closed_form_params (asserted equal to params_total
 before the save), seed, bn ("teacher" | "recal" | "fresh"; the recalibration's drift stats are under bn_recal),
 teacher "<repo>@<commit>", and enc_layers / ffn / dec_layers for a pruned student. A step-0 eval of a pruned student
-adds function_check: STUDY.md 2.2 calls a pruned student "function lost" when its step-0 CER against the teacher is
-at least 90 % on the 60-utterance CPU gate (--device cpu --step0-eval-utts 20 with the default --seed: 20 per gate
-set; on_gate is false for any other draw). The model card saved next to the weights as README.md gets a modification
-notice that describes this student (kitsune.student.model_card).
+adds function_check: the step-0 CER against the teacher and KL on the 60-utterance CPU gate (--device cpu
+--step0-eval-utts 20 with the default --seed: 20 per gate set; on_gate is false for any other draw), recorded but not
+classifying. STUDY.md 2.2's rule ("function lost" at a step-0 CER >= 90 %) classifies the Parakeet students only
+(scripts/03c_build_ctc_student.py): by the owner's decision of 2026-09-26 the pruned Transcribe students (T-0.6B,
+T-0.3B) are "function kept" (warm-up 300, probe class kept-t03) although their step-0 CER is >= 90 %, because an AED
+decoder derails at step 0 (T-0.6B: KL 4.207, CER 132 % against the teacher on the gate) and the first run trained this
+recipe fine. The model card saved next to the weights as README.md gets a modification notice that describes this
+student (kitsune.student.model_card).
 
 Usage:
   python scripts/03_build_student.py                                  # B20x2560 / dec 0 2 5 7 -> students/b20x2560-d4
                                                                       # (calibrated on reazon_small emilia_yodas galgame)
   python scripts/03_build_student.py --enc-layers 4 --dec-layers 0 7  # laptop smoke student   -> students/b4x2560-d2
-The size study's Transcribe students (on the laptop CPU; the first run's data dirs, 1,000 calibration ids):
+The size study's Transcribe students (on the laptop CPU; the first run's data dirs and its 1,000 calibration ids,
+importance_ids_sha256 5e31cd68..., recovered from the HF dataset history and kept in students/study/t03/
+calibration_ids.txt):
   python scripts/03_build_student.py --device cpu --teacher-dtype fp32 --step0-eval-utts 20 --bn keep \\
       --ffn-from students/b20x2560-d4 --out students/study/t06                      # T-0.6B: the first run's FFNs
   python scripts/03_build_student.py --device cpu --teacher-dtype fp32 --step0-eval-utts 20 --bn keep \\
-      --enc-layers 10 --dec-layers 0 7 --importance-layers all --out students/study/t03                 # T-0.3B
+      --enc-layers 8 --importance-layers all --calib-ids <the first run's calibration_ids.txt> \\
+      --out students/study/t03                              # T-0.3B: B8x2560, T-0.6B's decoder {0,2,5,7} (the default)
   python scripts/03_build_student.py --scratch bridge --device cpu --step0-eval-utts 0 --out students/study/bridge
   python scripts/03_build_student.py --scratch t01 --device cpu --step0-eval-utts 0 --out students/study/t01
   python scripts/03_build_student.py --scratch t01 --seed 1235 --device cpu --step0-eval-utts 0 \\
@@ -90,6 +97,9 @@ IMPORTANCE_FORMAT = 1
 LEGACY_IMPORTANCE_DTYPE = "torch.bfloat16"
 META_FORMAT = 2  # 2: the size study's fields; "bn" is the mode string (format 1 had the recalibration stats there)
 FUNCTION_LOST_CER = 0.9  # STUDY.md 2.2: step-0 CER vs the teacher >= this on the 60-utterance gate = function lost
+# ... for the Parakeet students only: a pruned Transcribe student's class is fixed by the owner (module docstring)
+AED_FUNCTION_RULE = ("owner decision 2026-09-26: pruned Transcribe students are function kept (warm-up 300, probe class "
+                     "kept-t03) whatever their step-0 CER; the 90 % rule classifies the Parakeet students only")
 # The 60-utterance CPU gate: 20 ids per EVAL_SETS set, drawn by step0_ids with this seed (sha d9d53e6e... on the first
 # run's selection). A step-0 eval drawn with another --seed is another sample, so it is not the gate.
 GATE_PER_SET, GATE_SEED = 20, 1234
@@ -438,12 +448,14 @@ def step0_eval(student, processor, featurizer, args, device, out: Path, log=prin
 
 
 def function_check(step0: dict) -> dict:
-    """STUDY.md 2.2's rule on a step-0 eval: function "lost" when the pooled greedy CER against the teacher's own
-    transcripts is >= 90 %. `on_gate` says whether the eval was the rule's 60-utterance gate: 20 per gate set, drawn
-    with GATE_SEED (the study builds it with --device cpu --step0-eval-utts 20 and the default --seed)."""
+    """The step-0 numbers of a pruned Transcribe student that STUDY.md 2.2's rule reads: the pooled greedy CER against
+    the teacher's own transcripts and the teacher-forced KL. `over_threshold` is what the 90 % rule would read; it does
+    not classify here: `function` is "kept" by the owner's decision (AED_FUNCTION_RULE). `on_gate` says whether the
+    eval was the 60-utterance gate: 20 per gate set, drawn with GATE_SEED (the study builds it with --device cpu
+    --step0-eval-utts 20 and the default --seed)."""
     cer = float(step0["greedy"]["all"]["cer_teacher_corpus"])
     return dict(cer_vs_teacher=cer, kl=float(step0["teacher_forced"]["all"]["kl"]), threshold=FUNCTION_LOST_CER,
-                function="lost" if cer >= FUNCTION_LOST_CER else "kept",
+                over_threshold=cer >= FUNCTION_LOST_CER, function="kept", by=AED_FUNCTION_RULE,
                 on_gate=(step0.get("n_per_set") == {s: GATE_PER_SET for s in EVAL_SETS}
                          and step0.get("seed") == GATE_SEED))
 
@@ -798,11 +810,10 @@ def main(argv=None) -> int:
             raise
         if meta.get("init_class", "").startswith("pruned"):
             fc = meta["function_check"] = function_check(meta["step0"])
-            print(f"  function check: step-0 CER vs teacher {fc['cer_vs_teacher']:.3f} -> function {fc['function']} "
-                  f"(rule: lost at >= {FUNCTION_LOST_CER:.0%}{'' if fc['on_gate'] else '; NOT the 60-utterance gate'})")
-            if fc["function"] == "lost":
-                print(f"  WARNING: by STUDY.md 2.2 this pruned student is 'function lost', but init_class says "
-                      f"{meta['init_class']}")
+            print(f"  function check: step-0 KL {fc['kl']:.3f}, CER vs teacher {fc['cer_vs_teacher']:.3f} "
+                  f"({'>=' if fc['over_threshold'] else '<'} {FUNCTION_LOST_CER:.0%}"
+                  f"{'' if fc['on_gate'] else '; NOT the 60-utterance gate'}) -> function {fc['function']} "
+                  f"({AED_FUNCTION_RULE})")
     else:
         meta["step0"] = dict(skipped=True)
     meta["stage"] = "complete"

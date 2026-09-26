@@ -285,6 +285,10 @@ def registered(side: dict) -> dict:
     sc["details"]["pool_hours_if_capped"] = {"reazon_large": {"1": 1000.0, "2": 1010.0}}  # the rule: 2
     sc["draw"].update(budget_s=float(prereg.STUDY_SELECTION["draw_audio_s"]), drawn_s=3_599_000.0,
                       pool_s=1010.0 * 3600)
+    # the uploaded selection's drawn hours per source, so the realised mix is the recorded one (prereg.mix_problems)
+    drawn = {"reazon_small": 90.770, "reazon_large": 325.516, "emilia_yodas": 267.630, "emilia_nc": 195.987,
+             "galgame": 120.097}
+    sc["hours"] = {src: {**(sc.get("hours") or {}).get(src, {}), "drawn": {"hours": h}} for src, h in drawn.items()}
     return sc
 
 
@@ -612,8 +616,8 @@ def test_data_problems_know_the_parakeet_requirement():
     set; a CTC student needs teacher npz only for the eval sets; configs without either are unchanged."""
     cfg = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"], "student": "students/s",
            "selection": "selection/s.parquet", "parakeet_root": "parakeet_out"}
-    base = ["teacher_out/meta.json", "second_out/meta.json", "selection/s.parquet",
-            *(f"students/s/{n}" for n in launch.STUDENT_FILES)]
+    base = ["teacher_out/meta.json", "second_out/meta.json", "selection/s.parquet",  # a CTC student: + its CC-BY card
+            *(f"students/s/{n}" for n in launch.STUDENT_FILES + (launch.CTC_CARD,))]
     teacher = [f"teacher_out/{s}/{st}.npz" for s, st in (("reazon_small", "train-00000"), ("galgame", "train-00000"),
                                                           ("galgame", "eval-00000"), ("eval_jsut", "eval-00000"))]
     second = ["second_out/reazon_small/train-00000.jsonl", "second_out/galgame/train-00000.jsonl",

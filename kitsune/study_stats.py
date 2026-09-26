@@ -31,6 +31,10 @@ order: the same seed gives bit-identical numbers on any machine. Run-to-run nois
 system: max(prior 1.6 %, 0.886 |ln(M4_replicate / M4_T-0.1B)|) (0.886 = sqrt(pi) / 2 makes one pair's |difference|
 unbiased for sigma). The CI of a ratio r = a / b is ln r +- 1.96 sqrt(v_boot + k sigma_run^2), with k the number of
 TRAINED systems among a and b (2 student-student, 1 student-teacher; the teachers are fixed models).
+The replicate is conditional (kitsune.prereg noise.replicate_trigger): sensitivity() recomputes every call (the three
+walks at every delta, the practical bars, the T/2 readout) at each sigma_run of the pre-registered grid (1.6 % and
+3.2 %), and replicate_needed is true when a family's primary limit call (the delta 10 % walk of Transcribe or
+Parakeet) differs between them; without that the report says the calls are robust to sigma_run up to 3.2 %.
 
 The limit (4.5). Per family, every smaller student s gets r_s = M4_s / M4_top (top: T-0.6B, P-0.3B; the scratch ladder
 bridge -> T-0.1B -> T-0.05B is a second walk with top = bridge). Tolerance delta: WITHIN if the CI's upper end
@@ -44,7 +48,10 @@ Readouts (4.6, 4.7): g per halving for every ladder step, g = r^(1/h) - 1 with h
 distillation gaps (with g over the teacher -> student halvings, outside the walk); the T/2 vs T budget readout; the
 practical bars; a Pareto set over CER, A100 RTF and VRAM; the anchor regression flag; and the section-7 invalidation
 rules as far as the inputs show them (analyse()'s checks: pass, fail or not_checked, and never a pass that compared
-nothing). The PREREG readers (settings_from_prereg, prereg_baselines, prereg_manifest) read kitsune.prereg's
+nothing). The owner's question ("how far can these models be compressed, and what should be offered") is answered
+first: offers() is one table per family (rows = sizes, the teacher as the reference row) with parameters, M4 and its
+per-set CERs, the ratio to the own teacher, the Parakeet TDT comparison, speed and VRAM, the delta 10 % call and the
+T/2 readout, and offer_text() turns the calls into plain sentences. The PREREG readers (settings_from_prereg, prereg_baselines, prereg_manifest) read kitsune.prereg's
 PREREG.json as it is written: numbers among prose, parakeet_ctc / galgame:<view> keys, a manifest block "pending"
 until the labels are sealed.
 
@@ -53,6 +60,7 @@ a second per system for the imitation CER); importing kitsune.evaluate (torch) i
 """
 from __future__ import annotations
 
+import copy
 import math
 import zlib
 from dataclasses import dataclass, field
@@ -78,11 +86,16 @@ TEACHER_BARS = (1.2, 1.5)  # the practical bars against the own teacher (4.7)
 ANCHOR_FLAG_REL = 0.05  # 4.1: T-0.6B worse than the anchor by more than 5 % relative, paired CI excluding 0
 DATA_WAIT_MAX = 0.05  # 6.2: calibration must not be loader-bound
 BRANCH_END_FRAC = 0.5  # 2.5: the T/2 branch ends at round(0.5 x max_steps)
+# the conditional replicate (kitsune.prereg noise.replicate_trigger): every call at each sigma_run of the grid; the
+# replicate is needed only if the primary walk of a trigger family differs between them (the scratch walk is second)
+SIGMA_GRID = (SIGMA_RUN_PRIOR, 0.032)
+TRIGGER_FAMILIES = ("transcribe", "parakeet")
 
 DEFAULT_SETTINGS = dict(delta_primary=DELTA_PRIMARY, deltas=list(DELTAS), sigma_run_prior=SIGMA_RUN_PRIOR,
                         sigma_hat_factor=SIGMA_HAT_FACTOR, boot_b=BOOT_B, boot_seed=BOOT_SEED, z=Z,
                         teacher_bars=list(TEACHER_BARS), anchor_flag_rel=ANCHOR_FLAG_REL,
-                        replicate=["study-t01-s1235", "study-t01"], branch_end_frac=BRANCH_END_FRAC)
+                        replicate=["study-t01-s1235", "study-t01"], branch_end_frac=BRANCH_END_FRAC,
+                        sigma_grid=list(SIGMA_GRID), trigger_families=list(TRIGGER_FAMILIES))
 
 # ------------------------------------------------------------------------------------------------ sets and metrics
 
@@ -126,11 +139,12 @@ DISPLAY = {"study-t06": "T-0.6B", "study-t03": "T-0.3B", "study-bridge": "bridge
 # exact total / non-embedding counts, STUDY.md 1.1 (meta-device builds; every builder asserts total == closed form).
 # The anchor is the first run's B20x2560-d4 = the T-0.6B shape; parakeet-ctc is the unpruned CTC path (24 x 4096);
 # cohere is the teacher itself (tests/test_student.py pins it), the far end of the Transcribe distillation gap.
-PARAMS_TOTAL = {"study-t06": 616_963_328, "study-t03": 320_752_384, "study-bridge": 320_752_384,
+# T-0.3B and the bridge are B8x2560 + decoder {0,2,5,7} (the owner's decision of 2026-09-26; kitsune.prereg.RUNS).
+PARAMS_TOTAL = {"study-t06": 616_963_328, "study-t03": 301_822_208, "study-bridge": 301_822_208,
                 "study-t01": 103_996_416, "study-t01-s1235": 103_996_416, "study-t005": 51_209_600,
                 "study-p03": 308_524_033, "study-p01": 98_468_865, "study-p005": 52_190_209,
                 "parakeet-ctc": 610_898_945, ANCHOR: 616_963_328, "cohere": 2_065_647_872}
-PARAMS_NON_EMBEDDING = {"study-t06": 599_137_536, "study-t03": 302_926_592, "study-bridge": 302_926_592,
+PARAMS_NON_EMBEDDING = {"study-t06": 599_137_536, "study-t03": 283_996_416, "study-bridge": 283_996_416,
                         "study-t01": 95_083_520, "study-t01-s1235": 95_083_520, "study-t005": 44_524_928,
                         "study-p03": 305_374_208, "study-p01": 95_319_040, "study-p005": 49_040_384,
                         "parakeet-ctc": 607_749_120, ANCHOR: 599_137_536}
@@ -805,6 +819,14 @@ class Study:
                               nostyle=self.compare(a, b, "jg_nostyle", deltas=[])))
         return dict(per_system=rows, equal_size=pairs)
 
+    def at_sigma(self, sigma: float) -> "Study":
+        """This analysis with sigma_run fixed at `sigma` (the sensitivity grid): the point sums, the bootstrap and the
+        metric caches are shared, only the CIs' run-noise term changes."""
+        other = copy.copy(self)
+        other.s = float(sigma)
+        other.sigma = dict(self.sigma, sigma_run=float(sigma), source=f"fixed at {100 * float(sigma):g} % (sensitivity)")
+        return other
+
     def anchor(self) -> dict:
         """4.1's regression flag: the study's T-0.6B worse than the first run's 0.6B (re-scored on the manifest) on
         the gate-pooled CER by more than 5 % relative, with the paired CI of ln r above 0. Both are trained runs, so
@@ -862,6 +884,208 @@ def pareto(points: Mapping[str, Sequence[float | None]]) -> list[str]:
     return sorted(front, key=lambda k: tuple(ok[k]))
 
 
+# ------------------------------------------------------------------------------------------------ sensitivity
+
+
+def _skey(sigma: float) -> str:
+    return f"{float(sigma):g}"
+
+
+def _spct(sigma: float) -> str:
+    return f"{100 * float(sigma):g} %"
+
+
+def _walk_key(w: Mapping | None) -> list | None:
+    """What a limit call is: the walk's status, its limit and where it stopped (the sentence follows from them)."""
+    return None if w is None else [w["status"], w["limit"], w["stop"]]
+
+
+def calls_at(st: Study) -> dict:
+    """Every call at st's sigma_run: per ladder the per-size calls at every delta and the walks, the practical bars
+    (the Parakeet TDT bar and the own-teacher bars, by the CI) and the T/2 readout."""
+    fams = {}
+    for f in LADDERS:
+        F = st.family(f)
+        fams[f] = dict(primary=_walk_key(F["primary"]),
+                       sentence=F["primary"]["sentence"] if F["primary"] else None,
+                       walks={d: _walk_key(w) for d, w in F["walks"].items()},
+                       calls={e["system"]: (e["m4"]["calls"] if e["m4"] else None) for e in F["entries"]})
+    b = st.bars()
+    bars = dict(tdt_smallest=b["tdt"]["smallest"],
+                tdt_meets={k: (v["meets"] if v else None) for k, v in b["tdt"]["per_student"].items()},
+                teacher_smallest_ci={k: v["ci"] for k, v in b["teacher"]["smallest"].items()},
+                teacher_ci_within={k: (v["ci_within"] if v else None) for k, v in b["teacher"]["per_student"].items()})
+    budget = {f: {r["system"]: r.get("label") for r in st.budget(f)["rows"]} for f in LADDERS}
+    return dict(sigma_run=st.s, families=fams, bars=bars, budget=budget)
+
+
+def _diffs(a, b, path: str = "") -> list[str]:
+    if isinstance(a, Mapping) and isinstance(b, Mapping):
+        return [d for k in sorted(set(a) | set(b), key=str) if k != "sigma_run"
+                for d in _diffs(a.get(k), b.get(k), f"{path}{k}.")]
+    return [] if a == b else [f"{path.rstrip('.')}: {a!r} -> {b!r}"]
+
+
+def sensitivity(st: Study) -> dict:
+    """The conditional replicate's rule (kitsune.prereg noise.replicate_trigger): every call at each sigma_run of the
+    grid (1.6 % and 3.2 %); replicate_needed when a trigger family's primary limit call (its delta-primary walk:
+    status, limit, stop) differs between any two grid points. `differences` lists every call that moves (the scratch
+    walk, the other deltas, the bars and the T/2 readout included); only the trigger families' primary walks decide.
+    With the replicate's results in the corpus, sigma_run is max(prior, sigma_hat) as before (st.sigma)."""
+    grid = [float(x) for x in st.st["sigma_grid"]]
+    at = {_skey(x): calls_at(st.at_sigma(x)) for x in grid}
+    first = _skey(grid[0])
+    trig = [f for f in st.st["trigger_families"] if f in LADDERS]
+    moved = {f: sorted({k for k in at if at[k]["families"][f]["primary"] != at[first]["families"][f]["primary"]})
+             for f in LADDERS}
+    needed = any(moved[f] for f in trig)
+    diffs = {k: _diffs(at[first], at[k]) for k in at if k != first}
+    rep, orig = st.st["replicate"]
+    ran = st.has(rep) and st.sigma.get("sigma_hat") is not None
+    lo, hi = _spct(grid[0]), _spct(grid[-1])
+    if ran:
+        state = "replicate_ran"
+        text = (f"The replicate ran: sigma_run = max({lo}, sigma_hat {_pct(st.sigma['sigma_hat'])}) = "
+                f"{_pct(st.s)}, and every call above uses it.")
+    elif needed:
+        state = "replicate_needed"
+        which = ", ".join(f"{f} ({at[first]['families'][f]['sentence']} at {lo}; "
+                          + "; ".join(f"{at[k]['families'][f]['sentence']} at {_spct(float(k))}" for k in moved[f])
+                          + ")" for f in trig if moved[f])
+        text = (f"REPLICATE NEEDED: the delta {100 * float(st.st['delta_primary']):g} % limit call of {which} depends "
+                f"on sigma_run. Run {rep} (box 'replicate', {orig}'s max_steps and LR), then sigma_run = max({lo}, "
+                f"sigma_hat); until then these calls are provisional.")
+    else:
+        state = "robust"
+        n = sum(len(v) for v in diffs.values())
+        text = (f"The calls are robust to sigma_run up to {hi}: every family's delta "
+                f"{100 * float(st.st['delta_primary']):g} % limit call is the same at {lo} and {hi}, so the replicate "
+                f"is not run" + (f" ({n} other call(s) move, listed below; they do not trigger it)." if n else "."))
+    return dict(grid=grid, trigger_families=trig, at=at, primary_moved=moved, replicate_needed=bool(needed),
+                replicate_ran=bool(ran), state=state, differences=diffs, text=text)
+
+
+# ------------------------------------------------------------------------------------------------ what to offer
+
+OFFER_FAMILIES = ("transcribe", "parakeet")
+
+
+def _vs(c: Mapping | None) -> str | None:
+    """better / within / worse of a comparison against a reference, by its CI of ln r (within: the CI holds 1)."""
+    if not c:
+        return None
+    lo, hi = c["ci_ln"]
+    return "better" if hi < 0 else "worse" if lo > 0 else "within"
+
+
+def offers(st: Study, speed: Mapping[str, Mapping] | None = None) -> dict:
+    """The offer table per family: the own teacher as the reference row, then the sizes from the top down. Per row:
+    total and non-embedding params (and the teacher / row parameter ratio), M4 and its per-set CERs, the ratio to the
+    own teacher on M4 with its CI, JSUT + Galgame-neutral against Parakeet TDT (better / within / worse by the CI),
+    the speed probe's batched RTF, batch-1 p50 / p95 and peak VRAM, the delta-primary call against the top with its
+    ratio and CI, and the T/2 readout (budget)."""
+    sp = {k: speed_entry(v) for k, v in (speed or {}).items()}
+    dkey = _dkey(float(st.st["delta_primary"]))
+    out = {}
+    for fam in OFFER_FAMILIES:
+        spec = LADDERS[fam]
+        top, teacher = spec["top"], spec["teacher"]
+        F = st.family(fam)
+        entry = {e["system"]: e for e in F["entries"]}
+        budget = {r["system"]: r for r in st.budget(fam)["rows"]}
+        t_params = params_of(teacher, st.params)
+        rows = []
+        for s, role in [(teacher, "teacher"), (top, "top"), *((x, "size") for x in spec["sizes"])]:
+            pt = params_of(s, st.params)
+            row = dict(system=s, display=display(s), role=role, available=st.has(s), params_total=pt,
+                       params_non_embedding=PARAMS_NON_EMBEDDING.get(base_run(s)),
+                       smaller_than_teacher=(t_params / pt if t_params and pt else None),
+                       m4=st.value(s, "m4"), sets={})
+            if st.has(s):
+                j = st.corpus.index(s)
+                row["sets"] = {k: _f(stratum_cer(st.point, k)[j]) for k in M4_SETS if k in st.corpus.strata}
+            vt = st.compare(s, teacher, "m4", deltas=[]) if s != teacher else None
+            row["vs_teacher"] = None if vt is None else dict(ratio=vt["ratio"], ci=vt["ci_ratio"])
+            tdt = st.compare(s, "parakeet-tdt", "jg", deltas=[])
+            row["vs_tdt"] = None if tdt is None else dict(ratio=tdt["ratio"], ci=tdt["ci_ratio"], verdict=_vs(tdt))
+            row["speed"] = sp.get(s)
+            if role == "size":
+                c = entry[s]["m4"] if s in entry else None
+                row["vs_top"] = None if c is None else dict(ratio=c["ratio"], ci=c["ci_ratio"], call=c["calls"][dkey])
+                b = budget.get(s)
+                row["t_half"] = None if not b or not b["available"] else dict(
+                    delta=b["delta"], ci=b["ci"], label=b["label"], compute_limited=b["compute_limited"],
+                    call_at_T_half=b["at_T_half"]["calls"][dkey])
+            rows.append(row)
+        out[fam] = dict(family=fam, text=spec["text"], top=top, teacher=teacher, delta=float(st.st["delta_primary"]),
+                        rows=rows, primary=F["primary"])
+    return out
+
+
+def _n(x) -> str:
+    return "n/a" if x is None else f"{x / 1e6:,.0f}M"
+
+
+def offer_text(off: Mapping, sens: Mapping | None = None, bars: Mapping | None = None) -> list[str]:
+    """The plain-English "what to offer" paragraph, one sentence group per family, generated from the calls only:
+    the top is the quality tier; the smallest size the delta-primary walk keeps WITHIN is the compact tier; a size the
+    walk calls OUTSIDE is offered only as a speed / memory tier with its CER cost; an UNRESOLVED size is not offered
+    as a claim. Then the Parakeet TDT bar and the sigma_run sensitivity."""
+    out = []
+    for fam, F in off.items():
+        rows = {r["system"]: r for r in F["rows"]}
+        top, w = rows[F["top"]], F["primary"]
+        d = f"{100 * F['delta']:g} %"
+        name = {"transcribe": "Transcribe (Cohere-distilled AED)", "parakeet": "Parakeet (CTC)"}.get(fam, fam)
+        if not top["available"] or w is None:
+            out.append(f"{name}: no results for its largest student yet; nothing to offer.")
+            continue
+        parts = [f"{name}: offer {top['display']} as the quality tier (M4 {_pct(top['m4'])}"
+                 + (f", {top['vs_teacher']['ratio']:.2f}x its teacher's CER" if top["vs_teacher"] else "")
+                 + f", {_n(top['params_total'])} parameters)."]
+        lim = rows.get(w["limit"])
+        if lim is not None and lim["system"] != top["system"]:
+            parts.append(f"{lim['display']} keeps M4 within {d} of it (ratio {lim['vs_top']['ratio']:.3f}, CI up to "
+                         f"{lim['vs_top']['ci'][1]:.3f}) at {_n(lim['params_total'])} parameters"
+                         + (f", {lim['smaller_than_teacher']:.1f}x smaller than the teacher" if
+                            lim["smaller_than_teacher"] else "")
+                         + ": offer it as the compact default.")
+        stop = rows.get(w["stop"]) if w["stop"] else None
+        if w["status"] == "reached" and stop is not None:
+            parts.append(f"{stop['display']} is OUTSIDE (M4 {stop['vs_top']['ratio']:.2f}x the top, CI "
+                         f"{stop['vs_top']['ci'][0]:.2f}-{stop['vs_top']['ci'][1]:.2f}): the limit is between "
+                         f"{rows[w['limit']]['display']} and {stop['display']}; offer {stop['display']}"
+                         + (" and smaller" if w["descriptive"] else "")
+                         + " only where speed or memory matters more than CER, with that cost stated.")
+        elif w["status"] == "unresolved" and stop is not None:
+            parts.append(f"{stop['display']} is UNRESOLVED at {d} (M4 {stop['vs_top']['ratio']:.2f}x the top, CI "
+                         f"{stop['vs_top']['ci'][0]:.2f}-{stop['vs_top']['ci'][1]:.2f}): not a claim; offer it at most "
+                         f"as an experimental tier.")
+        elif w["status"] == "not_reached":
+            parts.append(f"Every size down to {rows[w['limit']]['display']} is within {d}: the ladder does not "
+                         f"reach the limit, so smaller students are worth trying.")
+        elif w["status"] == "incomplete":
+            parts.append(f"The walk stops at {rows[w['stop']]['display'] if w['stop'] in rows else w['stop']}: no "
+                         f"results for it yet.")
+        for s in w.get("descriptive") or []:
+            r = rows.get(s)
+            if r and r.get("vs_top"):
+                parts.append(f"{r['display']} (descriptive only): M4 {r['vs_top']['ratio']:.2f}x the top.")
+        th = [r for r in F["rows"] if r["role"] != "teacher" and r.get("t_half") and r["t_half"]["compute_limited"]]
+        if th:
+            parts.append("Compute-limited at T (the gap to the top closes with training): "
+                         + ", ".join(r["display"] for r in th) + ".")
+        out.append(" ".join(parts))
+    if bars and bars.get("tdt", {}).get("available"):
+        sm = bars["tdt"]["smallest"]
+        out.append("Against Parakeet TDT 0.6B on JSUT + Galgame-neutral: " +
+                   (f"the smallest student at or below it (CI upper end) is {display(sm)}." if sm else
+                    "no student is at or below it with its CI's upper end."))
+    if sens:
+        out.append(sens["text"])
+    return out
+
+
 # ------------------------------------------------------------------------------------------------ section 7 checks
 
 
@@ -916,22 +1140,48 @@ def teacher_baseline_check(study: Study, prereg_baselines: Mapping[str, Mapping[
                  missing=missing)
 
 
+# the keys of a kitsune.prereg numbers file (prereg.NUMBERS_KEYS): what tells one file from a {box: file} mapping
+NUMBERS_FIELDS = ("box", "calibration", "max_steps", "lr_probes", "lr", "rules_sha256", "written_utc", "host")
+
+
+def numbers_by_box(numbers: Mapping | None) -> dict[str, Mapping]:
+    """The pre-registered numbers as {box: numbers file}. The study writes one file per box (kitsune.prereg:
+    PREREG_numbers_A.json, _B.json and _replicate.json, each naming its "box"; tools/study_report.py --numbers reads
+    them all); one file on its own (the whole study on one host, or a single box's) is keyed by its "box", "all" when it
+    has none; a {box: file} mapping is taken as it is. Each run is checked against the file of the box that trains it:
+    the one whose max_steps names it."""
+    if not numbers:
+        return {}
+    if any(k in numbers for k in NUMBERS_FIELDS):
+        return {str(numbers.get("box") or "all"): numbers}
+    return {str(k): v for k, v in numbers.items() if isinstance(v, Mapping)}
+
+
+def _per_box(files: Mapping[str, Mapping], field: str) -> list[tuple[str, str, object]]:
+    """(key, box, value) for every entry of `field` over the files, keyed by the entry's name, or "<name> (<box>)" when
+    two files hold it (box B calibrates study-t06 too, as its host's reference)."""
+    rows = [(box, k, v) for box, f in files.items() for k, v in (f.get(field) or {}).items()]
+    names = [k for _, k, _ in rows]
+    return [(k if names.count(k) == 1 else f"{k} ({box})", box, v) for box, k, v in rows]
+
+
 def lr_edge_check(numbers: Mapping | None) -> dict:
     """An LR winner at a grid edge after its one extension invalidates (7): the winner of every class's probes
-    (lowest objective) must not be the smallest or largest LR probed. PREREG_numbers.json lr_probes {class: {lr:
-    objective}} holds the extension point too, so an edge winner there is an edge winner after the extension."""
-    probes = (numbers or {}).get("lr_probes")
+    (lowest objective) must not be the smallest or largest LR probed. A numbers file's lr_probes {class: {lr:
+    objective}} holds the extension point too, so an edge winner there is an edge winner after the extension. Every
+    box's file counts (numbers_by_box: each probes its own classes)."""
+    probes = _per_box(numbers_by_box(numbers), "lr_probes")
     if not probes:
-        return check("lr_edge", "not_checked", "no lr_probes in PREREG_numbers.json")
+        return check("lr_edge", "not_checked", "no lr_probes in the numbers files")
     bad, rows = [], {}
-    for cls, grid in probes.items():
+    for cls, box, grid in probes:
         pts = sorted((float(lr), float(obj)) for lr, obj in grid.items() if obj is not None)
         if len(pts) < 2:
             bad.append(f"{cls}: fewer than 2 probed LRs")
             continue
         win = min(pts, key=lambda p: p[1])[0]
         edge = win in (pts[0][0], pts[-1][0])
-        rows[cls] = dict(winner=win, grid=[p[0] for p in pts], at_edge=edge)
+        rows[cls] = dict(winner=win, grid=[p[0] for p in pts], at_edge=edge, box=box)
         if edge:
             bad.append(f"{cls}: winner {win:g} at the edge of {[p[0] for p in pts]}")
     return check("lr_edge", "fail" if bad else "pass",
@@ -939,14 +1189,54 @@ def lr_edge_check(numbers: Mapping | None) -> dict:
 
 
 def loader_check(numbers: Mapping | None, limit: float = DATA_WAIT_MAX) -> dict:
-    cal = (numbers or {}).get("calibration")
+    """No run was calibrated loader-bound (7), on any box: every calibration entry of every numbers file (box B's
+    study-t06 as "study-t06 (B)" next to box A's)."""
+    cal = _per_box(numbers_by_box(numbers), "calibration")
     if not cal:
-        return check("loader_bound", "not_checked", "no calibration in PREREG_numbers.json")
-    bad = {r: v.get("data_wait_frac") for r, v in cal.items()
+        return check("loader_bound", "not_checked", "no calibration in the numbers files")
+    bad = {r: v.get("data_wait_frac") for r, _, v in cal
            if v.get("data_wait_frac") is None or float(v["data_wait_frac"]) >= limit}
     return check("loader_bound", "fail" if bad else "pass",
                  f"data_wait >= {limit:.0%} (or missing) for {sorted(bad)}" if bad
                  else f"data_wait < {limit:.0%} for all {len(cal)} calibrated runs", runs=bad)
+
+
+def numbers_check(numbers: Mapping | None, rules_sha256: str | None = None,
+                  file_sha256: Mapping[str, str] | None = None) -> dict:
+    """The numbers files belong to this pre-registration (7: a numbers file written under other rules; the replicate
+    box refuses box A's file under other rules): every file's rules_sha256 is the committed PREREG.json's (rules_sha256:
+    kitsune.prereg.rules_sha256 of it, when given) and the other files'; the replicate's numbers_from names box A's
+    file by that file's sha256 (file_sha256: {box: sha256 of the file's bytes}, when given). A file without
+    rules_sha256 is not compared; nothing compared is not_checked."""
+    files = numbers_by_box(numbers)
+    if not files:
+        return check("numbers", "not_checked", "no numbers files")
+    shas = {b: f.get("rules_sha256") for b, f in files.items() if f.get("rules_sha256")}
+    bad, compared = [], 0
+    if len(shas) > 1:
+        compared += 1
+        if len(set(shas.values())) > 1:
+            bad.append("the files were written under different rules: "
+                       + ", ".join(f"{b} {s[:12]}..." for b, s in sorted(shas.items())))
+    if rules_sha256 and shas:
+        compared += 1
+        bad += [f"{b}: written under rules {s[:12]}..., PREREG.json is {rules_sha256[:12]}..."
+                for b, s in sorted(shas.items()) if s != rules_sha256]
+    for b, f in sorted(files.items()):
+        src = f.get("numbers_from")
+        if isinstance(src, Mapping) and (have := (file_sha256 or {}).get(str(src.get("box")))):
+            compared += 1
+            if src.get("sha256") != have:
+                bad.append(f"{b}: takes its numbers from box {src.get('box')}'s file with sha256 "
+                           f"{str(src.get('sha256'))[:12]}..., that file is {have[:12]}...")
+    boxes = sorted(files)
+    if bad:
+        return check("numbers", "fail", "; ".join(bad), boxes=boxes)
+    if not compared:
+        return check("numbers", "not_checked", f"nothing to compare in the numbers files of {boxes} (no rules_sha256 "
+                                               f"beside another file's or PREREG.json's)", boxes=boxes)
+    return check("numbers", "pass", f"the numbers files of {boxes} were written under the same rules"
+                 + (" as PREREG.json" if rules_sha256 else "") + " and name their sources by sha256", boxes=boxes)
 
 
 def _study_summaries(summaries: Mapping[str, Mapping] | None) -> tuple[dict, list[str]]:
@@ -957,17 +1247,25 @@ def _study_summaries(summaries: Mapping[str, Mapping] | None) -> tuple[dict, lis
 
 def max_steps_check(numbers: Mapping | None, summaries: Mapping[str, Mapping] | None,
                     end_frac: float = 0.5) -> dict:
-    """Every study run reached its pre-registered max_steps (7): PREREG_numbers.json max_steps against the summary's
-    "steps". A T/2 branch ends at round(end_frac x M) (PREREG.json branch.end_frac, not the branch's own config, which
-    could say otherwise; Python's round, as the trainer's frac_step). A study run with a summary but no pre-registered
-    number fails too. Only the study runs count: LR probes, the anchor and other runs in the same runs root are listed
-    as skipped. A pre-registered run without a summary leaves the check not_checked (unless another run fails)."""
-    ms = (numbers or {}).get("max_steps")
+    """Every study run reached its pre-registered max_steps (7): the numbers files' max_steps (every box's; a run named
+    by two files with different numbers fails) against the summary's "steps". A T/2 branch ends at round(end_frac x M)
+    (PREREG.json branch.end_frac, not the branch's own config, which could say otherwise; Python's round, as the
+    trainer's frac_step). A study run with a summary but no pre-registered number fails too. Only the study runs count:
+    LR probes, the anchor and other runs in the same runs root are listed as skipped. A pre-registered run without a
+    summary leaves the check not_checked (unless another run fails)."""
+    ms, bad = {}, []
+    for box, f in numbers_by_box(numbers).items():
+        for run, m in (f.get("max_steps") or {}).items():
+            if run in ms and int(ms[run]) != int(m):
+                bad.append(f"{run}: max_steps {ms[run]} and {m} in two numbers files")
+            ms.setdefault(run, m)
     runs, skipped = _study_summaries(summaries)
     if not ms or not runs:
-        return check("max_steps", "not_checked", "needs PREREG_numbers.json max_steps and the study runs' summaries",
+        if bad:
+            return check("max_steps", "fail", "; ".join(bad), skipped=skipped)
+        return check("max_steps", "not_checked", "needs the numbers files' max_steps and the study runs' summaries",
                      skipped=skipped)
-    bad, rows = [], {}
+    rows = {}
     for run, summ in runs.items():
         target = ms.get(base_run(run))
         steps = summ.get("steps")
@@ -1086,10 +1384,13 @@ def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[
             speed: Mapping[str, Mapping] | None = None, numbers: Mapping | None = None,
             summaries: Mapping[str, Mapping] | None = None, prereg_baselines: Mapping | None = None,
             prereg_manifest: Mapping | None = None, manifest_file_sha256: str | None = None,
-            imitation: bool = True) -> dict:
+            imitation: bool = True, rules_sha256: str | None = None,
+            numbers_file_sha256: Mapping[str, str] | None = None) -> dict:
     """Everything the study reports from its eval results, as one JSON-able dict (tools/study_report.py renders it).
 
-    speed: {system: {"rtf": float, "vram_gb": float, ...}} (the A100 speed probe); numbers: PREREG_numbers.json;
+    speed: {system: {"rtf": float, "vram_gb": float, ...}} (the A100 speed probe); numbers: the numbers files, {box:
+    PREREG_numbers_<box>.json} or one file (numbers_by_box); rules_sha256 / numbers_file_sha256: the committed
+    PREREG.json's rules sha256 and the numbers files' byte sha256s per box, for numbers_check;
     summaries: {run name: the trainer's summary.json} (tools/study_report.load_summaries keys the trainer's stamped run
     dirs by run name); prereg_baselines: prereg_baselines(PREREG.json); prereg_manifest: prereg_manifest(PREREG.json);
     manifest_file_sha256: the sha256 of the manifest file's bytes, compared with PREREG's manifest_sha256."""
@@ -1110,6 +1411,9 @@ def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[
     out["cross_family"] = st.cross_family()
     out["pareto"] = _pareto(st, speed)
     out["anchor"] = st.anchor()
+    out["sensitivity"] = sensitivity(st)
+    out["offers"] = offers(st, speed)
+    out["offer_text"] = offer_text(out["offers"], out["sensitivity"], out["bars"])
     # the sampling noise of the primary comparisons and what it means for the calls (the 4.5 table at our noise)
     ses = [e["m4"]["se"] for f in PRIMARY_FAMILIES for e in out["families"][f]["entries"] if e["m4"]]
     if ses:
@@ -1136,6 +1440,7 @@ def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[
                else "T-0.6B is not worse than the anchor by > 5 % with a CI excluding 0")),
         lr_edge_check(numbers),
         loader_check(numbers),
+        numbers_check(numbers, rules_sha256, numbers_file_sha256),
     ]
     out["invalid"] = any(c["status"] == "fail" for c in out["checks"])
     return _clean(out)
@@ -1159,25 +1464,35 @@ def parse_utc(x) -> datetime | None:
 
 
 def _timing_check(numbers: Mapping | None, summaries: Mapping[str, Mapping] | None) -> dict:
-    """PREREG_numbers.json before the first study step (7): its written_utc against each study run's started_utc
+    """A box's numbers file before that box's first study step (7): the written_utc of the file of the box that trains
+    a run (the file whose max_steps names it; with one file, that file) against each study run's started_utc
     (tools/study_report.load_summaries fills that from the run dir's config.json created_utc, or its stamp, when the
     summary has none; both precede the run's first step). The rules commit's own order is git's record, not visible
     here."""
-    w = parse_utc((numbers or {}).get("written_utc"))
+    files = numbers_by_box(numbers)
+    written = {b: parse_utc(f.get("written_utc")) for b, f in files.items()}
+
+    def written_for(run: str):
+        boxes = [b for b, f in files.items() if base_run(run) in (f.get("max_steps") or {})]
+        if not boxes and len(files) == 1:
+            boxes = list(files)
+        return written[boxes[0]] if boxes else None
+
     runs, _ = _study_summaries(summaries)
-    starts = {r: parse_utc(s.get("started_utc")) for r, s in runs.items()}
-    known = {r: t for r, t in starts.items() if t is not None}
-    if w is None or not known:
-        return check("prereg_timing", "not_checked", "needs PREREG_numbers.json written_utc and the study runs' start "
+    pairs = {r: (parse_utc(s.get("started_utc")), written_for(r)) for r, s in runs.items()}
+    known = {r: tw for r, tw in pairs.items() if None not in tw}
+    if not any(written.values()) or not known:
+        return check("prereg_timing", "not_checked", "needs the numbers files' written_utc and the study runs' start "
                                                      "times")
-    early = sorted(r for r, t in known.items() if t < w)
-    unknown = sorted(r for r, t in starts.items() if t is None)
-    tail = f"; no start time for {unknown}" if unknown else ""
+    early = sorted(r for r, (t, w) in known.items() if t < w)
+    unknown = sorted(r for r in pairs if r not in known)
+    tail = f"; no start time or numbers file for {unknown}" if unknown else ""
+    when = ", ".join(f"{b} {w.isoformat()}" for b, w in sorted(written.items()) if w is not None)
     if early:
-        return check("prereg_timing", "fail", f"runs started before PREREG_numbers.json was written ({w.isoformat()}): "
+        return check("prereg_timing", "fail", f"runs started before their box's numbers file was written ({when}): "
                                               f"{early}" + tail)
     return check("prereg_timing", "not_checked" if unknown else "pass",
-                 f"PREREG_numbers.json ({w.isoformat()}) precedes all {len(known)} study run starts" + tail)
+                 f"the numbers files ({when}) precede all {len(known)} study run starts of their boxes" + tail)
 
 
 def _systems(st: Study, imitation: bool) -> dict:
@@ -1300,6 +1615,10 @@ def _is_nums(v) -> bool:
     return isinstance(v, (list, tuple)) and len(v) > 0 and all(_is_num(x) for x in v)
 
 
+def _is_strs(v) -> bool:
+    return isinstance(v, (list, tuple)) and len(v) > 0 and all(isinstance(x, str) for x in v)
+
+
 def _is_pair(v) -> bool:
     return isinstance(v, (list, tuple)) and len(v) == 2 and all(isinstance(x, str) for x in v)
 
@@ -1313,6 +1632,9 @@ PREREG_SETTINGS = {
     "sigma_run_prior": (("sigma_run.prior", "sigma_run_prior", "sigma_prior"), _is_num, "a number"),
     "sigma_hat_factor": (("sigma_run.factor", "sigma_hat_factor"), _is_num, "a number"),
     "replicate": (("sigma_run.replicate", "replicate"), _is_pair, "[replicate run, original run]"),
+    "sigma_grid": (("sigma_run.grid", "sigma_grid"), _is_nums, "a list of numbers"),
+    "trigger_families": (("sigma_run.trigger_families", "trigger_families"), lambda v: _is_strs(v),
+                         "a list of family names"),
     "boot_b": (("bootstrap.B", "bootstrap.b", "boot_b"), _is_int, "an integer"),
     "boot_seed": (("bootstrap.seed", "boot_seed"), _is_int, "an integer"),
     "z": (("bootstrap.z", "z"), _is_num, "a number"),
@@ -1342,6 +1664,8 @@ def settings_from_prereg(prereg: Mapping | None) -> tuple[dict, dict]:
       sigma_run_prior  sigma_run.prior, sigma_run_prior, sigma_prior    (0.016)
       sigma_hat_factor sigma_run.factor, sigma_hat_factor               (0.886)
       replicate        sigma_run.replicate, replicate                   [replicate run, original run]
+      sigma_grid       sigma_run.grid, sigma_grid                       the sensitivity grid ([0.016, 0.032])
+      trigger_families sigma_run.trigger_families                       (["transcribe", "parakeet"])
       boot_b / boot_seed / z   bootstrap.{B, seed, z} (or boot_b / boot_seed / z)
       teacher_bars ([1.2, 1.5]), anchor_flag_rel (0.05), branch_end_frac (branch.end_frac, 0.5)
     A value of the wrong type outside "analysis" is prose of the rules (kitsune.prereg writes limit_rule.replicate as a
@@ -1392,6 +1716,12 @@ def settings_from_prereg(prereg: Mapping | None) -> tuple[dict, dict]:
     if not _is_pair(st["replicate"]):
         raise ValueError(f"replicate = {st['replicate']!r}: [replicate run, original run]")
     st["replicate"] = list(st["replicate"])
+    if not (_is_nums(st["sigma_grid"]) and all(0 < float(x) < 1 for x in st["sigma_grid"])):
+        raise ValueError(f"sigma_grid = {st['sigma_grid']!r} ({src['sigma_grid']}): fractions in (0, 1)")
+    st["sigma_grid"] = [float(x) for x in st["sigma_grid"]]
+    if not all(f in LADDERS for f in st["trigger_families"]):
+        raise ValueError(f"trigger_families = {st['trigger_families']!r}: families of {sorted(LADDERS)}")
+    st["trigger_families"] = list(st["trigger_families"])
     return st, src
 
 

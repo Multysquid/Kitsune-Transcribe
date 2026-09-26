@@ -205,8 +205,9 @@ def test_full_configs_resolve():
     for name, cfg in raw.items():
         resolved = m.load_config(str(ROOT / "configs" / f"{name}.json"), [])
         for k, v in cfg.items():
-            if not k.startswith("_"):
-                assert resolved[k] == v, k
+            if not k.startswith("_"):  # a section resolves to itself over the DEFAULTS keys it leaves out
+                d = m.DEFAULTS.get(k)
+                assert resolved[k] == (dict(d, **v) if isinstance(d, dict) and isinstance(v, dict) else v), k
         assert resolved["loss"] == m.DEFAULTS["loss"]  # the trainer sections inherit DEFAULTS
         assert kextent.validate(cfg) == [], name
         recipe = cfg["selection_recipe"]

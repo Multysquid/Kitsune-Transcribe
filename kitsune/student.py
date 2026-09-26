@@ -69,9 +69,13 @@ FFN_NAMES = ("feed_forward1", "feed_forward2")
 EXPECTED_DEFAULT_PARAMS = 616_963_328  # closed form for B20x2560 / dec4 / V16384 tied (report_model.md section 2)
 # The size study's pruned shapes, (kept encoder layers, FFN width, kept decoder layers) -> total parameters (STUDY.md
 # 1.1). 03_build_student.py asserts a build of one of these shapes from the 48-layer teacher lands on its count.
+# T-0.3B is B8x2560 with T-0.6B's decoder {0,2,5,7} (the owner's decision of 2026-09-26, replacing decision 17's
+# B10x2560 + decoder {0,7}, 320,752,384): the two-layer decoder {0,7} started at a step-0 KL of 15.7 on the gate, worse
+# than a random guess over 16,384 tokens (ln 16384 = 9.7), B8 with the four-layer decoder at 8.1. So T 0.6 -> 0.3
+# changes only the encoder's depth (20 -> 8 of 48 layers, evenly_spaced(8, 48) = [0,7,13,20,27,34,40,47]).
 PRUNED_EXPECTED_PARAMS = {
     (20, 2560, (0, 2, 5, 7)): EXPECTED_DEFAULT_PARAMS,  # T-0.6B, the first run's student
-    (10, 2560, (0, 7)): 320_752_384,  # T-0.3B
+    (8, 2560, (0, 2, 5, 7)): 301_822_208,  # T-0.3B
 }
 # save_student writes it next to the weights as README.md, its modification notice fitted to the student (model_card)
 MODEL_CARD = Path(__file__).resolve().parents[1] / "MODEL_CARD.md"
@@ -431,14 +435,14 @@ class ScratchShape:
             raise ValueError(f"the depthwise conv kernel must be odd ('same' padding): {self}")
 
 
-# STUDY.md 1.1 (decision 18, shapes W). The bridge is the T-0.3B shape (B10x2560 + decoder {0,7}) from scratch: the
-# teacher's widths, 10 encoder and 2 decoder layers.
+# STUDY.md 1.1 (decision 18, shapes W). The bridge is the T-0.3B shape (B8x2560 + decoder {0,2,5,7}, the owner's
+# decision of 2026-09-26) from scratch: the teacher's widths, 8 encoder and 4 decoder layers.
 SCRATCH_SHAPES = {
     "t01": ScratchShape(512, 12, 8, 2048, 512, 4, 8, 2048),
     "t005": ScratchShape(384, 10, 6, 1536, 384, 3, 6, 1536),
-    "bridge": ScratchShape(1280, 10, 8, 2560, 1024, 2, 8, 4096),
+    "bridge": ScratchShape(1280, 8, 8, 2560, 1024, 4, 8, 4096),
 }
-SCRATCH_EXPECTED_PARAMS = {"t01": 103_996_416, "t005": 51_209_600, "bridge": 320_752_384}
+SCRATCH_EXPECTED_PARAMS = {"t01": 103_996_416, "t005": 51_209_600, "bridge": 301_822_208}  # bridge == T-0.3B's
 
 
 def scratch_config(teacher_config: CohereAsrConfig, shape: ScratchShape) -> CohereAsrConfig:
@@ -644,6 +648,39 @@ def write_meta(out_dir, meta: dict):
 # first run's student; model_card rewrites it for any other student from its student_meta.json.
 _CARD_CHANGES = re.compile(r"It was pruned \(.*?`student_meta\.json` records the exact layers and FFN neurons kept\.",
                            re.S)
+# The size study trains on more data than the first run (STUDY.md 3: ReazonSpeech large and Emilia's non-YODAS part,
+# laion/Emolia), so a study student's card (a meta with init_class) lists it: two more `datasets` in the front matter,
+# and the card's ReazonSpeech credit replaced by an Emilia credit and a ReazonSpeech small + large one. The text is the
+# one the six uploaded Transcribe inits carry (students/study/<name>/README.md, hand-patched before model_card knew it;
+# tests/test_student.py checks model_card against them); the first run's card stays as written.
+_CARD_DATASETS_END = "- japanese-asr/whisper_transcriptions.reazonspeech.small\n---\n"
+_CARD_STUDY_DATASETS = ("japanese-asr/whisper_transcriptions.reazonspeech.large", "laion/Emolia")
+_CARD_REAZON = re.compile(r"- ReazonSpeech \(\[japanese-asr/whisper_transcriptions\.reazonspeech\.small\]\(.*?"
+                          r"Article 30-4 of the Japanese Copyright Act\.\n", re.S)
+_CARD_STUDY_DATA = (
+    "- Emilia, Japanese non-YODAS part ([laion/Emolia](https://huggingface.co/datasets/laion/Emolia) `JA-B*` tars, a "
+    "mirror\n"
+    "  of [amphion/Emilia-Dataset](https://huggingface.co/datasets/amphion/Emilia-Dataset) Emilia):\n"
+    "  [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) upstream, non-commercial (the mirror's own tag "
+    "says\n"
+    "  CC BY 4.0; the upstream licence governs).\n"
+    "- ReazonSpeech ([japanese-asr/whisper_transcriptions.reazonspeech.small](https://huggingface.co/datasets/japanese-"
+    "asr/whisper_transcriptions.reazonspeech.small)\n"
+    "  and [japanese-asr/whisper_transcriptions.reazonspeech.large](https://huggingface.co/datasets/japanese-asr/"
+    "whisper_transcriptions.reazonspeech.large),\n"
+    "  mirrors of [reazon-research/reazonspeech](https://huggingface.co/datasets/reazon-research/reazonspeech)):\n"
+    "  CDLA-Sharing-1.0, used for training under Article 30-4 of the Japanese Copyright Act.\n")
+
+
+def study_card_data(card: str) -> str | None:
+    """The card with the size study's training data (_CARD_STUDY_DATA), or None when its wording no longer has the
+    places it goes (the front matter's last dataset, the ReazonSpeech credit)."""
+    if card.count(_CARD_DATASETS_END) != 1:
+        return None
+    card = card.replace(_CARD_DATASETS_END, _CARD_DATASETS_END[:-5] + "".join(f"\n- {d}" for d in _CARD_STUDY_DATASETS)
+                        + "\n---\n")
+    new, n = _CARD_REAZON.subn(lambda _: _CARD_STUDY_DATA, card, count=1)
+    return new if n == 1 else None
 
 
 def model_card(meta: dict) -> str:
@@ -653,12 +690,22 @@ def model_card(meta: dict) -> str:
     recalibrated), and a verbatim copy would misstate every other build. A meta with the size study's fields
     (init_class) gets its own sentence: the pruned shape and its BN mode, or, for a from-scratch student, that it has
     the teacher's architecture at another size with randomly initialised weights. A meta without them (the first
-    run's format 1, tests) keeps the card as it is. A card whose notice no longer has the expected wording is kept as
-    it is, with a warning (save_student must not fail a training run's checkpoint over the card)."""
-    card = MODEL_CARD.read_bytes().decode("utf-8")
+    run's format 1, tests) keeps the card as it is. A study meta's card also lists the study's training data
+    (study_card_data): the text of the six uploaded Transcribe inits, which every checkpoint trained from them (its meta
+    is the init's plus a `trained` block) carries too. The card is LF whatever the checkout's line endings (git's
+    autocrlf gives a Windows checkout CRLF; the uploaded cards are LF). A card whose wording no longer has what
+    model_card rewrites is kept as it is, with a warning (save_student must not fail a training run's checkpoint over
+    the card)."""
+    card = MODEL_CARD.read_bytes().decode("utf-8").replace("\r\n", "\n")
     init = meta.get("init_class") if meta else None
     if not init:
         return card
+    study = study_card_data(card)
+    if study is None:
+        warnings.warn(f"{MODEL_CARD}: the front matter's datasets or the ReazonSpeech credit changed; the card does not "
+                      f"list the size study's training data")
+    else:
+        card = study
     head = (meta.get("build") or {}).get("tie_head", True)
     if init == "scratch":
         s = meta.get("scratch") or {}

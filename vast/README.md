@@ -6,7 +6,8 @@ private HF model repo, verifies the upload and destroys itself. A watchdog stops
 Nothing is rented until you run `launch.py --yes`.
 
 The same scripts also rent the **label box**: one RTX 5090 that labels the full download with both teachers and uploads
-the labels to the data repo (`--job label`, see "The label run" at the end).
+the labels to the data repo (`--job label`, see "The label run" below), and the **size study's boxes**: 4x or 1x A100
+that run a queue of calibration, LR probes and study runs (`--job study --box ...`, see "Size study" at the end).
 
 | file | runs where | what it does |
 |---|---|---|
@@ -74,7 +75,10 @@ code dependencies): github.com -> your profile -> Packages -> `kitsune-train` ->
    access to its contents (the trainer reads its uploads back), `kitsune-data` needs read. If the page applies one
    permission set to every selected repo, read + write on both is fine. No create permission is needed (both repos
    exist), and no gated-repo access: the parked student dir carries the processor and tokenizer files, and the
-   upstream datasets are public. Bootstrap checks this token against both repos in its first minute on the box.
+   upstream datasets are public. The size study's box B is the exception: its speed probe times the Cohere teacher
+   itself, so for that box the token also needs read access to the gated
+   `CohereLabs/cohere-transcribe-03-2026` (without it that one readout fails, recorded, and the box still
+   ends complete). Bootstrap checks this token against both repos in its first minute on the box.
 
 ### 3. vast.ai account
 
@@ -503,3 +507,186 @@ If the quota binds: a started root keeps its Parakeet settings (the box refuses 
 Read `labels/full/reports/galgame_judge.json` (kotoba vs Parakeet on the 58 kotoba-judged galgame shards) and
 `reports/parakeet_baselines.json` (TDT and CTC CER per eval set next to Cohere's), then plan the A100 run with
 `configs/full_sub3k.json` (or `configs/full.json`, or a derived subset).
+
+## Size study (the study boxes)
+
+The size study (study/STUDY.md; CONTRACT.md sections 6 and 8) runs on up to four boxes: the shakedown first, then
+boxes A and B **at the same time**, and the replicate only if the pre-registered rule asks for it. Each is one
+`launch.py --job study --box <box>` call; on the box `vast/supervise.py` runs `kitsune/study_queue.py` for that box
+instead of one trainer. The box's plan (runs, probe classes, calibrated runs, reference run, numbers file) is
+`kitsune.prereg.rules()["boxes"][<box>]`; the rules, the probe grids and every number rule come from `kitsune/prereg.py`.
+
+| box | GPUs | what it runs | central hours (cap) | cost at the 2026-09-25 snapshot |
+|---|---|---|---|---|
+| `shakedown` | 1 | both families (every run of boxes A and B): the stores of the real extent (the AED store, the CTC store with its frame preflight); per run a 100-step smoke at its planned micro-batch with the run's own start (its warm-up, seed and data order, its smoke gate: finite losses, throughput; at its class's lowest grid LR) and a step time, where a flat loss start fails a pruned run (t06, t03, p03, p01, p005) and is a note (`shake_notes` in the queue summary) for a scratch one (t01, t005, bridge); per family (AED; CTC as `*-ctc`) a crash at step 45 and the resume from step 40, a 50-step toy run and its T/2 branch, a complete eval on a subset (T-0.6B, P-0.3B: in-loop, mini and final); every run dir uploaded and verified | ~2 h (3.5 h) | ~$1.5-2 at ~$0.7-0.9/h |
+| `A` (Cohere) | 4 | calibration of study-t06/t03/t01/t005 together, LR probes kept-t03 and scratch (one edge extension each at most), `PREREG_numbers_A.json`, then study-t06, -t03, -t01, -t005 in one wave, each followed by its T/2 branch on the same GPU; the anchor re-score in a GPU gap | ~5.8 h (8 h) | ~$12.5 at ~$2.14/h (4x SXM4 40 GB) |
+| `B` (Parakeet + bridge) | 4 | calibration of study-p03/p01/p005/bridge together, then of study-t06 as this host's reference (`calib-study-t06-boxB`) under the load of three of them, probes lost, kept-p03 and bridge, `PREREG_numbers_B.json`, the wave of p03/p01/p005/bridge + branches, then the speed probe, one model at a time: its own students (their trained final weights), both teachers, then box A's students from the runs repo (after a wait of at most 45 min for box A) | ~6.3-7 h (9 h) | ~$13.5-15 |
+| `replicate` (conditional) | 1 | study-t01-s1235 and its branch, with study-t01's max_steps and LR from box A's numbers; only if the rule below asks for it | ~4.6 h (6 h) | ~$3-4 |
+
+Hours are the central estimate of STUDY.md 5.2-5.3 plus boot, bootstrap (two stores) and the end; the cap is the
+watchdog's (`KITSUNE_MAX_HOURS`, plus the extent's rebuild timeout). Traffic adds ~60 GB down and ~3-12 GB up (lean
+uploads) at the host's $/GB. launch.py prints the offer, the create command and the cost line; nothing is rented
+without `--yes`. Boxes A and B together: ~$26-28 central, ~$40 at both caps (box B's bridge probes are 5,000 steps each; a review of the code's numbers puts box B at ~7 h central, ~9 h high).
+
+### Before a study box (the owner's steps)
+
+1. The label root is sealed (`labels/full/COMPLETE.json`), the study selection is built on the laptop and uploaded,
+   and the filled PREREG is committed (see "The size study's selection and pre-registration" above). launch refuses
+   a study box (not the shakedown) while `study/PREREG.json` at the commit has a pending field, and whenever the
+   selection's sha256 in the data repo is not PREREG's `manifest.selection_sha256`.
+2. The students are built on the laptop (`D:/kitsune-students/study/<x>`) and uploaded, only what the boxes read:
+   ```bash
+   hf upload Multy123/kitsune-data D:/kitsune-students/study students/study --repo-type dataset \
+     --exclude "*.pt" --exclude "*/step0/*"
+   ```
+   launch checks, for every student of the box (and only those), `config.json`, `model.safetensors`, the processor and
+   tokenizer files, `student_meta.json`, `README.md`, and for a Parakeet-derived student its CC-BY-4.0
+   `MODEL_CARD.md`; and that each is the registered build: `kitsune.prereg.student_problems` on the data repo's
+   `student_meta.json` (complete, family, init class, seed, the exact parameter counts, and for a pruned student the
+   first run's calibration ids). A stale upload (the B10 T-0.3B, a P student ranked on re-drawn ids) is refused before
+   renting; bootstrap.sh checks the pulled copies again (`python -m kitsune.study_queue check-students`) before the
+   audio rebuild. (The first run's `students/b20x2560-d4` has no README.md in the data repo: upload
+   kitsune.student's model card as its README.md before relaunching a config that trains it.)
+3. The configs are generated and committed: `python tools/make_study_configs.py --check` says "up to date" (run it
+   without `--check` after a rule changes, e.g. a probe grid, and commit `configs/study/`). Push, and wait for the
+   image if `docker/` or `requirements-train.txt` changed.
+
+### Commands (PowerShell on the laptop)
+
+Every launch runs from a checkout at the commit the box will run (`--sha`, the full 40-hex id; the box clones exactly
+that commit, and launch reads the configs and `study/PREREG.json` at it). Code-only commits have no image of their own:
+`--image-tag main` (launch checks the image was built with this commit's dependencies). Each line first without
+`--yes` (read-only: the preflight, the offer table, the create command and the cost line), then the same line with
+`--yes` to rent. From `D:\Shizu-ko-distill` (or any checkout of the repo):
+```powershell
+git fetch origin
+git checkout <sha>
+```
+
+**1. The shakedown (done: rented from `0a0abae`).** For the record, the line it was launched with:
+```powershell
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast/launch.py --job study --box shakedown --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --image-tag main --sha 0a0abaeb7a11b26e718130b2664562aab975999a --yes
+```
+
+**2. Boxes A and B together.** Once the shakedown's `study/box-shakedown/queue_summary.json` says `complete` (and
+its `shake_notes` are read), from the commit that carries this README (the study's code), one line after the other,
+each with `--yes` once its look-only run shows no problems:
+```powershell
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast/launch.py --job study --box A --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --image-tag main --sha <sha> --yes
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast/launch.py --job study --box B --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --image-tag main --sha <sha> --yes
+```
+Both boxes run the same `<sha>` (the same `study/PREREG.json`: each numbers file records its `rules_sha256`, and the
+report checks they agree). They do not clash: launch never looks for other live boxes for a study job (each gets its
+own instance label `kitsune-study-<box>-...`); on the Hub each box has its own run ids (box B calibrates its reference
+as `calib-study-t06-boxB`, box A as `calib-study-t06`), its own `study/box-<box>/` (queue summary, infra logs) and its
+own `study/PREREG_numbers_<box>.json`; within a box the mains start 45 s apart (their 20-minute log syncs stay apart),
+and every upload backs off on a 429, a 5xx or a commit that raced another writer (409/412) (the trainers' log syncs
+15, 60, 180 s, then the next sync; the queue's uploads 5 s doubling to 10 min with up to 25 % jitter, then verified). `tests/test_study_box.py` runs both queues at once against one
+rate-limited runs repo. Box B's speed phase times its own students and the teachers first and box A's four students
+last, once box A's `study/box-A/queue_summary.json` lists their finished runs; box A is expected to end first (~5.8 h
+against ~6.3-7 h central, and box B has three more probes and the CTC frame store). If box A is still training then,
+box B polls its summary every 2 min for at most 45 min (~$1.6), never past its watchdog deadline less 1 h
+(`speed_wait` event). After that those four speed items fail as readouts (`readouts_failed`) and box B still ends
+complete. A redo re-times EVERY system, both teachers and all students, on one host into a fresh speed.json with
+`tools/speed_probe.py`: RTF and VRAM compare only within one host, and `tools/study_report.py` flags a speed.json
+that mixes hosts.
+
+**3. The replicate, only if it is needed** (CONTRACT.md 8: after boxes A and B, every limit call is computed at
+sigma_run 1.6 % and at 3.2 %; the replicate runs only if a family's LIMIT call - the primary delta 10 % walk - differs
+between the two, the study report's `replicate_needed`). Box A's numbers must be on the Hub, written under the same
+rules; from the same `<sha>`:
+```powershell
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast/launch.py --job study --box replicate --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --image-tag main --sha <sha> --yes
+```
+Box B's speed probe skips the replicate with a note (`speed_skipped`, `conditional: true`; it has study-t01's shape)
+unless its final weights are already in the runs repo; time it afterwards from the Hub with `tools/speed_probe.py` if
+it ran.
+
+The search is relaxed per launch: `num_gpus` 4 for A and B, 1 for the replicate and the shakedown; any A100, SXM4 or
+PCIe, 40 GB first, then 80 GB (equal compute is measured on each box's own host, so the variant does not bias
+max_steps); verified, reliability >= 0.93 (`STUDY_RELIABILITY`: the strict 0.98 left no 4x offer), driver CUDA >= 13.0,
+>= 12 cores and >= 64 GB RAM per GPU, disk and network >= 500 MB/s / Mbit/s down, >= 100 Mbit/s up per GPU. The disk
+comes from the extent's sizing with both label stores (the Cohere and the Parakeet store each copy the selected audio)
+and the box's checkpoints (`kitsune.study_queue.study_extra_gb`: up to 6 full states per run at 16 bytes a parameter,
+the bf16 exports, the probes running at once), about 450 GB for box A. `--offer-id`, `--max-dph` (default 6 $/h for 4
+GPUs, 2 for 1), `--disk-gb` and `--max-hours` work as for a training run. launch refuses the replicate while box A's
+numbers are not there or were written under other rules than the commit's `study/PREREG.json`. It passes the rented
+GPU count (`KITSUNE_N_GPUS`): the queue refuses to run on another count, and a box that trains a wave needs a GPU per
+run. The Cohere teacher's speed item (box B) reads the gated model with the box's own `HF_TOKEN` (the vast account
+env, One-time setup 3.2: the token needs read access to `CohereLabs/cohere-transcribe-03-2026`); without it that one
+readout fails and is recorded, the box still ends complete.
+
+### Numbers files are write-once; a relaunch reuses them
+
+A box writes `study/PREREG_numbers_<box>.json` once, uploads it, verifies it and logs its sha256 (`prereg_numbers`)
+before its first study step, and puts its queue summary up right after it. A box that dies after that is relaunched
+with the same launch line (a new instance, a fresh `queue.json`): launch sees the numbers file and says `relaunch: ...
+box <box> REUSES it`; the queue downloads it, checks its `rules_sha256` against the checkout's `study/PREREG.json`
+and the box, and then skips its calibration and probes entirely (never a second measurement, never an overwrite; the
+`prereg_numbers_reused` and `prereg_numbers` events). The loader retry's `perf.num_workers` and the smoke gate guard's
+decisions come from the earlier box's `study/box-<box>/queue_summary.json`. A numbers file written under other rules
+(another commit's PREREG) refuses the launch, and halts a box that gets that far: relaunch from the commit the numbers
+were written at. The wave itself starts again from step 0 (new run ids; the earlier box's finished run dirs stay in
+the runs repo).
+
+### Watching it (per box)
+
+| what | where |
+|---|---|
+| the box's state and outcome | runs repo `study/box-<box>/queue_summary.json` (after the numbers, then at the end: `status`, `reason`, every item's status and run dir, `calibration`, `lr_choice`, `numbers`, `smoke_gate_off`, `readouts_failed`); on the box `/workspace/kitsune_state/queue.json` and `queue_summary.json` |
+| the numbers | runs repo `study/PREREG_numbers_<box>.json`; its sha256 is the `prereg_numbers` event in `kitsune_state/events.jsonl`, before the first study step's `item_start` |
+| logs | on the box `tail -f /workspace/kitsune.log` (bootstrap, then `[queue] item_start`, `item_end`, `calibration_release`, `calibration`, `lr_chosen` / `lr_probe_extend`, `prereg_numbers`, `smoke_gate_off`, `item_uploaded`, `queue_end`) and `/workspace/kitsune_state/logs/<item>.log` per trainer; at the end in the runs repo `study/box-<box>/infra/<container>/` (the infra logs, `logs/`, any `rearm-<stamp>/`) |
+| the runs | runs repo `runs/<run>-<stamp>/` (each synced every 20 min while it trains, then uploaded lean and verified as it finishes) |
+| TensorBoard | `vastai ssh-url <id>`, then `ssh -p <port> root@<ip> -L 6006:localhost:6006` and http://localhost:6006: every run of the box (with A and B live, forward box B's to another local port, e.g. `-L 6007:localhost:6006`) |
+
+The calibration of a group starts together: each trainer sets up, writes `READY` in its run dir and waits; once all are
+there the queue writes `GO` into every one (`calibration_release`), so each run's steps 50-250 - the pre-registered
+window, literally - fall while the whole group trains, and the queue stops the group once all have logged step 250.
+Every trainer of a run (its calibration, probes, main and branch) gets the same loader: the queue gives each trainer an
+equal share of half the host's `/dev/shm` (the `shm` event) and cuts `perf.prefetch`, then `perf.num_workers`, to fit
+it. A main whose calibration run (its own start at its class's lowest grid LR) showed no falling loss over the smoke
+steps runs without the loss-trend check (`smoke_gate_off`, main and branch alike; a scratch run is ~5 % into its
+warm-up at step 100); the replicate follows box A's decision for study-t01.
+
+### How it ends, how to stop it, and what to do on a halt
+
+| outcome | instance | what to do |
+|---|---|---|
+| the queue exits 0: every item done and verified on the Hub | `finish.py --destroy` (lean): **destroyed** once verified | nothing; check the vast console after the destroy |
+| complete with `readouts_failed` (a failed anchor re-score or speed probe, e.g. no `HF_TOKEN` for the Cohere teacher) | **destroyed** like a complete box: a readout is never a reason to keep a paid box | redo that readout from the Hub (the run dirs and weights are there) |
+| a pre-registered halt (exit 4): calibration still loader-bound after `perf.num_workers` 12; an LR winner at a grid edge after its one extension; numbers on the Hub written under other rules | **stopped**; `reason` in `queue_summary.json` and the supervisor's decision | an owner decision: read `calibration` / `lr_choice` in the summary. The box has written no numbers (the numbers halt aside), so `vastai destroy instance <id>` and relaunch after the decision (a rule change is a new PREREG commit); a numbers-rules halt: relaunch from the commit the numbers were written at |
+| a trainer's throughput floor (exit 3) | **stopped** | a slow host: destroy and relaunch the same line (a new host; numbers already up are reused) |
+| the queue crashes (or the container restarts) | the queue again, up to 2 times: it resumes from `queue.json` (finished items skipped, a main run or probe from its local full state, a branch again from its parent, a calibration group again as a whole); then **stopped** | look at `kitsune_state/logs/`; continue in place (below) or destroy and relaunch |
+| the cap | **stopped** by the watchdog | continue in place (below) with a longer cap, or destroy and relaunch |
+
+Inside the queue a run that crashes resumes once from its own full state; a second failure marks it failed, the
+others go on, and the box ends stopped. A run whose smoke checks fail (`SmokeFailed`) fails at once: the same start
+fails the same way. The shakedown's smokes carry the study runs' own gate, so such a failure shows there first.
+
+To stop a box by hand: `vastai stop instance <id>` (disk kept, billed) or `vastai destroy instance <id>` (gone; what
+was uploaded stays in the runs repo). With A and B live, check the id against the label (`kitsune-study-A-...` /
+`kitsune-study-B-...`) before either. A stopped box continues in place with `vastai start instance <id>` and
+`bash /workspace/Kitsune-Transcribe/vast/onstart.sh --rearm`: the rearm keeps `queue.json`, so the queue resumes and
+never writes its numbers twice (delete `queue.json` only to start that box's study over, and never after its numbers
+are on the Hub: a relaunch reuses them anyway). Do not `touch runs/<run_id>/STOP` in a study run: it ends the run
+before its max_steps, which the pre-registration counts as an invalid run.
+
+### The trainer keys the study configs use (scripts/04_distill.py)
+
+| key | default (today's trainer) | study |
+|---|---|---|
+| `bn.mode` | `frozen` | `train` for the students built from scratch (bridge included): BN trains, evals use its running stats |
+| `loss.aux_ctc_weight` | 0 | 0.3 for the scratch runs: a training-only CTC head on the encoder, never exported |
+| `optim.weight_decay` | 0 | 1e-3 for the scratch runs, on the parameters of 2+ dimensions only |
+| `schedule.clock` / `max_steps` | wall / null | `steps`; max_steps from the box's numbers (the configs hold null, refused until filled) |
+| `eval.full_at_fracs` | null | [0.2, 0.4, 0.6, 0.8]: complete evals at those fractions of max_steps (eval.every_min null) |
+| `ckpt.full_at_fracs` / `weights_at_fracs` / `upload_full_at "frac:<f>"` | null / null / pre_cooldown, end | [0.4] (+0.8 for the runs of at most 0.1B, uploaded) / [0.4] / [] or ["frac:0.8"] |
+| `branch` | parent null | `<run>-half`: parent = the main run's local run dir (set by the queue), resume 0.4, end 0.5 |
+| `lr_probe.enabled` | false | the probes: metrics only, the teacher-forced objective on the complete gate sets at the end |
+| `specaug.seed` | null (the run's seed) | null: masks from (seed, step, micro-batch), identical across a resume or a branch |
+| `calibrate` | enabled false, window [50, 250], barrier false | the calibration runs: an lr_probe run that ends (at max_steps or on the STOP file the queue writes once every run of the group has its window) with its step-time table: a `calibrate_result` event and summary.json's `calibrate`; `barrier` (the queue sets it): `READY`, then wait for `GO` or `STOP` before the first step |
+| `pull_parakeet` | false | true (study/data.json): the box pulls both label roots |
+| `selection_recipe.study` | null | the pre-registered selection block (study/data.json) |
+
+The CTC trainer's keys (`family`, `parakeet_root`, `loss.w_ctc`) come with the CTC trainer (WP4b); box B needs it, and
+its store builder, before it can run.

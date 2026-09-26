@@ -21,7 +21,10 @@ Inputs
                    ("baselines", parakeet_ctc and galgame:<view> keys included) and the manifest block (the eval sets'
                    and Galgame views' id hashes, the manifest file's and the selection's sha256), all compared by the
                    invalidation checks. Out-of-range settings or unreadable JSON: exit 2.
-  --numbers FILE   PREREG_numbers.json (max_steps, lr_probes, calibration, written_utc) for the invalidation checks
+  --numbers FILE|DIR ...  the boxes' numbers files (max_steps, lr_probes, calibration, written_utc, rules_sha256) for
+                   the invalidation checks: PREREG_numbers_A.json, _B.json and _replicate.json (a DIR: every
+                   PREREG_numbers*.json in it), each keyed by its "box"; every run is checked against the file of the
+                   box that trains it, and every file's rules_sha256 against --prereg's (study_stats.numbers_check)
   --run-summaries DIR  the trainer's summaries: its runs root as it is (DIR/<run_name>-<stamp>/summary.json, keyed
                    by config.run_name; the newest start of a run name counts), or DIR/<run>/summary.json, DIR/<run>.json
                    (steps, resumes, config.selection, started_utc or the run dir's config.json created_utc). LR probes
@@ -32,11 +35,16 @@ Inputs
   --boot-b N, --seed N  override the bootstrap (development only: the report marks them as not pre-registered)
 
 Output (--out, written atomically): report.json (everything study_stats.analyse returns, plus the inputs' paths, the
-manifest file's sha256, the summaries read and the settings' sources) and report.md.
+manifest file's sha256, the summaries read and the settings' sources) and report.md. report.md LEADS with the owner's
+question (how far the models compress and what to offer): the "what to offer" sentences generated from the calls and
+one offer table per family (study_stats.offers: rows = the own teacher and the sizes; params, M4 and its sets, the
+ratio to the teacher, Parakeet TDT better / within / worse, speed, VRAM, the delta 10 % call, the T/2 readout), then
+the sigma_run sensitivity (every call at 1.6 % and 3.2 %, replicate_needed), then the statistics.
 
 Usage:
   python tools/study_report.py --tables evals/study --manifest labels/full/selections/study_manifest.json \
-      --prereg study/PREREG.json --numbers PREREG_numbers.json --speed speed.json --out reports/study
+      --prereg study/PREREG.json --numbers study/PREREG_numbers_A.json study/PREREG_numbers_B.json \
+      study/PREREG_numbers_replicate.json --speed speed.json --out reports/study
 CPU only. The statistics of 22 systems at B = 10,000 take about 5 s, the imitation CER about a second per system
 (--no-imitation skips it); the torch import behind kitsune.evaluate is the slowest part.
 """
@@ -156,6 +164,28 @@ def load_speed(path) -> dict | None:
     return raw.get("systems", raw)
 
 
+def speed_hosts(speed: dict | None) -> dict[str, list[str]]:
+    """"<host> / <gpu>" -> the systems timed there (tools/speed_probe.py records versions.host and gpu per system).
+    More than one: the speed and VRAM columns compare systems timed on different machines - e.g. box A's students
+    re-timed from the Hub after box B's speed phase found box A unfinished (vast/README.md)."""
+    out: dict[str, list[str]] = {}
+    for name, rec in (speed or {}).items():
+        if isinstance(rec, dict):
+            key = f"{(rec.get('versions') or {}).get('host') or '?'} / {rec.get('gpu') or '?'}"
+            out.setdefault(key, []).append(name)
+    return {k: sorted(v) for k, v in sorted(out.items())}
+
+
+def mixed_hosts_note(rep: dict) -> list[str]:
+    hosts = rep.get("speed_hosts") or {}
+    if len(hosts) < 2:
+        return []
+    return ["**The speed columns mix hosts** (RTF, latency and VRAM are comparable only within one host): "
+            + "; ".join(f"{h}: {', '.join(v)}" for h, v in hosts.items())
+            + ". Re-time every system, teachers included, on one host into a fresh speed.json (tools/speed_probe.py).",
+            ""]
+
+
 def load_params(path) -> dict | None:
     if path is None:
         return None
@@ -200,6 +230,79 @@ def table(header: list[str], rows: list[list]) -> list[str]:
     return out
 
 
+def _mci(c: dict | None, nd: int = 2) -> str:
+    """ratio [CI] of an offer-table cell ({ratio, ci})."""
+    if not c:
+        return "n/a"
+    return f"{c['ratio']:.{nd}f} [{c['ci'][0]:.{nd}f}, {c['ci'][1]:.{nd}f}]"
+
+
+def _num(x, fmt: str) -> str:
+    return "n/a" if x is None else format(x, fmt)
+
+
+def render_offers(rep: dict) -> list[str]:
+    """The report's lead: what to offer (study_stats.offer_text), then one offer table per family (study_stats.offers):
+    rows = the own teacher (reference) and the sizes, largest first."""
+    off = rep.get("offers")
+    if not off:
+        return []
+    dp = next(iter(off.values()))["delta"]
+    L = ["## What to offer", ""] + [f"- {t}" for t in rep.get("offer_text", [])] + [""] + mixed_hosts_note(rep)
+    head = ["model", "params total / non-emb.", "x smaller than teacher", "M4 CER", "JSUT", "CV8", "Reazon",
+            "Galgame-neutral", "M4 / own teacher [CI]", "vs Parakeet TDT (JSUT+Galgame) [CI]", "batched RTF",
+            "batch-1 p50 / p95 s", "peak VRAM GB", f"call at delta {100 * dp:g} % (M4 / top [CI])", "T/2 readout"]
+    for fam, F in off.items():
+        rows = []
+        for r in F["rows"]:
+            sp = r.get("speed") or {}
+            sets = r.get("sets") or {}
+            name = r["display"] + (" (teacher)" if r["role"] == "teacher" else " (top)" if r["role"] == "top" else "")
+            if not r["available"]:
+                rows.append([name, f"{_num(r['params_total'], ',')} / {_num(r['params_non_embedding'], ',')}"]
+                            + ["no results"] + [""] * (len(head) - 3))
+                continue
+            tdt = r.get("vs_tdt")
+            vt = r.get("vs_top")
+            th = r.get("t_half")
+            rows.append([
+                name, f"{_num(r['params_total'], ',')} / {_num(r['params_non_embedding'], ',')}",
+                _num(r.get("smaller_than_teacher"), ".1f"), pct(r["m4"]),
+                *(pct(sets.get(k)) for k in ss.M4_SETS),
+                _mci(r.get("vs_teacher")), f"{tdt['verdict']} {_mci(tdt)}" if tdt else "n/a",
+                _num(sp.get("rtf"), ".4f"), f"{_num(sp.get('p50_s'), '.3f')} / {_num(sp.get('p95_s'), '.3f')}",
+                _num(sp.get("vram_gb"), ".2f"),
+                "top" if r["role"] == "top" else "" if r["role"] == "teacher" else
+                (f"{vt['call']} {_mci(vt, 3)}" if vt else "n/a"),
+                "" if r["role"] != "size" else
+                (f"{th['label']} (delta ln r {th['delta']:+.3f} [{th['ci'][0]:+.3f}, {th['ci'][1]:+.3f}]; "
+                 f"{th['call_at_T_half']} at T/2)" if th else "n/a")])
+        L += [f"### Offer table: {F['text']}", ""] + table(head, rows) + [""]
+    L += ["vs Parakeet TDT: better / worse = the CI of the JSUT + Galgame-neutral ratio lies below / above 1; within "
+          "= it holds 1. Speed from the A100 speed probe (n/a without --speed).", ""]
+    return L
+
+
+def render_sensitivity(rep: dict) -> list[str]:
+    """The conditional replicate: every call at each sigma_run of the grid, and whether the replicate is needed."""
+    sens = rep.get("sensitivity")
+    if not sens:
+        return []
+    grid = sens["grid"]
+    L = ["## Sensitivity to sigma_run (the conditional replicate)", "", sens["text"], ""]
+    rows = []
+    for f in ("transcribe", "parakeet", "scratch"):
+        rows.append([f + (" (triggers)" if f in sens["trigger_families"] else "")]
+                    + [sens["at"][ss._skey(g)]["families"][f]["sentence"] for g in grid])
+    L += table(["family: delta-primary walk"] + [f"sigma_run {100 * g:g} %" for g in grid], rows) + [""]
+    L += [f"replicate_needed: **{'yes' if sens['replicate_needed'] else 'no'}** (state {sens['state']})."]
+    moved = [d for v in sens["differences"].values() for d in v]
+    if moved:
+        L += ["", "Calls that move across the grid (any delta, the bars, the T/2 readout):", ""]
+        L += [f"- {d}" for d in moved[:40]] + (["- ..."] if len(moved) > 40 else [])
+    return L + [""]
+
+
 def render_md(rep: dict) -> str:
     st = rep["settings"]
     dp = ss._dkey(float(st["delta_primary"]))
@@ -215,6 +318,9 @@ def render_md(rep: dict) -> str:
               ""]
     if rep.get("missing_systems"):
         L += [f"Systems without results: {', '.join(rep['missing_systems'])}.", ""]
+
+    L += render_offers(rep)
+    L += render_sensitivity(rep)
 
     L += [f"## The answer (delta = {100 * float(st['delta_primary']):g} %, pre-registered)", ""]
     for f in ("transcribe", "parakeet", "scratch"):
@@ -330,7 +436,7 @@ def render_md(rep: dict) -> str:
             for p in rep["cross_family"]["equal_size"]]
     L += table(["equal size", "raw r [CI]", "no-style r [CI]"], rows) + [""]
 
-    L += ["## Pareto: CER vs A100 RTF and VRAM", ""]
+    L += ["## Pareto: CER vs A100 RTF and VRAM", ""] + mixed_hosts_note(rep)
     pa = rep["pareto"]
     if pa["available"]:
         rows = [[disp(rep, s), pct(r["jg"]), pct(r["m4"]), "n/a" if r["rtf"] is None else f"{r['rtf']:.4g}",
@@ -388,6 +494,41 @@ def file_sha256(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def load_numbers(paths) -> tuple[dict | None, dict, list[str]]:
+    """({box: numbers file}, {box: the file's sha256}, the files read) from --numbers: files, or dirs whose
+    PREREG_numbers*.json are read. Each file is keyed by its "box" ("all" when it has none, the single-host layout);
+    two files of one box, or a file that is not a JSON object, is an InputError."""
+    if not paths:
+        return None, {}, []
+    files = []
+    for p in map(Path, paths):
+        files += sorted(p.glob("PREREG_numbers*.json")) if p.is_dir() else [p]
+    if not files:
+        raise InputError(f"--numbers {[str(p) for p in paths]}: no numbers file")
+    out, shas = {}, {}
+    for f in files:
+        try:
+            data = read_json(f)
+        except (OSError, ValueError) as e:
+            raise InputError(f"numbers file {f}: {e}") from e
+        if not isinstance(data, dict):
+            raise InputError(f"numbers file {f}: not a JSON object")
+        box = str(data.get("box") or "all")
+        if box in out:
+            raise InputError(f"numbers files: two files of box {box} ({f})")
+        out[box], shas[box] = data, file_sha256(f)
+    return out, shas, [str(f) for f in files]
+
+
+def prereg_rules_sha256(path) -> str | None:
+    """kitsune.prereg.rules_sha256 of --prereg (the canonical bytes every numbers file carries as rules_sha256)."""
+    if not path:
+        return None
+    from kitsune import prereg as kp
+
+    return kp.rules_sha256(path)
+
+
 def build_report(args) -> dict:
     manifest = ss.parse_manifest(read_json(args.manifest))
     tables, ignored = load_tables(args.tables, manifest.sets)
@@ -406,14 +547,19 @@ def build_report(args) -> dict:
         if val is not None:
             settings[key], sources[key] = int(val), "command line (NOT the pre-registered value)"
     summaries, summ_notes = load_summaries(args.run_summaries)
-    rep = ss.analyse(corpus, settings, params=load_params(args.params), speed=load_speed(args.speed),
-                     numbers=read_json(args.numbers) if args.numbers else None, summaries=summaries,
+    numbers, numbers_sha, numbers_files = load_numbers(args.numbers)
+    speed = load_speed(args.speed)
+    rep = ss.analyse(corpus, settings, params=load_params(args.params), speed=speed,
+                     numbers=numbers, summaries=summaries,
                      prereg_baselines=ss.prereg_baselines(prereg), prereg_manifest=ss.prereg_manifest(prereg),
-                     manifest_file_sha256=file_sha256(args.manifest), imitation=not args.no_imitation)
+                     manifest_file_sha256=file_sha256(args.manifest), imitation=not args.no_imitation,
+                     rules_sha256=prereg_rules_sha256(args.prereg), numbers_file_sha256=numbers_sha)
     rep["settings_sources"] = sources
+    rep["speed_hosts"] = speed_hosts(speed)
     rep["inputs"] = dict(tables=str(args.tables), manifest=str(args.manifest),
                          manifest_sha256=file_sha256(args.manifest), prereg=_s(args.prereg),
-                         numbers=_s(args.numbers), speed=_s(args.speed), params=_s(args.params),
+                         numbers=numbers_files, numbers_sha256=numbers_sha, speed=_s(args.speed),
+                         params=_s(args.params),
                          run_summaries=_s(args.run_summaries), summaries_read=summ_notes["read"],
                          summaries_superseded=summ_notes["superseded"], ignored_files=ignored,
                          written_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -429,7 +575,7 @@ def main(argv=None) -> int:
     ap.add_argument("--tables", type=Path, required=True)
     ap.add_argument("--manifest", type=Path, required=True)
     ap.add_argument("--prereg", type=Path)
-    ap.add_argument("--numbers", type=Path)
+    ap.add_argument("--numbers", type=Path, nargs="+", help="the boxes' PREREG_numbers_<box>.json, or a dir of them")
     ap.add_argument("--run-summaries", type=Path)
     ap.add_argument("--speed", type=Path)
     ap.add_argument("--params", type=Path)

@@ -141,13 +141,19 @@ def test_default_spec_and_real_param_count_on_meta():
 
 
 @pytest.mark.parametrize("n_enc,dec,total,non_emb", [(20, (0, 2, 5, 7), 616_963_328, 599_137_536),
-                                                     (10, (0, 7), 320_752_384, 302_926_592)])
+                                                     (8, (0, 2, 5, 7), 301_822_208, 283_996_416)])
 def test_study_pruned_counts_on_meta(n_enc, dec, total, non_emb):
-    """T-0.6B and T-0.3B (STUDY.md 1.1): total and non-embedding (embed + pos_emb out, the head bias in)."""
+    """T-0.6B and T-0.3B (STUDY.md 1.1; T-0.3B = B8x2560 + decoder {0,2,5,7} by the owner's decision of 2026-09-26,
+    about 301.82M): total and non-embedding (embed + pos_emb out, the head bias in)."""
     spec = S.StudentSpec(S.evenly_spaced(n_enc, 48), 2560, list(dec))
     assert S.PRUNED_EXPECTED_PARAMS[(n_enc, 2560, dec)] == total
-    if n_enc == 10:
-        assert spec.enc_layers == [0, 5, 10, 16, 21, 26, 31, 37, 42, 47]
+    assert set(S.PRUNED_EXPECTED_PARAMS) == {(20, 2560, (0, 2, 5, 7)), (8, 2560, (0, 2, 5, 7))}  # no B10 + {0,7}
+    if n_enc == 8:
+        assert spec.enc_layers == [0, 7, 13, 20, 27, 34, 40, 47]
+        assert round(total / 1e6, 2) == 301.82  # the figure STUDY.md quoted for this option of decision 17
+        # the report_model.md closed form: 5,383,424 + L_enc (13,149,440 + 5,122 F) + L_dec 16,796,672 + 2,364,416
+        # + 1024 V + V (tied)
+        assert total == 5_383_424 + 8 * (13_149_440 + 5_122 * 2560) + 4 * 16_796_672 + 2_364_416 + 1025 * 16384
     with torch.device("meta"):
         m = CohereAsrForConditionalGeneration(S.student_config(CohereAsrConfig(), spec))
     assert S.count_fields(m) == dict(params_total=total, params_non_embedding=non_emb, closed_form_params=total)
@@ -611,7 +617,8 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
     assert (ma["family"], ma["init_class"], ma["enc_layers"], ma["ffn"]) == ("aed", "pruned_kept", [0, 2, 3], 48)
     assert ma["params_total"] == ma["closed_form_params"] and ma["expected_params"] is None  # not a study shape
     fcheck = ma["function_check"]
-    assert fcheck["on_gate"] is False and fcheck["function"] in ("kept", "lost") and fcheck["threshold"] == 0.9
+    assert fcheck["on_gate"] is False and fcheck["threshold"] == 0.9 and isinstance(fcheck["over_threshold"], bool)
+    assert fcheck["function"] == "kept" and fcheck["by"] == mod.AED_FUNCTION_RULE  # the owner's decision, not the rule
     assert fcheck["cer_vs_teacher"] == ma["step0"]["greedy"]["all"]["cer_teacher_corpus"]
     assert ma["build"]["seed"] == 1234 and ma["build"]["calibration"] == dict(
         sources=["src_a"], calib_utts=10, bn_utts=6, per_group=4, ids_sha256=None)
@@ -847,12 +854,17 @@ def test_build_identity_gate_and_legacy_meta():
     step0 = dict(n_per_set={s: 20 for s in mod.EVAL_SETS}, seed=1234, greedy={"all": {"cer_teacher_corpus": 0.95}},
                  teacher_forced={"all": {"kl": 4.0}})
     fc = mod.function_check(step0)
-    assert fc == dict(cer_vs_teacher=0.95, kl=4.0, threshold=0.9, function="lost", on_gate=True)
+    # the owner's decision of 2026-09-26: a pruned Transcribe student is function kept even over the 90 % line (T-0.6B
+    # measures 132 %); the 90 % rule classifies the Parakeet students only (03c)
+    assert fc == dict(cer_vs_teacher=0.95, kl=4.0, threshold=0.9, over_threshold=True, function="kept",
+                      by=mod.AED_FUNCTION_RULE, on_gate=True)
+    assert "Parakeet students only" in mod.AED_FUNCTION_RULE and "kept-t03" in mod.AED_FUNCTION_RULE
     assert mod.function_check(dict(step0, seed=7))["on_gate"] is False  # another 60 utterances
     assert mod.function_check(dict(step0, n_per_set={"eval_jsut": 20}))["on_gate"] is False
     no_seed = {k: v for k, v in step0.items() if k != "seed"}  # recorded before step-0 held its seed
     assert mod.function_check(no_seed)["on_gate"] is False
-    assert mod.function_check(dict(step0, greedy={"all": {"cer_teacher_corpus": 0.6}}))["function"] == "kept"
+    under = mod.function_check(dict(step0, greedy={"all": {"cer_teacher_corpus": 0.6}}))
+    assert (under["over_threshold"], under["function"]) == (False, "kept")
 
 
 def test_model_card_describes_the_student():
@@ -861,9 +873,13 @@ def test_model_card_describes_the_student():
     random. The card's wording is what model_card rewrites (a changed card would only warn)."""
     from dataclasses import asdict
 
-    card = S.MODEL_CARD.read_bytes().decode("utf-8")
+    card = S.MODEL_CARD.read_bytes().decode("utf-8").replace("\r\n", "\n")  # LF, whatever the checkout's endings
     assert S._CARD_CHANGES.search(card)
     assert S.model_card({}) == card and S.model_card({"format": 1, "bn": {"n_utts": 1000}}) == card
+    study = S.study_card_data(card)  # a study student's card: the first run's plus the study's training data
+    assert study is not None and "laion/Emolia" not in card and "reazonspeech.large" not in card
+    assert "- japanese-asr/whisper_transcriptions.reazonspeech.large\n- laion/Emolia\n---\n" in study
+    assert study.count("Emilia, Japanese non-YODAS part") == 1 and study.count("CDLA-Sharing-1.0") == 1
 
     def split(text):  # (the card outside the notice's what-was-done part, that part with whitespace normalised)
         head, rest = text.split("LICENSE-2.0). ", 1)
@@ -872,14 +888,14 @@ def test_model_card_describes_the_student():
 
     def notice(meta):
         outside, part = split(S.model_card(meta))
-        assert outside == split(card)[0]  # everything else is the card's, byte for byte
+        assert outside == split(study)[0]  # everything else is the study card's, byte for byte
         return part
 
     pruned = dict(init_class="pruned_kept", enc_layers=S.evenly_spaced(20, 48), ffn=2560, dec_layers=[0, 2, 5, 7],
                   build={"tie_head": True})
     assert notice(dict(pruned, bn="recal")) == split(card)[1]  # the first run's student: the card's own words
-    t03 = notice(dict(pruned, bn="teacher", enc_layers=S.evenly_spaced(10, 48), dec_layers=[0, 7]))
-    assert t03.startswith("It was pruned (encoder: 10 of 48 layers, FFN 5120 -> 2560; decoder: 2 of 8 layers), its "
+    t03 = notice(dict(pruned, bn="teacher", enc_layers=S.evenly_spaced(8, 48)))
+    assert t03.startswith("It was pruned (encoder: 8 of 48 layers, FFN 5120 -> 2560; decoder: 4 of 8 layers), its "
                           "output head tied to the token embedding, then trained by distillation from the teacher's "
                           "outputs. Its BatchNorm statistics are the teacher's.") and "recalibrated" not in t03
     untied = notice(dict(pruned, bn="recal", ffn=5120, build={"tie_head": False}))
@@ -889,6 +905,25 @@ def test_model_card_describes_the_student():
     assert scratch.startswith("It has that model's architecture at another size (encoder: 12 layers, width 512, FFN "
                               "2048; decoder: 4 layers, width 512, FFN 2048;") and "randomly initialised" in scratch
     assert "pruned" not in scratch and "FFN neurons kept" not in scratch
+
+
+STUDY_STUDENTS = Path(os.environ.get("KITSUNE_STUDY_STUDENTS", "D:/kitsune-students/study"))
+
+
+@pytest.mark.parametrize("name", ["t06", "t03", "bridge", "t01", "t01-s1235", "t005"])
+def test_model_card_is_the_uploaded_readme(name):
+    """model_card renders exactly the README.md uploaded with each Transcribe student init of the size study
+    (Multy123/kitsune-data students/study/<name>/, local copies under D:/kitsune-students/study; skipped without
+    them), from its student_meta.json alone; a checkpoint trained from it (its meta plus the trainer's `trained`
+    block, 04_distill save_weights) gets the same card."""
+    d = STUDY_STUDENTS / name
+    if not (d / "README.md").is_file() or not (d / "student_meta.json").is_file():
+        pytest.skip(f"no uploaded student {d}")
+    meta = json.loads((d / "student_meta.json").read_text(encoding="utf-8"))
+    want = (d / "README.md").read_bytes().decode("utf-8")
+    assert S.model_card(meta) == want
+    trained = dict(meta, trained=dict(run_id=f"study-{name}", step=9370, reason="final", lr_phase="cooldown"))
+    assert S.model_card(trained) == want
 
 
 def test_importance_state_roundtrip(tmp_path):

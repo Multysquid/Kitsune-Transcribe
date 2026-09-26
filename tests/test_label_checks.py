@@ -419,6 +419,66 @@ def test_k3_fails_when_a_stored_ctc_hyp_is_not_the_npz_path(root):
     assert st == "fail" and res["mismatch"] == 1 and res["examples"][0]["id"] == lc.jsonl_rows(jsonl)[0]["id"]
 
 
+def _tie_row(root):
+    """(npz, jsonl, row, dense position, arrays) of the first row with a dense frame whose top-2 swap changes the text."""
+    npz = root.labels / "parakeet_out" / "galgame" / "train-00001.npz"
+    with np.load(npz) as z:
+        arrays = {key: z[key] for key in z.files}
+    do = arrays["dense_offsets"]
+    for i in range(len(arrays["n_frames"])):
+        for d in range(int(do[i]), int(do[i + 1])):
+            c0, c1 = (int(x) for x in arrays["ctc_topk_idx"][d, :2])
+            if c0 != pt.BLANK and c1 != pt.BLANK and fake_decode([[c0]]) != fake_decode([[c1]]):
+                return npz, npz.with_suffix(".jsonl"), i, d, arrays
+    raise AssertionError("fixture has no usable dense frame")
+
+
+def _swapped_hyp(arrays, i, d):
+    do = arrays["dense_offsets"]
+    sl = slice(int(do[i]), int(do[i + 1]))
+    idx = arrays["ctc_topk_idx"][sl].copy()
+    idx[d - int(do[i]), 0] = idx[d - int(do[i]), 1]
+    return fake_decode([pt.ctc_greedy(pt.ctc_col0(int(arrays["n_frames"][i]), arrays["ctc_dense_frame"][sl], idx))])[0]
+
+
+def test_k3_counts_an_exact_fp16_top1_top2_tie_as_a_tie_not_a_failure(root):
+    """CONTRACT section 8: the stored ctc_hyp took the top-2 class on a frame whose stored fp16 top-1 and top-2
+    log-probs are exactly equal (02p's fp32 argmax decided). K3 passes, counts and lists the tie with its frame."""
+    npz, jsonl, i, d, arrays = _tie_row(root)
+    lp = arrays["ctc_topk_lp"].copy()
+    lp[d, 1] = lp[d, 0]
+    rewrite_npz(npz, ctc_topk_lp=lp)
+    hyp = _swapped_hyp(arrays, i, d)
+    rewrite_jsonl(jsonl, lambda rows: [dict(r, ctc_hyp=hyp) if j == i else r for j, r in enumerate(rows)])
+    st, res = status(make_ctx(root), "K3")
+    rid = lc.jsonl_rows(jsonl)[i]["id"]
+    assert st == "pass" and res["mismatch"] == 0 and res["n_ties"] == 1, res["reason"]
+    tie = res["ties"][0]
+    assert tie["id"] == rid and tie["shard"] == "galgame/train-00001" and tie["frames_swapped"] == 1
+    assert tie["frame"] == int(arrays["ctc_dense_frame"][d]) and tie["top2"] == int(arrays["ctc_topk_idx"][d, 1])
+    assert tie["lp"] == float(lp[d, 0]) and "1 exact fp16 tie" in res["reason"]
+    assert res["per_group"]["galgame"]["ties"] == 1 and res["identical_frac"] < 1
+
+
+def test_k3_fails_the_same_swap_when_the_log_probs_are_not_exactly_equal(root):
+    """The top-2 swap alone is no excuse: without an exact fp16 tie (or when no tied swap gives the stored text) the
+    row is a mismatch and K3 fails."""
+    npz, jsonl, i, d, arrays = _tie_row(root)
+    lp = arrays["ctc_topk_lp"].copy()
+    lp[d, 1] = np.float16(lp[d, 0]) - np.float16(0.001)  # one fp16 step apart, not a tie
+    assert lp[d, 1] != lp[d, 0]
+    rewrite_npz(npz, ctc_topk_lp=lp)
+    hyp = _swapped_hyp(arrays, i, d)
+    rewrite_jsonl(jsonl, lambda rows: [dict(r, ctc_hyp=hyp) if j == i else r for j, r in enumerate(rows)])
+    st, res = status(make_ctx(root), "K3")
+    assert st == "fail" and res["mismatch"] == 1 and res["n_ties"] == 0
+    lp[d, 1] = lp[d, 0]  # a tie on the frame, but the stored text is not the swapped path
+    rewrite_npz(npz, ctc_topk_lp=lp)
+    rewrite_jsonl(jsonl, lambda rows: [dict(r, ctc_hyp=hyp + "ん") if j == i else r for j, r in enumerate(rows)])
+    st, res = status(make_ctx(root), "K3")
+    assert st == "fail" and res["mismatch"] == 1 and res["n_ties"] == 0
+
+
 def test_k4_fails_when_n_frames_is_not_the_extractor_length(root):
     """A shard whose every utterance has one frame too many is internally consistent (K2 passes) but not what the
     extractor gives its audio."""
