@@ -70,9 +70,58 @@ does not fit from shared system memory, several times slower, instead of failing
 fraction of the card, on any OS. An out-of-memory error stops with a pointer to --batch-s (a smaller one needs a new
 --out; its batches are no longer the trainer's).
 
+The size study (study/STUDY.md 4.1-4.3; CONTRACT.md 1, 5):
+  families  the config's `family` (default "aed"; 04_distill reads it too) picks the student's path. aed: everything
+            above, unchanged (the first run's numbers reproduce). ctc: a Parakeet CTC student (a ParakeetForCTC dir,
+            kitsune.ctc_student.load_ctc_student) with its own features (ctc_features: Parakeet's 80-mel LogMel, no
+            dither) through kitsune.evaluate.ctc_eval: one encoder pass per batch gives the greedy CTC text (argmax,
+            collapse, drop blanks; decode_ids) and, from the stored Parakeet frame targets under the config's
+            parakeet_root (parakeet_out/<set>/eval-*.npz), the teacher-forced frame metrics (KL on dense and blank
+            frames, CTC per target token, argmax agreement, argmax-blank share); the probe likewise on its train
+            shards. The CTC student's teacher is Parakeet's stored CTC path (parakeet_out ctc_hyp): the greedy tables'
+            teacher_hyp, the baselines (kitsune.evaluate.parakeet_baselines, checked against PARAKEET_CTC_CER_PREREG
+            from study/PREREG.json once it is filled, not while it is pending) and the verdict's ratios
+            (verdict(family="ctc")). The student is scored against the eval store's reference, which must equal
+            parakeet_out's. A student frame count that differs from its stored n_frames leaves that row out of the
+            teacher-forced metrics and is counted (tf.n_frame_mismatch); the greedy text does not depend on it
+  manifest  with --manifest (default: study_manifest.json next to the config's selection, when it exists; "none":
+            none) the eval is checked against the study's frozen eval manifest (kitsune.study_stats.parse_manifest:
+            every set's ids hash to its sha256; against study/PREREG.json's manifest block once filled): each evaluated
+            set's rows in the eval store must be exactly the manifest's ids, else the eval refuses before any model is
+            loaded. Afterwards it writes
+              tables/<system>/<set>.parquet  the per-utterance table of CONTRACT.md 5 (kitsune.evaluate.
+                               utterance_table: id, set, ref, hyp, edits, ref_len, hyp_len, sub, del, ins, edits_style,
+                               edits_nostyle, truncated), in manifest order, one file per set: --tables DIR is what
+                               tools/study_report.py --tables reads. --system names it (default the config's
+                               run_name). A set whose decoded rows are not all of its manifest ids gets no table and
+                               the run exits non-zero
+              study.json       per stratum (the eval sets, Galgame as its views galgame_neutral / galgame_all /
+                               galgame_label_box) the system's corpus CER (raw and no-style) and its own teacher's on
+                               the same rows, M4 and the gate-pooled CER, the manifest's hashes and the tables written
+  --anchor  the first run's 0.6B (its checkpoint dir, e.g. step_9774) re-scored on the manifest (decision 29) as system
+            anchor-b20: an aed eval with the study config's eval settings, no history, no verdict, no probe
+  --teachers  no model: the teachers' tables from their stored hypotheses on the manifest rows - cohere (teacher_out
+            hyp), parakeet-ctc (parakeet_out ctc_hyp), parakeet-tdt (parakeet_out hyp) - after checking that both roots
+            hold every manifest row with the same reference, that the stored per-utterance cer / ctc_cer are this
+            scorer's (counted), and the baselines (Cohere's D32a numbers on the full gate sets as the trainer checks
+            them; every teacher and stratum against PREREG.json's baselines once filled, 0.05 pp): a drift refuses,
+            unless eval.check_baselines is false. Writes tables/<teacher>/<set>.parquet and teachers.json
+  --from-evals DIR  no model: the tables of a system from an eval dir that already holds its greedy_<set>.parquet
+            (the trainer's runs/<run_id>/evals/step_<N>/, or a 05 --out), checked against the manifest; with --system
+Wave-2 config keys that another package adds to 04_distill.DEFAULTS (family, loss.w_ctc, pull_parakeet,
+selection_recipe.study) are accepted here before that package lands: they are set aside for the merge (LATER_KEYS).
+
 Usage:
   python scripts/05_evaluate.py --root D:/Shizu-ko-distill --config configs/viability.json \
       --ckpt runs/<run_id>/checkpoints/step_<N> --out <dir> [--probe] [--sets eval_jsut eval_cv8] [--vram-frac 0.95]
+  python scripts/05_evaluate.py --config configs/study/study-p01.json --ckpt <step dir> --out <dir> --probe \
+      --tables evals/study                                       # a CTC student on the manifest, its tables
+  python scripts/05_evaluate.py --config configs/study/study-t06.json --anchor \
+      --ckpt runs/viability-b20x2560-20260925T071746Z/checkpoints/step_9774 --out evals/anchor --tables evals/study
+  python scripts/05_evaluate.py --config configs/study/study-t06.json --teachers --out evals/teachers \
+      --tables evals/study
+  python scripts/05_evaluate.py --from-evals runs/<run_id>/evals/step_<N> --system study-t03 \
+      --config configs/study/study-t03.json --out evals/study-t03 --tables evals/study
 """
 import argparse
 import hashlib
@@ -85,6 +134,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -105,8 +155,16 @@ from kitsune.runlog import _finite, _replace  # noqa: E402
 from kitsune.store import fsync_path  # noqa: E402
 
 DEFAULT_CONFIG = "configs/viability.json"
-# config keys holding paths, resolved against --root when relative (cache_dir is replaced by --cache-dir)
-PATH_KEYS = ("student", "data_root", "teacher_root", "second_root", "selection", "runs_root")
+# config keys holding paths, resolved against --root when relative (cache_dir is replaced by --cache-dir); a null one
+# (parakeet_root outside the study) stays null
+PATH_KEYS = ("student", "data_root", "teacher_root", "second_root", "selection", "runs_root", "parakeet_root")
+# the size study's config keys (wave 2) that 04_distill.DEFAULTS gains in another package (family and loss.w_ctc: the
+# CTC trainer; pull_parakeet and selection_recipe.study: the box path), with their defaults. Until DEFAULTS has one,
+# load_cfg sets it aside so the trainer's merge (unknown keys are an error) accepts a study config
+LATER_KEYS = {"family": "aed", "loss.w_ctc": 0.8, "pull_parakeet": False, "selection_recipe.study": None}
+ANCHOR = "anchor-b20"  # the first run's 0.6B re-scored on the manifest (decision 29; kitsune.study_stats.ANCHOR)
+MANIFEST_FILE = "study_manifest.json"  # next to the study selection (kitsune.prereg.MANIFEST_FILE)
+PREREG_JSON = ROOT / "study" / "PREREG.json"
 NVSMI_EVERY_S = 5.0  # nvidia-smi is a process start per read: at most one read per this many seconds
 BLIND_READS = 30  # this many failed temperature reads in a row stop the eval, paused or not
 PARTS, WORK = ".parts", ".work"
@@ -375,30 +433,86 @@ def make_guard(device: torch.device, args, log) -> ThermalGuard | None:
 # ------------------------------------------------------------------------------------------------------ config
 
 
-def resolve_config(D, args, out: Path, ckpt: Path) -> tuple[dict, Path, str]:
-    """The trainer's config (DEFAULTS merged with the file, --set on top, validated as the trainer does), relative
-    paths resolved against --root, the stores under --cache-dir and the checkpoint as the student. Returns (cfg, the
-    config file, the config's own student path)."""
+def _has_key(d: dict, dotted: str) -> bool:
+    for part in dotted.split("."):
+        if not isinstance(d, dict) or part not in d:
+            return False
+        d = d[part]
+    return True
+
+
+def set_aside_later_keys(D, raw: dict) -> dict:
+    """LATER_KEYS that 04_distill.DEFAULTS does not know yet, popped from `raw` (a copy of the file's config) so the
+    trainer's merge accepts it: {dotted key: the file's value}. A key DEFAULTS knows stays for the merge."""
+    later = {}
+    for key in LATER_KEYS:
+        if _has_key(D.DEFAULTS, key) or not _has_key(raw, key):
+            continue
+        *path, last = key.split(".")
+        node = raw
+        for part in path:
+            node[part] = dict(node[part])  # never modify the caller's nested dicts
+            node = node[part]
+        later[key] = node.pop(last)
+    return later
+
+
+def family_of(cfg: dict) -> str:
+    return str(cfg.get("family") or "aed")
+
+
+def w_ctc(cfg: dict) -> float:
+    return float(cfg["loss"].get("w_ctc", LATER_KEYS["loss.w_ctc"]))
+
+
+def load_cfg(D, args) -> tuple[dict, Path]:
+    """The trainer's config (DEFAULTS merged with the file, --set on top, validated as the trainer does, the LATER_KEYS
+    set aside for the merge and put back), relative paths resolved against --root. Returns (cfg, the config file)."""
     p = Path(args.config)
     if not p.is_absolute():  # as 04_distill.load_config: the working directory first, then this repo
         p = Path.cwd() / p if (Path.cwd() / p).exists() else ROOT / p
     raw = _read_json(p)
     if isinstance(raw.get("config"), dict) and "eval_sets" in raw["config"]:
         raw = raw["config"]  # a run's config.json: {run_id, argv, config, student_meta, ...}
+    raw = dict(raw)
+    later = set_aside_later_keys(D, raw)
     cfg = D._merge(D.DEFAULTS, raw)
     for s in args.set:
         D.apply_set(cfg, s)
     if args.batch_s is not None:
         cfg["eval"]["batch_s"] = float(args.batch_s)
     D.validate(cfg)
+    cfg.setdefault("family", later.get("family", LATER_KEYS["family"]))
+    cfg["loss"].setdefault("w_ctc", later.get("loss.w_ctc", LATER_KEYS["loss.w_ctc"]))
+    if family_of(cfg) not in ("aed", "ctc"):
+        raise SystemExit(f"family must be 'aed' or 'ctc', got {cfg['family']!r}")
     root = Path(args.root).resolve()
     for k in PATH_KEYS:
-        if not Path(cfg[k]).is_absolute():
+        if cfg.get(k) is not None and not Path(cfg[k]).is_absolute():
             cfg[k] = str(root / cfg[k])
+    return cfg, p
+
+
+def resolve_config(D, args, out: Path, ckpt: Path) -> tuple[dict, Path, str]:
+    """load_cfg, the stores under --cache-dir and the checkpoint as the student. Returns (cfg, the config file, the
+    config's own student path)."""
+    cfg, p = load_cfg(D, args)
     student = cfg["student"]
     cfg["cache_dir"] = str(Path(args.cache_dir).resolve() if args.cache_dir else out / "cache")
     cfg["student"] = str(ckpt)  # setup_model / setup_processing load cfg["student"]
     return cfg, p, student
+
+
+def ckpt_family(ckpt: Path) -> str | None:
+    """The family of a weights dir from its HF config.json (ParakeetForCTC: ctc; a Cohere ASR model: aed), None if it
+    says neither."""
+    c = _load_json(ckpt / "config.json") or {}
+    arch = " ".join(c.get("architectures") or []) + " " + str(c.get("model_type") or "")
+    if "ParakeetForCTC" in arch or "parakeet_ctc" in arch:
+        return "ctc"
+    if "Cohere" in arch or "cohere" in arch:
+        return "aed"
+    return None
 
 
 def weights_hash(ckpt: Path) -> str:
@@ -503,10 +617,21 @@ class Ctx:
     passes: list = field(default_factory=list)
     probe_empty: bool = False  # --probe found no probe rows: the trainer has no probe numbers either
     reference: dict | None = None  # eval.reference's per-set CER (04_distill.reference_model), for the verdict
+    family: str = "aed"
+    teacher_rows: dict | None = None  # ctc: id -> Parakeet's stored CTC row (the teacher of the greedy tables)
+    targets: dict | None = None  # ctc: id -> the stored Parakeet frame targets (kitsune.ctc_targets.FrameTargets)
+    manifest: dict | None = None  # load_manifest's record (the study manifest the store was checked against), or None
+    system: str | None = None  # the tables' system name (--system; the config's run_name; anchor-b20)
+    verdict_off: str | None = None  # why no verdict is written (--anchor), or None
 
     @property
     def bs(self) -> float:
         return float(self.cfg["eval"]["batch_s"])
+
+    def tf_summarise(self, raw: pd.DataFrame, **extra) -> tuple[dict, pd.DataFrame]:
+        """The family's teacher-forced (summary, per_utt) of raw rows (kitsune.evaluate summarise_tf / _ctc_tf)."""
+        fn = self.ev.summarise_ctc_tf if self.family == "ctc" else self.ev.summarise_tf
+        return fn(raw, **extra)
 
 
 def set_files(out: Path, s: str) -> list[Path]:
@@ -666,12 +791,21 @@ def run_pass(ctx: Ctx, sets: list[str]):
         set_audio: dict[str, float] = {}
         for i in members:
             set_audio[store.utts[i].source] = set_audio.get(store.utts[i].source, 0.0) + float(dur[i])
+        ctc_extra = {}
         try:
             t0 = time.time()
-            raw, dropped_tf = ev.teacher_forced_records(R.model, store, ctx.feat, R.device, ctx.bs, ids=ids,
-                                                        amp=R.amp)
-            t1 = time.time()
-            _, gdf = ev.greedy_eval(R.model, store, ids, ctx.feat, R.device, ctx.bs, tokenizer=R.tokenizer, amp=R.amp)
+            if ctx.family == "ctc":  # one encoder pass gives both: the tf part rides on the decode's log-probs
+                res = ev.ctc_eval(R.model, store, ids, ctx.feat, R.device, ctx.bs, tokenizer=R.tokenizer,
+                                  teacher_rows=ctx.teacher_rows, targets=ctx.targets, amp=R.amp)
+                raw, gdf, dropped_tf = res["tf"], res["greedy"], res["dropped"]
+                ctc_extra = dict(frame_mismatch=res["frame_mismatch"], no_targets=res["no_targets"])
+                t1 = t0
+            else:
+                raw, dropped_tf = ev.teacher_forced_records(R.model, store, ctx.feat, R.device, ctx.bs, ids=ids,
+                                                            amp=R.amp)
+                t1 = time.time()
+                _, gdf = ev.greedy_eval(R.model, store, ids, ctx.feat, R.device, ctx.bs, tokenizer=R.tokenizer,
+                                        amp=R.amp)
             t2 = time.time()
         except torch.OutOfMemoryError as e:
             _oom(ctx, e)
@@ -686,7 +820,7 @@ def run_pass(ctx: Ctx, sets: list[str]):
         _write_json(meta_p, dict(k=k, n=len(ids), n_tf=len(raw), n_greedy=len(gdf), audio_s=audio,
                                  set_audio=set_audio, dropped_tf=dropped_tf,
                                  dropped_greedy=dropped_g, tf_wall_s=t1 - t0, greedy_wall_s=t2 - t1,
-                                 temp_max_c=ctx.guard.max_seen if ctx.guard else None, time_utc=_now()))
+                                 temp_max_c=ctx.guard.max_seen if ctx.guard else None, time_utc=_now(), **ctc_extra))
         audio_now += audio
         el = time.time() - t_start
         eta = (left_s - audio_now) * el / audio_now if audio_now else None
@@ -725,13 +859,18 @@ def finish_pass(ctx: Ctx, sets: list[str], n_chunks: int, work: Path):
 
         d_tf = [i for m in metas for i in m["dropped_tf"] if src.get(i) == s]
         d_gr = [i for m in metas for i in m["dropped_greedy"] if src.get(i) == s]
+        ctc_extra = {}
+        if ctx.family == "ctc":  # the rows the teacher-forced metrics could not align (never in tf_<set>)
+            ctc_extra = dict(frame_mismatch=[r for m in metas for r in m.get("frame_mismatch") or []
+                                             if src.get(r["id"]) == s],
+                             no_targets=[i for m in metas for i in m.get("no_targets") or [] if src.get(i) == s])
         _table(raw_s, out / PARTS / f"{s}.tf_raw.parquet")
-        _table(ev.summarise_tf(raw_s)[1], out / f"tf_{s}.parquet")
+        _table(ctx.tf_summarise(raw_s)[1], out / f"tf_{s}.parquet")
         _table(g_s, out / f"greedy_{s}.parquet")
         _write_json(out / PARTS / f"{s}.json", dict(
             set=s, n_tf=len(raw_s), n_greedy=len(g_s), dropped_tf=d_tf, dropped_greedy=d_gr,
             tf_wall_s=share("tf_wall_s"), greedy_wall_s=share("greedy_wall_s"), pass_sets=sets,
-            batch_s=ctx.bs, chunks=n_chunks, time_utc=_now()))
+            batch_s=ctx.bs, chunks=n_chunks, time_utc=_now(), **ctc_extra))
         ctx.log.event("set_done", set=s, utts=len(g_s), undecodable=len(d_gr))
     shutil.rmtree(work, ignore_errors=True)
     _rmdir_if_empty(out / WORK)
@@ -776,11 +915,15 @@ def run_probe(ctx: Ctx):
     ctx.log.event("probe", utts=len(probe_ids), audio_h=round(st.hours, 3), greedy=len(pg_ids),
                   build_s=round(time.time() - t0, 1))
     try:
-        probe_sum, probe_df = ev.teacher_forced_eval(R.model, st, ctx.feat, R.device, ctx.bs, ids=probe_ids, amp=R.amp)
         pg_sum = pg_df = None
-        if pg_ids:
-            pg_sum, pg_df = ev.greedy_eval(R.model, st, pg_ids, ctx.feat, R.device, ctx.bs, tokenizer=R.tokenizer,
-                                           amp=R.amp)
+        if ctx.family == "ctc":
+            probe_sum, probe_df, pg_sum, pg_df = ctc_probe(ctx, st, probe_ids, pg_ids)
+        else:
+            probe_sum, probe_df = ev.teacher_forced_eval(R.model, st, ctx.feat, R.device, ctx.bs, ids=probe_ids,
+                                                         amp=R.amp)
+            if pg_ids:
+                pg_sum, pg_df = ev.greedy_eval(R.model, st, pg_ids, ctx.feat, R.device, ctx.bs, tokenizer=R.tokenizer,
+                                               amp=R.amp)
     except torch.OutOfMemoryError as e:
         _oom(ctx, e)
     ctx.D.assert_bn_frozen(R.model)
@@ -793,6 +936,315 @@ def run_probe(ctx: Ctx):
                                                  n_probe_greedy=len(pg_ids), time_utc=_now()))
     ctx.log.event("probe_done", utts=len(probe_df), greedy=len(pg_df) if pg_df is not None else 0,
                   wall_s=round(time.time() - t0, 1))
+
+
+# --------------------------------------------------------------------------------------------------- CTC family
+
+
+def parakeet_root(cfg: dict) -> Path:
+    if not cfg.get("parakeet_root"):
+        raise SystemExit("family 'ctc' needs parakeet_root: the Parakeet teacher's stored text and frame targets "
+                         "(parakeet_out/<source>/<stem>.{npz,jsonl})")
+    return Path(cfg["parakeet_root"])
+
+
+def parakeet_files(cfg: dict, store) -> list[Path]:
+    """The parakeet_out npz files holding the rows of `store`: each row's selection teacher_file (<source>/<stem>;
+    parakeet_out mirrors teacher_out's stems, the label box ran both passes over the same shards)."""
+    sel = pd.read_parquet(cfg["selection"], columns=["id", "teacher_file"])
+    want = {u.id for u in store.utts}
+    return [parakeet_root(cfg) / f"{f}.npz" for f in sorted(set(sel["teacher_file"][sel["id"].isin(want)]))]
+
+
+def parakeet_fingerprint(files: list[Path]) -> str:
+    """Identity of the Parakeet data a CTC eval read (for --out's identity): each npz's name and size, each jsonl's
+    bytes."""
+    h = hashlib.sha256()
+    for p in files:
+        h.update(f"{p.parent.name}/{p.name}:{p.stat().st_size}".encode())
+        j = p.with_suffix(".jsonl")
+        h.update(hashlib.sha256(j.read_bytes()).digest() if j.is_file() else b"-")
+    return h.hexdigest()[:16]
+
+
+def parakeet_data(cfg: dict, store, log, what: str = "eval") -> tuple[dict, dict, list[Path]]:
+    """A CTC eval's teacher over `store`: (teacher_rows, targets, files). teacher_rows: Parakeet's stored CTC text of
+    every row (kitsune.evaluate.ctc_teacher_rows) with the store's reference, which must equal parakeet_out's under
+    normalize_ja; targets: id -> its stored frame targets (kitsune.ctc_targets.load_ctc_targets). A row missing from
+    parakeet_out or with another reference refuses the eval: the study manifest holds only rows present in both
+    roots, and every system must be scored on the same text."""
+    from kitsune import evaluate as ev
+    from kitsune.ctc_targets import load_ctc_targets
+    from kitsune.text import normalize_ja
+
+    files = parakeet_files(cfg, store)
+    absent = [str(p) for p in files if not (p.is_file() and p.with_suffix(".jsonl").is_file())]
+    if absent:
+        raise SystemExit(f"REFUSED: parakeet_out lacks {len(absent)} npz/jsonl file(s) of the {what} rows, e.g. "
+                         f"{absent[:2]}")
+    want = {u.id for u in store.utts}
+    rows, targets = {}, {}
+    for p in files:
+        with open(p.with_suffix(".jsonl"), encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    r = json.loads(line)
+                    if r["id"] in want:
+                        rows[r["id"]] = r
+        targets.update({i: t for i, t in load_ctc_targets(p).items() if i in want})
+    if lost := sorted(want - set(rows)):
+        raise SystemExit(f"REFUSED: {len(lost)} {what} row(s) have no Parakeet row in parakeet_out, e.g. {lost[:3]}")
+    refs = {u.id: r for u, r in zip(store.utts, store.frame()["ref"].tolist())}
+    if differ := sorted(i for i in rows if normalize_ja(refs.get(i) or "") != normalize_ja(rows[i].get("ref") or "")):
+        raise SystemExit(f"REFUSED: {len(differ)} {what} row(s) have another reference in parakeet_out than in "
+                         f"teacher_out, e.g. {differ[:3]}: the systems would not be scored on the same text")
+    log.event("parakeet", what=what, files=len(files), rows=len(rows), targets=len(targets),
+              no_targets=len(want - set(targets)))
+    return ev.ctc_teacher_rows(rows, refs=refs), targets, files
+
+
+def setup_ctc(R, ckpt: Path, fallback: str | None, log):
+    """family ctc: the student in fp32 with sdpa attention, in eval mode (its BatchNorm on the running stats: the
+    evaluator never trains), its features (Parakeet's LogMel, no dither: kitsune.ctc_student.ctc_features) and its
+    tokenizer, from the checkpoint dir - or, without processor files there, from the config's own student dir."""
+    from transformers import AutoProcessor
+
+    from kitsune import ctc_student as CS
+
+    R.model = CS.load_ctc_student(ckpt, R.device, dtype=torch.float32)
+    R.student_meta = CS.load_meta(ckpt)
+    proc = next((Path(d) for d in (ckpt, fallback) if d and (Path(d) / "processor_config.json").is_file()), None)
+    if proc is None:
+        raise SystemExit(f"{ckpt}: no processor_config.json there or in the config's student dir: the CTC features and "
+                         "tokenizer come from it (kitsune.ctc_student.save_ctc_student writes it)")
+    R.processor = AutoProcessor.from_pretrained(str(proc), local_files_only=True)
+    R.tokenizer = R.processor.tokenizer
+    R.feat_eval = CS.ctc_features(proc, R.device).logmel
+    counts = CS.param_counts(R.model)
+    n_bn = sum(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in R.model.modules())
+    log.event("ctc_model", ckpt=str(ckpt), processor=str(proc), params_total=counts["total"],
+              encoder_layers=counts["encoder_layers"], bn=n_bn)
+
+
+def ctc_probe(ctx: Ctx, st, probe_ids: list[str], pg_ids: list[str]):
+    """run_probe for a CTC student: one ctc_eval pass over the probe with its stored frame targets (its train shards'
+    parakeet_out) gives the teacher-forced probe (summarise_ctc_tf) and the greedy rows of the probe_greedy subset."""
+    ev, R = ctx.ev, ctx.R
+    rows, targets, _ = parakeet_data(ctx.cfg, st, ctx.log, "probe")
+    res = ev.ctc_eval(R.model, st, probe_ids, ctx.feat, R.device, ctx.bs, tokenizer=R.tokenizer, teacher_rows=rows,
+                      targets=targets, amp=R.amp)
+    d = res["dropped"]
+    probe_sum, probe_df = ev.summarise_ctc_tf(res["tf"], n_bad_audio=len(d), bad_audio=d[:50],
+                                              bad_audio_per_set=ev._bad_audio_per_set(st, d), wall_s=res["wall_s"],
+                                              n_frame_mismatch=len(res["frame_mismatch"]),
+                                              frame_mismatch=res["frame_mismatch"][:50])
+    pg_sum = pg_df = None
+    if pg_ids:
+        g = res["greedy"]
+        pg_df = g[g["id"].isin(set(pg_ids))].reset_index(drop=True)
+        audio = float(pg_df["duration"].sum()) if len(pg_df) else 0.0
+        pg_sum = ev.summarise_greedy(pg_df, n_bad_audio=0, bad_audio=[], bad_audio_per_set={}, wall_s=res["wall_s"],
+                                     rtf=res["wall_s"] / audio if audio else float("nan"))
+    return probe_sum, probe_df, pg_sum, pg_df
+
+
+# ------------------------------------------------------------------------------------------------ the manifest
+
+
+def manifest_path(args, cfg: dict | None) -> Path | None:
+    """--manifest, else study_manifest.json next to the config's selection when it exists (the study's), else None;
+    --manifest none: no manifest (an eval of a subset of a study config's sets, never tabled)."""
+    if args.manifest and args.manifest.lower() == "none":
+        return None
+    if args.manifest:
+        return Path(args.manifest).resolve()
+    if cfg is not None and cfg.get("selection"):
+        p = Path(cfg["selection"]).parent / MANIFEST_FILE
+        if p.is_file():
+            return p
+    return None
+
+
+def load_manifest(path: Path, prereg_path, log) -> dict:
+    """The study manifest, verified (anything else refuses, SystemExit): its sets hash to their recorded sha256 and the
+    Galgame views lie inside the galgame set (kitsune.study_stats.parse_manifest), and it is the manifest
+    study/PREREG.json froze once that block is filled (study_stats.manifest_check: every set's and view's ids hash and
+    the file's own sha256; a pending block is not compared, and the record says so). Returns {manifest, path, sha256,
+    prereg_check}."""
+    from kitsune import study_stats as ss
+
+    try:
+        man = ss.parse_manifest(_read_json(path))
+    except (OSError, ValueError) as e:  # ManifestError is a ValueError, and so is unreadable JSON
+        raise SystemExit(f"REFUSED: manifest {path}: {e}") from e
+    sha = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    prereg = _load_json(Path(prereg_path)) if prereg_path and Path(prereg_path).is_file() else None
+    chk = ss.manifest_check(man, ss.prereg_manifest(prereg), sha)
+    if chk["status"] == "fail":
+        raise SystemExit(f"REFUSED: {chk['detail']}")
+    log.event("manifest", path=str(path), sha256=sha, sets={s: len(i) for s, i in man.sets.items()},
+              views={v: len(i) for v, i in man.views.items()}, prereg=chk["status"], detail=chk["detail"])
+    return dict(manifest=man, path=str(path), sha256=sha, prereg_check=chk)
+
+
+def _id_problems(name: str, have: list[str], want: list[str]) -> str | None:
+    """None when `have` is exactly the ids `want` (in any order, each once), else what differs."""
+    dup = sorted(i for i, k in Counter(have).items() if k > 1)
+    miss, extra = sorted(set(want) - set(have)), sorted(set(have) - set(want))
+    if not (dup or miss or extra):
+        return None
+    return (f"{name}: {len(miss)} manifest ids missing (e.g. {miss[:3]}), {len(extra)} not in the manifest (e.g. "
+            f"{extra[:3]}), {len(dup)} twice (e.g. {dup[:3]})")
+
+
+def check_store_against_manifest(man, store, sets: list[str], cfg: dict):
+    """Every evaluated set's rows in the eval store are exactly its manifest ids - none missing (a row whose audio
+    was not found included), none extra, none twice: the eval scores the frozen manifest or refuses (SystemExit)
+    before any model is loaded."""
+    sub = cfg["subset"]
+    if sub["eval_audio_s"] is not None or sub["eval_utts_per_set"]:
+        raise SystemExit("REFUSED: a study-manifest eval scores the complete sets: subset.eval_audio_s and "
+                         "subset.eval_utts_per_set must be null")
+    bad = []
+    for s in sets:
+        if s not in man.sets:
+            bad.append(f"{s}: not a set of the manifest ({sorted(man.sets)})")
+            continue
+        if p := _id_problems(s, [u.id for u in store.utts if u.source == s], man.sets[s]):
+            bad.append(p)
+    if bad:
+        lost = ((store.info.get("dropped") or {}).get("no_audio") or {}).get("ids") or []
+        raise SystemExit("REFUSED: the eval store does not match the study manifest: " + "; ".join(bad)
+                         + (f" (rows without audio: {lost[:5]})" if lost else ""))
+
+
+# ------------------------------------------------------------------------------------------------ study tables
+
+
+def strata(man) -> dict[str, tuple[str, list[str]]]:
+    """stratum -> (eval set, ids), as kitsune.study_stats scores them: every set one stratum, Galgame as its views
+    (galgame_<view>; galgame_all = the whole set when the manifest has no "all" view)."""
+    from kitsune import study_stats as ss
+
+    out = {s: (s, ids) for s, ids in man.sets.items() if s != ss.GALGAME}
+    if ss.GALGAME in man.sets:
+        views = dict(man.views)
+        views.setdefault("all", man.sets[ss.GALGAME])
+        for v in (*ss.GALGAME_VIEWS, *sorted(set(views) - set(ss.GALGAME_VIEWS))):
+            if v in views:
+                out[f"{ss.GALGAME}_{v}"] = (ss.GALGAME, views[v])
+    return out
+
+
+def tables_from_frames(man, frames: dict[str, pd.DataFrame], hyp_col: str = "hyp",
+                       trunc_col: str | None = "truncated") -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    """Per-utterance tables (kitsune.evaluate.utterance_table, manifest order) from per-set frames with id, ref and
+    `hyp_col` (a greedy_<set>.parquet: the system's hyp, or teacher_hyp for its teacher). A set whose rows are not
+    exactly its manifest ids gets no table: ({set: table}, {set: why not})."""
+    from kitsune import evaluate as ev
+
+    tables, refused = {}, {}
+    for s, df in frames.items():
+        if s not in man.sets:
+            refused[s] = f"{s} is not a set of the manifest"
+            continue
+        want = man.sets[s]
+        if p := _id_problems(s, df["id"].astype(str).tolist(), want):
+            refused[s] = p
+            continue
+        d = df.assign(id=df["id"].astype(str)).set_index("id").loc[want]
+        trunc = d[trunc_col].tolist() if trunc_col and trunc_col in d.columns else None
+        tables[s] = ev.utterance_table(want, s, d["ref"].tolist(), d[hyp_col].tolist(), trunc)
+    return tables, refused
+
+
+def publish_tables(tables_dir: Path, system: str, tables: dict[str, pd.DataFrame], refused: dict[str, str]) -> dict:
+    """<tables_dir>/<system>/<set>.parquet for every table, durable; a refused set's older table goes (the report must
+    not read a stale one). Returns {set: path}."""
+    d = tables_dir / system
+    d.mkdir(parents=True, exist_ok=True)
+    for s in refused:
+        (d / f"{s}.parquet").unlink(missing_ok=True)
+    paths = {}
+    for s, t in tables.items():
+        _table(t, d / f"{s}.parquet")
+        paths[s] = str(d / f"{s}.parquet")
+    return paths
+
+
+def study_block(man, tables: dict[str, pd.DataFrame], teacher: dict[str, pd.DataFrame] | None = None) -> dict:
+    """study.json's numbers: per stratum (strata()) the system's corpus CER, raw and no-style (kitsune.evaluate.
+    table_cer), and its teacher's on the same rows with the ratio; M4 (the macro mean over JSUT, CV8, Reazon and
+    Galgame-neutral), the qualifier pairs, JSUT + Galgame-neutral raw and no-style, and the gate-pooled CER
+    (sum / sum over JSUT, CV8, Reazon: the first run's val_cer), each with the teacher's and the ratio when it has
+    them."""
+    from kitsune import evaluate as ev
+    from kitsune import study_stats as ss
+
+    rows = {}
+    for name, (s, ids) in strata(man).items():
+        if s not in tables:
+            continue
+        c = ev.table_cer(tables[s], ids)
+        r = dict(cer=c["cer"], cer_nostyle=ev.table_cer(tables[s], ids, nostyle=True)["cer"], edits=c["edits"],
+                 ref_chars=c["ref_chars"], n=c["n"], n_empty_ref=c["n_empty_ref"])
+        if teacher and s in teacher:
+            t = ev.table_cer(teacher[s], ids)
+            r.update(teacher_cer=t["cer"], ratio_vs_teacher=c["cer"] / t["cer"] if t["cer"] else None)
+        rows[name] = r
+
+    def macro(names, key="cer"):
+        v = [rows[n].get(key) for n in names]
+        return float(np.mean(v)) if names and all(x is not None and np.isfinite(x) for x in v) else None
+
+    metrics = {}
+    for m, names, key in (("m4", ss.M4_SETS, "cer"), ("ood", ss.PAIRS["ood"], "cer"), ("ind", ss.PAIRS["ind"], "cer"),
+                          ("jg", ss.CROSS_SETS, "cer"), ("jg_nostyle", ss.CROSS_SETS, "cer_nostyle")):
+        if all(n in rows for n in names):
+            metrics[m] = macro(names, key)
+            if key == "cer" and all("teacher_cer" in rows[n] for n in names):
+                metrics[f"{m}_teacher"] = macro(names, "teacher_cer")
+                metrics[f"{m}_ratio"] = (metrics[m] / metrics[f"{m}_teacher"]
+                                         if metrics[m] is not None and metrics[f"{m}_teacher"] else None)
+    gate = [s for s in ev.GATE_SETS if s in rows]
+    if gate:
+        metrics["gate_pooled"] = sum(rows[s]["edits"] for s in gate) / max(sum(rows[s]["ref_chars"] for s in gate), 1)
+        metrics["gate_pooled_sets"] = gate
+    return dict(strata=rows, metrics=metrics)
+
+
+def manifest_record(M: dict) -> dict:
+    """The manifest an output was checked against: its file, sha256, per-set and per-view id hashes and the PREREG
+    comparison."""
+    man = M["manifest"]
+    return dict(path=M["path"], sha256=M["sha256"], sets=dict(man.sha256), views=dict(man.view_sha256),
+                prereg_check=M["prereg_check"])
+
+
+def study_record(system: str, family: str | None, M: dict, block: dict, paths: dict, refused: dict, **extra) -> dict:
+    """study.json: the system, its family and own teacher, the manifest it was checked against, study_block's numbers,
+    the tables written and the sets refused."""
+    from kitsune import evaluate as ev
+
+    return dict(system=system, family=family, teacher=ev.FAMILY_TEACHER.get(family) if family else None,
+                manifest=manifest_record(M), **block, tables=paths, refused=refused, time_utc=_now(), **extra)
+
+
+def write_study(ctx: Ctx, tables_dir: Path) -> dict:
+    """The system's tables and study.json from the evaluated sets' greedy_<set>.parquet (their teacher_hyp column is
+    the family's teacher on the same rows). Returns study.json's record; a set without a table is in its refused."""
+    man = ctx.manifest["manifest"]
+    present = [s for s in ctx.cfg["eval_sets"] if s in man.sets and set_done(ctx.out, s)]
+    frames = {s: pd.read_parquet(ctx.out / f"greedy_{s}.parquet") for s in present}
+    tables, refused = tables_from_frames(man, frames)
+    teacher, _ = tables_from_frames(man, frames, hyp_col="teacher_hyp", trunc_col="teacher_truncated")
+    paths = publish_tables(tables_dir, ctx.system, tables, refused)
+    rec = study_record(ctx.system, ctx.family, ctx.manifest, study_block(man, tables, teacher), paths, refused,
+                       out=str(ctx.out))
+    _write_output_json(ctx.out / "study.json", rec)
+    ctx.log.event("study_tables", system=ctx.system, sets=sorted(tables), refused=refused, m4=rec["metrics"].get("m4"),
+                  tables=str(tables_dir / ctx.system))
+    return rec
 
 
 # ------------------------------------------------------------------------------------------------------ summary
@@ -823,8 +1275,14 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
     d_gr = sorted((i for s in present for i in parts[s]["dropped_greedy"]), key=rank.__getitem__)
     tf_wall = sum(parts[s]["tf_wall_s"] for s in present)
     gr_wall = sum(parts[s]["greedy_wall_s"] for s in present)
-    tf_sum, _ = ev.summarise_tf(raw, n_bad_audio=len(d_tf), bad_audio=d_tf[:50],
-                                bad_audio_per_set=ev._bad_audio_per_set(store, d_tf), wall_s=tf_wall)
+    ctc_extra = {}
+    if ctx.family == "ctc":  # the rows the frame metrics could not align, next to the undecodable ones
+        mism = [r for s in present for r in parts[s].get("frame_mismatch") or []]
+        no_t = [i for s in present for i in parts[s].get("no_targets") or []]
+        ctc_extra = dict(n_frame_mismatch=len(mism), frame_mismatch=mism[:50], n_no_targets=len(no_t),
+                         no_targets=no_t[:50])
+    tf_sum, _ = ctx.tf_summarise(raw, n_bad_audio=len(d_tf), bad_audio=d_tf[:50],
+                                 bad_audio_per_set=ev._bad_audio_per_set(store, d_tf), wall_s=tf_wall, **ctc_extra)
     rows = gdf.drop(columns="in_greedy_subset")
     audio_s = float(rows["duration"].sum()) if len(rows) else 0.0
     full_sum = ev.summarise_greedy(rows, n_bad_audio=len(d_gr), bad_audio=d_gr[:50],
@@ -843,7 +1301,10 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
     train_s = float(trained.get("train_s") or 0.0)
     epoch = float(trained.get("epoch") or 0.0) if D.epoch_mode(cfg) else None
     combined = {}
-    if c := D.combined_val_full(cfg, tf_sum):
+    if ctx.family == "ctc":  # the CTC objective: (w_kl KL + w_ctc CTC) / target tokens over the gate sets
+        if c := ev.combined_loss(tf_sum, cfg["loss"]["w_kl"], w_ctc(cfg)):
+            combined["val_full"] = dict(c, scope="complete", family="ctc", w_ctc=w_ctc(cfg))
+    elif c := D.combined_val_full(cfg, tf_sum):
         combined["val_full"] = c
     summary = D.eval_summary(step, train_s, trained.get("reason") == "end", True, tf_sum, probe_sum, gr_sum, full_sum,
                              pg_sum, round(tf_wall + gr_wall + probe_wall, 1), n_probe_greedy=n_pg, n_probe=n_probe,
@@ -853,6 +1314,10 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
     ctx.log.event("summary", sets=present, probe=probe_sum is not None, headline=summary["headline"],
                   combined_loss={k: v["value"] for k, v in combined.items()})
 
+    if ctx.verdict_off:
+        (out / "verdict.json").unlink(missing_ok=True)
+        ctx.log.event("verdict_skipped", note=ctx.verdict_off)
+        return summary
     missing = [s for s in ev.GATE_SETS if s not in present]
     # the trainer's record of this eval holds the probe's KL (unless the probe has no rows), which the verdict's
     # probe-KL and gap trends read: a verdict without it would not be the trainer's
@@ -874,8 +1339,10 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
     rec = D.eval_history_record(step, train_s, tf_sum, gr_sum, probe_sum, pg_sum, summary["headline"], epoch=rec_epoch,
                                 full_sum=full_sum, lr_phase=lr_phase)
     history = sorted((r for r in hist if int(r["step"]) < step), key=lambda r: int(r["step"])) + [rec]
-    verdict = D.gate_verdict(cfg, ev.verdict(D.verdict_results(full_sum, history, ctx.reference),
-                                             **D.verdict_options(cfg)))
+    opts = dict(D.verdict_options(cfg))
+    if ctx.family != "aed":  # the ratios to the family's own teacher (Parakeet's CTC path)
+        opts.setdefault("family", ctx.family)
+    verdict = D.gate_verdict(cfg, ev.verdict(D.verdict_results(full_sum, history, ctx.reference), **opts))
     _write_output_json(out / "verdict.json", verdict)
     ctx.log.event("verdict", verdict=verdict.get("verdict"), reasons=verdict.get("reasons"), history=src,
                   history_steps=[int(r["step"]) for r in history])
@@ -887,8 +1354,27 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
 
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ckpt", required=True, help="the weights dir to evaluate (runs/<run_id>/checkpoints/step_<N>)")
+    ap.add_argument("--ckpt", default=None,
+                    help="the weights dir to evaluate (runs/<run_id>/checkpoints/step_<N>); not with --teachers or "
+                         "--from-evals")
     ap.add_argument("--out", required=True, help="output dir (the layout of evals/step_<N>/); resumable")
+    ap.add_argument("--manifest", default=None,
+                    help="the study's eval manifest (study_manifest.json) the eval is checked against and scored on "
+                         "(default: the one next to the config's selection, if there is one; none: no manifest)")
+    ap.add_argument("--prereg", default=str(PREREG_JSON),
+                    help="PREREG.json whose manifest (and, for --teachers, baselines) block is compared once filled "
+                         "(default %(default)s)")
+    ap.add_argument("--system", default=None,
+                    help="the tables' system name (default: the config's run_name; anchor-b20 with --anchor)")
+    ap.add_argument("--tables", default=None,
+                    help="the dir the per-utterance tables go to, as <dir>/<system>/<set>.parquet (default "
+                         "<out>/tables)")
+    ap.add_argument("--anchor", action="store_true",
+                    help="the first run's 0.6B re-scored on the manifest as anchor-b20: no history, verdict or probe")
+    ap.add_argument("--teachers", action="store_true",
+                    help="no model: the tables of cohere, parakeet-ctc and parakeet-tdt from their stored hypotheses")
+    ap.add_argument("--from-evals", default=None, metavar="DIR",
+                    help="no model: a system's tables from an eval dir's greedy_<set>.parquet (needs --system)")
     ap.add_argument("--config", default=DEFAULT_CONFIG,
                     help="trainer config or a run's config.json (default %(default)s)")
     ap.add_argument("--root", default=str(ROOT),
@@ -922,6 +1408,18 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="also cap the CUDA allocator at this fraction of the card (on Windows it is capped at the "
                          "free VRAM less a margin in any case, as the trainer's)")
     args = ap.parse_args(argv)
+    modes = [m for m, on in (("--teachers", args.teachers), ("--from-evals", args.from_evals),
+                             ("--anchor", args.anchor)) if on]
+    if len(modes) > 1:
+        ap.error(f"{' and '.join(modes)} are different modes: use one")
+    if (args.teachers or args.from_evals) and args.ckpt:
+        ap.error(f"{modes[0]} evaluates no model: no --ckpt")
+    if not (args.teachers or args.from_evals) and not args.ckpt:
+        ap.error("--ckpt is required (the weights dir to evaluate)")
+    if args.from_evals and not args.system:
+        ap.error("--from-evals needs --system (the name its tables go under)")
+    if args.anchor and args.probe:
+        ap.error("--anchor has no probe: the anchor was trained on another run's data")
     if args.max_temp and not args.resume_temp < args.max_temp:
         ap.error("--resume-temp must be below --max-temp")
     if args.vram_frac is not None and not 0 < args.vram_frac <= 1:
@@ -947,8 +1445,130 @@ def _versions() -> dict:
                 cuda=torch.version.cuda, code=code, code_root=str(ROOT))
 
 
+def _tables_dir(args, out: Path) -> Path:
+    return Path(args.tables).resolve() if args.tables else out / "tables"
+
+
+def main_teachers(args) -> int:
+    """--teachers: the teachers' per-utterance tables from their stored hypotheses on the manifest rows (module
+    docstring). Refuses (SystemExit) before writing a table when a manifest row is missing from either root, a
+    reference differs between them, or - with eval.check_baselines - a baseline drifts."""
+    D = load_trainer()
+    from kitsune import evaluate as ev
+    from kitsune import study_stats as ss
+    from kitsune.text import cer as utt_cer
+    from kitsune.text import normalize_ja
+
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    log = EvalLog(out / "events.jsonl")
+    cfg, cfg_path = load_cfg(D, args)
+    mpath = manifest_path(args, cfg)
+    if mpath is None:
+        raise SystemExit("--teachers needs the study manifest (--manifest, or study_manifest.json next to the "
+                         "config's selection)")
+    M = load_manifest(mpath, args.prereg, log)
+    man = M["manifest"]
+    sets = list(dict.fromkeys(args.sets or [s for s in cfg["eval_sets"] if s in man.sets]))
+    if absent := [s for s in sets if s not in man.sets]:
+        raise SystemExit(f"REFUSED: {absent} are not sets of the manifest {sorted(man.sets)}")
+    coh = ev.load_teacher_rows(cfg["teacher_root"], sets, split="eval")
+    pk = ev.load_teacher_rows(parakeet_root(cfg), sets, split="eval")
+    problems, stored = [], {"cohere": 0, "parakeet-ctc": 0, "parakeet-tdt": 0}
+    tables = {"cohere": {}, "parakeet-ctc": {}, "parakeet-tdt": {}}
+    for s in sets:
+        want = man.sets[s]
+        miss = {root: [i for i in want if i not in rows][:3] for root, rows in (("teacher_out", coh),
+                                                                               ("parakeet_out", pk))}
+        if any(miss.values()):
+            problems.append(f"{s}: manifest rows missing from " + ", ".join(f"{r} (e.g. {m})" for r, m in miss.items()
+                                                                           if m))
+            continue
+        if differ := [i for i in want if normalize_ja(coh[i]["ref"] or "") != normalize_ja(pk[i]["ref"] or "")]:
+            problems.append(f"{s}: {len(differ)} rows with another reference in parakeet_out, e.g. {differ[:3]}")
+            continue
+        refs = [coh[i]["ref"] for i in want]
+        for name, rows, hk, ck, tk in (("cohere", coh, "hyp", "cer", "truncated"),
+                                       ("parakeet-ctc", pk, "ctc_hyp", "ctc_cer", None),
+                                       ("parakeet-tdt", pk, "hyp", "cer", "truncated")):
+            hyps = [rows[i][hk] for i in want]
+            tables[name][s] = ev.utterance_table(want, s, refs, hyps, [rows[i].get(tk) for i in want] if tk else None)
+            # the stored per-utterance CER (kitsune.text.cer, rounded to 4 by the label passes) is this scorer's
+            stored[name] += sum(abs(round(utt_cer(h, rows[i]["ref"] or ""), 4) - float(rows[i][ck])) > 5e-5
+                                for i, h in zip(want, hyps))
+    if problems:
+        raise SystemExit("REFUSED: the label roots do not hold the manifest as registered: " + "; ".join(problems))
+    blocks = {name: study_block(man, t) for name, t in tables.items()}
+    check = bool(cfg["eval"]["check_baselines"])
+    drift = []
+    try:  # Cohere's D32a numbers on its full gate sets, as the trainer checks them at start-up (K11)
+        cohere_d32a = ev.teacher_baselines(cfg["teacher_root"], [s for s in ev.GATE_SETS if s in sets], check=check)
+    except ValueError as e:
+        raise SystemExit(f"REFUSED: {e}") from e
+    reg = ss.prereg_baselines(_load_json(Path(args.prereg)) if Path(args.prereg).is_file() else None)
+    for name, block in blocks.items():
+        got = {k: v["cer"] for k, v in block["strata"].items()}
+        if block["metrics"].get("m4") is not None:
+            got["m4"] = block["metrics"]["m4"]
+        for k, v in (reg.get(name) or {}).items():
+            if k in got and abs(got[k] - v) > ev.BASELINE_TOL:
+                drift.append(f"{name} {k}: {100 * got[k]:.3f} % here, {100 * v:.3f} % registered")
+    if drift and check:
+        raise SystemExit("REFUSED: teacher baselines drift from PREREG.json by more than 0.05 pp: " + "; ".join(drift))
+    tdir = _tables_dir(args, out)
+    paths = {name: publish_tables(tdir, name, t, {}) for name, t in tables.items()}
+    rec = dict(manifest=manifest_record(M), config=str(cfg_path),
+               teacher_root=cfg["teacher_root"], parakeet_root=str(parakeet_root(cfg)), sets=sets,
+               teachers={name: dict(blocks[name], tables=paths[name], stored_cer_mismatches=stored[name])
+                         for name in tables},
+               cohere_d32a=cohere_d32a, prereg_baselines="compared" if reg else "pending or absent",
+               drift=drift, time_utc=_now())
+    _write_output_json(out / "teachers.json", rec)
+    log.event("teacher_tables", sets=sets, tables=str(tdir), stored_cer_mismatches=stored, drift=drift,
+              m4={n: b["metrics"].get("m4") for n, b in blocks.items()})
+    return 0
+
+
+def main_from_evals(args) -> int:
+    """--from-evals DIR: a system's tables and study.json from the greedy_<set>.parquet an eval dir holds (the
+    trainer's evals/step_<N>/ or a 05 --out), checked against the manifest; the family's teacher is the tables'
+    teacher_hyp column. Exits non-zero when a set of the manifest could not be tabled."""
+    src = Path(args.from_evals).resolve()
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    log = EvalLog(out / "events.jsonl")
+    cfg = None
+    if not args.manifest:
+        cfg, _ = load_cfg(load_trainer(), args)
+    mpath = manifest_path(args, cfg)
+    if mpath is None:
+        raise SystemExit("--from-evals needs the study manifest (--manifest, or a --config whose selection has one)")
+    M = load_manifest(mpath, args.prereg, log)
+    man = M["manifest"]
+    frames = {s: pd.read_parquet(src / f"greedy_{s}.parquet") for s in man.sets
+              if (src / f"greedy_{s}.parquet").is_file()}
+    if not frames:
+        raise SystemExit(f"{src}: no greedy_<set>.parquet of a manifest set")
+    tables, refused = tables_from_frames(man, frames)
+    teacher, _ = tables_from_frames(man, frames, hyp_col="teacher_hyp", trunc_col="teacher_truncated")
+    paths = publish_tables(_tables_dir(args, out), args.system, tables, refused)
+    fam = family_of(cfg) if cfg else None
+    rec = study_record(args.system, fam, M, study_block(man, tables, teacher), paths, refused, source=str(src),
+                       missing_sets=sorted(set(man.sets) - set(frames)))
+    _write_output_json(out / "study.json", rec)
+    log.event("study_tables", system=args.system, sets=sorted(tables), refused=refused, m4=rec["metrics"].get("m4"),
+              source=str(src))
+    if refused:
+        raise SystemExit(f"REFUSED: no table for {sorted(refused)}: " + "; ".join(refused.values()))
+    return 0
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.teachers:
+        return main_teachers(args)
+    if args.from_evals:
+        return main_from_evals(args)
     D = load_trainer()
     from kitsune import evaluate as ev
     from kitsune import student as S
@@ -961,12 +1581,23 @@ def main(argv=None) -> int:
     log = EvalLog(out / "events.jsonl")
     t_start = time.time()
     cfg, cfg_path, cfg_student = resolve_config(D, args, out, ckpt)
+    family = family_of(cfg)
+    if (fc := ckpt_family(ckpt)) not in (None, family):
+        raise SystemExit(f"{ckpt} is a {fc} model, the config's family is {family}")
+    if args.anchor and family != "aed":
+        raise SystemExit("--anchor re-scores the first run's 0.6B (a Transcribe model): it needs an aed config")
+    if args.anchor:
+        args.history = "none"  # the anchor's history is another run's, on other eval sets
+    system = args.system or (ANCHOR if args.anchor else cfg["run_name"])
     trained = S.load_meta(ckpt).get("trained") or {}
     step = int(args.step if args.step is not None else trained.get("step", 0))
     sets = list(dict.fromkeys(args.sets or cfg["eval_sets"]))
     unknown = [s for s in sets if s not in cfg["eval_sets"]]
     if unknown:
         raise SystemExit(f"--sets {unknown} not among the config's eval_sets {cfg['eval_sets']}")
+    mpath = manifest_path(args, cfg)
+    if args.anchor and mpath is None:
+        raise SystemExit("--anchor scores on the study manifest: pass --manifest (or a config whose selection has one)")
     dev = cfg["device"]
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if dev in (None, "auto") else dev)
     inv = dict(time_utc=_now(), argv=list(argv) if argv is not None else sys.argv[1:], ckpt=str(ckpt), step=step,
@@ -974,10 +1605,13 @@ def main(argv=None) -> int:
                cache_dir=cfg["cache_dir"], sets=sets, probe=args.probe, force=args.force, device=str(device),
                autocast=cfg["autocast"], batch_s=float(cfg["eval"]["batch_s"]), chunk_s=args.chunk_s,
                versions=_versions(), status="running")
+    if family != "aed" or mpath is not None:  # the aed record without a manifest stays as it was
+        inv.update(family=family, system=system, manifest=str(mpath) if mpath else None, anchor=bool(args.anchor))
     log.event("evaluate_start", ckpt=str(ckpt), step=step, sets=sets, probe=args.probe, device=str(device),
               autocast=cfg["autocast"], batch_s=float(cfg["eval"]["batch_s"]), config=str(cfg_path),
-              root=inv["root"], out=str(out))
+              root=inv["root"], out=str(out), **({"family": family, "system": system} if "family" in inv else {}))
     ctx = None
+    refused = {}
     try:
         seed = int(cfg["seed"])  # as the trainer (nothing in the eval draws from them)
         torch.manual_seed(seed)
@@ -990,11 +1624,25 @@ def main(argv=None) -> int:
         greedy_ids = D.greedy_subset_ids(cfg, store)
         log.event("data", eval_utts=len(store), eval_h=round(store.hours, 3), per_set=store.info.get("per_source"),
                   dropped=store.info.get("dropped"), greedy=len(greedy_ids), build_s=round(time.time() - t0, 1))
-        try:
-            base = ev.teacher_baselines(cfg["teacher_root"], cfg["eval_sets"], check=cfg["eval"]["check_baselines"])
-            log.event("teacher_baselines", sets=base)
-        except FileNotFoundError as e:
-            log.event("teacher_baselines", skipped=str(e))
+        M = None
+        if mpath is not None:  # the study: the eval scores the frozen manifest or refuses here
+            M = load_manifest(mpath, args.prereg, log)
+            check_store_against_manifest(M["manifest"], store, sets, cfg)
+        teacher_rows = targets = None
+        pk_files = []
+        if family == "ctc":  # the teacher is Parakeet's stored CTC path; its frame targets for the tf metrics
+            teacher_rows, targets, pk_files = parakeet_data(cfg, store, log)
+            base = ev.parakeet_baselines(parakeet_root(cfg), cfg["eval_sets"], ids=[u.id for u in store.utts],
+                                         check=cfg["eval"]["check_baselines"])
+            log.event("teacher_baselines", family="ctc", teacher="parakeet-ctc", sets=base,
+                      prereg="registered" if ev.PARAKEET_CTC_CER_PREREG else "pending")
+        else:
+            try:
+                base = ev.teacher_baselines(cfg["teacher_root"], cfg["eval_sets"],
+                                            check=cfg["eval"]["check_baselines"])
+                log.event("teacher_baselines", sets=base)
+            except FileNotFoundError as e:
+                log.event("teacher_baselines", skipped=str(e))
         reference = D.reference_model(cfg)  # before the eval: a bad eval.reference file stops it here
         if reference:
             log.event("reference", **reference)
@@ -1005,10 +1653,14 @@ def main(argv=None) -> int:
                         sources=list(cfg["sources"]), subset=cfg["subset"], store=store.info.get("fingerprint"),
                         greedy_subset=ec["greedy_subset"], probe=[ec["probe"], ec["probe_is_train"],
                                                                   ec["probe_greedy_audio_s"]])
+        if family == "ctc":  # an aed --out keeps its identity as it was
+            identity.update(family=family, parakeet=parakeet_fingerprint(pk_files))
         check_identity(out, identity)
         ctx = Ctx(D=D, ev=ev, cfg=cfg, args=args, out=out, log=log, store=store, greedy_ids=set(greedy_ids),
                   identity_key=hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest(),
-                  reference=reference)
+                  reference=reference, family=family, teacher_rows=teacher_rows, targets=targets, manifest=M,
+                  system=system, verdict_off="anchor: its history is another run's on other eval sets; it gets "
+                                             "tables and a summary, no verdict" if args.anchor else None)
         want_probe = args.probe and bool(cfg["eval"]["probe"])
         if args.probe and not cfg["eval"]["probe"]:
             log.event("probe_off", note="the config has eval.probe false: no probe to evaluate")
@@ -1031,8 +1683,11 @@ def main(argv=None) -> int:
             # as the trainer: on Windows CUDA always (the driver's sysmem fallback would serve an oversized batch from
             # shared memory instead of raising OOM), --vram-frac on any OS; a no-op otherwise
             D.cap_vram(R, max_frac=args.vram_frac)
-            D.setup_model(R, grad_ckpt=False)
-            D.setup_processing(R)
+            if family == "ctc":
+                setup_ctc(R, ckpt, cfg_student, log)
+            else:
+                D.setup_model(R, grad_ckpt=False)
+                D.setup_processing(R)
             ctx.R = R
             ctx.feat = Guarded(R.feat_eval, ctx.guard) if ctx.guard else R.feat_eval
             if todo:
@@ -1042,10 +1697,18 @@ def main(argv=None) -> int:
         end_force(ctx)
         sweep_work(ctx)  # passes that hold a set done now can never continue
         summary = write_summary(ctx, step, trained, ckpt)
-        inv.update(status="complete", headline=(summary or {}).get("headline"))
+        if M is not None:
+            study = write_study(ctx, _tables_dir(args, out))
+            refused = study["refused"]
+            inv.update(tables=study["tables"], refused=refused, m4=study["metrics"].get("m4"))
+        inv.update(status="complete" if not refused else "tables_refused", headline=(summary or {}).get("headline"))
+        if refused:
+            raise SystemExit(f"REFUSED: no table for {sorted(refused)} (the eval itself is complete): "
+                             + "; ".join(refused.values()))
         return 0
     except BaseException as e:
-        inv.update(status="failed", error=f"{type(e).__name__}: {e}"[:2000])
+        inv.update(status="failed" if inv["status"] == "running" else inv["status"],
+                   error=f"{type(e).__name__}: {e}"[:2000])
         raise
     finally:
         inv["wall_s"] = round(time.time() - t_start, 1)

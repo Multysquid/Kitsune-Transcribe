@@ -9,6 +9,11 @@ host crash tore a file of its resume state. Also: sets already done are skipped,
 of other eval settings is refused, no verdict without the probe the config has, the resume state is fsynced, and the
 thermal guard runs before every batch, waits for the GPU to cool and stops when it can no longer read it.
 
+The size study's AED side (tests/test_evaluate_study.py has the CTC family): on a study manifest the same eval writes
+the per-utterance tables (CONTRACT.md 5) whose corpus CER per set is its summary's; --anchor re-scores a checkpoint as
+anchor-b20 without a verdict; --from-evals makes the same tables from the trainer's own eval dir; a manifest that does
+not hold the store's rows refuses before the model is loaded.
+
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import json
 import os
@@ -114,7 +119,7 @@ def env(tmp_path_factory):
     (run,) = list((root / "runs").glob("tiny-eval-*"))
     assert (run / "evals" / "step_1" / "verdict.json").exists()
     assert load(run / "evals" / "step_1" / "summary.json")["final"] is True
-    return dict(root=root, run=run, ckpt=run / "checkpoints" / "step_1", relative=root / "relative.json")
+    return dict(root=root, run=run, ckpt=run / "checkpoints" / "step_1", relative=root / "relative.json", sel=sel)
 
 
 def assert_the_trainers(env, out: Path):
@@ -536,3 +541,88 @@ def test_the_thermal_guard_waits_for_the_gpu_to_cool(monkeypatch):
     fallback = m05.make_guard(torch.device("cuda", 0), args, log)
     assert fallback.source == "nvidia-smi" and fallback.min_interval_s == m05.NVSMI_EVERY_S
     assert m05._bus_tuple("00000000:01:00.0") == m05._bus_tuple(b"0000:01:00.0") == m05._bus_tuple("01:00.0")
+
+
+# ------------------------------------------------------------------------------------------------ the size study
+
+
+def write_manifest(env, path: Path, drop: str | None = None) -> dict:
+    """The study manifest of the env's selection: per eval set its kept eval rows in selection order and their sha256
+    (make_selection's layout); `drop`: leave that id out (the hashes stay consistent)."""
+    from kitsune.store import ids_sha256
+
+    s = pd.read_parquet(env["sel"])
+    man = {"schema": 1, "sets": {}}
+    for e in SETS:
+        ids = [i for i in s["id"][(s["source"] == e) & (s["split"] == "eval") & s["keep"]] if i != drop]
+        man["sets"][e] = {"n": len(ids), "ids_sha256": ids_sha256(ids), "ids": ids}
+    path.write_text(json.dumps(man), encoding="utf-8")
+    return man
+
+
+def test_the_anchor_on_the_manifest_and_its_tables(env, tmp_path):
+    """--anchor on a study manifest: the eval is the trainer's (its greedy tables to the bit), no verdict (the anchor's
+    history is another run's), and the tables of anchor-b20 in CONTRACT.md 5's format, one per set in manifest order,
+    whose corpus CER per set is the summary's and whose gate-pooled CER is its headline val_cer. --from-evals makes the
+    same tables from the trainer's own eval dir; --anchor takes no probe."""
+    from kitsune import evaluate as ev
+
+    m05 = load_script("05_evaluate")
+    man = write_manifest(env, tmp_path / "study_manifest.json")
+    out, tables = tmp_path / "anchor", tmp_path / "tables"
+    argv = ["--root", str(env["root"]), "--config", str(env["relative"]), "--ckpt", str(env["ckpt"]), "--manifest",
+            str(tmp_path / "study_manifest.json"), "--tables", str(tables)]
+    assert m05.main([*argv, "--anchor", "--out", str(out)]) == 0
+    assert not (out / "verdict.json").exists() and events(out, "verdict_skipped")[-1]["note"].startswith("anchor")
+    ref = env["run"] / "evals" / "step_1"
+    s = load(out / "summary.json")
+    for e in SETS:
+        g = pd.read_parquet(out / f"greedy_{e}.parquet")
+        a, b = pd.read_parquet(ref / f"greedy_{e}.parquet"), g.copy()
+        assert [list(x) for x in a.pop("hyp_ids")] == [list(x) for x in b.pop("hyp_ids")]
+        pd.testing.assert_frame_equal(a, b, check_exact=True)
+        t = pd.read_parquet(tables / "anchor-b20" / f"{e}.parquet")
+        assert tuple(t.columns) == ev.TABLE_COLUMNS and t["id"].tolist() == man["sets"][e]["ids"]
+        c = ev.table_cer(t)
+        d = s["greedy_full"]["sets"][e]
+        assert (c["edits"], c["ref_chars"], c["cer"]) == (d["ref_edits"], d["ref_chars"], d["cer_ref_corpus"])
+        assert int(t["truncated"].sum()) == d["n_truncated"]
+    st = load(out / "study.json")
+    assert st["system"] == "anchor-b20" and st["family"] == "aed" and st["teacher"] == "cohere" and not st["refused"]
+    assert st["metrics"]["gate_pooled"] == pytest.approx(s["headline"]["val_cer"])
+    assert set(st["strata"]) == set(SETS) and "m4" not in st["metrics"]  # no Galgame set: no M4
+    assert all(st["strata"][e]["ratio_vs_teacher"] == pytest.approx(s["greedy_full"]["sets"][e]["ratio_vs_teacher"])
+               for e in SETS)
+    (inv,) = load(out / "evaluator.json")["invocations"]
+    assert inv["status"] == "complete" and inv["anchor"] and inv["system"] == "anchor-b20" and inv["family"] == "aed"
+    # the trainer's own eval dir gives the same tables
+    assert m05.main(["--from-evals", str(ref), "--system", "tiny-eval", "--manifest",
+                     str(tmp_path / "study_manifest.json"), "--out", str(tmp_path / "from"), "--tables",
+                     str(tables)]) == 0
+    for e in SETS:
+        pd.testing.assert_frame_equal(pd.read_parquet(tables / "tiny-eval" / f"{e}.parquet"),
+                                      pd.read_parquet(tables / "anchor-b20" / f"{e}.parquet"))
+    with pytest.raises(SystemExit):
+        m05.main([*argv, "--anchor", "--probe", "--out", str(tmp_path / "x")])
+
+
+def test_a_manifest_without_the_stores_rows_is_refused(env, tmp_path, monkeypatch):
+    """A manifest that lacks one of the eval store's rows refuses the eval before the model is loaded; so does
+    --anchor without a manifest."""
+    m05 = load_script("05_evaluate")
+    real = m05.load_trainer
+
+    def load_trainer():
+        D = real()
+        D.setup_model = lambda *a, **k: pytest.fail("the model was loaded before the refusal")
+        return D
+
+    monkeypatch.setattr(m05, "load_trainer", load_trainer)
+    s = pd.read_parquet(env["sel"])
+    drop = s["id"][(s["source"] == "eval_cv8") & (s["split"] == "eval") & s["keep"]].iloc[2]
+    write_manifest(env, tmp_path / "m.json", drop=drop)
+    argv = ["--root", str(env["root"]), "--config", str(env["relative"]), "--ckpt", str(env["ckpt"])]
+    with pytest.raises(SystemExit, match="does not match the study manifest.*eval_cv8"):
+        m05.main([*argv, "--manifest", str(tmp_path / "m.json"), "--out", str(tmp_path / "o1")])
+    with pytest.raises(SystemExit, match="--anchor scores on the study manifest"):
+        m05.main([*argv, "--anchor", "--out", str(tmp_path / "o2")])
