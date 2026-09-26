@@ -682,6 +682,14 @@ def test_ctc_reference_run(env, ref_run):
     comb = s["combined_loss"]["val_full"]
     gate = [s["tf"]["sets"][x] for x in EVAL]
     ntok = sum(d["n_tok"] for d in gate)
+    # the headline's val_top1 pools the frame agreement per frame (its unit), not per target token
+    nfr = sum(d["n_frames"] for d in gate)
+    assert s["headline"]["val_top1"] == pytest.approx(sum(d["top1"] * d["n_frames"] for d in gate) / nfr)
+    assert s["headline"]["val_loss"] == pytest.approx(sum(d["kl"] * d["n_tok"] for d in gate) / ntok)
+    mini = json.loads((run / "evals" / "step_15_mini" / "summary.json").read_text(encoding="utf-8"))
+    mg = [d for d in mini["tf"]["sets"].values()]
+    assert mini["headline"]["val_top1"] == pytest.approx(
+        sum(d["top1"] * d["n_frames"] for d in mg) / sum(d["n_frames"] for d in mg))
     assert comb["value"] == pytest.approx(sum(d["kl"] * d["n_tok"] + 0.8 * d["ctc"] * d["n_tok"] for d in gate) / ntok)
     assert comb["w_ctc"] == 0.8 and comb["sets"] == sorted(EVAL)
     # the train probe: teacher-forced on its rows, greedy CTC on the probe-greedy ones, against the teacher's text

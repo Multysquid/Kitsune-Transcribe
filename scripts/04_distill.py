@@ -2374,9 +2374,11 @@ def eval_summary(step: int, train_s: float, final: bool, complete: bool, tf_sum:
     on the same curve). probe_greedy / epoch / combined_loss only when given, so the runs without them keep their
     records unchanged."""
     from kitsune import evaluate as ev
+    from kitsune.ctc_eval import frame_headline
 
     head_gr = full_sum if full_sum is not None else gr_sum
-    head = ev.headline(tf=tf_sum, greedy=head_gr, probe=probe_sum, probe_greedy=pg_sum)
+    # a CTC summary's val_top1 pooled per frame (its unit); an AED record is left as headline() gives it
+    head = frame_headline(ev.headline(tf=tf_sum, greedy=head_gr, probe=probe_sum, probe_greedy=pg_sum), tf_sum)
     summary = dict(step=step, train_s=train_s, final=final, complete=complete, tf=tf_sum, probe=probe_sum,
                    greedy=gr_sum, greedy_full=full_sum, wall_s=wall_s, headline=head,
                    headline_scope=dict(val_greedy="complete" if full_sum is not None else "subset",
@@ -2755,6 +2757,10 @@ def run_mini_eval(R: Run, step: int) -> dict:
             log.table(kind, frames[kind], step, suffix="mini")
     head = ev.headline(tf=parts.get("tf"), greedy=parts.get("greedy"), probe=parts.get("probe"),
                        probe_greedy=parts.get("probe_greedy"))
+    if is_ctc(cfg):
+        from kitsune.ctc_eval import frame_headline
+
+        frame_headline(head, parts.get("tf"))  # val_top1 per frame, as eval_summary
     epoch = R.st["epoch_progress"]
     log.eval_json("summary", dict(step=step, train_s=R.clock(), epoch=epoch, mini=True, wall_s=wall, headline=head,
                                   n_val=len(R.mini_val_ids), n_train=len(R.mini_train_ids), **parts,

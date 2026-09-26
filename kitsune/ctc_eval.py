@@ -14,7 +14,8 @@ of the very log-probs the teacher-forced metrics score:
                    teacher baseline on the same ids is Parakeet CTC (ctc_hyp): the CTC students' own teacher
 
 The teacher-forced summary (summarise_ctc_tf) uses the AED summary's keys where the quantities correspond, so
-kitsune.evaluate.eval_record / headline / gate_kd_sums read it unchanged: per set `kl` = (KL dense + KL blank) summed
+kitsune.evaluate.eval_record / headline / gate_kd_sums read it unchanged (headline's val_top1 re-pooled per frame by
+frame_headline): per set `kl` = (KL dense + KL blank) summed
 over every valid frame / N_u, the CTC target tokens (the objective's normalisation), `ce` = the CTC loss per target
 token (the CTC family's second loss term, also under `ctc`), `top1` = the frame argmax agreement (also
 `argmax_agree`), n_tok = N_u. So the training objective on an eval is w_kl * kl + w_ctc * ce (combined_loss_ctc), the
@@ -295,6 +296,23 @@ def gate_sums(tf: dict | None) -> dict | None:
                 ctc_sum=sum(float(d["ctc"]) * int(d["n_tok"]) for d in vt.values()), n_tok=n, sets=sorted(vt))
 
 
+def frame_headline(head: dict, tf: dict | None) -> dict:
+    """kitsune.evaluate.headline's record with val_top1 pooled per valid frame, the unit of a CTC set's top1 (the frame
+    argmax agreement): headline pools the gate sets' top1 weighted by their target tokens, the AED unit, which would
+    weight a CTC set by N_u instead of its frames. The pool is then every gate frame's agreement / the gate frames, as
+    the per-set numbers are. A summary whose sets have no n_frames (an AED one) leaves the record as it was. In place;
+    returns it."""
+    sets = (tf or {}).get("sets") or {}
+    gate = {s: d for s, d in sets.items() if s in GATE_SETS} or dict(sets)
+    if "val_top1" not in head or not gate or not all("n_frames" in d for d in gate.values()):
+        return head
+    vf = {s: d for s, d in gate.items() if d.get("n_frames")}
+    n = sum(int(d["n_frames"]) for d in vf.values())
+    if n:
+        head["val_top1"] = sum(float(d["top1"]) * int(d["n_frames"]) for d in vf.values()) / n
+    return head
+
+
 def combined_loss_ctc(tf: dict | None, w_kl: float, w_ctc: float) -> dict | None:
     """The CTC family's training objective on an eval (the combined loss's val / val_full points): (w_kl * sum KL +
     w_ctc * sum CTC) / N_u over the gate sets - kitsune.ctc_kd.ctc_kd_objective's expression over the eval's
@@ -381,4 +399,4 @@ def relabel_verdict(verdict: dict) -> dict:
 
 __all__ = ["BASELINE_TOL", "CTC_BLANK", "GATE_SETS", "PARAKEET_CTC_CER_PREREG", "PARAKEET_TDT_CER", "TEACHER_SYSTEM",
            "combined_loss_ctc", "ctc_eval", "ctc_eval_records", "ctc_forward", "ctc_teacher_baselines", "frame_batch",
-           "gate_sums", "greedy_frame", "relabel_verdict", "store_text", "summarise_ctc_tf", "verdict_teacher"]
+           "frame_headline", "gate_sums", "greedy_frame", "relabel_verdict", "store_text", "summarise_ctc_tf", "verdict_teacher"]
