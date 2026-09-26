@@ -436,6 +436,7 @@ def test_box_a_dry_run(box):
     last = max(rows, key=lambda run: rows[run][a]["wall"])
     assert table[last]["window"] == [a, b]
     assert all(rows[run][c["window"][0]]["wall"] >= t_all and c["window"][0] >= a for run, c in table.items())
+    assert all(c["fixed_window"]["window"] == [a, b] and c["fixed_window"]["t_step_s"] > 0 for c in table.values())
 
     # probes: the grids, the kept-t03 extension (its grid winner sat on the top edge), both chosen
     kept = sorted(r["lr_probes"]["classes"]["kept-t03"]["grid"])

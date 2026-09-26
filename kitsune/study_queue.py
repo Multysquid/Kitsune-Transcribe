@@ -15,7 +15,8 @@ grids and the edge rule, max_steps, the branch fractions - comes from kitsune.pr
                aligned (group_windows): each run's 200-step window starts at or after step 50 once EVERY run of the group
                has reached step 50, so each is measured while the others train; once all have theirs the queue ends the
                group with the STOP file. t_i = the median step time over the window, logging included (the difference
-               of consecutive steps' loop clocks), data_wait_frac = the loader's share of it. A run at or above
+               of consecutive steps' loop clocks), data_wait_frac = the loader's share of it; the literal steps
+               (50, 250] are kept next to it (fixed_window, for the record). A run at or above
                prereg.DATA_WAIT_MAX: perf.num_workers 12 for every run of the box and the whole calibration again; still
                loader-bound: the box halts
   probes       every grid point of the box's probe classes, packed onto the GPUs longest first (steps x the calibrated
@@ -1028,12 +1029,14 @@ class Queue:
                         continue
                     s0, s1 = wins[k]
                     st = calibration_stats(rows[k], s0, s1)
+                    fixed = calibration_stats(rows[k], a, a + n)  # the literal steps (50, 250], for the record
                     res = self.item(k)["result"] or {}
                     micro = res.get("micro_audio_s") or self.rules["runs"][run]["micro_audio_s"]
                     out[run] = dict(t_step_s=st["t_step_s"], micro_audio_s=float(micro),
                                     data_wait_frac=st["data_wait_frac"], steps_measured=st["steps_measured"],
                                     window=st["window"], mean_step_s=st["mean_step_s"], workers=res.get("workers"),
-                                    run_dir=self.item(k)["run_dir"])
+                                    run_dir=self.item(k)["run_dir"],
+                                    fixed_window={x: fixed[x] for x in ("window", "t_step_s", "data_wait_frac")})
                 return out
             self.event("calibration_group_failed", round=rnd, group=gi, attempt=attempt,
                        status={k: self.item(k)["status"] for k in names}, windows=wins)
