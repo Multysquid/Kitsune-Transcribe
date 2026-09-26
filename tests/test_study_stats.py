@@ -556,10 +556,14 @@ def test_teacher_baselines_under_kitsune_prereg_names():
 
 
 def test_kitsune_prereg_rules_feed_the_report():
-    """kitsune.prereg's own rules(), pending and filled from a sidecar built on the planted manifest, read as the
-    inline layout above (skipped until WP1's kitsune/prereg.py is on the branch)."""
+    """kitsune.prereg's own rules(), pending and filled from a sidecar that passes prereg.sidecar_problems (WP1's
+    fake_sidecar, with the planted manifest's hashes and every teacher's planted baselines), read as the inline
+    layout above."""
     kp = pytest.importorskip("kitsune.prereg")
-    tables, manifest = planted({"cohere": 1.0, "parakeet-ctc": 1.1, "study-t06": 1.2})
+    tp = pytest.importorskip("test_prereg")
+    tables, manifest = planted({"cohere": 1.0, "parakeet-ctc": 1.1, "parakeet-tdt": 1.05, "study-t06": 1.2})
+    gal = manifest["sets"]["galgame"]["ids"]
+    manifest["galgame_views"].update({"all": list(gal), "label_box": gal[:80]})
     man = ss.parse_manifest(manifest)
     st = ss.Study(ss.build_corpus(tables, manifest), dict(boot_b=100))
     pending = json.loads(kp.rules_json(kp.rules()))
@@ -571,19 +575,18 @@ def test_kitsune_prereg_rules_feed_the_report():
     def cer(t, k):
         return {"cer": float(ss.stratum_cer(st.point, k)[st.corpus.index(t)])}
 
-    keys = {"eval_jsut": "eval_jsut", "eval_cv8": "eval_cv8", "galgame:neutral": "galgame_neutral"}
-    sidecar = {"selection": {"path": "s.parquet", "sha256": "a" * 64},
-               "manifest": {"path": "m.json", "sha256": "b" * 64}, "extent": {"name": "full", "inputs": {}},
-               "ids_sha256": {"train": "c" * 64, "probe": "d" * 64, "eval": dict(man.sha256)},
-               "n": {"train": 1, "probe": 1, "eval": {s: len(v) for s, v in man.sets.items()}},
-               "galgame_views": {v: {"n": len(ids), "ids_sha256": ids_sha256(ids)} for v, ids in man.views.items()},
-               "draw": {"drawn_s": 3600.0, "pool_s": 7200.0},
-               "baselines": {name: {**{k: cer(t, s) for k, s in keys.items()}, "m4": st.value(t, "m4")}
-                             for name, t in (("cohere", "cohere"), ("parakeet_ctc", "parakeet-ctc"))}}
+    sidecar = tp.fake_sidecar()
+    sidecar["manifest"]["sha256"] = "b" * 64
+    sidecar["ids_sha256"]["eval"] = dict(man.sha256)
+    sidecar["n"]["eval"] = {s: len(v) for s, v in man.sets.items()}
+    sidecar["galgame_views"] = {v: {"n": len(ids), "ids_sha256": ids_sha256(ids), "n_with_ref": len(ids)}
+                                for v, ids in man.views.items()}
+    sidecar["baselines"] = {t: {**{k: cer(t, k) for k in kp.STRATA}, "m4": st.value(t, "m4")} for t in kp.TEACHERS}
+    assert kp.sidecar_problems(sidecar) == []
     filled = json.loads(kp.rules_json(kp.rules(sidecar)))
     assert ss.manifest_check(man, ss.prereg_manifest(filled), "b" * 64)["status"] == "pass"
     chk = ss.teacher_baseline_check(st, ss.prereg_baselines(filled), defaults={})
-    assert chk["status"] == "pass" and len(chk["rows"]) == 8
+    assert chk["status"] == "pass" and len(chk["rows"]) == len(kp.TEACHERS) * (len(kp.STRATA) + 1)
 
 
 def test_run_summaries_in_the_trainer_layout(tmp_path):
