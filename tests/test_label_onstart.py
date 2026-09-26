@@ -19,7 +19,9 @@ VAST = ROOT / "vast"
 def find_bash() -> str | None:  # as test_infra.find_bash
     import shutil
     for cand in (shutil.which("bash"), r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe"):
-        if cand and Path(cand).exists() and "system32" not in cand.lower():  # System32\bash.exe is WSL, not Git Bash
+        # System32\bash.exe and WindowsApps\bash.exe are WSL, not Git Bash: it cannot read the Windows paths the tests
+        # pass (exit 127 from a PowerShell-started pytest)
+        if cand and Path(cand).exists() and not any(w in cand.lower() for w in ("system32", "windowsapps")):
             return cand
     return None
 
