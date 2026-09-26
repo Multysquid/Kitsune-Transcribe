@@ -141,7 +141,9 @@ two boxes that train them (Transcribe first, then Parakeet and the bridge), the 
 LR probe grids and the edge rule, the equal-compute calibration of max_steps, the T/2 branch, the selection and the
 eval manifest, the metric, the noise model and the limit rule: per family, the smallest size whose 4-set CER stays
 within 10 % of the family's largest student. Each box writes the numbers only it can measure
-(`PREREG_numbers_<box>.json`) before its first study step; `tools/study_report.py` computes the answer.
+(`PREREG_numbers_<box>.json`) before its first study step; `tools/study_report.py` computes the answer, checking
+every run against its own box's numbers file (`--numbers` takes all three). `prereg.student_problems` checks a built
+student against its registered counts, seed, init class and calibration ids.
 
 ## Setup
 

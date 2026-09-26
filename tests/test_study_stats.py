@@ -9,6 +9,7 @@ exp(ln 1.1 + 0.0443) = 1.150. The noise model itself is checked by Monte Carlo (
 the bootstrap CI on sampled utterances). The readers of the invalidation checks' inputs are tested on the layouts the
 study really produces: kitsune.prereg's PREREG.json (inline copy of its shape; its own rules() once it is on the
 branch) and the trainer's runs root."""
+import copy
 import hashlib
 import importlib.util
 import json
@@ -591,6 +592,70 @@ def test_kitsune_prereg_rules_feed_the_report():
     assert ss.manifest_check(man, ss.prereg_manifest(filled), "b" * 64)["status"] == "pass"
     chk = ss.teacher_baseline_check(st, ss.prereg_baselines(filled), defaults={})
     assert chk["status"] == "pass" and len(chk["rows"]) == len(kp.TEACHERS) * (len(kp.STRATA) + 1)
+
+
+def test_the_checks_read_every_boxs_numbers_file(tmp_path):
+    """The study writes one numbers file per box (kitsune.prereg.write_numbers: A, B, the replicate from A's); the
+    report reads them all (--numbers DIR) and checks each run against the file of the box that trains it: max_steps
+    over the three files, each box's written_utc against its own runs' starts, every box's probes and calibration
+    (box B's study-t06 is its own entry), and all files written under the committed rules, the replicate's naming A's
+    file by its sha256."""
+    kp = pytest.importorskip("kitsune.prereg")
+    tp = pytest.importorskip("test_prereg")
+    tool = study_tool()
+    study = tmp_path / "study"
+    rules_path = study / kp.RULES_JSON
+    kp.write_rules(study, tp.fake_sidecar())
+    for box, t_ref in (("A", 1.079), ("B", 1.2)):
+        c, probes = tp.calib(box, t_ref=t_ref), tp.chosen_probes(box)
+        kp.write_numbers(study / kp.BOXES[box]["numbers_file"], c, probes, kp.run_lrs(kp.choose_lr(probes), box),
+                         kp.max_steps(c, box=box), box=box, rules_path=rules_path)
+    a_path = study / kp.BOXES["A"]["numbers_file"]
+    steps, lrs, _ = kp.replicate_numbers(a_path)
+    kp.write_numbers(study / kp.BOXES["replicate"]["numbers_file"], {}, {}, lrs, steps, box="replicate",
+                     numbers_from=a_path, rules_path=rules_path)
+    numbers, shas, read = tool.load_numbers([study])
+    assert sorted(numbers) == ["A", "B", "replicate"] and len(read) == 3 and shas["A"] == kp.file_sha256(a_path)
+    assert ss.numbers_by_box(numbers) == numbers and list(ss.numbers_by_box(numbers["B"])) == ["B"]
+
+    numbers["A"]["written_utc"], numbers["B"]["written_utc"] = "2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"
+    ms = {r: m for f in numbers.values() for r, m in f["max_steps"].items()}
+    assert sorted(ms) == sorted(kp.RUNS) and ms["study-t01-s1235"] == ms["study-t01"]
+    summ = {r: {"steps": m, "started_utc": "2026-11-02T00:00:00Z"} for r, m in ms.items()}
+    summ["study-t01-half"] = {"steps": round(0.5 * ms["study-t01"]), "started_utc": "2026-11-03T00:00:00Z"}
+    rules_sha = kp.rules_sha256(rules_path)
+    checks = {c["rule"]: c for c in (ss.max_steps_check(numbers, summ), ss._timing_check(numbers, summ),
+                                     ss.lr_edge_check(numbers), ss.loader_check(numbers),
+                                     ss.numbers_check(numbers, rules_sha, shas))}
+    assert {k: c["status"] for k, c in checks.items()} == dict(
+        max_steps="pass", prereg_timing="pass", lr_edge="pass", loader_bound="pass", numbers="pass")
+    assert set(checks["lr_edge"]["classes"]) == set(kp.PROBES) and checks["lr_edge"]["classes"]["lost"]["box"] == "B"
+    assert "9 calibrated runs" in checks["loader_bound"]["detail"]  # A's 4, B's 5 (study-t06 again), the replicate's 0
+
+    # each run against its own box's file: a box-A run started between A's and B's numbers is fine, a box-B one not
+    early = dict(summ, **{r: dict(summ[r], started_utc="2026-10-15T00:00:00Z") for r in ("study-t03", "study-p03")})
+    t = ss._timing_check(numbers, early)
+    assert t["status"] == "fail" and "['study-p03']" in t["detail"]
+    # box B calibrated study-t06 loader-bound: named as B's entry, not A's
+    lb = copy.deepcopy(numbers)
+    lb["B"]["calibration"]["study-t06"]["data_wait_frac"] = 0.07
+    assert ss.loader_check(lb)["runs"] == {"study-t06 (B)": 0.07}
+    # two files that give one run different max_steps
+    two = copy.deepcopy(numbers)
+    two["B"]["max_steps"]["study-t06"] = ms["study-t06"] + 10
+    c2 = ss.max_steps_check(two, summ)
+    assert c2["status"] == "fail" and "two numbers files" in c2["detail"]
+    assert ss.max_steps_check(two, None)["status"] == "fail"
+    # the files against the rules: another PREREG, a file written under other rules, a replicate from another A file
+    assert ss.numbers_check(numbers, "f" * 64, shas)["status"] == "fail"
+    other = copy.deepcopy(numbers)
+    other["B"]["rules_sha256"] = "e" * 64
+    assert "different rules" in ss.numbers_check(other)["detail"]
+    moved = ss.numbers_check(numbers, rules_sha, dict(shas, A="d" * 64))
+    assert moved["status"] == "fail" and "replicate: takes its numbers from box A's file" in moved["detail"]
+    assert ss.numbers_check({"max_steps": {"study-t06": 9370}})["status"] == "not_checked"  # nothing to compare
+    with pytest.raises(tool.InputError, match="two files of box A"):
+        tool.load_numbers([a_path, study])
 
 
 def test_run_summaries_in_the_trainer_layout(tmp_path):
