@@ -177,7 +177,44 @@ The size study (every default below is the trainer as it was before them; the st
                     checkpoint uploads (local full states for a resume only) - and at the end the training objective
                     teacher-forced on the complete gate sets (lr_probe_eval): an `lr_probe_result` event and
                     summary.json's lr_probe {objective, per_set, lr, max_steps, family}
-RESUME_FIXED also holds bn.mode, loss.aux_ctc_weight, specaug.seed and family.
+  family            "aed" (default: the Cohere-family students above) or "ctc": a Parakeet-family student (a
+                    transformers ParakeetForCTC dir from scripts/03c_build_ctc_student.py) distilled from the Parakeet
+                    teacher's per-frame CTC targets under parakeet_root (STUDY.md 2.1, decisions 15, 22-24). The same run
+                    - schedule, clocks, checkpoints, resume, branch, LR probe, evals, early stop, uploads - with:
+                      model      kitsune.ctc_student.load_ctc_student (sdpa; no decoder, no pos_emb), the rel-pos patch,
+                                 BatchNorm in bn.mode (the pruned P students keep the teacher's stats, frozen)
+                      features   kitsune.ctc_student.ctc_features' LogMel: 80 mel, pre-emphasis 0.97, per-feature
+                                 normalisation, NO dither (the Parakeet extractor has none); SpecAugment masks only
+                      data       frame stores (kitsune.trainset.build_frame_stores; cache dirs ctc_train / ctc_eval /
+                                 ctc_*_sub*: store_dir) of the selection's rows with their parakeet_out targets, built with
+                                 the FRAME PREFLIGHT: every row's decoded audio must give its stored n_frames (decision 15:
+                                 a mismatch is dropped and counted, more than 0.1 % of the train rows or any eval row fails
+                                 the run; a `frame_preflight` event per store, a reused cache's too). The planner packs
+                                 by padded audio (no decoder lengths). The run reads no teacher_out; scripts/05_evaluate.py
+                                 scores a CTC student on the token eval store (build_eval_store's default builds both)
+                      loss       kitsune.ctc_kd: (w_kl x KL on every frame + loss.w_ctc x CTC on the teacher's greedy CTC
+                                 path) / N_u, the CTC target tokens of the whole step (T = 1, no T^2). loss/objective,
+                                 loss/kl (= kl_dense + kl_blank), loss/kl_dense, loss/kl_blank and loss/ctc are per
+                                 target token; ctc/argmax_agree, ctc/argmax_blank (the blank-collapse watch),
+                                 ctc/teacher_blank, ctc/frac_dense and ctc/kl_per_frame per valid frame
+                      evals      kitsune.ctc_eval: one pass gives the teacher-forced frame metrics per set (the eval
+                                 summaries' kl = KL per target token, ce = CTC per target token, top1 = frame argmax
+                                 agreement, plus kl_dense, kl_blank, argmax_blank, teacher_blank, ...) and the greedy CTC
+                                 decode (kitsune.ctc_student.greedy_ctc_ids), scored vs the reference and vs the teacher's
+                                 stored ctc_hyp. The teacher baselines (at start) and the verdict's teacher are Parakeet
+                                 CTC's (ctc_hyp) on the same ids; the combined loss and the LR probe's objective are
+                                 w_kl x KL + w_ctc x CTC per target token
+                      smoke      LogMel vs the Parakeet extractor, the longest micro-batch's forward+backward, padded rows
+                                 vs alone on the frame log-probs, the FLOP count of the CTC model; the memory probe's
+                                 worst case is the micro-batch with the most padded frames (frames x 3073 fp32 logits)
+                      export     step_<N>/ is a ParakeetForCTC dir (bf16 weights, fp32 BN stats) with the Parakeet
+                                 processor and tokenizer, student_meta.json (its `trained` block) and the CC-BY-4.0
+                                 MODEL_CARD.md (kitsune.ctc_student.save_ctc_student); load_ctc_student loads it
+                    loss.w_ctc: the CTC term's weight (0.8, decision 23; the CTC family only; loss.w_kl is shared). The
+                    aux-CTC head (loss.aux_ctc_weight) is an AED option: a CTC student refuses it
+RESUME_FIXED also holds bn.mode, loss.aux_ctc_weight, specaug.seed and family. summary.json carries family,
+selection_sha256 (the selection file's sha256, as its store build hashed it) and started_utc (the run's first start;
+a T/2 branch's own).
 
 Test hook: the environment variable KITSUNE_CRASH_AT_STEP=<n> raises a RuntimeError just before step n (exercises
 the crash path and --resume; it lives in the environment so a resumed run does not inherit it from the config).
@@ -268,6 +305,10 @@ BUCKETS = (("p1_gt_0.99", lambda p1: p1 > 0.99), ("p1_lt_0.9", lambda p1: p1 < 0
 # Defaults = the viability run (configs/viability.json spells out the same values, and turns early_stop on). Paths are
 # relative to the repo root.
 DEFAULTS = {
+    # family: "aed" (a Cohere-family student, CohereAsr AED) or "ctc" (a Parakeet-family student, ParakeetForCTC, on
+    # the frame targets under parakeet_root; the module docstring's "family" entry). A CTC run requires parakeet_root
+    # (below: the local dir with parakeet_out's <src>/<stem>.{npz,jsonl} and meta.json), the one run that reads it
+    "family": "aed",
     "run_name": "viability-b20x2560", "student": "students/b20x2560-d4", "data_root": "data",
     "teacher_root": "teacher_out", "second_root": "second_out", "selection": "selection/viability.parquet",
     "cache_dir": "cache", "runs_root": "runs",
@@ -290,8 +331,8 @@ DEFAULTS = {
     "device": "auto", "autocast": "bfloat16",  # autocast: "bfloat16" or "none" (fp32; the CPU tests)
     # aux_ctc_weight: > 0 adds the training-only aux-CTC head (d_enc -> V + 1, blank V) on the encoder output, trained
     # on the teacher's greedy ids with this weight (the from-scratch students; setup_aux_ctc, kitsune.kd.aux_ctc_loss);
-    # 0 = no head
-    "loss": {"w_kl": 1.0, "w_ce": 0.8, "l2sp_lambda": 0.05, "aux_ctc_weight": 0.0},
+    # 0 = no head. w_ctc: family "ctc" only, the CTC term's weight next to w_kl (decision 23; w_ce is the AED one's)
+    "loss": {"w_kl": 1.0, "w_ce": 0.8, "l2sp_lambda": 0.05, "aux_ctc_weight": 0.0, "w_ctc": 0.8},
     # seed: the SpecAugment masks' seed (null: the run's seed); each micro-batch's masks come from a generator seeded
     # with (seed, step, micro-batch index), so a resumed or branched run augments exactly as its parent would have
     "specaug": {"enabled": True, "freq_masks": 2, "freq_width": 27, "time_masks_min": 2, "time_masks_max": 5,
@@ -381,6 +422,14 @@ LR_PROBE_SETS = tuple(trainset.EVAL_SETS)
 # in ".")
 BRANCH_FREE = ("run_name", "branch.", "hf.", "eval.full_at_fracs", "ckpt.", "log.")
 AUX_CTC_PREFIX = "aux_ctc."  # parameter names of the aux-CTC head (R.param_names; never in exported weights)
+FAMILIES = ("aed", "ctc")  # the student families (config key family; the module docstring)
+# the CTC family's per-utterance and per-step terms (train_step_ctc): kl (= kl_dense + kl_blank) and ctc first, as the
+# AED TERMS start with kl and ce (the non-finite-step event reads the first two), then the frame counts and metrics
+CTC_TERMS = ("kl", "ctc", "argmax_agree", "n_frames", "n_tokens", "kl_dense", "kl_blank", "n_dense", "argmax_blank",
+             "teacher_blank")
+CTC_TAGS = dict(kl="loss/kl", ctc="loss/ctc", kl_dense="loss/kl_dense", kl_blank="loss/kl_blank")  # per target token
+CTC_FRAME_TAGS = dict(argmax_agree="ctc/argmax_agree", argmax_blank="ctc/argmax_blank",
+                      teacher_blank="ctc/teacher_blank", n_dense="ctc/frac_dense")  # per valid frame
 
 
 class ThroughputTooLow(RuntimeError):
@@ -529,9 +578,17 @@ def validate(cfg: dict):
 
 def validate_study(cfg: dict):
     """The size study's keys (bn, loss.aux_ctc_weight, optim.weight_decay, the steps clock's warm-up, the fraction
-    evals and checkpoints, branch, specaug.seed, lr_probe); their defaults are the trainer as it was before them."""
+    evals and checkpoints, branch, specaug.seed, lr_probe, family and loss.w_ctc); their defaults are the trainer as it
+    was before them."""
     sch, ck, ev_cfg = cfg["schedule"], cfg["ckpt"], cfg["eval"]
     steps_clock = sch["clock"] == "steps"
+    if cfg["family"] not in FAMILIES:
+        raise SystemExit(f"family must be one of {', '.join(FAMILIES)}, got {cfg['family']!r}")
+    if not (_number(cfg["loss"]["w_ctc"]) and cfg["loss"]["w_ctc"] >= 0):
+        raise SystemExit(f"loss.w_ctc must be a number >= 0, got {cfg['loss']['w_ctc']!r}")
+    if cfg["family"] == "ctc" and not (isinstance(cfg["parakeet_root"], str) and cfg["parakeet_root"]):
+        raise SystemExit("family 'ctc' needs parakeet_root (the local parakeet_out dir with <src>/<stem>.npz/.jsonl and "
+                         "meta.json)")
     bn = cfg["bn"]
     if bn["mode"] not in BN_MODES:
         raise SystemExit(f"bn.mode must be one of {', '.join(BN_MODES)}, got {bn['mode']!r}")
@@ -543,6 +600,9 @@ def validate_study(cfg: dict):
     for key in ("aux_ctc_weight",):
         if not (_number(cfg["loss"][key]) and cfg["loss"][key] >= 0):
             raise SystemExit(f"loss.{key} must be a number >= 0, got {cfg['loss'][key]!r}")
+    if cfg["family"] == "ctc" and float(cfg["loss"]["aux_ctc_weight"]) > 0:
+        raise SystemExit("loss.aux_ctc_weight is the AED students' aux-CTC head; a CTC student's CTC loss is its main "
+                         "loss (loss.w_ctc): set loss.aux_ctc_weight 0 with family 'ctc'")
     if not (_number(cfg["optim"]["weight_decay"]) and cfg["optim"]["weight_decay"] >= 0):
         raise SystemExit(f"optim.weight_decay must be a number >= 0, got {cfg['optim']['weight_decay']!r}")
     if not (isinstance(sch["warmup_steps"], int) and not isinstance(sch["warmup_steps"], bool)
@@ -643,6 +703,15 @@ def rpath(value) -> Path:
 def bn_mode(cfg: dict) -> str:
     """bn.mode ("frozen" for a config without the key: a unit test's partial config)."""
     return (cfg.get("bn") or {}).get("mode", "frozen")
+
+
+def family(cfg: dict) -> str:
+    """The student family ("aed" for a config without the key: a unit test's partial config, a state from before)."""
+    return cfg.get("family") or "aed"
+
+
+def is_ctc(cfg: dict) -> bool:
+    return family(cfg) == "ctc"
 
 
 def aux_ctc_weight(cfg: dict) -> float:
@@ -843,11 +912,15 @@ class Run:
     vram_cap_gb: float | None = None  # the caching allocator's cap on Windows (cap_vram); None = no cap
     reference: dict | None = None  # eval.reference's per-set CER, read at setup (reference_model); None = none
     aux_ctc: object = None  # the training-only aux-CTC head (setup_aux_ctc; loss.aux_ctc_weight > 0), else None
+    # family "ctc": the teacher text (reference, ctc_hyp) of the eval store and the probe rows, read once per run
+    # (kitsune.ctc_eval.store_text), key -> {id: row}
+    texts: dict = field(default_factory=dict)
     branch_start: bool = False  # this launch starts a T/2 branch from its parent's state (build; not a resume)
     loop_t0: float | None = None
     t_start: float = field(default_factory=time.time)
     # branch: the T/2 branch's schedule (branch_state; None for an ordinary run). fulls_kept: the full states of
-    # ckpt.full_at_fracs, which rotate_full keeps
+    # ckpt.full_at_fracs, which rotate_full keeps. started_utc: the run's first start (train(); a resume keeps it, a T/2
+    # branch sets its own; None in a state saved before it existed)
     st: dict = field(default_factory=lambda: dict(
         step=0, train_s=0.0, smoke_done=False, pre_cooldown_done=False, pre_cooldown_full=None, step0_done=False,
         last_eval_t=0.0, last_eval_step=0, last_weights_t=0.0, last_weights_step=0, last_full_t=0.0,
@@ -855,7 +928,7 @@ class Run:
         oom_skips=0, audio_s=0.0, tokens=0, step_time_s=0.0, smoke_losses=[], smoke_audio_s=0.0, smoke_time_s=0.0,
         smoke_dropped=0, smoke_utts=0, epoch=0, epoch_progress=0.0, resumes=0, weights=[], fulls=[],
         last_objective=None, lr_phase=None, last_eval_epoch=0, total_steps=None, early_stop=early_stop_state(),
-        mini_history=[], branch=None, fulls_kept=[]))
+        mini_history=[], branch=None, fulls_kept=[], started_utc=None))
 
     def clock(self) -> float:
         """Loop clock in seconds: continues across resumes, frozen outside the training loop."""
@@ -1075,13 +1148,21 @@ def hf_roundtrip(R: Run) -> dict:
 def setup_model(R: Run, grad_ckpt: bool, bn_mode: str = "frozen"):
     """Student -> device in fp32, frozen pos_emb, rel-pos patch, BatchNorm in `bn_mode` (the trainer passes bn.mode;
     scripts/05_evaluate.py, which only evaluates, keeps the default "frozen"), bn.momentum, optional
-    checkpointing/compile."""
+    checkpointing/compile. Family "ctc": a ParakeetForCTC dir (kitsune.ctc_student.load_ctc_student, sdpa) - no
+    decoder, so no pos_emb; the rest the same (a pruned P student's BN holds the teacher's stats, frozen by bn.mode
+    "frozen")."""
     from kitsune import student as S
 
     cfg = R.cfg
     sdir = rpath(cfg["student"])
-    model = S.load_student(sdir, R.device, dtype=torch.float32)
-    model.model.decoder.pos_emb.weight.requires_grad_(False)  # fixed sinusoids stored as an Embedding
+    ctc = is_ctc(cfg)
+    if ctc:
+        from kitsune import ctc_student as CS
+
+        model = CS.load_ctc_student(sdir, R.device, dtype=torch.float32)
+    else:
+        model = S.load_student(sdir, R.device, dtype=torch.float32)
+        model.model.decoder.pos_emb.weight.requires_grad_(False)  # fixed sinusoids stored as an Embedding
     if cfg["perf"]["relpos_patch"]:
         patch_relpos_once_per_batch(model)
     train_mode(model, bn_mode)
@@ -1094,8 +1175,11 @@ def setup_model(R: Run, grad_ckpt: bool, bn_mode: str = "frozen"):
             if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
                 m.momentum = float(momentum)
     if cfg["perf"]["compile"]:  # in place: state_dict keys (L2-SP names, checkpoints) stay unchanged
-        model.model.encoder.compile(dynamic=True)
-        model.model.decoder.compile(dynamic=True)
+        if ctc:
+            model.encoder.compile(dynamic=True)
+        else:
+            model.model.encoder.compile(dynamic=True)
+            model.model.decoder.compile(dynamic=True)
     R.model = model
     R.student_meta = S.load_meta(sdir)
     R.bn0 = {n: (m.running_mean.detach().clone(), m.running_var.detach().clone())
@@ -1147,8 +1231,17 @@ def setup_processing(R: Run):
                            f"tokenizer.json and tokenizer_config.json next to the weights): {type(e).__name__}: {e}"
                            ) from e
     fe = R.processor.feature_extractor
-    R.feat_eval = LogMel.from_feature_extractor(fe).to(R.device)
-    R.feat_train = LogMel.from_feature_extractor(fe, exact_dither=R.cfg["perf"]["train_exact_dither"]).to(R.device)
+    if is_ctc(R.cfg):
+        # the ParakeetFeatureExtractor path (kitsune.ctc_student.ctc_features: its filterbank, 80 mel, pre-emphasis
+        # 0.97, per-feature normalisation, no dither; ValueError for another extractor): the frames the targets were
+        # made on. No dither, so the train and eval featurisers are the same computation
+        from kitsune.ctc_student import ctc_features
+
+        R.feat_eval = ctc_features(sdir, R.device).logmel
+        R.feat_train = ctc_features(sdir, R.device).logmel
+    else:
+        R.feat_eval = LogMel.from_feature_extractor(fe).to(R.device)
+        R.feat_train = LogMel.from_feature_extractor(fe, exact_dither=R.cfg["perf"]["train_exact_dither"]).to(R.device)
     R.tokenizer = R.processor.tokenizer
     R.specaug = SpecAugment(**{k: v for k, v in R.cfg["specaug"].items() if k not in ("enabled", "seed")})
     R.gen = torch.Generator(device=R.device)  # re-seeded for every micro-batch (specaug_seed)
@@ -1386,16 +1479,20 @@ def _subset_dir(prefix: str, budget_s: float, seed: int, ids: list[str]) -> str:
 
 
 def train_store_spec(cfg: dict, log) -> tuple[str, list[str] | None]:
-    """The train store setup_data builds: its cache dir name under cache_dir and the ids it holds (None: every kept
-    train row of cfg["sources"]). subset.train_audio_s draws a seeded duration subset (a `subset` event with every
-    id), subset.train_utts a seeded one that starts with probe rows. scripts/05_evaluate.py takes its probe rows from
-    the same ids."""
+    """The train store setup_data builds: its name under cache_dir and the ids it holds (None: every kept train row of
+    cfg["sources"]). subset.train_audio_s draws a seeded duration subset (a `subset` event with every id; the name
+    carries the ids' hash), subset.train_utts a seeded one that starts with probe rows. scripts/05_evaluate.py takes
+    its probe rows from the same ids and packs them into TOKEN stores named after this name. Family "ctc": a duration
+    subset draws from every row (the frame planner excludes none), and the frame store lives under
+    store_dir(cfg, name) = cache_dir/"ctc_"<name>, so a token store built under the plain name (05's) never touches
+    it."""
     sel, teach = rpath(cfg["selection"]), rpath(cfg["teacher_root"])
     sub, seed = cfg["subset"], int(cfg["seed"])
     if sub["train_audio_s"] is not None:
         rows = trainset.read_selection(sel, cfg["sources"], ["train"])
-        prompt_len = len(trainset._teacher_meta(teach)["prompt"])
-        rows = rows[rows["n_tok"] + prompt_len - 1 <= int(cfg["batch"]["max_dec_len"])]  # what the planner can use
+        if not is_ctc(cfg):
+            prompt_len = len(trainset._teacher_meta(teach)["prompt"])
+            rows = rows[rows["n_tok"] + prompt_len - 1 <= int(cfg["batch"]["max_dec_len"])]  # what the planner can use
         ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["train_audio_s"]),
                                 np.random.default_rng([seed, 11]))
         log.event("subset", split="train", sources=cfg["sources"], seed=seed, pool=len(rows), **rec)
@@ -1410,20 +1507,18 @@ def train_store_spec(cfg: dict, log) -> tuple[str, list[str] | None]:
     return "train", None
 
 
-def build_eval_store(cfg: dict, log) -> trainset.Stores:
-    """The eval store of cfg["eval_sets"] (cached under cache_dir, shared with 03's eval cache): every kept eval row,
-    or the seeded subset subset.eval_audio_s (pooled over the sets; a `subset` event) or subset.eval_utts_per_set
-    asks for. setup_data's, and scripts/05_evaluate.py's."""
-    sel, data, teach, cache = (rpath(cfg["selection"]), rpath(cfg["data_root"]), rpath(cfg["teacher_root"]),
-                               rpath(cfg["cache_dir"]))
+def eval_store_spec(cfg: dict, log) -> tuple[str, list[str] | None]:
+    """The eval store's name under cache_dir and the ids it holds (None: every kept row of cfg["eval_sets"]): the
+    seeded subset subset.eval_audio_s (pooled over the sets; a `subset` event) or subset.eval_utts_per_set asks for.
+    Both families' eval stores of a config hold these rows (the frame store under store_dir's "ctc_" name)."""
+    sel = rpath(cfg["selection"])
     sub, seed = cfg["subset"], int(cfg["seed"])
     if sub["eval_audio_s"] is not None:  # pooled over the eval sets
         rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
         ids, rec = audio_subset(rows["id"].tolist(), rows["duration"].to_numpy(), float(sub["eval_audio_s"]),
                                 np.random.default_rng([seed, 12]))
         log.event("subset", split="eval", sources=cfg["eval_sets"], seed=seed, pool=len(rows), **rec)
-        return trainset.build_stores(sel, data, teach, cache / _subset_dir("eval", rec["budget_s"], seed, ids),
-                                     cfg["eval_sets"], ["eval"], ids=ids, log=print)
+        return _subset_dir("eval", rec["budget_s"], seed, ids), ids
     if sub["eval_utts_per_set"]:
         n = int(sub["eval_utts_per_set"])
         rows = trainset.read_selection(sel, cfg["eval_sets"], ["eval"])
@@ -1433,9 +1528,72 @@ def build_eval_store(cfg: dict, log) -> trainset.Stores:
             r = rows[rows["source"] == s]
             greedy = _seeded_ids(r["id"][r["in_greedy_subset"]].tolist(), min(n, int(cfg["eval"]["greedy_subset"])), rng)
             ids += greedy + _seeded_ids(r["id"][~r["id"].isin(greedy)].tolist(), max(0, n - len(greedy)), rng)
-        return trainset.build_stores(sel, data, teach, cache / f"eval_sub{n}_s{seed}", cfg["eval_sets"], ["eval"],
-                                     ids=ids, log=print)
-    return trainset.eval_store(sel, data, teach, cache / "eval", cfg["eval_sets"], log=print)
+        return f"eval_sub{n}_s{seed}", ids
+    return "eval", None
+
+
+FRAME_STORE_PREFIX = "ctc_"  # a frame store's cache dir: this + the token store's name (store_dir)
+
+
+def store_dir(cfg: dict, name: str, frames: bool | None = None) -> Path:
+    """The cache dir of the store `name` (train_store_spec's / eval_store_spec's): cache_dir/<name> for a token store,
+    cache_dir/ctc_<name> for a frame store (frames None: the run's family's). The two kinds of one config's rows never
+    share a directory: they share cache_dir on the study box, and a build of the other kind would replace the files."""
+    frames = is_ctc(cfg) if frames is None else frames
+    return rpath(cfg["cache_dir"]) / ((FRAME_STORE_PREFIX if frames else "") + name)
+
+
+def _store(cfg: dict, name: str, sources: list[str], split: str, ids: list[str] | None = None, log=None, *,
+           frames: bool) -> trainset.Stores:
+    """One store: a token store (kitsune.trainset.build_stores, teacher_root) or a frame store with its frame preflight
+    (build_frame_stores, parakeet_root; family "ctc" only), under store_dir. A preflight that fails the build is logged
+    as a `frame_preflight` event (ok false, its counts) before it stops the run."""
+    sel, data = rpath(cfg["selection"]), rpath(cfg["data_root"])
+    where = store_dir(cfg, name, frames)
+    if not frames:
+        return trainset.build_stores(sel, data, rpath(cfg["teacher_root"]), where, sources, [split], ids=ids, log=print)
+    if not is_ctc(cfg):
+        raise ValueError(f"a frame store is family ctc's: this config's family is {family(cfg)!r}")
+    try:
+        return trainset.build_frame_stores(sel, data, rpath(cfg["parakeet_root"]), where, sources, [split], ids=ids,
+                                           log=print)
+    except trainset.FramePreflightFailed as e:
+        if log is not None:
+            log.event("frame_preflight", store=split, **e.report)
+        raise
+
+
+def log_frame_preflight(log, split: str, store: trainset.Stores):
+    """The `frame_preflight` event of a frame store (its build's report, stores.json's; `reused` when this run did not
+    build it): decision 15's counts - rows checked, mismatches dropped per split, undecodable rows, the train share
+    against its limit."""
+    rep = dict(store.info.get("frame_preflight") or {})
+    rep.pop("mismatches", None)  # the dropped ids are in `dropped` (and every one in stores.json)
+    log.event("frame_preflight", store=split, reused=bool(store.info.get("reused")), built=store.info.get("created"),
+              **rep)
+
+
+def build_train_store(cfg: dict, log) -> trainset.Stores:
+    """The train store of cfg["sources"] (cached under cache_dir): train_store_spec's rows, of the run's family (family
+    "ctc": the frame store, under store_dir). setup_data's; the box's store step builds it ahead of the runs."""
+    name, ids = train_store_spec(cfg, log)
+    return _store(cfg, name, cfg["sources"], "train", ids=ids, log=log, frames=is_ctc(cfg))
+
+
+def build_eval_store(cfg: dict, log, frames: bool | None = None) -> trainset.Stores:
+    """The eval store of cfg["eval_sets"] (cached under cache_dir, shared with 03's eval cache): eval_store_spec's rows.
+      frames None  (the default: scripts/05_evaluate.py's and the box's store step, kitsune/study_queue.py) the TOKEN
+                   store (teacher_root), the one the evaluator scores every system on, of either family and in either
+                   evaluator path (its CTC eval takes the frame targets from parakeet_out itself), and the speed
+                   probe's cache/eval. For a family-ctc config the trainer's frame store of the same rows is built (or
+                   reused) first, so this one call pre-builds every eval store the config's runs and evals open: a box
+                   must never leave it to runs that start in parallel (a store build takes no lock).
+      frames True  the frame store alone, with its frame preflight (family ctc: setup_data's)
+      frames False the token store alone"""
+    name, ids = eval_store_spec(cfg, log)
+    if frames is None and is_ctc(cfg):
+        _store(cfg, name, cfg["eval_sets"], "eval", ids=ids, log=log, frames=True)
+    return _store(cfg, name, cfg["eval_sets"], "eval", ids=ids, log=log, frames=bool(frames))
 
 
 def probe_greedy_subset(cfg: dict, probe_ids: list[str], duration: dict[str, float], log) -> list[str]:
@@ -1472,11 +1630,13 @@ def greedy_subset_ids(cfg: dict, evalstore) -> list[str]:
 def setup_data(R: Run):
     """Train/eval stores (cached under cache_dir, shared with 03's eval cache), probe and greedy ids, planner."""
     cfg, log = R.cfg, R.log
-    sel, data, teach, cache = rpath(cfg["selection"]), rpath(cfg["data_root"]), rpath(cfg["teacher_root"]), rpath(cfg["cache_dir"])
     t0 = time.time()
-    name, ids = train_store_spec(cfg, log)
-    R.train = trainset.build_stores(sel, data, teach, cache / name, cfg["sources"], ["train"], ids=ids, log=print)
-    R.evalstore = build_eval_store(cfg, log)
+    R.train = build_train_store(cfg, log)
+    if is_ctc(cfg):  # decision 15's counts of each store (a reused cache's too), before the next one is built
+        log_frame_preflight(log, "train", R.train)
+    R.evalstore = build_eval_store(cfg, log, frames=is_ctc(cfg))  # never the token store a ctc run does not read
+    if is_ctc(cfg):
+        log_frame_preflight(log, "eval", R.evalstore)
 
     if cfg["eval"]["probe"] and cfg["eval"]["probe_is_train"]:
         R.probe_ids = [u.id for u in R.train.utts]
@@ -1490,7 +1650,7 @@ def setup_data(R: Run):
     R.probe_greedy_ids = probe_greedy_subset(cfg, R.probe_ids, {u.id: u.duration for u in R.train.utts}, log)
     R.greedy_ids = greedy_subset_ids(cfg, R.evalstore)
     R.mini_val_ids, R.mini_train_ids = mini_subsets(R)
-    R.ds = trainset.AudioBatchDataset(R.train)
+    R.ds = trainset.dataset_for(R.train)  # FrameBatchDataset for a frame store (family "ctc")
     R.src_index = {s: i for i, s in enumerate(sorted({u.source for u in R.train.utts}))}
     log.event("data", train_utts=len(R.train), train_h=round(R.train.hours, 3),
               per_source=R.train.info.get("per_source"), dropped=R.train.info.get("dropped"),
@@ -1540,11 +1700,14 @@ def mini_subsets(R: Run) -> tuple[list[str], list[str]]:
 
 
 def make_planner(R: Run, micro_audio_s: float) -> trainset.StepPlanner:
+    """The step planner over the train store; family "ctc" plans frames (max_dec_len None: no decoder to bound,
+    micro-batches cut by padded audio alone; batch.max_dec_len is unused)."""
     b, mix = R.cfg["batch"], R.cfg["mix"]
     weights = None if mix in (None, "natural") else mix
     return trainset.StepPlanner(R.train.utts, step_audio_s=b["step_audio_s"], micro_audio_s=micro_audio_s,
-                                max_dec_len=b["max_dec_len"], pool_micro=b["pool_micro"], seed=int(R.cfg["seed"]),
-                                weights=weights, prompt_len=len(R.train.info.get("prompt", trainset.PROMPT)))
+                                max_dec_len=None if is_ctc(R.cfg) else b["max_dec_len"], pool_micro=b["pool_micro"],
+                                seed=int(R.cfg["seed"]), weights=weights,
+                                prompt_len=len(R.train.info.get("prompt", trainset.PROMPT)))
 
 
 def plan_epochs(R: Run):
@@ -1599,6 +1762,40 @@ def forward_logits(R: Run, mb: dict, featurizer, gen=None, capture: dict | None 
     return logits, rows, mfrac, (enc, enc_len)
 
 
+def forward_ctc(R: Run, mb: dict, featurizer, gen=None, capture: dict | None = None):
+    """Family "ctc": the student's frame log-probs of a FrameBatchDataset micro-batch - LogMel (fp32), SpecAugment if
+    `gen` (masks only: nothing may change the frame count), the encoder under autocast, the CTC head in fp32 outside it,
+    log-softmax in fp32 (kitsune.ctc_student.ctc_log_probs). Returns (log_probs (B, T, V), the student's valid frames
+    per row (B,), masked_frac or None). T may exceed the batch's longest n_frames by the padding's frame; the loss cuts
+    it (kitsune.ctc_kd)."""
+    from kitsune.ctc_student import ctc_log_probs
+
+    dev = R.device
+    feats, fmask = featurizer(mb["wave"].to(dev, non_blocking=True), mb["lengths"].to(dev, non_blocking=True))
+    mfrac = None
+    if gen is not None:
+        feats, mfrac = R.specaug(feats, fmask, gen)
+    hooks = []
+    if capture is not None:
+        for name, mod in capture.pop("_modules", []):
+            hooks.append(mod.register_forward_hook(_capture_hook(capture, name)))
+    try:
+        with R.autocast():
+            lp, n_frames = ctc_log_probs(R.model, feats, fmask)
+    finally:
+        for hk in hooks:
+            hk.remove()
+    return lp, n_frames, mfrac
+
+
+def ctc_frame_batch(mb: dict) -> dict:
+    """The frame targets of a FrameBatchDataset micro-batch, as kitsune.ctc_kd.ctc_kd_losses reads them (it moves them
+    to the log-probs' device)."""
+    from kitsune.ctc_eval import frame_batch
+
+    return frame_batch(mb)
+
+
 def aux_ctc_sum(R: Run, enc: tuple, mb: dict) -> torch.Tensor:
     """The aux-CTC loss of one micro-batch, summed over its rows (kitsune.kd.aux_ctc_loss): R.aux_ctc on the encoder
     output of forward_logits(with_encoder=True), in fp32 outside autocast as the LM head, blank = the head's last class,
@@ -1624,6 +1821,10 @@ def _capture_hook(store: dict, name: str):
 
 
 def activation_modules(model) -> list[tuple[str, torch.nn.Module]]:
+    if not hasattr(model, "model"):  # a ParakeetForCTC (family "ctc"): the encoder only
+        enc = model.encoder.layers
+        return [("encoder.subsampling", model.encoder.subsampling)] + [
+            (f"encoder.layers.{i}", enc[i]) for i in sorted({0, len(enc) // 2, len(enc) - 1})]
     enc, dec = model.model.encoder.layers, model.model.decoder.layers
     out = [("encoder.subsampling", model.model.encoder.subsampling)]
     out += [(f"encoder.layers.{i}", enc[i]) for i in sorted({0, len(enc) // 2, len(enc) - 1})]
@@ -1658,9 +1859,63 @@ def _put_back(saved: list[tuple[torch.Tensor, torch.Tensor]]):
         buf.copy_(keep)
 
 
+def optimizer_update(R: Run, step: int, lr: float, stats_step: bool, hist_step: bool, capture: dict | None,
+                     bn_keep: list, nonfinite_fields) -> dict | None:
+    """The part of an optimizer step after its backward passes, the same for both families: per-module gradient norms
+    and gradient histograms (stats / hist steps), clipping (the pre-clip norm), AdamW, the decoupled L2-SP pull (on the
+    host masters and pushed under offload), update ratios, weight and activation histograms and the BN drift check,
+    then the gradients freed. A non-finite gradient norm skips the step instead: gradients dropped, the BN running
+    stats put back (bn_keep), a `nonfinite_grad_skipped` event with nonfinite_fields()'s culprit fields, and
+    FloatingPointError after optim.max_nonfinite_skips in a row; returns None. Else the start of the step's
+    statistics (grad_norm and clip coefficient are the caller's to add)."""
+    cfg = R.cfg
+    out: dict = {}
+    if stats_step:
+        out["grad_sq_by_module"] = _grad_sq_by_module(R)
+        before = [p.detach().clone() for p in _weights(R)]  # offload: the host masters, not a second model on the GPU
+    if hist_step:
+        _grad_hists(R, step)
+    clip = cfg["optim"]["clip"]
+    gnorm = torch.nn.utils.clip_grad_norm_(R.params, clip if clip else float("inf"), foreach=True)
+    gnorm = float(gnorm)
+    if not math.isfinite(gnorm):
+        R.opt.zero_grad(set_to_none=True)
+        _put_back(bn_keep)
+        R.st["nonfinite_skips"] += 1
+        R.st["nonfinite_total"] += 1
+        R.log.event("nonfinite_grad_skipped", at_step=step, grad_norm=gnorm, consecutive=R.st["nonfinite_skips"],
+                    **nonfinite_fields(), **({"bn_stats_restored": True} if bn_keep else {}))
+        if R.st["nonfinite_skips"] > int(cfg["optim"]["max_nonfinite_skips"]):
+            raise FloatingPointError(f"{R.st['nonfinite_skips']} consecutive steps with a non-finite gradient norm")
+        return None
+    R.st["nonfinite_skips"] = 0
+    R.opt.step()
+    if offloaded(R):  # L2-SP on the host masters, its value from the same pass (a second one costs ~1 s), then push
+        out["l2sp"] = float(R.l2sp.apply_(lr, value=True))
+        R.opt.push()
+    else:
+        R.l2sp.apply_(lr)
+    if stats_step:  # ||delta theta|| / ||theta|| per module, the L2-SP pull included
+        diffs = torch._foreach_sub([p.detach() for p in _weights(R)], before)
+        dn = _by_module(R, _sq_norms(diffs))
+        del diffs, before
+        pn = _by_module(R, _sq_norms([p.detach() for p in _weights(R)]))
+        out["update_ratio"] = {k: math.sqrt(dn[k] / pn[k]) if pn[k] > 0 else float("nan") for k in dn}
+    if hist_step:
+        _weight_hists(R, step)
+        for name, t in (capture or {}).items():
+            R.log.hist(f"act/{name}", t, step)
+        _bn_drift_check(R, step)
+    R.opt.zero_grad(set_to_none=True)
+    out["grad_norm"], out["clip_coef"] = gnorm, min(1.0, clip / (gnorm + 1e-6)) if clip else 1.0
+    return out
+
+
 def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dict | None:
     """One optimizer step over its micro-batches. Returns the step's CPU statistics, or None if it was skipped
-    (non-finite gradient norm or OOM; the planner position still moves on)."""
+    (non-finite gradient norm or OOM; the planner position still moves on). Family "ctc": train_step_ctc."""
+    if is_ctc(R.cfg):
+        return train_step_ctc(R, step, lr, mbs, epoch)
     cfg, dev = R.cfg, R.device
     lg = cfg["log"]
     dropped = [i for mb in mbs for i in mb["dropped"]]  # before the filter: a micro-batch can lose all its rows
@@ -1752,52 +2007,19 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
                                          f"{cfg['memory']['max_oom_skips']}); last: {oom}")
         return None
 
-    out: dict = {}
-    if stats_step:
-        out["grad_sq_by_module"] = _grad_sq_by_module(R)
-        before = [p.detach().clone() for p in _weights(R)]  # offload: the host masters, not a second model on the GPU
-    if hist_step:
-        _grad_hists(R, step)
-    clip = cfg["optim"]["clip"]
-    gnorm = torch.nn.utils.clip_grad_norm_(R.params, clip if clip else float("inf"), foreach=True)
-    gnorm = float(gnorm)
-    if not math.isfinite(gnorm):
-        R.opt.zero_grad(set_to_none=True)
-        _put_back(bn_keep)
-        R.st["nonfinite_skips"] += 1
-        R.st["nonfinite_total"] += 1
+    def nonfinite_fields() -> dict:
         # everything needed to find the culprit afterwards: the step's ids per micro-batch, each micro-batch's loss
         # sums, and the utterances whose own loss is non-finite (empty if only the backward overflowed)
         pus = [pu.cpu() for pu in per_utt]
         bad = [mb["ids"][b] for (mb, _), pu in zip(meta, pus) for b in range(len(mb["ids"]))
                if not bool(torch.isfinite(pu[b, :2]).all())]
-        R.log.event("nonfinite_grad_skipped", at_step=step, grad_norm=gnorm, consecutive=R.st["nonfinite_skips"],
-                    nonfinite_ids=bad, ids=[mb["ids"] for mb in mbs],
+        return dict(nonfinite_ids=bad, ids=[mb["ids"] for mb in mbs],
                     mb_n_tok=[int(mb["top_idx"].shape[0]) for mb in mbs],
-                    mb_kl_sum=[float(pu[:, 0].sum()) for pu in pus], mb_ce_sum=[float(pu[:, 1].sum()) for pu in pus],
-                    **({"bn_stats_restored": True} if bn_keep else {}))
-        if R.st["nonfinite_skips"] > int(cfg["optim"]["max_nonfinite_skips"]):
-            raise FloatingPointError(f"{R.st['nonfinite_skips']} consecutive steps with a non-finite gradient norm")
+                    mb_kl_sum=[float(pu[:, 0].sum()) for pu in pus], mb_ce_sum=[float(pu[:, 1].sum()) for pu in pus])
+
+    out = optimizer_update(R, step, lr, stats_step, hist_step, capture, bn_keep, nonfinite_fields)
+    if out is None:
         return None
-    R.st["nonfinite_skips"] = 0
-    R.opt.step()
-    if offloaded(R):  # L2-SP on the host masters, its value from the same pass (a second one costs ~1 s), then push
-        out["l2sp"] = float(R.l2sp.apply_(lr, value=True))
-        R.opt.push()
-    else:
-        R.l2sp.apply_(lr)
-    if stats_step:  # ||delta theta|| / ||theta|| per module, the L2-SP pull included
-        diffs = torch._foreach_sub([p.detach() for p in _weights(R)], before)
-        dn = _by_module(R, _sq_norms(diffs))
-        del diffs, before
-        pn = _by_module(R, _sq_norms([p.detach() for p in _weights(R)]))
-        out["update_ratio"] = {k: math.sqrt(dn[k] / pn[k]) if pn[k] > 0 else float("nan") for k in dn}
-    if hist_step:
-        _weight_hists(R, step)
-        for name, t in (capture or {}).items():
-            R.log.hist(f"act/{name}", t, step)
-        _bn_drift_check(R, step)
-    R.opt.zero_grad(set_to_none=True)
 
     # one host transfer for the step's statistics
     flat = torch.cat([tot, by_src.flatten(), n_src, by_bucket.flatten(), n_bucket, aux_sum.reshape(1)]).cpu().numpy()
@@ -1810,9 +2032,8 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
         return v
 
     out.update(tot=take(nt), by_src=take(S * nt).reshape(S, nt), n_src=take(S), by_bucket=take(len(BUCKETS) * nt)
-               .reshape(len(BUCKETS), nt), n_bucket=take(len(BUCKETS)), n_tok=n_tok, grad_norm=gnorm,
-               audio_real=audio_real, audio_pad=audio_pad, dec_real=dec_real, dec_pad=dec_pad, n_micro=len(mbs),
-               clip_coef=min(1.0, clip / (gnorm + 1e-6)) if clip else 1.0)
+               .reshape(len(BUCKETS), nt), n_bucket=take(len(BUCKETS)), n_tok=n_tok, audio_real=audio_real,
+               audio_pad=audio_pad, dec_real=dec_real, dec_pad=dec_pad, n_micro=len(mbs))
     aux_step = float(take(1)[0])
     if w_aux > 0:  # per target token, as loss/kl and loss/ce
         out["aux_ctc"] = aux_step / n_tok
@@ -1825,6 +2046,131 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
             utts.append(dict(step=step, epoch=epoch, id=mb["ids"][b], source=mb["sources"][b],
                              duration=float(mb["durations"][b]), n_tok=int(n[b]), kl=float(pu[b, 0] / n[b]),
                              ce=float(pu[b, 1] / n[b]), top1_acc=float(pu[b, 2] / n[b]), masked_frac=float(mf[b]),
+                             agree=float(mb["agree"][b]), attempt=R.st["resumes"]))
+    out["utts"] = utts
+    out["masked_frac"] = float(np.concatenate(masked).mean()) if masked else float("nan")
+    out["dropped"] = len(dropped)
+    out["n_utts"] = len(utts)
+    return out
+
+
+def ctc_terms(losses: dict) -> torch.Tensor:
+    """kitsune.ctc_kd.ctc_kd_losses(per_utt=True)'s vectors as a (B, len(CTC_TERMS)) float matrix (kl = kl_dense +
+    kl_blank), detached."""
+    cols = {"kl": losses["kl_dense"] + losses["kl_blank"], "n_tokens": losses["n_tokens"]}
+    return torch.stack([(cols[k] if k in cols else losses[k]).detach().float() for k in CTC_TERMS], dim=1)
+
+
+def ctc_step_loss(R: Run, mb: dict, featurizer, n_tok_step: int, gen=None, capture: dict | None = None):
+    """One micro-batch's share of a CTC step's loss: forward_ctc, then kitsune.ctc_kd.ctc_kd_losses per utterance
+    against the micro-batch's frame targets, and ctc_kd_objective = (w_kl (KL dense + KL blank) + w_ctc CTC) / the
+    STEP's N_u (n_tok_step), so the micro-batches' losses add up to the step's. Returns (loss, the per-utterance
+    losses, masked_frac or None). train_step_ctc's and fwd_bwd's; the loss-parity test checks it against the library."""
+    from kitsune.ctc_kd import ctc_kd_losses, ctc_kd_objective
+
+    lp, _, mfrac = forward_ctc(R, mb, featurizer, gen=gen, capture=capture)
+    losses = ctc_kd_losses(lp, ctc_frame_batch(mb), per_utt=True)
+    lp = None
+    return ctc_kd_objective(losses, n_tok_step, R.cfg["loss"]["w_kl"], R.cfg["loss"]["w_ctc"]), losses, mfrac
+
+
+def train_step_ctc(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dict | None:
+    """train_step of family "ctc": every micro-batch's forward, CTC-KD loss over the step's N_u (the CTC target tokens
+    of all its micro-batches: ctc_step_loss) and backward, then optimizer_update. The step's statistics are the sums of
+    CTC_TERMS over the step, per source and per utterance (train_utts: n_tok = U, kl and ce = its KL and CTC per target
+    token - per 1 for a silent one -, top1_acc = its frame argmax agreement). Skipped (None) for OOM or a non-finite
+    gradient norm, as train_step."""
+    cfg, dev = R.cfg, R.device
+    lg = cfg["log"]
+    dropped = [i for mb in mbs for i in mb["dropped"]]
+    if dropped:
+        R.log.event("dropped_audio", at_step=step, n=len(dropped), ids=dropped)
+    mb_index = [j for j, mb in enumerate(mbs) if len(mb["ids"])]
+    mbs = [mb for mb in mbs if len(mb["ids"])]
+    if not mbs:
+        R.log.event("empty_step", at_step=step)
+        return None
+    n_tok = sum(int(mb["n_tok"].sum()) for mb in mbs)
+    for g in R.opt.param_groups:
+        g["lr"] = lr
+    bn_keep = [(b, b.clone()) for b in bn_running_stats(R.model)] if bn_mode(cfg) == "train" else []
+    stats_step = lg["layer_stats_every"] and step % int(lg["layer_stats_every"]) == 0
+    hist_step = lg["hist_every"] and step % int(lg["hist_every"]) == 0
+    capture = {"_modules": activation_modules(R.model)} if hist_step else None
+    S, nt = len(R.src_index), len(CTC_TERMS)
+    tot = torch.zeros(nt, device=dev)
+    by_src = torch.zeros(S, nt, device=dev)
+    n_src = torch.zeros(S, device=dev)
+    per_utt, meta = [], []
+    audio_real = audio_pad = 0.0
+    loss = losses = oom = None
+    gen = R.gen if cfg["specaug"]["enabled"] else None
+    j = -1
+    try:
+        for j, mb in enumerate(mbs):
+            if gen is not None:
+                gen.manual_seed(specaug_seed(cfg, step, mb_index[j]))
+            loss, losses, mfrac = ctc_step_loss(R, mb, R.feat_train, n_tok, gen=gen,
+                                                capture=capture if j == 0 else None)
+            loss.backward()
+            with torch.no_grad():
+                T = ctc_terms(losses)  # (B, nt)
+                sidx = torch.tensor([R.src_index[s] for s in mb["sources"]], device=dev)
+                tot += T.sum(0)
+                by_src.index_add_(0, sidx, T)
+                n_src += torch.bincount(sidx, minlength=S).float()
+                per_utt.append(T)
+                B = len(mb["ids"])
+                meta.append((mb, mfrac.detach() if mfrac is not None else torch.zeros(B, device=dev)))
+            lens = mb["lengths"]
+            audio_real += float(lens.sum()) / SR
+            audio_pad += float(lens.max()) * len(lens) / SR
+            loss = losses = None
+    except torch.OutOfMemoryError as e:
+        oom = str(e)[:500]
+    if oom is not None:  # outside the except: its traceback no longer pins the step's activations
+        loss = losses = None
+        per_utt.clear()
+        meta.clear()
+        R.opt.zero_grad(set_to_none=True)
+        _put_back(bn_keep)
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+        R.st["oom_skips"] += 1
+        R.log.event("oom_step_skipped", at_step=step, n_micro=len(mbs), at_micro=j, audio_pad_s=round(audio_pad, 1),
+                    count=R.st["oom_skips"], error=oom, ids=[mb["ids"] for mb in mbs],
+                    padded_s=[round(float(mb["lengths"].max()) * len(mb["ids"]) / SR, 1) for mb in mbs],
+                    padded_frames=[int(mb["n_frames"].max()) * len(mb["ids"]) for mb in mbs],
+                    **({"bn_stats_restored": True} if bn_keep else {}))
+        if R.st["oom_skips"] > int(cfg["memory"]["max_oom_skips"]):
+            raise torch.OutOfMemoryError(f"{R.st['oom_skips']} steps skipped for OOM (limit "
+                                         f"{cfg['memory']['max_oom_skips']}); last: {oom}")
+        return None
+
+    def nonfinite_fields() -> dict:
+        pus = [pu.cpu() for pu in per_utt]
+        bad = [mb["ids"][b] for (mb, _), pu in zip(meta, pus) for b in range(len(mb["ids"]))
+               if not bool(torch.isfinite(pu[b, :2]).all())]
+        return dict(nonfinite_ids=bad, ids=[mb["ids"] for mb in mbs], mb_n_tok=[int(mb["n_tok"].sum()) for mb in mbs],
+                    mb_kl_sum=[float(pu[:, 0].sum()) for pu in pus], mb_ctc_sum=[float(pu[:, 1].sum()) for pu in pus])
+
+    out = optimizer_update(R, step, lr, stats_step, hist_step, capture, bn_keep, nonfinite_fields)
+    if out is None:
+        return None
+    flat = torch.cat([tot, by_src.flatten(), n_src]).cpu().numpy()  # one host transfer for the step's statistics
+    out.update(tot=flat[:nt], by_src=flat[nt:nt + S * nt].reshape(S, nt), n_src=flat[nt + S * nt:], n_tok=n_tok,
+               audio_real=audio_real, audio_pad=audio_pad, n_micro=len(mbs))
+    col = {k: i for i, k in enumerate(CTC_TERMS)}
+    utts, masked = [], []
+    for (mb, mf), pu in zip(meta, per_utt):
+        pu, mf = pu.cpu().numpy(), mf.float().cpu().numpy()
+        masked.append(mf)
+        for b in range(len(mb["ids"])):
+            u, fr = max(float(pu[b, col["n_tokens"]]), 1.0), max(float(pu[b, col["n_frames"]]), 1.0)
+            utts.append(dict(step=step, epoch=epoch, id=mb["ids"][b], source=mb["sources"][b],
+                             duration=float(mb["durations"][b]), n_tok=int(pu[b, col["n_tokens"]]),
+                             kl=float(pu[b, col["kl"]] / u), ce=float(pu[b, col["ctc"]] / u),
+                             top1_acc=float(pu[b, col["argmax_agree"]] / fr), masked_frac=float(mf[b]),
                              agree=float(mb["agree"][b]), attempt=R.st["resumes"]))
     out["utts"] = utts
     out["masked_frac"] = float(np.concatenate(masked).mean()) if masked else float("nan")
@@ -1883,18 +2229,28 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
     combined-loss chart next to combined_loss/val (kitsune.evaluate.combined_loss, the same quantity on the gate sets).
     It is measured on the step's augmented audio (SpecAugment on its log-mel features, under specaug.enabled) in train
     mode, with the weights before this step's update; the val points are un-augmented, in eval mode. That difference
-    is the point of a train curve (what the optimizer sees), not something to correct."""
+    is the point of a train curve (what the optimizer sees), not something to correct.
+    Family "ctc": the objective is w_kl * KL + w_ctc * CTC per CTC target token (N_u), logged with loss/kl (= kl_dense
+    + kl_blank), loss/kl_dense, loss/kl_blank and loss/ctc per target token, and the frame metrics ctc/argmax_agree,
+    ctc/argmax_blank, ctc/teacher_blank, ctc/frac_dense, ctc/kl_per_frame per valid frame (ctc_step_rows)."""
     from kitsune.runlog import system_stats
 
     cfg = R.cfg
+    ctc = is_ctc(cfg)
     n_tok = out["n_tok"]
     tot = out["tot"]
-    w_kl, w_ce = cfg["loss"]["w_kl"], cfg["loss"]["w_ce"]
-    kl, ce = tot[0] / n_tok, tot[1] / n_tok
     l2sp = out["l2sp"] if "l2sp" in out else float(R.l2sp.value())
-    objective = w_kl * kl + w_ce * ce
-    # loss/total: what the step minimised (the objective, plus the aux-CTC term when there is one) + the L2-SP value
-    aux = aux_ctc_weight(cfg) * out["aux_ctc"] if "aux_ctc" in out else 0.0
+    if ctc:
+        loss_row, objective, family_row = ctc_step_rows(R, out, l2sp)
+    else:
+        w_kl, w_ce = cfg["loss"]["w_kl"], cfg["loss"]["w_ce"]
+        kl, ce = tot[0] / n_tok, tot[1] / n_tok
+        objective = w_kl * kl + w_ce * ce
+        # loss/total: what the step minimised (the objective, plus the aux-CTC term when there is one) + the L2-SP value
+        aux = aux_ctc_weight(cfg) * out["aux_ctc"] if "aux_ctc" in out else 0.0
+        loss_row = {"loss/total": objective + aux + l2sp, "loss/objective": objective, "loss/kl": kl, "loss/ce": ce,
+                    "loss/l2sp": l2sp, "combined_loss/train": objective}
+        family_row = {}
     t, T = R.progress()
     n_steps = R.planner.epoch_stats[e]["steps"] if e in R.planner.epoch_stats else 1
     R.st["epoch"], R.st["epoch_progress"] = e, e + (s + 1) / n_steps
@@ -1907,13 +2263,12 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
         mult = 4.0 if R.st["memory"].get("grad_ckpt") else 3.0
         flops = mult * R.st["flops_per_padded_s"] * out["audio_pad"]
     row = {
-        "loss/total": objective + aux + l2sp, "loss/objective": objective, "loss/kl": kl, "loss/ce": ce,
-        "loss/l2sp": l2sp, "combined_loss/train": objective,
+        **loss_row,
         "opt/lr": lr, "opt/grad_norm": out["grad_norm"], "opt/clip_coef": out["clip_coef"],
         "time/step_s": step_s, "time/data_wait_s": wait_s, "time/compute_s": step_s - wait_s,
         "perf/audio_s_per_s": out["audio_real"] / step_s, "perf/tokens_per_s": n_tok / step_s,
         "perf/pad_eff_audio": out["audio_real"] / max(out["audio_pad"], 1e-9),
-        "perf/pad_eff_dec": out["dec_real"] / max(out["dec_pad"], 1e-9),
+        **({} if ctc else {"perf/pad_eff_dec": out["dec_real"] / max(out["dec_pad"], 1e-9)}),  # no decoder in a CTC
         "aug/masked_frac": out["masked_frac"],
         "data/epoch": e, "data/epoch_progress": R.st["epoch_progress"], "data/utts": out["n_utts"],
         "data/audio_s": out["audio_real"], "data/tokens": n_tok, "data/micro_batches": out["n_micro"],
@@ -1925,22 +2280,26 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
     if flops is not None:
         row["perf/tflops"] = flops / step_s / 1e12
         row["perf/mfu"] = flops / step_s / (float(cfg["perf"]["peak_tflops"]) * 1e12)
-    for i, k in enumerate(TERMS[2:], start=2):
-        row[TERM_TAGS[k]] = tot[i] / n_tok
-    for src, si in R.src_index.items():
-        n = out["n_src"][si]
-        if n > 0:
-            row[f"src/{src}/kl"] = out["by_src"][si, 0] / n
-            row[f"src/{src}/ce"] = out["by_src"][si, 1] / n
-            row[f"src/{src}/top1"] = out["by_src"][si, 2] / n
-            row[f"src/{src}/tokens"] = n
-    for b, (name, _) in enumerate(BUCKETS):
-        n = out["n_bucket"][b]
-        row[f"bucket/{name}/frac"] = n / n_tok
-        if n > 0:
-            row[f"bucket/{name}/kl"] = out["by_bucket"][b, 0] / n
-            row[f"bucket/{name}/ce"] = out["by_bucket"][b, 1] / n
-            row[f"bucket/{name}/top1"] = out["by_bucket"][b, 2] / n
+    if ctc:
+        row.update(family_row)
+        row["perf/frames_per_s"] = family_row["data/frames"] / step_s
+    else:
+        for i, k in enumerate(TERMS[2:], start=2):
+            row[TERM_TAGS[k]] = tot[i] / n_tok
+        for src, si in R.src_index.items():
+            n = out["n_src"][si]
+            if n > 0:
+                row[f"src/{src}/kl"] = out["by_src"][si, 0] / n
+                row[f"src/{src}/ce"] = out["by_src"][si, 1] / n
+                row[f"src/{src}/top1"] = out["by_src"][si, 2] / n
+                row[f"src/{src}/tokens"] = n
+        for b, (name, _) in enumerate(BUCKETS):
+            n = out["n_bucket"][b]
+            row[f"bucket/{name}/frac"] = n / n_tok
+            if n > 0:
+                row[f"bucket/{name}/kl"] = out["by_bucket"][b, 0] / n
+                row[f"bucket/{name}/ce"] = out["by_bucket"][b, 1] / n
+                row[f"bucket/{name}/top1"] = out["by_bucket"][b, 2] / n
     if R.device.type == "cuda":
         row["mem/step_peak_gb"] = torch.cuda.max_memory_allocated() / 2**30
     row.update(system_stats())
@@ -1954,16 +2313,56 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
     return objective
 
 
+def ctc_step_rows(R: Run, out: dict, l2sp: float) -> tuple[dict, float, dict]:
+    """A CTC step's loss rows, objective and family rows from train_step_ctc's sums (log_step): the objective (w_kl *
+    KL + w_ctc * CTC) / N_u - kitsune.ctc_kd.ctc_kd_objective over the step, what its gradient came from (a step of
+    silent rows only divides by 1, as the loss did) - with its terms per target token; the frame metrics per valid
+    frame (the argmax-blank share is the blank-collapse watch: the teacher's own share is ctc/teacher_blank); per source
+    the KL and CTC per target token, the frame agreement, the tokens and the utterances."""
+    cfg = R.cfg
+    col = {k: i for i, k in enumerate(CTC_TERMS)}
+    tot = out["tot"]
+    n = max(float(out["n_tok"]), 1.0)
+    frames = max(float(tot[col["n_frames"]]), 1.0)
+    per_tok = {k: float(tot[col[k]]) / n for k in CTC_TAGS}
+    objective = float(cfg["loss"]["w_kl"]) * per_tok["kl"] + float(cfg["loss"]["w_ctc"]) * per_tok["ctc"]
+    loss_row = {"loss/total": objective + l2sp, "loss/objective": objective,
+                **{CTC_TAGS[k]: v for k, v in per_tok.items()}, "loss/l2sp": l2sp, "combined_loss/train": objective}
+    fam = {tag: float(tot[col[k]]) / frames for k, tag in CTC_FRAME_TAGS.items()}
+    fam.update({"ctc/kl_per_frame": float(tot[col["kl"]]) / frames, "ctc/frames_per_token": frames / n,
+                "data/frames": float(tot[col["n_frames"]])})
+    for src, si in R.src_index.items():
+        if out["n_src"][si] > 0:
+            b = out["by_src"][si]
+            u, f = max(float(b[col["n_tokens"]]), 1.0), max(float(b[col["n_frames"]]), 1.0)
+            fam.update({f"src/{src}/kl": float(b[col["kl"]]) / u, f"src/{src}/ctc": float(b[col["ctc"]]) / u,
+                        f"src/{src}/argmax_agree": float(b[col["argmax_agree"]]) / f,
+                        f"src/{src}/tokens": float(b[col["n_tokens"]]), f"src/{src}/utts": float(out["n_src"][si])})
+    return loss_row, objective, fam
+
+
 # ---------------------------------------------------------------------------------------------------------- evals
 
 
 def combined_val_full(cfg: dict, tf_sum: dict) -> dict | None:
     """combined_loss/val_full's record of a complete-set eval (kitsune.evaluate.combined_loss over the gate sets of its
-    teacher-forced pass, with scope "complete"), None without a token."""
+    teacher-forced pass, with scope "complete"), None without a token. Family "ctc": the CTC objective
+    (kitsune.ctc_eval.combined_loss_ctc: w_kl x KL + w_ctc x CTC per target token)."""
+    c = combined_loss(cfg, tf_sum)
+    return dict(c, scope="complete") if c else None
+
+
+def combined_loss(cfg: dict, tf_sum: dict | None) -> dict | None:
+    """The family's training objective on a teacher-forced eval summary, pooled over its gate sets: AED
+    kitsune.evaluate.combined_loss (w_kl x KL + w_ce x CE), CTC kitsune.ctc_eval.combined_loss_ctc (w_kl x KL + w_ctc
+    x CTC); None without a token."""
+    if is_ctc(cfg):
+        from kitsune.ctc_eval import combined_loss_ctc
+
+        return combined_loss_ctc(tf_sum, cfg["loss"]["w_kl"], cfg["loss"]["w_ctc"])
     from kitsune import evaluate as ev
 
-    c = ev.combined_loss(tf_sum, cfg["loss"]["w_kl"], cfg["loss"]["w_ce"])
-    return dict(c, scope="complete") if c else None
+    return ev.combined_loss(tf_sum, cfg["loss"]["w_kl"], cfg["loss"]["w_ce"])
 
 
 def eval_summary(step: int, train_s: float, final: bool, complete: bool, tf_sum: dict, probe_sum: dict | None,
@@ -1975,9 +2374,11 @@ def eval_summary(step: int, train_s: float, final: bool, complete: bool, tf_sum:
     on the same curve). probe_greedy / epoch / combined_loss only when given, so the runs without them keep their
     records unchanged."""
     from kitsune import evaluate as ev
+    from kitsune.ctc_eval import frame_headline
 
     head_gr = full_sum if full_sum is not None else gr_sum
-    head = ev.headline(tf=tf_sum, greedy=head_gr, probe=probe_sum, probe_greedy=pg_sum)
+    # a CTC summary's val_top1 pooled per frame (its unit); an AED record is left as headline() gives it
+    head = frame_headline(ev.headline(tf=tf_sum, greedy=head_gr, probe=probe_sum, probe_greedy=pg_sum), tf_sum)
     summary = dict(step=step, train_s=train_s, final=final, complete=complete, tf=tf_sum, probe=probe_sum,
                    greedy=gr_sum, greedy_full=full_sum, wall_s=wall_s, headline=head,
                    headline_scope=dict(val_greedy="complete" if full_sum is not None else "subset",
@@ -2031,6 +2432,81 @@ def eval_event_sets(tf_sum: dict, gr_sum: dict, full_sum: dict | None) -> dict:
     return brief
 
 
+def ctc_text(R: Run, key: str, store, ids: list[str] | None = None) -> dict[str, dict]:
+    """The teacher text (reference, the teacher's ctc_hyp and its CER, truncated) of a frame store's rows - every row, or
+    `ids` - read once per run into R.texts[key] (kitsune.ctc_eval.store_text)."""
+    from kitsune.ctc_eval import store_text
+
+    if key not in R.texts:
+        R.texts[key] = store_text(store, ids)
+    return R.texts[key]
+
+
+def ctc_eval_parts(R: Run, complete: bool, mini_val: bool) -> tuple:
+    """run_eval's numbers for family "ctc", in its variables' order: (tf_sum, tf_df, combined, probe_sum, probe_df,
+    pg_sum, pg_df, gr_sum, gr_df, full_sum). One pass over the whole eval store (kitsune.ctc_eval.ctc_eval_records:
+    frame metrics and greedy CTC decode of every row); the teacher-forced summaries are kitsune.ctc_eval's
+    (summarise_ctc_tf), the greedy ones kitsune.evaluate.summarise_greedy's over the rows of each scope - the fixed
+    greedy subset (gr_sum; its rows are the greedy tables unless the eval is complete) and, at a complete eval, every
+    row (full_sum). The combined loss: val_full (complete) over the gate sets of the pass, val (mini_val) over the mini
+    eval's val subset of the same pass. The probe: one pass over its rows and the probe-greedy ones."""
+    from kitsune import ctc_eval as ce
+    from kitsune import evaluate as ev
+
+    cfg = R.cfg
+    bs = float(cfg["eval"]["batch_s"])
+    t0 = time.time()
+    raw, hyps, dropped = ce.ctc_eval_records(R.model, R.evalstore, R.feat_eval, R.device, bs, amp=R.amp)
+    wall = time.time() - t0
+    bad = ce.bad_audio_per_set(R.evalstore, dropped)
+    extra = dict(n_bad_audio=len(dropped), bad_audio=dropped[:50], bad_audio_per_set=bad, wall_s=wall)
+    tf_sum, tf_df = ce.summarise_ctc_tf(raw, **extra)
+    combined = {}  # series -> its combined_loss record, the scope it pooled next to the numbers
+    if complete and (c := combined_val_full(cfg, tf_sum)):
+        combined["val_full"] = c
+    if mini_val and R.mini_val_ids:
+        mini_tf, _ = ce.summarise_ctc_tf(raw[raw["id"].isin(set(R.mini_val_ids))].reset_index(drop=True))
+        if c := combined_loss(cfg, mini_tf):
+            combined["val"] = dict(c, scope="mini")
+    gall = ce.greedy_frame(raw, hyps, ctc_text(R, "eval", R.evalstore), R.tokenizer)
+    audio_s = float(raw["duration"].sum()) if len(raw) else 0.0
+    greedy_meta = dict(extra, rtf=wall / audio_s if audio_s else float("nan"))
+    subset = set(R.greedy_ids)
+    full_sum = None
+    if complete:
+        full_sum = ev.summarise_greedy(gall, **greedy_meta)
+        gr_df = gall
+        gr_df["in_greedy_subset"] = gr_df["id"].isin(subset)
+        gr_sum = ev.summarise_greedy(gr_df[gr_df["in_greedy_subset"]], wall_s=wall)
+    else:
+        gr_df = gall[gall["id"].isin(subset)].reset_index(drop=True)
+        sub_dropped = [i for i in dropped if i in subset]
+        gr_sum = ev.summarise_greedy(gr_df, n_bad_audio=len(sub_dropped), bad_audio=sub_dropped[:50],
+                                     bad_audio_per_set=ce.bad_audio_per_set(R.evalstore, sub_dropped), wall_s=wall,
+                                     rtf=greedy_meta["rtf"])
+    probe_sum = probe_df = pg_sum = pg_df = None
+    if R.probe_ids or R.probe_greedy_ids:
+        ids = list(dict.fromkeys(list(R.probe_ids) + list(R.probe_greedy_ids)))
+        t1 = time.time()
+        praw, phyps, pdropped = ce.ctc_eval_records(R.model, R.train, R.feat_eval, R.device, bs, ids=ids, amp=R.amp,
+                                                    decode=bool(R.probe_greedy_ids))
+        pwall = time.time() - t1
+        if R.probe_ids:
+            want = set(R.probe_ids)
+            pd_ = [i for i in pdropped if i in want]
+            probe_sum, probe_df = ce.summarise_ctc_tf(
+                praw[praw["id"].isin(want)].reset_index(drop=True), n_bad_audio=len(pd_), bad_audio=pd_[:50],
+                bad_audio_per_set=ce.bad_audio_per_set(R.train, pd_), wall_s=pwall)
+        if R.probe_greedy_ids:
+            want = set(R.probe_greedy_ids)
+            g_raw = praw[praw["id"].isin(want)].reset_index(drop=True)
+            pg_df = ce.greedy_frame(g_raw, phyps, ctc_text(R, "probe", R.train, ids), R.tokenizer)
+            pd_ = [i for i in pdropped if i in want]
+            pg_sum = ev.summarise_greedy(pg_df, n_bad_audio=len(pd_), bad_audio=pd_[:50],
+                                         bad_audio_per_set=ce.bad_audio_per_set(R.train, pd_), wall_s=pwall)
+    return tf_sum, tf_df, combined, probe_sum, probe_df, pg_sum, pg_df, gr_sum, gr_df, full_sum
+
+
 def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = None, mini_val: bool = False) -> dict:
     """Teacher-forced on every eval utterance and on the train probe, greedy on the fixed subsets - or on the COMPLETE
     eval sets (`complete`; default: the final eval under eval.final_full_greedy; the loop passes it for every
@@ -2047,7 +2523,11 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     the complete sets, but only these evals are complete ones: the step-0 eval and the every_min / every_steps ones
     decode the greedy subset). mini_val (the step-0 eval, when mini evals are on) adds a teacher-forced pass over the
     mini eval's val subset for combined_loss/val's first point, the scope of every later one (run_mini_eval): the
-    mini evals themselves stay out of step 0, the early stop and the verdict."""
+    mini evals themselves stay out of step 0, the early stop and the verdict.
+
+    Family "ctc": the same records from one pass over the eval store (ctc_eval_parts): a CTC student's greedy decode
+    is the argmax of the log-probs the teacher-forced metrics score, so every eval decodes every eval row and the
+    fixed subset's numbers are taken from those rows."""
     from kitsune import evaluate as ev
 
     cfg, log = R.cfg, R.log
@@ -2055,33 +2535,37 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
     complete = bool(final and cfg["eval"]["final_full_greedy"]) if complete is None else bool(complete)
     t0 = time.time()
     log.event("eval_start", at_step=step, final=final, complete=complete)
-    tf_sum, tf_df = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, amp=R.amp)
-    w_kl, w_ce = cfg["loss"]["w_kl"], cfg["loss"]["w_ce"]
-    combined = {}  # series -> its combined_loss record, the scope it pooled next to the numbers
-    if complete and (c := combined_val_full(cfg, tf_sum)):
-        combined["val_full"] = c
-    if mini_val and R.mini_val_ids:
-        mini_tf, _ = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, ids=R.mini_val_ids,
-                                            amp=R.amp)
-        if c := ev.combined_loss(mini_tf, w_kl, w_ce):
-            combined["val"] = dict(c, scope="mini")
-    probe_sum = probe_df = None
-    if R.probe_ids:
-        probe_sum, probe_df = ev.teacher_forced_eval(R.model, R.train, R.feat_eval, R.device, bs, ids=R.probe_ids,
-                                                     amp=R.amp)
-    pg_sum = pg_df = None
-    if R.probe_greedy_ids:  # un-augmented greedy decode of train utterances: memorisation shows as CER vs teacher -> 0
-        pg_sum, pg_df = ev.greedy_eval(R.model, R.train, R.probe_greedy_ids, R.feat_eval, R.device, bs,
-                                       tokenizer=R.tokenizer, amp=R.amp)
-    full_sum = None
-    if complete:
-        full_sum, gr_df = ev.greedy_eval(R.model, R.evalstore, None, R.feat_eval, R.device, bs, tokenizer=R.tokenizer,
-                                         amp=R.amp)
-        gr_df["in_greedy_subset"] = gr_df["id"].isin(set(R.greedy_ids))
-        gr_sum = ev.summarise_greedy(gr_df[gr_df["in_greedy_subset"]], wall_s=full_sum["wall_s"])
+    if is_ctc(cfg):
+        (tf_sum, tf_df, combined, probe_sum, probe_df, pg_sum, pg_df, gr_sum, gr_df,
+         full_sum) = ctc_eval_parts(R, complete, mini_val)
     else:
-        gr_sum, gr_df = ev.greedy_eval(R.model, R.evalstore, R.greedy_ids, R.feat_eval, R.device, bs,
-                                       tokenizer=R.tokenizer, amp=R.amp)
+        tf_sum, tf_df = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, amp=R.amp)
+        w_kl, w_ce = cfg["loss"]["w_kl"], cfg["loss"]["w_ce"]
+        combined = {}  # series -> its combined_loss record, the scope it pooled next to the numbers
+        if complete and (c := combined_val_full(cfg, tf_sum)):
+            combined["val_full"] = c
+        if mini_val and R.mini_val_ids:
+            mini_tf, _ = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, bs, ids=R.mini_val_ids,
+                                                amp=R.amp)
+            if c := ev.combined_loss(mini_tf, w_kl, w_ce):
+                combined["val"] = dict(c, scope="mini")
+        probe_sum = probe_df = None
+        if R.probe_ids:
+            probe_sum, probe_df = ev.teacher_forced_eval(R.model, R.train, R.feat_eval, R.device, bs, ids=R.probe_ids,
+                                                         amp=R.amp)
+        pg_sum = pg_df = None
+        if R.probe_greedy_ids:  # un-augmented greedy decode of train utterances: memorisation shows as CER vs teacher
+            pg_sum, pg_df = ev.greedy_eval(R.model, R.train, R.probe_greedy_ids, R.feat_eval, R.device, bs,
+                                           tokenizer=R.tokenizer, amp=R.amp)
+        full_sum = None
+        if complete:
+            full_sum, gr_df = ev.greedy_eval(R.model, R.evalstore, None, R.feat_eval, R.device, bs,
+                                             tokenizer=R.tokenizer, amp=R.amp)
+            gr_df["in_greedy_subset"] = gr_df["id"].isin(set(R.greedy_ids))
+            gr_sum = ev.summarise_greedy(gr_df[gr_df["in_greedy_subset"]], wall_s=full_sum["wall_s"])
+        else:
+            gr_sum, gr_df = ev.greedy_eval(R.model, R.evalstore, R.greedy_ids, R.feat_eval, R.device, bs,
+                                           tokenizer=R.tokenizer, amp=R.amp)
     assert_bn_mode(R.model, bn_mode(cfg))  # an eval gives every module its own flag back
     # rows the dataset could not decode are left out of these numbers (and of the verdict's gate sets, which says
     # so): the eval-side twin of train_step's `dropped_audio` event
@@ -2136,7 +2620,11 @@ def run_eval(R: Run, step: int, final: bool = False, complete: bool | None = Non
         samples += ev.pick_samples(pg_df, int(cfg["log"]["samples_per_eval"]), seed=int(cfg["seed"]))
     log.samples(step, samples)
 
-    if not final:  # what fit_budget scales the final eval's duration from (a complete decode: nothing to scale)
+    if not final and is_ctc(cfg):  # one pass over every eval row whatever the scope, the decode inside it
+        R.st["eval_cost"] = dict(tf_s=float(tf_sum.get("wall_s", 0.0)),
+                                 probe_s=float(probe_sum.get("wall_s", 0.0)) if probe_sum else 0.0,
+                                 greedy_s=0.0, greedy_n=len(R.evalstore))
+    elif not final:  # what fit_budget scales the final eval's duration from (a complete decode: nothing to scale)
         R.st["eval_cost"] = dict(tf_s=float(tf_sum.get("wall_s", 0.0)),
                                  probe_s=(float(probe_sum.get("wall_s", 0.0)) if probe_sum else 0.0)
                                  + (float(pg_sum.get("wall_s", 0.0)) if pg_sum else 0.0),
@@ -2227,7 +2715,9 @@ def run_mini_eval(R: Run, step: int) -> dict:
     st["mini_history"] (summary.json's mini_history). It never feeds the verdict's history, the early stop or the
     final-eval estimate. Its teacher-forced val pass also gives combined_loss/val (kitsune.evaluate.combined_loss over
     the gate sets of the val subset, summary.json's combined_loss): the held-out curve of the combined-loss chart, one
-    scope from its step-0 point (run_eval's mini_val) to the last mini. Returns the headline."""
+    scope from its step-0 point (run_eval's mini_val) to the last mini. Returns the headline. Family "ctc": one pass per
+    subset gives both its frame metrics and its greedy CTC decode (kitsune.ctc_eval.ctc_eval), the combined loss is the
+    CTC objective."""
     from kitsune import evaluate as ev
 
     cfg, log = R.cfg, R.log
@@ -2237,16 +2727,25 @@ def run_mini_eval(R: Run, step: int) -> dict:
     for kind, store, ids in (("tf", R.evalstore, R.mini_val_ids), ("probe", R.train, R.mini_train_ids)):
         if not ids:
             continue
+        g = "greedy" if kind == "tf" else "probe_greedy"
+        if is_ctc(cfg):
+            from kitsune.ctc_eval import ctc_eval
+
+            parts[kind], frames[kind], gdf, meta = ctc_eval(
+                R.model, store, R.feat_eval, R.device, bs, ids=ids, tokenizer=R.tokenizer,
+                text=mini_teacher_rows(R, kind, store, ids) if greedy else None, amp=R.amp, decode=bool(greedy))
+            if greedy:
+                parts[g], frames[g] = ev.summarise_greedy(gdf, **meta), gdf
+            continue
         parts[kind], frames[kind] = ev.teacher_forced_eval(R.model, store, R.feat_eval, R.device, bs, ids=ids,
                                                            amp=R.amp)
         if greedy:
-            g = "greedy" if kind == "tf" else "probe_greedy"
             parts[g], frames[g] = ev.greedy_eval(R.model, store, ids, R.feat_eval, R.device, bs,
                                                  tokenizer=R.tokenizer, amp=R.amp,
                                                  teacher_rows=mini_teacher_rows(R, kind, store, ids))
     assert_bn_mode(R.model, bn_mode(cfg))  # an eval gives every module its own flag back
     wall = round(time.time() - t0, 1)
-    comb = ev.combined_loss(parts.get("tf"), cfg["loss"]["w_kl"], cfg["loss"]["w_ce"])
+    comb = combined_loss(cfg, parts.get("tf"))
     combined = {"val": dict(comb, scope="mini")} if comb else {}
 
     for kind in ("tf", "greedy"):
@@ -2258,6 +2757,10 @@ def run_mini_eval(R: Run, step: int) -> dict:
             log.table(kind, frames[kind], step, suffix="mini")
     head = ev.headline(tf=parts.get("tf"), greedy=parts.get("greedy"), probe=parts.get("probe"),
                        probe_greedy=parts.get("probe_greedy"))
+    if is_ctc(cfg):
+        from kitsune.ctc_eval import frame_headline
+
+        frame_headline(head, parts.get("tf"))  # val_top1 per frame, as eval_summary
     epoch = R.st["epoch_progress"]
     log.eval_json("summary", dict(step=step, train_s=R.clock(), epoch=epoch, mini=True, wall_s=wall, headline=head,
                                   n_val=len(R.mini_val_ids), n_train=len(R.mini_train_ids), **parts,
@@ -2413,7 +2916,10 @@ def _flush_dir(tmp: Path):
 
 
 def save_weights(R: Run, step: int, reason: str) -> Path:
-    """bf16 weights (+ processor, student_meta.json with a `trained` block) -> checkpoints/step_<N>/, then upload."""
+    """bf16 weights (+ processor, student_meta.json with a `trained` block) -> checkpoints/step_<N>/, then upload.
+    Family "ctc": a ParakeetForCTC dir by kitsune.ctc_student.save_ctc_student - the Parakeet processor and tokenizer
+    files copied from the student dir, the CC-BY-4.0 attribution card as MODEL_CARD.md and README.md - which
+    kitsune.ctc_student.load_ctc_student loads."""
     from kitsune import student as S
 
     name = f"step_{step}"
@@ -2431,7 +2937,12 @@ def save_weights(R: Run, step: int, reason: str) -> Path:
                            reason=reason, time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                            init=str(R.cfg["student"]), last_objective=R.st["last_objective"],
                            lr_phase=lr_phase_name(R.st.get("lr_phase")))
-    S.save_student(R.model, tmp, R.processor, meta)
+    if is_ctc(R.cfg):
+        from kitsune.ctc_student import save_ctc_student
+
+        save_ctc_student(R.model, tmp, rpath(R.cfg["student"]), meta)
+    else:
+        S.save_student(R.model, tmp, R.processor, meta)
     _flush_dir(tmp)
     _replace_dir(tmp, d)
     _sync_dir(R.ckpt_dir)
@@ -2596,24 +3107,31 @@ def measure_flops(R: Run, mb: dict) -> float:
 
     aux = getattr(R, "aux_ctc", None) is not None
     with torch.no_grad(), frozen_eval(R.model), FlopCounterMode(display=False) as fc:
-        res = forward_logits(R, mb, R.feat_eval, with_encoder=aux)
-        if aux:  # training compute too (its ~16k-class head on every encoder frame)
-            aux_ctc_sum(R, res[3], mb)
+        if is_ctc(R.cfg):  # the encoder and the CTC head on every frame (the loss is small next to them)
+            forward_ctc(R, mb, R.feat_eval)
+        else:
+            res = forward_logits(R, mb, R.feat_eval, with_encoder=aux)
+            if aux:  # training compute too (its ~16k-class head on every encoder frame)
+                aux_ctc_sum(R, res[3], mb)
     padded = float(mb["lengths"].max()) * len(mb["lengths"]) / SR
     return fc.get_total_flops() / max(padded, 1e-9)
 
 
 def fwd_bwd(R: Run, mb: dict) -> tuple[float, bool]:
     """Forward and backward of one micro-batch on the training objective, the aux-CTC term included (so the memory
-    probe's passes hold its (frames x V + 1) logits too); returns (loss, finite loss and gradients)."""
-    aux = getattr(R, "aux_ctc", None) is not None
-    res = forward_logits(R, mb, R.feat_train, with_encoder=aux)
-    losses = kd_losses(res[0], mb["top_idx"].to(R.device), mb["top_lp"].to(R.device))
-    n = int(mb["top_idx"].shape[0])
-    loss = kd_objective(losses, n, R.cfg["loss"]["w_kl"], R.cfg["loss"]["w_ce"])
-    if aux:
-        loss = loss + aux_ctc_weight(R.cfg) * aux_ctc_sum(R, res[3], mb) / n
-    res = None
+    probe's passes hold its (frames x V + 1) logits too); returns (loss, finite loss and gradients). Family "ctc": the
+    CTC-KD objective over the micro-batch's own N_u (ctc_step_loss), with its (frames x 3073) fp32 log-probs."""
+    if is_ctc(R.cfg):
+        loss, _, _ = ctc_step_loss(R, mb, R.feat_train, int(mb["n_tok"].sum()))
+    else:
+        aux = getattr(R, "aux_ctc", None) is not None
+        res = forward_logits(R, mb, R.feat_train, with_encoder=aux)
+        losses = kd_losses(res[0], mb["top_idx"].to(R.device), mb["top_lp"].to(R.device))
+        n = int(mb["top_idx"].shape[0])
+        loss = kd_objective(losses, n, R.cfg["loss"]["w_kl"], R.cfg["loss"]["w_ce"])
+        if aux:
+            loss = loss + aux_ctc_weight(R.cfg) * aux_ctc_sum(R, res[3], mb) / n
+        res = None
     loss.backward()
     norms = torch._foreach_norm([p.grad for p in R.params if p.grad is not None])
     ok = bool(torch.isfinite(loss)) and all(bool(torch.isfinite(n)) for n in norms)
@@ -2628,7 +3146,10 @@ def padded_row_check(R: Run) -> dict:
     smoke.pad_min_argmax_agree over the pooled positions if set). One short utterance's argmax is no gate: under bf16
     autocast the padded and unpadded runs use different kernel shapes, and a 3-5 token utterance of a correct but
     untrained student flips on a single near-tie. With autocast on, the bound is at least 10x the bf16 noise floor
-    measured on the same utterances (alone under autocast vs alone without it)."""
+    measured on the same utterances (alone under autocast vs alone without it). Family "ctc": padded_row_check_ctc,
+    the same gate on the frame log-probs."""
+    if is_ctc(R.cfg):
+        return padded_row_check_ctc(R)
     sm = R.cfg["smoke"]
     order = sorted(range(len(R.train)), key=lambda i: R.train.utts[i].duration)
     if len(order) < 2:
@@ -2669,6 +3190,63 @@ def padded_row_check(R: Run) -> dict:
     out = dict(n_utts=len(kl), n_tok=int(kl_t.numel()), kl_mean=float(kl_t.mean()), kl_max=float(kl_t.max()),
                argmax_agree=float(torch.cat(agree).float().mean()), max_abs_logit_diff=diff, finite=finite,
                pad_to_s=round(R.train.utts[longest].duration, 2), rows_per_forward=per + 1)
+    bound = float(sm["pad_max_mean_kl"])
+    if noise:
+        out["bf16_noise_kl_mean"] = float(torch.cat(noise).mean())
+        bound = max(bound, 10 * out["bf16_noise_kl_mean"])
+    min_agree = sm.get("pad_min_argmax_agree")
+    out.update(kl_bound=bound, ok=finite and out["kl_mean"] <= bound
+               and (min_agree is None or out["argmax_agree"] >= float(min_agree)))
+    return out
+
+
+def padded_row_check_ctc(R: Run) -> dict:
+    """padded_row_check of family "ctc": the smoke.pad_utts shortest train utterances, each padded next to the longest,
+    vs the same utterances run alone, compared on their valid FRAMES' log-probs - a masking bug (padding leaking into
+    the attention, the convolution module or the relative positions) moves every frame. The gate: the mean
+    KL(alone || padded) per frame over all their valid frames <= smoke.pad_max_mean_kl (at least 10x the bf16 noise
+    floor with autocast on), finite, and smoke.pad_min_argmax_agree over the pooled frames if set. n_tok counts
+    frames here."""
+    sm = R.cfg["smoke"]
+    order = sorted(range(len(R.train)), key=lambda i: R.train.utts[i].duration)
+    if len(order) < 2:
+        return dict(skipped="fewer than 2 train utterances")
+    longest, shorts = order[-1], order[:min(int(sm["pad_utts"]), len(order) - 1)]
+    per = max(1, int(float(R.planner.micro_audio_s) // max(R.train.utts[longest].duration, 1e-3)) - 1)
+    kl, noise, agree, diff, finite = [], [], [], 0.0, True
+
+    def kl_rows(lp_ref, lp):  # per frame KL(ref || lp), fp32 over the 3073 classes
+        return (lp_ref.exp() * (lp_ref - lp)).sum(-1).cpu()
+
+    with torch.no_grad(), frozen_eval(R.model):
+        for c in range(0, len(shorts), per):
+            chunk = shorts[c:c + per]
+            both = R.ds[[longest, *chunk]]
+            lb, nb, _ = forward_ctc(R, both, R.feat_eval)
+            for i in chunk:
+                alone = R.ds[[i]]
+                if R.ds.ids[i] not in both["ids"] or not alone["ids"]:
+                    continue  # undecodable audio (the dataset logged it)
+                la, na, _ = forward_ctc(R, alone, R.feat_eval)
+                r, n = both["ids"].index(R.ds.ids[i]), int(na[0])
+                pb, pa = lb[r, :n].float(), la[0, :n].float()
+                finite = finite and int(nb[r]) == n and bool(torch.isfinite(pb).all() and torch.isfinite(pa).all())
+                kl.append(kl_rows(pa, pb))
+                agree.append((pa.argmax(-1) == pb.argmax(-1)).cpu())
+                diff = max(diff, float((pa - pb).abs().max()) if n else 0.0)
+                if R.amp:
+                    R.amp = False
+                    try:
+                        l32, _, _ = forward_ctc(R, alone, R.feat_eval)
+                    finally:
+                        R.amp = True
+                    noise.append(kl_rows(l32[0, :n].float(), pa))
+    if not kl:
+        return dict(skipped="no decodable utterance")
+    kl_t = torch.cat(kl)
+    out = dict(n_utts=len(kl), n_tok=int(kl_t.numel()), kl_mean=float(kl_t.mean()), kl_max=float(kl_t.max()),
+               argmax_agree=float(torch.cat(agree).float().mean()), max_abs_logit_diff=diff, finite=finite,
+               pad_to_s=round(R.train.utts[longest].duration, 2), rows_per_forward=per + 1, unit="frames")
     bound = float(sm["pad_max_mean_kl"])
     if noise:
         out["bf16_noise_kl_mean"] = float(torch.cat(noise).mean())
@@ -2737,9 +3315,21 @@ def train_dither_check(R: Run, lengths: list[int]) -> dict:
                 exact=feat.exact_dither, n=len(lengths), device=str(dev))
 
 
+def hf_features(R: Run, waves: list[np.ndarray]) -> tuple[torch.Tensor, torch.Tensor]:
+    """The HF extractor's features of `waves`, as the teacher saw them (smoke_checks' reference): the Cohere processor
+    (kitsune.features.hf_reference, the teacher pass's call) or, family "ctc", the student dir's
+    ParakeetFeatureExtractor, which the Parakeet label pass ran (80 mel, no dither)."""
+    if is_ctc(R.cfg):
+        out = R.processor.feature_extractor([np.asarray(w, dtype=np.float32) for w in waves], sampling_rate=SR,
+                                            return_tensors="pt")
+        return out["input_features"], out["attention_mask"]
+    from kitsune.features import hf_reference
+
+    return hf_reference(waves, path_or_repo=str(rpath(R.cfg["student"])))
+
+
 def smoke_checks(R: Run):
     """Checks that cost seconds and catch the failures that would otherwise burn the paid hours silently."""
-    from kitsune.features import hf_reference
     from kitsune.patches import sdpa_backend_report
 
     log = R.log
@@ -2751,7 +3341,7 @@ def smoke_checks(R: Run):
     waves = [R.train.wave(i) for i in idx]
     bad = None
     try:
-        ref, ref_mask = hf_reference(waves, path_or_repo=str(rpath(R.cfg["student"])))
+        ref, ref_mask = hf_features(R, waves)
         wave = torch.zeros(len(waves), max(len(w) for w in waves))
         for i, w in enumerate(waves):
             wave[i, :len(w)] = torch.from_numpy(w)
@@ -2779,8 +3369,10 @@ def smoke_checks(R: Run):
     worst = R.planner.worst_micro_batches()
     mb = R.ds[worst["longest"]]
     loss, ok = fwd_bwd(R, mb)
+    targets = dict(targets=int(mb["n_tok"].sum()), frames=int(mb["n_frames"].sum())) if is_ctc(R.cfg) else dict(
+        targets=int(mb["top_idx"].shape[0]))
     log.event("smoke_longest_fwd_bwd", ok=ok, loss=loss, utts=len(mb["ids"]),
-              padded_s=round(float(mb["lengths"].max()) * len(mb["ids"]) / SR, 1), targets=int(mb["top_idx"].shape[0]))
+              padded_s=round(float(mb["lengths"].max()) * len(mb["ids"]) / SR, 1), **targets)
     if not ok:
         raise SmokeFailed("non-finite loss or gradient on the longest padded micro-batch")
 
@@ -2858,8 +3450,11 @@ def memory_probe(R: Run) -> dict:
     still fails, enable per-layer gradient checkpointing and start again from the configured size - never under
     bn.mode "train" (the recomputed forward would update the running stats a second time), where the probe fails below
     memory.min_micro_audio_s instead; BatchNorm stays in the run's mode (train_mode). With the aux-CTC head its logits
-    are part of every pass (fwd_bwd), and the micro-batch with the most padded frames is probed too. The choice is kept
-    in the full state, so a resume uses the same batches. On Windows it runs under cap_vram's cap, so OOM means OOM."""
+    are part of every pass (fwd_bwd), and the micro-batch with the most padded frames is probed too. Family "ctc": the
+    frame planner's worst cases, the longest micro-batch and the one with the most padded frames, whose (frames x 3073)
+    fp32 log-probs with their gradient are the CTC student's peak (kitsune.trainset.StepPlanner.worst_micro_batches).
+    The choice is kept in the full state, so a resume uses the same batches. On Windows it runs under cap_vram's cap,
+    so OOM means OOM."""
     cfg, log = R.cfg, R.log
     bn = bn_mode(cfg)
     micro0 = float(cfg["batch"]["micro_audio_s"])
@@ -3054,7 +3649,8 @@ def branch_start_state(cfg: dict) -> tuple[Path, dict]:
         raise SystemExit(f"schedule.warmup_steps {cfg['schedule']['warmup_steps']} does not end before the branch's "
                          f"cooldown starts at step {rs}")
     st = copy.deepcopy(state["st"])
-    st.update(weights=[], fulls=[], fulls_kept=[], pre_cooldown_done=False, pre_cooldown_full=None, resumes=0)
+    st.update(weights=[], fulls=[], fulls_kept=[], pre_cooldown_done=False, pre_cooldown_full=None, resumes=0,
+              started_utc=None)  # the branch's own start (train())
     st["branch"] = dict(parent_run_id=parent.name, resume_step=rs, end_step=es, t_c=float(rs), parent_dir=str(parent),
                         parent_state=str(full), parent_max_steps=int(M), resume_frac=float(br["resume_frac"]),
                         end_frac=float(br["end_frac"]))
@@ -3141,8 +3737,11 @@ def train(R: Run, state: dict | None) -> int:
     if state is not None:
         R.st.update(copy.deepcopy(state["st"]))
         R.st.setdefault("optim_groups", "single")  # a state from before the param groups: its one group (setup_optim)
+        R.st.setdefault("started_utc", None)  # a state from before it: unknown (tools/study_report falls back)
         if not R.branch_start:  # a branch is a new run dir: its first launch is no resume
             R.st["resumes"] += 1
+    if state is None or R.branch_start:  # the run's first start: summary.json's started_utc, kept across resumes
+        R.st["started_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     # true/false: this config's (a resume's --set too); "auto": the memory probe's choice, saved in the full state
     gc = cfg["memory"]["grad_ckpt"]
     grad_ckpt = gc if isinstance(gc, bool) else bool(R.st["memory"].get("grad_ckpt"))
@@ -3155,8 +3754,16 @@ def train(R: Run, state: dict | None) -> int:
     setup_data(R)
     R.planner = make_planner(R, float(R.st["memory"].get("micro_audio_s", cfg["batch"]["micro_audio_s"])))
     try:
-        base = ev.teacher_baselines(rpath(cfg["teacher_root"]), cfg["eval_sets"], check=cfg["eval"]["check_baselines"])
-        log.event("teacher_baselines", sets=base)
+        if is_ctc(cfg):  # the CTC students' teacher: Parakeet's CTC path (ctc_hyp), checked against its PREREG numbers
+            from kitsune.ctc_eval import TEACHER_SYSTEM, ctc_teacher_baselines
+
+            base = ctc_teacher_baselines(rpath(cfg["parakeet_root"]), cfg["eval_sets"],
+                                         check=cfg["eval"]["check_baselines"])
+            log.event("teacher_baselines", teacher=TEACHER_SYSTEM, sets=base)
+        else:
+            base = ev.teacher_baselines(rpath(cfg["teacher_root"]), cfg["eval_sets"],
+                                        check=cfg["eval"]["check_baselines"])
+            log.event("teacher_baselines", sets=base)
     except FileNotFoundError as e:
         log.event("teacher_baselines", skipped=str(e))
     R.reference = reference_model(cfg)  # a missing or malformed file stops the run here, not at its verdict
@@ -3164,7 +3771,13 @@ def train(R: Run, state: dict | None) -> int:
         log.event("reference", **R.reference)
     from kitsune import student as S
 
-    log.event("model", params=S.param_report(R.model), trainable=sum(p.numel() for p in R.params),
+    if is_ctc(cfg):
+        from kitsune.ctc_student import param_counts
+
+        report = param_counts(R.model)
+    else:
+        report = S.param_report(R.model)
+    log.event("model", family=family(cfg), params=report, trainable=sum(p.numel() for p in R.params),
               grad_ckpt=grad_ckpt, relpos_patch=cfg["perf"]["relpos_patch"], compile=cfg["perf"]["compile"],
               bn_mode=bn_mode(cfg), optim_groups=R.st["optim_groups"],
               **({"aux_ctc_params": sum(p.numel() for p in R.aux_ctc.parameters())} if R.aux_ctc is not None else {}))
@@ -3251,8 +3864,7 @@ def train(R: Run, state: dict | None) -> int:
         log.event("eval_final_reused", at_step=step)
     else:
         full_sum = run_eval(R, step, final=True, complete=final_complete)
-    verdict = gate_verdict(cfg, ev.verdict(verdict_results(full_sum, R.st["history"], R.reference),
-                                           **verdict_options(cfg)))
+    verdict = gate_verdict(cfg, family_verdict(cfg, full_sum, R.st["history"], R.reference))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
     if line := reference_line((verdict.get("numbers") or verdict).get("reference")):
@@ -3276,20 +3888,26 @@ def lr_probe_eval(R: Run, step: int) -> dict:
     """The LR probe's result (lr_probe.enabled): the family's training objective per target token, teacher-forced on
     the COMPLETE gate sets (LR_PROBE_SETS) in eval mode - AED: w_kl x KL + w_ce x CE (kitsune.kd.kd_objective's terms;
     no aux CTC) - pooled token-weighted over the three sets (`objective`) and per set (`per_set`). Tables and the
-    summary under evals/step_<N>/, the scalars eval/tf/... and combined_loss/val_full (the same number). The CTC
-    family's objective comes with its trainer (family "ctc", wave 2)."""
+    summary under evals/step_<N>/, the scalars eval/tf/... and combined_loss/val_full (the same number). Family "ctc":
+    w_kl x KL + w_ctc x CTC per CTC target token (kitsune.ctc_kd.ctc_kd_objective's terms; the frame metrics of
+    kitsune.ctc_eval, no decode), the result naming them ctc / w_ctc."""
     from kitsune import evaluate as ev
 
     cfg, log = R.cfg, R.log
-    family = cfg.get("family", "aed")
-    if family != "aed":
-        raise NotImplementedError(f"lr_probe for family {family!r}: its objective comes with the CTC trainer")
-    w_kl, w_ce = float(cfg["loss"]["w_kl"]), float(cfg["loss"]["w_ce"])
+    fam = family(cfg)
+    w_kl = float(cfg["loss"]["w_kl"])
+    second, w2 = ("ctc", float(cfg["loss"]["w_ctc"])) if fam == "ctc" else ("ce", float(cfg["loss"]["w_ce"]))
     ids = [u.id for u in R.evalstore.utts if u.source in LR_PROBE_SETS]
     t0 = time.time()
     log.event("eval_start", at_step=step, final=True, complete=True, lr_probe=True)
-    tf_sum, tf_df = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device, float(cfg["eval"]["batch_s"]),
-                                           ids=ids, amp=R.amp)
+    if fam == "ctc":
+        from kitsune.ctc_eval import ctc_eval
+
+        tf_sum, tf_df, _, _ = ctc_eval(R.model, R.evalstore, R.feat_eval, R.device, float(cfg["eval"]["batch_s"]),
+                                       ids=ids, amp=R.amp, decode=False)
+    else:
+        tf_sum, tf_df = ev.teacher_forced_eval(R.model, R.evalstore, R.feat_eval, R.device,
+                                               float(cfg["eval"]["batch_s"]), ids=ids, amp=R.amp)
     assert_bn_mode(R.model, bn_mode(cfg))
     sets = tf_sum.get("sets", {})
     missing = [s for s in LR_PROBE_SETS if not sets.get(s, {}).get("n_tok")]
@@ -3298,11 +3916,12 @@ def lr_probe_eval(R: Run, step: int) -> dict:
                            f"{', '.join(LR_PROBE_SETS)})")
     n = {s: int(sets[s]["n_tok"]) for s in LR_PROBE_SETS}
     kl = sum(float(sets[s]["kl"]) * n[s] for s in LR_PROBE_SETS) / sum(n.values())
-    ce = sum(float(sets[s]["ce"]) * n[s] for s in LR_PROBE_SETS) / sum(n.values())
-    result = dict(objective=w_kl * kl + w_ce * ce,
-                  per_set={s: w_kl * float(sets[s]["kl"]) + w_ce * float(sets[s]["ce"]) for s in LR_PROBE_SETS},
-                  lr=float(cfg["optim"]["lr"]), max_steps=R.max_steps(), family=family, step=int(step), kl=kl, ce=ce,
-                  w_kl=w_kl, w_ce=w_ce, n_tok=n, n_utts={s: int(sets[s]["n_utts"]) for s in LR_PROBE_SETS},
+    t2 = sum(float(sets[s][second]) * n[s] for s in LR_PROBE_SETS) / sum(n.values())
+    result = dict(objective=w_kl * kl + w2 * t2,
+                  per_set={s: w_kl * float(sets[s]["kl"]) + w2 * float(sets[s][second]) for s in LR_PROBE_SETS},
+                  lr=float(cfg["optim"]["lr"]), max_steps=R.max_steps(), family=fam, step=int(step), kl=kl,
+                  **{second: t2}, w_kl=w_kl, **{f"w_{second}": w2}, n_tok=n,
+                  n_utts={s: int(sets[s]["n_utts"]) for s in LR_PROBE_SETS},
                   n_bad_audio=int(tf_sum.get("n_bad_audio", 0)), wall_s=round(time.time() - t0, 1))
     for src, g in tf_df.groupby("source", sort=True):
         log.table(f"tf_{src}", g.reset_index(drop=True), step)
@@ -3367,10 +3986,30 @@ def reference_model(cfg: dict) -> dict | None:
         raise SystemExit(f"eval.reference: {e}") from e
 
 
-def verdict_results(final: dict, history: list[dict], reference: dict | None = None) -> dict:
+def verdict_results(final: dict, history: list[dict], reference: dict | None = None,
+                    teacher: dict | None = None) -> dict:
     """kitsune.evaluate.verdict's results: the final eval's greedy summary, the history and, when the config has one,
-    the reference model's CER (the verdict's "reference", reported only)."""
-    return dict(final=final, history=history, **({"reference": reference} if reference else {}))
+    the reference model's CER (the verdict's "reference", reported only); teacher: the per-set teacher CER to judge
+    against (family "ctc": family_verdict's), else the verdict's own (the same ids, or the pre-registered Cohere
+    numbers)."""
+    return dict(final=final, history=history, **({"reference": reference} if reference else {}),
+                **({"teacher": teacher} if teacher else {}))
+
+
+def family_verdict(cfg: dict, final: dict, history: list[dict], reference: dict | None = None) -> dict:
+    """kitsune.evaluate.verdict of the run's family: AED as before; "ctc" against its own teacher, Parakeet's CTC path
+    - its corpus CER on the same ids as the student's final numbers (kitsune.ctc_eval.verdict_teacher; never the
+    verdict's fallback to Cohere's pre-registered numbers), each set's record named for it (relabel_verdict:
+    teacher_system, the Parakeet CTC PREREG numbers as teacher_prereg / baseline_drift)."""
+    from kitsune import evaluate as ev
+
+    if not is_ctc(cfg):
+        return ev.verdict(verdict_results(final, history, reference), **verdict_options(cfg))
+    from kitsune.ctc_eval import relabel_verdict, verdict_teacher
+
+    out = ev.verdict(verdict_results(final, history, reference, teacher=verdict_teacher(final)),
+                     **verdict_options(cfg))
+    return relabel_verdict(out)
 
 
 def reference_line(bar: dict | None) -> str | None:
@@ -3603,6 +4242,20 @@ def loop(R: Run):
         loader.close()
 
 
+def selection_sha256(R: Run) -> str | None:
+    """The sha256 of the selection file the run trains on (the bytes, as make_selection's sidecar and PREREG.json hash
+    it): the train store's record of it (its build fingerprinted that very file), else the file itself (a run that
+    failed before its stores); None if neither is there."""
+    info = getattr(getattr(R, "train", None), "info", None) or {}
+    if info.get("selection_sha256"):
+        return info["selection_sha256"]
+    try:
+        p = rpath(R.cfg["selection"])
+        return trainset._sha256(p) if p.is_file() else None
+    except (KeyError, TypeError, OSError):
+        return None
+
+
 def make_summary(R: Run, status: str, **extra) -> dict:
     st, hist = R.st, R.st["history"]
     elapsed = R.log.elapsed() if R.log else time.time() - R.t_start
@@ -3631,7 +4284,10 @@ def make_summary(R: Run, status: str, **extra) -> dict:
     if br:  # a T/2 branch: its parent and schedule (the `branch` event's fields)
         extra.setdefault("branch", {k: br[k] for k in ("parent_run_id", "resume_step", "end_step", "t_c")})
     return dict(
-        status=status, run_id=R.run_dir.name, steps=st["step"], epochs=st["epoch_progress"],
+        status=status, run_id=R.run_dir.name, family=family(R.cfg),
+        # the study's checks (kitsune.study_stats): one selection for every run, PREREG_numbers before the first start
+        selection_sha256=selection_sha256(R), started_utc=st.get("started_utc"),
+        steps=st["step"], epochs=st["epoch_progress"],
         train_s=round(st["train_s"], 1), elapsed_s_total=round(elapsed, 1), resumes=st["resumes"],
         budget_s=R.budget_s,  # None = the full train_hours; else T clipped to the instance deadline
         throughput=dict(audio_s=st["audio_s"], tokens=st["tokens"], step_time_s=round(st["step_time_s"], 1),

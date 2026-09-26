@@ -254,7 +254,8 @@ def test_overfit_configs_resolve():
         # no GO/NO-GO for a sanity run ("N/A" with the numbers); a mini eval every 200 steps (never at an epoch end)
         assert c["eval"]["gate"] is False and c["eval"]["full_every_epochs"] is None
         assert c["eval"]["mini"] == dict(every_steps=200, val_per_set=32, train_utts=64, greedy=True)
-        assert c["loss"] == m.DEFAULTS["loss"] == dict(w_kl=1.0, w_ce=0.8, l2sp_lambda=0.05, aux_ctc_weight=0.0)
+        assert c["loss"] == m.DEFAULTS["loss"] == dict(w_kl=1.0, w_ce=0.8, l2sp_lambda=0.05, aux_ctc_weight=0.0,
+                                                       w_ctc=0.8)  # w_ctc: the CTC family's, unread by these runs
         assert {k: c["optim"][k] for k in ("lr", "betas", "clip")} == dict(lr=1e-4, betas=[0.9, 0.98], clip=1.0)
         assert c["autocast"] == "bfloat16" and c["perf"]["relpos_patch"] and c["memory"]["grad_ckpt"] == "auto"
         # a resume point right after the smoke steps and every 10 min: scripts/supervise_distill.py relaunches from

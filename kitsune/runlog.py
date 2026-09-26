@@ -298,6 +298,25 @@ TB_BUCKET_RULES = (
     # teacher-confidence columns)
     (r"(?P<t>(layers|l2sp|aug|bn|tok)/.+|opt/(grad_norm|clip_coef)|bucket/[^/]+/frac)", r"3_misc/\g<t>"),
     (rf"(?P<t>eval/(mini/)?(tf|probe)/[^/]+/({_TOK_DIAG}))", r"3_misc/\g<t>"),
+    # the CTC family's own tags (scripts/04_distill.py family "ctc"; kitsune.ctc_eval). Its loss/kl, loss/ctc,
+    # loss/kl_dense and loss/kl_blank go to train_loss above, the eval summaries' kl / ce / top1 to val_loss /
+    # val_accuracy; here the frame metrics - the argmax agreement with the teacher and the argmax-blank shares (the
+    # blank-collapse watch) next to the accuracy, the CTC loss and the KL split next to the loss, per set and per
+    # source (eval_ctc: the eval summaries' names of them) -, the frame counts (operational), and the dense share and
+    # frames per token (diagnostics)
+    (r"ctc/(?P<m>argmax_agree|argmax_blank|teacher_blank)", r"2_loss_accuracy/train_accuracy/ctc_frames/\g<m>"),
+    (r"ctc/(?P<m>kl_per_frame)", r"2_loss_accuracy/train_loss/\g<m>"),
+    (r"src/(?P<src>[^/]+)/(?P<m>ctc)", r"2_loss_accuracy/train_loss/by_source/\g<src>/\g<m>"),
+    (r"src/(?P<src>[^/]+)/(?P<m>argmax_agree)", r"2_loss_accuracy/train_accuracy/by_source/\g<src>/\g<m>"),
+    (r"(?P<t>src/[^/]+/utts)", r"1_operational/\g<t>"),
+    (rf"eval/(?P<mini>mini/)?(?P<kind>tf|probe)/{_SET}/(?P<m>ctc|kl_dense|kl_blank|kl_per_frame)",
+     r"2_loss_accuracy/eval_ctc/\g<mini>\g<kind>/\g<set>/\g<m>"),
+    (rf"eval/(?P<mini>mini/)?(?P<kind>tf|probe)/{_SET}/(?P<m>argmax_agree|argmax_blank|teacher_blank)",
+     r"2_loss_accuracy/eval_ctc/\g<mini>\g<kind>/\g<set>/\g<m>"),
+    (rf"eval/(?P<mini>mini/)?(?P<kind>tf|probe)/{_SET}/(?P<m>n_frames)",
+     r"1_operational/eval/\g<mini>\g<kind>/\g<set>/\g<m>"),
+    (r"(?P<t>ctc/(frac_dense|frames_per_token)|eval/(mini/)?(tf|probe)/[^/]+/(frac_dense|frames_per_token))",
+     r"3_misc/\g<t>"),
 )
 _TB_RULES = tuple((re.compile(p), t) for p, t in TB_BUCKET_RULES)
 
