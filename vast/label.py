@@ -1551,8 +1551,8 @@ def step_consumer_check(ctx: StepCtx, hub: bool = False):
     for c in ctx.label_cfgs:
         cfg = json.loads((ctx.kdir / c).read_text(encoding="utf-8"))
         problems += [f"{c}: {p}" for p in extent.pull_plan(cfg, record, files).get("problems", [])]
-        problems += [f"{c}: {p}" for p in launch.extent_problems(files, cfg, record)
-                     if hub or "COMPLETE.json" not in p]  # the local tree is sealed only at F7
+        # launch's check wants the seal, but both checks run before it (F7 writes COMPLETE.json only once they pass)
+        problems += [f"{c}: {p}" for p in launch.extent_problems(files, cfg, record) if "COMPLETE.json" not in p]
         problems += [f"{c}: {p}" for p in launch.selection_problems(ctx.kdir / cfg["selection"], cfg["selection"],
                                                                      cfg, set(files))]
     if not hub:
