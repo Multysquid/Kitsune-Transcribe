@@ -842,6 +842,20 @@ def test_the_report_leads_with_the_offer(report):
     assert "WITHIN 1.020 [" in md and "REPLICATE NEEDED" in md and "replicate_needed: **yes**" in md
 
 
+def test_the_report_flags_a_speed_json_that_mixes_hosts():
+    """Box A's students re-timed from the Hub after box B's speed phase found box A unfinished would sit in one
+    speed.json with the rest, timed on another A100: the report names the hosts above the offer tables and Pareto."""
+    tool = study_tool()
+    one = {"study-t06": {"rtf": 0.02, "gpu": "A100", "versions": {"host": "b"}},
+           "cohere": {"rtf": 0.05, "gpu": "A100", "versions": {"host": "b"}}}
+    assert tool.speed_hosts(one) == {"b / A100": ["cohere", "study-t06"]}
+    assert tool.mixed_hosts_note({"speed_hosts": tool.speed_hosts(one)}) == []
+    mixed = {**one, "study-t01": {"rtf": 0.01, "gpu": "A100", "versions": {"host": "c"}}}
+    note = tool.mixed_hosts_note({"speed_hosts": tool.speed_hosts(mixed)})
+    assert "mix hosts" in note[0] and "b / A100: cohere, study-t06" in note[0] and "c / A100: study-t01" in note[0]
+    assert tool.speed_hosts(None) == {}
+
+
 def test_study_report_end_to_end(tmp_path):
     """The three table layouts (one file per system, one per set, a 05_evaluate dir with text only), PREREG.json,
     PREREG_numbers.json, summaries and a speed JSON -> report.json and report.md with the planted calls."""

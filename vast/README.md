@@ -580,13 +580,16 @@ report checks they agree). They do not clash: launch never looks for other live 
 own instance label `kitsune-study-<box>-...`); on the Hub each box has its own run ids (box B calibrates its reference
 as `calib-study-t06-boxB`, box A as `calib-study-t06`), its own `study/box-<box>/` (queue summary, infra logs) and its
 own `study/PREREG_numbers_<box>.json`; within a box the mains start 45 s apart (their 20-minute log syncs stay apart),
-and every upload backs off on a 429 or a 5xx (the trainers' log syncs 15, 60, 180 s, then the next sync; the queue's
-uploads 5 s doubling to 10 min, then verified). `tests/test_study_box.py` runs both queues at once against one
-rate-limited runs repo. Box B times box A's four students at its end only if box A's
-`study/box-A/queue_summary.json` already lists their finished runs; box A is expected to end first (~5.8 h against
-~6.3 h central, and box B has three more probes and the CTC frame store). If box A is still training then, those four
-speed items fail as readouts (`readouts_failed`), box B still ends complete, and they are timed afterwards from the
-Hub with `tools/speed_probe.py`, as a failed readout is.
+and every upload backs off on a 429, a 5xx or a commit that raced another writer (409/412) (the trainers' log syncs
+15, 60, 180 s, then the next sync; the queue's uploads 5 s doubling to 10 min with up to 25 % jitter, then verified). `tests/test_study_box.py` runs both queues at once against one
+rate-limited runs repo. Box B's speed phase times its own students and the teachers first and box A's four students
+last, once box A's `study/box-A/queue_summary.json` lists their finished runs; box A is expected to end first (~5.8 h
+against ~6.3-7 h central, and box B has three more probes and the CTC frame store). If box A is still training then,
+box B polls its summary every 2 min for at most 45 min (~$1.6), never past its watchdog deadline less 1 h
+(`speed_wait` event). After that those four speed items fail as readouts (`readouts_failed`) and box B still ends
+complete. A redo re-times EVERY system, both teachers and all students, on one host into a fresh speed.json with
+`tools/speed_probe.py`: RTF and VRAM compare only within one host, and `tools/study_report.py` flags a speed.json
+that mixes hosts.
 
 **3. The replicate, only if it is needed** (CONTRACT.md 8: after boxes A and B, every limit call is computed at
 sigma_run 1.6 % and at 3.2 %; the replicate runs only if a family's LIMIT call - the primary delta 10 % walk - differs

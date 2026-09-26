@@ -164,6 +164,28 @@ def load_speed(path) -> dict | None:
     return raw.get("systems", raw)
 
 
+def speed_hosts(speed: dict | None) -> dict[str, list[str]]:
+    """"<host> / <gpu>" -> the systems timed there (tools/speed_probe.py records versions.host and gpu per system).
+    More than one: the speed and VRAM columns compare systems timed on different machines - e.g. box A's students
+    re-timed from the Hub after box B's speed phase found box A unfinished (vast/README.md)."""
+    out: dict[str, list[str]] = {}
+    for name, rec in (speed or {}).items():
+        if isinstance(rec, dict):
+            key = f"{(rec.get('versions') or {}).get('host') or '?'} / {rec.get('gpu') or '?'}"
+            out.setdefault(key, []).append(name)
+    return {k: sorted(v) for k, v in sorted(out.items())}
+
+
+def mixed_hosts_note(rep: dict) -> list[str]:
+    hosts = rep.get("speed_hosts") or {}
+    if len(hosts) < 2:
+        return []
+    return ["**The speed columns mix hosts** (RTF, latency and VRAM are comparable only within one host): "
+            + "; ".join(f"{h}: {', '.join(v)}" for h, v in hosts.items())
+            + ". Re-time every system, teachers included, on one host into a fresh speed.json (tools/speed_probe.py).",
+            ""]
+
+
 def load_params(path) -> dict | None:
     if path is None:
         return None
@@ -226,7 +248,7 @@ def render_offers(rep: dict) -> list[str]:
     if not off:
         return []
     dp = next(iter(off.values()))["delta"]
-    L = ["## What to offer", ""] + [f"- {t}" for t in rep.get("offer_text", [])] + [""]
+    L = ["## What to offer", ""] + [f"- {t}" for t in rep.get("offer_text", [])] + [""] + mixed_hosts_note(rep)
     head = ["model", "params total / non-emb.", "x smaller than teacher", "M4 CER", "JSUT", "CV8", "Reazon",
             "Galgame-neutral", "M4 / own teacher [CI]", "vs Parakeet TDT (JSUT+Galgame) [CI]", "batched RTF",
             "batch-1 p50 / p95 s", "peak VRAM GB", f"call at delta {100 * dp:g} % (M4 / top [CI])", "T/2 readout"]
@@ -414,7 +436,7 @@ def render_md(rep: dict) -> str:
             for p in rep["cross_family"]["equal_size"]]
     L += table(["equal size", "raw r [CI]", "no-style r [CI]"], rows) + [""]
 
-    L += ["## Pareto: CER vs A100 RTF and VRAM", ""]
+    L += ["## Pareto: CER vs A100 RTF and VRAM", ""] + mixed_hosts_note(rep)
     pa = rep["pareto"]
     if pa["available"]:
         rows = [[disp(rep, s), pct(r["jg"]), pct(r["m4"]), "n/a" if r["rtf"] is None else f"{r['rtf']:.4g}",
@@ -526,12 +548,14 @@ def build_report(args) -> dict:
             settings[key], sources[key] = int(val), "command line (NOT the pre-registered value)"
     summaries, summ_notes = load_summaries(args.run_summaries)
     numbers, numbers_sha, numbers_files = load_numbers(args.numbers)
-    rep = ss.analyse(corpus, settings, params=load_params(args.params), speed=load_speed(args.speed),
+    speed = load_speed(args.speed)
+    rep = ss.analyse(corpus, settings, params=load_params(args.params), speed=speed,
                      numbers=numbers, summaries=summaries,
                      prereg_baselines=ss.prereg_baselines(prereg), prereg_manifest=ss.prereg_manifest(prereg),
                      manifest_file_sha256=file_sha256(args.manifest), imitation=not args.no_imitation,
                      rules_sha256=prereg_rules_sha256(args.prereg), numbers_file_sha256=numbers_sha)
     rep["settings_sources"] = sources
+    rep["speed_hosts"] = speed_hosts(speed)
     rep["inputs"] = dict(tables=str(args.tables), manifest=str(args.manifest),
                          manifest_sha256=file_sha256(args.manifest), prereg=_s(args.prereg),
                          numbers=numbers_files, numbers_sha256=numbers_sha, speed=_s(args.speed),
