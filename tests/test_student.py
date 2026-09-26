@@ -140,6 +140,23 @@ def test_default_spec_and_real_param_count_on_meta():
     assert S.param_report(t)["total"] == S.closed_form_params(t.config) == 2_065_647_872
 
 
+@pytest.mark.parametrize("n_enc,dec,total,non_emb", [(20, (0, 2, 5, 7), 616_963_328, 599_137_536),
+                                                     (10, (0, 7), 320_752_384, 302_926_592)])
+def test_study_pruned_counts_on_meta(n_enc, dec, total, non_emb):
+    """T-0.6B and T-0.3B (STUDY.md 1.1): total and non-embedding (embed + pos_emb out, the head bias in)."""
+    spec = S.StudentSpec(S.evenly_spaced(n_enc, 48), 2560, list(dec))
+    assert S.PRUNED_EXPECTED_PARAMS[(n_enc, 2560, dec)] == total
+    if n_enc == 10:
+        assert spec.enc_layers == [0, 5, 10, 16, 21, 26, 31, 37, 42, 47]
+    with torch.device("meta"):
+        m = CohereAsrForConditionalGeneration(S.student_config(CohereAsrConfig(), spec))
+    assert S.count_fields(m) == dict(params_total=total, params_non_embedding=non_emb, closed_form_params=total)
+    with torch.device("meta"):  # untied (the raw config): the head weight is vocabulary-sized, so it is not counted
+        u = CohereAsrForConditionalGeneration(S.student_config(CohereAsrConfig(), S.StudentSpec(
+            spec.enc_layers, 2560, list(dec), tie_head=False)))
+    assert S.non_embedding_params(u) == non_emb
+
+
 # ------------------------------------------------------------------------------------------------ build
 
 
@@ -245,6 +262,49 @@ def test_build_from_bf16_teacher_gives_fp32_student(tmp_path):
     assert {b.dtype for n, b in student.named_buffers() if ".running_" in n} == {torch.float32}
     assert torch.equal(student.model.encoder.subsampling.linear.weight,
                        teacher.model.encoder.subsampling.linear.weight.float())
+
+
+def test_build_with_a_given_ffn_selection():
+    """build_student(keep=...) (03 --ffn-from): the same student as from the importance that chose that selection;
+    keep_from_meta reads what a build recorded; check_keep rejects a selection that does not fit the spec."""
+    teacher = tiny_teacher(seed=11)
+    spec = S.StudentSpec([0, 2, 3], 48, [0, 2])
+    imp = rand_importance(spec.enc_layers, 128, seed=3)
+    a = S.build_student(teacher, spec, imp)
+    keep = S.select_ffn_neurons(imp, spec.enc_layers, 48, 128)
+    meta = json.loads(S.dump_json(dict(kept=dict(ffn={f"{l}.{n}": v for (l, n), v in keep.items()}))))
+    back = S.keep_from_meta(meta)
+    assert set(back) == set(keep) and all(torch.equal(back[k], keep[k]) for k in keep)
+    b = S.build_student(teacher, spec, importance=None, keep=back)
+    sa, sb = a.state_dict(), b.state_dict()
+    assert all(torch.equal(sa[k], sb[k]) for k in sa)
+    # a superset (all four layers) is restricted to the spec's layers
+    wide = back | {(1, n): torch.arange(48) for n in S.FFN_NAMES}
+    assert set(S.check_keep(wide, spec, 128)) == set(keep)
+    assert S.check_keep(back, S.StudentSpec([0, 2, 3], 128, [0]), 128) == {}  # nothing pruned
+    bad = []
+    k0 = (0, "feed_forward1")
+    for v in (back[k0][:-1],  # too few
+              back[k0].flip(0),  # not ascending
+              torch.cat([back[k0][:-1], torch.tensor([128])])):  # outside the teacher's width
+        bad.append(back | {k0: v})
+    bad.append({k: v for k, v in back.items() if k != (3, "feed_forward2")})  # a layer missing
+    for sel in bad:
+        with pytest.raises(ValueError):
+            S.build_student(teacher, spec, importance=None, keep=sel)
+    with pytest.raises(ValueError, match="kept.ffn"):
+        S.keep_from_meta({"kept": {"ffn": {}}})
+
+
+def test_build_keeps_the_teachers_bn_stats():
+    """Without recalibration (03 --bn keep) every kept layer's BN running stats are the teacher layer's, bitwise."""
+    teacher = tiny_teacher(seed=12)
+    spec = S.StudentSpec([1, 3], 64, [0])
+    student = S.build_student(teacher, spec, rand_importance([1, 3], 128))
+    for j, tl in enumerate(spec.enc_layers):
+        s_bn, t_bn = student.model.encoder.layers[j].conv.norm, teacher.model.encoder.layers[tl].conv.norm
+        for b in ("running_mean", "running_var", "num_batches_tracked"):
+            assert torch.equal(getattr(s_bn, b), getattr(t_bn, b)), (j, b)
 
 
 def test_build_rejects_bad_requests():
@@ -466,18 +526,28 @@ def test_build_script_end_to_end_tiny(tmp_path):
             "--calib-per-group", "4", "--calib-batch-s", "20", "--eval-batch-s", "20"]
     mod = load_script("03_build_student")
     assert mod.main(argv) == 0
+    # the BN recalibration stops its feature generator early (max_utts); closing it must not leave grad mode off for
+    # the rest of the process (any later test that calls backward would fail)
+    assert torch.is_grad_enabled()
 
     meta = S.load_meta(out)
     assert meta["stage"] == "complete"
     assert meta["spec"] == {"enc_layers": [0, 2, 3], "ffn_dim": 48, "dec_layers": [0, 2], "tie_head": True}
-    assert meta["calibration"]["n_importance"] == 12 and meta["bn"]["n_utts"] == 8
+    assert meta["calibration"]["n_importance"] == 12 and meta["bn"] == "recal" and meta["bn_recal"]["n_utts"] == 8
+    assert meta["format"] == 2 and meta["family"] == "aed" and meta["init_class"] == "pruned_kept"
+    assert meta["params_total"] == meta["closed_form_params"] == meta["params"]["total"]
+    assert meta["params_non_embedding"] == meta["params_total"] - 16384 * 64 - 1024 * 64  # tied: embed + pos_emb out
+    assert (meta["enc_layers"], meta["ffn"], meta["dec_layers"], meta["seed"]) == ([0, 2, 3], 48, [0, 2], 1234)
+    assert meta["teacher"] == str(teacher_dir)  # a local dir has no commit: no "@<commit>"
     assert len(meta["kept"]["ffn"]["2.feed_forward1"]) == 48 and meta["kept"]["ffn"]["2.feed_forward1"] == sorted(
         meta["kept"]["ffn"]["2.feed_forward1"])
     assert 0 < meta["importance"]["kept_mass_min"] <= meta["importance"]["kept_mass_mean"] < 1
     assert meta["params"]["total"] == meta["params"]["closed_form"]
     assert "teacher_revision" in meta and meta["teacher_revision"] is None  # a local teacher dir has no hub commit
-    assert (out / "README.md").exists()  # the model card
-    assert meta["step0"]["n_per_set"] == {"eval_x": 4}
+    card = (out / "README.md").read_text(encoding="utf-8")  # the model card, its notice describing this student
+    assert "It was pruned (encoder: 3 of 48 layers, FFN 5120 -> 48; decoder: 2 of 8 layers), its output head tied to " \
+           "the token embedding and its BatchNorm statistics recalibrated, then trained" in card
+    assert meta["step0"]["n_per_set"] == {"eval_x": 4} and meta["step0"]["seed"] == 1234
     assert meta["step0"]["greedy"]["sets"]["eval_x"]["n"] == 4
     assert "kl" in meta["step0"]["teacher_forced"]["sets"]["eval_x"]
     assert {"started", "saved", "finished"} <= set(meta["timestamps"]) and "sha" in meta["git"]
@@ -502,6 +572,142 @@ def test_build_script_end_to_end_tiny(tmp_path):
     assert mod.main(argv) == 0
     m3 = S.load_meta(out)
     assert m3["stage"] == "complete" and "resumed" in m3["timestamps"] and m3["step0"]["n_per_set"] == {"eval_x": 4}
+
+
+def test_build_script_study_flags_end_to_end_tiny(tmp_path):
+    """The size study's pruned builds on a tiny saved teacher: --bn keep (teacher BN stats, no calibration audio for
+    BN), --importance-layers all (one cache over every teacher layer) reused by another size through
+    --importance-cache, and --ffn-from (another student's FFN selection, cross-checked against its importance.pt;
+    no calibration audio at all). Plus the step-0 function check and the build identity guard."""
+    try:
+        from transformers import AutoProcessor
+
+        proc = AutoProcessor.from_pretrained(S.TEACHER_ID)
+    except Exception as e:
+        pytest.skip(f"teacher processor not cached: {e}")
+    from fixtures import load_script, make_fake_corpus, make_fake_selection
+    from safetensors.torch import load_file
+
+    fc = make_fake_corpus(tmp_path / "corpus", sources={"src_a": (40, "train"), "eval_x": (12, "eval")})
+    sel = make_fake_selection(fc, greedy_n=6, probe_n=4)
+    teacher_dir = tmp_path / "teacher"
+    teacher = tiny_teacher(seed=9)
+    teacher.save_pretrained(teacher_dir)
+    proc.save_pretrained(teacher_dir)
+    common = ["--teacher", str(teacher_dir), "--calib-utts", "10", "--bn-utts", "6", "--sources", "src_a",
+              "--device", "cpu", "--eval-sets", "eval_x", "--selection", str(sel), "--data", str(fc.data),
+              "--teacher-root", str(fc.teacher_out), "--eval-cache", str(tmp_path / "cache_eval"),
+              "--calib-per-group", "4", "--calib-batch-s", "20", "--eval-batch-s", "20", "--teacher-dtype", "fp32"]
+    mod = load_script("03_build_student")
+
+    a = tmp_path / "a"  # B3x48 / dec {0,2}, BN kept, importance over all 4 teacher layers
+    argv_a = common + ["--enc-layers", "3", "--ffn", "48", "--dec-layers", "0", "2", "--bn", "keep",
+                       "--importance-layers", "all", "--step0-eval-utts", "3", "--out", str(a)]
+    assert mod.main(argv_a) == 0
+    ma = S.load_meta(a)
+    assert ma["bn"] == "teacher" and "bn_recal" not in ma and ma["calibration"]["n_bn"] == 0
+    assert ma["calibration"]["n_importance"] == 10 and ma["importance"]["n_layers"] == 4
+    assert ma["importance"]["teacher_dtype"] == "torch.float32" and not ma["importance"]["reused"]
+    assert (ma["family"], ma["init_class"], ma["enc_layers"], ma["ffn"]) == ("aed", "pruned_kept", [0, 2, 3], 48)
+    assert ma["params_total"] == ma["closed_form_params"] and ma["expected_params"] is None  # not a study shape
+    fcheck = ma["function_check"]
+    assert fcheck["on_gate"] is False and fcheck["function"] in ("kept", "lost") and fcheck["threshold"] == 0.9
+    assert fcheck["cer_vs_teacher"] == ma["step0"]["greedy"]["all"]["cer_teacher_corpus"]
+    assert ma["build"]["seed"] == 1234 and ma["build"]["calibration"] == dict(
+        sources=["src_a"], calib_utts=10, bn_utts=6, per_group=4, ids_sha256=None)
+    card = (a / "README.md").read_text(encoding="utf-8")
+    assert "It was pruned (encoder: 3 of 48 layers, FFN 5120 -> 48; decoder: 2 of 8 layers), its output head tied to " \
+           "the token embedding, then trained by distillation from the teacher's outputs. Its BatchNorm statistics " \
+           "are the teacher's." in card and "recalibrated" not in card
+    cache = torch.load(a / "importance.pt", weights_only=True)
+    assert cache["layers"] == [0, 1, 2, 3] and len(cache["importance"]) == 8
+    tsd = teacher.state_dict()
+    sd = load_file(a / "model.safetensors")
+    for j, tl in enumerate([0, 2, 3]):  # the teacher's BN stats, fp32, bitwise
+        for b in ("running_mean", "running_var", "num_batches_tracked"):
+            assert torch.equal(sd[f"model.encoder.layers.{j}.conv.norm.{b}"],
+                               tsd[f"model.encoder.layers.{tl}.conv.norm.{b}"])
+
+    # another size reuses the all-layer cache: nothing recomputed, nothing written
+    b = tmp_path / "b"
+    mtime = (a / "importance.pt").stat().st_mtime_ns
+    assert mod.main(common + ["--enc-layers", "2", "--ffn", "32", "--dec-layers", "1", "--bn", "keep",
+                              "--importance-cache", str(a / "importance.pt"), "--step0-eval-utts", "0",
+                              "--out", str(b)]) == 0
+    mb = S.load_meta(b)
+    assert mb["importance"]["reused"] and mb["importance"]["path"] == str(a / "importance.pt")
+    assert (a / "importance.pt").stat().st_mtime_ns == mtime and not (b / "importance.pt").exists()
+    imp = S.importance_from_state(cache["importance"])
+    want = S.select_ffn_neurons(imp, [0, 3], 32, 128)
+    assert mb["kept"]["ffn"] == {f"{l}.{n}": v.tolist() for (l, n), v in sorted(want.items())}
+    # a named cache that does not match (other calibration ids; the same ids through a bf16 teacher, which ranks the
+    # neurons at the cut differently) is an input: refused, never overwritten
+    with pytest.raises(SystemExit, match="does not match"):
+        mod.main([x if x != "10" else "9" for x in common] + [
+            "--enc-layers", "2", "--ffn", "32", "--dec-layers", "1", "--bn", "keep", "--importance-cache",
+            str(a / "importance.pt"), "--step0-eval-utts", "0", "--out", str(tmp_path / "b2")])
+    with pytest.raises(SystemExit, match="does not match"):
+        mod.main([x if x != "fp32" else "bf16" for x in common] + [
+            "--enc-layers", "2", "--ffn", "32", "--dec-layers", "1", "--bn", "keep", "--importance-cache",
+            str(a / "importance.pt"), "--step0-eval-utts", "0", "--out", str(tmp_path / "b2")])
+    assert (a / "importance.pt").stat().st_mtime_ns == mtime
+    assert cache["key"]["teacher_dtype"] == "torch.float32"
+
+    # the sampled ids are written in sample order; --calib-ids reads exactly them back (another seed would draw
+    # others), so the cache key matches again
+    ids_a = (a / "calibration_ids.txt").read_text(encoding="utf-8").split()
+    assert len(ids_a) == 10 and ma["calibration"]["ids_file"] == "calibration_ids.txt"
+    assert mod.ids_sha(ids_a) == ma["calibration"]["importance_ids_sha256"] == cache["key"]["ids_sha256"]
+    b3 = tmp_path / "b3"
+    assert mod.main(common + [
+        "--seed", "99", "--calib-ids", str(a / "calibration_ids.txt"), "--enc-layers", "2", "--ffn", "32",
+        "--dec-layers", "1", "--bn", "keep", "--importance-cache", str(a / "importance.pt"), "--step0-eval-utts", "0",
+        "--out", str(b3)]) == 0
+    mb3 = S.load_meta(b3)
+    assert mb3["importance"]["reused"] and mb3["calibration"]["ids_from"] == str(a / "calibration_ids.txt")
+    assert mb3["build"]["seed"] == 99 and mb3["build"]["calibration"]["ids_sha256"] == mod.ids_sha(ids_a)
+    assert (b3 / "calibration_ids.txt").read_text(encoding="utf-8").split() == ids_a
+    (tmp_path / "bad_ids.txt").write_text("\n".join(ids_a[:9] + ["no-such-id"]) + "\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="not kept train rows"):
+        mod.main(common + ["--calib-ids", str(tmp_path / "bad_ids.txt"), "--enc-layers", "2", "--ffn", "32",
+                           "--dec-layers", "1", "--bn", "keep", "--step0-eval-utts", "0",
+                           "--out", str(tmp_path / "b4")])
+
+    # --ffn-from: a's selection, verbatim; no calibration audio; the same weights as a
+    c = tmp_path / "c"
+    argv_c = common + ["--enc-layers", "3", "--ffn", "48", "--dec-layers", "0", "2", "--bn", "keep",
+                       "--ffn-from", str(a), "--step0-eval-utts", "0", "--out", str(c)]
+    assert mod.main(argv_c) == 0
+    mc = S.load_meta(c)
+    assert mc["kept"] == ma["kept"] and mc["importance"]["reproduced_by_importance"]
+    assert mc["importance"]["source_teacher_dtype"] == "torch.float32"  # the selection is a's, measured in fp32
+    assert mc["importance"]["ffn_from"] == str(a) and mc["calibration"]["n_importance"] == 0
+    assert mc["calibration"]["importance_ids_sha256"] == ma["calibration"]["importance_ids_sha256"]
+    assert mc["build"]["ffn_from"] == str(a) and "sample" in mc["durations_s"]
+    sc = load_file(c / "model.safetensors")
+    assert set(sc) == set(sd) and all(torch.equal(sc[k], sd[k]) for k in sd)
+    with pytest.raises(ValueError):  # a's selection has no 5120 -> 32 FFNs for these layers
+        mod.main(common + ["--enc-layers", "3", "--ffn", "32", "--dec-layers", "0", "--bn", "keep",
+                           "--ffn-from", str(a), "--step0-eval-utts", "0", "--out", str(tmp_path / "d")])
+    tampered = dict(ma, kept=dict(ma["kept"], ffn=dict(ma["kept"]["ffn"])))
+    ks = tampered["kept"]["ffn"]["2.feed_forward1"]
+    ks = sorted(set(range(128)) - set(ks))[:1] + ks[1:]
+    tampered["kept"]["ffn"]["2.feed_forward1"] = sorted(ks)
+    (tmp_path / "e").mkdir()
+    S.write_meta(tmp_path / "e", tampered)
+    (tmp_path / "e" / "importance.pt").write_bytes((a / "importance.pt").read_bytes())
+    with pytest.raises(SystemExit, match="does not reproduce"):
+        mod.main(common + ["--enc-layers", "3", "--ffn", "48", "--dec-layers", "0", "2", "--bn", "keep",
+                           "--ffn-from", str(tmp_path / "e"), "--step0-eval-utts", "0", "--out", str(tmp_path / "f")])
+
+    # the build identity: the same dir with recalibrated BN is another student; so is one with another seed (it draws
+    # the calibration sample and the step-0 ids), even when only the step-0 eval is left to resume
+    with pytest.raises(SystemExit, match="different student"):
+        mod.main([x if x != "keep" else "recal" for x in argv_a])
+    assert mod.main(argv_a) == 0  # the same build: already complete
+    S.write_meta(a, dict(S.load_meta(a), stage="saved"))
+    with pytest.raises(SystemExit, match="different student"):
+        mod.main(argv_a + ["--seed", "5"])
 
 
 def test_build_script_refuses_a_teacher_commit_the_targets_did_not_come_from(tmp_path):
@@ -551,6 +757,138 @@ def test_importance_cache_is_keyed_on_the_teacher_commit(tmp_path, monkeypatch):
     c["key"].pop("teacher_revision")
     torch.save(c, tmp_path / "importance.pt")
     assert reused(b) is False and computed == [a, b, b]
+
+
+def test_importance_cache_is_keyed_on_the_teacher_dtype(tmp_path, monkeypatch):
+    """The same utterances through a bf16 and an fp32 teacher rank the neurons at the cut differently, so a cache is
+    only reused by a build in its own dtype. A cache from before the key held the dtype counts as the dtype its info
+    recorded, or bf16 (the only one before --teacher-dtype)."""
+    from types import SimpleNamespace
+
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    computed = []
+
+    def fake_importance(teacher, feats, layers, device):
+        computed.append(mod.teacher_dtype(teacher))
+        return {(l, n): torch.rand(8) for l in layers for n in S.FFN_NAMES}
+
+    monkeypatch.setattr(S, "ffn_importance", fake_importance)
+    utts = [dict(id=f"u{i}", duration=1.0, source="s", wave=None) for i in range(3)]
+    args = SimpleNamespace(teacher=S.TEACHER_ID, calib_batch_s=10.0)
+    spec = SimpleNamespace(enc_layers=[0, 2])
+    path = tmp_path / "importance.pt"
+
+    def reused(dtype):
+        teacher = torch.nn.Linear(2, 2).to(dtype)
+        teacher.config = SimpleNamespace(_commit_hash="a" * 40)
+        _, info = mod.load_or_compute_importance(teacher, None, utts, args, spec, "cpu", tmp_path, log=lambda *_: None)
+        return info["reused"]
+
+    assert [reused(torch.float32), reused(torch.float32), reused(torch.bfloat16)] == [False, True, False]
+    c = torch.load(path, weights_only=True)
+    assert c["key"]["teacher_dtype"] == c["info"]["teacher_dtype"] == "torch.bfloat16"
+    c["key"].pop("teacher_dtype")  # written before the key held the dtype; info says bf16
+    torch.save(c, path)
+    assert reused(torch.bfloat16) is True
+    c["key"].pop("teacher_dtype", None)
+    c["info"]["teacher_dtype"] = "torch.float32"  # this branch's first caches: the dtype only in info
+    torch.save(c, path)
+    assert reused(torch.float32) is True and reused(torch.bfloat16) is False
+    c = torch.load(path, weights_only=True)
+    c["key"].pop("teacher_dtype")
+    c["info"].pop("teacher_dtype")  # the first run's: no dtype anywhere, computed in bf16
+    torch.save(c, path)
+    assert mod.importance_key(c)["teacher_dtype"] == "torch.bfloat16" and reused(torch.bfloat16) is True
+    assert computed == ["torch.float32", "torch.bfloat16", "torch.bfloat16"]
+
+
+def test_feature_batches_leave_grad_mode_alone():
+    """A consumer under @torch.no_grad() that stops early leaves feature_batches suspended; closing it afterwards must
+    not switch grad mode off for the rest of the process (it did while the generator yielded inside its no_grad)."""
+    import gc
+
+    import numpy as np
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    utts = [dict(id=f"u{i}", duration=1.0, wave=np.zeros(16000, np.float32)) for i in range(3)]
+
+    @torch.no_grad()
+    def first(it):
+        for item in it:
+            return item
+
+    g = mod.feature_batches(utts, lambda w, n: (w, n), "cpu", 1.0, "test")  # one utterance per batch
+    wave, _ = first(g)
+    assert torch.is_grad_enabled() and wave.shape == (1, 16000)
+    del g
+    gc.collect()
+    assert torch.is_grad_enabled()
+
+
+def test_build_identity_gate_and_legacy_meta():
+    """A pruned build's identity holds the seed and the calibration inputs; the first run's format-1 meta still reads
+    as the default build; function_check's on_gate needs the gate's 20 per set AND its seed."""
+    from fixtures import load_script
+
+    mod = load_script("03_build_student")
+    default = mod.build_identity(mod.parse_args([]))
+    assert default["seed"] == 1234 and default["calibration"] == dict(
+        sources=["reazon_small", "emilia_yodas", "galgame"], calib_utts=1000, bn_utts=1000, per_group=16,
+        ids_sha256=None)
+    first_run = {"format": 1, "args": {  # students/b20x2560-d4/student_meta.json
+        "enc_layers": 20, "ffn": 2560, "dec_layers": [0, 2, 5, 7], "no_tie_head": False, "calib_utts": 1000,
+        "bn_utts": 1000, "sources": ["reazon_small", "emilia_yodas", "galgame"], "seed": 1234, "calib_per_group": 16}}
+    assert mod.legacy_identity(first_run) == default
+    assert mod.build_identity(mod.parse_args(["--seed", "7"])) != default
+
+    step0 = dict(n_per_set={s: 20 for s in mod.EVAL_SETS}, seed=1234, greedy={"all": {"cer_teacher_corpus": 0.95}},
+                 teacher_forced={"all": {"kl": 4.0}})
+    fc = mod.function_check(step0)
+    assert fc == dict(cer_vs_teacher=0.95, kl=4.0, threshold=0.9, function="lost", on_gate=True)
+    assert mod.function_check(dict(step0, seed=7))["on_gate"] is False  # another 60 utterances
+    assert mod.function_check(dict(step0, n_per_set={"eval_jsut": 20}))["on_gate"] is False
+    no_seed = {k: v for k, v in step0.items() if k != "seed"}  # recorded before step-0 held its seed
+    assert mod.function_check(no_seed)["on_gate"] is False
+    assert mod.function_check(dict(step0, greedy={"all": {"cer_teacher_corpus": 0.6}}))["function"] == "kept"
+
+
+def test_model_card_describes_the_student():
+    """README.md's Apache-2.0 modification notice says what was done to the teacher: the first run's student keeps
+    the card as written; a study student gets its own shape and BN mode; a scratch student says its weights are
+    random. The card's wording is what model_card rewrites (a changed card would only warn)."""
+    from dataclasses import asdict
+
+    card = S.MODEL_CARD.read_bytes().decode("utf-8")
+    assert S._CARD_CHANGES.search(card)
+    assert S.model_card({}) == card and S.model_card({"format": 1, "bn": {"n_utts": 1000}}) == card
+
+    def split(text):  # (the card outside the notice's what-was-done part, that part with whitespace normalised)
+        head, rest = text.split("LICENSE-2.0). ", 1)
+        part, tail = rest.split("\n## Training data", 1)
+        return head + tail, " ".join(part.split())
+
+    def notice(meta):
+        outside, part = split(S.model_card(meta))
+        assert outside == split(card)[0]  # everything else is the card's, byte for byte
+        return part
+
+    pruned = dict(init_class="pruned_kept", enc_layers=S.evenly_spaced(20, 48), ffn=2560, dec_layers=[0, 2, 5, 7],
+                  build={"tie_head": True})
+    assert notice(dict(pruned, bn="recal")) == split(card)[1]  # the first run's student: the card's own words
+    t03 = notice(dict(pruned, bn="teacher", enc_layers=S.evenly_spaced(10, 48), dec_layers=[0, 7]))
+    assert t03.startswith("It was pruned (encoder: 10 of 48 layers, FFN 5120 -> 2560; decoder: 2 of 8 layers), its "
+                          "output head tied to the token embedding, then trained by distillation from the teacher's "
+                          "outputs. Its BatchNorm statistics are the teacher's.") and "recalibrated" not in t03
+    untied = notice(dict(pruned, bn="recal", ffn=5120, build={"tie_head": False}))
+    assert "FFN 5120;" in untied and "tied" not in untied and "BatchNorm statistics recalibrated" in untied
+    scratch = notice(dict(init_class="scratch", bn="fresh", scratch=dict(name="t01", **asdict(S.SCRATCH_SHAPES["t01"])),
+                          build={"init": "scratch"}))
+    assert scratch.startswith("It has that model's architecture at another size (encoder: 12 layers, width 512, FFN "
+                              "2048; decoder: 4 layers, width 512, FFN 2048;") and "randomly initialised" in scratch
+    assert "pruned" not in scratch and "FFN neurons kept" not in scratch
 
 
 def test_importance_state_roundtrip(tmp_path):

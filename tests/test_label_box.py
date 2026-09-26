@@ -414,9 +414,15 @@ def test_consumer_check_step_is_65_on_problems(stepctx, box, monkeypatch):
     monkeypatch.setattr(launch, "selection_problems", lambda path, name, cfg, have=None: [])
     monkeypatch.setattr(label, "consumer_local_problems", lambda ctx: [])
     ctx, _ = stepctx()
-    assert label.run_step("consumer-check", [], ctx) == 0  # locally the root is not sealed yet
+    # neither check can want the seal: F7 writes COMPLETE.json only after both passed (the first label box stopped
+    # at F6 on exactly this problem)
+    assert label.run_step("consumer-check", [], ctx) == 0
+    assert label.run_step("consumer-check", ["--hub"], ctx) == 0
+    monkeypatch.setattr(launch, "extent_problems", lambda files, cfg, record: ["labels/full/COMPLETE.json missing",
+                                                                              "reazon_large/train-00001 missing"])
     assert label.run_step("consumer-check", ["--hub"], ctx) == 65
     assert json.loads((box.state / "consumer_check_hub.json").read_text())["n_problems"] == 2  # per config
+    monkeypatch.setattr(launch, "extent_problems", lambda files, cfg, record: ["labels/full/COMPLETE.json missing"])
     monkeypatch.setattr(label, "consumer_local_problems", lambda ctx: ["reazon_small/train-00000: Parakeet ids"])
     assert label.run_step("consumer-check", [], ctx) == 65
     assert json.loads((box.kdir / "labels/full/reports/consumer_check.json").read_text())["n_problems"] == 1

@@ -214,7 +214,7 @@ def test_cooldown_action_moves_the_schedule_on_every_clock(tmp_path, monkeypatch
     m = load_script("04_distill")
     # steps: trigger after step 7 of 20 -> t_c 7, T 7 + ceil(0.3 * 7) = 10
     R, evs, sc = _unit_run(m, tmp_path, ["schedule.clock=steps", "schedule.max_steps=20", "schedule.cooldown_frac=0.3",
-                                         "early_stop.enabled=true"])
+                                         "schedule.warmup_steps=2", "early_stop.enabled=true"])
     R.st["step"] = 7
     assert R.progress() == (7.0, 20.0) and R.cooldown_start(20.0) == pytest.approx(14.0)
     assert m.early_stop_trigger(R, "patience", "cooldown") is False  # the loop goes on
@@ -229,7 +229,7 @@ def test_cooldown_action_moves_the_schedule_on_every_clock(tmp_path, monkeypatch
 
     # already cooling down (t >= (1 - 0.3) * 20 = 14): no second cooldown, the scheduled end stays
     R, evs, _ = _unit_run(m, tmp_path, ["schedule.clock=steps", "schedule.max_steps=20", "schedule.cooldown_frac=0.3",
-                                        "early_stop.enabled=true"])
+                                        "schedule.warmup_steps=2", "early_stop.enabled=true"])
     R.st["step"] = 15
     assert m.early_stop_trigger(R, "floor", "cooldown") is False
     assert R.st["early_stop"]["cooldown"] is None and R.progress() == (15.0, 20.0)
@@ -275,7 +275,8 @@ def test_summary_best_step_and_stopped_early(tmp_path):
     from kitsune import evaluate as ev
 
     teacher = dict(ev.TEACHER_CER_PREREG, eval_emilia=0.10, galgame=0.21)
-    sets = ["schedule.clock=steps", "schedule.max_steps=20", "schedule.cooldown_frac=0.3", "early_stop.enabled=true"]
+    sets = ["schedule.clock=steps", "schedule.max_steps=20", "schedule.cooldown_frac=0.3", "schedule.warmup_steps=2",
+            "early_stop.enabled=true"]
 
     def rec(step, gate, monitor):  # the student / teacher CER ratio on every gate set and on every monitor set
         return dict(step=step, elapsed_s=float(step), heldout_kl=1.0,

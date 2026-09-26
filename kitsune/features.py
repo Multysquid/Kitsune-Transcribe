@@ -102,7 +102,7 @@ class LogMel(nn.Module):
     def from_feature_extractor(cls, fe, **kw) -> "LogMel":
         """Copy every setting (and the filterbank tensor itself) from an HF CohereAsrFeatureExtractor instance."""
         return cls(fe.mel_filters, n_fft=fe.n_fft, hop_length=fe.hop_length, win_length=fe.win_length,
-                   preemphasis=fe.preemphasis, dither=fe.dither, sampling_rate=fe.sampling_rate,
+                   preemphasis=fe.preemphasis, dither=getattr(fe, "dither", 0.0), sampling_rate=fe.sampling_rate,
                    n_mels=fe.feature_size, **kw)
 
     @classmethod
@@ -199,9 +199,10 @@ class SpecAugment(nn.Module):
 
     Per utterance: `freq_masks` bands of width ~U{0..freq_width}; n ~ U{time_masks_min..time_masks_max} time masks of
     width ~U{0..max(1, floor(time_width * valid_frames))}, each placed wholly inside the valid frames. All randomness
-    comes from the `generator` argument (seed it per step), drawn in one call on the generator's device, so a step
-    is reproducible and independent of the global RNG. Returns the masked features and the fraction of each
-    utterance's valid frames covered by a time mask (for logging)."""
+    comes from the `generator` argument, drawn in one call on the generator's device, so a batch's masks are a
+    function of the generator's seed and the batch's shape only, independent of the global RNG (the trainer seeds it
+    per micro-batch from (specaug.seed, step, micro-batch index): scripts/04_distill.py specaug_seed). Returns the
+    masked features and the fraction of each utterance's valid frames covered by a time mask (for logging)."""
 
     def __init__(self, freq_masks: int = 2, freq_width: int = 27, time_masks_min: int = 2, time_masks_max: int = 5,
                  time_width: float = 0.05):

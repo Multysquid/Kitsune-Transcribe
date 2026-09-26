@@ -31,7 +31,8 @@ parameters and no compute, and it would add id-remapping risk.
 02_teacher_pass.py   teacher forward passes -> teacher_out/<source>/<split>-NNNNN.{npz,jsonl}
 02p_parakeet_pass.py second teacher, Parakeet TDT-CTC 0.6B ja -> parakeet_out/<source>/<split>-NNNNN.{npz,jsonl}
 02b_second_opinion.py  second ASR opinion per utterance -> second_out/ (agreement-based label filter)
-make_selection.py    which utterances train / evaluate, and why -> selection/*.parquet
+make_selection.py    which utterances train / evaluate, and why -> selection/*.parquet (the size study's: + sidecar and
+                     eval manifest; study/PREREG.{json,md} from `python -m kitsune.prereg`)
 03_build_student.py  prune the teacher to the student (20 enc layers, FFN 2560, 4 dec layers), init from teacher
 04_distill.py        KL on the stored top-16 + CE on the teacher tokens + L2-SP; TensorBoard (cards in three groups:
                      1_operational, 2_loss_accuracy, 3_misc; first the combined loss KL + 0.8 CE per step and on the
@@ -111,7 +112,9 @@ It decodes greedy TDT with transformers' semantics plus NeMo's max-symbols guard
 About 1.34 MB per audio hour (~17.5 GB for the full ~13k h). The format (array names, shapes, dtypes, the settings in
 `meta.json`) is documented in the docstring of [kitsune/parakeet_targets.py](kitsune/parakeet_targets.py), which also
 has the loader (`load_shard`) and the checker (`check_shard`). Parakeet was trained on ReazonSpeech, so its reazon
-targets are in-training-data predictions. No trainer reads `parakeet_out` yet. The same pass's TDT hypothesis is the
+targets are in-training-data predictions. No trainer reads `parakeet_out` yet; the size study's selection does
+(`make_selection.py` with a `selection_recipe.study` block: both roots, the F1a agreement filter, CTC feasibility; see
+vast/README.md, "The size study's selection and pre-registration"). The same pass's TDT hypothesis is the
 second opinion that judges Galgame in `second_out` (the `model2` field of each row names the judge).
 
 ## Setup

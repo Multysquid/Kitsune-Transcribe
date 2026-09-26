@@ -36,6 +36,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from kitsune.prereg import study_files
 from kitsune.store import fsync_path, load_progress, read_manifest, sidecar_meta
 from kitsune.store import ids_sha256  # noqa: F401  re-exported: the record's per-stem join key
 
@@ -431,8 +432,14 @@ def pull_plan(cfg: dict, record: dict, files: list[str]) -> dict:
     """What a consumer of the extent pulls from the data repo listing `files`: {dir_patterns, explicit, required,
     problems}. An uncapped name is pulled by directory globs, a capped one by its explicit <stem>.npz/.jsonl files (a
     prefix of a big source); second_out only for the train sources and selection_recipe.filter_eval_sets (the gate sets
-    have none); never parakeet_out. `required` is every file the run needs; missing ones are problems. The student's
-    files are the caller's to check (vast/launch.py STUDENT_FILES)."""
+    have none). parakeet_out (<stem>.npz/.jsonl of every name, and its meta.json) only for a CTC student
+    (cfg family "ctc") or with cfg pull_parakeet true (the study box pulls both teachers for every run); a CTC run
+    without pull_parakeet needs teacher_out only for its eval sets' eval stems (the Cohere baselines), not for its train
+    stems. A study selection (selection_recipe.study) also brings its sidecar and manifest (kitsune.prereg.study_files:
+    <selection>.json and study_manifest.json next to it; the box checks the manifest hash and every scorer reads it).
+    Without these keys (every config before the study) the plan is what it always was. `required` is every file the
+    run needs; missing ones are problems. The student's files are the caller's to check (vast/launch.py
+    STUDENT_FILES)."""
     problems = validate(cfg)
     if problems:
         return dict(dir_patterns=[], explicit=[], required=[], problems=problems)
@@ -440,19 +447,33 @@ def pull_plan(cfg: dict, record: dict, files: list[str]) -> dict:
     capped = set(_inputs(cfg))
     teacher_root, second_root = cfg.get("teacher_root", "teacher_out"), cfg.get("second_root", "second_out")
     judged = set(cfg.get("sources") or []) | set((cfg.get("selection_recipe") or {}).get("filter_eval_sets") or [])
+    ctc = cfg.get("family", "aed") == "ctc"
+    parakeet_root = cfg.get("parakeet_root") if ctc or cfg.get("pull_parakeet") else None
+    if (ctc or cfg.get("pull_parakeet")) and not parakeet_root:
+        problems.append(f"the config {'trains a CTC student' if ctc else 'sets pull_parakeet'} but has no "
+                        f"parakeet_root")
+    teacher_all = not ctc or bool(cfg.get("pull_parakeet"))  # else: eval stems of the eval sets only
+    eval_sets = set(cfg.get("eval_sets") or [])
     required = [f"{teacher_root}/meta.json", f"{second_root}/meta.json", cfg["selection"]]
+    if (cfg.get("selection_recipe") or {}).get("study") is not None:
+        required += list(study_files(cfg["selection"]))
+    required += [f"{parakeet_root}/meta.json"] if parakeet_root else []
     dir_patterns = list(required) + ([f"{cfg['student'].rstrip('/')}/*"] if cfg.get("student") else [])
     explicit = []
     for name, stems in subset_stems(record, cfg).items():
         if not stems:
             problems.append(f"{name}: the extent record has no stems for it")
-        roots = [(teacher_root, (".npz", ".jsonl"))] + ([(second_root, (".jsonl",))] if name in judged else [])
-        wanted = [f"{r}/{name}/{stem}{ext}" for r, exts in roots for stem in sorted(stems) for ext in exts]
-        required += wanted
-        if name in capped:
-            explicit += wanted
-        else:
-            dir_patterns += [f"{r}/{name}/*" for r, _ in roots]
+        roots = [(teacher_root, (".npz", ".jsonl"), stems if teacher_all else
+                  {st for st in stems if name in eval_sets and st.startswith("eval-")})]
+        roots += [(second_root, (".jsonl",), stems)] if name in judged else []
+        roots += [(parakeet_root, (".npz", ".jsonl"), stems)] if parakeet_root else []
+        for r, exts, some in roots:
+            wanted = [f"{r}/{name}/{stem}{ext}" for stem in sorted(some) for ext in exts]
+            required += wanted
+            if name in capped or some != stems:  # a prefix of a big source, or part of a directory (or nothing)
+                explicit += wanted
+            else:
+                dir_patterns.append(f"{r}/{name}/*")
     have = set(files)
     if missing := [f for f in required if f not in have]:
         problems.append(f"{len(missing)} of the {len(required)} files the extent needs are not in the data repo, "
