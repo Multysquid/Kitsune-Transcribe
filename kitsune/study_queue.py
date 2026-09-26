@@ -52,7 +52,8 @@ grids and the edge rule, max_steps, the branch fractions - comes from kitsune.pr
                the box complete, the failure recorded (queue_summary.json readouts_failed)
 Boxes A and B run at the same time against one runs repo: their items, run ids (a run one box calibrates as its
 reference only is calib-<run>-box<box>), state, queue summaries (study/box-<box>/) and numbers files are the box's
-own; every upload backs off on a 429 (finish.hub_retry), and each box's mains start SYNC_OFFSET_S apart
+own; every upload backs off on a 429 or a commit that raced another (409/412; finish.hub_retry), and each box's mains
+start SYNC_OFFSET_S apart. Box B's speed phase times box A's students last, after a bounded wait for box A (await_box)
 Loader and /dev/shm: every trainer of a run gets the same perf.num_workers / perf.prefetch (loader_sets): the
 loader-bound retry's workers, cut so its in-flight micro-batches fit its share of the host's /dev/shm (the trainers of
 one box share it; each trainer's own shm_cap measures only the free space it sees when it starts).
@@ -118,6 +119,15 @@ PARAKEET_DIR = "models/parakeet-tdt_ctc-0.6b-ja-hf"  # the converted teacher in 
 TEACHERS = {"cohere": ("cohere", None), "parakeet-ctc": ("parakeet-ctc", PARAKEET_DIR),
             "parakeet-tdt": ("parakeet-tdt", PARAKEET_DIR)}
 SPEED_PER_SET = 40  # ids per eval set of the speed probe's fixed list (its default; one list for every system)
+# boxes A and B are launched together: box B's speed phase times its own students and the teachers first, then waits
+# for box A's queue summary to list A's finished runs - polled every SPEED_WAIT_POLL_S, at most SPEED_WAIT_S (~$1.6 on
+# the 4x box) and never past the watchdog's deadline less SPEED_WAIT_MARGIN_S (the remaining probes and finish.py's
+# lean upload). Without a deadline file (a local or dry run: no watchdog) it does not wait. After the wait an unfinished
+# box's students are failed readouts, timed later from the Hub
+SPEED_WAIT_S = 2700
+SPEED_WAIT_POLL_S = 120
+SPEED_WAIT_MARGIN_S = 3600
+DEADLINE_FILE = "deadline"  # vast/onstart.sh: the watchdog's stop time (epoch s) in $KITSUNE_STATE
 CALIB_GROUP_TIMEOUT_S = 5400  # a group whose windows are not all in by then is stopped and counts as failed
 STOP_GRACE_S = 1800  # how long a stopped run may take to leave (its end phase)
 MAX_ATTEMPTS = 2  # per item: a run resumes (or a branch restarts) once; a second failure is final
@@ -532,6 +542,8 @@ class Settings:
     poll_s: float = 10.0
     sync_offset_s: float = SYNC_OFFSET_S
     calib_timeout_s: float = CALIB_GROUP_TIMEOUT_S
+    speed_wait_s: float = SPEED_WAIT_S
+    speed_poll_s: float = SPEED_WAIT_POLL_S
     host: str | None = None
     env: dict = field(default_factory=dict)  # extra env for every child
 
@@ -592,6 +604,7 @@ class Queue:
         self.procs: dict[str, subprocess.Popen] = {}
         self.rules_path = Path(self.s.rules_path) if self.s.rules_path else self.root / "study" / prereg.RULES_JSON
         self._pending_uploads: list[str] = []
+        self._awaited: set[str] = set()  # the other boxes phase_speed has waited for (await_box)
 
     # -------------------------------------------------------------------------------------------------- state
 
@@ -1629,22 +1642,68 @@ class Queue:
         except Exception as e:  # noqa: BLE001  a readout: logged, the system is not timed
             return None, f"{run}: box {box}'s weights not fetched ({type(e).__name__}: {e})"
 
+    def speed_wait_limit(self) -> float:
+        """How long phase_speed may wait for another box (s): SPEED_WAIT_S, cut to the watchdog's deadline less
+        SPEED_WAIT_MARGIN_S; 0 without a deadline file (no watchdog: a local or dry run)."""
+        try:
+            deadline = float((Path(self.s.state_dir) / DEADLINE_FILE).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return 0.0
+        return max(0.0, min(float(self.s.speed_wait_s), deadline - SPEED_WAIT_MARGIN_S - time.time()))
+
+    def await_box(self, box: str) -> None:
+        """Wait (bounded: speed_wait_limit) until box's queue summary in the runs repo lists every run of its plan as
+        done, or says the box ended (complete or halted; a failed box may be restarted by its supervisor, so the wait
+        goes on). Once per box; the replicate's box is never waited for (it runs after A and B, if at all). Logged as
+        a speed_wait event; what the summary then says is trained_weights' business."""
+        if box in self._awaited or box not in ("A", "B") or self.uploader is None:
+            return
+        self._awaited.add(box)
+        runs = ((self.rules.get("boxes") or {}).get(box) or {}).get("runs") or []
+        limit, t0, status, ready = self.speed_wait_limit(), time.time(), None, False
+        dest = Path(self.s.state_dir) / "speed_models" / f"box-{box}"
+        while True:
+            try:
+                summ = json.loads(self.uploader.download(f"{NUMBERS_DIR}/box-{box}/{SUMMARY_FILE}", dest)
+                                  .read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001  not written yet, or a read that failed: the next poll reads again
+                summ = None
+            if summ is not None:
+                status = summ.get("status")
+                items = summ.get("items") or {}
+                ready = all((items.get(r) or {}).get("status") == "done" for r in runs)
+                if ready or status in ("complete", "halted"):
+                    break
+            left = limit - (time.time() - t0)
+            if left <= 0:
+                break
+            time.sleep(min(float(self.s.speed_poll_s), left))
+        self.event("speed_wait", box=box, waited_s=round(time.time() - t0, 1), limit_s=round(limit, 1),
+                   box_status=status, ready=ready)
+
     def phase_speed(self):
         """The speed probe of every study student (its trained final weights: trained_weights) and both teachers, one
-        model at a time on an idle host (nothing else runs by now)."""
+        model at a time on an idle host (nothing else runs by now). This box's students and the teachers first, then
+        the other boxes' students (await_box first: boxes A and B are launched together and A may still be training),
+        so a late box gets the most time without a wait."""
         tool = self.root / SPEED_TOOL
         if not tool.is_file() and self.s.speed_cmd is None:
             self.event("speed_skipped", why=f"{SPEED_TOOL} is not in this checkout (WP5b)")
             return
         out = self.root / "runs" / f"speed-{self.box}"
         out.mkdir(parents=True, exist_ok=True)
-        systems = [(run, spec["family"], None) for run, spec in self.rules["runs"].items()]
+        runs = self.rules["runs"]
+        systems = [(run, runs[run]["family"], None) for run in runs if run in self.plan["runs"]]
         systems += [(k, kind, path) for k, (kind, path) in TEACHERS.items()]
+        systems += [(run, runs[run]["family"], None) for run in runs if run not in self.plan["runs"]]
+        boxes = self.rules.get("boxes") or {}
         for sys_name, kind, path in systems:
             name = f"speed-{sys_name}"
             if name not in self.state["items"]:
                 source = "teacher"
                 if kind in ("aed", "ctc"):  # a student: its trained final weights
+                    if sys_name not in self.plan["runs"]:
+                        self.await_box(next((b for b, p in boxes.items() if sys_name in p["runs"]), ""))
                     path, source = self.trained_weights(sys_name)
                 if kind in ("aed", "ctc") and path is None:
                     # the replicate is conditional (CONTRACT.md 8: it runs only if a limit call moves between

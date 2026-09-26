@@ -716,6 +716,15 @@ def test_box_b_plan_and_dry_run(box):
     speed = [x for x in recs if x["mode"] == "speed"]
     timed = [x for x in r["runs"] if x != prereg.REPLICATE]
     assert len(speed) == len(timed) + len(Q.TEACHERS) and all(a["t1"] <= b["t0"] for a, b in zip(speed, speed[1:]))
+    # box B's own students first, then the teachers, box A's last (A, launched at the same time, gets the most time)
+    order = [x["item"][len("speed-"):] for x in speed]
+    own = wave
+    assert set(order[:len(own)]) == set(own) and set(order[len(own):len(own) + len(Q.TEACHERS)]) == set(Q.TEACHERS)
+    assert set(order[len(own) + len(Q.TEACHERS):]) == set(r["boxes"]["A"]["runs"])
+    # no watchdog deadline in a dry run: box A's summary is read once, no wait
+    waits = [json.loads(x) for x in (root / "state" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+             if '"speed_wait"' in x]
+    assert [(w["box"], w["limit_s"], w["ready"]) for w in waits] == [("A", 0.0, True)]
     got = json.loads((root / "runs" / "speed-B" / "speed.json").read_text(encoding="utf-8"))["systems"]
     assert set(got) == set(timed) | {"cohere", "parakeet-ctc", "parakeet-tdt"}
     assert got["study-p03"]["kind"] == "ctc" and got["study-t06"]["kind"] == "aed" and got["cohere"]["model"] is None
@@ -736,6 +745,42 @@ def test_box_b_plan_and_dry_run(box):
     assert set(num["max_steps"]) >= set(r["boxes"]["B"]["runs"]) and "study-t06" in num["calibration"]
     summary = json.loads((root / "state" / "queue_summary.json").read_text(encoding="utf-8"))
     assert summary["status"] == "complete" and summary["reason"] is None and summary["readouts_failed"] == {}
+
+
+def test_box_b_waits_for_box_a_bounded_by_the_watchdog_deadline(box):
+    """Boxes A and B are launched together: box B's speed phase waits for box A's summary to list A's finished runs,
+    polling, at most speed_wait_s and never past the watchdog's deadline less SPEED_WAIT_MARGIN_S; then goes on."""
+    make, _, root = box
+    r = study_rules()
+    remote = box_a_on_the_hub(r)
+    done = remote["study/box-A/queue_summary.json"]
+    running = json.loads(done)
+    running.update(status="running", items={k: {**v, "status": "running"} for k, v in running["items"].items()})
+    up = FakeUploader(remote={**remote, "study/box-A/queue_summary.json": json.dumps(running).encode()})
+    state = root / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / Q.DEADLINE_FILE).write_text(f"{int(time.time() + Q.SPEED_WAIT_MARGIN_S + 3600)}\n")
+    q = make("B", uploader=up, speed_wait_s=20, speed_poll_s=0.05)
+    assert 19 <= q.speed_wait_limit() <= 20
+    flip = threading.Timer(0.4, lambda: up.remote.__setitem__("study/box-A/queue_summary.json", done))
+    flip.start()
+    t0 = time.time()
+    q.await_box("A")
+    assert 0.3 <= time.time() - t0 < 10
+    q.await_box("A")  # once per box
+    q.await_box("replicate")  # never waited for
+    ev = [json.loads(x) for x in (state / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    waits = [e for e in ev if e["kind"] == "speed_wait"]
+    assert len(waits) == 1 and waits[0]["ready"] is True and waits[0]["box_status"] == "complete"
+    assert q.trained_weights("study-t01")[0] is not None
+    # past the deadline less the margin: no wait at all; box A still running is then a failed readout
+    up.remote["study/box-A/queue_summary.json"] = json.dumps(running).encode()
+    (state / Q.DEADLINE_FILE).write_text(f"{int(time.time() + Q.SPEED_WAIT_MARGIN_S - 60)}\n")
+    q2 = make("B", uploader=up, speed_wait_s=20, speed_poll_s=0.05)
+    assert q2.speed_wait_limit() == 0.0
+    t0 = time.time()
+    q2.await_box("A")
+    assert time.time() - t0 < 5 and q2.trained_weights("study-t01")[0] is None
 
 
 def test_replicate_takes_box_as_numbers(box):
