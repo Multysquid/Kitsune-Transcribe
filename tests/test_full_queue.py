@@ -510,7 +510,7 @@ def smoke_registry(reg: dict, *, sigstop: bool) -> dict:
     reg = box_only(reg, "full-smoke", watchdog={"orphan_s": 0, "action": "alert"})
     for f in reg["boxes"]["full-smoke"]["faults"]:
         if f["action"] == "freeze_controller_hb":
-            f["seconds"] = 2.0
+            f["seconds"] = 30.0  # longer than the rest of smoke-p005: its end falls inside, whatever the load
         if f["action"] == "wipe_run_dir" and not sigstop:
             f["min_attempt"] = 1
     if not sigstop:
@@ -603,12 +603,15 @@ def check_smoke(fq, rc, runs_hub, scratch_hub, seen):
     # F4 deadline: KITSUNE_DEADLINE = its start + 600 s
     p005_rec = next(x for x in fq.records("train") if x["item"] == "smoke-p005")
     assert float(p005_rec["deadline"]) == pytest.approx(p005_rec["t0"] + 600, abs=5)
-    # F5 freeze: train_hb unchanged over the window (an item end and its summary put fell inside it)
+    # F5 freeze: train_hb unchanged from the fault until it ended (its window, or the run's end: end_faults), across
+    # an item end and its summary put
     fired = st["faults"]["F5"]["fired_at"]["wall"]
-    window = [m for t, m in seen if fired + 0.05 < t < st["faults"]["F5"]["window_end"] - 0.05]
+    until = min(st["faults"]["F5"]["window_end"],
+                next(e["wall"] for e in fq.events("fault_outcome") if e["id"] == "F5"))
+    window = [m for t, m in seen if fired + 0.05 < t < until - 0.05]
     assert window and len(set(window)) == 1
-    ends = [e for e in fq.events("item_end") if fired < e["wall"] < st["faults"]["F5"]["window_end"]]
-    assert ends, "no item ended inside the freeze window"
+    ends = [e for e in fq.events("item_end") if fired < e["wall"] < until]
+    assert any(e["item"] == "smoke-p005" for e in ends), "smoke-p005 did not end inside the freeze"
     # smoke-nostart: skipped by the no-start rule; check 3's math on the fakes' step times
     assert st["items"]["smoke-nostart"]["status"] == "skipped" and "smoke-nostart" in st["no_start"]
     c3 = v["checks"]["3"]["evidence"]
