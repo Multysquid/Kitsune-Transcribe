@@ -1164,10 +1164,10 @@ class FullQueue(Q.Queue):
                 self._reap(name, proc, now)
                 continue
             try:
-                hb = os.stat(fullrun.item_hb_path(name, self.s.state_dir)).st_mtime
+                beat_m = os.stat(fullrun.item_hb_path(name, self.s.state_dir)).st_mtime
             except OSError:
-                hb = 0.0
-            age = now - max(hb, float(att["t0"]))
+                beat_m = 0.0
+            age = now - max(beat_m, float(att["t0"]))
             it["hb_max_gap_s"] = round(max(float(it.get("hb_max_gap_s") or 0.0), age), 1)
             sm, mh = spec["stall_min"], spec.get("max_hours")
             if sm is not None and age > float(sm) * 60:
