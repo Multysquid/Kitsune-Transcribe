@@ -63,7 +63,7 @@ Numerics (the exact recipes; the constants are the torchao parity test's to pin)
   emulate GEMM  the input is rounded to the autocast dtype when autocast is on (the real path sees autocast's bf16),
                 then fake-quantised (W*A* formats), then F.linear in fp32 with autocast off on the exact dequantised
                 weight (weight-only formats: rounded to bf16, which is what the real path dequantises to); the output
-                is cast to the autocast dtype. The process's matmul precision applies: emulate and real are compared
+                is cast to the autocast dtype, and the bias added in it (as the real path adds it to its GEMM's output). The process's matmul precision applies: emulate and real are compared
                 with tolerances only
 
 Layer filter (select_layers): every nn.Linear except one whose weight is shared with another module (T-0.6B's
@@ -570,10 +570,12 @@ class QuantLinear(nn.Linear):
             if kq.count and kq.act == "int8" and dev == "cuda" and x2.shape[0] <= 16:
                 kq.fallback_risk += 1
             y = F.linear(x2.to(self.weight.dtype), self.weight)
-        y = y[:m]
+        # the GEMM's output in the output dtype first, then the bias in it: what the real path does (its GEMM returns
+        # the autocast dtype), so emulate rounds where it rounds
+        y = y[:m].to(out_dtype)
         if self.bias is not None:
-            y = y + self.bias.to(y.dtype)
-        return y.to(out_dtype).reshape(*lead, n)
+            y = y + self.bias.to(out_dtype)
+        return y.reshape(*lead, n)
 
     def extra_repr(self) -> str:
         return f"{super().extra_repr()}, fmt={self.kq.fmt}, impl={self.kq.impl}"

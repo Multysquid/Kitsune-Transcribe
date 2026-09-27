@@ -141,16 +141,41 @@ def test_to_torchao_int8_on_cpu(fmt):
     _dequant_equal(Q.to_torchao(pack, fmt, "cpu"), pack)
 
 
+def _int8_act_candidates(x: torch.Tensor, pw: Q.QuantPack, yr: torch.Tensor) -> list:
+    """On a mismatch: the share of torchao's outputs each variant of the activation recipe and of the output's
+    rescaling reproduces bit for bit, best first - what to set INT8_ACT_* to (the assertion message shows it)."""
+    import itertools
+
+    qw = pw.qweight.double()
+    out = []
+    for div, qmin, sdt, form in itertools.product((127.0, 127.5), (-127, -128), (torch.bfloat16, torch.float32),
+                                                  ("dequant_fp32", "int_fp32", "int_bf16_chain", "int_scale_bf16")):
+        xf = x.float()
+        sx = torch.clamp((xf.abs().amax(1) / div).to(sdt), min=Q.INT8_ACT_EPS).float()
+        qx = torch.clamp(torch.round(xf / sx[:, None]), qmin, 127)
+        yint = (qx.double() @ qw.T).float()
+        if form == "dequant_fp32":
+            y = torch.nn.functional.linear(qx * sx[:, None], Q.unpack_weight(pw)).to(torch.bfloat16)
+        elif form == "int_fp32":
+            y = (yint * sx[:, None] * pw.scale[None, :]).to(torch.bfloat16)
+        elif form == "int_bf16_chain":
+            y = (yint * sx[:, None]).to(torch.bfloat16) * pw.scale[None, :].to(torch.bfloat16)
+        else:
+            y = (yint * (sx[:, None] * pw.scale[None, :]).to(torch.bfloat16).float()).to(torch.bfloat16)
+        out.append((round(float((y == yr).float().mean()), 4), div, qmin, str(sdt), form))
+    return sorted(out, reverse=True)[:6]
+
+
 def test_int8_w8a8_forward_on_cpu_is_the_emulations():
     """A W8A8 Linear through torchao on CPU and its emulation: the same activation grid (per token, INT8_ACT_DIV over
-    [INT8_ACT_QMIN, 127]) gives the same bf16 outputs but for rare rounding flips of the last bf16 bit."""
+    [INT8_ACT_QMIN, 127], the scale in INT8_ACT_SCALE_DTYPE) gives the same bf16 outputs but for rare rounding flips
+    of the last bf16 bit. (No bias: both paths add it the same way, outside the GEMM.)"""
     g = torch.Generator().manual_seed(2)
     w = weight(64, 128)
-    real, emu = nn.Linear(128, 64), nn.Linear(128, 64)
+    real, emu = nn.Linear(128, 64, bias=False), nn.Linear(128, 64, bias=False)
     with torch.no_grad():
         real.weight.copy_(w.float())
-        real.bias.copy_(torch.randn(64, generator=g) * 0.01)
-        emu.load_state_dict(real.state_dict())
+        emu.weight.copy_(w.float())
     Q.quantize_linear(real, "int8-w8a8", "torchao")
     Q.quantize_linear(emu, "int8-w8a8", "emulate")
     x = (torch.randn(32, 128, generator=g) * torch.logspace(-2, 1, 32)[:, None]).to(torch.bfloat16)
@@ -159,7 +184,8 @@ def test_int8_w8a8_forward_on_cpu_is_the_emulations():
     assert yr.dtype == ye.dtype == torch.bfloat16
     same = float((yr == ye).float().mean())
     rel = float((yr.float() - ye.float()).norm() / ye.float().norm())
-    assert same >= 0.98 and rel < 1e-2, (same, rel)
+    assert same >= 0.98 and rel < 1e-2, dict(same=same, rel=rel, weight=type(real.weight).__name__,
+                                             best=_int8_act_candidates(x, Q.pack_weight(w, "int8"), yr))
 
 
 @needs_cuda
@@ -183,3 +209,4 @@ def test_the_pack_is_the_same_on_cuda_and_cpu():
 def test_the_selftest_passes_on_this_gpu():
     rec = Q.selftest("cuda:0", rows=(1, 7, 17, 128))
     assert rec["ok"], [c for c in rec["checks"] if not c["ok"]]
+

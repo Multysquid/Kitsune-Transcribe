@@ -318,7 +318,7 @@ def test_act_fake_quant_semantics():
     with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
         y = lin(x)
     xe = Q.fake_quant_act(x.to(torch.bfloat16).float(), "int8")
-    want = (torch.nn.functional.linear(xe, lin.weight) + lin.bias).to(torch.bfloat16)
+    want = torch.nn.functional.linear(xe, lin.weight).to(torch.bfloat16) + lin.bias.to(torch.bfloat16)
     assert y.dtype == torch.bfloat16 and torch.equal(y, want)
     with torch.no_grad():
         y32 = lin(x)
