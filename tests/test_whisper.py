@@ -198,16 +198,24 @@ def test_tiny_decode_on_cpu(tiny_dir, monkeypatch):
     rows = W.greedy_whisper(wm, feats, longest)
     assert len(calls) == 1 and len(inner) == 1
     k = calls[0]
-    assert (k["language"], k["task"], k["return_timestamps"], k["num_beams"], k["do_sample"], k["temperature"],
-            k["force_unique_generate_call"]) == ("ja", "transcribe", False, 1, False, None, True)
-    assert k["max_new_tokens"] == W.max_new_tokens(longest, MAX_TARGET)
+    # only Whisper's own arguments next to the config (transformers 5.13 deprecates generation kwargs beside one)
+    assert set(k) == {"input_features", "generation_config", "language", "task", "return_timestamps", "temperature",
+                      "stopping_criteria", "force_unique_generate_call"}
+    assert (k["language"], k["task"], k["return_timestamps"], k["temperature"], k["force_unique_generate_call"]) == (
+        "ja", "transcribe", False, None, True)
     gc = k["generation_config"]
+    assert (gc.max_new_tokens, gc.num_beams, gc.do_sample) == (W.max_new_tokens(longest, MAX_TARGET), 1, False)
     assert gc.no_speech_threshold is None and gc.logprob_threshold is None and gc.compression_ratio_threshold is None
+    # the snapshot sets the reference decoding's thresholds (as a published config may): off on the loaded model, so
+    # transformers cannot refill them into the call's config; its forced_decoder_ids are overridden by language / task
+    saved = json.loads((tiny_dir / "generation_config.json").read_text(encoding="utf-8"))
+    assert saved["no_speech_threshold"] == 0.6 and saved["forced_decoder_ids"][0] == [1, None]
+    assert all(getattr(wm.model.generation_config, t) is None for t in W.FALLBACK_THRESHOLDS)
     assert seen and all(r == PROMPT for batch in seen for r in batch)
     assert len(rows) == 3
     for r in rows:
         assert r["stop"] in ("eos", "repetition", "length") and r["truncated"] == (r["stop"] != "eos")
-        assert r["max_new"] == k["max_new_tokens"] and len(r["hyp_ids"]) <= r["max_new"]
+        assert r["max_new"] == gc.max_new_tokens and len(r["hyp_ids"]) <= r["max_new"]
         assert r["n_timestamp_tokens"] == 0 and EOS not in r["text_ids"]
     texts = W.decode_texts(wm, rows)
     assert all(isinstance(t, str) and t == t.strip() for t in texts)

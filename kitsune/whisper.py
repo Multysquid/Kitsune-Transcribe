@@ -46,7 +46,6 @@ times the very functions below (features, greedy_whisper, decode_texts).
 """
 import copy
 import logging
-import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +71,7 @@ REQUIRED_FILES = ("config.json", "generation_config.json", "model.safetensors", 
 DEFAULT_MAX_ROWS = 64  # the row cap of a model dir outside WHISPER_MODELS: large-v3's, the smallest (safest) one
 LOAD_BEAT_MAX_S = 3600  # heartbeat.beating's bound around a download + load (the contract's section 9)
 REPETITION = dict(window=24, max_period=12)  # kitsune.generation.RepetitionStop's defaults, recorded in whisper.json
+FALLBACK_THRESHOLDS = ("logprob_threshold", "compression_ratio_threshold", "no_speech_threshold")  # load_whisper: off
 
 
 @dataclass(frozen=True)
@@ -183,6 +183,10 @@ def load_whisper(path, device, dtype: torch.dtype, *, spec: WhisperSpec | None =
                          f"task_to_id {TASK}, no_timestamps_token_id, decoder_start_token_id)")
     eos = gc.eos_token_id
     eos = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
+    # the long-form fallback off on the model's own config: transformers fills every None of a generate call's config
+    # from this one, so a threshold a snapshot sets would come back (a no-speech threshold skips rows)
+    for k in FALLBACK_THRESHOLDS:
+        setattr(gc, k, None)
     return WhisperModel(model=model, feature_extractor=fe, tokenizer=tok,
                         prompt_ids=[int(gc.decoder_start_token_id), int(lang[f"<|{LANGUAGE}|>"]), int(task[TASK]),
                                     int(nts)],
@@ -271,11 +275,15 @@ def _quiet_length_warning():
         lg.removeFilter(_LENGTH_WARNING)
 
 
-def generation_config(wm: WhisperModel):
-    """The model's generation config with every fallback threshold off: temperature None and a single pass mean no
-    fallback, and without a no-speech threshold no row is skipped (a skipped row would have no output at all)."""
+def generation_config(wm: WhisperModel, max_new: int):
+    """One call's generation config: the model's (the published one, its fallback thresholds off since load_whisper)
+    with the greedy settings and this batch's max_new_tokens. They go in the config, not as generate() kwargs:
+    transformers 5.13 deprecates passing both. temperature None (a single pass: no fallback) is Whisper's own
+    argument."""
     gc = copy.deepcopy(wm.model.generation_config)
-    gc.logprob_threshold = gc.compression_ratio_threshold = gc.no_speech_threshold = None
+    gc.max_new_tokens, gc.do_sample, gc.num_beams = int(max_new), False, 1
+    for k in FALLBACK_THRESHOLDS:
+        setattr(gc, k, None)
     return gc
 
 
@@ -294,10 +302,9 @@ def greedy_whisper(wm: WhisperModel, feats: torch.Tensor, longest_s: float, *, f
     mx = max_new_tokens(longest_s, wm.model.config.max_target_positions)
     stop = RecordingRepetitionStop(PROMPT_LEN)
     with _fp32_head(wm.model) if fp32_head else nullcontext(), _quiet_length_warning():
-        seq = wm.model.generate(input_features=feats, generation_config=generation_config(wm), language=LANGUAGE,
-                                task=TASK, return_timestamps=False, num_beams=1, do_sample=False, temperature=None,
-                                max_new_tokens=mx, stopping_criteria=StoppingCriteriaList([stop]),
-                                force_unique_generate_call=True)
+        seq = wm.model.generate(input_features=feats, generation_config=generation_config(wm, mx), language=LANGUAGE,
+                                task=TASK, return_timestamps=False, temperature=None,
+                                stopping_criteria=StoppingCriteriaList([stop]), force_unique_generate_call=True)
     seq = (seq.sequences if hasattr(seq, "sequences") else seq).cpu()
     want = torch.tensor(wm.prompt_ids, dtype=seq.dtype)
     if seq.ndim != 2 or seq.shape[0] != feats.shape[0] or seq.shape[1] < PROMPT_LEN or not bool(
@@ -360,9 +367,3 @@ def split_rows(batches: list[list[int]], max_rows: int | None) -> list[list[int]
         return [list(b) for b in batches]
     m = int(max_rows)
     return [list(b[i:i + m]) for b in batches for i in range(0, len(b), m)]
-
-
-def machine_id() -> str | None:
-    """$KITSUNE_MACHINE_ID (launch exports it on every full box): the vast machine, so records of two rentals of the
-    same host group together (the container hostname differs per rental)."""
-    return os.environ.get("KITSUNE_MACHINE_ID") or None

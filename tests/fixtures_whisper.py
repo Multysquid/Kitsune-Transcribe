@@ -69,12 +69,16 @@ def tiny_whisper(seed: int = 0, *, n_mels: int = 128):
                         suppress_tokens=None)
     torch.manual_seed(seed)
     model = WhisperForConditionalGeneration(cfg).eval()
+    # as the published configs: the deprecated forced_decoder_ids (language detection, transcribe), which language= /
+    # task= override; and the long-form fallback thresholds of OpenAI's reference decoding, which load_whisper turns
+    # off (with them a row whose log-prob is low would be skipped)
     model.generation_config = GenerationConfig(
         decoder_start_token_id=SOT, eos_token_id=EOS, pad_token_id=PAD, bos_token_id=SOT,
         lang_to_id={"<|en|>": 3, "<|de|>": 4, "<|ja|>": JA}, task_to_id={"transcribe": TRANSCRIBE,
                                                                         "translate": TRANSLATE},
         no_timestamps_token_id=NO_TS, is_multilingual=True, max_length=MAX_TARGET, return_timestamps=False,
-        begin_suppress_tokens=None, suppress_tokens=None)
+        begin_suppress_tokens=None, suppress_tokens=None, forced_decoder_ids=[[1, None], [2, TRANSCRIBE], [3, NO_TS]],
+        no_speech_threshold=0.6, logprob_threshold=-1.0, compression_ratio_threshold=2.4)
     return model, WhisperFeatureExtractor(feature_size=n_mels), tiny_tokenizer()
 
 
