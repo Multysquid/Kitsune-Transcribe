@@ -3,12 +3,14 @@
 A fake download (it writes the sample's bytes into the cache dir and advances an injected clock at a chosen rate)
 stands in for hf_hub_download: pass and slow verdicts and their exit codes 0/3, a download error or a file of the wrong
 size exits 1, a slow host is cut at the cutoff without waiting for its samples, every timed file is deleted, the
-timeouts never go below launch's 40 MB/s sizing or 30 min, --timeouts prints them, and the samples are the files 01
-downloads at 01's pinned revisions. CPU only, no network.
+timeouts never go below launch's 40 MB/s sizing or 30 min, --timeouts prints them, the samples are the files 01
+downloads at 01's pinned revisions, and they download with hf_xet's chunk cache off, in a Xet cache dir of the gate
+run's own. CPU only, no network.
 """
 import importlib.util
 import json
 import math
+import os
 import sys
 import threading
 from pathlib import Path
@@ -190,3 +192,41 @@ def test_the_timeouts_cli_prints_a_passed_gates_minutes(tmp_path, gate_env, caps
     slow.write_text(json.dumps(dict(rec, verdict="slow")), encoding="utf-8")
     assert netgate.main(["--timeouts", str(slow)]) == 1
     assert netgate.main(["--timeouts", str(tmp_path / "missing.json")]) == 1
+
+
+def test_the_gate_times_the_link_never_the_xet_cache(tmp_path, gate_env, monkeypatch):
+    """hf_xet's chunk cache (under HF_XET_CACHE) outlives --dir: a gate retried after an error would read the samples
+    the first attempt fetched at disk speed and could pass a slow host. Every sample downloads with the chunk cache off
+    and HF_XET_CACHE a dir of this gate run, beside --dir and removed with it, whatever the box set; after an attempt
+    that failed on its third sample, the retry finds that dir empty again. The box's values come back afterwards."""
+    shared = tmp_path / "hf_home" / "xet"
+    monkeypatch.setenv("HF_XET_CACHE", str(shared))
+    monkeypatch.setenv("HF_XET_CHUNK_CACHE_SIZE_BYTES", str(10 * 2**30))
+    seen = []
+
+    def caching(clock, **kw):
+        inner = fake_download(clock, 100e6, **kw)
+
+        def download(repo, filename, *, revision, cache_dir):
+            xet = Path(os.environ["HF_XET_CACHE"])
+            seen.append((os.environ["HF_XET_CHUNK_CACHE_SIZE_BYTES"], xet, cache_dir,
+                         sorted(p.name for p in xet.rglob("*") if p.is_file()) if xet.exists() else []))
+            (xet / "chunk-cache").mkdir(parents=True, exist_ok=True)  # what hf_xet would leave behind
+            (xet / "chunk-cache" / filename.replace("/", "_")).write_bytes(b"chunks")
+            return inner(repo, filename, revision=revision, cache_dir=cache_dir)
+
+        return download
+
+    out, dest = tmp_path / "state" / "download_gate.json", tmp_path / "netgate"
+    clock = Clock()
+    assert netgate.main(["--out", str(out), "--dir", str(dest)], clock=clock,
+                        download=caching(clock, fail=netgate.SAMPLES[2].filename)) == 1  # retried by bootstrap
+    clock = Clock()
+    assert netgate.main(["--out", str(out), "--dir", str(dest)], download=caching(clock), clock=clock) == 0
+    own = Path(str(dest) + ".xet")
+    assert [s[0] for s in seen] == ["0"] * 6 and {s[1] for s in seen} == {own}
+    assert all(Path(s[2]) == dest for s in seen)
+    assert [s[3] for s in seen][3] == [], "the retry starts with no cache of the first attempt"
+    assert not own.exists() and not dest.exists() and not shared.exists()
+    assert os.environ["HF_XET_CACHE"] == str(shared) and os.environ["HF_XET_CHUNK_CACHE_SIZE_BYTES"] == str(10 * 2**30)
+    assert json.loads(out.read_text(encoding="utf-8"))["verdict"] == "pass"

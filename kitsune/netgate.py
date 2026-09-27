@@ -22,10 +22,15 @@ all set by vast/launch.py; KITSUNE_MACHINE_ID and KITSUNE_CPU_QUOTA go into the 
 (format 1) reaches the runs repo with the box's infra files (full/box-<box>/infra/<container>/download_gate.json).
 
 A slow host is cut early: the samples get CUTOFF_FACTOR x the time they may take at the minimum rate (~157 s), so a
-2.9 MB/s host is refused after under three minutes instead of the ~15 its samples would take. Stdlib only at import
+2.9 MB/s host is refused after under three minutes instead of the ~15 its samples would take. The gate times the link,
+never a cache: hf_xet keeps a chunk cache under HF_XET_CACHE (default $HF_HOME/xet) that outlives the --dir cache, so
+the gate runs with that cache off and in a dir of its own (<--dir>.xet, removed with --dir); otherwise a gate retried
+after an error (bootstrap's retry 2) could read the samples the first attempt fetched at disk speed and pass a slow
+host. Stdlib only at import
 (huggingface_hub is imported where the download runs; kitsune.extent's constants where the timeouts are computed).
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -62,6 +67,10 @@ SAMPLES = (
 )
 
 EXIT_PASS, EXIT_ERROR, EXIT_SLOW = 0, 1, 3
+# hf_xet's chunk cache off for the gate (its dir is the gate's own too, see _own_xet_cache); read when the process's
+# Xet session starts, i.e. at the first download
+XET_CHUNK_CACHE_ENV = "HF_XET_CHUNK_CACHE_SIZE_BYTES"
+XET_CACHE_ENV = "HF_XET_CACHE"
 
 
 def min_rate(gate_bytes: float, max_h: float) -> float:
@@ -73,6 +82,25 @@ def _hf_download(repo: str, filename: str, *, revision: str, cache_dir: str) -> 
     from huggingface_hub import hf_hub_download  # 01's own call (Ingest.download), so the gate times the same path
 
     return hf_hub_download(repo, filename, repo_type="dataset", revision=revision, cache_dir=cache_dir)
+
+
+@contextlib.contextmanager
+def _own_xet_cache(path: Path):
+    """While the samples download: hf_xet's chunk cache off (HF_XET_CHUNK_CACHE_SIZE_BYTES=0) and its cache dir
+    HF_XET_CACHE = path, a dir of this gate run alone that the caller removes afterwards. Both win over any value the
+    box set: a cache that survives a gate attempt would time the disk, not the link. The previous values come back on
+    exit (the gate's own process ends there anyway)."""
+    keep = {k: os.environ.get(k) for k in (XET_CHUNK_CACHE_ENV, XET_CACHE_ENV)}
+    os.environ[XET_CHUNK_CACHE_ENV] = "0"
+    os.environ[XET_CACHE_ENV] = str(path)
+    try:
+        yield
+    finally:
+        for k, v in keep.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _dir_bytes(d: Path) -> int:
@@ -217,7 +245,8 @@ def main(argv=None, *, download=_hf_download, clock=time.monotonic) -> int:
     ap = argparse.ArgumentParser(prog="python -m kitsune.netgate", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=None, help="write the gate record here (the box: $STATE/download_gate.json)")
-    ap.add_argument("--dir", default=None, help="the download cache dir (emptied after the gate)")
+    ap.add_argument("--dir", default=None,
+                    help="the download cache dir (removed after the gate, with the Xet cache dir <dir>.xet beside it)")
     ap.add_argument("--timeouts", default=None, metavar="GATE_JSON",
                     help="print the passed gate's 'PULL_MIN REBUILD_MIN' and exit")
     args = ap.parse_args(argv)
@@ -250,10 +279,13 @@ def main(argv=None, *, download=_hf_download, clock=time.monotonic) -> int:
           f"{min_rate(gate_bytes, max_h) / 1e6:.1f} MB/s ({gate_bytes / 1e9:.1f} GB in {max_h:g} h), cutoff "
           f"{cutoff_s:.0f} s", flush=True)
     dest = Path(args.dir)
+    xet = dest.with_name(dest.name + ".xet")  # beside dest, so a cut sample's partial bytes count only the sample
     try:
-        meas = measure(SAMPLES, dest, cutoff_s=cutoff_s, download=download, clock=clock)
+        with _own_xet_cache(xet):
+            meas = measure(SAMPLES, dest, cutoff_s=cutoff_s, download=download, clock=clock)
     finally:
         shutil.rmtree(dest, ignore_errors=True)
+        shutil.rmtree(xet, ignore_errors=True)
     rec = verdict(meas, gate_bytes=gate_bytes, max_h=max_h, rebuild_bytes=rebuild_bytes, pull_bytes=pull_bytes)
     for s in rec["samples"]:
         print(f"netgate:   {s['repo']}/{s['filename']}: {s['bytes'] / 1e9:.2f} GB in {s['seconds']:.1f} s "
