@@ -54,6 +54,19 @@ def usable_cpus() -> int:
     return max(1, n)
 
 
+def per_gpu_cpus(n_gpus: int | None = None) -> int:
+    """The CPUs one GPU's trainer may use (fix 2): usable_cpus() divided by the box's GPU count (n_gpus, else
+    KITSUNE_N_GPUS, else 1), at least 1. The loader workers (kitsune.trainset.default_num_workers,
+    kitsune.study_queue.auto_workers) are sized from it, as vast/onstart.sh sizes the thread pools from the quota per
+    GPU: two trainers on a 2-GPU box share one container's quota."""
+    if not n_gpus:
+        try:
+            n_gpus = int(os.environ.get("KITSUNE_N_GPUS") or 1)
+        except ValueError:
+            n_gpus = 1
+    return max(1, usable_cpus() // max(1, int(n_gpus)))
+
+
 def default_workers() -> int:
     """Decode processes of a build: every usable CPU (usable_cpus) up to MAX_PROCESSES (61 on Windows)."""
     cap = WIN_MAX_PROCESSES if sys.platform == "win32" else MAX_PROCESSES
