@@ -179,10 +179,13 @@ INT8_EPS = float(torch.finfo(torch.float32).eps)
 # before the codes are computed, and the file's F32 holds it exactly. Measured by the parity test in the image (CI of
 # 4278cea: torchao 0.18's int8 weight scales were bf16(amax / 127.5) on every row, fp32 ones differed)
 INT8_SCALE_DTYPE = torch.bfloat16
-INT8_ACT_DIV = 127.0  # torchao's per-token activation quant uses the reduced range [-127, 127]
+# torchao 0.18's int8 activation (Int8Tensor, per token): the scale bf16(amax / 127.5) like the weight's, the codes
+# clamped to [-127, 127]. Measured in the image (CI of 772e3b7): this emulation gives torchao's CPU W8A8 outputs bit
+# for bit, where / 127 matched none and [-128, 127] three in four
+INT8_ACT_DIV = 127.5
 INT8_ACT_QMIN = -127
 INT8_ACT_EPS = 1e-5
-INT8_ACT_SCALE_DTYPE = torch.bfloat16  # the activation's scale in its own (autocast) dtype, as the weight's
+INT8_ACT_SCALE_DTYPE = torch.bfloat16
 NVFP4_SCALE_MIN = float(torch.finfo(torch.float8_e4m3fn).tiny)  # torchao nvfp4_quantize clamps the block scale here
 NVFP4_BLOCK, MXFP4_BLOCK = 16, 32
 E8M0_BIAS = 127
