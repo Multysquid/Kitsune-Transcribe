@@ -429,9 +429,22 @@ def test_setup_data_opens_the_dev_store_and_guards_its_rows(env, tmp_path):
     assert set(data["dev_per_source"]) == {"src_a", "src_b"}
     got = json.loads((tmp_path / "dev_ids.json").read_text(encoding="utf-8"))
     assert got == dict(seed=1234, per_source=4, ids_sha256=rec["ids_sha256"], ids=rec["ids"])
-    assert R.st["dev"] == dict(ids_sha256=rec["ids_sha256"], n_ids=8, per_source=4)
-    # the same rows again (a resume): fine; other rows: a SystemExit naming both
+    assert R.st["dev"] == dict(ids_sha256=rec["ids_sha256"], n_ids=8, per_source=4, n=8,
+                               store_ids_sha256=m._ids_sha256(ids))
+    # the same rows again (a resume): fine, and every store is a reused cache now (the token stores say so too)
+    evs.clear()
     m.setup_data(R)
+    data = next(e for e in evs if e["kind"] == "data")
+    assert data["stores_reused"] == {"train": True, "eval": True, "dev": True}
+    # a state from before the store keys takes them from this store
+    R.st["dev"] = dict(ids_sha256=rec["ids_sha256"], n_ids=8, per_source=4)
+    m.setup_data(R)
+    assert R.st["dev"]["n"] == 8 and R.st["dev"]["store_ids_sha256"] == m._ids_sha256(ids)
+    # the same pick, but the store holds other rows (a shard missing on a new host dropped some): a SystemExit
+    R.st["dev"] = dict(R.st["dev"], n=7, store_ids_sha256=m._ids_sha256(ids[1:]))
+    with pytest.raises(SystemExit, match="holds 8 rows .* scored 7"):
+        m.setup_data(R)
+    # other picked rows: a SystemExit naming both
     R.st["dev"] = dict(R.st["dev"], ids_sha256="0" * 64)
     with pytest.raises(SystemExit, match="the dev rows changed"):
         m.setup_data(R)

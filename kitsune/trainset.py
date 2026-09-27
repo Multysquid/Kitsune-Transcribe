@@ -288,6 +288,7 @@ def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Se
             old["dropped"]["no_audio"]["n"] == 0 or sorted(shard_size) == old.get("all_shards"))
         if old.get("fingerprint") == fingerprint and same_audio:
             st = load_stores(cache_dir)
+            st.info["reused"] = True  # in memory only, as build_frame_stores (04_distill's data event: stores_reused)
             log(f"stores: reusing {cache_dir} ({len(st)} utts, {st.hours:.2f} h, built {old.get('created')})")
             return st
 

@@ -1932,7 +1932,10 @@ def setup_dev(R: Run) -> dict:
     frame preflight's `frame_preflight` event (family ctc), the `dev_store` event {name, n, per_source, seed,
     ids_sha256, hours, n_in_train} and the guard: the dev rows are a train row nowhere (n_in_train must be 0), and a
     resume scores the rows its state scored (st["dev"]; eval.dev.per_source / seed are RESUME_FIXED, the selection is
-    too, so only a changed file or dev_pick could move them). Returns the `data` event's dev_utts, dev_h and
+    too, so only a changed file or dev_pick could move them). The store's own rows count too (n, store_ids_sha256): a
+    store rebuilt on a new host can hold fewer of the picked rows (a shard missing from the pull drops its rows, the
+    frame preflight drops some), and the early stop's smoothing and patience must not mix numbers over two row sets;
+    a state from before those keys takes them from this store. Returns the `data` event's dev_utts, dev_h and
     dev_per_source."""
     cfg, log, store = R.cfg, R.log, getattr(R, "devstore", None)
     rec = store.info["dev_pick"]
@@ -1946,12 +1949,21 @@ def setup_dev(R: Run) -> dict:
     if n_in_train:
         raise SystemExit(f"{n_in_train} of the dev rows are in the train store too ({cfg['selection']}): the early "
                          "stop would read rows the run trains on")
-    want = dict(ids_sha256=rec["ids_sha256"], n_ids=rec["n"], per_source=rec["per_source"])
-    if R.st.get("dev") is None:
+    held = dict(n=len(store), store_ids_sha256=_ids_sha256(u.id for u in store.utts))
+    want = dict(ids_sha256=rec["ids_sha256"], n_ids=rec["n"], per_source=rec["per_source"], **held)
+    prev = R.st.get("dev")
+    if prev is None:
         R.st["dev"] = want
-    elif R.st["dev"]["ids_sha256"] != want["ids_sha256"]:
-        raise SystemExit(f"the dev rows changed: this run's state scored {R.st['dev']} and the selection now gives "
+    elif prev["ids_sha256"] != want["ids_sha256"]:
+        raise SystemExit(f"the dev rows changed: this run's state scored {prev} and the selection now gives "
                          f"{want} (the selection file or eval.dev differs from the run's)")
+    elif any(k in prev and prev[k] != v for k, v in held.items()):
+        raise SystemExit(f"the dev store {store.cache_dir} holds {held['n']} rows (store_ids_sha256 "
+                         f"{held['store_ids_sha256'][:12]}), this run's state scored {prev.get('n')} "
+                         f"({str(prev.get('store_ids_sha256'))[:12]}) of the same {rec['n']} picked rows: a shard "
+                         "missing from this host's data, or other audio, left other rows in it")
+    else:
+        prev.update(held)  # a state from before these keys: this store's rows from now on
     path = R.run_dir / "dev_ids.json"
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(dict(seed=rec["seed"], per_source=rec["per_source"], ids_sha256=rec["ids_sha256"],

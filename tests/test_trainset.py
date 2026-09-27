@@ -804,10 +804,13 @@ def test_the_dev_split_reads_its_rows_train_shards(corpus, selection, tmp_path, 
     assert not {u.id for u in train.utts} & set(want["id"])
     assert len(train) + len(dev) == len(build_stores(selection, corpus.data, corpus.teacher_out, tmp_path / "all",
                                                      TRAIN, ["train"]))
-    # a rebuild with the same rows reuses the cache (the shards' sizes are its audio check)
+    # a rebuild with the same rows reuses the cache (the shards' sizes are its audio check), and says so in memory
+    # (info["reused"], as a frame store: the trainer's data event), never in the cache's stores.json
     read.clear()
-    assert len(build_stores(dev_sel, corpus.data, corpus.teacher_out, tmp_path / "dev", TRAIN, ["dev"])) == len(dev)
-    assert read == []
+    again = build_stores(dev_sel, corpus.data, corpus.teacher_out, tmp_path / "dev", TRAIN, ["dev"])
+    assert len(again) == len(dev) and read == []
+    assert again.info["reused"] is True and "reused" not in dev.info
+    assert "reused" not in json.loads((tmp_path / "dev" / "stores.json").read_text(encoding="utf-8"))
 
     for bad in (["test"], ["train", "Dev"]):
         with pytest.raises(ValueError, match="not selection splits"):
