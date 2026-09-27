@@ -1370,7 +1370,9 @@ def full_main(args, cfg: dict, by_source: dict, stems, record, full: dict, t0: f
         print(f"  {s:>13}: {what}; {b['rows']} rows {b['hours']:.2f} h, kept {b['kept_rows']} rows "
               f"{b['kept_hours']:.2f} h")
     share = d["share_of_pool"]
-    warn = "" if LEAVE_SHARE_WARN[0] <= share <= LEAVE_SHARE_WARN[1] else (
+    # the expected share is the full pool's (plan v3: 0.4-0.55 %); a smoke's pool is the study extent, about a
+    # twelfth of it, so its dev slice of the same size is a larger share and is not warned about
+    warn = "" if body["draw"] is not None or LEAVE_SHARE_WARN[0] <= share <= LEAVE_SHARE_WARN[1] else (
         f"  WARNING: outside {100 * LEAVE_SHARE_WARN[0]:g}-{100 * LEAVE_SHARE_WARN[1]:g} %")
     print(f"  buffers {d['buffer']['rows']} rows {d['buffer']['hours']:.2f} h; dev_dup {d['dev_dup']['rows']} rows "
           f"{d['dev_dup']['hours']:.2f} h; leaving training {d['leave_training_hours']:.2f} h = {100 * share:.3f} % "
