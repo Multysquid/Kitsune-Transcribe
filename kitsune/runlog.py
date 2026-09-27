@@ -15,7 +15,8 @@ Layout (relative to runs/<run_id>/):
                               files below keep the tag as logged
   metrics/scalars.jsonl       EVERY scalar: {"step","wall","elapsed_s","tag","value"}; a non-finite value is written
                               as null with "nf": "nan"|"inf"|"-inf" (JSON has no NaN)
-  metrics/scalars.parquet     rewritten from the jsonl at each sync (tag, step, wall, elapsed_s, value)
+  metrics/scalars.parquet     rewritten from the jsonl at each sync (tag, step, wall, elapsed_s, value); with
+                              scalars_parquet="close" only at close() (its final sync)
   metrics/steps.parquet       one wide row per optimizer step (step, wall, elapsed_s, <every step_row key>)
   metrics/train_utts/part-*.parquet   one row per utterance per time it is trained on (flushed every ~500 steps)
   metrics/hist/part-*.parquet histogram summaries: quantiles, moments, 64-bin counts/edges (json)
@@ -751,10 +752,18 @@ class RunLogger:
     def __init__(self, run_dir, cfg: dict, hf_repo: str | None = None, sync_every_min: float = 10, *,
                  resume: dict | None = None, student_meta: dict | None = None, tee: bool = True,
                  capture: bool = True, train_utts_flush_steps: int = 500, api=None,
-                 upload_retries: tuple[float, ...] = (15, 60, 180), close_join_s: float = 600):
+                 upload_retries: tuple[float, ...] = (15, 60, 180), close_join_s: float = 600,
+                 scalars_parquet: str = "sync"):
         import torch  # noqa: F401  (SummaryWriter needs it anyway; import errors surface here, not mid-run)
         from torch.utils.tensorboard import SummaryWriter
 
+        # when metrics/scalars.parquet is rewritten from scalars.jsonl: "sync" at every sync, "close" only at the final
+        # sync close() runs (the trainer's log.scalars_parquet, 4e). A full-data run's jsonl grows to millions of rows,
+        # and re-reading all of it at every sync costs the host more than the mirror is worth before the run ends
+        if scalars_parquet not in ("sync", "close"):
+            raise ValueError(f"scalars_parquet must be 'sync' or 'close', got {scalars_parquet!r}")
+        self.scalars_parquet = scalars_parquet
+        self._final_sync = False  # set by close() for its last sync (an attribute: sync()'s signature stays as it was)
         self.dir = Path(run_dir)
         self.run_id = self.dir.name
         self.cfg, self.hf_repo = cfg, hf_repo
@@ -1056,9 +1065,11 @@ class RunLogger:
     # ------------------------------------------------------------------------------------------------ events
 
     def event(self, kind: str, **fields):
-        """events.jsonl line, fsynced (these are the lines you want after a crash); also TensorBoard text."""
-        row = dict(wall=round(time.time(), 3), time=_now_iso(), elapsed_s=round(self.elapsed(), 3), step=self.step,
-                   kind=kind, **fields)
+        """events.jsonl line, fsynced (these are the lines you want after a crash); also TensorBoard text. The row's
+        step is the logger's current one, unless the event names its own `step` (an event about another step, e.g. a
+        timed state's upload that its thread reports steps later)."""
+        row = dict(wall=round(time.time(), 3), time=_now_iso(), elapsed_s=round(self.elapsed(), 3),
+                   step=fields.pop("step", self.step), kind=kind, **fields)
         line = json.dumps(_finite(row), ensure_ascii=False, default=str)
         with self._lock:
             with open(self.p_events, "a", encoding="utf-8") as f:
@@ -1110,7 +1121,8 @@ class RunLogger:
     def sync(self, force: bool = False, wait: bool | None = None) -> bool:
         """Rewrite the parquet mirrors and upload the run dir, in a background thread. Non-forced calls are no-ops
         until sync_every_min has passed (or while a sync is still running). force=True always runs and by default
-        waits for completion (end of run / exception path)."""
+        waits for completion (end of run / exception path). close()'s last sync is the one that writes
+        metrics/scalars.parquet under scalars_parquet "close" (_final_sync)."""
         wait = force if wait is None else wait
         if not force and time.monotonic() - self._last_sync < self.sync_every_s:
             return False
@@ -1140,7 +1152,7 @@ class RunLogger:
                         *(p for p in (self.dir / "tb").iterdir() if p.is_file())]
             sizes = {p.relative_to(self.dir).as_posix(): p.stat().st_size for p in appended if p.exists()}
         snap = dict(steps=self._steps_table(), hist=hist, utts=utts, step=self.step, scalars_bytes=scalars_bytes,
-                    sizes=sizes)
+                    sizes=sizes, final=self._final_sync)
         th = threading.Thread(target=self._sync_worker, args=(snap,), name="runlog-sync", daemon=True)
         self._sync_thread = th
         self._sync_t0, self._sync_step, self._stall_logged = time.monotonic(), snap["step"], False
@@ -1155,8 +1167,8 @@ class RunLogger:
                 self._write_part("hist", snap["hist"])
             if snap["utts"]:
                 self._write_part("train_utts", snap["utts"])
-            _atomic_parquet(read_scalars_jsonl(self.p_scalars, limit=snap["scalars_bytes"]),
-                            self.dir / "metrics" / "scalars.parquet")
+            if self.scalars_parquet == "sync" or snap.get("final"):
+                self._write_scalars_parquet(snap["scalars_bytes"])
             self._write_steps(snap["steps"])
         except Exception as e:
             self.event("sync_error", stage="local", error=f"{type(e).__name__}: {e}", traceback=traceback.format_exc())
@@ -1169,6 +1181,11 @@ class RunLogger:
                                traceback=traceback.format_exc())
                     return
                 self._upload(snap["step"], Path(stage))
+
+    def _write_scalars_parquet(self, limit: int | None):
+        """metrics/scalars.parquet from the first `limit` bytes of scalars.jsonl (whole lines: sync() noted a flushed
+        length), None = all of it."""
+        _atomic_parquet(read_scalars_jsonl(self.p_scalars, limit=limit), self.dir / "metrics" / "scalars.parquet")
 
     def _stage(self, dest: Path, sizes: dict[str, int]):
         """Copy of the run dir to upload (checkpoints/ and *.tmp left out): the append-only files cut at the lengths
@@ -1233,7 +1250,8 @@ class RunLogger:
     def close(self, summary: dict | None = None):
         """Write summary.json (if given), flush everything, run a final forced sync, restore stdout/stderr. The wait
         for the syncs is bounded by close_join_s: a stalled earlier sync means no final one (it would queue behind the
-        stall), and a final one that stalls is left behind too."""
+        stall), and a final one that stalls is left behind too. The final sync writes metrics/scalars.parquet under
+        scalars_parquet "close" (the failure path's close too); with no final sync it is written here, locally."""
         if self._closed:
             return
         if summary is not None:
@@ -1242,8 +1260,16 @@ class RunLogger:
         self.event("logger_close", elapsed_s_total=round(self.elapsed(), 1))
         until = time.monotonic() + self.close_join_s
         if self._join_sync(until):
+            self._final_sync = True
             self.sync(force=True, wait=False)
             self._join_sync(until)
+        elif self.scalars_parquet == "close":
+            try:
+                with self._lock:
+                    self._f_scalars.flush()
+                self._write_scalars_parquet(None)
+            except Exception as e:
+                self.event("sync_error", stage="local", error=f"{type(e).__name__}: {e}", traceback=traceback.format_exc())
         with self._lock:
             self._closed = True
             self.tb.close()
