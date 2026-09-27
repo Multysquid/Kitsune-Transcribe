@@ -8,14 +8,18 @@
              and strips and counts timestamp ids; RecordingRepetitionStop records the first fire only
   decode     a tiny random Whisper (tests/fixtures_whisper.py): the prompt is asserted (drift refuses), generate runs
              once per batch with force_unique_generate_call and the fallback off, the stop sees the 4-token prompt, the
-             fp32 head changes no id in fp32, an 80-mel model loads with its own extractor
-  snapshots  fetch asks for the pinned revision and the allowed files only (a fake snapshot_download: no network) and
-             refuses a snapshot without its weights; resolve takes a key or a dir
+             fp32 head changes no id in fp32, an 80-mel model loads with its own extractor; scripted logits through a
+             real generate call give the three ends (repetition / eos / length) with pad == EOS
+  snapshots  fetch asks for the pinned revision and the allowed files only (a fake snapshot_download: no network),
+             refuses a snapshot without its weights, and retries a transient Hub error (finish.hub_retry) but not a
+             404 or an offline miss; resolve takes a key or a dir
   whisper_eval  end to end on an eval store: greedy_<set>.parquet (no teacher_hyp), whisper.json, the row-cap split,
              05's tables and study.json (family whisper, teacher null) that load in the study report; a second run
-             decodes nothing; another --max-rows, a store that is not the manifest's, a frame store and a set outside
-             the manifest refuse (exit 2) before any model is loaded; --limit-per-set is speed_probe's draw and cannot
-             be tabled; a heartbeat per batch and a bounded one around the load; --fetch-only; never exit 3
+             decodes nothing; a stopped --force continues where it stopped (.parts/force.json); a partial re-run keeps
+             every set's table; another --max-rows, a store that is not the manifest's, a frame store, a set outside
+             the manifest and a --model typo refuse (exit 2) before any model is loaded, a store not built yet exits 1;
+             --limit-per-set is speed_probe's draw and cannot be tabled; a heartbeat per batch and a bounded one around
+             the load; --fetch-only; never exit 3
 """
 import json
 import os
@@ -228,6 +232,40 @@ def test_tiny_decode_on_cpu(tiny_dir, monkeypatch):
         W.greedy_whisper(wm, feats, longest)
 
 
+def test_a_scripted_decode_tells_the_three_ends_apart(tiny_dir):
+    """The pad == EOS trap through a real generate call (the LM head swapped for scripted logits): a row that loops is
+    cut by the repetition stop at its first fire and padded with EOS, yet it is "repetition" with exactly its 24 loop
+    ids; a row that emits EOS is "eos" with the EOS kept in hyp_ids; a row that never ends runs to max_new ("length").
+    If transformers ran the criteria at another point of a step, or padded finished rows otherwise, these would move
+    (and whisper.json's n_repetition / n_truncated with them)."""
+    wm = W.load_whisper(tiny_dir, "cpu", torch.float32)
+
+    class Scripted(torch.nn.Module):
+        """Row 0: token 10 forever; row 1: 11, 12, then EOS; row 2: a new token every step (never periodic)."""
+
+        def __init__(self):
+            super().__init__()
+            self.step = 0
+            self.weight = torch.nn.Parameter(torch.zeros(V, 16))
+
+        def forward(self, h):
+            out = torch.full((h.shape[0], h.shape[1], V), -1e4)
+            s, self.step = self.step, self.step + 1
+            out[0, -1, 10] = 0
+            out[1, -1, [11, 12, EOS][min(s, 2)]] = 0
+            out[2, -1, 13 + s % 45] = 0
+            return out
+
+    wm.model.proj_out = Scripted()
+    rows = W.greedy_whisper(wm, W.features(wm, [np.zeros(32000, np.float32)] * 3), 2.0, fp32_head=False)
+    mx = W.max_new_tokens(2.0, MAX_TARGET)
+    assert [r["stop"] for r in rows] == ["repetition", "eos", "length"]
+    assert rows[0]["hyp_ids"] == rows[0]["text_ids"] == [10] * 24 and rows[0]["truncated"]
+    assert rows[1]["hyp_ids"] == [11, 12, EOS] and rows[1]["text_ids"] == [11, 12] and not rows[1]["truncated"]
+    assert rows[2]["hyp_ids"] == [13 + s for s in range(mx)] and rows[2]["max_new"] == mx and rows[2]["truncated"]
+    assert all(r["n_timestamp_tokens"] == 0 for r in rows)
+
+
 def test_an_80_mel_model_loads_its_own_extractor(tmp_path):
     """whisper-small has 80 mel bins: the extractor comes from the snapshot, never a fixed 128; a snapshot whose
     extractor and model disagree refuses."""
@@ -270,6 +308,51 @@ def test_fetch_and_resolve_without_the_network(tiny_dir, tmp_path, monkeypatch):
     monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **k: str(bare))
     with pytest.raises(RuntimeError, match="model.safetensors"):
         W.fetch(spec)
+
+
+def test_fetch_retries_a_transient_hub_error(tiny_dir, monkeypatch):
+    """The Whisper item's only download backs off like every other box download (vast/finish.py hub_retry): a
+    transient error (snapshot_download's LocalEntryNotFoundError after a 5xx or a dropped connection on an empty
+    cache) is retried and the second call's snapshot is used; a refusal the Hub repeats (a 404: no such revision) is
+    raised at once; offline (HF_HUB_OFFLINE, the laptop and the tests) it is one call, no back-off."""
+    import httpx
+    import huggingface_hub
+    from huggingface_hub.errors import LocalEntryNotFoundError, RevisionNotFoundError
+
+    from kitsune.study_queue import _finish
+
+    monkeypatch.setattr(_finish(), "HUB_RETRY_WAITS", (0, 0))  # the back-off's waits, not its logic
+    monkeypatch.setattr(huggingface_hub, "is_offline_mode", lambda: False)
+    calls = []
+
+    def flaky(**k):
+        calls.append(k)
+        if len(calls) == 1:
+            raise LocalEntryNotFoundError("Got: ConnectError: connection reset\nAn error happened while trying to "
+                                          "locate the files on the Hub")
+        return str(tiny_dir)
+
+    spec = W.WHISPER_MODELS["whisper-large-v3"]
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", flaky)
+    assert W.fetch(spec) == tiny_dir and len(calls) == 2
+    assert calls[0] == calls[1] and calls[0]["revision"] == spec.revision
+
+    def gone(**k):
+        calls.append(k)
+        raise RevisionNotFoundError("404 Client Error: Revision Not Found", response=httpx.Response(
+            404, request=httpx.Request("GET", "https://huggingface.co/api/models/openai/whisper-large-v3")))
+
+    calls.clear()
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", gone)
+    with pytest.raises(RevisionNotFoundError):
+        W.fetch(spec)
+    assert len(calls) == 1
+    calls.clear()
+    monkeypatch.setattr(huggingface_hub, "is_offline_mode", lambda: True)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", flaky)
+    with pytest.raises(LocalEntryNotFoundError):
+        W.fetch(spec)
+    assert len(calls) == 1
 
 
 # ------------------------------------------------------------------------------------------------ whisper_eval
@@ -416,12 +499,77 @@ def test_a_second_run_decodes_nothing_and_other_settings_refuse(wenv, tiny_dir, 
     assert events(out, "todo")[-1]["sets"] == ["eval_cv8"]
     pd.testing.assert_frame_equal(pd.read_parquet(out / "greedy_eval_cv8.parquet"), before["eval_cv8"])
     assert set(load(out / "whisper.json")["sets"]) == set(EVAL_SETS)  # the earlier sets stay in the record
+    assert not (out / we.PARTS / we.FORCE).exists() and events(out, "force_done")
+
+
+def test_a_stopped_forced_run_continues_where_it_stopped(wenv, tiny_dir, first_run, tmp_path, monkeypatch):
+    """--force is resumable, as 05's: a forced run stopped after its first set (a stall kill, a new host) leaves its
+    record (.parts/force.json); the same forced command again deletes nothing and decodes only the sets not done since;
+    the record goes once they are all done, and a later --force starts over."""
+    out = tmp_path / "out"
+    shutil.copytree(first_run["out"], out)
+    before = {s: pd.read_parquet(out / f"greedy_{s}.parquet") for s in EVAL_SETS}
+    real, decoded = we.decode_set, []
+
+    def stop_after_one(args, wm, store, s, *a, **k):
+        if decoded:
+            raise RuntimeError("stall kill")
+        decoded.append(s)
+        return real(args, wm, store, s, *a, **k)
+
+    forced = ("--force", "--sets", "eval_cv8", "eval_reazon", "galgame")
+    monkeypatch.setattr(we, "decode_set", stop_after_one)
+    with pytest.raises(RuntimeError, match="stall kill"):
+        we.main(argv_of(wenv, tiny_dir, out, *forced))
+    assert decoded == ["eval_cv8"] and [we.set_done(out, s) for s in EVAL_SETS] == [True, True, False, False]
+    assert load(out / we.PARTS / we.FORCE)["sets"] == list(forced[2:])
+    assert load(out / "whisper.json")["status"] == "failed"
+
+    def spy(args, wm, store, s, *a, **k):
+        decoded.append(s)
+        return real(args, wm, store, s, *a, **k)
+
+    decoded.clear()
+    monkeypatch.setattr(we, "decode_set", spy)
+    assert we.main(argv_of(wenv, tiny_dir, out, *forced)) == 0
+    assert decoded == ["eval_reazon", "galgame"] and events(out, "force_continue")
+    assert not (out / we.PARTS / we.FORCE).exists() and events(out, "force_done")
+    for s in EVAL_SETS:
+        pd.testing.assert_frame_equal(pd.read_parquet(out / f"greedy_{s}.parquet"), before[s])
+    w = load(out / "whisper.json")
+    assert w["status"] == "complete" and set(w["sets"]) == set(EVAL_SETS)
+    decoded.clear()
+    assert we.main(argv_of(wenv, tiny_dir, out, "--force", "--sets", "eval_cv8")) == 0
+    assert decoded == ["eval_cv8"] and events(out, "force")[-1]["sets"] == ["eval_cv8"]
+
+
+def test_a_partial_rerun_keeps_every_table(wenv, tiny_dir, first_run, tmp_path):
+    """--tables tables every manifest set done in --out, not only the sets this command named: a forced re-run of one
+    set keeps the other sets' tables and study.json's M4 (05's publish_tables deletes a table it was not handed). A
+    fresh --sets eval_jsut run (smoke B's large-v3 item) tables that set only."""
+    out, tables = tmp_path / "out", tmp_path / "tables"
+    shutil.copytree(first_run["out"], out)
+    assert we.main(argv_of(wenv, tiny_dir, out, tables=tables)) == 0
+    m4 = load(out / "study.json")["metrics"]["m4"]
+    assert m4 is not None
+    assert we.main(argv_of(wenv, tiny_dir, out, "--force", "--sets", "eval_cv8", tables=tables)) == 0
+    assert events(out, "todo")[-1]["sets"] == ["eval_cv8"]
+    st = load(out / "study.json")
+    assert sorted(p.stem for p in (tables / "whisper-tiny").glob("*.parquet")) == sorted(EVAL_SETS)
+    assert st["missing_sets"] == [] and st["refused"] == {} and st["metrics"]["m4"] == m4
+    assert events(out, "study_tables")[-1]["sets"] == sorted(EVAL_SETS)
+    fresh, ftables = tmp_path / "fresh", tmp_path / "ftables"
+    assert we.main(argv_of(wenv, tiny_dir, fresh, "--sets", "eval_jsut", tables=ftables)) == 0
+    assert [p.stem for p in (ftables / "whisper-tiny").glob("*.parquet")] == ["eval_jsut"]
+    assert events(fresh, "study_tables")[-1]["sets"] == ["eval_jsut"]
 
 
 def test_refusals_before_any_model_is_loaded(wenv, tiny_dir, tmp_path, monkeypatch):
     """Exit 2, no model loaded: a store whose rows are not the manifest's, a set outside the manifest, a frame store, a
-    manifest that does not hash to itself; --limit-per-set with --tables and a model dir without --system are argument
-    errors (exit 2)."""
+    manifest that does not hash to itself; --limit-per-set with --tables, a model dir without --system and a --model
+    that is neither a key nor a model dir (a typo: refused before --out's identity is written, so the corrected command
+    can use that --out) are argument errors (exit 2). A --store that is not built yet is no refusal: exit 1, as the
+    queue retries it."""
     def no_model(*a, **k):
         raise AssertionError("a model was loaded before the refusal")
 
@@ -452,7 +600,12 @@ def test_refusals_before_any_model_is_loaded(wenv, tiny_dir, tmp_path, monkeypat
     a = argv_of(wenv, tiny_dir, tmp_path / "o6")
     a[a.index("--system"):a.index("--system") + 2] = []
     assert we.main(a) == 2
-    assert not any((tmp_path / f"o{i}" / "greedy_eval_jsut.parquet").exists() for i in range(1, 7))
+    assert we.main(argv_of(wenv, "whisper-lage-v3", tmp_path / "o7")) == 2
+    assert not (tmp_path / "o7").exists()
+    a = argv_of(wenv, tiny_dir, tmp_path / "o8")
+    a[a.index("--store") + 1] = str(tmp_path / "not-built")
+    assert we.main(a) == 1
+    assert not any((tmp_path / f"o{i}" / "greedy_eval_jsut.parquet").exists() for i in range(1, 9))
 
 
 def test_limit_per_set_is_the_speed_probes_draw(wenv, tiny_dir, tmp_path):

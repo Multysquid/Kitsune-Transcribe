@@ -11,7 +11,8 @@ Models (WHISPER_MODELS; the system name is the key, the tables' and the speed re
                           bins: the loader takes the feature extractor of each model's own snapshot, never 128)
 Every Hub read is pinned, like the datasets and the teachers: a repo that moves between smoke B and box 2 would score a
 different model under the same name. fetch downloads only ALLOW_PATTERNS (the single fp16/bf16 model.safetensors and
-the processor files): the large-v3 repo also holds fp32 shards, flax and .bin copies, several GB nobody reads.
+the processor files): the large-v3 repo also holds fp32 shards, flax and .bin copies, several GB nobody reads. It
+retries a transient Hub error with the box's back-off (vast/finish.py hub_retry): it is the item's only download.
 
 The decode is the AED students' (kitsune.evaluate.greedy_generate), transposed to Whisper's generate:
   prompt     SOT, <|ja|>, <|transcribe|>, <|notimestamps|> (PROMPT_LEN 4): language forced (no language-ID errors on
@@ -109,11 +110,27 @@ def max_new_tokens(longest_s: float, max_target_positions: int, prompt_len: int 
 def fetch(spec: WhisperSpec, cache_dir=None) -> Path:
     """The pinned snapshot's dir (huggingface_hub.snapshot_download of spec.repo @ spec.revision, ALLOW_PATTERNS only,
     into cache_dir: the box's <root>/cache/hf; None = the HF default cache). A cached snapshot is used as it is (also
-    with HF_HUB_OFFLINE=1). Raises when the snapshot lacks a REQUIRED_FILES entry."""
-    from huggingface_hub import snapshot_download
+    with HF_HUB_OFFLINE=1). Raises when the snapshot lacks a REQUIRED_FILES entry.
 
-    path = Path(snapshot_download(repo_id=spec.repo, revision=spec.revision, allow_patterns=list(ALLOW_PATTERNS),
-                                  cache_dir=str(cache_dir) if cache_dir else None))
+    A transient Hub error (a 5xx, a 429, a dropped connection: vast/finish.py's retryable) is retried with the box's
+    back-off (finish.hub_retry, HUB_RETRY_WAITS: ~21 min in all, inside the callers' LOAD_BEAT_MAX_S heartbeat), as
+    every other box download is: huggingface_hub retries neither snapshot_download's repo_info call nor its file
+    metadata requests, and this is the Whisper item's only download (the build has no prefetch item, and the queue
+    does not retry a failed eval or speed item), so one 503 on an empty cache would lose that yardstick for the whole
+    box. A refusal the Hub repeats (a missing repo or revision, a gated repo, a refused token) is raised at once, and
+    offline (HF_HUB_OFFLINE) it is one call: the cache holds the snapshot or it fails at once."""
+    from huggingface_hub import is_offline_mode, snapshot_download
+
+    def once():
+        return snapshot_download(repo_id=spec.repo, revision=spec.revision, allow_patterns=list(ALLOW_PATTERNS),
+                                 cache_dir=str(cache_dir) if cache_dir else None)
+
+    if is_offline_mode():
+        path = Path(once())
+    else:
+        from kitsune.study_queue import _finish  # vast/finish.py, stdlib only at import
+
+        path = Path(_finish().hub_retry(once, f"fetch {spec.repo}@{spec.revision[:8]}"))
     if missing := [f for f in REQUIRED_FILES if not (path / f).is_file()]:
         raise RuntimeError(f"{spec.repo}@{spec.revision}: the snapshot at {path} lacks {missing}")
     return path

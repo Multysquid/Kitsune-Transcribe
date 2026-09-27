@@ -12,12 +12,17 @@ Flow:
      with other settings refuses (exit 2): use a new --out.
   3. The model: a WHISPER_MODELS key is fetched at its pinned revision into --hf-cache (only its allowed files), a
      model dir is used as it is; loaded under a heartbeat (kitsune.heartbeat.beating, bounded: LOAD_BEAT_MAX_S).
-  4. Per set, resumable at set granularity (a set whose greedy_<set>.parquet and .parts/<set>.json agree is skipped;
-     --force decodes the named sets again): whisper_batches (the eval's batches, row-capped at --max-rows), the audio
-     through kitsune.evaluate._prefetched, features, greedy_whisper, decode_texts; the thermal guard (05's, --max-temp)
-     and a heartbeat beat before every batch.
+  4. Per set, resumable at set granularity (a set whose greedy_<set>.parquet and .parts/<set>.json agree is skipped):
+     whisper_batches (the eval's batches, row-capped at --max-rows), the audio through kitsune.evaluate._prefetched,
+     features, greedy_whisper, decode_texts; the thermal guard (05's, --max-temp) and a heartbeat beat before every
+     batch. --force decodes the named sets again, as 05's does: its first run deletes their outputs and records what it
+     forces (.parts/force.json), so the same forced command after a stop (a stall kill, a new host) finds the record,
+     deletes nothing and decodes only the sets not done since; the record goes once every set it names is done (delete
+     it to start a stopped forced run over).
   5. whisper.json after every set (status running, then complete; failed with the error when it stops), then with
-     --tables 05 --from-evals on --out (the sets named by --sets only, when given).
+     --tables 05 --from-evals on --out, over every manifest set done in --out (not only the sets this command named:
+     a partial re-run, e.g. --force --sets eval_cv8, must not drop the other sets' tables or M4 from study.json; the
+     identity check makes every set in --out the same model and settings).
 
 Outputs in --out:
   greedy_<set>.parquet  one row per decoded manifest row, in batch order: id, source, duration, ref (the store's), hyp,
@@ -36,16 +41,22 @@ Outputs in --out:
                         <tables>/<system>/<set>.parquet
 
 --limit-per-set N (smoke B's quick rows): N ids per set, speed_probe.pick_ids's seeded draw (--seed). Such a run
-scores part of each set, so it cannot be tabled (--tables refused). --fetch-only: only step 3's download, on CPU (a
-prefetch; nothing else is read or written).
+scores part of each set, so it cannot be tabled: --limit-per-set with --tables is an argument error (exit 2), and a
+registry item that adds --limit-per-set to the box argv must also drop its --tables. --manifest is optional with it
+(given, the sets are still checked against it). --fetch-only: only step 3's download, on CPU (a prefetch; nothing
+else is read or written).
 
-Exit codes: 0 done; 2 refused (store, manifest, identity, a frame store, tables refused by 05, bad arguments); 1 any
-other error. Never 3 (the queue's throughput code).
+Exit codes: 0 done; 2 refused (a store whose rows are not the manifest's, a frame store, the manifest, identity, tables
+refused by 05, bad arguments incl. a --model that is neither a key nor a model dir); 1 any other error, including a
+--store that is not built yet (retryable: the queue's stores item may still be building it). Never 3 (the queue's
+throughput code).
 
-Usage (box 2's registry eval item; smoke B adds --sets eval_jsut, or --limit-per-set 50 without --tables):
+Usage (box 2's registry eval item; smoke B's large-v3 item adds --sets eval_jsut):
   python tools/whisper_eval.py --model whisper-large-v3 --store <root>/cache/eval \
       --manifest labels/full/selections/study_manifest.json --out runs/whisper-large-v3-<stamp> \
       --tables runs/whisper-large-v3-<stamp>/tables --hf-cache <root>/cache/hf --device cuda --max-temp 0
+smoke B's quick rows (turbo, kotoba, small): the same without --tables (and --manifest optional), plus
+  --limit-per-set 50
 """
 import argparse
 import importlib.util
@@ -68,6 +79,7 @@ from kitsune import whisper as W  # noqa: E402
 
 EXIT_REFUSED = 2
 PARTS = ".parts"
+FORCE = "force.json"  # in .parts: the sets an unfinished --force run decodes again (05's start_force record)
 SCHEMA = 1
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 COLUMNS = ("id", "source", "duration", "ref", "hyp", "truncated", "stop", "n_tok", "n_timestamp_tokens", "max_new",
@@ -157,6 +169,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     for flag, v in (("--store", args.store), ("--out", args.out)):
         if not v:
             ap.error(f"{flag} is required")
+    # before --out's identity is written: a typo there would spoil the out dir for the corrected command
+    if args.model not in W.WHISPER_MODELS and not (Path(args.model) / "config.json").is_file():
+        ap.error(f"--model {args.model!r} is neither a Whisper key ({', '.join(W.WHISPER_MODELS)}) nor a model dir")
     if args.limit_per_set is not None and args.tables:
         ap.error("--limit-per-set scores part of each set, which cannot be tabled: drop --tables")
     if args.limit_per_set is None and not args.manifest:
@@ -209,6 +224,42 @@ def set_done(out: Path, s: str) -> bool:
     part = m05()._load_json(out / PARTS / f"{s}.json")
     return (isinstance(part, dict) and part.get("n") is not None
             and m05()._rows(out / f"greedy_{s}.parquet") == part["n"])
+
+
+def start_force(out: Path, sets: list[str], log):
+    """--force (05's start_force, per set): the first run deletes the named sets' outputs and records what it forces
+    (.parts/force.json). The same forced command after a stop finds that record and deletes nothing, so it decodes only
+    the sets not done since - a stall kill or a new host must not throw away hours of large-v3 (end_force drops it)."""
+    M = m05()
+    old = M._load_json(out / PARTS / FORCE)
+    if isinstance(old, dict) and old.get("sets") == list(sets):
+        log.event("force_continue", since=old.get("time_utc"), sets=list(sets))
+        return
+    for s in sets:
+        for p in (out / f"greedy_{s}.parquet", out / PARTS / f"{s}.json"):
+            p.unlink(missing_ok=True)
+    M._write_json(out / PARTS / FORCE, dict(sets=list(sets), time_utc=M._now()))
+    log.event("force", sets=list(sets))
+
+
+def end_force(out: Path, log):
+    """The --force record goes once every set it names is done, by the forced command or any other."""
+    p = out / PARTS / FORCE
+    if not p.exists():
+        return
+    rec = m05()._load_json(p)
+    if isinstance(rec, dict) and not all(set_done(out, s) for s in rec.get("sets") or ()):
+        return  # an unreadable record is of no use: it goes
+    p.unlink(missing_ok=True)
+    log.event("force_done", sets=(rec or {}).get("sets") if isinstance(rec, dict) else None)
+
+
+def tabled_sets(out: Path, manifest_sets) -> list[str] | None:
+    """The sets --tables hands 05 --from-evals: every manifest set done in --out, whatever this command named (None =
+    all of them: 05's default). A partial re-run (--force --sets eval_cv8) would otherwise table eval_cv8 alone, and
+    05's publish_tables would delete the other sets' tables and study.json lose M4."""
+    done = [s for s in manifest_sets if set_done(out, s)]
+    return None if len(done) == len(manifest_sets) else done
 
 
 def set_summary(df: pd.DataFrame, dropped: list[str], wall_s: float, stats: dict) -> dict:
@@ -318,7 +369,11 @@ def run(args) -> int:
     log.event("whisper_start", argv=args.argv, model=args.model, system=args.system, out=str(out),
               device=str(device), dtype=dname, max_rows=max_rows, batch_s=args.batch_s,
               limit_per_set=args.limit_per_set)
-    store = trainset.load_stores(args.store)
+    try:
+        store = trainset.load_stores(args.store)
+    except FileNotFoundError as e:  # exit 1, not a refusal: the box's stores item may not have built it yet
+        raise SystemExit(f"the eval store {args.store} is not built ({e.filename or e}): build it first (exit 1, "
+                         "retryable)") from e
     if (store.info or {}).get("kind") == "frames":
         raise Refused(f"{args.store} is a frame store (the CTC trainer's): Whisper reads the eval TOKEN store "
                       "(<cache_dir>/eval), whose references every system is scored against")
@@ -333,10 +388,7 @@ def run(args) -> int:
                     limit_per_set=args.limit_per_set, seed=int(args.seed), transformers=transformers.__version__)
     _refusing(M.check_identity, out, identity)
     if args.force:
-        for s in sets:
-            for p in (out / f"greedy_{s}.parquet", out / PARTS / f"{s}.json"):
-                p.unlink(missing_ok=True)
-        log.event("force", sets=sets)
+        start_force(out, sets, log)
     todo = [s for s in sets if not set_done(out, s)]
     log.event("todo", sets=todo, skipped_done=[s for s in sets if s not in todo])
     old = M._load_json(out / W.WHISPER_META)
@@ -359,6 +411,7 @@ def run(args) -> int:
                 M._write_json(out / PARTS / f"{s}.json", dict(n=int(len(df)), summary=set_summary(df, dropped, wall,
                                                                                                     stats)))
                 M._write_output_json(out / W.WHISPER_META, whisper_record(args, out, meta, "running"))
+        end_force(out, log)
         rec = whisper_record(args, out, meta, "complete")
         M._write_output_json(out / W.WHISPER_META, rec)
         log.event("whisper_done", sets={s: v["cer_corpus"] for s, v in rec["sets"].items()})
@@ -373,8 +426,8 @@ def run(args) -> int:
     if args.tables:
         argv = ["--from-evals", str(out), "--system", args.system, "--manifest", str(Path(args.manifest).resolve()),
                 "--prereg", str(args.prereg), "--out", str(out), "--tables", str(Path(args.tables).resolve())]
-        if args.sets:
-            argv += ["--sets", *sets]
+        if (done := tabled_sets(out, list(Mf["manifest"].sets))) is not None:
+            argv += ["--sets", *done]
         rc = _refusing(M.main, argv)
         if rc:
             raise Refused(f"05 --from-evals exited {rc}")
