@@ -46,7 +46,8 @@ Numerics (the exact recipes; the constants are the torchao parity test's to pin)
   export runs on CPU); torch.round is round half to even; values are clamped to +-448 before any cast to e4m3
   E2M1          codes 0-7 = {0, .5, 1, 1.5, 2, 3, 4, 6}, bit 3 the sign (torch.signbit: -0.2 is code 8, as torchao);
                 round to nearest, ties to the even code; two codes per byte, element 2i in the low nibble
-  int8 weights  s = max(amax_row, INT8_EPS) / INT8_DIV, q = clamp(round(w / s), -128, 127); dequant q * s
+  int8 weights  s = max(amax_row, INT8_EPS) / INT8_DIV (in INT8_SCALE_DTYPE), q = clamp(round(w / s), -128, 127);
+                dequant q * s
   int8 acts     per token: s = max(amax_row, INT8_ACT_EPS) / INT8_ACT_DIV, q = clamp(round(x / s), INT8_ACT_QMIN, 127)
   nvfp4         t = amax(|w|) / (448 * 6) (an all-zero tensor: 1); per 16 along K bs = e4m3(clamp((b / 6) / t,
                 NVFP4_SCALE_MIN, 448)); codes of clamp(w / (bs * t), +-6); dequant E2M1[c] * (bs * t). Activations
@@ -174,6 +175,10 @@ E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _E2M1_MIDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 INT8_DIV = 127.5  # torchao choose_qparams_affine SYMMETRIC over [-128, 127]: amax / ((127 - -128) / 2)
 INT8_EPS = float(torch.finfo(torch.float32).eps)
+# the dtype torchao keeps an int8 weight's per-row scale in (the file stores it as F32, which holds either exactly):
+# the scale is rounded to it before the codes are computed. fp32 until the parity test says torchao keeps the weight's
+# own dtype (bf16)
+INT8_SCALE_DTYPE = torch.float32
 INT8_ACT_DIV = 127.0  # torchao's per-token activation quant uses the reduced range [-127, 127]
 INT8_ACT_QMIN = -127
 INT8_ACT_EPS = 1e-5
@@ -369,9 +374,10 @@ class QuantPack:
         return int(sum(t.numel() * t.element_size() for t in self.parts().values()))
 
 
-def _int8_rows(x: torch.Tensor, div: float, eps: float, qmin: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _int8_rows(x: torch.Tensor, div: float, eps: float, qmin: int, scale_dtype=torch.float32
+               ) -> tuple[torch.Tensor, torch.Tensor]:
     amax = x.abs().amax(dim=1)
-    s = amax.clamp(min=eps) / div
+    s = (amax.clamp(min=eps) / div).to(scale_dtype).float()
     q = torch.clamp(torch.round(x / s[:, None]), qmin, 127)
     return q, s
 
@@ -444,7 +450,7 @@ def pack_weight(w: torch.Tensor, wfmt: str, *, mx_rounding: str = "rceil") -> Qu
     if not bool(torch.isfinite(wb).all()):
         raise QuantError(f"a weight of shape {(n, k)} holds non-finite values: it cannot be quantised")
     if wfmt == "int8":
-        q, s = _int8_rows(wb, INT8_DIV, INT8_EPS, -128)
+        q, s = _int8_rows(wb, INT8_DIV, INT8_EPS, -128, scale_dtype=INT8_SCALE_DTYPE)
         return QuantPack("int8", (n, k), q.to(torch.int8), scale=s.float())
     if wfmt == "fp8":
         q, s = _fp8_rows(wb)

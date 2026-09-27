@@ -667,3 +667,54 @@ def test_cli_exit_codes_and_the_export_heartbeat(dirs, tmp_path, monkeypatch, ca
     assert Q.main(["readout", "--config", "c.json", "--ckpt", str(dirs["ctc"]), "--fmt", "int8-cpu", "--out",
                    str(tmp_path / "r"), "--cache-dir", str(tmp_path / "c"), "--manifest", "m.json"]) == 2
     capsys.readouterr()
+
+
+class FakeAOTensor(torch.Tensor):
+    """A traceable wrapper subclass shaped like torchao's int8 weight (qdata int8 (N, K), scale (N, 1)): the torchao
+    adapter's generic part (__tensor_flatten__ / __tensor_unflatten__, the roles, the exact scale conversion) on the
+    laptop, where torchao itself is absent."""
+
+    @staticmethod
+    def __new__(cls, qdata, scale, shape, extra=None):
+        return torch.Tensor._make_wrapper_subclass(cls, shape, dtype=torch.bfloat16, device=qdata.device)
+
+    def __init__(self, qdata, scale, shape, extra=None):
+        self.qdata, self.scale, self.extra = qdata, scale, extra
+
+    def __tensor_flatten__(self):
+        return ["qdata", "scale"] + (["extra"] if self.extra is not None else []), None
+
+    @classmethod
+    def __tensor_unflatten__(cls, inner, ctx, outer_size, outer_stride):
+        return cls(inner["qdata"], inner["scale"], outer_size, inner.get("extra"))
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        raise NotImplementedError(func)
+
+    def dequantize(self):
+        return self.qdata.float() * self.scale.float()
+
+
+def test_the_torchao_adapter_swaps_a_subclass_inner_tensors(monkeypatch):
+    """to_torchao places the pack's codes and scales into the template's inner tensors (by role: dtype and shape),
+    from_torchao reads them back; a scale dtype that cannot hold the pack's values, or an inner tensor of no known
+    role, raises instead of converting silently."""
+    n, k = 16, 32
+    w = torch.randn(n, k)
+    pack = Q.pack_weight(w, "int8")
+    tpl = FakeAOTensor(torch.zeros(n, k, dtype=torch.int8), torch.ones(n, 1), (n, k))
+    monkeypatch.setattr(Q, "_template", lambda n_, k_, fmt, device: tpl)
+    t = Q.to_torchao(pack, "int8-w8a8", "cpu")
+    assert type(t) is FakeAOTensor and t.shape == (n, k) and torch.equal(t.qdata, pack.qweight)
+    assert torch.equal(t.scale.reshape(-1), pack.scale) and torch.equal(t.dequantize(), Q.unpack_weight(pack))
+    back = Q.from_torchao(t, "int8-w8a8")
+    assert torch.equal(back.qweight, pack.qweight) and torch.equal(back.scale, pack.scale)
+    bf16 = FakeAOTensor(torch.zeros(n, k, dtype=torch.int8), torch.ones(n, 1, dtype=torch.bfloat16), (n, k))
+    monkeypatch.setattr(Q, "_template", lambda n_, k_, fmt, device: bf16)
+    with pytest.raises(Q.QuantError, match="does not hold the pack"):
+        Q.to_torchao(pack, "int8-w8a8", "cpu")
+    odd = FakeAOTensor(torch.zeros(n, k, dtype=torch.int8), torch.ones(n, 1), (n, k), extra=torch.zeros(3, 3))
+    monkeypatch.setattr(Q, "_template", lambda n_, k_, fmt, device: odd)
+    with pytest.raises(Q.QuantError, match="cannot place"):
+        Q.to_torchao(pack, "int8-w8a8", "cpu")

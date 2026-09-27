@@ -356,7 +356,7 @@ def test_quant_records(env, tmp_path):
     h = pd.read_parquet(hy)
     assert list(h.columns) == ["id", "ref", "hyp", "hyp_1", "duration"] and h["id"].tolist() == doc["ids"]
     assert h["hyp_1"].notna().sum() == 4 and (h["hyp_1"].iloc[:4] != h["hyp"].iloc[:4]).sum() == q["hyp_diff_1"]
-    assert q["versions"]["torchao"] is None
+    assert "torchao" in q["versions"]
 
 
 def test_quant_refusals(env, tmp_path, capsys):

@@ -5,7 +5,10 @@ Why: CI runs this inside the freshly built image before the image is tagged (.gi
 broken wheel, an ABI mismatch (numpy vs numba, torch vs transformers) or a pin that did not stick is caught for free
 on a GitHub runner instead of on a rented A100. It needs no GPU, no network and no data, and it exercises the exact
 call path the trainer uses: `model.model(...)` with sdpa attention on a padded batch, then the LM head in fp32; and
-the viewer's import path the box starts (tensorboard.main, which needs pkg_resources from the pinned setuptools).
+the viewer's import path the box starts (tensorboard.main, which needs pkg_resources from the pinned setuptools); and
+torchao as kitsune/quant.py uses it (torchao_check: every name it looks up, an int8 W8A8 Linear on CPU). The workflow
+then runs tests/test_quant.py and tests/test_quant_torchao.py inside the same image (the repo mounted), where the
+quant recipe's bit-level parity with torchao is checked.
 
 Usage (inside the image; the base image's ENTRYPOINT must be bypassed):
   docker run --rm --entrypoint /venv/main/bin/python <image> /opt/kitsune/smoke_import.py
@@ -50,7 +53,18 @@ MODULES = {
     "pyyaml": "yaml",
     "pytest": "pytest",
     "vastai": "vastai",
+    "torchao": "torchao",  # the quantised variants' runtime (kitsune/quant.py); torchao_check below
 }
+# torchao's names kitsune/quant.py uses (its TORCHAO_CONFIGS and adapter lookups; tests/test_infra.py keeps the lists
+# equal) and the modules it looks them up in, in its order (torchao's prototype namespaces move between releases)
+TORCHAO_NAMES = ("Int8WeightOnlyConfig", "Int8DynamicActivationInt8WeightConfig", "NVFP4WeightOnlyConfig",
+                 "NVFP4DynamicActivationNVFP4WeightConfig", "Float8DynamicActivationFloat8WeightConfig", "PerRow",
+                 "quantize_", "MXDynamicActivationMXWeightConfig", "KernelPreference")
+TORCHAO_MODULES = ("torchao.quantization", "torchao.prototype.mx_formats",
+                   "torchao.prototype.mx_formats.inference_workflow", "torchao.prototype.mx_formats.nvfp4_tensor",
+                   "torchao.prototype.mx_formats.mx_tensor", "torchao.prototype.mx_formats.utils",
+                   "torchao.prototype.mx_formats.config", "torchao.quantization.granularity",
+                   "torchao.quantization.quantize_.common")
 PROMPT = [13764, 7, 4, 16, 98, 98, 5, 9, 11, 13]  # the teacher's ja decoder prompt (scripts/02_teacher_pass.py)
 PAD, EOS = 2, 3
 
@@ -155,6 +169,61 @@ def tensorboard_server() -> dict:
     return {"plugins": len(plugins), "samples_per_plugin": tb.flags.samples_per_plugin}
 
 
+def torchao_check(skip_missing: bool = False) -> dict | str:
+    """torchao as the quantised variants use it, on CPU and without kitsune code (the image has none): the import
+    (its C++ extension's warnings recorded, not failed: kitsune's int8 runs through torch._int_mm and FP4 / FP8
+    through torch._scaled_mm, not torchao's own kernels), every name kitsune/quant.py looks up (an API-drift canary:
+    a renamed config fails here, before a box pays for it), an int8 W8A8 quantize_ of a bf16 Linear(64, 64) whose CPU
+    forward is within 5e-2 relative of bf16, and an NVFP4 weight-only quantise + dequantize (skipped with the reason
+    where torchao refuses it on CPU). Without torchao: "skipped" under --skip-missing, else it fails."""
+    import warnings
+
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            import torchao
+    except ModuleNotFoundError:
+        if skip_missing:
+            return "skipped (torchao not installed)"
+        raise
+    import torch
+
+    def find(name):
+        for mod in TORCHAO_MODULES:
+            try:
+                m = importlib.import_module(mod)
+            except Exception:  # noqa: BLE001 - a module another release does not have
+                continue
+            if hasattr(m, name):
+                return getattr(m, name)
+        return None
+
+    rec = {"version": torchao.__version__, "warnings": [str(w.message)[:200] for w in caught][:5]}
+    missing = [n for n in TORCHAO_NAMES if find(n) is None]
+    if missing:
+        raise RuntimeError(f"torchao {torchao.__version__} lacks {missing} in {TORCHAO_MODULES}")
+    torch.manual_seed(0)
+    lin = torch.nn.Linear(64, 64).to(torch.bfloat16)
+    x = torch.randn(8, 64, dtype=torch.bfloat16)
+    with torch.no_grad():
+        ref = lin(x).float()
+        find("quantize_")(lin, find("Int8DynamicActivationInt8WeightConfig")())
+        y = lin(x).float()
+    rel = float((y - ref).norm() / ref.norm())
+    if not rel < 5e-2:
+        raise RuntimeError(f"torchao int8 W8A8 on CPU: relative error {rel:.3g} against bf16")
+    rec["int8_w8a8_cpu_rel_err"] = rel
+    try:
+        lin4 = torch.nn.Linear(64, 64).to(torch.bfloat16)
+        w = lin4.weight.detach().float().clone()
+        find("quantize_")(lin4, find("NVFP4WeightOnlyConfig")())
+        d = lin4.weight.dequantize().float()
+        rec["nvfp4_dequant_rel_err"] = float((d - w).norm() / w.norm())
+    except Exception as e:  # noqa: BLE001 - NVFP4 is a GPU format: CPU support is not required
+        rec["nvfp4"] = f"skipped on CPU: {type(e).__name__}: {e}"[:200]
+    return rec
+
+
 def tiny_forward_backward(seed: int = 0) -> dict:
     """Random tiny CohereAsr (real 16384 vocab and prompt ids), padded batch of 2, sdpa, fp32 head, CE backward."""
     import torch
@@ -227,7 +296,8 @@ def main() -> int:
     import torch
     print(f"torch {torch.__version__}  cuda built {torch.version.cuda}  arch {torch.cuda.get_arch_list()}  "
           f"cuda available {torch.cuda.is_available()}")
-    for name, fn in (("audio", audio_roundtrip), ("tensorboard", tensorboard_server), ("model", tiny_forward_backward)):
+    for name, fn in (("audio", audio_roundtrip), ("tensorboard", tensorboard_server), ("model", tiny_forward_backward),
+                     ("torchao", lambda: torchao_check(args.skip_missing))):
         try:
             print(f"  {name}: {fn()}")
         except Exception as e:

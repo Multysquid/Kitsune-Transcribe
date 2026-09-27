@@ -40,6 +40,11 @@ nvidia-ml-py==13.610.43
 psutil==7.1.0
 pyyaml==6.0.3
 
+# quantised variants (kitsune/quant.py): torchao's int8 / NVFP4 / FP8 tensor subclasses and kernels. Not on the
+# laptop (its tests emulate); the wheel requires no torch version, so the constraints file keeps the base image's
+# torch 2.14. .github/workflows/image.yml runs tests/test_quant*.py inside the image before tagging it
+torchao==0.18.0
+
 # tests (the smoke check and tests/ can run inside the image)
 pytest==9.1.1
 
