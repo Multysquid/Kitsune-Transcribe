@@ -48,7 +48,6 @@ from kitsune import fullrun  # noqa: E402
 EVAL = ["eval_jsut", "eval_cv8", "eval_reazon"]
 PEAK = 3e-3
 FLAT = 1e9  # min_delta_abs: no check after the first improves
-EVENT_META = ("wall", "time", "elapsed_s", "step", "kind")
 DEV_STEMS = {"src_a": ["train-00004"], "src_b": ["train-00003"]}
 
 
@@ -95,8 +94,8 @@ def rule(**kw) -> dict:
 
 def with_dev_split(sel: Path, stems: dict[str, list[str]], out: Path | None = None) -> Path:
     """A copy of a selection whose kept rows of the named shards ({source: [stem, ...]}; teacher_file <source>/<stem>)
-    are the dev slice, as make_selection.py's full mode marks it: split "dev", keep true, teacher_file their train shard,
-    never in the probe or the greedy subset. The parquet's own metadata is kept."""
+    are the dev slice, as make_selection.py's full mode marks it: split "dev", keep true, teacher_file their train
+    shard, never in the probe or the greedy subset. The parquet's own metadata is kept."""
     table = pq.read_table(sel)
     df = table.to_pandas()
     files = {f"{s}/{st}" for s, v in stems.items() for st in v}
@@ -551,7 +550,8 @@ def test_dev_ce_early_stop_on_the_step_clock(env):
     assert es["raw"] == pytest.approx(dh[4]["dev_ce"])
     assert es["value"] == pytest.approx((dh[3]["dev_ce"] + dh[4]["dev_ce"]) / 2)
     assert scalar(run, "early_stop/evals_since_best") == {2: 0, 3: 1, 4: 2}
-    assert sorted(scalar(run, "early_stop/raw")) == [1, 2, 3, 4] and sorted(scalar(run, "early_stop/value")) == [2, 3, 4]
+    assert sorted(scalar(run, "early_stop/raw")) == [1, 2, 3, 4]
+    assert sorted(scalar(run, "early_stop/value")) == [2, 3, 4]
     assert [e["at_step"] for e in events(run, "eval")] == [0, 3, 6]
     assert sorted(dh) == [0, 1, 2, 3, 4, 5, 6]  # none at the last loop step 6: the final one covers it
     assert any(e["name"] == "full_step_4" and e["reason"] == "pre_cooldown" for e in events(run, "checkpoint"))
