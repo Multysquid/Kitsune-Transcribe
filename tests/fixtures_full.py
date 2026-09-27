@@ -26,8 +26,11 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fixtures import ROOT  # noqa: E402
+# stdlib only (no `from fixtures import ROOT`: that loads numpy, pyarrow and soundfile), so a test of a stdlib-only
+# script (launch, bootstrap's helper) can use it as cheaply as kitsune.fullrun itself
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from kitsune import fullrun  # noqa: E402
 

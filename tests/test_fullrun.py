@@ -122,8 +122,10 @@ def test_families_and_speed_kinds_follow_the_code():
     assert set(kinds) <= set(fr.SPEED_KINDS) and set(fr.SPEED_KINDS) - set(kinds) <= {"whisper"}
 
 
-def test_stdlib_only_at_import():
-    code = ("import sys; import kitsune.fullrun; "
+@pytest.mark.parametrize("imp", ["import kitsune.fullrun", "sys.path.insert(0, 'tests'); import fixtures_full"])
+def test_stdlib_only_at_import(imp):
+    # the fixture too: a test of a stdlib-only script (launch, bootstrap's helper) can use it without the heavy stack
+    code = (f"import sys; {imp}; "
             "print(sorted(m for m in sys.modules if m.split('.')[0] in ('numpy', 'torch', 'pandas', 'pyarrow') "
             "or m == 'kitsune.prereg'))")
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=120)
