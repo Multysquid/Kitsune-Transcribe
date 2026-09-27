@@ -10,7 +10,8 @@
 - early_stop.smooth (nothing counted before k values; min_evals and patience count smoothed checks)
 - the COOLDOWN file, acting once or ignored inside a cooldown, through the module-level stop_requested (the study box's
   wrapper) and _stop_requested_trainer
-- the resume reset flag: one-shot, epochs extension, the refusals, a repeat before the first save
+- the resume reset flag: one-shot, epochs extension, the refusals, a repeat before the first save, the runs repo's
+  COOLDOWN copy deleted (or, when that fails, ignored); a resume that switches to the epoch clock needs no flag
 - 4c's extra memory-probe passes and synthetic shapes; 4d's deadline cooldown (schedule / start / compress / clear,
   no time left) and a whole run that ends by the deadline
 - summary.json's end_reason and resume_resets
@@ -750,6 +751,104 @@ def test_resume_reset_refusals_on_their_own(tmp_path):
     R.cfg["schedule"]["max_steps"] = 30
     m.resume_reset_finish(R, before)
     assert evs[-1]["kind"] == "resume_reset" and evs[-1]["T"] == 30.0 and R.st["schedule_resets"][-1]["at_step"] == 12
+
+
+class _RunsRepo:
+    """The runs repo as drop_hub_cooldown sees it: file_exists / delete_file over a set of paths (fail: what
+    delete_file raises)."""
+
+    def __init__(self, files=(), fail: Exception | None = None):
+        self.files, self.fail, self.deleted = set(files), fail, []
+
+    def file_exists(self, repo_id, filename, repo_type=None, **kw):
+        return filename in self.files
+
+    def delete_file(self, path_in_repo, repo_id=None, repo_type=None, commit_message=None, **kw):
+        if self.fail is not None:
+            raise self.fail
+        self.files.discard(path_in_repo)
+        self.deleted.append((repo_id, path_in_repo, repo_type))
+
+
+def test_the_resume_reset_deletes_the_runs_repo_cooldown(tmp_path):
+    """The log syncs upload the run dir without deleting, so after a reset consumed COOLDOWN the runs repo still holds
+    runs/<id>/COOLDOWN, and a later resume of the continuation on a new host (resume-pull brings back runs/<id>/*)
+    would put it back where the fresh early-stop state acts on it at once. The reset deletes that copy (after a log
+    sync under way), and the owner's next COOLDOWN still acts. When the delete fails (or a sync is still running),
+    the fresh state counts the file as acted on: the copy pulled back changes nothing, and the event warns. Without
+    an output repo nothing is asked of the Hub."""
+    m = load_script("04_distill")
+    sets = ["schedule.clock=steps", "schedule.max_steps=40", "schedule.warmup_steps=2", "schedule.resume_reset=true"]
+
+    def reset(name: str, repo: _RunsRepo | None, *, local: bool = True, synced: bool = True):
+        run = tmp_path / name
+        run.mkdir()
+        R, evs, _ = _unit_run(m, run, sets)
+        R.st["step"] = 5
+        if local:
+            R.st["early_stop"]["cooldown_file"] = {"at_step": 3}  # the COOLDOWN acted on before the reset
+            (run / "COOLDOWN").touch()
+        if repo is not None:
+            R.uploader = SimpleNamespace(api=repo, repo="owner/runs")
+            R.log.wait_sync = lambda timeout=None: synced
+        return R, evs, m.resume_reset_start(R), run
+
+    def new_host(R, run, repo):  # a later resume on a new host: the run dir gets back what the runs repo holds
+        if f"runs/{run.name}/COOLDOWN" in repo.files:
+            (run / "COOLDOWN").touch()
+        R.st["step"] = 8
+        return m.stop_requested(R)
+
+    repo = _RunsRepo({"runs/ok/COOLDOWN", "runs/ok/events.jsonl"})
+    R, evs, before, run = reset("ok", repo)
+    assert before["cooldown_hub"] == "deleted" and repo.deleted == [("owner/runs", "runs/ok/COOLDOWN", "model")]
+    assert repo.files == {"runs/ok/events.jsonl"} and "cooldown_warning" not in before
+    assert not (run / "COOLDOWN").exists() and before["cooldown_file_consumed"].startswith("COOLDOWN.consumed-")
+    assert new_host(R, run, repo) is False and not evs  # nothing came back: no cooldown
+    (run / "COOLDOWN").touch()  # the owner's next request in the continuation acts
+    assert m.stop_requested(R) is False and [e["reason"] for e in evs if e["kind"] == "early_stop"] == ["cooldown_file"]
+
+    repo = _RunsRepo({"runs/nothing/events.jsonl"})  # the file never reached the Hub
+    _, _, before, _ = reset("nothing", repo)
+    assert before["cooldown_hub"] == "absent" and not repo.deleted
+
+    for name, repo, synced, why in (
+            ("fails", _RunsRepo({"runs/fails/COOLDOWN"}, fail=RuntimeError("503")), True, "failed: RuntimeError: 503"),
+            ("syncing", _RunsRepo({"runs/syncing/COOLDOWN"}), False, "failed: a log sync")):
+        R, evs, before, run = reset(name, repo, synced=synced)
+        assert before["cooldown_hub"].startswith(why) and f"runs/{name}/COOLDOWN" in repo.files and not repo.deleted
+        assert R.st["early_stop"]["cooldown_file"] == dict(at_step=5, ignored="consumed by resume_reset")
+        assert new_host(R, run, repo) is False and not evs  # the stale copy came back and changes nothing
+        m.resume_reset_finish(R, before)
+        assert evs[-1]["kind"] == "resume_reset" and "ignores a COOLDOWN" in evs[-1]["cooldown_warning"]
+        assert evs[-1]["cooldown_hub"] == before["cooldown_hub"]
+
+    # a failed check on a run that never had a COOLDOWN: nothing to fall back on, a later COOLDOWN acts
+    R, _, before, _ = reset("clean", _RunsRepo(), local=False, synced=False)
+    assert before["cooldown_hub"].startswith("failed: ") and R.st["early_stop"]["cooldown_file"] is None
+    assert "cooldown_warning" not in before
+    # no output repo: no Hub call, no key
+    R, _, before, _ = reset("offline", None)
+    assert "cooldown_hub" not in before and R.st["early_stop"]["cooldown_file"] is None
+
+
+def test_a_resume_that_switches_to_the_epoch_clock_needs_no_reset(env):
+    """plan_epochs plans schedule.epochs when a resume switches a state without a plan (the steps clock) to the epoch
+    clock, so build lets that --set schedule.epochs through without the reset flag; an epoch count that would change
+    nothing (the steps clock never reads it) is still refused."""
+    m = load_script("04_distill")
+    path = write_config(env, "switch", {"schedule": {"max_steps": 6}, "ckpt": {"full_every_steps": 2}})
+    assert m.main(["--config", path]) == 0
+    run = one_run(env["root"], "switch")
+    st2 = str(run / "checkpoints" / "full_step_2")
+    with pytest.raises(SystemExit, match="would change nothing"):
+        m.main(["--config", path, "--resume", st2, "--set", "schedule.epochs=1"])
+    assert m.main(["--config", path, "--resume", st2, "--set", "schedule.clock=epochs", "--set", "schedule.epochs=1",
+                   "--set", "schedule.max_steps=null"]) == 0
+    (sched,) = events(run, "schedule")
+    s = summary(run)
+    assert sched["epochs"] == 1 and sched["total_steps"] > 6 and s["steps"] == sched["total_steps"]
+    assert s["resume_resets"] == 0 and s["status"] == "complete" and s["end_reason"] == "schedule"
 
 
 # ----------------------------------------------------------------------------------------------------- CTC

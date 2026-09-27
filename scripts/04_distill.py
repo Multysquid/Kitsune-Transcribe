@@ -262,11 +262,13 @@ the trainer as it was before them; configs/full/*.json turn them on):
                     early stop or a finished cooldown, normally from the uploaded pre_cooldown state (a state inside
                     its cooldown puts the LR back at its peak). One-shot: resume_reset_start clears total_steps,
                     pre_cooldown_done / _full, the early-stop state (dev_history stays) and 4d's record, renames
-                    COOLDOWN to COOLDOWN.consumed-<stamp> and sets the flag false before any save; plan_epochs plans
-                    the new schedule.epochs; resume_reset_finish refuses a new T at or before the step and records the
-                    reset (st["schedule_resets"], a `resume_reset` event, summary.json's resume_resets). Refused on a
-                    fresh start, on a T/2 branch and with a STOP file; a resume that changes schedule.epochs without
-                    the flag is refused too (plan_epochs keeps the state's total_steps, so it would change nothing)
+                    COOLDOWN to COOLDOWN.consumed-<stamp> (and deletes the runs repo's copy, which a new-host resume
+                    would pull back) and sets the flag false before any save; plan_epochs plans the new
+                    schedule.epochs; resume_reset_finish refuses a new T at or before the step and records the reset
+                    (st["schedule_resets"], a `resume_reset` event, summary.json's resume_resets). Refused on a fresh
+                    start, on a T/2 branch and with a STOP file; a resume that sets another schedule.epochs without
+                    the flag is refused too when it would change nothing (plan_epochs keeps the state's total_steps;
+                    a switch to the epoch clock from a state without a plan still plans it)
   deadline cooldown schedule.deadline_cooldown (clock epochs or steps; the wall clock has fit_budget): at loop start
   (4d)              and every deadline_check_steps steps after the smoke phase, fit_epochs_deadline projects the end
                     phase against $KITSUNE_DEADLINE from the loop-clock s/step over >= deadline_window_steps steps of
@@ -4163,12 +4165,18 @@ def build(args) -> tuple[Run, dict | None]:
         saved = copy.deepcopy(cfg)
         overrides, repeated = resume_overrides(saved, [apply_set(cfg, s) for s in args.set])
         validate(cfg)
-        if cfg["schedule"]["epochs"] != saved["schedule"]["epochs"] and not cfg["schedule"]["resume_reset"]:
-            # plan_epochs keeps the state's total_steps: without the reset the new value would change nothing
-            raise SystemExit(f"--set schedule.epochs {cfg['schedule']['epochs']!r} on a resume (the state's "
-                             f"{saved['schedule']['epochs']!r}; overrides {sorted(overrides)}) needs --set "
-                             "schedule.resume_reset=true, which plans the run again (the module docstring's resume "
-                             "reset)")
+        new_epochs = cfg["schedule"]["epochs"]
+        planned = cfg["schedule"]["clock"] == "epochs" and not state["st"].get("total_steps")
+        if (new_epochs != saved["schedule"]["epochs"] and new_epochs is not None and not planned
+                and not cfg["schedule"]["resume_reset"]):
+            # a new epoch count that would change nothing: plan_epochs keeps the plan in the state's total_steps (or
+            # the clock is not "epochs"). Planned is the one case it takes: the clock switched to "epochs" on this
+            # resume, from a state without a plan (plan_epochs in train)
+            raise SystemExit(f"--set schedule.epochs {new_epochs!r} on a resume (the state's "
+                             f"{saved['schedule']['epochs']!r}, its plan {state['st'].get('total_steps')!r} steps, "
+                             f"schedule.clock {cfg['schedule']['clock']!r}; overrides {sorted(overrides)}) would "
+                             "change nothing: it needs --set schedule.resume_reset=true, which plans the run again "
+                             "(the module docstring's resume reset)")
         run_dir = full.parent.parent
     else:
         cfg = load_config(args.config, args.set)
@@ -4231,9 +4239,12 @@ def resume_reset_start(R: Run) -> dict:
     pre_cooldown_full (the new cooldown saves its own pre_cooldown state), the early-stop state (fresh: patience,
     smoothing, trigger, cooldown; dev_history is kept, and early_stop.enabled decides whether it can fire again) and
     4d's deadline_cooldown; renames runs/<run_id>/COOLDOWN to COOLDOWN.consumed-<UTC stamp> (else it would fire again at
-    once); counts st["resume_resets"]; and sets the flag false in R.cfg before anything is saved, so every later save
-    and a crash-resume from one do not reset again, while a repeat of the same argv before the first save resets the
-    same state the same way. Returns what resume_reset_finish records."""
+    once) and deletes the runs repo's copy (drop_hub_cooldown: the log syncs never delete, so a later resume on a new
+    host would pull it back and cut the continuation short; when that delete fails on a run that has had a COOLDOWN,
+    the fresh early-stop state counts the file as acted on, so a copy pulled back is ignored - and so is a new COOLDOWN
+    in this continuation: the event warns); counts st["resume_resets"]; and sets the flag false in R.cfg before
+    anything is saved, so every later save and a crash-resume from one do not reset again, while a repeat of the same
+    argv before the first save resets the same state the same way. Returns what resume_reset_finish records."""
     st, cfg = R.st, R.cfg
     if R.branch_start or st.get("branch"):
         raise SystemExit("schedule.resume_reset: a T/2 branch keeps its parent's schedule; it cannot be reset")
@@ -4255,9 +4266,46 @@ def resume_reset_start(R: Run) -> dict:
             dest, n = R.run_dir / f"{COOLDOWN_FILE}.consumed-{stamp}-{n}", n + 1
         cool.replace(dest)
         before["cooldown_file_consumed"] = dest.name
+    hub = drop_hub_cooldown(R)  # after the rename: a log sync from now on no longer carries the file
+    if hub is not None:
+        before["cooldown_hub"] = hub
+        # the run has had a COOLDOWN (renamed now, by an earlier reset attempt, or acted on by the state): the Hub may
+        # hold its copy
+        had = (before.get("cooldown_file_consumed") or before["early_stop_before"].get("cooldown_file")
+               or next(R.run_dir.glob(f"{COOLDOWN_FILE}.consumed-*"), None))
+        if hub.startswith("failed") and had:
+            st["early_stop"]["cooldown_file"] = dict(at_step=int(st["step"]), ignored="consumed by resume_reset")
+            before["cooldown_warning"] = (f"the runs repo may still hold runs/{R.run_dir.name}/{COOLDOWN_FILE}: this "
+                                          "continuation ignores a COOLDOWN file (use STOP, or delete the Hub copy and "
+                                          "reset again)")
     st["resume_resets"] = int(st.get("resume_resets") or 0) + 1
     cfg["schedule"]["resume_reset"] = False
     return before
+
+
+def drop_hub_cooldown(R: Run) -> str | None:
+    """Delete runs/<run_id>/COOLDOWN from the runs repo (hf.output_repo, through the checkpoint Uploader's api) for
+    resume_reset_start. The log syncs upload the run dir without deleting anything, so the copy of a COOLDOWN the reset
+    consumed stays there, and a later resume on a new host (kitsune.full_queue resume-pull brings back runs/<id>/*)
+    would put it back in the run dir, where the continuation's fresh early-stop state would act on it at once. Waits
+    (bounded) for a log sync under way first, which may still carry the file. Returns None without an output repo,
+    "absent", "deleted" or "failed: <error>" (never raises: the reset goes on, resume_reset_start falls back)."""
+    up = getattr(R, "uploader", None)
+    api, repo = getattr(up, "api", None), getattr(up, "repo", None)
+    if api is None or not repo:
+        return None
+    wait_sync = getattr(R.log, "wait_sync", None)
+    if wait_sync is not None and not wait_sync(120):  # none runs before the loop today; bounded all the same
+        return "failed: a log sync that may carry the file is still running"
+    path = f"runs/{R.run_dir.name}/{COOLDOWN_FILE}"
+    try:
+        if not api.file_exists(repo, path, repo_type="model"):
+            return "absent"
+        api.delete_file(path, repo_id=repo, repo_type="model",
+                        commit_message=f"{R.run_dir.name}: {COOLDOWN_FILE} consumed by a resume reset")
+        return "deleted"
+    except Exception as e:  # noqa: BLE001  (network, auth: recorded in the resume_reset event)
+        return f"failed: {type(e).__name__}: {e}"[:500]
 
 
 def resume_reset_finish(R: Run, before: dict):
