@@ -231,6 +231,57 @@ Usage:
   python scripts/04_distill.py --config configs/smoke_laptop.json
   python scripts/04_distill.py --config configs/overfit_10s.json
   python scripts/04_distill.py --config configs/viability.json --resume runs/<run_id>/checkpoints/full_step_<N>
+
+Full-data runs: dev slice, early stopping v2, COOLDOWN, resume reset, deadline cooldown, 4c (every default below is
+the trainer as it was before them; configs/full/*.json turn them on):
+  eval.dev          the dev slice: the selection's kept split "dev" rows (whole train shards held out by
+                    make_selection.py full mode; kitsune.fullrun DEV_SPLIT; their audio and labels live in their train
+                    shards, kitsune.trainset), a seeded per_source of them per train source (fullrun.dev_pick; seed
+                    null: the run's) in a store of their own (build_dev_store: cache dir dev_p<n>_s<seed>_<sha8>, a
+                    frame store with its frame preflight for family ctc; the box's store step builds it too). setup_data
+                    writes runs/<run_id>/dev_ids.json and a `dev_store` event (n_in_train must be 0), and a resume on
+                    other dev rows stops (st["dev"]; per_source and seed are RESUME_FIXED). run_dev_eval (every
+                    every_steps steps, or at each every_epochs fraction of an epoch; a step-0 one under at_start, a
+                    final one under at_end): teacher-forced on every dev row, greedy too with greedy (CTC: the argmax
+                    of the same pass, free; AED: a decode), pooled over the sources: dev_objective (the family's
+                    training objective), dev_kl and dev_ce (CTC: the CTC loss) per target token; one record in
+                    st["dev_history"] (summary.json's dev_history), evals/step_<N>_dev/, eval/dev/* scalars and an
+                    `eval_dev` event, never an `eval` event nor the verdict's history. With early stopping off a run
+                    with dev evals trains exactly as one without
+  early stopping v2 metrics dev_ce / dev_kl / dev_objective (checked after every dev eval instead of after the full
+                    evals; need eval.dev); smooth k > 1: the rule reads the mean of the last k values and counts
+                    nothing before it has k (early_stop/raw next to early_stop/value; the `early_stop` event gains raw
+                    and smooth); allow_test_sets false refuses heldout_kl (it pools the gate sets the runs are scored
+                    on). stopped_early now also holds a dev trigger and the COOLDOWN file's
+  COOLDOWN          runs/<run_id>/COOLDOWN, checked before every step with the STOP file, acts once whatever
+                    early_stop.enabled says: the early stop's cooldown action with reason "cooldown_file" (the WSD
+                    cooldown starts now over cooldown_frac x the progress so far); inside a cooldown it only logs a
+                    `cooldown_file` event (ignored). The pre_cooldown state is then saved and uploaded as for any
+                    cooldown
+  resume reset      --resume <state> --set schedule.resume_reset=true [--set schedule.epochs=<E>]: continue past an
+                    early stop or a finished cooldown, normally from the uploaded pre_cooldown state (a state inside
+                    its cooldown puts the LR back at its peak). One-shot: resume_reset_start clears total_steps,
+                    pre_cooldown_done / _full, the early-stop state (dev_history stays) and 4d's record, renames
+                    COOLDOWN to COOLDOWN.consumed-<stamp> and sets the flag false before any save; plan_epochs plans
+                    the new schedule.epochs; resume_reset_finish refuses a new T at or before the step and records the
+                    reset (st["schedule_resets"], a `resume_reset` event, summary.json's resume_resets). Refused on a
+                    fresh start, on a T/2 branch and with a STOP file; a resume that changes schedule.epochs without
+                    the flag is refused too (plan_epochs keeps the state's total_steps, so it would change nothing)
+  deadline cooldown schedule.deadline_cooldown (clock epochs or steps; the wall clock has fit_budget): at loop start
+  (4d)              and every deadline_check_steps steps after the smoke phase, fit_epochs_deadline projects the end
+                    phase against $KITSUNE_DEADLINE from the loop-clock s/step over >= deadline_window_steps steps of
+                    this launch (deadline_rate) and schedules, starts or compresses the WSD cooldown in its own record
+                    st["deadline_cooldown"] (Run.progress takes the smaller T of it and an early stop's, cooldown_start
+                    the earlier t_c), or clears a record whose cooldown has not begun once the run fits again; no step
+                    left ends the loop (`no_time_left`). Exit 0, summary.json's end_reason "deadline"
+  4c                memory.probe_extended adds the micro-batch with the most rows (and, family ctc, the most CTC
+                    targets and the largest CTC lattice) to the memory probe; memory.probe_shapes adds synthetic
+                    micro-batches of the train rows nearest given durations (synth_micro_batch; the full data's worst
+                    shapes on a smoke run). The memory_probe event gains extended, headroom_gb and shapes
+  summary.json      end_reason (schedule | early_stop | cooldown_file | stop_file | deadline) and resume_resets always;
+                    dev_history, deadline_cooldown and schedule_resets when there are any
+  also              the epoch clock refuses a schedule.max_steps; eval.dev refuses lr_probe.enabled;
+                    selection_recipe.full_study is a full selection's recipe (validate_box)
 """
 import argparse
 import concurrent.futures
@@ -324,10 +375,12 @@ DEFAULTS = {
     # run, whose 02b pass the laptop GPU could not finish). Read by scripts/make_selection.py --config and checked by
     # vast/launch.py against the selection's own record; not by the trainer. study: the size study's selection rules
     # (kitsune.prereg.STUDY_SELECTION, which study/data.json carries verbatim; null: not a study selection); a dict of
-    # exactly those keys (validate_box)
+    # exactly those keys (validate_box). full_study: a full-data selection's recipe (kitsune.fullrun.FULL_STUDY: the
+    # study's rules plus the dev slice; make_selection.py full mode); null, or a block full_recipe_problems accepts,
+    # never together with study (validate_box)
     "selection_recipe": {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "eval_emilia=0.2"],
                          "filter_eval_sets": ["eval_emilia", "galgame"], "partial_second_opinion": ["galgame"],
-                         "study": None},
+                         "study": None, "full_study": None},
     # the label extent (kitsune/extent.py; make_selection.py, vast/launch.py and bootstrap.sh read it), the Parakeet
     # soft-target root and the label box's settings (vast/label.py): configs/full.json sets them, the trainer never
     # reads them. None, so a config's object replaces the default whole (_merge does not recurse into None).
@@ -357,11 +410,21 @@ DEFAULTS = {
     # decays, setup_optim)
     "optim": {"lr": 1e-4, "betas": [0.9, 0.98], "eps": 1e-8, "weight_decay": 0.0, "clip": 1.0, "fused": True,
               "max_nonfinite_skips": 3, "offload": "none", "offload_fused": False},
-    # clock "steps": warmup_steps must end before the cooldown starts (validate), and is not capped
+    # clock "steps": warmup_steps must end before the cooldown starts (validate), and is not capped. resume_reset: a
+    # resume's one-shot flag (--resume --set schedule.resume_reset=true): the run continues past its early stop or
+    # cooldown with a fresh schedule, e.g. more schedule.epochs (resume_reset_start; the module docstring's full-data
+    # section). deadline_cooldown (clock epochs or steps): schedule, start or compress the WSD cooldown so the end
+    # phase finishes before $KITSUNE_DEADLINE (fit_epochs_deadline), checked at loop start and every
+    # deadline_check_steps steps from the loop-clock s/step over at least deadline_window_steps steps of this launch
     "schedule": {"warmup_steps": 300, "cooldown_frac": 0.2, "train_hours": 4.0, "clock": "wall", "max_steps": None,
-                 "end_reserve_min": 30, "epochs": None},
+                 "end_reserve_min": 30, "epochs": None, "resume_reset": False, "deadline_cooldown": False,
+                 "deadline_check_steps": 100, "deadline_window_steps": 1000},
     "batch": {"step_audio_s": 1500, "micro_audio_s": 400, "pool_micro": 50, "max_dec_len": 200},
-    "memory": {"grad_ckpt": "auto", "probe_longest_bucket": True, "min_micro_audio_s": 100, "max_oom_skips": 3},
+    # probe_extended: the memory probe also runs the micro-batch with the most rows (and, family ctc, the most CTC
+    # targets and the largest CTC lattice); probe_shapes: null or [{"name", "durations"}], synthetic micro-batches of
+    # the train rows nearest those durations (the full data's worst shapes on a smoke run; probe_passes)
+    "memory": {"grad_ckpt": "auto", "probe_longest_bucket": True, "min_micro_audio_s": 100, "max_oom_skips": 3,
+               "probe_extended": False, "probe_shapes": None},
     # loader_timeout_s: seconds the loop waits for a worker micro-batch before it raises (a crash the supervisor can
     # resume) instead of hanging until the watchdog; 0 = wait forever (trainset.make_loader). profile_smoke: a
     # torch.profiler record of ~20 smoke steps into runs/<run_id>/smoke/profile/ (kitsune.profiling, smoke_profiler);
@@ -389,6 +452,13 @@ DEFAULTS = {
              "batch_s": 400, "check_baselines": True, "every_epochs": None, "probe_is_train": False,
              "probe_greedy_audio_s": None, "full_every_epochs": None,
              "mini": {"every_steps": None, "val_per_set": 32, "train_utts": 64, "greedy": True}, "gate": True,
+             # dev: the dev-slice eval (run_dev_eval), on when every_epochs (a number > 0: at every such fraction of
+             # an epoch) or every_steps is set: teacher-forced (greedy too: CTC free, AED a decode) on a seeded
+             # per_source rows per train source of the selection's split "dev" (seed null: the run's), its pooled
+             # objective / KL / CE the early stop's dev_* metrics; at_start: a step-0 one (never checked), at_end: a
+             # final one. Null the leaves, never the dict (validate's bool check)
+             "dev": {"every_epochs": None, "every_steps": None, "per_source": 600, "seed": None, "greedy": False,
+                     "at_start": True, "at_end": True},
              "verdict_version": 1, "verdict_min_epoch_gap": 0.25, "reference": None, "full_at_fracs": None},
     # full_at_fracs / weights_at_fracs (steps clock): null, or fractions in (0, 1): a full state / exported weights at
     # step round(f * max_steps); those full states stay local past keep_local's rotation (a T/2 branch resumes the
@@ -405,9 +475,13 @@ DEFAULTS = {
               "pad_min_argmax_agree": None, "require_loss_decrease": True, "decode_per_set": 8,
               "max_dropped_frac": 0.01},
     # checked after every in-loop eval (the module docstring; early_stop_update, early_stop_trigger). Off here, so a
-    # config that does not mention it trains to its budget; viability.json turns it on with these values
+    # config that does not mention it trains to its budget; viability.json turns it on with these values. A dev_*
+    # metric is checked after every dev eval instead (eval.dev). smooth: the rule reads the mean of the last `smooth`
+    # values (none counted before there are that many); allow_test_sets false refuses a metric that reads the test
+    # sets (TEST_SET_METRICS: heldout_kl pools JSUT / CV8 / Reazon-test)
     "early_stop": {"enabled": False, "metric": "heldout_kl", "patience": 3, "min_delta_rel": 0.005,
-                   "min_delta_abs": 0.0, "min_evals": 3, "floor": None, "action": "cooldown"},
+                   "min_delta_abs": 0.0, "min_evals": 3, "floor": None, "action": "cooldown", "smooth": 1,
+                   "allow_test_sets": True},
     # the T/2 branch (steps clock; the module docstring): parent = a local run dir whose full state at
     # round(resume_frac x its max_steps) this run continues, to round(end_frac x max_steps) with the cooldown from the
     # resume step: the WSD schedule of a run with budget end_frac x T, and one eval, the final one (it ignores
@@ -424,13 +498,25 @@ DEFAULTS = {
     "calibrate": {"enabled": False, "window": [50, 250], "barrier": False},
     "seed": 1234,
 }
-EARLY_STOP_METRICS = ("probe_kl", "heldout_kl", "train_loss")
+# the dev-slice metrics (run_dev_eval's pooled numbers, read from st["dev_history"]): the training objective, its KL
+# and its CE (CTC: the CTC loss) per target token
+DEV_METRICS = ("dev_ce", "dev_kl", "dev_objective")
+EARLY_STOP_METRICS = ("probe_kl", "heldout_kl", "train_loss", *DEV_METRICS)
+# the metrics that read the test sets (heldout_kl pools the gate sets JSUT / CV8 / Reazon-test): early_stop.
+# allow_test_sets false refuses them, so the full runs' stop cannot peek at what they are scored on (probe_kl reads
+# train rows, train_loss the objective, dev_* the dev slice)
+TEST_SET_METRICS = ("heldout_kl",)
 # config keys a resume cannot change (resume_overrides): they shape the step plan or the data it walks, and the
 # planner state it restores (the epoch position) is only valid for the plan it was saved with; or they decide what the
-# model and its loss are (BN mode, the aux-CTC head in the full state, the augmentation stream, the student family)
+# model and its loss are (BN mode, the aux-CTC head in the full state, the augmentation stream, the student family);
+# or which dev rows the early stop reads (eval.dev.per_source / seed: a change would compare other rows' numbers)
 RESUME_FIXED = ("seed", "mix", "sources", "selection", "subset", "batch.step_audio_s", "batch.micro_audio_s",
-                "batch.pool_micro", "batch.max_dec_len", "bn.mode", "loss.aux_ctc_weight", "specaug.seed", "family")
+                "batch.pool_micro", "batch.max_dec_len", "bn.mode", "loss.aux_ctc_weight", "specaug.seed", "family",
+                "eval.dev.per_source", "eval.dev.seed")
 STOP_FILE = "STOP"  # runs/<run_id>/STOP: finish the step under way, then the end phase (reason "stop_file")
+# runs/<run_id>/COOLDOWN: start the WSD cooldown now, once (reason "cooldown_file"; ignored inside a cooldown), whatever
+# early_stop.enabled says (cooldown_file). A resume_reset renames it to COOLDOWN.consumed-<UTC stamp>
+COOLDOWN_FILE = "COOLDOWN"
 # the LR probe's objective pools these complete sets (the D32a gate sets, kitsune.evaluate.GATE_SETS)
 LR_PROBE_SETS = tuple(trainset.EVAL_SETS)
 # a branch requires the parent's config to equal its own except these keys (and everything under the ones ending
@@ -589,6 +675,7 @@ def validate(cfg: dict):
     if es["enabled"] and es["metric"] == "probe_kl" and not ev_cfg["probe"]:
         raise SystemExit("early_stop.metric 'probe_kl' needs eval.probe")
     validate_study(cfg)
+    validate_full(cfg)
 
 
 def validate_study(cfg: dict):
@@ -676,6 +763,61 @@ def validate_study(cfg: dict):
         if missing or cfg["subset"]["eval_audio_s"] is not None or cfg["subset"]["eval_utts_per_set"]:
             raise SystemExit(f"lr_probe.enabled scores the COMPLETE gate sets {', '.join(LR_PROBE_SETS)}: eval_sets must "
                              f"hold them (missing: {missing}) and subset.eval_audio_s / eval_utts_per_set be null")
+
+
+def validate_full(cfg: dict):
+    """The full-data runs' trainer keys (eval.dev, early_stop.smooth / allow_test_sets and the dev metrics,
+    schedule.resume_reset / deadline_*, memory.probe_extended / probe_shapes); their defaults are the trainer as it was
+    before them. Also refused: the epoch clock with a schedule.max_steps (Run.max_steps() ends every clock there, so a
+    full config copied from a study config would stop long before its cooldown) and the dev eval in an LR probe
+    (metrics only). selection_recipe.full_study is validate_box's (the box path's keys)."""
+    sch, es, dev = cfg["schedule"], cfg["early_stop"], cfg["eval"]["dev"]
+    if dev["every_epochs"] is not None and not (_number(dev["every_epochs"]) and dev["every_epochs"] > 0):
+        raise SystemExit(f"eval.dev.every_epochs must be null or a number of epochs > 0, got {dev['every_epochs']!r}")
+    if dev["every_steps"] is not None and not _pos_int(dev["every_steps"]):
+        raise SystemExit(f"eval.dev.every_steps must be null or an int >= 1, got {dev['every_steps']!r}")
+    if dev["every_epochs"] is not None and dev["every_steps"] is not None:
+        raise SystemExit("eval.dev.every_epochs and eval.dev.every_steps are two cadences of the same dev eval: set "
+                         "one")
+    if not _pos_int(dev["per_source"]):
+        raise SystemExit(f"eval.dev.per_source must be an int >= 1, got {dev['per_source']!r}")
+    if dev["seed"] is not None and not (isinstance(dev["seed"], int) and not isinstance(dev["seed"], bool)
+                                        and dev["seed"] >= 0):
+        raise SystemExit(f"eval.dev.seed must be null (the run's seed) or an int >= 0, got {dev['seed']!r}")
+    if dev_on(cfg) and cfg["lr_probe"]["enabled"]:
+        raise SystemExit("eval.dev and lr_probe.enabled: an LR probe is metrics only (no eval in the loop); set the "
+                         "eval.dev cadences null")
+    if not _pos_int(es["smooth"]):
+        raise SystemExit(f"early_stop.smooth must be an int >= 1 (1: no smoothing), got {es['smooth']!r}")
+    if es["metric"] in TEST_SET_METRICS and not es["allow_test_sets"]:
+        raise SystemExit(f"early_stop.metric {es['metric']!r} reads the test sets (it pools the gate sets eval_jsut, "
+                         "eval_cv8 and eval_reazon, which the runs are scored on) and early_stop.allow_test_sets is "
+                         "false: use a dev metric (" + ", ".join(DEV_METRICS) + ") with eval.dev")
+    if es["enabled"] and es["metric"] in DEV_METRICS and not dev_on(cfg):
+        raise SystemExit(f"early_stop.metric {es['metric']!r} reads the dev evals: set eval.dev.every_epochs or "
+                         "eval.dev.every_steps")
+    if sch["clock"] == "epochs" and sch["max_steps"] is not None:
+        raise SystemExit(f"schedule.clock 'epochs' with schedule.max_steps {sch['max_steps']!r}: max_steps ends the "
+                         "run on every clock (a study config's value would stop it before its cooldown); set it null")
+    if sch["deadline_cooldown"] and sch["clock"] not in ("epochs", "steps"):
+        raise SystemExit(f"schedule.deadline_cooldown needs schedule.clock 'epochs' or 'steps' (the wall clock fits "
+                         f"its budget to the deadline itself: fit_budget), got {sch['clock']!r}")
+    for key in ("deadline_check_steps", "deadline_window_steps"):
+        if not _pos_int(sch[key]):
+            raise SystemExit(f"schedule.{key} must be an int >= 1, got {sch[key]!r}")
+    shapes = cfg["memory"]["probe_shapes"]
+    if shapes is not None:
+        ok = isinstance(shapes, list) and bool(shapes)
+        names = []
+        for s in shapes if ok else ():
+            ok = ok and (isinstance(s, dict) and set(s) == {"name", "durations"} and isinstance(s["name"], str)
+                         and re.fullmatch(r"[A-Za-z0-9_-]+", s["name"]) is not None
+                         and isinstance(s["durations"], list) and bool(s["durations"])
+                         and all(_number(d) and d > 0 for d in s["durations"]))
+            names.append(s.get("name") if isinstance(s, dict) else None)
+        if not ok or len(set(names)) != len(names):
+            raise SystemExit(f"memory.probe_shapes must be null or a non-empty list of {{\"name\": [A-Za-z0-9_-]+ "
+                             f"(unique), \"durations\": [seconds > 0, ...]}}, got {shapes!r}")
 
 
 def upload_frac(entry) -> float | None:
@@ -797,9 +939,23 @@ def early_stop_state() -> dict:
     """The early-stop part of the full state (Run.st["early_stop"]): the best value and its step, in-loop evals
     checked, evals since the best, the last value, the loss/objective sum and count since the previous eval (metric
     "train_loss"), the trigger (the `early_stop` event's fields, or None), whether the loop must end (`stop`) and an
-    early cooldown's schedule (`cooldown`: t_c and T on the run's clock, or None)."""
+    early cooldown's schedule (`cooldown`: t_c and T on the run's clock, or None). recent: the last early_stop.smooth
+    raw values (None for a missing one), whose mean the rule reads; cooldown_file: the COOLDOWN file's one action
+    ({at_step[, ignored]}, or None). A state written before a key existed gets it from here (train)."""
     return dict(best=None, best_step=None, evals=0, evals_since_best=0, value=None, loss_sum=0.0, loss_n=0,
-                triggered=None, stop=False, cooldown=None)
+                triggered=None, stop=False, cooldown=None, recent=[], cooldown_file=None)
+
+
+def st_full_defaults() -> dict:
+    """The full-data runs' part of Run.st (fresh objects each call; a state written before them keeps these defaults
+    through R.st.update): dev_history (one record per dev eval, run_dev_eval), dev_last_step / dev_last_epoch (the
+    last dev eval's position, dev_due), dev (the dev rows' {ids_sha256, n_ids, per_source}: a resume on other rows
+    stops), deadline_cooldown (4d's record, fit_epochs_deadline; None: none), deadline_rate (the last loop-clock s/step
+    4d used, for a later launch's first checks), schedule_resets (one record per resume_reset) and resume_resets (their
+    count, summary.json's); data_wait_s (the logged steps' seconds waiting for the loader: summary.json's
+    throughput.data_wait_frac next to step_time_s)."""
+    return dict(dev_history=[], dev_last_step=0, dev_last_epoch=0.0, dev=None, deadline_cooldown=None,
+                deadline_rate=None, schedule_resets=[], resume_resets=0, data_wait_s=0.0)
 
 
 def early_stop_update(es: dict, ec: dict, value, step: int) -> str | None:
@@ -907,6 +1063,8 @@ class Run:
     param_names: list = field(default_factory=list)
     train: object = None
     evalstore: object = None
+    devstore: object = None  # the dev-slice store (build_dev_store; None: eval.dev off)
+    deadline_marks: list = field(default_factory=list)  # 4d's (step, loop clock) samples of this launch (deadline_rate)
     ds: object = None
     planner: object = None
     probe_ids: list = field(default_factory=list)
@@ -943,7 +1101,7 @@ class Run:
         oom_skips=0, audio_s=0.0, tokens=0, step_time_s=0.0, smoke_losses=[], smoke_audio_s=0.0, smoke_time_s=0.0,
         smoke_dropped=0, smoke_utts=0, epoch=0, epoch_progress=0.0, resumes=0, weights=[], fulls=[],
         last_objective=None, lr_phase=None, last_eval_epoch=0, total_steps=None, early_stop=early_stop_state(),
-        mini_history=[], branch=None, fulls_kept=[], started_utc=None))
+        mini_history=[], branch=None, fulls_kept=[], started_utc=None, **st_full_defaults()))
 
     def clock(self) -> float:
         """Loop clock in seconds: continues across resumes, frozen outside the training loop."""
@@ -958,24 +1116,34 @@ class Run:
         m = self.cfg["schedule"]["max_steps"]
         return int(m) if m else None
 
-    def progress(self) -> tuple[float, float]:
-        """(t, T): loop seconds or steps done, out of the budget; T ends early under an early-stop cooldown."""
+    def base_progress(self) -> tuple[float, float]:
+        """(t, T) of the schedule alone: max_steps, the epoch plan's total_steps, or train_hours / the deadline-fitted
+        budget_s on the wall clock, before any cooldown record shortens it (progress)."""
         s = self.cfg["schedule"]
         if s["clock"] == "steps":
-            t, T = float(self.st["step"]), float(self.max_steps())
-        elif s["clock"] == "epochs":  # total_steps: plan_epochs
-            t, T = float(self.st["step"]), float(self.st["total_steps"])
-        else:
-            t, T = self.clock(), self.budget_s if self.budget_s is not None else float(s["train_hours"]) * 3600
-        cd = self.st["early_stop"]["cooldown"]
-        return (t, min(T, cd["T"])) if cd else (t, T)
+            return float(self.st["step"]), float(self.max_steps())
+        if s["clock"] == "epochs":  # total_steps: plan_epochs
+            return float(self.st["step"]), float(self.st["total_steps"])
+        return self.clock(), self.budget_s if self.budget_s is not None else float(s["train_hours"]) * 3600
+
+    def cooldowns(self, deadline: bool = True) -> list[dict]:
+        """The cooldown records that move the schedule: the early stop's (early_stop.cooldown) and 4d's
+        (st["deadline_cooldown"], unless deadline is False), each {t_c, T, ...}."""
+        recs = [self.st["early_stop"]["cooldown"], self.st.get("deadline_cooldown") if deadline else None]
+        return [c for c in recs if c]
+
+    def progress(self, deadline: bool = True) -> tuple[float, float]:
+        """(t, T): loop seconds or steps done, out of the budget; T ends early under an early-stop or 4d cooldown
+        record, the smallest T of them (deadline False: without 4d's, the plan it would shorten)."""
+        t, T = self.base_progress()
+        return t, min([T] + [c["T"] for c in self.cooldowns(deadline)])
 
     def cooldown_start(self, T: float) -> float:
-        """t_c of the WSD schedule with budget T: (1 - cooldown_frac) T, or where an early-stop cooldown began, or a T/2
-        branch's resume step."""
-        cd = self.st["early_stop"]["cooldown"]
-        if cd:
-            return cd["t_c"]
+        """t_c of the WSD schedule with budget T: (1 - cooldown_frac) T, or where an early-stop or 4d cooldown begins
+        (the earlier of their t_c when both exist), or a T/2 branch's resume step."""
+        cds = self.cooldowns()
+        if cds:
+            return min(c["t_c"] for c in cds)
         br = self.st.get("branch")
         return float(br["t_c"]) if br else (1.0 - float(self.cfg["schedule"]["cooldown_frac"])) * T
 
@@ -1611,6 +1779,75 @@ def build_eval_store(cfg: dict, log, frames: bool | None = None) -> trainset.Sto
     return _store(cfg, name, cfg["eval_sets"], "eval", ids=ids, log=log, frames=bool(frames))
 
 
+def dev_on(cfg: dict) -> bool:
+    """The dev-slice eval runs (eval.dev.every_epochs or every_steps set; False for a config without the block: a unit
+    test's partial config, a state from before it)."""
+    dev = (cfg.get("eval") or {}).get("dev") or {}
+    return bool(dev.get("every_epochs") or dev.get("every_steps"))
+
+
+def dev_metric(cfg: dict) -> bool:
+    """The early stop reads the dev evals (a DEV_METRICS metric): checked after each dev eval, not after the full
+    evals."""
+    return (cfg.get("early_stop") or {}).get("metric") in DEV_METRICS
+
+
+def _ids_sha256(ids) -> str:
+    """sha256 of the sorted ids joined by newlines (the dev pick's identity: dev_store_name's sha8, st["dev"])."""
+    return hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest()
+
+
+def dev_ids(cfg: dict, log) -> tuple[list[str], dict]:
+    """The dev rows the dev eval scores: kitsune.fullrun.dev_pick over the selection's kept split-"dev" rows of
+    cfg["sources"] (a seeded eval.dev.per_source per source, all of a smaller one; seed eval.dev.seed, else the run's),
+    in selection order. A `subset` event (split "dev") gives the counts and ids_sha256; the ids go to dev_ids.json
+    (setup_data). Returns (ids, record: seed, per_source, n, ids_sha256, pool and picked per source, ids per source).
+    A selection without dev rows for a source stops the run: a full selection (make_selection.py full mode) has
+    them."""
+    from kitsune import fullrun
+
+    dev = cfg["eval"]["dev"]
+    sel = rpath(cfg["selection"])
+    per = int(dev["per_source"])
+    seed = int(cfg["seed"] if dev["seed"] is None else dev["seed"])
+    rows = trainset.read_selection(sel, cfg["sources"], [fullrun.DEV_SPLIT])
+    try:
+        ids = fullrun.dev_pick(zip(rows["id"].tolist(), rows["source"].tolist()), cfg["sources"], per, seed)
+    except ValueError as e:
+        raise SystemExit(f"eval.dev needs kept split '{fullrun.DEV_SPLIT}' rows of every source in {sel}: {e}"
+                         ) from None
+    src_of = dict(zip(rows["id"].tolist(), rows["source"].tolist()))
+    by_src = {s: [i for i in ids if src_of[i] == s] for s in cfg["sources"]}
+    rec = dict(seed=seed, per_source=per, n=len(ids), ids_sha256=_ids_sha256(ids),
+               pool={s: int((rows["source"] == s).sum()) for s in cfg["sources"]},
+               picked={s: len(v) for s, v in by_src.items()})
+    log.event("subset", split=fullrun.DEV_SPLIT, sources=cfg["sources"], **rec)
+    return ids, dict(rec, ids=by_src)
+
+
+def dev_store_name(rec: dict) -> str:
+    """The dev store's cache name (store_dir adds "ctc_" for a frame store): per_source, seed and the ids' hash, so
+    configs that pick other rows never share one."""
+    return f"dev_p{rec['per_source']}_s{rec['seed']}_{rec['ids_sha256'][:8]}"
+
+
+def build_dev_store(cfg: dict, log) -> trainset.Stores | None:
+    """The dev store (None unless dev_on): dev_ids' rows of cfg["sources"], split "dev", of the run's family (a frame
+    store with its frame preflight for family ctc; the dev split reads the audio of its rows' train shards,
+    kitsune.trainset), built or reused under store_dir(cfg, dev_store_name). It writes no file of its own and needs no
+    run dir: the box's store step (kitsune.full_queue build-stores) calls it next to build_train_store and
+    build_eval_store with a logger that has .event() only. The pick's record (dev_ids) rides along in the store's
+    in-memory info["dev_pick"], for setup_data's dev_ids.json and `dev_store` event."""
+    if not dev_on(cfg):
+        return None
+    ids, rec = dev_ids(cfg, log)
+    from kitsune import fullrun
+
+    store = _store(cfg, dev_store_name(rec), cfg["sources"], fullrun.DEV_SPLIT, ids=ids, log=log, frames=is_ctc(cfg))
+    store.info["dev_pick"] = rec  # in memory only, as "reused"
+    return store
+
+
 def probe_greedy_subset(cfg: dict, probe_ids: list[str], duration: dict[str, float], log) -> list[str]:
     """The probe rows greedy-decoded at every full eval (eval.probe_greedy_audio_s, else subset.eval_audio_s: a
     seeded ~N s of the probe; none if both are null or the probe is empty), logged as a `subset` event. duration: id ->
@@ -1643,15 +1880,23 @@ def greedy_subset_ids(cfg: dict, evalstore) -> list[str]:
 
 
 def setup_data(R: Run):
-    """Train/eval stores (cached under cache_dir, shared with 03's eval cache), probe and greedy ids, planner."""
+    """Train/eval stores (cached under cache_dir, shared with 03's eval cache), the dev store under eval.dev
+    (setup_dev), probe and greedy ids, planner. The store opens and builds run under a bounded heartbeat
+    (kitsune.heartbeat.beating: a full-extent build takes hours; a no-op without $KITSUNE_HEARTBEAT); the `data` event
+    says which stores this run reused (stores_reused: a frame store records it, a token store never does)."""
+    from kitsune import heartbeat
+
     cfg, log = R.cfg, R.log
     t0 = time.time()
-    R.train = build_train_store(cfg, log)
-    if is_ctc(cfg):  # decision 15's counts of each store (a reused cache's too), before the next one is built
-        log_frame_preflight(log, "train", R.train)
-    R.evalstore = build_eval_store(cfg, log, frames=is_ctc(cfg))  # never the token store a ctc run does not read
-    if is_ctc(cfg):
-        log_frame_preflight(log, "eval", R.evalstore)
+    with heartbeat.beating(max_s=36000):
+        R.train = build_train_store(cfg, log)
+        if is_ctc(cfg):  # decision 15's counts of each store (a reused cache's too), before the next one is built
+            log_frame_preflight(log, "train", R.train)
+        R.evalstore = build_eval_store(cfg, log, frames=is_ctc(cfg))  # never the token store a ctc run does not read
+        if is_ctc(cfg):
+            log_frame_preflight(log, "eval", R.evalstore)
+        R.devstore = build_dev_store(cfg, log)
+    dev = setup_dev(R) if getattr(R, "devstore", None) is not None else {}
 
     if cfg["eval"]["probe"] and cfg["eval"]["probe_is_train"]:
         R.probe_ids = [u.id for u in R.train.utts]
@@ -1675,7 +1920,43 @@ def setup_data(R: Run):
               build_s=round(time.time() - t0, 1),
               **(dict(probe_greedy=len(R.probe_greedy_ids)) if R.probe_greedy_ids else {}),
               **(dict(mini_val=len(R.mini_val_ids), mini_train=len(R.mini_train_ids))
-                 if cfg["eval"]["mini"]["every_steps"] else {}))
+                 if cfg["eval"]["mini"]["every_steps"] else {}),
+              **dev, stores_reused={k: bool(s.info.get("reused")) for k, s in (
+                  ("train", R.train), ("eval", R.evalstore), ("dev", getattr(R, "devstore", None))) if s is not None})
+
+
+def setup_dev(R: Run) -> dict:
+    """setup_data's part for the dev store (eval.dev on): runs/<run_id>/dev_ids.json {seed, per_source, ids_sha256,
+    ids {source: [...]}} (informational: the ids are a pure function of the selection, per_source and the seed), the
+    frame preflight's `frame_preflight` event (family ctc), the `dev_store` event {name, n, per_source, seed,
+    ids_sha256, hours, n_in_train} and the guard: the dev rows are a train row nowhere (n_in_train must be 0), and a
+    resume scores the rows its state scored (st["dev"]; eval.dev.per_source / seed are RESUME_FIXED, the selection is
+    too, so only a changed file or dev_pick could move them). Returns the `data` event's dev_utts, dev_h and
+    dev_per_source."""
+    cfg, log, store = R.cfg, R.log, getattr(R, "devstore", None)
+    rec = store.info["dev_pick"]
+    if is_ctc(cfg):
+        log_frame_preflight(log, "dev", store)
+    ids = [i for v in rec["ids"].values() for i in v]
+    n_in_train = len(set(ids) & {u.id for u in R.train.utts})
+    info = dict(name=store.cache_dir.name, n=len(store), n_ids=rec["n"], per_source=rec["per_source"],
+                seed=rec["seed"], ids_sha256=rec["ids_sha256"], hours=round(store.hours, 4), n_in_train=n_in_train)
+    log.event("dev_store", **info)
+    if n_in_train:
+        raise SystemExit(f"{n_in_train} of the dev rows are in the train store too ({cfg['selection']}): the early "
+                         "stop would read rows the run trains on")
+    want = dict(ids_sha256=rec["ids_sha256"], n_ids=rec["n"], per_source=rec["per_source"])
+    if R.st.get("dev") is None:
+        R.st["dev"] = want
+    elif R.st["dev"]["ids_sha256"] != want["ids_sha256"]:
+        raise SystemExit(f"the dev rows changed: this run's state scored {R.st['dev']} and the selection now gives "
+                         f"{want} (the selection file or eval.dev differs from the run's)")
+    path = R.run_dir / "dev_ids.json"
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(dict(seed=rec["seed"], per_source=rec["per_source"], ids_sha256=rec["ids_sha256"],
+                                   ids=rec["ids"]), indent=1) + "\n", encoding="utf-8")
+    _replace_file(tmp, path)
+    return dict(dev_utts=len(store), dev_h=round(store.hours, 3), dev_per_source=store.info.get("per_source"))
 
 
 def mini_subsets(R: Run) -> tuple[list[str], list[str]]:
@@ -2799,6 +3080,94 @@ def run_mini_eval(R: Run, step: int) -> dict:
     return head
 
 
+def dev_due(R: Run, step: int) -> bool:
+    """A dev eval is due after optimizer step `step` (eval.dev on and its store open): every eval.dev.every_steps
+    steps since the last one, or at each crossing of a multiple of eval.dev.every_epochs by the epoch progress
+    (e + (s + 1) / steps of epoch e, log_step: 0.1, 0.2, ... and exactly at the epoch ends, whatever the full-eval
+    cadence; a skipped step never gets here and the next one catches up). The loop skips it at its last step, where
+    the end phase's at_end one runs."""
+    if getattr(R, "devstore", None) is None or not dev_on(R.cfg):
+        return False
+    dev = R.cfg["eval"]["dev"]
+    if dev["every_steps"]:
+        return step - int(R.st["dev_last_step"]) >= int(dev["every_steps"])
+    k = float(dev["every_epochs"])
+    return math.floor(R.st["epoch_progress"] / k + 1e-9) > math.floor(float(R.st["dev_last_epoch"]) / k + 1e-9)
+
+
+def run_dev_eval(R: Run, step: int, final: bool = False) -> dict:
+    """The dev-slice eval (eval.dev; the dev store of build_dev_store): its own pass in eval mode without gradients,
+    teacher-forced on every dev row - AED kitsune.evaluate.teacher_forced_eval, plus a greedy decode with
+    eval.dev.greedy (a real decode: costly); CTC kitsune.ctc_eval.ctc_eval, whose greedy decode is the argmax of the
+    same pass (free). Pooled over every dev source (combined_loss pools the gate sets, and no train source is one):
+    dev_objective = the family's training objective, dev_kl its KL and dev_ce its CE (CTC: the CTC loss), per target
+    token. One record in st["dev_history"] (replacing one of the same step): {step, epoch, elapsed_s, wall_s, final,
+    dev_ce, dev_kl, dev_objective, n_tok, n_utts, per_source {src: {ce, kl, n_tok}}[, cer, cer_vs_teacher]}, which
+    early_stop_value reads for the DEV_METRICS; tables and summary.json under evals/step_<N>_dev/, the scalars
+    eval/dev/{objective, ce, kl, wall_s} and eval/dev/tf/..., eval/dev/greedy/..., and an `eval_dev` event. It never
+    writes an `eval` event, the verdict's history, the final-eval estimate or the evalstore's text, and draws no random
+    number: with the early stop off, a run with dev evals trains exactly as one without. The early stop's check is the
+    caller's (loop). Returns the record."""
+    from kitsune import evaluate as ev
+
+    cfg, log, store = R.cfg, R.log, getattr(R, "devstore", None)
+    dc = cfg["eval"]["dev"]
+    bs, greedy = float(cfg["eval"]["batch_s"]), bool(dc["greedy"])
+    t0 = time.time()
+    gr_sum = gr_df = None
+    if is_ctc(cfg):
+        from kitsune.ctc_eval import ctc_eval
+
+        tf_sum, tf_df, gdf, meta = ctc_eval(R.model, store, R.feat_eval, R.device, bs, ids=None, tokenizer=R.tokenizer,
+                                            text=ctc_text(R, "dev", store) if greedy else None, amp=R.amp,
+                                            decode=greedy)
+        if greedy:
+            gr_sum, gr_df = ev.summarise_greedy(gdf, **meta), gdf
+    else:
+        tf_sum, tf_df = ev.teacher_forced_eval(R.model, store, R.feat_eval, R.device, bs, amp=R.amp)
+        if greedy:
+            gr_sum, gr_df = ev.greedy_eval(R.model, store, None, R.feat_eval, R.device, bs, tokenizer=R.tokenizer,
+                                           amp=R.amp, teacher_rows=mini_teacher_rows(R, "dev", store,
+                                                                                     [u.id for u in store.utts]))
+    assert_bn_mode(R.model, bn_mode(cfg))  # an eval gives every module its own flag back
+    wall = round(time.time() - t0, 1)
+    c = combined_loss(cfg, tf_sum) or {}
+    ce_key = "ctc" if is_ctc(cfg) else "ce"
+    rec = dict(step=int(step), epoch=R.st["epoch_progress"], elapsed_s=R.clock(), wall_s=wall, final=bool(final),
+               dev_ce=c.get(ce_key), dev_kl=c.get("kl"), dev_objective=c.get("value"), n_tok=int(c.get("n_tok", 0)),
+               n_utts=int(tf_sum.get("n_utts", 0)),
+               per_source={s: dict(ce=d["ce"], kl=d["kl"], n_tok=int(d["n_tok"]))
+                           for s, d in tf_sum.get("sets", {}).items()})
+    if gr_sum is not None and "all" in gr_sum:
+        rec.update(cer=gr_sum["all"]["cer_ref_corpus"], cer_vs_teacher=gr_sum["all"]["cer_teacher_corpus"])
+    hist = R.st["dev_history"]
+    if hist and hist[-1]["step"] == rec["step"]:
+        hist[-1] = rec
+    else:
+        hist.append(rec)
+    R.st["dev_last_step"], R.st["dev_last_epoch"] = int(step), float(R.st["epoch_progress"])
+
+    for src, g in tf_df.groupby("source", sort=True):
+        log.table(f"tf_{src}", g.reset_index(drop=True), step, suffix="dev")
+    if gr_df is not None:
+        for src, g in gr_df.groupby("source", sort=True):
+            log.table(f"greedy_{src}", g.reset_index(drop=True), step, suffix="dev")
+    log.eval_json("summary", dict(rec, dev=True, tf=tf_sum, **({"greedy": gr_sum} if gr_sum is not None else {}),
+                                  **({"combined_loss": c} if c else {})), step, suffix="dev")
+    scal = ev.flatten(tf_sum, "eval/dev/tf")
+    if gr_sum is not None:
+        scal.update(ev.flatten(gr_sum, "eval/dev/greedy"))
+    scal.update({f"eval/dev/{k}": rec[f"dev_{k}"] for k in ("objective", "ce", "kl") if rec[f"dev_{k}"] is not None})
+    scal["eval/dev/wall_s"] = wall
+    log.scalars(scal, step)
+    sets = {s: dict(ce=round(d["ce"], 5), kl=round(d["kl"], 5)) for s, d in rec["per_source"].items()}
+    for s, d in (gr_sum or {}).get("sets", {}).items():
+        sets.setdefault(s, {}).update(cer=round(d["cer_ref_corpus"], 4), cer_teacher=round(d["cer_teacher_corpus"], 4))
+    log.event("eval_dev", at_step=int(step), epoch=rec["epoch"], final=bool(final), wall_s=wall,
+              **{k: rec[k] for k in DEV_METRICS}, sets=sets)
+    return rec
+
+
 # ----------------------------------------------------------------------------------------------------- early stop
 
 
@@ -2806,26 +3175,50 @@ def early_stop_value(R: Run, metric: str) -> float | None:
     """The early-stop metric right after an eval: the newest eval record's probe_kl / heldout_kl (eval_record), or the
     mean loss/objective of the optimizer steps since the previous eval (None if there were none). loss/objective, not
     loss/total: the L2-SP value in loss/total is not in the gradient and grows with the distance from the initial
-    weights, so a window mean of loss/total rises once the objective flattens and patience would fire on a timetable."""
+    weights, so a window mean of loss/total rises once the objective flattens and patience would fire on a timetable.
+    A dev metric (DEV_METRICS): the newest dev eval's number when that eval ran at this very step (run_dev_eval),
+    else None."""
     es = R.st["early_stop"]
     if metric == "train_loss":
         return es["loss_sum"] / es["loss_n"] if es["loss_n"] else None
+    if metric in DEV_METRICS:
+        dh = R.st.get("dev_history") or []
+        return dh[-1].get(metric) if dh and dh[-1]["step"] == R.st["step"] else None
     return (R.st["history"][-1] if R.st["history"] else {}).get(metric)
 
 
+def smooth_k(cfg: dict) -> int:
+    """early_stop.smooth (1 for a config without the key: a unit test's, a state from before it)."""
+    return int((cfg.get("early_stop") or {}).get("smooth") or 1)
+
+
 def early_stop_check(R: Run, step: int) -> bool:
-    """After every in-loop eval: with early_stop.enabled and no trigger yet, update the early-stop state
-    (early_stop_update), log it and act on a trigger (early_stop_trigger). Returns True when the loop must end now."""
+    """After every in-loop eval (a dev metric: after every dev eval, loop): with early_stop.enabled and no trigger yet,
+    update the early-stop state (early_stop_update), log it and act on a trigger (early_stop_trigger). Returns True when
+    the loop must end now. early_stop.smooth k > 1: the raw value joins es["recent"] (the last k; None for a missing or
+    non-finite one); nothing is counted - no evals, no patience, no min_evals - before there are k of them (only
+    early_stop/raw is logged), then the rule reads their mean (None if any is None: no improvement), so min_evals and
+    patience count smoothed checks. early_stop/value is what the rule saw, early_stop/raw the newest value."""
     ec, es = R.cfg["early_stop"], R.st["early_stop"]
     value = early_stop_value(R, ec["metric"])
     es["loss_sum"], es["loss_n"] = 0.0, 0  # the next eval's train-loss window starts here
     if not ec["enabled"] or es["triggered"]:
         return False
-    reason = early_stop_update(es, ec, value, step)
     nan = float("nan")
+    k = smooth_k(R.cfg)
+    raw = {}
+    if k > 1:
+        v = float(value) if value is not None and math.isfinite(float(value)) else None
+        es["recent"] = (list(es.get("recent") or []) + [v])[-k:]
+        raw = {"early_stop/raw": nan if v is None else v}
+        if len(es["recent"]) < k:
+            R.log.scalars(raw, step)
+            return False
+        value = None if any(x is None for x in es["recent"]) else sum(es["recent"]) / k
+    reason = early_stop_update(es, ec, value, step)
     row = {"early_stop/value": nan if es["value"] is None else es["value"],
            "early_stop/best": nan if es["best"] is None else es["best"],
-           "early_stop/evals_since_best": es["evals_since_best"]}
+           "early_stop/evals_since_best": es["evals_since_best"], **raw}
     if reason is None:
         row["early_stop/triggered"] = 0.0
     R.log.scalars(row, step)
@@ -2843,6 +3236,8 @@ def early_stop_trigger(R: Run, reason: str, action: str) -> bool:
     info = dict(metric=ec["metric"] if ec["enabled"] else None, value=es["value"], best=es["best"],
                 best_step=es["best_step"], evals_since_best=es["evals_since_best"], reason=reason, action=action,
                 at_step=step, epoch=R.st["epoch_progress"])
+    if (k := smooth_k(R.cfg)) > 1:  # value is the smoothed one; raw the newest check's (only then: tests pin the rest)
+        info.update(raw=(es.get("recent") or [None])[-1], smooth=k)
     if es["triggered"]:  # the STOP file after an early cooldown began
         info["previous"] = es["triggered"]
     if action == "cooldown":
@@ -2866,8 +3261,32 @@ def early_stop_trigger(R: Run, reason: str, action: str) -> bool:
 
 def stop_requested(R: Run) -> bool:
     """The manual stop: runs/<run_id>/STOP exists (one stat per optimizer step, whatever early_stop.enabled says) ->
-    the "stop" path with reason "stop_file"."""
+    the "stop" path with reason "stop_file". Before it, the manual cooldown: runs/<run_id>/COOLDOWN (one more stat;
+    cooldown_file)."""
+    if (R.run_dir / COOLDOWN_FILE).exists():
+        cooldown_file(R)
     return (R.run_dir / STOP_FILE).exists() and early_stop_trigger(R, "stop_file", "stop")
+
+
+def cooldown_file(R: Run):
+    """runs/<run_id>/COOLDOWN, acted on once (es["cooldown_file"], in the full state: a resume from a state saved after
+    it does not act again; the file itself stays): outside a cooldown, the early stop's cooldown action with reason
+    "cooldown_file" (early_stop_trigger: the WSD cooldown starts now over cooldown_frac x the progress so far, the run
+    ends when it is over; summary.json's stopped_early), whatever early_stop.enabled says. Inside a cooldown (the
+    scheduled one, an early stop's or 4d's) it changes nothing: one `cooldown_file` event {at_step, ignored} and no
+    early_stop_trigger, whose "already" path would overwrite the trigger an earlier dev early stop left (and with it
+    summary.json's stopped_early)."""
+    es = R.st["early_stop"]
+    if es.get("cooldown_file"):
+        return
+    step = R.st["step"]
+    t, T = R.progress()
+    if R.st["pre_cooldown_done"] or t >= R.cooldown_start(T) or es["cooldown"]:
+        es["cooldown_file"] = dict(at_step=step, ignored="cooldown under way")
+        R.log.event("cooldown_file", **es["cooldown_file"], epoch=R.st["epoch_progress"])
+        return
+    early_stop_trigger(R, "cooldown_file", "cooldown")
+    es["cooldown_file"] = dict(at_step=step)
 
 
 # ----------------------------------------------------------------------------------------------------- checkpoints
@@ -3279,13 +3698,15 @@ def decode_preflight(R: Run):
     that hits a whole source - a codec, or the resampler that every 24 and 48 kHz file goes through (librosa / soxr /
     numba), broken on a new box - would only thin the data: the run would train without that source and judge the
     gate on the sets that are left. A set that fails on more than half its sample raises SmokeFailed with its first
-    error; every set's count is a `smoke_decode` event."""
+    error; every set's count is a `smoke_decode` event. The dev store's sources too (eval.dev: the early stop's rows),
+    after the others, so their draws are the ones before it."""
     n = int(R.cfg["smoke"]["decode_per_set"])
     if n <= 0:
         return
     rng = np.random.default_rng([int(R.cfg["seed"]), 16])
     sets, bad = {}, []
-    for kind, store in (("train", R.train), ("eval", R.evalstore)):
+    dev = getattr(R, "devstore", None)
+    for kind, store in (("train", R.train), ("eval", R.evalstore), *((("dev", dev),) if dev is not None else ())):
         by_src = {}
         for i, u in enumerate(store.utts):
             by_src.setdefault(u.source, []).append(i)
@@ -3436,7 +3857,13 @@ def probe_passes(R: Run, planner: trainset.StepPlanner, rec: dict):
     allocated / reserved into rec (CUDA). train_step accumulates a step's micro-batches into the same gradients, so
     from the second micro-batch on, forward and backward run with the full fp32 gradients (4 B/param, 2.3 GiB for the
     real student) already allocated. When the plan has steps of more than one micro-batch every pass therefore starts
-    from zero-filled gradients (backward adds into them in place, as in training) instead of none."""
+    from zero-filled gradients (backward adds into them in place, as in training) instead of none.
+    memory.probe_extended (4c) adds the micro-batch with the most rows (both families: per-row buffers, the decoder's
+    padded positions) and, for the frame planner, the one with the most CTC targets and the one with the largest CTC
+    lattice (rows x frames x (2 max targets + 1): the CTC loss's alpha/beta). memory.probe_shapes adds a synthetic
+    micro-batch per shape (synth_micro_batch), probed as "shape:<name>" - at the configured micro_audio_s, and after an
+    OOM fallback only the shapes whose padded seconds fit the smaller one (the others are listed, skipped, in
+    rec["shapes"], the memory_probe event's)."""
     cuda = R.device.type == "cuda"
     plan = planner.epoch_plan(0)
     rec["grads_held"] = held = max(len(step) for step in plan) > 1
@@ -3445,6 +3872,27 @@ def probe_passes(R: Run, planner: trainset.StepPlanner, rec: dict):
         # their log_softmax and gradient - the micro-batch with the most padded audio, not necessarily the longest
         worst["most_padded_frames"] = max((mb for step in plan for mb in step),
                                           key=lambda mb: float(planner.dur[mb].max()) * len(mb))
+    mem = (getattr(R, "cfg", None) or {}).get("memory") or {}  # the tests' stub R has no config: nothing extended
+    if mem.get("probe_extended"):
+        mbs = [mb for step in plan for mb in step]
+        worst["most_rows"] = max(mbs, key=lambda mb: (len(mb), float(planner.dur[mb].max())))
+        if planner.frames:
+            worst["most_targets"] = max(mbs, key=lambda mb: int(planner.n_tok[mb].sum()))
+            worst["largest_ctc_lattice"] = max(mbs, key=lambda mb: len(mb) * float(planner.dur[mb].max())
+                                               * (2 * int(planner.n_tok[mb].max()) + 1))
+    if mem.get("probe_shapes"):
+        micro0 = float(R.cfg["batch"]["micro_audio_s"])
+        rec["shapes"] = {}
+        for shape in mem["probe_shapes"]:
+            idx = synth_micro_batch(planner, shape["durations"])
+            padded = round(float(planner.dur[idx].max()) * len(idx), 3) if idx else 0.0
+            info = dict(n=len(idx), padded_s=padded)
+            if not idx or (planner.micro_audio_s < micro0 and padded > planner.micro_audio_s):
+                info["skipped"] = (f"larger than micro_audio_s {planner.micro_audio_s:g} after an OOM fallback"
+                                   if idx else "no train row to stand in")
+            else:
+                worst[f"shape:{shape['name']}"] = idx
+            rec["shapes"][shape["name"]] = info
     for name, idx in worst.items():
         if held:
             for p in R.params:
@@ -3456,6 +3904,32 @@ def probe_passes(R: Run, planner: trainset.StepPlanner, rec: dict):
             rec["peak_gb"][name] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
             rec["max_reserved_gb"] = max(rec.get("max_reserved_gb", 0.0),
                                          round(torch.cuda.max_memory_reserved() / 2**30, 2))
+
+
+def synth_micro_batch(planner: trainset.StepPlanner, durations) -> list[int]:
+    """A synthetic micro-batch for memory.probe_shapes: for each target duration, longest first, the unused train row
+    whose duration is nearest (the longer one on a tie), among the rows the planner can use (a token planner excludes
+    those past batch.max_dec_len). Store indices, in that order; fewer when the store has fewer rows. The shapes come
+    from the full data's worst micro-batches (tools/full_plan.py worst_shapes), so a smoke run on a smaller selection
+    probes the full run's memory peak with its own rows."""
+    elig = np.ones(len(planner.dur), dtype=bool) if planner.frames else planner.dec_len <= planner.max_dec_len
+    order = np.flatnonzero(elig)
+    order = order[np.argsort(planner.dur[order], kind="stable")]
+    d, n = planner.dur[order], len(order)
+    used, out = set(), []
+    for target in sorted((float(x) for x in durations), reverse=True):
+        j = int(np.searchsorted(d, target))
+        lo, hi = j - 1, j
+        while lo >= 0 and lo in used:
+            lo -= 1
+        while hi < n and hi in used:
+            hi += 1
+        if lo < 0 and hi >= n:
+            break
+        p = hi if hi < n and (lo < 0 or d[hi] - target <= target - d[lo]) else lo
+        used.add(p)
+        out.append(int(order[p]))
+    return out
 
 
 def memory_probe(R: Run) -> dict:
@@ -3496,10 +3970,14 @@ def memory_probe(R: Run) -> dict:
         if err is None:
             R.planner = planner
             total = torch.cuda.get_device_properties(R.device).total_memory / 2**30
+            # 4c: extended (memory.probe_extended), the synthetic shapes' {n, padded_s[, skipped]} and the headroom
+            # the worst pass left on the card (the full runs' budget: <= 28 GiB of the 5090's 32)
+            mr = rec.get("max_reserved_gb")
             log.event("memory_probe", ok=True, micro_audio_s=micro, grad_ckpt=ckpt, peak_gb=rec["peak_gb"],
-                      grads_held=rec["grads_held"], max_reserved_gb=rec.get("max_reserved_gb"),
+                      grads_held=rec["grads_held"], max_reserved_gb=mr,
                       vram_cap_gb=R.vram_cap_gb, device_gb=round(total, 1),
-                      reserved_adam_gb=round(adam_bytes / 2**30, 2))
+                      reserved_adam_gb=round(adam_bytes / 2**30, 2), extended=bool(cfg["memory"]["probe_extended"]),
+                      headroom_gb=round(total - mr, 2) if mr is not None else None, shapes=rec.get("shapes"))
             return dict(micro_audio_s=micro, grad_ckpt=ckpt)
         # outside the except: its traceback no longer pins the failed pass's activations
         R.opt.zero_grad(set_to_none=True)
@@ -3686,9 +4164,18 @@ def build(args) -> tuple[Run, dict | None]:
         saved = copy.deepcopy(cfg)
         overrides, repeated = resume_overrides(saved, [apply_set(cfg, s) for s in args.set])
         validate(cfg)
+        if cfg["schedule"]["epochs"] != saved["schedule"]["epochs"] and not cfg["schedule"]["resume_reset"]:
+            # plan_epochs keeps the state's total_steps: without the reset the new value would change nothing
+            raise SystemExit(f"--set schedule.epochs {cfg['schedule']['epochs']!r} on a resume (the state's "
+                             f"{saved['schedule']['epochs']!r}; overrides {sorted(overrides)}) needs --set "
+                             "schedule.resume_reset=true, which plans the run again (the module docstring's resume "
+                             "reset)")
         run_dir = full.parent.parent
     else:
         cfg = load_config(args.config, args.set)
+        if cfg["schedule"]["resume_reset"]:
+            raise SystemExit("schedule.resume_reset is a resume's one-shot flag: pass it with --resume <state> (--set "
+                             "schedule.resume_reset=true), never in a config or a fresh start")
         overrides = repeated = {}
         if cfg["branch"]["parent"]:
             branch_full, state = branch_start_state(cfg)
@@ -3737,6 +4224,62 @@ def build(args) -> tuple[Run, dict | None]:
     return R, state
 
 
+def resume_reset_start(R: Run) -> dict:
+    """schedule.resume_reset (a resume's one-shot flag; build refuses it on a fresh start), right after train()
+    restored the state: the run continues past its early stop or its cooldown with a fresh schedule. Refused on a T/2
+    branch (its schedule is its parent's) and while runs/<run_id>/STOP exists (the stop would end it at once). Clears
+    st total_steps (plan_epochs plans schedule.epochs again, a --set value included), pre_cooldown_done and
+    pre_cooldown_full (the new cooldown saves its own pre_cooldown state), the early-stop state (fresh: patience,
+    smoothing, trigger, cooldown; dev_history is kept, and early_stop.enabled decides whether it can fire again) and
+    4d's deadline_cooldown; renames runs/<run_id>/COOLDOWN to COOLDOWN.consumed-<UTC stamp> (else it would fire again at
+    once); counts st["resume_resets"]; and sets the flag false in R.cfg before anything is saved, so every later save
+    and a crash-resume from one do not reset again, while a repeat of the same argv before the first save resets the
+    same state the same way. Returns what resume_reset_finish records."""
+    st, cfg = R.st, R.cfg
+    if R.branch_start or st.get("branch"):
+        raise SystemExit("schedule.resume_reset: a T/2 branch keeps its parent's schedule; it cannot be reset")
+    if (R.run_dir / STOP_FILE).exists():
+        raise SystemExit(f"schedule.resume_reset with {R.run_dir / STOP_FILE} present: the STOP file would end the "
+                         "continued run at once; remove it first")
+    before = dict(at_step=int(st["step"]), time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  total_steps_before=st.get("total_steps"), early_stop_before=copy.deepcopy(st["early_stop"]),
+                  pre_cooldown_full_before=st.get("pre_cooldown_full"),
+                  lr_phase_before=lr_phase_name(st.get("lr_phase")),
+                  deadline_cooldown_before=copy.deepcopy(st.get("deadline_cooldown")))
+    st.update(total_steps=None, pre_cooldown_done=False, pre_cooldown_full=None, early_stop=early_stop_state(),
+              deadline_cooldown=None)
+    cool = R.run_dir / COOLDOWN_FILE
+    if cool.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest, n = R.run_dir / f"{COOLDOWN_FILE}.consumed-{stamp}", 1
+        while dest.exists():
+            dest, n = R.run_dir / f"{COOLDOWN_FILE}.consumed-{stamp}-{n}", n + 1
+        cool.replace(dest)
+        before["cooldown_file_consumed"] = dest.name
+    st["resume_resets"] = int(st.get("resume_resets") or 0) + 1
+    cfg["schedule"]["resume_reset"] = False
+    return before
+
+
+def resume_reset_finish(R: Run, before: dict):
+    """resume_reset_start's second half, after plan_epochs planned the schedule again: the new T must lie past the
+    state's step (else the continuation would end at once); a record {at_step, time_utc, total_steps_before,
+    total_steps_after, epochs, early_stop_before, pre_cooldown_full_before, lr_phase_before, ...} joins
+    st["schedule_resets"] (summary.json's) and goes out as the `resume_reset` event. A state saved inside its cooldown
+    (lr_phase_before "cooldown") puts the LR back at its peak: the event warns."""
+    t, T = R.progress()
+    if T <= t:
+        raise SystemExit(f"schedule.resume_reset: the new schedule ends at {T:g} (schedule.clock "
+                         f"{R.cfg['schedule']['clock']!r}), not after the state's {t:g}: raise schedule.epochs (or "
+                         "max_steps / train_hours) with --set")
+    rec = dict(before, total_steps_after=R.st.get("total_steps"), T=T, epochs=R.cfg["schedule"]["epochs"],
+               clock=R.cfg["schedule"]["clock"], resume_resets=R.st["resume_resets"])
+    if before["lr_phase_before"] == "cooldown":
+        rec["warning"] = "the state was saved inside its cooldown: the LR goes back to its peak"
+    R.st["schedule_resets"].append(rec)
+    R.log.event("resume_reset", **rec)
+
+
 def train(R: Run, state: dict | None) -> int:
     from kitsune import evaluate as ev
 
@@ -3753,8 +4296,11 @@ def train(R: Run, state: dict | None) -> int:
         R.st.update(copy.deepcopy(state["st"]))
         R.st.setdefault("optim_groups", "single")  # a state from before the param groups: its one group (setup_optim)
         R.st.setdefault("started_utc", None)  # a state from before it: unknown (tools/study_report falls back)
+        for k, v in early_stop_state().items():  # the state's early_stop replaced the default whole: keys added since
+            R.st["early_stop"].setdefault(k, v)
         if not R.branch_start:  # a branch is a new run dir: its first launch is no resume
             R.st["resumes"] += 1
+    reset = resume_reset_start(R) if cfg["schedule"]["resume_reset"] else None  # before anything is saved
     if state is None or R.branch_start:  # the run's first start: summary.json's started_utc, kept across resumes
         R.st["started_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     # true/false: this config's (a resume's --set too); "auto": the memory probe's choice, saved in the full state
@@ -3818,6 +4364,8 @@ def train(R: Run, state: dict | None) -> int:
         R.planner.load_state_dict(state["planner"])
         _set_rng_state(state["rng"])
         plan_epochs(R)  # a no-op unless the clock was switched to "epochs" on this resume
+        if reset is not None:  # the reset cleared total_steps: plan_epochs planned schedule.epochs again
+            resume_reset_finish(R, reset)
         if R.branch_start:
             br = R.st["branch"]
             ignored = branch_fracs(cfg)
@@ -3854,6 +4402,8 @@ def train(R: Run, state: dict | None) -> int:
         else:
             log.event("phase", name="step0_eval")
             run_eval(R, 0, mini_val=True)  # with combined_loss/val's step-0 point on the mini val subset (minis on)
+            if getattr(R, "devstore", None) is not None and cfg["eval"]["dev"]["at_start"]:
+                run_dev_eval(R, 0)  # the dev curve's step-0 point, never checked by the early stop
         R.st["step0_done"] = True
 
     if R.st["early_stop"]["stop"]:  # resumed after an early stop had triggered: straight to the end phase
@@ -3879,6 +4429,10 @@ def train(R: Run, state: dict | None) -> int:
         log.event("eval_final_reused", at_step=step)
     else:
         full_sum = run_eval(R, step, final=True, complete=final_complete)
+    dh = R.st["dev_history"]
+    if (getattr(R, "devstore", None) is not None and cfg["eval"]["dev"]["at_end"]
+            and not (dh and dh[-1]["step"] == step)):
+        run_dev_eval(R, step, final=True)  # the dev curve's last point (the loop skips one at its last step)
     verdict = gate_verdict(cfg, family_verdict(cfg, full_sum, R.st["history"], R.reference))
     log.eval_json("verdict", verdict, step)
     log.event("verdict", **verdict)
@@ -4091,6 +4645,141 @@ def fit_budget(R: Run):
                 train_s=round(R.clock()), T=round(min(T, t0_budget)), T_train_hours=t0_budget, clipped=T < t0_budget)
 
 
+def deadline_on(cfg: dict) -> bool:
+    """4d applies: schedule.deadline_cooldown on the epochs or steps clock (validate refuses it on the wall clock)."""
+    sch = cfg.get("schedule") or {}
+    return bool(sch.get("deadline_cooldown")) and sch.get("clock") in ("epochs", "steps")
+
+
+def deadline_rate(R: Run) -> float | None:
+    """4d's loop-clock seconds per optimizer step, now: over the newest window of at least
+    schedule.deadline_window_steps steps of THIS launch (R.deadline_marks, the (step, loop clock) sample of every 4d
+    check after the smoke phase, fit_epochs_deadline's; the evals, minis, dev evals and saves in the window are in it),
+    else the last rate st["deadline_rate"] kept (an earlier launch's), else None."""
+    step, now = int(R.st["step"]), R.clock()
+    marks = R.deadline_marks
+    W = int(R.cfg["schedule"]["deadline_window_steps"])
+    while len(marks) > 1 and step - marks[1][0] >= W:  # the newest sample W steps back is all a rate needs
+        marks.pop(0)
+    if marks and step - marks[0][0] >= W and step > marks[0][0]:
+        return (now - marks[0][1]) / (step - marks[0][0])
+    return R.st.get("deadline_rate")
+
+
+def _evals_ahead(R: Run, t: float, t_end: float) -> int:
+    """The in-loop complete evals at epoch ends (eval.full_every_epochs / every_epochs) strictly between steps t and
+    t_end (the one at t_end would be the end phase's final eval), an epoch taken as the plan's steps per epoch
+    (total_steps / epochs on the epoch clock, else the first planned epoch's)."""
+    per = epoch_cadence(R.cfg)
+    if not per or t_end <= t:
+        return 0
+    sch = R.cfg["schedule"]
+    if sch["clock"] == "epochs" and R.st.get("total_steps"):
+        spe = float(R.st["total_steps"]) / int(sch["epochs"])
+    else:
+        stats = getattr(R.planner, "epoch_stats", None) or {}
+        spe = float(next(iter(stats.values()))["steps"]) if stats else 0.0
+    if spe <= 0:
+        return 0
+    every = spe * per
+    return max(0, math.ceil(t_end / every - 1e-9) - 1 - math.floor(t / every + 1e-9))
+
+
+def fit_epochs_deadline(R: Run, at_start: bool = False) -> dict | None:
+    """4d (schedule.deadline_cooldown; the epochs and steps clocks, where fit_budget does nothing): fit the run's end
+    phase before $KITSUNE_DEADLINE (deadline_unix; the queue's per-item deadline) by scheduling, starting or compressing
+    the WSD cooldown - its own record st["deadline_cooldown"] {t_c, T, ...} next to the early stop's cooldown, never
+    through early_stop.triggered (either can act after the other; Run.progress takes the smaller T, Run.cooldown_start
+    the earlier t_c). Active once the smoke phase is done and a rate is known (deadline_rate). The time left minus the
+    reserve (schedule.end_reserve_min, the final eval's estimate final_eval_estimate, and the last dev eval's wall time
+    under eval.dev.at_end) gives fit = the most steps n with n x rate + (the in-loop epoch-end evals among them) x the
+    eval estimate <= it; T_new = t + fit, against T_plan = the schedule's T without 4d's record:
+      fits (t + fit >= T_plan)   a record whose cooldown has not begun is cleared (action "clear": an early
+                                 pessimistic rate never cuts the run for good), else nothing
+      in a cooldown already      "compress": T_new with the cooldown's t_c, only when T_new is below the current T
+      else                       t_c = max(t, T_new - ceil(cooldown_frac x T_new)): "schedule" (t_c later: the run
+                                 uses its time and still anneals over its full share) or "start" (now)
+    T_new <= t (no step fits): the record's T = t ends the loop at once and a `no_time_left` event says so. Every action
+    is a `deadline_cooldown` event {t_c, T, action, clock, at_step, deadline, left_s, sec_per_step, reserve_s,
+    evals_ahead, T_before}, kept as st["deadline_cooldown"] (summary.json's); the scalar sched/deadline_T (t + fit)
+    follows every check with a rate; the launch's first active check (the loop start, at_start, or on a fresh run the
+    first after the smoke phase) also logs `deadline_check` {deadline, left_s, sec_per_step, T, projected_end_utc,
+    fits}. The loop saves the pre_cooldown state at the record's t_c, as for any cooldown. Returns
+    the record of an action, else None."""
+    cfg, st = R.cfg, R.st
+    sch = cfg["schedule"]
+    if not deadline_on(cfg):
+        return None
+    deadline = deadline_unix()
+    if deadline is None or (cfg["smoke"]["enabled"] and int(cfg["smoke"]["steps"]) > 0 and not st["smoke_done"]):
+        return None
+    # the launch's first active check logs deadline_check (a fresh run's loop start falls in the smoke phase: its first
+    # check after the smoke phase does); every check leaves a (step, loop clock) sample for deadline_rate
+    first = not R.deadline_marks
+    if R.deadline_marks and R.deadline_marks[-1][0] == st["step"]:
+        R.deadline_marks.pop()  # the same step checked again: its newest sample
+    R.deadline_marks.append((int(st["step"]), R.clock()))
+    rate = deadline_rate(R)
+    t, T = R.progress()
+    per_eval = final_eval_estimate(R)
+    dh = st.get("dev_history") or []
+    dev_end = float(dh[-1].get("wall_s") or 0.0) if dh and dev_on(cfg) and cfg["eval"]["dev"]["at_end"] else 0.0
+    reserve = float(sch["end_reserve_min"]) * 60 + per_eval + dev_end
+    now = time.time()
+    left = deadline - now
+    if at_start or first:
+        proj = None
+        if rate is not None:
+            proj = now + (T - t) * rate + _evals_ahead(R, t, T) * per_eval + reserve
+        R.log.event("deadline_check", deadline=deadline, left_s=round(left, 1), reserve_s=round(reserve, 1),
+                    sec_per_step=rate, T=T, fits=None if proj is None else proj <= deadline,
+                    projected_end_utc=(datetime.fromtimestamp(proj, timezone.utc).isoformat(timespec="seconds")
+                                       if proj is not None else None))
+    if rate is None or rate <= 0:
+        return None
+    st["deadline_rate"] = rate
+    budget = left - reserve
+
+    def cost(n: int) -> float:
+        return n * rate + _evals_ahead(R, t, t + n) * per_eval
+
+    # the largest n with cost(n) <= budget (cost grows with n); -1: not even no step
+    lo, hi = (0, max(0, int(budget // rate))) if budget >= 0 else (-1, -1)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        lo, hi = (mid, hi) if cost(mid) <= budget else (lo, mid - 1)
+    fit = max(lo, 0)
+    R.log.scalars({"sched/deadline_T": float(t + fit)}, st["step"])
+    T_plan = R.progress(deadline=False)[1]
+    dl = st.get("deadline_cooldown")
+    base = dict(clock=sch["clock"], at_step=int(st["step"]), deadline=deadline, left_s=round(left, 1),
+                sec_per_step=rate, reserve_s=round(reserve, 1), T_before=T)
+    if t + fit >= T_plan:
+        if dl and dl["t_c"] > t:  # scheduled, not begun: the run fits again
+            st["deadline_cooldown"] = None
+            rec = dict(base, t_c=None, T=T_plan, action="clear", evals_ahead=_evals_ahead(R, t, T_plan))
+            R.log.event("deadline_cooldown", **rec)
+            return rec
+        return None
+    T_new = float(t + fit)
+    if st["pre_cooldown_done"] or t >= R.cooldown_start(T):  # in a cooldown (scheduled, early or 4d's) already
+        if T_new >= T:
+            return None
+        rec = dict(base, t_c=R.cooldown_start(T), T=T_new, action="compress")
+    else:
+        t_c = max(float(t), T_new - math.ceil(float(sch["cooldown_frac"]) * T_new))
+        if dl and (dl["t_c"], dl["T"]) == (t_c, T_new):  # the record it has already: no new event
+            return None
+        rec = dict(base, t_c=t_c, T=T_new, action="schedule" if t_c > t else "start")
+    rec["evals_ahead"] = _evals_ahead(R, t, T_new)
+    st["deadline_cooldown"] = dict(rec)
+    R.log.event("deadline_cooldown", **rec)
+    if T_new <= t:
+        R.log.event("no_time_left", at_step=int(st["step"]), t=t, T=T_new, deadline=deadline, left_s=round(left, 1),
+                    reserve_s=round(reserve, 1), sec_per_step=rate)
+    return rec
+
+
 def loop(R: Run):
     cfg, log = R.cfg, R.log
     sch, ck, ev_cfg = cfg["schedule"], cfg["ckpt"], cfg["eval"]
@@ -4134,6 +4823,8 @@ def loop(R: Run):
     prof = smoke_profiler(R, smoke_n)  # perf.profile_smoke: ~20 steps of the smoke phase under torch.profiler
 
     fit_budget(R)
+    deadline_every = int(sch["deadline_check_steps"]) if deadline_on(cfg) else None  # 4d: here, then every N steps
+    fit_epochs_deadline(R, at_start=True)
     log.event("phase", name="train", at_step=R.st["step"], workers=nw, micro_audio_s=R.planner.micro_audio_s,
               grad_ckpt=R.st["memory"].get("grad_ckpt"))
     loader = trainset.make_loader(R.ds, R.planner, nw, prefetch, timeout_s=float(cfg["perf"]["loader_timeout_s"]))
@@ -4190,6 +4881,7 @@ def loop(R: Run):
             step_s = time.perf_counter() - t0
             R.st["step"] = step
             objective = log_step(R, step, lr, phase, out, wait, step_s, e, s)
+            R.st["data_wait_s"] += wait  # summary.json's throughput.data_wait_frac (with log_step's step_time_s)
             if profiled:  # after the step's logging, part of its per-step cost; the summary is written at the last
                 prof.end(step, wait, step_s, out["n_micro"])
             es = R.st["early_stop"]
@@ -4214,7 +4906,8 @@ def loop(R: Run):
                               ev_cfg["every_steps"])
             at_frac = step in frac_eval  # eval.full_at_fracs: a complete eval next to the cadence, never moving it
             eval_now = cadence or at_frac
-            if eval_now and R.st["early_stop"]["cooldown"]:  # an early cooldown's last step: the final eval covers it
+            if eval_now and (R.st["early_stop"]["cooldown"] or R.st.get("deadline_cooldown")):
+                # an early or 4d cooldown's last step: the final eval covers it
                 t_now, T_now = R.progress()
                 eval_now = t_now < T_now
             if eval_now:
@@ -4227,7 +4920,9 @@ def loop(R: Run):
                     R.st["last_eval_epoch"] = R.planner.epoch
                 if not R.st["pre_cooldown_done"]:  # a fresher final-eval estimate (never moves T in the cooldown)
                     fit_budget(R)
-                if early_stop_check(R, step):  # action "stop": the end phase right after this eval
+                # action "stop": the end phase right after this eval. A dev metric is checked after the dev evals
+                # instead (below): early_stop_check also restarts train_loss's window at every call
+                if not dev_metric(cfg) and early_stop_check(R, step):
                     break
             elif (not probe and mini_due(R, step)
                   and not ending(R.st["mini_history"][-1]["wall_s"] if R.st["mini_history"] else 0.0)):
@@ -4235,6 +4930,15 @@ def loop(R: Run):
                 # follows): on the wall clock also when the mini itself, as long as the last one took, would carry the
                 # clock past T. A first mini, the checkpoints saved after it or a STOP file can still end the loop here
                 run_mini_eval(R, step)
+            # the dev eval (eval.dev) on its own cadence, next to the full and mini evals, and 4d's check: both before
+            # the saves, so a state saved at this step holds the dev record and any trigger or deadline record. Never
+            # at the loop's last step: the end phase's at_end dev eval covers it
+            if not probe and dev_due(R, step) and not ending():
+                run_dev_eval(R, step)
+                if dev_metric(cfg) and early_stop_check(R, step):  # action "stop": the end phase follows
+                    break
+            if deadline_every and step % deadline_every == 0:
+                fit_epochs_deadline(R)
             if not probe and due(t, step, R.st["last_weights_t"], R.st["last_weights_step"], ck["weights_every_min"],
                                  ck["weights_every_steps"]):
                 save_weights(R, step, "periodic")
@@ -4308,7 +5012,10 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         budget_s=R.budget_s,  # None = the full train_hours; else T clipped to the instance deadline
         throughput=dict(audio_s=st["audio_s"], tokens=st["tokens"], step_time_s=round(st["step_time_s"], 1),
                         audio_s_per_s=st["audio_s"] / st["step_time_s"] if st["step_time_s"] else None,
-                        tokens_per_s=st["tokens"] / st["step_time_s"] if st["step_time_s"] else None),
+                        tokens_per_s=st["tokens"] / st["step_time_s"] if st["step_time_s"] else None,
+                        # the share of the logged steps' time spent waiting for the loader (the smoke's check 5)
+                        data_wait_frac=(st.get("data_wait_s", 0.0) / st["step_time_s"]
+                                        if st["step_time_s"] else None)),
         memory=st["memory"], skipped=dict(nonfinite=st["nonfinite_total"], oom=st["oom_skips"]),
         cost=dict(dph=dph, usd=round(dph * elapsed / 3600, 2) if dph else None, note="trainer process time only"),
         best=dict(greedy_cer_ratio_mean=best(cer_ratio),  # the gate sets, as heldout_kl (eval_record)
@@ -4319,7 +5026,43 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         stopped_early=trig if trig and not (trig.get("cooldown") or {}).get("already") else None,
         early_stop_trigger=trig,  # every trigger; None: none
         history=hist, mini_history=st["mini_history"], checkpoints=dict(weights=st["weights"], full=st["fulls"]),
-        config=R.cfg, **extra)
+        **summary_full(R), config=R.cfg, **extra)
+
+
+def end_reason(R: Run) -> str:
+    """What set the run's last step (summary.json's end_reason): a "stop" trigger's reason - "stop_file", else
+    "early_stop" (patience / floor) -, else the record with the smallest T among the schedule's own ("schedule"), the
+    early stop's cooldown ("early_stop", or "cooldown_file" for the COOLDOWN file's) and 4d's ("deadline"), the first
+    on a tie; on the wall clock a budget clipped to the deadline (fit_budget) is "deadline" too."""
+    st, sch = R.st, R.cfg["schedule"]
+    es = st["early_stop"]
+    trig = es.get("triggered") or {}
+    if es.get("stop"):
+        return "stop_file" if trig.get("reason") == "stop_file" else "early_stop"
+    try:
+        _, T = R.base_progress()
+    except TypeError:  # a run that failed before its plan (epoch clock: no total_steps yet); the summary must go out
+        T = float("inf")
+    budget = getattr(R, "budget_s", None)
+    clipped = sch["clock"] == "wall" and budget is not None and budget < float(sch["train_hours"]) * 3600
+    cands = [("deadline" if clipped else "schedule", T)]
+    if es.get("cooldown"):
+        cands.append(("cooldown_file" if trig.get("reason") == "cooldown_file" else "early_stop", es["cooldown"]["T"]))
+    if st.get("deadline_cooldown"):
+        cands.append(("deadline", st["deadline_cooldown"]["T"]))
+    return min(cands, key=lambda c: c[1])[0]
+
+
+def summary_full(R: Run) -> dict:
+    """summary.json's full-data fields: end_reason and resume_resets always; dev_history (the dev evals' records),
+    deadline_cooldown (4d's record) and schedule_resets (the resume resets') when there are any. stopped_early keeps
+    its meaning (a trigger that shortened the run), now also for a dev metric's trigger and the COOLDOWN file's."""
+    st = R.st
+    out = dict(end_reason=end_reason(R), resume_resets=int(st.get("resume_resets") or 0))
+    for key in ("dev_history", "deadline_cooldown", "schedule_resets"):
+        if st.get(key):
+            out[key] = st[key]
+    return out
 
 
 # set by main() when it returns or fails with an upload still running: run_script (the __main__ entry) then skips
@@ -4417,7 +5160,8 @@ def calibrate_on(cfg: dict) -> bool:
 
 
 def validate_box(cfg: dict):
-    """The box path's keys (DEFAULTS: pull_parakeet, selection_recipe.study, calibrate) and optim.lr. calibrate needs
+    """The box path's keys (DEFAULTS: pull_parakeet, selection_recipe.study / full_study, calibrate) and optim.lr.
+    full_study: kitsune.fullrun.full_recipe_problems' block, never with study. calibrate needs
     the steps clock and lr_probe.enabled (its loop is the LR probe's: metrics only), no branch, and a window (a, b] of
     whole steps with 0 <= a < b that the run reaches past a (max_steps > a; the study box ends its calibration runs
     with the STOP file once every run of the group has its window, kitsune.study_queue); barrier (a bool) only on a
@@ -4435,6 +5179,15 @@ def validate_box(cfg: dict):
                                   and all(_number(v) for v in study.values())):
         raise SystemExit(f"selection_recipe.study must be null or the study's selection block with the keys "
                          f"{sorted(prereg.STUDY_SELECTION)} (numbers; study/data.json), got {study!r}")
+    full_study = cfg["selection_recipe"].get("full_study")
+    if full_study is not None:  # a full-data selection's recipe (kitsune.fullrun: FULL_STUDY, make_selection full mode)
+        from kitsune import fullrun
+
+        if study is not None:
+            raise SystemExit("selection_recipe.study and selection_recipe.full_study are two selections' recipes: set "
+                             "one (a full-data run's selection is make_selection.py's full mode)")
+        if problems := fullrun.full_recipe_problems(full_study):
+            raise SystemExit(f"selection_recipe.full_study is not the registered full recipe: {'; '.join(problems)}")
     cal = cfg["calibrate"]
     w = cal["window"]
     if not (isinstance(w, list) and len(w) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in w)
