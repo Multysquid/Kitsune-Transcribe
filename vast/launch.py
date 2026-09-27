@@ -409,15 +409,12 @@ def search_offers(exe: str, job: JobSpec | None = None, disk_gb: int | None = No
         ranked = rank_offers(offers, job, avoid, max_dph, machine)
         if ranked:
             return name, query, ranked
-        avoided = sum(str(o.get("machine_id")) in {str(m) for m in avoid} for o in offers)
         why = ""
-        if offers and avoided == len(offers):
-            why = f" (all {len(offers)} on avoided machines)"
-        elif offers:
-            why = (f" ({len(offers)} found: {avoided} on avoided machines, the rest failing the client filter"
-                   + (f", on machines other than {machine}" if machine else "") + (", or above the price cap"
-                                                                                  if max_dph is not None else "")
-                   + ")")
+        if offers:  # (a job without a client filter, --machine or a cap only loses offers to the avoided machines)
+            avoided = sum(str(o.get("machine_id")) in {str(m) for m in avoid} for o in offers)
+            why = (f" (all {len(offers)} on avoided machines)" if avoided == len(offers) else
+                   f" ({avoided} of {len(offers)} on avoided machines, the others dropped by the client filter, "
+                   f"--machine or the price cap)")
         print(f"no offers for {name}{why}: {query}")
     if job.sort == "est_total":  # --ssh --direct needs a direct port: show whether that is what empties the search
         hint = " ".join(t for t in job_query(job, job.tiers[-1][1], disk_gb).split(" ")
