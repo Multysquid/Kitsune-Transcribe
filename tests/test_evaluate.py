@@ -861,3 +861,22 @@ def test_combined_val_is_the_training_objective(mixed_store, featurizer):
     m.run_mini_eval(R, 2)
     assert scal["combined_loss/val"] == pytest.approx(one["objective"], rel=1e-5)
     assert scal["eval/mini/tf/all/n_tok"] > one["n_tok"]  # galgame was evaluated, only not pooled
+
+
+def test_the_teacher_row_loaders_refuse_the_dev_split(tmp_path):
+    """The dev slice has no label files of its own (its rows sit in train shards): the loaders refuse split "dev"
+    rather than glob a pattern that finds nothing; the trainer's dev eval reads the text from its dev store. Other
+    splits are unchanged."""
+    from kitsune import ctc_eval as ce
+
+    d = tmp_path / "src"
+    d.mkdir()
+    (d / "train-00000.jsonl").write_text(json.dumps(dict(id="a", hyp="h", ref="r")) + "\n", encoding="utf-8")
+    for fn in (lambda: ev.load_teacher_rows(tmp_path, ["src"], split="dev"),
+               lambda: ce.load_parakeet_rows(tmp_path, ["src"], split="dev")):
+        with pytest.raises(ValueError, match="dev rows are read from the dev store"):
+            fn()
+    assert ev.load_teacher_rows(tmp_path, ["src"], split="train")["a"]["source"] == "src"
+    assert list(ev.load_teacher_rows(tmp_path, ["src"])) == ["a"]
+    assert ce.load_parakeet_rows(tmp_path, ["src"], split="train")["src"][0]["id"] == "a"
+    assert ce.load_parakeet_rows(tmp_path, ["src"]) == {"src": []}
