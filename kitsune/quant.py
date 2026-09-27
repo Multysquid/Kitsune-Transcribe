@@ -290,7 +290,7 @@ def e2m1_encode(v: torch.Tensor) -> torch.Tensor:
     """fp values -> uint8 E2M1 codes (0-15): |v| clamped to 6, rounded to the nearest of E2M1_VALUES with ties to the
     even code, bit 3 = torch.signbit (so -0.0 and a negative value rounding to 0 are code 8, as torchao)."""
     v = v.float()
-    a = v.abs().clamp(max=F4_MAX)
+    a = v.abs().clamp(max=F4_MAX).contiguous()
     mids = torch.tensor(_E2M1_MIDS, dtype=torch.float32, device=v.device)
     lo = torch.bucketize(a, mids, right=False)
     hi = torch.bucketize(a, mids, right=True)
