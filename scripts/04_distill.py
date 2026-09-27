@@ -949,13 +949,12 @@ def early_stop_state() -> dict:
 def st_full_defaults() -> dict:
     """The full-data runs' part of Run.st (fresh objects each call; a state written before them keeps these defaults
     through R.st.update): dev_history (one record per dev eval, run_dev_eval), dev_last_step / dev_last_epoch (the
-    last dev eval's position, dev_due), dev (the dev rows' {ids_sha256, n_ids, per_source}: a resume on other rows
-    stops), deadline_cooldown (4d's record, fit_epochs_deadline; None: none), deadline_rate (the last loop-clock s/step
-    4d used, for a later launch's first checks), schedule_resets (one record per resume_reset) and resume_resets (their
-    count, summary.json's); data_wait_s (the logged steps' seconds waiting for the loader: summary.json's
-    throughput.data_wait_frac next to step_time_s)."""
+    last dev eval's position, dev_due), dev (the dev rows' {ids_sha256, n_ids, per_source, n, store_ids_sha256}: a
+    resume on other rows stops, setup_dev), deadline_cooldown (4d's record, fit_epochs_deadline; None: none),
+    deadline_rate (the last loop-clock s/step 4d used, for a later launch's first checks), schedule_resets (one record
+    per resume_reset) and resume_resets (their count, summary.json's)."""
     return dict(dev_history=[], dev_last_step=0, dev_last_epoch=0.0, dev=None, deadline_cooldown=None,
-                deadline_rate=None, schedule_resets=[], resume_resets=0, data_wait_s=0.0)
+                deadline_rate=None, schedule_resets=[], resume_resets=0)
 
 
 def early_stop_update(es: dict, ec: dict, value, step: int) -> str | None:
@@ -4881,7 +4880,6 @@ def loop(R: Run):
             step_s = time.perf_counter() - t0
             R.st["step"] = step
             objective = log_step(R, step, lr, phase, out, wait, step_s, e, s)
-            R.st["data_wait_s"] += wait  # summary.json's throughput.data_wait_frac (with log_step's step_time_s)
             if profiled:  # after the step's logging, part of its per-step cost; the summary is written at the last
                 prof.end(step, wait, step_s, out["n_micro"])
             es = R.st["early_stop"]
@@ -5048,10 +5046,7 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         budget_s=R.budget_s,  # None = the full train_hours; else T clipped to the instance deadline
         throughput=dict(audio_s=st["audio_s"], tokens=st["tokens"], step_time_s=round(st["step_time_s"], 1),
                         audio_s_per_s=st["audio_s"] / st["step_time_s"] if st["step_time_s"] else None,
-                        tokens_per_s=st["tokens"] / st["step_time_s"] if st["step_time_s"] else None,
-                        # the share of the logged steps' time spent waiting for the loader (the smoke's check 5)
-                        data_wait_frac=(st.get("data_wait_s", 0.0) / st["step_time_s"]
-                                        if st["step_time_s"] else None)),
+                        tokens_per_s=st["tokens"] / st["step_time_s"] if st["step_time_s"] else None),
         memory=st["memory"], skipped=dict(nonfinite=st["nonfinite_total"], oom=st["oom_skips"]),
         cost=dict(dph=dph, usd=round(dph * elapsed / 3600, 2) if dph else None, note="trainer process time only"),
         best=dict(greedy_cer_ratio_mean=best(cer_ratio),  # the gate sets, as heldout_kl (eval_record)

@@ -502,7 +502,6 @@ def test_dev_evals_change_no_training_number(env):
                                                                         for e in events(b, "eval")]
 
     sb_ = summary(b)
-    assert 0 <= sb_["throughput"]["data_wait_frac"] < 1 and summary(a)["throughput"]["data_wait_frac"] is not None
     dh = sb_["dev_history"]
     assert [r["step"] for r in dh] == list(range(0, 9)) and [r["final"] for r in dh] == [False] * 8 + [True]
     assert "dev_history" not in summary(a) and summary(a)["end_reason"] == sb_["end_reason"] == "schedule"
