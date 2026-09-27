@@ -422,6 +422,8 @@ def test_speed_mapping_and_flags(world):
     assert "Q1" not in flags["full-p03@nvfp4-w4a4"] and "E1" in flags["full-p03"] and "E1" not in flags["full-t06"]
     assert flags["kotoba-whisper-v2.0"][:6] == ["W1", "W2", "W3", "W4", "W5", "W6"]
     assert flags["whisper-small"][:5] == ["W1", "W3", "W4", "W5", "W6"] and "R1" in flags["parakeet-ctc"]
+    chk = next(c for c in rep["checks"] if c["rule"] == "speed_groups")
+    assert chk["status"] == "fail" and "['whisper-small']" in chk["detail"]  # the re-time group alone would pass
     md = (world["out"] / "report.md").read_text(encoding="utf-8")
     assert "n/a (simulated)" in md
     for f in FR.FLAGS:
@@ -529,7 +531,10 @@ def test_duplicate_readouts_and_tables_precedence(world, tmp_path):
     older = text_table(ids, refs, noisy(refs, 0.1, 40))
     newer = text_table(ids, refs, noisy(refs, 0.11, 41))
     write_readout(pull, "quant-a", "study-p03@int8-w8a8", older, time_utc="2026-10-01T00:00:00+00:00", quant=q)
-    write_readout(pull, "quant-b", "study-p03@int8-w8a8", newer, time_utc="2026-10-02T00:00:00+00:00", quant=q)
+    # scored from memory (05 --quant on the bf16 checkpoint): no file of its own, weights are the bf16 export's
+    mem = dict(q, file_bytes=None, weights_bytes=312_000_000, source="memory")
+    write_readout(pull, "mem-b", "study-p03@int8-w8a8", newer, time_utc="2026-10-02T00:00:00+00:00", quant=mem,
+                  weights=dict(path="ckpt", file_bytes=617_000_000))
     partial = newer[newer["set"].isin(["eval_jsut", "eval_cv8"])]
     write_readout(pull, "emu", "study-p03@int8-w8a8", partial, time_utc="2026-10-09T00:00:00+00:00",
                   quant=dict(q, impl="emulate"))
@@ -540,14 +545,16 @@ def test_duplicate_readouts_and_tables_precedence(world, tmp_path):
                    "--readouts", pull, "--boot-b", 200], tmp_path / "out")
     assert rc == 0
     inp = rep["inputs"]
-    assert Path(inp["readouts_read"]["study-p03@int8-w8a8"]).name == "quant-b"
+    assert Path(inp["readouts_read"]["study-p03@int8-w8a8"]).name == "mem-b"
     sup = {Path(s["dir"]).name for s in inp["readouts_superseded"]}
-    assert sup == {"quant-a", "emu", "shadow"}
+    assert sup == {"quant-a", "emu", "shadow"} and "study-p03" not in inp["readouts_read"]
     assert [Path(i["path"]).parent.name for i in inp["readouts_ignored"]] == ["empty"]
     assert rep["systems"]["study-p03"]["metrics"]["m4"] == pytest.approx(
         np.mean([hand_cer(t["study-p03"], s) for s in ("eval_jsut", "eval_cv8", "eval_reazon")]
                 + [hand_cer(t["study-p03"], "galgame", world["manifest"]["galgame_views"]["neutral"])]))
-    assert rep["systems"]["study-p03@int8-w8a8"]["display"] == "P-0.3B study INT8 W8A8"
+    v = rep["systems"]["study-p03@int8-w8a8"]
+    assert v["display"] == "P-0.3B study INT8 W8A8"
+    assert v["file_bytes"] == 312_000_000 and v["file_bytes_from"] == "in-memory (quant.weights_bytes)"
 
 
 def test_kotoba_bias_from_the_judge_file(world, tmp_path, monkeypatch, capsys):

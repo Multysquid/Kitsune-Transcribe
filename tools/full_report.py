@@ -55,15 +55,17 @@ three gate sets, from each readout's summary.json; within a family only (AED per
 Hallucination counts per system over the M4 strata and over M4-all (rows with a reference): empty outputs, runaways
 (edits > reference length, or output > 2x it), truncated decodes, SILENCE_PHRASES (Whisper's subtitle phrases where
 the reference does not hold them; a heuristic), bracketed spans; the same on clips under SHORT_CLIP_S; and non-empty
-outputs on Galgame's empty references. Kana mode: JSUT rows whose reference has >= 3 kanji and whose non-empty output has none (flag K1 over 1 %).
+outputs on Galgame's empty references. Kana mode: JSUT rows whose reference has >= 3 kanji and whose non-empty
+output has none (flag K1 over 1 %).
 
 Speed, per system: its own record in the chart group; else a full-data row takes its study weights' record (flag S1:
 same shape, same code); else a record from another group (S3). A full-data AED row whose readout emits more than 5 %
 more or fewer tokens on the 200 speed ids than the timed study weights did gets S2, and then its speed is the chart
 group's study-t06 record times the full-t06 / study-t06 ratio of box full's re-time pair (the two timed on one machine
 at one time), labelled so. MXFP4 and emulated variants have no speed ("n/a (simulated)", S4). File size, in order:
-study.json quant.file_bytes, weights.file_bytes, whisper.json model.weights_file_bytes, else the speed record's
-in-memory weights_bytes (marked "in-memory").
+study.json quant.file_bytes, quant.weights_bytes (a variant scored from memory: never its bf16 checkpoint's
+weights.file_bytes), weights.file_bytes, whisper.json model.weights_file_bytes, else the speed record's in-memory
+weights_bytes (both in-memory sources are marked so).
 
 Outputs (--out, written atomically): report.json; report.md (the offer table first, then study -> full, quantisation,
 Whisper with its seven caveats verbatim from plan v3 section 7, the charts, hallucinations, per-set CERs, the flags,
@@ -714,9 +716,13 @@ def token_drift(ntok: dict[str, int], ids: list[str], rec: dict | None) -> dict 
 
 
 def _file_size(ro: dict | None, speed: dict | None) -> tuple[float | None, str | None]:
+    """(bytes, where from). A variant scored from memory (05 --quant on the bf16 --ckpt) has no file of its own: its
+    weights.file_bytes are the bf16 checkpoint's, so it takes quant.weights_bytes (what the exporter would write)."""
     st = (ro or {}).get("study") or {}
-    for v, src in ((((st.get("quant") or {}).get("file_bytes")), "quant.file_bytes"),
-                   (((st.get("weights") or {}).get("file_bytes")), "weights.file_bytes"),
+    q = st.get("quant") or {}
+    for v, src in ((q.get("file_bytes"), "quant.file_bytes"),
+                   (q.get("weights_bytes"), "in-memory (quant.weights_bytes)"),
+                   (None if q else (st.get("weights") or {}).get("file_bytes"), "weights.file_bytes"),
                    ((((ro or {}).get("whisper") or {}).get("model") or {}).get("weights_file_bytes"),
                     "whisper.json")):
         if _num(v):
@@ -1058,10 +1064,12 @@ def checks(rep: dict, readouts: dict, sp: dict, man_sha: str) -> list[dict]:
                         detail=f"{len(sp['ids'])} ids, sha256 {str(sp['ids_sha256'])[:12]}"
                                + (": the study's 200-id list" if same else
                                   f", not the study's ({STUDY_SPEED_IDS_SHA256[:12]})")))
-        n = len(sp["groups"])
-        out.append(dict(rule="speed_groups", status="pass" if n == 1 else "fail",
-                        detail=f"{n} machine/GPU group(s); the chart group is {sp['primary']}"
-                               + ("" if n == 1 else ": rows from the others carry S3 and are not drawn")))
+        # another group is expected (box full's re-time pair feeds the S2 ratio); a ROW timed there is not comparable
+        s3 = sorted(s for s, v in rep["systems"].items() if "S3" in v["flags"])
+        out.append(dict(rule="speed_groups", status="fail" if s3 else "pass",
+                        detail=f"{len(sp['groups'])} machine/GPU group(s); the chart group is {sp['primary']}"
+                               + (f"; rows timed only elsewhere (S3, not drawn): {s3}" if s3 else
+                                  "; every row with a speed has it from the chart group")))
     return out
 
 
@@ -1526,7 +1534,7 @@ def write_outputs(rep: dict, out: Path) -> None:
     sr.write_atomic(out / "chart_points.json", json.dumps(dict(group=prim, gpu=gpu, points=pts), indent=1,
                                                           ensure_ascii=False))
     sr.write_atomic(out / "chart_points.csv", points_csv(pts))
-    where = f"timed on {gpu}" if gpu else ""
+    where = f"Timed on {gpu}." if gpu else ""
     sr.write_atomic(out / "chart_error_vs_speed.svg", chart_svg(
         pts, x_key="rtfx", title="Error vs speed: M4-all CER against batched speed", better="Better: down and right",
         x_label=f"Batched speed, x real time (RTFx, log scale){', ' + gpu if gpu else ''}", gpu=where))
