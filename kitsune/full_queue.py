@@ -35,6 +35,9 @@ machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it neve
   heartbeat  the queue beats $KITSUNE_STATE/train_hb (the box watchdog's file) on every poll, and under beating() while
              it uploads, puts its summary or verdict, downloads weights or pulls a run (ctl_beat_path: never while a
              smoke's freeze_controller_hb fault holds it)
+  uploads    every finished run dir and readout or eval out dir, and the speed dir after every speed item (its
+             events.jsonl gets one line per speed item that ran), lean, then verified; each verified upload puts the
+             summary (coalesced), so an item is `verified` there only once its output is on the Hub
   summary    $KITSUNE_STATE/queue_summary.json, put at full/box-<box>/queue_summary.json in the runs repo on every item
              start (coalesced: at most one put per summary_min_s) and end, when a training run's dir appears, and at the
              end: a new host's resume reads it (the source of truth of the box's run ids)
@@ -58,6 +61,20 @@ set run gets `sets_once` (schedule.resume_reset=true and its sets), passed on ev
 its resume_reset and a full state after it. Its readout then writes runs/m4-<run_id>-r<N>, so the first one on the Hub
 stays. Exit 0 plan written, 3 refused (no summary, an unknown run id, a state that does not match its checksum, a
 set-only run that is past its cooldown: use --resume-reset), 1 anything transient (bootstrap retries it).
+  done       a train item is done when the box summary says so and its export checkpoints/step_<steps>/ is on the
+             Hub; also when the run's own summary.json is complete with its export there (the box died between the
+             trainer's end and the queue's item-end put), but only when that summary cannot be an earlier run's: no
+             Hub state lies past its steps and, for a continuation, it counts more resume_resets than the run had
+             before it. A readout, eval or speed item is done only when the summary also says `verified` (its out dir,
+             or the speed dir, reached the Hub); the others start fresh
+  continued  a reset or set run is a continuation, recorded in the box summary (items.<n>.continuation: run_id, reset,
+             sets, resume_resets_before). A later plain --resume goes on from the newest Hub state that holds its
+             reset (st.resume_resets past resume_resets_before); when none does yet, the continuation is applied again
+             as it was launched (a reset from the pre_cooldown state, a set from the newest state, with its sets), so
+             a host lost during a continuation never falls back to the first run's end
+  outputs    resume-pull pulls the training runs only; a fresh item that reads an adopted done item's out dir
+             ({out:<item>}), or the first speed item after an adoption (the speed dir's speed.json, which its upload
+             would otherwise replace), pulls that dir from the runs repo first (a quant variant's weights excepted)
 
 Usage (vast/supervise.py runs `run` for KITSUNE_JOB=full; KITSUNE_BOX, KITSUNE_OUT_REPO, KITSUNE_SCRATCH_REPO,
 KITSUNE_STATE from the env):
@@ -260,18 +277,22 @@ def _states_of(listing: dict[str, dict], run_id: str) -> dict[int, dict[str, dic
 
 
 def pull_run(run_id: str, root: Path, runs: Hub, scratch: Hub | None, *, pick: str = "newest",
-             refuse_past_cooldown: bool = False, with_state: bool = True, weights_step: int | None = None) -> dict:
+             refuse_past_cooldown: bool = False, with_state: bool = True, weights_step: int | None = None,
+             min_resets: int | None = None) -> dict:
     """A run as a new host needs it (resume-pull, and the smoke's wipe_run_dir fault): runs/<run_id>/* but its
     checkpoints from the runs repo, then (with_state) one full state into runs/<run_id>/checkpoints/full_step_<N>/
     (downloaded into full_step_<N>.tmp/, every file checked, then renamed):
       pick "newest"        the highest step of the scratch repo's timed state (its pointer, fullrun.pointer_problems)
                            and the runs repo's full_step_<N>/ holding trainer.pt
       pick "pre_cooldown"  the highest runs-repo full_step_<N> whose trainer.json says reason pre_cooldown (a reset)
+    min_resets: only states whose trainer.json counts st.resume_resets >= min_resets (a continuation goes on only from
+    a state that holds its reset; none: no state is pulled, the caller applies the continuation again).
     weights_step: also the export checkpoints/step_<N>/ (a done run whose readout or eval is still to run).
     refuse_past_cooldown: ResumeRefused when the chosen state's trainer.json has st.pre_cooldown_done or
     st.early_stop.triggered (a --resume-set run: epochs cannot be extended past a cooldown without the reset flag).
-    Returns {state, step, source ("scratch" | "runs" | None), kitsune_sha}. ResumeRefused on a malformed pointer, a
-    file that does not match, or pick pre_cooldown without such a state."""
+    Returns {state, step, source ("scratch" | "runs" | None), kitsune_sha, resume_resets (the chosen state's
+    st.resume_resets)}. ResumeRefused on a malformed pointer, a file that does not match, or pick pre_cooldown without
+    such a state."""
     root = Path(root)
     prefix = f"runs/{run_id}"
     stage = root / "cache" / "hub_pull" / f"{run_id}-{time.time_ns()}"
@@ -281,7 +302,7 @@ def pull_run(run_id: str, root: Path, runs: Hub, scratch: Hub | None, *, pick: s
         if src.is_dir():
             shutil.copytree(src, root / prefix, dirs_exist_ok=True)
         (root / prefix).mkdir(parents=True, exist_ok=True)
-        out = dict(state=None, step=None, source=None, kitsune_sha=None)
+        out = dict(state=None, step=None, source=None, kitsune_sha=None, resume_resets=None)
         listing = runs.listing(f"{prefix}/checkpoints") if (with_state or weights_step is not None) else {}
         if weights_step is not None:
             _fetch_files(runs, {p: m for p, m in listing.items()
@@ -304,32 +325,43 @@ def pull_run(run_id: str, root: Path, runs: Hub, scratch: Hub | None, *, pick: s
                               files={f"{base}/{f}": m for f, m in ptr["files"].items()},
                               kitsune_sha=ptr.get("kitsune_sha")))
         states = _states_of(listing, run_id)
+
+        def resets(c) -> int:  # the candidate's st.resume_resets, from its small trainer.json
+            if "tj" not in c:
+                c["tj"] = c["hub"].read_json(f"{c['base']}/trainer.json", stage) or {}
+            return int((c["tj"].get("st") or {}).get("resume_resets") or 0)
+
         for step in sorted(states, reverse=True):
             files = states[step]
             if "trainer.pt" not in files:
                 continue
             base = f"{prefix}/checkpoints/full_step_{step}"
+            c = dict(step=step, source="runs", hub=runs, base=base,
+                     files={f"{base}/{f}": m for f, m in files.items()}, kitsune_sha=None)
             if pick == "pre_cooldown":
-                tj = runs.read_json(f"{base}/trainer.json", stage)
-                if not tj or tj.get("reason") != "pre_cooldown":
+                c["tj"] = runs.read_json(f"{base}/trainer.json", stage) or {}
+                if c["tj"].get("reason") != "pre_cooldown":
                     continue
-            cands.append(dict(step=step, source="runs", hub=runs, base=base,
-                              files={f"{base}/{f}": m for f, m in files.items()}, kitsune_sha=None))
+            if min_resets is not None and resets(c) < min_resets:
+                continue
+            cands.append(c)
             if pick == "pre_cooldown":
                 break  # the highest one
         if pick == "pre_cooldown" and not cands:
             raise ResumeRefused(f"{runs.repo}:{prefix}/checkpoints has no pre_cooldown full state to reset from")
+        if min_resets is not None:
+            cands = [c for c in cands if resets(c) >= min_resets]
         if not cands:
             return out
         best = max(cands, key=lambda c: (c["step"], c["source"] == "runs"))
         dest = root / prefix / "checkpoints" / f"full_step_{best['step']}"
         _fetch_files(best["hub"], best["files"], dest, stage, best["base"] + "/")
-        if refuse_past_cooldown:
-            st = (_read_json(dest / "trainer.json") or {}).get("st") or {}
-            if st.get("pre_cooldown_done") or (st.get("early_stop") or {}).get("triggered"):
-                raise ResumeRefused(f"{run_id}: its newest state ({dest.name}) is past its cooldown or early stop; "
-                                    f"a --resume-set alone cannot extend it: use --resume-reset {run_id}")
-        out.update(state=dest.name, step=best["step"], source=best["source"], kitsune_sha=best["kitsune_sha"])
+        st = (_read_json(dest / "trainer.json") or {}).get("st") or {}
+        if refuse_past_cooldown and (st.get("pre_cooldown_done") or (st.get("early_stop") or {}).get("triggered")):
+            raise ResumeRefused(f"{run_id}: its newest state ({dest.name}) is past its cooldown or early stop; "
+                                f"a --resume-set alone cannot extend it: use --resume-reset {run_id}")
+        out.update(state=dest.name, step=best["step"], source=best["source"], kitsune_sha=best["kitsune_sha"],
+                   resume_resets=int(st.get("resume_resets") or 0))
         return out
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -500,7 +532,7 @@ class FullQueue(Q.Queue):
             if new:
                 self.item(name).update(needs=list(spec["needs"]), of=spec.get("of"), out=None, hb_max_gap_s=None,
                                        stalls=0, peak_rss_gb=None, hub_resume=False, sets_once=[], check_resume=None,
-                                       check_resume_tries=0, held_until=None, why=None)
+                                       check_resume_tries=0, held_until=None, continuation=None, why=None)
         plan_path = Path(self.s.state_dir) / fullrun.RESUME_PLAN
         if self._fresh and plan_path.is_file() and self.state.get("resumed") is None:
             self.adopt(json.loads(plan_path.read_text(encoding="utf-8")))
@@ -514,11 +546,14 @@ class FullQueue(Q.Queue):
         """Seed the items from $KITSUNE_STATE/resume_plan.json (resume-pull on this new host): done items done and
         verified (their run dirs are on the Hub), resumed runs interrupted in their pulled run dir (check-resume
         before their first start), the rest fresh with a new attempt budget. Every reset / set run id (the plan's,
-        and KITSUNE_RESUME_RESET / KITSUNE_RESUME_SETS) gets its sets_once."""
+        and KITSUNE_RESUME_RESET / KITSUNE_RESUME_SETS) gets its sets_once and a `continuation` record (the box
+        summary's: a later resume-pull must not take the first run's complete summary.json for this run's end); a
+        resumed run that is a continuation already keeps the plan's record. A done speed item keeps its speed dir,
+        pulled from the Hub before the next speed item writes into it (_prepare_eval)."""
         if plan.get("box") != self.box:
             raise Q.QueueError(f"{fullrun.RESUME_PLAN} is box {plan.get('box')!r}'s, not {self.box!r}'s")
-        want = {rid: ["schedule.resume_reset=true"]
-                for rid in fullrun.parse_resume_reset(os.environ.get(fullrun.ENV_RESUME_RESET))}
+        env_reset = fullrun.parse_resume_reset(os.environ.get(fullrun.ENV_RESUME_RESET))
+        want = {rid: ["schedule.resume_reset=true"] for rid in env_reset}
         for rid, sets in fullrun.parse_resume_sets(os.environ.get(fullrun.ENV_RESUME_SETS)).items():
             want[rid] = ["schedule.resume_reset=true", *sets]
         seeded = {}
@@ -541,12 +576,29 @@ class FullQueue(Q.Queue):
                     self.event("resume_sets_differ", item=name, plan=sets, env=want[rid])
                 if sets and it["status"] != "done":
                     it["sets_once"] = sets
+                    before = e.get("resume_resets_before")
+                    it["continuation"] = dict(
+                        run_id=rid, reset=bool(e.get("reset")) or rid in env_reset, sets=sets,
+                        resume_resets_before=int(before if before is not None else self._local_resets(it["run_dir"])),
+                        adopted_utc=_now_utc())
+                elif (e.get("continuation") or {}).get("run_id") == rid and it["status"] != "done":
+                    it["continuation"] = dict(e["continuation"])
             if it["kind"] == "speed" and it["status"] == "done" and it["out"] and not self.state["speed_dir"]:
-                self.state["speed_dir"] = dict(run_dir=it["out"], verified=True)
+                self.state["speed_dir"] = dict(run_dir=it["out"], verified=True, adopted=True, pulled=False)
             seeded[name] = it["status"]
         self.state["resumed"] = dict(plan_created_utc=plan.get("created_utc"),
                                      summary_sha256=plan.get("summary_sha256"), items=seeded, wall=time.time())
         self.event("queue_resume_adopted", items=seeded)
+
+    def _local_resets(self, run_dir: str) -> int:
+        """st.resume_resets of the run dir's newest local full state (trainer.json); 0 without one."""
+        ck = self.root / run_dir / "checkpoints"
+        steps = [int(m.group(1)) for p in (ck.iterdir() if ck.is_dir() else ())
+                 if (m := FULL_STATE_RE.match(p.name)) and (p / "trainer.json").is_file()]
+        if not steps:
+            return 0
+        tj = _read_json(ck / f"full_step_{max(steps)}" / "trainer.json") or {}
+        return int((tj.get("st") or {}).get("resume_resets") or 0)
 
     def machine_checks(self):
         """only_if_new_machine: a speed item that re-times what another box timed runs only on another machine
@@ -590,7 +642,9 @@ class FullQueue(Q.Queue):
         self._pending_uploads = [n for n in self.order if self.item(n)["status"] == "done"
                                  and self.item(n)["verified"] is not True and self._upload_dir(n)]
         sd = self.state.get("speed_dir")
-        if sd and sd.get("written") and sd.get("verified") is not True:
+        if sd and ((sd.get("written") and sd.get("verified") is not True) or any(
+                self.item(n)["status"] == "done" and self.item(n)["verified"] is not True
+                for n in self.kind_names("speed"))):
             self._pending_uploads.append(SPEED_DIR_KEY)
         self.event("queue_start", gpus=self.gpus, items=self.order, restart=not self._fresh,
                    adopted=self.state.get("resumed") is not None, registry_sha256=self.registry_sha256)
@@ -598,7 +652,6 @@ class FullQueue(Q.Queue):
         try:
             self.put_summary(force=True)
             self.execute(list(self.order), monitor=self.monitor)
-            self.finish_speed_dir()
             self.drain_uploads()
             self.end_faults()
             rc, status, reason = self.outcome()
@@ -840,14 +893,88 @@ class FullQueue(Q.Queue):
                 return False
         if spec["kind"] == "eval" and not it["out"]:
             it["out"] = f"runs/{name}-{time.strftime(STAMP, time.gmtime())}"
+        why = None
         if spec["kind"] == "speed":
             it["out"] = self.speed_dir()
+            why = self.pull_speed_dir()
+        why = why or self.pull_inputs(name)
+        if why:  # a fresh item never runs on a missing input, nor writes a speed.json that would replace the Hub's
+            self._end(name, "failed", "item_failed", reason=why)
+            return False
         try:  # every placeholder fillable now: a registry template that is not fails this item, not the queue
             self.argv_for(name, it, None)
         except Q.QueueError as e:
             self._end(name, "failed", "item_failed", reason=str(e))
             return False
         return True
+
+    def pull_out_dir(self, rel: str, ignore: tuple[str, ...] = ()) -> str | None:
+        """An out dir that is on the Hub but not on this host (an item done on an earlier host: resume-pull pulls only
+        the training runs) from the runs repo into <root>/<rel> (through a stage dir), under the controller heartbeat;
+        ignore: patterns under it left on the Hub. Why not (None: pulled, or the Hub has no such dir)."""
+        hub = self.runs_hub()
+        if hub is None:
+            return f"{rel} is not on this host and there is no runs repo ({fullrun.ENV_OUT_REPO}) to pull it from"
+        stage = self.root / "cache" / "hub_pull" / f"{Path(rel).name}-{time.time_ns()}"
+        try:
+            with self.ctl_beating():
+                hub.pull_tree(rel, stage, ignore=[f"{rel}/{p}" for p in ignore])
+            found = (stage / rel).is_dir()
+            if found:
+                shutil.copytree(stage / rel, self.root / rel, dirs_exist_ok=True)
+        except Exception as e:  # noqa: BLE001  the item that needs it fails (recorded), never the queue
+            return f"{rel}: not pulled from the runs repo ({type(e).__name__}: {e})"
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        self.event("out_dir_pulled", run_dir=rel, found=found)
+        return None
+
+    def fetch_hub_file(self, rel: str) -> bool:
+        """One runs-repo file into <root>/<rel> (through a stage dir); False when there is no runs repo, no such file,
+        or the download failed (logged)."""
+        hub = self.runs_hub()
+        if hub is None:
+            return False
+        stage = self.root / "cache" / "hub_pull" / f"file-{time.time_ns()}"
+        try:
+            got = hub.download(rel, stage)
+            if got is None:
+                return False
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(got), str(self.root / rel))
+            return True
+        except Exception as e:  # noqa: BLE001  the verdict check then fails with the file missing as its evidence
+            log(f"{rel}: not fetched from the runs repo ({type(e).__name__}: {e})")
+            return False
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+
+    def pull_speed_dir(self) -> str | None:
+        """An adopted speed dir (its done items' records are in the Hub's speed.json) is pulled before the first speed
+        item on this host writes into it: speed_probe merges into an existing --out, and the dir's upload replaces the
+        Hub's speed.json, which would lose those records."""
+        sd = self.state["speed_dir"]
+        if not sd.get("adopted") or sd.get("pulled"):
+            return None
+        why = self.pull_out_dir(sd["run_dir"])
+        if why is None:
+            sd["pulled"] = True
+            self.save()
+        return why
+
+    def pull_inputs(self, name: str) -> str | None:
+        """Every {out:<item>} of the item's argv or args whose item is done but whose out dir is not on this host (done
+        before an adoption), pulled from the runs repo (a quant readout's exported variant/ weights excepted: its
+        readers read the eval outputs). Why not (None: all there)."""
+        spec = self.spec_of(name)
+        for a in [*(spec.get("argv") or []), *(spec.get("args") or [])]:
+            for x in re.findall(r"\{out:([^{}]+)\}", a):
+                src = self.state["items"].get(x) or {}
+                if src.get("status") == "done" and src.get("out") and not (self.root / src["out"]).is_dir():
+                    why = self.pull_out_dir(src["out"], ignore=("variant/*",))
+                    if why:
+                        return why
+        return None
 
     def fetch_weights(self, pairs: list[tuple[str, int]]) -> str | None:
         """Download runs-repo weights (runs/<run_id>/config.json and checkpoints/step_<step>/) into <root>/cache/hub,
@@ -1015,14 +1142,14 @@ class FullQueue(Q.Queue):
             return None
         rd = self.root / it["run_dir"] if it["run_dir"] else (self.find_run_dir(name) if it["attempts"] else None)
         if rd is None or not rd.is_dir():
-            it["run_dir"] = None
+            it["run_dir"], it["continuation"] = None, None
             return None
         ck = rd / "checkpoints"
         if ck.is_dir() and any(FULL_STATE_RE.match(p.name) and (p / "trainer.pt").is_file() for p in ck.iterdir()):
             return rd
         self.set_aside(rd, "no full state to resume from")
         it["run_dir"] = None
-        it["sets_once"] = []  # a fresh start cannot take a reset
+        it["sets_once"], it["continuation"] = [], None  # a fresh start cannot take a reset: a new run, no continuation
         return None
 
     # --------------------------------------------------------------------------------------------- the end
@@ -1077,6 +1204,8 @@ class FullQueue(Q.Queue):
             with open(rd / "events.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps({"kind": "item_done", "item": name, "status": it["status"], "rc": rc,
                                     "wall": time.time(), "box": self.box}) + "\n")
+        if kind == "speed":
+            self.speed_item_ended(name, rc)
         if it["status"] == "done" and kind == "train" and rd is not None:
             self.ensure_attribution(it, rd)
             if it.get("sets_once"):
@@ -1120,7 +1249,8 @@ class FullQueue(Q.Queue):
     def drain_uploads(self, one: bool = False):
         """Upload and verify the finished run dirs, readout and eval out dirs and the speed dir (lean), one per call
         inside the scheduler loop (none while a speed probe runs: it times on an idle host); under the controller
-        heartbeat."""
+        heartbeat. The speed dir's upload verifies every done speed item it carries. Each upload asks for a summary put
+        (coalesced), so the Hub's summary says `verified` once an output is there (resume-pull's rule for done)."""
         if not self._pending_uploads:
             return
         if one and any(self.item(n)["kind"] == "speed" for n in self.procs):
@@ -1130,6 +1260,8 @@ class FullQueue(Q.Queue):
                 name = self._pending_uploads.pop(0)
                 entry = self.state["speed_dir"] if name == SPEED_DIR_KEY else self.item(name)
                 rel = entry["run_dir"] if name == SPEED_DIR_KEY else self._upload_dir(name)
+                covered = [n for n in self.kind_names("speed") if self.item(n)["status"] == "done"
+                           and self.item(n)["verified"] is not True] if name == SPEED_DIR_KEY else []
                 if self.uploader is None or not rel or not (self.root / rel).is_dir():
                     entry["verified"] = None
                 else:
@@ -1137,29 +1269,32 @@ class FullQueue(Q.Queue):
                     if problems:  # once more: a transient Hub error, a commit that raced another writer
                         problems = self.uploader.sync_run(self.root / rel)
                     entry["verified"] = not problems
-                    self.event("item_uploaded", item=name, run_dir=rel, verified=not problems, problems=problems[:20])
+                    for n in covered:  # speed.json holds every speed item done so far
+                        self.item(n)["verified"] = not problems
+                    self.event("item_uploaded", item=name, run_dir=rel, verified=not problems, problems=problems[:20],
+                               **({"speed_items": covered} if name == SPEED_DIR_KEY else {}))
                 self.save()
+                self.put_summary()
                 if one:
                     return
 
-    def finish_speed_dir(self):
-        """After the pool: runs/speed-<box>-<stamp>/events.jsonl (one line per speed item; it makes the dir a run dir
-        for finish.py) and its lean upload."""
-        sd = self.state.get("speed_dir")
-        names = [n for n in self.kind_names("speed") if self.item(n)["attempts"]]
-        if not sd or not names:
-            return
-        d = self.root / sd["run_dir"]
+    def speed_item_ended(self, name: str, rc: int):
+        """A speed item that ran: its line in <speed dir>/events.jsonl (which makes the dir a run dir for finish.py),
+        and the dir's upload queued at once (after the next idle poll), so a record never waits for the end of the
+        pool to reach the Hub. A done speed item is `verified` only once that upload is."""
+        it = self.item(name)
+        d = self.root / self.speed_dir()
+        sd = self.state["speed_dir"]
         d.mkdir(parents=True, exist_ok=True)
         with open(d / "events.jsonl", "a", encoding="utf-8") as f:
-            for n in self.kind_names("speed"):
-                it = self.item(n)
-                f.write(json.dumps({"kind": "speed", "item": n, "system": self.spec_of(n)["system"],
-                                    "status": it["status"], "why": it.get("why"), "wall": time.time()}) + "\n")
-        sd["written"] = True
+            f.write(json.dumps({"kind": "speed", "item": name, "system": self.spec_of(name)["system"],
+                                "status": it["status"], "why": it.get("why"), "rc": rc, "wall": time.time(),
+                                "box": self.box}) + "\n")
+        sd.update(written=True, verified=None)
+        if it["status"] == "done":
+            it["verified"] = None
         if SPEED_DIR_KEY not in self._pending_uploads:
             self._pending_uploads.append(SPEED_DIR_KEY)
-        self.save()
 
     # --------------------------------------------------------------------------------------------- monitor
 
@@ -1438,7 +1573,7 @@ class FullQueue(Q.Queue):
                             of=it.get("of"), gpu=(it["attempts"] or [{}])[-1].get("gpu"), verified=it["verified"],
                             attempts=len(it["attempts"]), hb_max_gap_s=it.get("hb_max_gap_s"),
                             stalls=it.get("stalls"), peak_rss_gb=it.get("peak_rss_gb"), result=it["result"],
-                            why=it.get("why"))
+                            why=it.get("why"), continuation=it.get("continuation"))
         return dict(format=1, kind=fullrun.JOB, box=self.box, status=status, reason=reason, rc=rc, sha=self.s.sha,
                     machine_id=self.s.machine_id, container_id=self.s.container_id, gpus=self.gpus,
                     registry_sha256=self.registry_sha256, deadline=self.box_deadline(),
@@ -1446,7 +1581,8 @@ class FullQueue(Q.Queue):
                     host_mem_peak_gb=self.state.get("host_mem_peak_gb"), items=items,
                     readouts_failed=self.state["readouts_failed"], no_start=self.state["no_start"],
                     not_needed=self.state["not_needed"], faults=self.faults_list(), resumed=self.state.get("resumed"),
-                    speed_dir=(self.state.get("speed_dir") or {}).get("run_dir"))
+                    speed_dir=(self.state.get("speed_dir") or {}).get("run_dir"),
+                    speed_dir_verified=(self.state.get("speed_dir") or {}).get("verified"))
 
     def faults_list(self) -> list[dict]:
         return [dict(id=fs["id"], action=fs["action"], item=fs["item"], fired_at=fs.get("fired_at"),
@@ -1802,9 +1938,13 @@ class SmokeVerdict:
         if "json" not in spec:
             return True, ev
         try:
-            path = self.q.root / self.q.fill(spec["json"], name)
+            rel = self.q.fill(spec["json"], name)
         except Q.QueueError as e:
             return False, dict(ev, error=str(e))
+        path = self.q.root / rel
+        adopted = ((self.q.state.get("resumed") or {}).get("items") or {}).get(name) == "done"
+        if adopted and not path.is_file() and not Path(rel).is_absolute():
+            ev["fetched"] = self.q.fetch_hub_file(rel)  # done on an earlier host: its out dir is on the Hub only
         val = _dig(_read_json(path), spec["path"])
         ev.update(json=self.q._rel(path) if path.exists() else str(path), path=spec["path"], value=val)
         ok = val is not None
@@ -1882,6 +2022,44 @@ def check_resume(run_dir: str) -> int:
     return EXIT_FAIL if res.get("reason") == "store not built" else EXIT_REFUSED
 
 
+def done_on_hub(rid: str, s_it: dict, runs: Hub, scratch: Hub | None, stage: Path) -> tuple[int, dict] | None:
+    """(steps, result) when a train item's run is done on the Hub, else None:
+      - the box summary (the source of truth) says done, and its export checkpoints/step_<steps>/ is on the Hub;
+      - or the box died between the trainer's end and the queue's item-end put: the run's own summary.json is complete
+        with its export there, but only when that summary cannot be an earlier run's. A continuation (--resume-reset /
+        --resume-set) runs in the same run dir, which keeps the first run's complete summary.json (on the Hub too)
+        until the continuation's own end: so no Hub state may lie past its steps (the scratch pointer, a runs-repo
+        full_step_<N>), and when the box summary records a continuation of this run, the summary must count more
+        resume_resets than the run had before it."""
+    res = s_it.get("result") or {}
+    listing = runs.listing(f"runs/{rid}/checkpoints")
+
+    def exported(steps: int) -> bool:
+        return any(p.startswith(f"runs/{rid}/checkpoints/step_{steps}/") for p in listing)
+
+    if s_it.get("status") == "done" and res.get("steps") is not None and exported(int(res["steps"])):
+        return int(res["steps"]), res
+    hub = runs.read_json(f"runs/{rid}/summary.json", stage) or {}
+    if hub.get("status") != "complete" or hub.get("steps") is None:
+        return None
+    steps = int(hub["steps"])
+    cont = s_it.get("continuation") or {}
+    if cont.get("run_id") == rid and int(hub.get("resume_resets") or 0) <= int(cont.get("resume_resets_before") or 0):
+        return None  # the summary of the run the continuation went on from
+    newest = max(_states_of(listing, rid), default=0)
+    try:
+        ptr = scratch.read_json(fullrun.scratch_pointer(rid), stage) if scratch is not None else None
+    except ResumeRefused:
+        ptr = None  # not JSON: pull_run refuses it, if it comes to that
+    if isinstance((ptr or {}).get("step"), int):
+        newest = max(newest, ptr["step"])
+    if newest > steps or not exported(steps):
+        return None  # a state past the summary's end: a later run (a continuation) went on in this run dir
+    return steps, dict(run_id=rid, steps=steps, status="complete", epochs=hub.get("epochs"),
+                       stopped_early=bool(hub.get("stopped_early")), end_reason=hub.get("end_reason"),
+                       resume_resets=int(hub.get("resume_resets") or 0))
+
+
 def resume_pull(box: str, root: Path, *, runs: Hub, scratch: Hub | None, registry: dict, state_dir: Path,
                 reset: list[str] | None = None, sets: dict[str, list[str]] | None = None,
                 sha: str | None = None) -> dict:
@@ -1909,55 +2087,75 @@ def resume_pull(box: str, root: Path, *, runs: Hub, scratch: Hub | None, registr
 
     def entry(it, status, **kw):
         base = dict(kind=it["kind"], status=status, run_dir=None, out=None, result=None, state=None, step=None,
-                    source=None, reset=False, sets=[], steps=None, kitsune_sha=summ.get("sha"))
+                    source=None, reset=False, sets=[], steps=None, kitsune_sha=summ.get("sha"),
+                    resume_resets_before=None, continuation=None)
         base.update(kw)
         entries[it["name"]] = base
+
+    def resume(it, got, **kw):
+        entry(it, "resume", run_dir=f"runs/{rid_of[it['name']]}", state=got["state"], step=got["step"],
+              source=got["source"], kitsune_sha=got["kitsune_sha"] or summ.get("sha"), **kw)
 
     for it in trains:
         name = it["name"]
         s_it = s_items.get(name) or {}
         rid = rid_of.get(name)
-        run_dir = f"runs/{rid}" if rid else None
-        once = ["schedule.resume_reset=true", *sets.get(rid, [])] if rid in special else []
         if rid is None:
             entry(it, "fresh")
             continue
         steps = (s_it.get("result") or {}).get("steps")
+        cont = s_it.get("continuation") if (s_it.get("continuation") or {}).get("run_id") == rid else None
         if rid in reset:
             got = pull_run(rid, root, runs, scratch, pick="pre_cooldown")
-            entry(it, "resume", run_dir=run_dir, state=got["state"], step=got["step"], source=got["source"],
-                  reset=True, sets=once, steps=steps)
+            resume(it, got, reset=True, sets=["schedule.resume_reset=true", *sets.get(rid, [])], steps=steps,
+                   resume_resets_before=got["resume_resets"])
             continue
-        # done on the Hub: the run's own summary.json complete and its export checkpoints/step_<steps>/ there (also
-        # when the box died between the trainer's end and the queue's summary put)
-        hub_summary = runs.read_json(f"runs/{rid}/summary.json", state_dir / "hub_reads") or {}
-        if hub_summary.get("status") == "complete" and hub_summary.get("steps") is not None:
-            steps = int(hub_summary["steps"])
-        done = hub_summary.get("status") == "complete" and steps is not None and \
-            bool(runs.listing(f"runs/{rid}/checkpoints/step_{steps}"))
-        if done and rid not in special:
-            dependants = [x for x in spec["items"] if x.get("of") == name and not x.get("of_box")
-                          and (s_items.get(x["name"]) or {}).get("status") != "done"]
-            pull_run(rid, root, runs, scratch, with_state=False, weights_step=steps if dependants else None)
-            result = s_it.get("result") if s_it.get("status") == "done" and s_it.get("result") else dict(
-                run_id=rid, steps=steps, status="complete", epochs=hub_summary.get("epochs"),
-                stopped_early=bool(hub_summary.get("stopped_early")), end_reason=hub_summary.get("end_reason"),
-                resume_resets=int(hub_summary.get("resume_resets") or 0))
-            entry(it, "done", run_dir=run_dir, result=result, steps=steps)
+        if rid not in special:
+            done = done_on_hub(rid, s_it, runs, scratch, state_dir / "hub_reads")
+            if done is not None:
+                steps, result = done
+                dependants = [x for x in spec["items"] if x.get("of") == name and not x.get("of_box") and not (
+                    (s_items.get(x["name"]) or {}).get("status") == "done"
+                    and (s_items.get(x["name"]) or {}).get("verified") is True)]
+                pull_run(rid, root, runs, scratch, with_state=False, weights_step=steps if dependants else None)
+                entry(it, "done", run_dir=f"runs/{rid}", result=result, steps=steps)
+                continue
+        if cont is not None and rid not in special:
+            # a continuation the host was lost during: on from the newest Hub state that holds its reset
+            before = int(cont.get("resume_resets_before") or 0)
+            got = pull_run(rid, root, runs, scratch, min_resets=before + 1)
+            if got["state"] is not None:
+                resume(it, got, steps=steps, continuation=cont)
+                continue
+            # no Hub state holds the reset yet: the continuation is applied again, as it was launched
+            log(f"{rid}: no Hub state holds its continuation's reset yet; the continuation starts again "
+                f"({'reset' if cont.get('reset') else 'set'} {cont.get('sets')})")
+            if cont.get("reset"):
+                got = pull_run(rid, root, runs, scratch, pick="pre_cooldown")
+            else:
+                got = pull_run(rid, root, runs, scratch, refuse_past_cooldown=True)
+            if got["state"] is None:
+                raise ResumeRefused(f"{rid}: its continuation has no full state on the Hub to start from")
+            resume(it, got, reset=bool(cont.get("reset")), sets=list(cont.get("sets") or []), steps=steps,
+                   resume_resets_before=got["resume_resets"])
             continue
-        got = pull_run(rid, root, runs, scratch, refuse_past_cooldown=rid in sets and rid not in reset)
+        got = pull_run(rid, root, runs, scratch, refuse_past_cooldown=rid in sets)
         if got["state"] is None:
             log(f"warning: {rid} has no full state on the Hub; {name} starts fresh")
             entry(it, "fresh", run_dir=None)
             continue
-        entry(it, "resume", run_dir=run_dir, state=got["state"], step=got["step"], source=got["source"],
-              sets=once, reset=False, steps=steps, kitsune_sha=got["kitsune_sha"] or summ.get("sha"))
-    reopened = {it["name"] for it in trains if rid_of.get(it["name"]) in special}
+        once = ["schedule.resume_reset=true", *sets[rid]] if rid in sets else []
+        resume(it, got, sets=once, steps=steps, resume_resets_before=got["resume_resets"] if once else None)
+    # a readout or eval of a run that goes on (a reset, a set, a lost continuation, a started run) runs again
+    reopened = {it["name"] for it in trains if entries[it["name"]]["status"] != "done"}
     for it in spec["items"]:
         if it["kind"] == "train":
             continue
         s_it = s_items.get(it["name"]) or {}
-        if it["kind"] != "stores" and s_it.get("status") == "done" and it.get("of") not in reopened:
+        # done only with its output verified on the Hub (a readout's or eval's out dir, the speed dir's speed.json);
+        # an item done but not yet uploaded starts fresh
+        if it["kind"] != "stores" and s_it.get("status") == "done" and s_it.get("verified") is True and \
+                it.get("of") not in reopened:
             entry(it, "done", out=s_it.get("out"), run_dir=s_it.get("run_dir"), result=s_it.get("result"))
         else:
             entry(it, "fresh")

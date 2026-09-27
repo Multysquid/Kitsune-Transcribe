@@ -347,9 +347,14 @@ def test_box_full_shares_two_gpus_stores_first_and_the_pool_after_training(fq):
     assert set(got["systems"]) == {"study-t06", "full-t06"} and sd.startswith("runs/speed-full-")
     assert [x for x in sp[sp.index("--per-set"):sp.index("--per-set") + 4]] == ["--per-set", "40", "--seed", "1234"]
     assert sp[sp.index("--out") + 1] == f"{sd}/speed.json" and "--require-idle" in sp
-    assert any(n == Path(sd).name for _, n, _ in up.synced) and st["speed_dir"]["verified"] is True
+    # the speed dir is uploaded after each speed item (a record never waits for the pool's end), one events.jsonl line
+    # per speed item; each done speed item is verified by the upload that carried it
+    assert [n for _, n, _ in up.synced].count(Path(sd).name) == 2 and st["speed_dir"]["verified"] is True
+    assert [e["item"] for e in Q.read_events(fq.root / sd)] == ["speed-full-t06", "speed-study-t06"]
+    assert all(st["items"][n]["verified"] is True for n in ("speed-full-t06", "speed-study-t06"))
     # the summary records every kind's result
     s = fq.summary()
+    assert s["speed_dir_verified"] is True and s["items"]["speed-study-t06"]["verified"] is True
     assert s["items"]["speed-full-t06"]["result"] == {"system": "full-t06", "out": sd}
     assert s["items"]["whisper-small"]["result"]["rc"] == 0 and s["deadline"] == pytest.approx(deadline)
 
@@ -915,11 +920,19 @@ def test_resume_pull_keeps_a_hub_complete_run_done_and_pulls_its_export_for_its_
     # its readout done too: no export pulled
     shutil.rmtree(hubs.root / "runs" / RID)
     box_summary(hubs.runs, "p01", {"full-p01": {"status": "done", "run_dir": f"runs/{RID}", "result": result},
-                                   "m4-full-p01": {"status": "done", "out": f"runs/m4-{RID}", "result": {"m4": 0.1}}})
+                                   "m4-full-p01": {"status": "done", "out": f"runs/m4-{RID}", "result": {"m4": 0.1},
+                                                   "verified": True}})
     plan = hubs.pull()
     assert plan["items"]["m4-full-p01"] == dict(plan["items"]["m4-full-p01"], status="done", out=f"runs/m4-{RID}",
                                                 result={"m4": 0.1})
     assert not (hubs.root / "runs" / RID / "checkpoints").exists()
+    # a readout done but not yet verified on the Hub (the host died before its upload): fresh, the export pulled
+    box_summary(hubs.runs, "p01", {"full-p01": {"status": "done", "run_dir": f"runs/{RID}", "result": result},
+                                   "m4-full-p01": {"status": "done", "out": f"runs/m4-{RID}", "result": {"m4": 0.1},
+                                                   "verified": None}})
+    plan = hubs.pull()
+    assert plan["items"]["m4-full-p01"]["status"] == "fresh" and plan["items"]["full-p01"]["status"] == "done"
+    assert sorted(p.name for p in (hubs.root / "runs" / RID / "checkpoints").iterdir()) == ["step_300"]
     # the box died between the trainer's end and the queue's summary put: the run's own Hub summary says done
     shutil.rmtree(hubs.root / "runs" / RID)
     box_summary(hubs.runs, "p01", {"full-p01": {"status": "running", "run_dir": f"runs/{RID}"}})
@@ -967,6 +980,53 @@ def test_resume_pull_refuses_a_set_only_run_past_its_cooldown_an_unknown_id_and_
     hub_run(hubs.runs, RID, fulls={200: "periodic"}, st={"pre_cooldown_done": False, "early_stop": {}})
     plan = hubs.pull(sets={RID: ["schedule.epochs=6"]})
     assert plan["items"]["full-p01"]["sets"] == ["schedule.resume_reset=true", "schedule.epochs=6"]
+
+
+CONT = {"run_id": RID, "reset": True, "sets": ["schedule.resume_reset=true", "schedule.epochs=6"],
+        "resume_resets_before": 0, "adopted_utc": "2026-09-28T00:00:00+00:00"}
+
+
+def test_resume_pull_goes_on_with_a_lost_continuation_never_from_the_first_runs_end(fq, hubs):
+    """A continuation (--resume-reset / --resume-set) runs in the first run's dir, whose complete summary.json and
+    export stay on the Hub until the continuation's own end. A host lost during it must not plan the run done at the
+    first run's end."""
+    first = {"status": "complete", "run_id": RID, "steps": 300, "epochs": 4.0, "stopped_early": None,
+             "end_reason": "schedule", "resume_resets": 0}
+    hub_run(hubs.runs, RID, fulls={240: "pre_cooldown"}, step_export=300, st={"resume_resets": 0})
+    hubs.runs.commit({f"runs/{RID}/summary.json": json.dumps(first).encode()}, writer="t")
+    # no continuation record, but a state past the summary's end (the review's case): not done, on from that state
+    box_summary(hubs.runs, "p01", {"full-p01": {"status": "running", "run_dir": f"runs/{RID}"},
+                                   "m4-full-p01": {"status": "pending"}})
+    scratch_state(hubs.scratch, RID, 400, st={"resume_resets": 1})
+    e = hubs.pull()["items"]["full-p01"]
+    assert (e["status"], e["state"], e["source"], e["sets"]) == ("resume", "full_step_400", "scratch", [])
+    # the box summary records the continuation: its reset reached the Hub (a timed state counting resume_resets 1),
+    # below the first run's end this time: on from there, no reset again, the record carried to the next host
+    shutil.rmtree(hubs.root / "runs" / RID)
+    box_summary(hubs.runs, "p01", {"full-p01": {"status": "running", "run_dir": f"runs/{RID}", "continuation": CONT},
+                                   "m4-full-p01": {"status": "pending"}})
+    scratch_state(hubs.scratch, RID, 260, st={"resume_resets": 1})
+    plan = hubs.pull()
+    e = plan["items"]["full-p01"]
+    assert (e["status"], e["state"], e["source"], e["reset"], e["sets"]) == ("resume", "full_step_260", "scratch",
+                                                                             False, [])
+    assert e["continuation"] == CONT and plan["items"]["m4-full-p01"]["status"] == "fresh"
+    # no Hub state holds the reset yet (the scratch repo still has the first run's last timed state): the continuation
+    # is applied again as it was launched, from the pre_cooldown state with its sets
+    shutil.rmtree(hubs.root / "runs" / RID)
+    scratch_state(hubs.scratch, RID, 290, st={"resume_resets": 0, "pre_cooldown_done": True})
+    e = hubs.pull()["items"]["full-p01"]
+    assert (e["status"], e["state"], e["source"], e["reset"]) == ("resume", "full_step_240", "runs", True)
+    assert e["sets"] == CONT["sets"] and e["resume_resets_before"] == 0 and e["continuation"] is None
+    # the continuation ended (its summary counts the reset) before the queue's item-end put: done at its own end
+    shutil.rmtree(hubs.root / "runs" / RID)
+    hubs.runs.commit({f"runs/{RID}/summary.json": json.dumps(dict(first, steps=450, epochs=6.0,
+                                                                   resume_resets=1)).encode(),
+                      f"runs/{RID}/checkpoints/step_450/model.safetensors": b"export2"}, writer="t")
+    scratch_state(hubs.scratch, RID, 440, st={"resume_resets": 1})
+    e = hubs.pull()["items"]["full-p01"]
+    assert (e["status"], e["steps"], e["result"]["resume_resets"], e["result"]["steps"]) == ("done", 450, 1, 450)
+    assert sorted(p.name for p in (hubs.root / "runs" / RID / "checkpoints").iterdir()) == ["step_450"]
 
 
 def test_resume_pull_cli_exit_codes(fq, hubs, monkeypatch):
@@ -1089,6 +1149,82 @@ def test_a_reset_run_keeps_its_sets_until_the_state_after_the_reset_and_reads_ou
     ro = fq.records("readout")[0]["argv"]
     assert ro[ro.index("--out") + 1] == f"runs/m4-{RID}-r1"
     assert fq.events("resume_reset_applied")[0]["item"] == "full-p01"
+    # the continuation record, in the box summary from its first put on (a later resume-pull reads it): the run's
+    # resume_resets before it from the pulled state's trainer.json (the plan here does not carry it)
+    cont = it["continuation"]
+    assert cont == dict(cont, run_id=RID, reset=True, sets=["schedule.resume_reset=true"], resume_resets_before=0)
+    assert fq.summary()["items"]["full-p01"]["continuation"] == cont
+
+
+def test_adoption_carries_a_continuation_record_of_the_plan(fq):
+    local_run(fq.root, RID, 10, st={"resume_resets": 1})
+    write_plan(fq, {"full-p01": {"status": "resume", "run_dir": f"runs/{RID}", "continuation": CONT}})
+    q = fq.make("p01")
+    q.register()
+    assert q.item("full-p01")["continuation"] == CONT and q.item("full-p01")["sets_once"] == []
+    assert q.summary("running", None, None)["items"]["full-p01"]["continuation"] == CONT
+
+
+def test_adoption_pulls_the_speed_dir_before_the_next_speed_item_merges_into_it(fq):
+    hub = DirHub.create(fq.tmp / "runs-hub", limit=100000, window_s=1.0)
+    sd = "runs/speed-full-smoke-20260927T000000Z"
+    hub.commit({f"{sd}/speed.json": json.dumps({"systems": {"study-p01": {"kind": "ctc", "rtf": 0.02}}}).encode(),
+                f"{sd}/events.jsonl": (json.dumps({"kind": "speed", "item": "speed-study-p01"}) + "\n").encode()},
+               writer="setup")
+    write_plan(fq, {"speed-study-p01": {"status": "done", "out": sd, "result": {"system": "study-p01", "out": sd}},
+                    "speed-cohere": {"status": "fresh"}}, box="full-smoke")
+    up = FakeUploader()
+    q = fq.make("full-smoke", registry=box_only(fq.reg, "full-smoke", keep=["speed-study-p01", "speed-cohere"]),
+                uploader=up, runs_hub=F.Hub("u/runs", api=FakeApi(hub, "q")))
+    assert q.run() == F.EXIT_OK
+    got = json.loads((fq.root / sd / "speed.json").read_text(encoding="utf-8"))
+    assert set(got["systems"]) == {"study-p01", "cohere"}  # merged into the Hub's speed.json, which the upload replaces
+    assert [e["item"] for e in Q.read_events(fq.root / sd)] == ["speed-study-p01", "speed-cohere"]
+    assert [e["run_dir"] for e in fq.events("out_dir_pulled")] == [sd] and [n for _, n, _ in up.synced] == [
+        Path(sd).name]
+    st = fq.st()
+    assert st["items"]["speed-cohere"]["verified"] is True and st["items"]["speed-study-p01"]["verified"] is True
+    assert [x["item"] for x in fq.records()] == ["speed-cohere"]
+
+
+def test_a_fresh_item_pulls_the_out_dirs_of_adopted_items_it_reads(fq):
+    """smoke-b's compare after an adoption: the quant and in-memory readouts it compares were done on the lost host;
+    their out dirs come from the runs repo first (the exported variant weights stay there). The verdict reads an
+    adopted item's own JSON from the Hub too."""
+    hub = DirHub.create(fq.tmp / "runs-hub", limit=100000, window_s=1.0)
+    qd, md = "runs/quant-int8-w8a8-study-p03-20260927T000000Z", "runs/mem-int8-w8a8-study-p03-20260927T000000Z"
+    hub.commit({f"{qd}/study.json": b'{"system": "study-p03@int8-w8a8"}', f"{qd}/variant/model.safetensors": b"w" * 64,
+                f"{qd}/tables/study-p03@int8-w8a8/eval_jsut.parquet": b"t", f"{md}/study.json": b'{"system": "x"}'},
+               writer="setup")
+    names = ["quant-int8-w8a8-study-p03", "mem-int8-w8a8-study-p03", "cmp-int8-w8a8-study-p03"]
+    write_plan(fq, {names[0]: {"status": "done", "out": qd, "result": {"out": qd, "rc": 0}},
+                    names[1]: {"status": "done", "out": md, "result": {"out": md, "rc": 0}},
+                    names[2]: {"status": "fresh"}}, box="smoke-b")
+    reg = set_item(box_only(fq.reg, "smoke-b", keep=names), "smoke-b", names[2], argv=[  # the fake eval's --out
+        "{python}", FAKE, "eval", f"{{out:{names[0]}}}", f"{{out:{names[1]}}}", "--out", "{out}"])
+    runs_hub = F.Hub("u/runs", api=FakeApi(hub, "q"))
+    env = dict(FAKE_WRITES=json.dumps({names[2]: {"compare.json": {"same": True}}}))
+    assert fq.make("smoke-b", registry=reg, env=env, runs_hub=runs_hub).run() == F.EXIT_OK
+    assert (fq.root / qd / "study.json").is_file() and (fq.root / qd / "tables").is_dir()
+    assert not (fq.root / qd / "variant").exists() and (fq.root / md / "study.json").is_file()
+    argv = fq.records("eval")[0]["argv"]
+    assert qd in argv and md in argv and fq.st()["items"][names[2]]["status"] == "done"
+    v = json.loads((fq.state / fullrun.VERDICT_FILE).read_text(encoding="utf-8"))
+    assert v["overall"] == "pass" and v["checks"]["14"]["pass"] is True
+    # the compare itself adopted done on the next host: the verdict fetches its compare.json from the Hub
+    cd = fq.st()["items"][names[2]]["out"]
+    hub.commit({f"{cd}/compare.json": b'{"same": true}'}, writer="q")
+    state2 = fq.tmp / "state2"
+    (state2).mkdir()
+    shutil.copy(fq.state / fullrun.RESUME_PLAN, state2 / fullrun.RESUME_PLAN)
+    plan = json.loads((state2 / fullrun.RESUME_PLAN).read_text())
+    plan["items"][names[2]] = {"status": "done", "out": cd, "result": {"out": cd, "rc": 0}}
+    (state2 / fullrun.RESUME_PLAN).write_text(json.dumps(plan))
+    shutil.rmtree(fq.root / cd)
+    q = fq.make("smoke-b", registry=reg, state_dir=state2, runs_hub=runs_hub)
+    q.register()
+    c14 = F.SmokeVerdict(q).build()["checks"]["14"]
+    assert c14["pass"] is True and c14["evidence"][0]["fetched"] is True
 
 
 # ===================================================================================================== CLI
