@@ -975,6 +975,8 @@ def test_the_dev_split_frame_store_reads_its_rows_train_shards(big, monkeypatch)
         assert st.targets(i).n_frames == trainset.ctc_frames(n_samples(fc.utts[st.utts[i].id].audio))
     two = planted_parakeet_out(fc, big["root"] / "po_dev_two", unique_length(fc, df["id"][dev].tolist())[:2],
                                monkeypatch)
-    with pytest.raises(trainset.FramePreflightFailed, match=r"dev 2/\d+; train share 0\.000 %, dev share [1-9]"):
+    with pytest.raises(trainset.FramePreflightFailed, match=r"dev 2/\d+; train share 0\.000 %, dev share ") as e:
         trainset.build_frame_stores(sel, fc.data, two.root, big["root"] / "cache" / "dev_two", ["src_big"], ["dev"],
                                     log=lambda s: None)
+    frac = e.value.report["dev_mismatch_frac"]
+    assert frac == 2 / int(dev.sum()) > 0.001 and f"dev share {100 * frac:.3f} %, limit 0.1 % each" in str(e.value)
