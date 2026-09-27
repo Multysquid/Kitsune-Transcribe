@@ -809,7 +809,8 @@ What launch checks and decides, before anything is rented:
 bootstrap.sh (job full) runs, in order: **download_gate** (`python -m kitsune.netgate`: three pinned upstream files,
 ~2.5 GB, downloaded as 01 downloads them; a host that could not pull 571.2 GB in `KITSUNE_GATE_MAX_H` hours, 31.7 MB/s at
 5 h, is refused with exit 3 after at most ~3 minutes, and a pass sets the label pull's and the rebuild's per-attempt
-timeouts from the measured rate, the rebuild's never below launch's 40 MB/s sizing), **plan** (also the scratch repo's
+timeouts from the measured rate, the rebuild's never below launch's 40 MB/s sizing; hf_xet's chunk cache is off and
+its cache dir the gate's own, so a retried gate times the link again, never the disk), **plan** (also the scratch repo's
 token check), **pull_derived** (everything but the labels: the meta files, the selection, the registry's students,
 extra files and dirs), **resume_pull** (`--resume` only), **check_students** (`python -m kitsune.fullrun
 check-students`), **pull_labels** in the background while **rebuild_audio** (01 `--extent-config`) runs, then
@@ -864,5 +865,7 @@ A dead or stopped box continues elsewhere from what the Hub has:
   state. `--resume-set <run_id>:schedule.epochs=<E>` (repeatable; `KITSUNE_RESUME_SETS`): resume with another epoch
   count (the only key allowed). Both imply `--resume`.
 - launch refuses a box whose Hub summary is missing and a reset/set id that no train item of the box ran, prints what
-  will resume with the newest state step it can see (scratch and runs repo), and warns about a live
-  `kitsune-full-<box>*` instance: destroy the old box first, two boxes must never write the same run dirs.
+  will resume with the newest state step it can see (scratch and runs repo), and warns about a live instance with
+  the box's own label prefix `kitsune-full-<box>-<data config stem>-` (not `kitsune-full-<box>*`, which for box `full`
+  would also match the smoke box's `kitsune-full-full-smoke-...`): destroy the old box first, two boxes must never
+  write the same run dirs.
