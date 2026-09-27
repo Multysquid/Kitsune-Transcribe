@@ -1,7 +1,9 @@
 """tools/full_report.py: the full-data runs' report (CONTRACT.md 10), on synthetic inputs shaped exactly like what the
 full box writes: 05_evaluate --out readouts (study.json with WP5's quant / weights blocks, tables/<system>/<set>.parquet
 or only greedy_<set>.parquet, summary.json's tf.sets KL), whisper_eval dirs (whisper.json, greedy parquets without
-teacher_hyp), speed_probe files from several runs/speed-*/ dirs and machines, and the trainer's summary.json.
+teacher_hyp), speed_probe files from several runs/speed-*/ dirs and machines (the wave-1 records with only
+versions.host, as smoke A writes them, and the full boxes' queue summaries that give their machine), and the
+trainer's summary.json.
 
 Two worlds. The TEXT world scores real ref / hyp strings (kitsune.evaluate.utterance_table), so the metrics, the
 hallucination and kana counts can be checked against sums taken here by hand. The PLANTED world reuses
@@ -13,6 +15,7 @@ import json
 import math
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -116,14 +119,27 @@ def greedy_frames(ids, refs, hyps, *, duration=5.0, n_tok=10, durations=None, tr
     return out
 
 
-def srec(rtf, *, machine="m54650", gpu="NVIDIA GeForce RTX 5090", p50_s=None, tokens=None, t=T0, kind="ctc",
-         **kw) -> dict:
-    """A tools/speed_probe.py record."""
+def srec(rtf, *, machine="m54650", host="c0ffee", gpu="NVIDIA GeForce RTX 5090", p50_s=None, tokens=None, t=T0,
+         kind="ctc", **kw) -> dict:
+    """A tools/speed_probe.py record. machine=None: the wave-1 speed_probe's versions (the container host only; WP6
+    adds machine_id), as smoke A writes them."""
     p50 = rtf * 40 if p50_s is None else p50_s
+    versions = dict(host=host) if machine is None else dict(host=host, machine_id=machine)
     return dict(kind=kind, rtf=rtf, p50_s=p50, p95_s=1.2 * p50, vram_peak_reserved_bytes=3_000_000_000,
                 vram_peak_reserved_bytes_1=800_000_000, vram_gb=3.0, weights_bytes=600_000_000,
-                params_total=300_000_000, tokens_per_utt=tokens, gpu=gpu,
-                versions=dict(host="c0ffee", machine_id=machine), time_utc=t, **kw)
+                params_total=300_000_000, tokens_per_utt=tokens, gpu=gpu, versions=versions, time_utc=t, **kw)
+
+
+def queue_summary(path: Path, box: str, machine_id: str, started_utc: str, speed_dir: str | None = None) -> Path:
+    """A full box's full/box-<box>/queue_summary.json (CONTRACT.md 5): machine_id, started (unix seconds) and the
+    speed item's out dir."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    items = {"speed-study-p03": dict(kind="speed", status="done", out=speed_dir,
+                                     result=dict(system="study-p03", out=speed_dir))} if speed_dir else {}
+    started = datetime.fromisoformat(started_utc).timestamp()
+    path.write_text(json.dumps(dict(format=1, kind="full", box=box, status="complete", machine_id=machine_id,
+                                    started=started, items=items)), encoding="utf-8")
+    return path
 
 
 def write_speed(path: Path, ids: list[str], systems: dict) -> Path:
@@ -522,22 +538,36 @@ def test_kl_study_to_full_and_quant_sections(world):
     assert "torch.compile records" in md and "study-p03@int8-w8a8+compile" in md
 
 
+def wp5_bytes(deployable: int) -> dict:
+    """study.json quant.weights_bytes as WP5 writes it (the recipe's bytes; kitsune.quant.weight_bytes minus
+    resident)."""
+    return dict(deployable=deployable, quantized=deployable // 4, kept=deployable - deployable // 4)
+
+
 def test_duplicate_readouts_and_tables_precedence(world, tmp_path):
-    """One system found twice: complete beats partial, real beats simulated, then the newest; a --tables system
-    beats a readout of its name."""
+    """One system found twice: complete beats partial, real beats simulated (each on its own), a readout of the
+    exported file beats a newer one scored from memory (smoke B's quant-* then mem-* of study-p03@<fmt>), then the
+    newest; a --tables system beats a readout of its name. A variant scored only from memory takes WP5's
+    quant.weights_bytes.deployable, never its bf16 checkpoint's weights.file_bytes."""
     t, ids, refs = world["T"], world["ids"], world["refs"]
     pull = tmp_path / "runs"
-    q = dict(format="int8-w8a8", base_system="study-p03", impl="torchao", file_bytes=1)
+    q = dict(format="int8-w8a8", base_system="study-p03", impl="torchao", simulated=False,
+             weights_bytes=wp5_bytes(318_000_000))
     older = text_table(ids, refs, noisy(refs, 0.1, 40))
     newer = text_table(ids, refs, noisy(refs, 0.11, 41))
-    write_readout(pull, "quant-a", "study-p03@int8-w8a8", older, time_utc="2026-10-01T00:00:00+00:00", quant=q)
-    # scored from memory (05 --quant on the bf16 checkpoint): no file of its own, weights are the bf16 export's
-    mem = dict(q, file_bytes=None, weights_bytes=312_000_000, source="memory")
+    write_readout(pull, "quant-a", "study-p03@int8-w8a8", older, time_utc="2026-10-01T00:00:00+00:00",
+                  quant=dict(q, source="file", file_bytes=320_000_000))
+    # scored from memory (05 --quant on the bf16 checkpoint), later: no file of its own, weights are the bf16 export's
+    mem = dict(q, source="memory", file_bytes=None, weights_bytes=wp5_bytes(312_000_000))
     write_readout(pull, "mem-b", "study-p03@int8-w8a8", newer, time_utc="2026-10-02T00:00:00+00:00", quant=mem,
                   weights=dict(path="ckpt", file_bytes=617_000_000))
     partial = newer[newer["set"].isin(["eval_jsut", "eval_cv8"])]
     write_readout(pull, "emu", "study-p03@int8-w8a8", partial, time_utc="2026-10-09T00:00:00+00:00",
-                  quant=dict(q, impl="emulate"))
+                  quant=dict(q, source="file", impl="emulate", simulated=True))  # partial AND simulated
+    write_readout(pull, "emu-all", "study-p03@int8-w8a8", newer, time_utc="2026-10-09T00:00:00+00:00",
+                  quant=dict(q, source="file", impl="emulate", simulated=True))  # complete: simulated alone loses
+    write_readout(pull, "mem-fp16", "study-p03@fp16", newer, time_utc="2026-10-02T00:00:00+00:00",
+                  quant=dict(mem, format="fp16"), weights=dict(path="ckpt", file_bytes=617_000_000))
     write_readout(pull, "shadow", "study-p03", t["cohere"], time_utc="2026-10-09T00:00:00+00:00")
     write_readout(pull, "empty", "orphan")  # no tables and no greedy parquets: ignored, listed
     write_tables(tmp_path / "tables", {"study-p03": t["study-p03"], "parakeet-ctc": t["parakeet-ctc"]})
@@ -545,16 +575,196 @@ def test_duplicate_readouts_and_tables_precedence(world, tmp_path):
                    "--readouts", pull, "--boot-b", 200], tmp_path / "out")
     assert rc == 0
     inp = rep["inputs"]
-    assert Path(inp["readouts_read"]["study-p03@int8-w8a8"]).name == "mem-b"
-    sup = {Path(s["dir"]).name for s in inp["readouts_superseded"]}
-    assert sup == {"quant-a", "emu", "shadow"} and "study-p03" not in inp["readouts_read"]
+    assert Path(inp["readouts_read"]["study-p03@int8-w8a8"]).name == "quant-a"
+    sup = {Path(s["dir"]).name: s for s in inp["readouts_superseded"]}
+    assert set(sup) == {"mem-b", "emu", "emu-all", "shadow"} and "study-p03" not in inp["readouts_read"]
+    assert sup["emu-all"]["complete"] and sup["emu-all"]["simulated"] and not sup["mem-b"]["file_scored"]
     assert [Path(i["path"]).parent.name for i in inp["readouts_ignored"]] == ["empty"]
     assert rep["systems"]["study-p03"]["metrics"]["m4"] == pytest.approx(
         np.mean([hand_cer(t["study-p03"], s) for s in ("eval_jsut", "eval_cv8", "eval_reazon")]
                 + [hand_cer(t["study-p03"], "galgame", world["manifest"]["galgame_views"]["neutral"])]))
     v = rep["systems"]["study-p03@int8-w8a8"]
-    assert v["display"] == "P-0.3B study INT8 W8A8"
-    assert v["file_bytes"] == 312_000_000 and v["file_bytes_from"] == "in-memory (quant.weights_bytes)"
+    assert v["display"] == "P-0.3B study INT8 W8A8" and v["metrics"]["m4"] == pytest.approx(
+        np.mean([hand_cer(older, s) for s in ("eval_jsut", "eval_cv8", "eval_reazon")]
+                + [hand_cer(older, "galgame", world["manifest"]["galgame_views"]["neutral"])]))
+    assert v["file_bytes"] == 320_000_000 and v["file_bytes_from"] == "quant.file_bytes"
+    f = rep["systems"]["study-p03@fp16"]
+    assert f["file_bytes"] == 312_000_000 and f["file_bytes_from"] == "in-memory (quant.weights_bytes)"
+    assert next(r for r in rep["offer"]["rows"] if r["system"] == "study-p03@fp16")["file_bytes"] == 312_000_000
+
+
+SMOKE_A = "speed-full-smoke-20261001T000000Z"
+SMOKE_B = "speed-smoke-b-20261002T000000Z"
+
+
+def test_speed_groups_from_queue_summaries(world, tmp_path, capsys):
+    """Smoke A times the bf16 rows with the wave-1 speed_probe (versions.host only: the container's name) and smoke B
+    the variants and Whisper with machine_id, on ONE machine (smoke B's bf16 re-time is then not_needed). The box's
+    queue summary gives smoke A's machine: one group, every bf16 row and teacher drawn. Without a summary that
+    covers smoke A (the box launched again later, elsewhere) its host is its own group (S3, the check says why);
+    --machine-of, or an explicit --queue-summaries naming the dir, resolves it."""
+    t, ids, refs = world["T"], world["ids"], world["refs"]
+    root = tmp_path / "pull"
+    runs = root / "runs"
+    write_tables(tmp_path / "tables", {s: t[s] for s in ("cohere", "parakeet-ctc", "parakeet-tdt", "study-p03",
+                                                         "study-t06")})
+    write_readout(runs, f"m4-full-p03-{STAMP}", "full-p03", t["full-p03"], family="ctc")
+    sp_ids = world["sp_ids"]
+    a = dict(machine=None, host="c-7f3a9e1b2", t="2026-10-01T06:00:00+00:00")
+    b = dict(host="c-0b5e", t="2026-10-02T03:00:00+00:00")
+    speed = [
+        write_speed(runs / SMOKE_A / "speed.json", sp_ids, {
+            "study-p03": srec(0.0004, **a), "study-t06": srec(0.001, kind="aed", tokens=10.0, **a),
+            "parakeet-ctc": srec(0.0005, **a), "parakeet-tdt": srec(0.0006, **a),
+            "cohere": srec(0.002, kind="cohere", **a)}),
+        write_speed(runs / SMOKE_B / "speed.json", sp_ids, {
+            "study-p03@int8-w8a8": srec(0.00045, **b), "study-p03@nvfp4-w4a4": srec(0.0005, **b),
+            "study-t06@int8-w8a8": srec(0.0009, **b), "study-t06@nvfp4-w4a4": srec(0.0009, **b),
+            "whisper-large-v3": srec(0.004, kind="whisper", **b), "kotoba-whisper-v2.0": srec(0.002, **b)})]
+    hub = queue_summary(root / "full" / "box-full-smoke" / "queue_summary.json", "full-smoke", "m54650",
+                        "2026-10-01T00:00:00+00:00", f"runs/{SMOKE_A}")
+    base = ["--manifest", world["man"], "--prereg", "none", "--tables", tmp_path / "tables", "--readouts", runs,
+            "--speed", *speed, "--boot-b", 200]
+
+    rc, rep = run(base, tmp_path / "o1")  # the summary at the runs repo's layout is read without the flag
+    assert rc == 0
+    sg = rep["speed_groups"]
+    assert list(sg["groups"]) == [PRIMARY] and sg["primary"] == PRIMARY
+    assert sg["groups"][PRIMARY]["machine_from"] == sorted([f"queue summary {hub}", "versions.machine_id"])
+    assert rep["inputs"]["queue_summaries"] == [str(hub)]
+    sysd = rep["systems"]
+    assert sysd["study-p03"]["speed"]["flags"] == [] and sysd["full-p03"]["speed"]["flags"] == ["S1"]
+    assert sysd["cohere"]["speed"]["machine_from"] == f"queue summary {hub}"
+    drawn = {p["system"] for p in rep["chart"]["points"] if p["drawn"]}
+    assert drawn == {"cohere", "parakeet-ctc", "parakeet-tdt", "full-p03", "study-t06"}  # study-p03: as full-p03
+    assert next(c for c in rep["checks"] if c["rule"] == "speed_groups")["status"] == "pass"
+
+    # box full-smoke launched again on another machine later: its summary now says m77777, started after smoke A's
+    # records were timed, so it does not cover them
+    queue_summary(hub, "full-smoke", "m77777", "2026-10-01T12:00:00+00:00", "runs/speed-full-smoke-20261001T120000Z")
+    rc, rep = run(base, tmp_path / "o2")
+    host = "c-7f3a9e1b2 / NVIDIA GeForce RTX 5090"
+    assert rc == 0 and set(rep["speed_groups"]["groups"]) == {PRIMARY, host}
+    assert rep["speed_groups"]["groups"][host]["machine_from"] == ["versions.host"]
+    assert rep["systems"]["study-p03"]["speed"]["flags"] == ["S3"]
+    chk = next(c for c in rep["checks"] if c["rule"] == "speed_groups")
+    assert chk["status"] == "fail" and "keyed by a container host" in chk["detail"]
+
+    for extra, where in ((["--machine-of", "c-7f3a9e1b2=m54650"], "--machine-of c-7f3a9e1b2"),
+                         (["--machine-of", f"{SMOKE_A}=m54650"], f"--machine-of {SMOKE_A}")):
+        rc, rep = run(base + extra, tmp_path / "o3")
+        assert rc == 0 and list(rep["speed_groups"]["groups"]) == [PRIMARY]
+        assert rep["systems"]["study-p03"]["speed"]["machine_from"] == where
+    # the first launch's summary kept elsewhere (the infra dir, a copy): it names smoke A's dir and started before it
+    first = queue_summary(tmp_path / "kept" / "box-full-smoke" / "queue_summary.json", "full-smoke", "m54650",
+                          "2026-10-01T00:00:00+00:00", f"runs/{SMOKE_A}")
+    rc, rep = run(base + ["--queue-summaries", tmp_path / "kept"], tmp_path / "o4")
+    assert rc == 0 and list(rep["speed_groups"]["groups"]) == [PRIMARY]
+    assert rep["systems"]["study-p03"]["speed"]["machine_from"] == f"queue summary {first}"
+    rc, _ = run(base + ["--machine-of", "c-7f3a9e1b2"], tmp_path / "o5")
+    assert rc == 2 and "expected NAME=MACHINE_ID" in capsys.readouterr().err
+
+
+def test_s2_retime_keeps_variants_on_the_bf16_basis_and_chart_twins(world, tmp_path):
+    """S2: the bf16 full-t06 row AND its variant take box full's bf16 re-time ratio (the variant decodes the same
+    tokens), so "x bf16 speed" and the chart's join compare one basis; each keeps its record's own numbers. A study
+    row hides behind its full-data twin only when that twin is drawn: an emulated full variant leaves its timed study
+    variant on the chart."""
+    t, ids, refs = world["T"], world["ids"], world["refs"]
+    runs = tmp_path / "runs"
+    write_tables(tmp_path / "tables", {s: t[s] for s in ("cohere", "parakeet-ctc", "study-p03", "study-t06")})
+    h = noisy(refs, 0.095, 26)
+    write_readout(runs, "m4-full-t06", "full-t06", greedy=greedy_frames(ids, refs, h, n_tok=15), family="aed")
+    write_readout(runs, "quant-int8-w8a8-full-t06", "full-t06@int8-w8a8", text_table(ids, refs, h), family="aed",
+                  quant=dict(format="int8-w8a8", impl="torchao", simulated=False, source="file",
+                             base_system="full-t06", file_bytes=700_000_000))
+    write_readout(runs, "m4-full-p03", "full-p03", t["full-p03"], family="ctc")
+    write_readout(runs, "quant-nvfp4-w4a4-full-p03", "full-p03@nvfp4-w4a4", text_table(ids, refs, noisy(refs, .09, 6)),
+                  family="ctc", quant=dict(format="nvfp4-w4a4", impl="emulate", simulated=True, source="file",
+                                           base_system="full-p03", file_bytes=180_000_000))
+    write_readout(runs, "quant-nvfp4-w4a4-study-p03", "study-p03@nvfp4-w4a4",
+                  text_table(ids, refs, noisy(refs, .095, 7)), family="ctc",
+                  quant=dict(format="nvfp4-w4a4", impl="torchao", simulated=False, source="file",
+                             base_system="study-p03", file_bytes=180_000_000))
+    sp_ids = world["sp_ids"]
+    speed = [
+        write_speed(runs / SMOKE_B / "speed.json", sp_ids, {
+            "study-t06": srec(0.001, tokens=10.0, kind="aed"), "study-t06@int8-w8a8": srec(0.0008, kind="aed"),
+            "study-p03": srec(0.0004), "study-p03@nvfp4-w4a4": srec(0.0003), "parakeet-ctc": srec(0.0005),
+            "cohere": srec(0.002, kind="cohere")}),
+        write_speed(runs / "speed-full-20261005T000000Z" / "speed.json", sp_ids, {
+            "full-t06": srec(0.003, machine="m99999", p50_s=0.09, kind="aed"),
+            "study-t06": srec(0.002, machine="m99999", p50_s=0.06, kind="aed")})]
+    rc, rep = run(["--manifest", world["man"], "--prereg", "none", "--tables", tmp_path / "tables", "--readouts",
+                   runs, "--speed", *speed, "--boot-b", 200], tmp_path / "out")
+    assert rc == 0
+    sp = {s: v["speed"] for s, v in rep["systems"].items()}
+    for s, rtf, p50 in (("full-t06", 0.001, 0.04), ("full-t06@int8-w8a8", 0.0008, 0.032)):
+        assert sp[s]["flags"] == ["S1", "S2"] and sp[s]["drift"]["drift"] == pytest.approx(0.5)
+        assert sp[s]["rtf"] == pytest.approx(rtf * 1.5) and sp[s]["p50_ms"] == pytest.approx(1000 * p50 * 1.5)
+        assert sp[s]["unscaled"]["rtf"] == pytest.approx(rtf) and sp[s]["retime"]["full"] == "full-t06"
+    assert "applied to the variant" in sp["full-t06@int8-w8a8"]["retime"]["note"]
+    md = (tmp_path / "out" / "report.md").read_text(encoding="utf-8")
+    quant = md[md.index("## Quantisation"):md.index("## Charts")].splitlines()
+    head = next(ln for ln in quant if ln.startswith("| variant |"))
+    row = next(ln for ln in quant if ln.startswith("| T-0.6B full INT8 W8A8 |"))
+    col = [c.strip() for c in head.split("|")].index("x bf16 speed")
+    assert row.split("|")[col].strip() == "1.25"  # 0.001 / 0.0008: the study weights' own ratio
+    svg = (tmp_path / "out" / "chart_error_vs_speed.svg").read_text(encoding="utf-8")
+    assert svg.count('class="j s-cohere"') == 1  # the variant joined to its re-timed bf16 point
+    pts = {p["system"]: p for p in rep["chart"]["points"]}
+    assert pts["study-p03@nvfp4-w4a4"]["drawn"] and "S4" in pts["full-p03@nvfp4-w4a4"]["not_drawn"]
+    assert pts["study-p03"]["not_drawn"] == "shown as its full-data row full-p03" and pts["full-p03"]["drawn"]
+    nd = next(ln for ln in md.splitlines() if ln.startswith("Not drawn:"))
+    assert "P-0.3B full NVFP4 W4A4" in nd and "P-0.3B study NVFP4 W4A4" not in nd
+
+
+def test_greedy_set_refused_like_05(world, tmp_path):
+    """A greedy-only readout with one set whose rows are not its manifest ids: that set is refused for that system
+    (05's tables_from_frames rule), listed, and the report is written with the other sets."""
+    t, ids, refs = world["T"], world["ids"], world["refs"]
+    runs = tmp_path / "runs"
+    h = noisy(refs, 0.08, 40)
+    fr = greedy_frames(ids, refs, h)
+    fr["eval_cv8"] = fr["eval_cv8"].iloc[1:]
+    write_readout(runs, "m4-full-p03", "full-p03", greedy=fr, family="ctc")
+    write_tables(tmp_path / "tables", {"parakeet-ctc": t["parakeet-ctc"]})
+    rc, rep = run(["--manifest", world["man"], "--prereg", "none", "--tables", tmp_path / "tables", "--readouts",
+                   runs, "--boot-b", 200], tmp_path / "out")
+    assert rc == 0
+    v = rep["systems"]["full-p03"]
+    assert "eval_cv8" not in v["sets"] and v["metrics"]["m4"] is None and v["metrics"]["m4_all"] is None
+    assert v["sets"]["eval_jsut"]["cer"] == pytest.approx(hand_cer(text_table(ids, refs, h), "eval_jsut"))
+    ref = rep["inputs"]["readouts_refused_sets"]
+    assert [(r["system"], r["set"]) for r in ref] == [("full-p03", "eval_cv8")] and "1 manifest ids missing" in \
+        ref[0]["why"]
+    assert "greedy sets refused" in (tmp_path / "out" / "report.md").read_text(encoding="utf-8")
+
+
+def test_unreadable_inputs_refuse_with_exit_2(world, tmp_path, capsys):
+    """CONTRACT.md 1.5: an unreadable or malformed input refuses (exit 2, the file named), never a traceback (1)."""
+    write_tables(tmp_path / "tables", {"cohere": world["T"]["cohere"]})
+    base = ["--manifest", world["man"], "--prereg", "none", "--tables", tmp_path / "tables", "--boot-b", 200]
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"study-t06": ', encoding="utf-8")
+    shape = tmp_path / "list.json"
+    shape.write_text("[1, 2]", encoding="utf-8")
+    runs = tmp_path / "runs"
+    (runs / f"full-p03-{STAMP}").mkdir(parents=True)
+    (runs / f"full-p03-{STAMP}" / "summary.json").write_text('{"status": ', encoding="utf-8")
+    ro = tmp_path / "ro"
+    (ro / "m4-x" / "tables" / "full-p03").mkdir(parents=True)
+    (ro / "m4-x" / "study.json").write_text(json.dumps(dict(system="full-p03")), encoding="utf-8")
+    (ro / "m4-x" / "tables" / "full-p03" / "eval_jsut.parquet").write_bytes(b"not a parquet file")
+    for extra, needle in ((["--params", bad], "bad.json"), (["--params", shape], "--params"),
+                          (["--run-summaries", runs], "summary.json"),
+                          (["--kotoba-jsonl", tmp_path / "missing.jsonl"], "--kotoba-jsonl"),
+                          (["--readouts", ro], "eval_jsut.parquet"), (["--queue-summaries", shape], "list.json"),
+                          (["--queue-summaries", tmp_path / "nowhere"], "--queue-summaries")):
+        rc, _ = run(base + extra, tmp_path / "out")
+        err = capsys.readouterr().err
+        assert rc == 2 and "REFUSED:" in err and needle in err, (extra, err)
+        assert "Traceback" not in err
 
 
 def test_kotoba_bias_from_the_judge_file(world, tmp_path, monkeypatch, capsys):

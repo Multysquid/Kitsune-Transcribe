@@ -16,15 +16,32 @@ Inputs (lean pulls of the runs repo; no weights are read)
                          of WP5, weights.file_bytes), its tables <hit>/tables/<system>/<set>.parquet or else its
                          greedy_<set>.parquet (scored here as 05 scores them; never the box paths study.json.tables
                          names), summary.json (tf.sets.<set>.kl and n_tok: KL to the own teacher) and whisper.json
-                         (params, file bytes, decode counts). greedy_<set>.parquet also give the clip durations (the
-                         short-clip counts) and the AED token counts (flag S2). One system found twice: the one scored
-                         on every manifest set wins, then a real (not simulated) one, then the newest time_utc; the
-                         others are listed. A --tables system always wins over a readout of the same name.
+                         (params, file bytes, decode counts). A greedy set whose rows are not exactly its manifest ids
+                         gets no table, as 05 refuses it: that system lacks the set (inputs.readouts_refused_sets).
+                         greedy_<set>.parquet also give the clip durations (the short-clip counts) and the AED token
+                         counts (flag S2). One system found twice: the one scored on every manifest set wins, then a
+                         real (not simulated) one, then one scored from its exported file over one scored from memory
+                         (smoke B scores study-p03@<fmt> both ways; only the file has its true bytes), then the newest
+                         time_utc; the others are listed. A --tables system always wins over a readout of that name.
   --speed FILE ...       tools/speed_probe.py outputs (every runs/speed-*/speed.json given). Every file must hold
                          the same id list (ids_sha256: the study's 200 ids); another list refuses (exit 2). Records
-                         are grouped by machine + GPU (versions.machine_id, else versions.host; gpu): a group is one
-                         machine at one time, and only numbers of one group are comparable. The CHART GROUP is the
-                         group holding the most systems; the speed columns and the charts come from it.
+                         are grouped by machine + GPU: a group is one machine, and only numbers of one group are
+                         comparable. A record's machine: its versions.machine_id (WP6's speed_probe records
+                         KITSUNE_MACHINE_ID); else --machine-of; else the machine_id of the queue summary of the box
+                         that wrote the file (a summary that names that runs/speed-<box>-<stamp> dir or is that box's,
+                         of a launch that started before the record was timed); else versions.host. The wave-1
+                         speed_probe that times smoke A records only the host, the container's name, which differs
+                         per rental: without the summary, smoke A and smoke B on one machine would be two groups. One
+                         name timed twice in one group: the newest time_utc counts, the others are listed
+                         (speed_groups.superseded). The CHART GROUP is the group holding the most systems; the speed
+                         columns and the charts come from it.
+  --queue-summaries PATH ...  the full boxes' full/box-<box>/queue_summary.json (CONTRACT.md 5: box, machine_id,
+                         started, the speed items' out), as files or dirs searched for them. The summary at the runs
+                         repo's layout beside a speed file (<root>/full/box-<box>/ for <root>/runs/speed-<box>-*/) is
+                         read without the flag.
+  --machine-of NAME=ID ...  the machine of the records in the speed dir NAME (speed-<box>-<stamp>) or of the container
+                         host NAME (versions.host), for a file no summary covers (a box launched again elsewhere
+                         replaces its summary)
   --run-summaries DIR ... the trainer's runs roots (tools/study_report.load_summaries): steps, epochs, stopped_early,
                          early_stop_trigger, end_reason, resume_resets of the full and study runs
   --params FILE          {system: params_total} (the study's params.json); kitsune.study_stats.PARAMS_TOTAL, a
@@ -62,10 +79,13 @@ Speed, per system: its own record in the chart group; else a full-data row takes
 same shape, same code); else a record from another group (S3). A full-data AED row whose readout emits more than 5 %
 more or fewer tokens on the 200 speed ids than the timed study weights did gets S2, and then its speed is the chart
 group's study-t06 record times the full-t06 / study-t06 ratio of box full's re-time pair (the two timed on one machine
-at one time), labelled so. MXFP4 and emulated variants have no speed ("n/a (simulated)", S4). File size, in order:
-study.json quant.file_bytes, quant.weights_bytes (a variant scored from memory: never its bf16 checkpoint's
-weights.file_bytes), weights.file_bytes, whisper.json model.weights_file_bytes, else the speed record's in-memory
-weights_bytes (both in-memory sources are marked so).
+at one time), labelled so. Its quantised variants, which decode the same tokens, take the same bf16 ratio (the pair is
+bf16 only; labelled so), so a variant and its bf16 row stay on one basis: the chart's joins and the quantisation
+table's "x bf16 speed" compare like with like (speed.unscaled keeps the record's own numbers). MXFP4 and emulated
+variants have no speed ("n/a (simulated)", S4). File size, in order: study.json quant.file_bytes, quant.weights_bytes
+(a variant scored from memory: never its bf16 checkpoint's weights.file_bytes; WP5 writes it as {deployable, quantized,
+kept}, and deployable is what the exporter would write), weights.file_bytes, whisper.json model.weights_file_bytes,
+else the speed record's in-memory weights_bytes (both in-memory sources are marked so).
 
 Outputs (--out, written atomically): report.json; report.md (the offer table first, then study -> full, quantisation,
 Whisper with its seven caveats verbatim from plan v3 section 7, the charts, hallucinations, per-set CERs, the flags,
@@ -73,13 +93,14 @@ inputs and checks); offer.csv; chart_error_vs_speed.svg (x batched RTFx, log; y 
 chart_error_vs_latency.svg (x batch-1 p50 ms, log), hand-written SVG with deterministic bytes (matplotlib is not in
 the box image), drawn from the chart group only; chart_points.json / .csv (the same points, for a live chart).
 
-Exit codes: 0 written; 2 refused (manifest, tables, speed id lists, an unreadable input); 1 anything else.
+Exit codes: 0 written; 2 refused (manifest, tables, speed id lists, an unreadable or malformed input file: JSON,
+parquet, the params, a run summary); 1 anything else.
 
 Usage (on the laptop, after a lean pull of the runs repo into D:/kitsune-pull):
   python tools/full_report.py --manifest D:/kitsune-study/selections/study_manifest.json \
       --tables D:/kitsune-study/results/tables --readouts D:/kitsune-pull/runs \
       --speed D:/kitsune-pull/runs/speed-full-smoke-*/speed.json D:/kitsune-pull/runs/speed-smoke-b-*/speed.json \
-      --run-summaries D:/kitsune-pull/runs D:/kitsune-study/results/runs/runs \
+      --queue-summaries D:/kitsune-pull/full --run-summaries D:/kitsune-pull/runs D:/kitsune-study/results/runs/runs \
       --params D:/kitsune-study/results/params.json --out D:/kitsune-study/full-report
 CPU only; about a minute (the bootstrap of every system at B = 10,000 and the torch import behind kitsune.evaluate).
 """
@@ -155,6 +176,9 @@ FULL_METRICS = {
 GAP = "gap_neutral_all"  # CER(galgame_all) - CER(galgame_neutral): what the Kotoba-chosen view takes off
 COMPARE_METRICS = ("m4", "m4_all")
 
+# runs/speed-<box>-<stamp>: the speed items of one box launch share this dir (CONTRACT.md 1.1)
+SPEED_DIR_RE = re.compile(r"^speed-(?P<box>[a-z0-9][a-z0-9.-]*)-(?P<stamp>\d{8}T\d{6}Z)(?:-\d+)?$")
+
 SHORT_CLIP_S = 2.0
 # Whisper's well-known outputs on silence and music (YouTube subtitle credits), compared after normalize_ja; a
 # heuristic count, listed in report.json
@@ -178,7 +202,8 @@ FLAGS = {
     "R1": "Reazon is in-domain (Parakeet and the students were trained on ReazonSpeech).",
     "S1": "Speed of the study weights of the same shape and code (the full-data weights were not timed).",
     "S2": "Token drift over 5 % between the full-data weights and the timed study weights on the speed ids: re-timed "
-          "(the study row x the full/study ratio of box full's re-time pair) where that pair exists.",
+          "(the study row x the full/study ratio of box full's bf16 re-time pair; a variant x the same bf16 ratio) "
+          "where that pair exists.",
     "S3": "Speed from another machine or GPU than the chart group's: not comparable with the other rows.",
     "S4": "Simulated (MXFP4, or an emulated run): accuracy only, no speed.",
     "S5": "No speed record.",
@@ -225,6 +250,57 @@ def read_json(path):
         raise InputError(f"{path}: {e}") from e
 
 
+# this module's private copy of study_report (_load_tool: not the one in sys.modules) reads its JSON through
+# read_json, so a broken run summary, config.json or params file refuses naming its path (exit 2)
+sr.read_json = read_json
+
+
+def _refusing(what: str, fn, *args):
+    """fn(*args), where an unreadable or malformed input (a missing file, broken JSON or parquet, a field of the
+    wrong type) refuses with `what` named (InputError, exit 2) instead of a traceback (exit 1)."""
+    try:
+        return fn(*args)
+    except InputError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+        raise InputError(f"{what}: {type(e).__name__}: {e}") from e
+
+
+def _read_parquet(path: Path, columns=None) -> pd.DataFrame:
+    """A parquet file (only `columns` that it has, when given); a broken one refuses (InputError)."""
+    def read():
+        cols = columns if columns is None else [c for c in columns if c in set(pq.read_schema(path).names)]
+        return pd.read_parquet(path, columns=cols)
+    return _refusing(str(path), read)
+
+
+def _id_problems(have: list[str], want: list[str]) -> str | None:
+    """None when `have` is exactly the ids `want` (any order, each once), else what differs: 05_evaluate's rule for a
+    set it scores (_id_problems there)."""
+    seen, dup = set(), set()
+    for i in have:
+        (dup if i in seen else seen).add(i)
+    miss, extra = sorted(set(want) - seen), sorted(seen - set(want))
+    if not (dup or miss or extra):
+        return None
+    return (f"{len(miss)} manifest ids missing (e.g. {miss[:3]}), {len(extra)} not in the manifest (e.g. "
+            f"{extra[:3]}), {len(dup)} twice (e.g. {sorted(dup)[:3]})")
+
+
+def _unix(t) -> float | None:
+    """Unix seconds from a number (a queue summary's started) or an ISO string (a speed record's time_utc; naive =
+    UTC); None when neither."""
+    if t is None or isinstance(t, bool):
+        return None
+    if isinstance(t, (int, float)):
+        return float(t) if math.isfinite(t) else None
+    try:
+        d = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).timestamp()
+
+
 def _num(x):
     """A finite number or None (JSON fields that may be missing, null or a string)."""
     try:
@@ -243,36 +319,48 @@ def _greedy_frames(d: Path, sets) -> dict[str, pd.DataFrame]:
         s = sr._set_of_file(f.stem, sets)
         if s is None:
             continue
-        names = set(pq.read_schema(f).names)
-        cols = [c for c in ("id", "ref", "hyp", "truncated", "duration", "n_tok") if c in names]
-        if "id" in cols:
-            out[s] = pd.read_parquet(f, columns=cols)
+        df = _read_parquet(f, ("id", "ref", "hyp", "truncated", "duration", "n_tok"))
+        if "id" in df.columns:
+            out[s] = df
     return out
 
 
-def _table_from_greedy(frames: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
-    """A system's per-utterance table from its greedy frames, scored exactly as 05_evaluate.tables_from_frames scores
-    them (kitsune.evaluate.utterance_table: edits and the no-style edits on normalize_ja strings)."""
+def _table_from_greedy(frames: dict[str, pd.DataFrame], man: ss.Manifest) -> tuple[pd.DataFrame | None, dict]:
+    """(a system's per-utterance table, {set: why refused}) from its greedy frames, scored exactly as
+    05_evaluate.tables_from_frames scores them (kitsune.evaluate.utterance_table in manifest order: edits and the
+    no-style edits on normalize_ja strings). Like 05, a set whose rows are not exactly its manifest ids gets no table
+    (the system lacks that set) instead of refusing the whole report in build_corpus."""
     from kitsune import evaluate as ev
 
-    parts = []
+    parts, refused = [], {}
     for s, df in frames.items():
         if not {"ref", "hyp"} <= set(df.columns):
+            refused[s] = "no ref / hyp columns"
             continue
-        trunc = df["truncated"].tolist() if "truncated" in df.columns else None
-        parts.append(ev.utterance_table(df["id"].astype(str).tolist(), s, df["ref"].tolist(), df["hyp"].tolist(),
-                                        trunc))
-    return pd.concat(parts, ignore_index=True) if parts else None
+        want = man.sets[s]
+        if p := _id_problems(df["id"].astype(str).tolist(), want):
+            refused[s] = p
+            continue
+        d = df.assign(id=df["id"].astype(str)).set_index("id").loc[want]
+        trunc = d["truncated"].tolist() if "truncated" in d.columns else None
+        parts.append(ev.utterance_table(want, s, d["ref"].tolist(), d["hyp"].tolist(), trunc))
+    return (pd.concat(parts, ignore_index=True) if parts else None), refused
 
 
 def _table_from_dir(d: Path, sets) -> pd.DataFrame | None:
-    """<hit>/tables/<system>/<set>.parquet, as tools/study_report.load_tables reads one system's dir."""
+    """<hit>/tables/<system>/<set>.parquet, as tools/study_report.load_tables reads one system's dir (05 publishes
+    only sets it did not refuse, so a mismatch here refuses the report in build_corpus)."""
     parts = []
     for f in sorted(d.glob("*.parquet")):
         s = sr._set_of_file(f.stem, sets)
         if s is not None:
-            parts.append(sr._read_parquet(f).drop(columns=["source"], errors="ignore").assign(set=s))
+            parts.append(_read_parquet(f, sr.COLUMNS).drop(columns=["source"], errors="ignore").assign(set=s))
     return pd.concat(parts, ignore_index=True) if parts else None
+
+
+def _file_scored(study: dict) -> bool:
+    """A variant scored from its exported file (quant.source "file"), not from memory: only it has its true bytes."""
+    return (study.get("quant") or {}).get("source") == "file"
 
 
 def _simulated(study: dict) -> bool:
@@ -283,7 +371,7 @@ def _simulated(study: dict) -> bool:
 def load_readouts(dirs, man: ss.Manifest) -> tuple[dict, dict]:
     """(system -> readout dict, notes) from every study.json under the --readouts dirs (module docstring)."""
     found: dict[str, list[dict]] = {}
-    notes = dict(read={}, superseded=[], ignored=[])
+    notes = dict(read={}, superseded=[], ignored=[], refused_sets=[])
     for d in dirs or []:
         d = Path(d)
         if not d.is_dir():
@@ -296,14 +384,17 @@ def load_readouts(dirs, man: ss.Manifest) -> tuple[dict, dict]:
                 continue
             hit = f.parent
             frames = _greedy_frames(hit, man.sets)
-            table, source = None, None
+            table, source, refused = None, None, {}
             if (hit / "tables" / system).is_dir():
                 table, source = _table_from_dir(hit / "tables" / system, man.sets), "tables"
             if table is None and frames:
-                table, source = _table_from_greedy(frames), "greedy"
+                (table, refused), source = _table_from_greedy(frames, man), "greedy"
+                notes["refused_sets"] += [dict(system=system, dir=str(hit), set=s, why=why)
+                                          for s, why in sorted(refused.items())]
             if table is None:
-                notes["ignored"].append(dict(path=str(f), why="no tables/<system>/<set>.parquet and no "
-                                                               "greedy_<set>.parquet next to it"))
+                notes["ignored"].append(dict(path=str(f), why="every greedy set refused" if refused else
+                                             "no tables/<system>/<set>.parquet and no greedy_<set>.parquet next "
+                                             "to it"))
                 continue
             durations, ntok = {}, {}
             for df in frames.values():
@@ -322,11 +413,14 @@ def load_readouts(dirs, man: ss.Manifest) -> tuple[dict, dict]:
                 durations=durations, ntok=ntok, time_utc=str(rec.get("time_utc") or "")))
     out = {}
     for system, cands in found.items():
-        cands.sort(key=lambda c: (c["complete"], not c["simulated"], c["time_utc"]))
+        # smoke B scores study-p03@<fmt> from its exported file and then from memory (mem-*, later): the accuracy is
+        # the same (its check 14), but only the file readout knows the variant's true bytes
+        cands.sort(key=lambda c: (c["complete"], not c["simulated"], _file_scored(c["study"]), c["time_utc"]))
         out[system] = cands[-1]
         notes["read"][system] = cands[-1]["dir"]
         notes["superseded"] += [dict(system=system, dir=c["dir"], time_utc=c["time_utc"], complete=c["complete"],
-                                     simulated=c["simulated"]) for c in cands[:-1]]
+                                     simulated=c["simulated"], file_scored=_file_scored(c["study"]))
+                                for c in cands[:-1]]
     return out, notes
 
 
@@ -528,11 +622,12 @@ def halluc_counts(df: pd.DataFrame, man: ss.Manifest, durations: dict) -> dict:
 def kotoba_bias(path: Path, tables: dict[str, pd.DataFrame], man: ss.Manifest) -> dict:
     """Decision 29: Kotoba-Whisper v2.0's STORED Galgame hypotheses (the judge file that chose Galgame-neutral)
     scored on the 810 neutral rows and on every Galgame row with a reference, on the tables' references."""
-    raw = Path(path).read_bytes()
+    raw = _refusing(f"--kotoba-jsonl {path}", Path(path).read_bytes)
     sha = hashlib.sha256(raw).hexdigest()
     if sha != KOTOBA_JSONL_SHA256:
         raise InputError(f"--kotoba-jsonl {path}: sha256 {sha[:12]}, not the judge file's {KOTOBA_JSONL_SHA256[:12]}")
-    rows = [json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()]
+    rows = _refusing(f"--kotoba-jsonl {path}",
+                     lambda: [json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()])
     hyp2 = {str(r["id"]): r.get("hyp2") for r in rows if isinstance(r, dict) and "id" in r}
     model2 = {}
     for r in rows:
@@ -565,16 +660,100 @@ def kotoba_bias(path: Path, tables: dict[str, pd.DataFrame], man: ss.Manifest) -
 # ------------------------------------------------------------------------------------------------ speed
 
 
-def group_of(rec: dict) -> str:
-    """The comparability key of a speed record: machine (KITSUNE_MACHINE_ID, else the container host) and GPU."""
-    v = rec.get("versions") or {}
-    gpu = rec.get("gpu") or (str(rec.get("device")) if rec.get("device") else None)
-    return f"{v.get('machine_id') or v.get('host') or '?'} / {gpu or '?'}"
+def load_queue_summaries(paths, speed_paths) -> list[dict]:
+    """[{path, box, machine_id, started, claims}] of the full boxes' queue summaries (CONTRACT.md 5): the
+    --queue-summaries files and the queue_summary.json under the given dirs, plus the one at the runs repo's layout
+    beside each speed file (<root>/runs/speed-<box>-<stamp>/speed.json -> <root>/full/box-<box>/queue_summary.json)
+    when it exists. claims = the speed dirs the summary names (its speed_dir, its speed items' out)."""
+    files = []
+    for p in paths or []:
+        p = Path(p)
+        if p.is_dir():
+            files += sorted(p.rglob("queue_summary.json"))
+        elif p.is_file():
+            files.append(p)
+        else:
+            raise InputError(f"--queue-summaries {p}: no such file or directory")
+    for p in speed_paths or []:
+        m = SPEED_DIR_RE.match(Path(p).parent.name)
+        f = Path(p).parent.parent.parent / "full" / f"box-{m['box']}" / "queue_summary.json" if m else None
+        if f is not None and f.is_file():
+            files.append(f)
+    out, seen = [], set()
+    for f in files:
+        if str(f.resolve()) in seen:
+            continue
+        seen.add(str(f.resolve()))
+        doc = read_json(f)
+        items = (doc.get("items") or {}) if isinstance(doc, dict) else None
+        if not isinstance(items, dict) or not isinstance(doc.get("box"), str):
+            raise InputError(f"{f}: not a full box's queue summary (no box, or items not a mapping)")
+        claims = {Path(doc["speed_dir"]).name} if isinstance(doc.get("speed_dir"), str) else set()
+        for it in items.values():
+            if isinstance(it, dict) and it.get("kind") == "speed":
+                res = it.get("result") if isinstance(it.get("result"), dict) else {}
+                claims |= {Path(o).name for o in (it.get("out"), res.get("out")) if isinstance(o, str) and o}
+        mid = doc.get("machine_id")
+        out.append(dict(path=str(f), box=doc["box"], machine_id=None if mid in (None, "") else str(mid),
+                        started=_unix(doc.get("started")), claims=sorted(claims)))
+    return out
 
 
-def load_speed(paths) -> dict:
-    """{records: {(group, name): record}, ids, ids_sha256, files, superseded, groups} from the speed files. One id
-    list for all (else InputError); one record per name and group (the newest time_utc; the others listed)."""
+def parse_machine_of(pairs) -> dict[str, str]:
+    """--machine-of NAME=ID pairs -> {NAME: ID}."""
+    out = {}
+    for p in pairs or []:
+        name, sep, mid = str(p).partition("=")
+        if not sep or not name.strip() or not mid.strip():
+            raise InputError(f"--machine-of {p!r}: expected NAME=MACHINE_ID (NAME a speed-<box>-<stamp> dir or a "
+                             "container host)")
+        out[name.strip()] = mid.strip()
+    return out
+
+
+def machine_of(rec: dict, file: str, qs: list[dict], override: dict[str, str]) -> tuple[str | None, str]:
+    """(machine, where from) of one speed record (module docstring, --speed): versions.machine_id; else --machine-of
+    by speed dir or host; else the one machine_id of the queue summaries that cover the file (they name its dir or are
+    its box's, and their launch started before the record was timed: a box launched again on another host replaces
+    its summary, and the earlier launch's records predate the new one); else versions.host."""
+    v = rec.get("versions") if isinstance(rec.get("versions"), dict) else {}
+    if v.get("machine_id"):
+        return str(v["machine_id"]), "versions.machine_id"
+    d = Path(file).parent.name
+    host = v.get("host") or None
+    for k in (d, host):
+        if k and k in override:
+            return override[k], f"--machine-of {k}"
+    m = SPEED_DIR_RE.match(d)
+    t = _unix(rec.get("time_utc"))
+    if t is None and m:  # the dir's stamp: the box's first speed attempt, at or before every record in it
+        try:
+            t = datetime.strptime(m["stamp"], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            t = None
+    cover = []
+    for q in qs:
+        named, same_box = d in q["claims"], m is not None and m["box"] == q["box"]
+        if not q["machine_id"] or not (named or same_box):
+            continue
+        if q["started"] is not None and t is not None:
+            if t < q["started"]:
+                continue  # timed before that launch started: another launch's (and maybe another host's) record
+        elif not named:
+            continue  # no times to compare: only a summary that names this very dir
+        cover.append(q)
+    mids = sorted({q["machine_id"] for q in cover})
+    if len(mids) == 1:
+        return mids[0], "queue summary " + ", ".join(sorted({q["path"] for q in cover}))
+    if host:
+        return host, "versions.host" + (f" (the queue summaries disagree: {mids})" if mids else "")
+    return None, "unknown"
+
+
+def load_speed(paths, qs: list[dict] | None = None, override: dict[str, str] | None = None) -> dict:
+    """{records: {(group, name): record}, ids, ids_sha256, files, superseded, groups, primary} from the speed files.
+    One id list for all (else InputError). A group is machine (machine_of) + GPU; one record per name and group (the
+    newest time_utc; the others listed)."""
     recs, sup, files = {}, [], []
     ids = sha = first = None
     for p in paths or []:
@@ -592,8 +771,10 @@ def load_speed(paths) -> dict:
         for name, rec in sorted(systems.items()):
             if not isinstance(rec, dict) or _num(rec.get("rtf")) is None:
                 continue
-            key = (group_of(rec), name)
-            rec = dict(rec, _file=str(p))
+            machine, where = machine_of(rec, str(p), qs or [], override or {})
+            gpu = rec.get("gpu") or (str(rec.get("device")) if rec.get("device") else None)
+            key = (f"{machine or '?'} / {gpu or '?'}", name)
+            rec = dict(rec, _file=str(p), _machine_from=where)
             old = recs.get(key)
             if old is None or str(rec.get("time_utc") or "") > str(old.get("time_utc") or ""):
                 if old is not None:
@@ -604,11 +785,12 @@ def load_speed(paths) -> dict:
     groups: dict[str, dict] = {}
     for (g, name), rec in sorted(recs.items()):
         e = groups.setdefault(g, dict(systems=[], compiled=[], files=set(), gpu=rec.get("gpu"),
-                                      machine=g.rsplit(" / ", 1)[0]))
+                                      machine=g.rsplit(" / ", 1)[0], machine_from=set()))
         (e["compiled"] if name.endswith("+compile") else e["systems"]).append(name)
         e["files"].add(rec["_file"])
+        e["machine_from"].add(rec["_machine_from"])
     for e in groups.values():
-        e["files"] = sorted(e["files"])
+        e["files"], e["machine_from"] = sorted(e["files"]), sorted(e["machine_from"])
     primary = max(sorted(groups), key=lambda g: len(groups[g]["systems"])) if groups else None
     return dict(records=recs, ids=ids or [], ids_sha256=sha, files=files, superseded=sup, groups=groups,
                 primary=primary)
@@ -624,7 +806,8 @@ def speed_fields(rec: dict) -> dict:
                 vram_gb=vb / 1e9 if vb is not None else _num(rec.get("vram_gb")),
                 vram_1_gb=v1 / 1e9 if v1 is not None else None, weights_bytes=_num(rec.get("weights_bytes")),
                 params_total=_num(rec.get("params_total")), tokens_per_utt=_num(rec.get("tokens_per_utt")),
-                emulated=bool(rec.get("emulated")), time_utc=rec.get("time_utc"), file=rec.get("_file"))
+                emulated=bool(rec.get("emulated")), time_utc=rec.get("time_utc"), file=rec.get("_file"),
+                machine_from=rec.get("_machine_from"))
 
 
 def retime_pair(sp: dict, full: str, study: str) -> tuple[str, dict, dict] | None:
@@ -675,25 +858,28 @@ def resolve_speed(system: str, inf: dict, sp: dict, drift: dict | None) -> dict:
     if drift and drift.get("fires") and n != system:
         out["flags"].append("S2")
         out["drift"] = drift
-        pair = retime_pair(sp, system, n) if inf["role"] == "full" else None
+        # the re-time pair is bf16 only (decision 22): a variant of full-t06 decodes the full-data weights' tokens
+        # too, so it takes the same bf16 ratio, and a variant and its bf16 row stay on one basis (x bf16 speed, joins)
+        full = system if inf["role"] == "full" else inf["base"]
+        stu = FULL_RUNS[full][0] if full in FULL_RUNS else None
+        pair = retime_pair(sp, full, stu) if stu else None
         if pair and g == prim:
             pg, a, b = pair
             fa, fb = speed_fields(a), speed_fields(b)
             scale = {k: (fa[k] / fb[k] if fa.get(k) and fb.get(k) else None) for k in ("rtf", "p50_ms", "p95_ms")}
+            out["unscaled"] = {k: out[k] for k in ("rtf", "rtfx", "p50_ms", "p95_ms")}
             if scale["rtf"]:
                 out["rtf"] = out["rtf"] * scale["rtf"]
                 out["rtfx"] = 1 / out["rtf"]
             for k in ("p50_ms", "p95_ms"):
                 if scale[k] and out[k] is not None:
                     out[k] = out[k] * scale[k]
-            out["retime"] = dict(group=pg, ratio=scale, full=system, study=n,
-                                 note=f"{n}'s chart-group record x the {system}/{n} ratio timed in {pg}")
-        elif inf["role"] == "full":
+            out["retime"] = dict(group=pg, ratio=scale, full=full, study=stu,
+                                 note=f"{n}'s chart-group record x the {full}/{stu} ratio timed in {pg}"
+                                      + (" (the bf16 pair's ratio, applied to the variant)" if full != system else ""))
+        else:
             out["retime"] = dict(group=None, note="no re-time pair (box full's speed-full-t06 / speed-study-t06) "
                                                   "in another group: the study weights' speed is shown")
-        else:
-            out["retime"] = dict(group=None, note="a variant keeps its study weights' speed: the re-time pair is "
-                                                  "bf16 only")
     return out
 
 
@@ -717,11 +903,15 @@ def token_drift(ntok: dict[str, int], ids: list[str], rec: dict | None) -> dict 
 
 def _file_size(ro: dict | None, speed: dict | None) -> tuple[float | None, str | None]:
     """(bytes, where from). A variant scored from memory (05 --quant on the bf16 --ckpt) has no file of its own: its
-    weights.file_bytes are the bf16 checkpoint's, so it takes quant.weights_bytes (what the exporter would write)."""
+    weights.file_bytes are the bf16 checkpoint's, so it takes quant.weights_bytes, what the exporter would write.
+    CONTRACT.md 8 leaves that field's shape open; WP5 writes the recipe's bytes {deployable, quantized, kept}, and
+    deployable (= quantized + kept) is the file's weight bytes. A plain number is read as it is."""
     st = (ro or {}).get("study") or {}
     q = st.get("quant") or {}
+    wb = q.get("weights_bytes")
+    wb = wb.get("deployable") if isinstance(wb, dict) else wb
     for v, src in ((q.get("file_bytes"), "quant.file_bytes"),
-                   (q.get("weights_bytes"), "in-memory (quant.weights_bytes)"),
+                   (wb, "in-memory (quant.weights_bytes)"),
                    (None if q else (st.get("weights") or {}).get("file_bytes"), "weights.file_bytes"),
                    ((((ro or {}).get("whisper") or {}).get("model") or {}).get("weights_file_bytes"),
                     "whisper.json")):
@@ -755,9 +945,9 @@ def load_all_summaries(dirs) -> tuple[dict, dict]:
     for d in dirs or []:
         if not Path(d).is_dir():
             raise InputError(f"--run-summaries {d}: not a directory")
-        summ, n = sr.load_summaries(Path(d))
+        summ, n = _refusing(f"--run-summaries {d}", sr.load_summaries, Path(d))
         for name, s in summ.items():
-            if not isinstance(s.get("config"), dict):
+            if not isinstance(s, dict) or not isinstance(s.get("config"), dict):
                 continue  # a 05 summary.json (readouts, evals): not a trainer's
             if name in out:
                 notes["superseded"].append(notes["read"][name])
@@ -772,7 +962,7 @@ def build_report(args) -> dict:
     man_sha = sr.file_sha256(args.manifest)
     prereg_path = None if args.prereg is None or str(args.prereg).lower() == "none" else Path(args.prereg)
     prereg = read_json(prereg_path) if prereg_path else None
-    pchk = ss.manifest_check(man, ss.prereg_manifest(prereg), man_sha)
+    pchk = ss.manifest_check(man, _refusing(f"--prereg {prereg_path}", ss.prereg_manifest, prereg), man_sha)
     if pchk["status"] == "fail":
         raise InputError(f"the manifest is not the one PREREG.json froze ({prereg_path}): {pchk['detail']}")
     # True: the frozen file and PREREG's hashes; None: the frozen file, PREREG not compared (--prereg none)
@@ -782,7 +972,7 @@ def build_report(args) -> dict:
     tables_from: dict[str, str] = {}
     for d in args.tables or []:
         try:
-            t, _ = sr.load_tables(Path(d), man.sets)
+            t, _ = _refusing(f"--tables {d}", sr.load_tables, Path(d), man.sets)
         except SystemExit as e:
             raise InputError(f"--tables {d}: {e.code}") from e
         for name, df in t.items():
@@ -803,13 +993,14 @@ def build_report(args) -> dict:
         del tables[s], info[s]
     if not tables:
         raise InputError("no system table: give --tables and / or --readouts")
-    scored = {s: ss.ensure_scored(df) for s, df in tables.items()}
+    scored = {s: _refusing(f"the table of {s} ({tables_from[s]})", ss.ensure_scored, df) for s, df in tables.items()}
     corpus = ss.build_corpus(scored, man)
     st = Stats(corpus, args.boot_b, args.seed)
 
     summaries, summ_notes = load_all_summaries(args.run_summaries)
-    params = sr.load_params(args.params) if args.params else {}
-    sp = load_speed(args.speed)
+    params = _refusing(f"--params {args.params}", sr.load_params, args.params) if args.params else {}
+    qs = load_queue_summaries(args.queue_summaries, args.speed)
+    sp = load_speed(args.speed, qs, parse_machine_of(args.machine_of))
     durations = {}
     for ro in readouts.values():
         durations.update(ro["durations"])
@@ -890,7 +1081,8 @@ def build_report(args) -> dict:
     rep["offer"] = offer_table(rep)
     rep["whisper"] = whisper_block(rep, scored, man, args.kotoba_jsonl)
     rep["speed_groups"] = dict(primary=sp["primary"], groups=sp["groups"], ids_sha256=sp["ids_sha256"],
-                               n_ids=len(sp["ids"]), superseded=sp["superseded"])
+                               n_ids=len(sp["ids"]), superseded=sp["superseded"], queue_summaries=qs,
+                               machine_of=parse_machine_of(args.machine_of))
     rep["chart"] = dict(points=chart_points(rep), files=["chart_error_vs_speed.svg", "chart_error_vs_latency.svg",
                                                          "chart_points.json", "chart_points.csv"])
     rep["flags_legend"] = FLAGS
@@ -901,7 +1093,9 @@ def build_report(args) -> dict:
     rep["inputs"] = dict(manifest=str(args.manifest), tables=[str(d) for d in args.tables or []],
                          readouts=[str(d) for d in args.readouts or []], readouts_read=ro_notes["read"],
                          readouts_superseded=ro_notes["superseded"], readouts_ignored=ro_notes["ignored"],
-                         speed=sp["files"], run_summaries=[str(d) for d in args.run_summaries or []],
+                         readouts_refused_sets=ro_notes["refused_sets"], speed=sp["files"],
+                         queue_summaries=[q["path"] for q in qs],
+                         run_summaries=[str(d) for d in args.run_summaries or []],
                          summaries_read=summ_notes["read"], summaries_superseded=summ_notes["superseded"],
                          params=_s(args.params), kotoba_jsonl=_s(args.kotoba_jsonl),
                          written_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
@@ -1066,10 +1260,16 @@ def checks(rep: dict, readouts: dict, sp: dict, man_sha: str) -> list[dict]:
                                   f", not the study's ({STUDY_SPEED_IDS_SHA256[:12]})")))
         # another group is expected (box full's re-time pair feeds the S2 ratio); a ROW timed there is not comparable
         s3 = sorted(s for s, v in rep["systems"].items() if "S3" in v["flags"])
+        keyed = "; ".join(f"{g}: machine from {', '.join(e['machine_from'])}" for g, e in sp["groups"].items())
+        by_host = len(sp["groups"]) > 1 and any("versions.host" in w for e in sp["groups"].values()
+                                                for w in e["machine_from"])
         out.append(dict(rule="speed_groups", status="fail" if s3 else "pass",
                         detail=f"{len(sp['groups'])} machine/GPU group(s); the chart group is {sp['primary']}"
                                + (f"; rows timed only elsewhere (S3, not drawn): {s3}" if s3 else
-                                  "; every row with a speed has it from the chart group")))
+                                  "; every row with a speed has it from the chart group") + f" ({keyed})"
+                               + ("; a group is keyed by a container host (a record without machine_id that no "
+                                  "queue summary covers): give --queue-summaries or --machine-of if it is another "
+                                  "group's machine" if by_host else "")))
     return out
 
 
@@ -1085,7 +1285,8 @@ def _chart_family(v: dict) -> str:
 
 def chart_points(rep: dict) -> list[dict]:
     """Every offered row as a chart point: drawn only when it has a speed in the chart group (or the S2 re-time
-    from it) and an M4-all; a study row is left to its full-data row when that exists (same x, the full-data y)."""
+    from it) and an M4-all. A study row is left to its full-data twin (full-x, full-x@fmt: the same x) only when that
+    twin is drawn; otherwise it is drawn itself or listed with its own reason."""
     sysd = rep["systems"]
     pts = []
     for r in rep["offer"]["rows"]:
@@ -1095,24 +1296,30 @@ def chart_points(rep: dict) -> list[dict]:
                 "variant" if v["role"] == "quant" else "full" if v["role"] == "full" else "study")
         base = v["base"] if kind == "variant" else None
         why = None
+        if sp.get("simulated"):
+            why = "simulated format: accuracy only, no speed (S4)"
+        elif not sp.get("available"):
+            why = "no speed record (S5)"
+        elif not sp.get("in_chart_group"):
+            why = f"timed on another machine/GPU ({sp.get('group')}, S3)"
+        elif v["metrics"]["m4_all"] is None:
+            why = "no M4-all (a set is missing)"
+        twin = None
         if r["block"] == "study":
             full = STUDY_TO_FULL.get(base or s)
             twin = full if kind != "variant" else (f"{full}@{v['format']}" if full else None)
-            if twin and twin in sysd:
-                why = f"shown as its full-data row {twin}"
-        if why is None and sp.get("simulated"):
-            why = "simulated format: accuracy only, no speed (S4)"
-        elif why is None and not sp.get("available"):
-            why = "no speed record (S5)"
-        elif why is None and not sp.get("in_chart_group"):
-            why = f"timed on another machine/GPU ({sp.get('group')}, S3)"
-        elif why is None and v["metrics"]["m4_all"] is None:
-            why = "no M4-all (a set is missing)"
         pts.append(dict(system=s, display=v["display"], family=_chart_family(v), kind=kind, base=base,
                         format=v["format"], rtfx=sp.get("rtfx"), p50_ms=sp.get("p50_ms"),
                         m4_all_pct=None if v["metrics"]["m4_all"] is None else 100 * v["metrics"]["m4_all"],
                         m4_pct=None if v["metrics"]["m4"] is None else 100 * v["metrics"]["m4"],
-                        speed_source=sp.get("source"), flags=v["flags"], drawn=why is None, not_drawn=why))
+                        speed_source=sp.get("source"), flags=v["flags"], drawn=why is None, not_drawn=why,
+                        _twin=twin))
+    # second pass: twins are full-data rows (never in the study block), so hiding a study row never hides another
+    drawn = {p["system"] for p in pts if p["drawn"]}
+    for p in pts:
+        twin = p.pop("_twin")
+        if twin in drawn:
+            p.update(drawn=False, not_drawn=f"shown as its full-data row {twin}")
     return pts
 
 
@@ -1178,9 +1385,9 @@ text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;fill:var(--ink2);
 
 def chart_svg(points: list[dict], *, x_key: str, title: str, x_label: str, better: str, gpu: str | None) -> str:
     """One paper-style scatter as a standalone SVG (deterministic bytes): y = M4-all CER %, x = x_key on a log axis;
-    families by colour, full-data students as dots, study-only students as diamonds, quantised variants hollow and
-    joined to their bf16 point, teachers as stars; direct labels where they fit, a <title> tooltip on every mark,
-    and the rows not drawn listed under the plot."""
+    families by colour, full-data students as dots, study students without a drawn full-data twin as diamonds,
+    quantised variants hollow and joined to their bf16 point, teachers as stars; direct labels where they fit, a
+    <title> tooltip on every mark, and the rows not drawn listed under the plot."""
     W, left, right, top, plot_h = 980, 72, 250, 70, 420
     plot_w = W - left - right
     drawn = [p for p in points if p["drawn"] and p.get(x_key) and p["m4_all_pct"] is not None]
@@ -1273,7 +1480,7 @@ def chart_svg(points: list[dict], *, x_key: str, title: str, x_label: str, bette
             L.append(f'<text class="lab" x="{lx + 18}" y="{yy}">{_esc(name)}</text>')
         ly += 20 + 18 * len(CHART_FAMILIES) + 14
         L.append(f'<text class="axl" x="{lx}" y="{ly}">Mark</text>')
-        keys = (("dot", "full-data student, bf16"), ("diamond", "study student (no full run)"),
+        keys = (("dot", "full-data student, bf16"), ("diamond", "study student (no full-data point)"),
                 ("hollow", "quantised variant, joined to bf16"), ("star", "teacher"))
         for i, (k, name) in enumerate(keys):
             yy = ly + 20 + 18 * i
@@ -1416,7 +1623,9 @@ def render_md(rep: dict) -> str:
                          "n/a" if not (v["file_bytes"] and b["file_bytes"]) else
                          f"{b['file_bytes'] / v['file_bytes']:.2f}",
                          sp.get("text") or ("n/a" if sp.get("rtfx") is None else f"{sp['rtfx']:,.0f}"),
-                         "n/a" if not (sp.get("rtfx") and bsp.get("rtfx")) else f"{sp['rtfx'] / bsp['rtfx']:.2f}",
+                         # one machine only; an S2 variant and its base share the re-time ratio (resolve_speed)
+                         "n/a" if not (sp.get("rtfx") and bsp.get("rtfx") and sp.get("in_chart_group")
+                                       and bsp.get("in_chart_group")) else f"{sp['rtfx'] / bsp['rtfx']:.2f}",
                          ((q.get("nonfinite") or {}).get("rows", "n/a")), " ".join(v["flags"])])
         L += sr.table(["variant", "bf16", "bf16 M4", "M4", "delta M4 pp", "ratio vs bf16 [CI]", "delta M4-all pp",
                        "KL", "delta KL", "file MB", "x smaller than bf16", "RTFx", "x bf16 speed",
@@ -1512,9 +1721,13 @@ def render_md(rep: dict) -> str:
           f"- tables: {', '.join(inp['tables']) or 'none'}; readouts: {', '.join(inp['readouts']) or 'none'} "
           f"({len(inp['readouts_read'])} read, {len(inp['readouts_superseded'])} superseded, "
           f"{len(inp['readouts_ignored'])} ignored)",
-          f"- speed: {', '.join(inp['speed']) or 'none'}",
+          f"- speed: {', '.join(inp['speed']) or 'none'}; queue summaries (the machine of records without "
+          f"machine_id): {', '.join(inp['queue_summaries']) or 'none'}",
           f"- run summaries: {', '.join(inp['run_summaries']) or 'none'} ({len(inp['summaries_read'])} read); params: "
           f"{inp['params'] or 'none'}; Kotoba judge file: {inp['kotoba_jsonl'] or 'none'}"]
+    if inp["readouts_refused_sets"]:
+        L.append("- greedy sets refused (their ids are not the manifest's; that system lacks the set, as 05 refuses "
+                 "it): " + "; ".join(f"{r['system']}/{r['set']} ({r['why']})" for r in inp["readouts_refused_sets"]))
     if rep["left_out"]["half"]:
         L.append(f"- left out (the T/2 branches; --include-half keeps them): {', '.join(rep['left_out']['half'])}")
     return "\n".join(L) + "\n"
@@ -1553,6 +1766,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--tables", type=Path, nargs="+", help="the study's tables dir(s): <dir>/<system>/<set>.parquet")
     ap.add_argument("--readouts", type=Path, nargs="+", help="dirs searched for study.json (05 / whisper_eval --out)")
     ap.add_argument("--speed", type=Path, nargs="+", help="speed_probe outputs (runs/speed-*/speed.json)")
+    ap.add_argument("--queue-summaries", type=Path, nargs="+",
+                    help="full/box-<box>/queue_summary.json files or dirs holding them: the machine of speed records "
+                         "without versions.machine_id (the one beside each speed file's runs/ is read anyway)")
+    ap.add_argument("--machine-of", nargs="+", metavar="NAME=ID",
+                    help="the machine of the records in speed dir NAME (speed-<box>-<stamp>) or of container host "
+                         "NAME, where no queue summary says it")
     ap.add_argument("--run-summaries", type=Path, nargs="+", help="the trainer's runs root(s)")
     ap.add_argument("--params", type=Path, help="{system: params_total} (the study's params.json)")
     ap.add_argument("--kotoba-jsonl", type=Path, help="Kotoba's stored Galgame judge file (decision 29; optional)")
