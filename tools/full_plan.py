@@ -23,9 +23,13 @@ Per student (--student NAME=FAMILY:MICRO:STEP:EPOCHS, repeatable; default the fo
                                  the micro-batch with the most rows, the one with the longest utterance (StepPlanner.
                                  worst_micro_batches) and the one with the most target tokens; the value of
                                  memory.probe_shapes (durations longest first, 3 decimals)
+  planner_fingerprint            aed only: StepPlanner.fingerprint over the selection's rows, the value a T run records
+                                 (its plan state, the timed-state pointer) when its train store keeps selection order
 The ctc family plans frames (max_dec_len None): only the durations drive its plan. The selection's n_tok is the Cohere
 token count, not the CTC target length the frame store holds, so a ctc student's micro_targets_max and most_targets
-use it as a proxy (the step counts and audio are exact).
+use it as a proxy, and its fingerprint (which hashes n_tok) is reported as planner_fingerprint_proxy: it never equals
+the trainer's frame-planner fingerprint, so resume tooling must not compare it with one. The step counts and audio
+are exact for both families.
 
 Usage (CPU, a few minutes on the full selection; no labels or audio needed):
   python tools/full_plan.py --selection D:/kitsune-study/selections/study_1000h.parquet --json plan.json
@@ -144,10 +148,12 @@ def plan_student(st: Student, utts: list, cache: dict) -> dict:
            "micro_utts_max": s0["micro_utts_max"], "micro_targets_max": s0["micro_targets_max"],
            "excluded_dec_len": s0["excluded_dec_len"], "steps_per_0p1_epoch": round(steps[0] / 10, 1),
            "cooldown_start_step": math.ceil((1.0 - COOLDOWN_FRAC) * total) + 1,
-           "real_h": s0["real_h"], "planner_fingerprint": planner.fingerprint,
-           "worst_shapes": worst_shapes(planner, plans[0])}
+           "real_h": s0["real_h"], "worst_shapes": worst_shapes(planner, plans[0])}
     if st.family == "aed":
         out["pad_eff_dec"] = s0["pad_eff_dec"]
+        out["planner_fingerprint"] = planner.fingerprint
+    else:  # hashes the Cohere n_tok, not the frame store's CTC targets: not the trainer's fingerprint (docstring)
+        out["planner_fingerprint_proxy"] = planner.fingerprint
     return out
 
 

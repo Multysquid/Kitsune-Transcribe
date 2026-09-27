@@ -74,7 +74,11 @@ def test_equals_the_step_planner(tmp_path):
         assert (r["micro_utts_max"], r["micro_targets_max"]) == (s0["micro_utts_max"], s0["micro_targets_max"])
         over = int((kept["n_tok"] + len(trainset.PROMPT) - 1 > 200).sum())
         assert r["excluded_dec_len"] == (over if family == "aed" else 0) == s0["excluded_dec_len"] and over > 0
-        assert r["planner_fingerprint"] == pl.fingerprint
+        # aed: the planner's fingerprint; ctc: only as a named proxy (it hashes the Cohere n_tok, while the trainer's
+        # frame planner hashes the CTC targets), so no key compares equal-looking values that never match
+        key = "planner_fingerprint" if family == "aed" else "planner_fingerprint_proxy"
+        assert r[key] == pl.fingerprint
+        assert not ({"planner_fingerprint", "planner_fingerprint_proxy"} - {key}) & set(r)
         assert r["steps_per_0p1_epoch"] == round(len(plans[0]) / 10, 1)
         assert r["cooldown_start_step"] == math.ceil(0.8 * r["total_steps"]) + 1
         assert r["study_step_real_s"] is None and r["delta_pct"] is None  # "a" / "c" are no study students
