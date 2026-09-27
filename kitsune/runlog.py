@@ -255,6 +255,22 @@ TB_BUCKET_RULES = (
     (rf"eval/mini/probe/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/train_probe_loss_mini/\g<set>/\g<m>"),
     (rf"eval/mini/probe/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/train_probe_accuracy_mini/\g<set>/\g<m>"),
     (rf"eval/mini/probe_greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/train_probe_accuracy_mini/\g<set>/\g<m>"),
+    # the dev-slice evals (eval/dev/..., scripts/04_distill.py run_dev_eval), ahead of the generic eval/<kind>/ rules:
+    # the pooled numbers the full runs' early stop reads first (00_dev), then per source as the eval sets' (loss,
+    # accuracy, the CTC frame metrics); their cost and counts operational, the token diagnostics misc. Never named
+    # combined_loss/*: the combined-loss chart (TB_LAYOUT) stays train vs val
+    (r"eval/dev/(?P<m>objective|ce|kl)", r"2_loss_accuracy/00_dev/\g<m>"),
+    (rf"eval/dev/tf/{_SET}/(?P<m>(kl|ce){_SPLIT})", r"2_loss_accuracy/dev_loss/\g<set>/\g<m>"),
+    (rf"eval/dev/tf/{_SET}/(?P<m>top1{_SPLIT})", r"2_loss_accuracy/dev_accuracy/\g<set>/\g<m>"),
+    (rf"eval/dev/greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/dev_accuracy/\g<set>/\g<m>"),
+    (rf"eval/dev/tf/{_SET}/(?P<m>ctc|kl_dense|kl_blank|kl_per_frame|argmax_agree|argmax_blank|teacher_blank)",
+     r"2_loss_accuracy/eval_ctc/dev/\g<set>/\g<m>"),
+    (rf"eval/dev/greedy/{_SET}/(?P<m>{_CER_DEN})", r"1_operational/eval/dev/greedy/\g<set>/\g<m>"),
+    (rf"eval/dev/(?P<kind>tf|greedy)/(?P<m>{_EVAL_OPS})", r"1_operational/eval/dev/\g<kind>/\g<m>"),
+    (rf"eval/dev/(?P<kind>tf|greedy)/{_SET}/(?P<m>{_EVAL_SET_OPS}|n_frames)",
+     r"1_operational/eval/dev/\g<kind>/\g<set>/\g<m>"),
+    (r"eval/dev/wall_s", r"1_operational/eval/dev/wall_s"),
+    (rf"(?P<t>eval/dev/tf/[^/]+/({_TOK_DIAG}|frac_dense|frames_per_token))", r"3_misc/\g<t>"),
     # loss/total = objective + the L2-SP value lam/2*||theta-theta0||^2, which the light decoupled pull does not hold
     # down: it climbs all run as the weights leave the init (70 by step 600 of an overfit run whose objective fell to
     # 0.1), so it and loss/l2sp get their own group, named for it, beside the optimised objective, kl and ce
@@ -274,7 +290,8 @@ TB_BUCKET_RULES = (
     (rf"eval/probe_greedy/{_SET}/(?P<m>{_CER})", r"2_loss_accuracy/train_probe_accuracy/\g<set>/\g<m>"),
     (r"eval/(?P<m>kl_gap_heldout_minus_probe|cer_teacher_gap_heldout_minus_probe)",
      r"2_loss_accuracy/overfit_gap/\g<m>"),
-    (r"early_stop/(?P<m>value|best)", r"2_loss_accuracy/early_stop/\g<m>"),  # the monitored metric, its best
+    # the monitored metric (smoothed under early_stop.smooth), its best, its newest raw value
+    (r"early_stop/(?P<m>value|best|raw)", r"2_loss_accuracy/early_stop/\g<m>"),
     (r"samples(?P<rest>/.+)?", r"2_loss_accuracy/samples\g<rest>"),
     # 1_operational: time, throughput, memory, system, data progress (tokens per source), schedule, early-stop
     # bookkeeping (evals since the best, triggered), eval cost and counts (ref_chars: a CER denominator), lifecycle text
