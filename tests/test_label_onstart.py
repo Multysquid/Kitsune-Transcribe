@@ -266,7 +266,7 @@ def test_a_full_box_boots_bootstrap_then_the_supervisor_with_a_fresh_train_hb(tm
     state.mkdir()
     for name in ("bootstrap.sh", "supervise.py", "label.py"):
         (repo / "vast" / name).write_text(f'echo {name} >> "$KITSUNE_STATE/ran"\n'
-                                          f'[ -e "$KITSUNE_STATE/train_hb" ] && echo hb >> "$KITSUNE_STATE/ran"\n',
+                                          f'[ ! -e "$KITSUNE_STATE/train_hb" ] || echo hb >> "$KITSUNE_STATE/ran"\n',
                                           encoding="utf-8", newline="\n")
     script = tmp_path / "subshell.sh"
     script.write_text("\n".join(["set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }", "PY=bash", subshell_body()]),
@@ -275,6 +275,12 @@ def test_a_full_box_boots_bootstrap_then_the_supervisor_with_a_fresh_train_hb(tm
     r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     assert (state / "ran").read_text(encoding="utf-8").split() == ["bootstrap.sh", "hb", "supervise.py", "hb"]
+    (state / "ran").unlink()
+    (state / "train_hb").unlink()
+    env.pop("KITSUNE_JOB")  # the train job: unchanged, no train_hb
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (state / "ran").read_text(encoding="utf-8").split() == ["bootstrap.sh", "supervise.py"]
 
 
 def test_the_watchdog_keeps_the_label_defaults():

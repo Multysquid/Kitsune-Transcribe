@@ -279,7 +279,7 @@ log "watchdog started (deadline $(date -u -d "@$(cat "$KITSUNE_STATE/deadline")"
         exec 7>&-  # label.py takes supervise.lock itself for its lifetime (--rearm checks it)
         exec "$PY" "$KITSUNE_DIR/vast/label.py"
     fi
-    touch "$KITSUNE_STATE/train_hb"  # a full box's controller heartbeat (the watchdog's): fresh as bootstrap starts
+    [ "${KITSUNE_JOB:-train}" != full ] || touch "$KITSUNE_STATE/train_hb"  # its watchdog's heartbeat, fresh now
     if [ -s "$KITSUNE_STATE/supervise.json" ]; then
         # a restart of this run: the supervisor starts only after a bootstrap that passed its coverage check and
         # records its history before the first attempt (--rearm moves it aside), so the data is on disk; bootstrap's
