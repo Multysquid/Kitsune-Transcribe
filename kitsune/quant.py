@@ -38,7 +38,7 @@ Principles:
   module identity   a selected nn.Linear is class-swapped in place to QuantLinear (names, state_dict keys and hooks
                     stay); a pointwise Conv1d(k=1) of a conformer convolution module is replaced by
                     PointwiseConv1dAsLinear, whose inner `.linear` is then treated like every other Linear
-  imports           torch, numpy and the stdlib only at import: torchao, transformers and safetensors are imported where
+  imports           torch and the stdlib only at import: torchao, transformers and safetensors are imported where
                     they are used, so the report can import this module on the laptop
 
 Numerics (the exact recipes; the constants are the torchao parity test's to pin):
@@ -112,11 +112,10 @@ import shutil
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -162,8 +161,8 @@ TORCHAO_CONFIGS = {"int8-w8a16": "Int8WeightOnlyConfig", "int8-w8a8": "Int8Dynam
                    "nvfp4-w4a16": "NVFP4WeightOnlyConfig", "nvfp4-w4a4": "NVFP4DynamicActivationNVFP4WeightConfig",
                    "fp8-w8a8": "Float8DynamicActivationFloat8WeightConfig"}
 # where torchao keeps them (its prototype namespaces move between releases; the first module that has a name wins)
-_AO_MODULES = ("torchao.quantization", "torchao.prototype.mx_formats", "torchao.prototype.mx_formats.inference_workflow",
-               "torchao.prototype.mx_formats.nvfp4_tensor", "torchao.prototype.mx_formats.mx_tensor",
+_AO_MODULES = ("torchao.quantization", "torchao.prototype.mx_formats",
+               "torchao.prototype.mx_formats.inference_workflow", "torchao.prototype.mx_formats.nvfp4_tensor", "torchao.prototype.mx_formats.mx_tensor",
                "torchao.prototype.mx_formats.utils", "torchao.prototype.mx_formats.config",
                "torchao.quantization.granularity", "torchao.quantization.quantize_.common")
 
@@ -694,7 +693,8 @@ def _model_device(model: nn.Module) -> torch.device:
 
 
 def model_family(model: nn.Module) -> str:
-    """"ctc" (ParakeetForCTC) or "aed" (a Cohere ASR model); anything else (Whisper included: never quantised) raises."""
+    """"ctc" (ParakeetForCTC) or "aed" (a Cohere ASR model); anything else (Whisper included: never quantised)
+    raises."""
     name = type(model).__name__
     if name == "ParakeetForCTC":
         return "ctc"

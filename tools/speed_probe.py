@@ -624,8 +624,9 @@ def parse_args(argv=None) -> argparse.Namespace:
             ap.error(f"--quant times a student: kinds aed and ctc, not {args.kind}")
         base = (args.system or "")[:-len(COMPILE_SUFFIX)] if args.compile else (args.system or "")
         if split_system(base)[1] != args.quant or base.endswith(COMPILE_SUFFIX):
-            ap.error(f"--quant {args.quant} needs --system <base>@{args.quant}" + (COMPILE_SUFFIX if args.compile else "")
-                     + ": a variant's record must never replace the base system's")
+            suffix = COMPILE_SUFFIX if args.compile else ""
+            ap.error(f"--quant {args.quant} needs --system <base>@{args.quant}{suffix}: a variant's record must never "
+                     "replace the base system's")
         if args.quant == "fp16" and args.dtype != "auto":
             ap.error("--quant fp16 sets the dtype (fp16 weights under fp16 autocast): no --dtype")
     if args.compile and args.kind == "parakeet-tdt":
