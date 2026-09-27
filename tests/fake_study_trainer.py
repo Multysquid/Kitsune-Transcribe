@@ -51,11 +51,9 @@ prefix: value}, 0.12, m4_teacher, m4_ratio, jg, jg_nostyle, gate_pooled and stra
 also fails stores, readout and eval items (rc, or [rc per launch]); FAKE_ITEM_S {item prefix: seconds} is how long a
 stores, readout, eval or speed item takes.
 """
-import hashlib
 import json
 import math
 import os
-import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -355,6 +353,8 @@ def item_sleep(record: dict):
 def full_state(run: Path, step: int, reason: str, st: dict, mark: str | None = None) -> Path:
     """checkpoints/full_step_<step>/ as save_full writes it (a .tmp dir renamed in), trainer.json with reason and
     st."""
+    import shutil  # here, not at the top: every launch of this fake (the study box's too) starts as fast as the base's
+
     d = run / "checkpoints" / f"full_step_{step}"
     tmp = d.with_name(d.name + ".tmp")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -372,6 +372,8 @@ def full_state(run: Path, step: int, reason: str, st: dict, mark: str | None = N
 def timed_upload(run: Path, step: int, epoch: float, st: dict):
     """A timed full state into the scratch DirHub FAKE_SCRATCH, as kitsune/scratch.py sends it: one commit of the state
     and its pointer (runs/<id>/timed_state.json, format 1) that deletes the run's previous state, then a squash."""
+    import hashlib
+
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from fake_runs_repo import DirHub
 
