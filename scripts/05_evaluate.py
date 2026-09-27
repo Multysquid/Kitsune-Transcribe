@@ -117,9 +117,12 @@ The size study (study/STUDY.md 4.1-4.3; CONTRACT.md 1, 5):
             them; every teacher and stratum against PREREG.json's baselines once filled, 0.05 pp): a drift refuses,
             unless eval.check_baselines is false. Writes tables/<teacher>/<set>.parquet and teachers.json
   --from-evals DIR  no model: the tables of a system from an eval dir that already holds its greedy_<set>.parquet
-            (the trainer's runs/<run_id>/evals/step_<N>/, or a 05 --out), checked against the manifest; with --system.
-            Every manifest set (or the --sets named) must be there and match, else it exits non-zero; study.json's
-            family is the --config's, else the eval dir's own (evals_family)
+            (the trainer's runs/<run_id>/evals/step_<N>/, a 05 --out, or a tools/whisper_eval.py --out), checked
+            against the manifest; with --system. Every manifest set (or the --sets named) must be there and match, else
+            it exits non-zero; study.json's family is the --config's, else the eval dir's own (evals_family). A dir
+            with a whisper.json (kitsune.whisper.WHISPER_META) is a Whisper system's whatever --config says: family
+            "whisper", no teacher (teacher null, no teacher_cer / *_teacher / *_ratio), and study.json carries its model
+            and decode blocks. A teacher table is built only when every set's parquet has the teacher_hyp column
 Wave-2 config keys that another package adds to 04_distill.DEFAULTS (family, loss.w_ctc, pull_parakeet,
 selection_recipe.study) are accepted here before that package lands: they are set aside for the merge (LATER_KEYS).
 A generated study config whose schedule.max_steps is still null (its box fills it) is validated with a stand-in; the
@@ -1660,9 +1663,14 @@ def main_teachers(args) -> int:
 
 
 def evals_family(src: Path) -> str | None:
-    """The family of the system whose eval dir `src` is: a 05 --out's evaluator.json (its last invocation's family; an
-    aed eval without a manifest records none), else the run's config.json two levels up (runs/<run_id>/evals/step_<N>/:
-    its config's family, "aed" when it has none, as the trainer reads it), else None."""
+    """The family of the system whose eval dir `src` is: "whisper" for a tools/whisper_eval.py --out (its whisper.json),
+    else a 05 --out's evaluator.json (its last invocation's family; an aed eval without a manifest records none), else
+    the run's config.json two levels up (runs/<run_id>/evals/step_<N>/: its config's family, "aed" when it has none, as
+    the trainer reads it), else None."""
+    from kitsune.whisper import FAMILY, WHISPER_META
+
+    if (src / WHISPER_META).is_file():
+        return FAMILY
     rec = _load_json(src / "evaluator.json")
     if isinstance(rec, dict) and rec.get("invocations"):
         return str(rec["invocations"][-1].get("family") or "aed")
@@ -1674,10 +1682,13 @@ def evals_family(src: Path) -> str | None:
 
 def main_from_evals(args) -> int:
     """--from-evals DIR: a system's tables and study.json from the greedy_<set>.parquet an eval dir holds (the
-    trainer's evals/step_<N>/ or a 05 --out), checked against the manifest; the family's teacher is the tables'
-    teacher_hyp column. Every set of the manifest is tabled (or the --sets named): exits non-zero when one could not
-    be - its rows are not the manifest's (refused), or the dir has none (missing_sets) - and a set without a table
-    now has none in the tables dir either (publish_tables)."""
+    trainer's evals/step_<N>/, a 05 --out or a whisper_eval --out), checked against the manifest; the family's teacher
+    is the tables' teacher_hyp column, when every set has one (a Whisper dir has none: no teacher). Every set of the
+    manifest is tabled (or the --sets named): exits non-zero when one could not be - its rows are not the manifest's
+    (refused), or the dir has none (missing_sets) - and a set without a table now has none in the tables dir either
+    (publish_tables). A whisper.json in the dir makes the family "whisper" over --config's."""
+    from kitsune.whisper import FAMILY, WHISPER_META
+
     src = Path(args.from_evals).resolve()
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -1698,11 +1709,22 @@ def main_from_evals(args) -> int:
         raise SystemExit(f"{src}: no greedy_<set>.parquet of a manifest set")
     missing = [s for s in want if s not in frames]
     tables, refused = tables_from_frames(man, frames)
-    teacher, _ = tables_from_frames(man, frames, hyp_col="teacher_hyp", trunc_col="teacher_truncated")
+    # the family's teacher on the same rows: only a system with one has a teacher_hyp column in every set (a Whisper
+    # model has none, and a teacher table from some sets only would give M4 a teacher of part of its strata)
+    teacher = (tables_from_frames(man, frames, hyp_col="teacher_hyp", trunc_col="teacher_truncated")[0]
+               if all("teacher_hyp" in f.columns for f in frames.values()) else None)
     paths, stale = publish_tables(_tables_dir(args, out), args.system, tables)
-    fam = family_of(cfg) if cfg else evals_family(src)
+    # whisper.json wins over --config: a Whisper system scored with a student config must not become "aed" with
+    # Cohere as its teacher
+    is_whisper = (src / WHISPER_META).is_file()
+    fam = FAMILY if is_whisper else family_of(cfg) if cfg else evals_family(src)
+    extra = {}
+    if is_whisper:
+        w = _load_json(src / WHISPER_META)
+        w = w if isinstance(w, dict) else {}
+        extra["whisper"] = dict(model=w.get("model"), decode=w.get("decode"), limit_per_set=w.get("limit_per_set"))
     rec = study_record(args.system, fam, M, study_block(man, tables, teacher), paths, refused, source=str(src),
-                       missing_sets=missing, stale_removed=stale)
+                       missing_sets=missing, stale_removed=stale, **extra)
     _write_output_json(out / "study.json", rec)
     log.event("study_tables", system=args.system, sets=sorted(tables), refused=refused, missing_sets=missing,
               stale_removed=stale, m4=rec["metrics"].get("m4"), source=str(src))

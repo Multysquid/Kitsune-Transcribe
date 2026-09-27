@@ -942,3 +942,52 @@ def test_the_first_a100_runs_per_set_cer_from_its_eval_parquets():
                               "cohere": pd.concat(teach.values(), ignore_index=True)}, man)
     pooled = ss.metric_values(ss.point_sums(corpus), "gate_pooled")
     assert float(pooled[corpus.index("anchor-b20")]) == pytest.approx(0.1215, abs=5e-5)  # the run's val_cer 12.15 %
+
+
+def test_05_from_evals_without_a_teacher_column(ctc_env, ctc_run, tmp_path):
+    """--from-evals on an eval dir whose greedy parquets have no teacher columns (a Whisper model's, WP6): the tables
+    are the system's, and there is no teacher table - teacher null, no teacher_cer, no m4_teacher / m4_ratio - also when
+    only some sets have a teacher_hyp. A whisper.json in the dir makes the family "whisper" even with a student's
+    --config (never "ctc" / "aed" with that family's teacher), and study.json carries its model and decode blocks."""
+    import shutil
+
+    m05 = ctc_run["m05"]
+    teacher_cols = ["teacher_hyp", "cer_teacher", "teacher_cer", "teacher_truncated", "has_teacher"]
+    src = tmp_path / "src"
+    src.mkdir()
+    for e in EVAL_SETS:
+        g = pd.read_parquet(ctc_run["out"] / f"greedy_{e}.parquet")
+        g.drop(columns=[c for c in teacher_cols if c in g.columns]).to_parquet(src / f"greedy_{e}.parquet")
+    man = ss.parse_manifest(ctc_env["manifest"])
+
+    def from_evals(name, *extra):
+        out = tmp_path / name
+        assert m05.main(["--from-evals", str(src), "--system", name, "--manifest", str(ctc_env["manifest_path"]),
+                         "--out", str(out), "--tables", str(tmp_path / "tables"), *extra]) == 0
+        return load(out / "study.json")
+
+    def no_teacher(st):
+        assert st["teacher"] is None and st["refused"] == {} and st["missing_sets"] == []
+        assert not any("teacher_cer" in r for r in st["strata"].values())
+        assert "m4" in st["metrics"] and not any(k.endswith(("_teacher", "_ratio")) for k in st["metrics"])
+
+    st = from_evals("no-teacher")
+    no_teacher(st)
+    assert st["family"] is None and "whisper" not in st  # no config, no evaluator.json: the family is unknown
+    for e in EVAL_SETS:
+        pd.testing.assert_frame_equal(pd.read_parquet(tmp_path / "tables" / "no-teacher" / f"{e}.parquet"),
+                                      pd.read_parquet(ctc_run["tables"] / "study-p01" / f"{e}.parquet"))
+    # one set with its teacher, the others without: still no teacher table (M4 would have a teacher of part of it)
+    shutil.copy(ctc_run["out"] / "greedy_eval_jsut.parquet", src / "greedy_eval_jsut.parquet")
+    no_teacher(from_evals("mixed"))
+    (src / "whisper.json").write_text(json.dumps(dict(schema=1, system="whisper-x", family="whisper",
+                                                      model=dict(repo="openai/whisper-small", n_mels=80),
+                                                      decode=dict(language="ja"), limit_per_set=None)),
+                                      encoding="utf-8")
+    assert m05.evals_family(src) == "whisper"
+    st = from_evals("whisper-x", "--root", str(ctc_env["root"]), "--config", str(ctc_env["config"]))
+    no_teacher(st)
+    assert st["family"] == "whisper" and st["whisper"]["model"]["repo"] == "openai/whisper-small"
+    assert st["whisper"]["decode"] == dict(language="ja")
+    corpus = ss.build_corpus(study_report.load_tables(tmp_path / "tables", man.sets)[0], man)
+    assert {"no-teacher", "mixed", "whisper-x"} <= set(corpus.systems)
