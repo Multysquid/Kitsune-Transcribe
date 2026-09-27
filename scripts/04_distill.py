@@ -259,7 +259,8 @@ Full-data runs: timed states, heartbeats, 4e, fix 7 (the full-run build contract
                     failure path's too), not at every sync; metrics/scalars.jsonl is unchanged
   log.full_scalars_every_steps  (fix 7) N > 1: after the smoke phase only every N-th step's row holds the full set
                     (system stats, per source, buckets, token diagnostics), the others the CORE_STEP_TAGS keys;
-                    steps.parquet keeps a row per step. mem/step_peak_reserved_gb (CUDA) is logged every step
+                    steps.parquet keeps a row per step. mem/step_peak_reserved_gb (CUDA) is logged every step, and
+                    summary.json's throughput has data_wait_frac (the loader's share of the steps' time)
 """
 import argparse
 import concurrent.futures
@@ -1258,8 +1259,9 @@ class ScratchUploader(Uploader):
 def st_timed_defaults() -> dict:
     """The timed states' part of Run.st (fresh objects; a state saved before them resumes with these): the loop clock and
     step of the last timed save (its cadence), and the last timed state that went up ({name, step, time_utc, count}:
-    count = the run's timed uploads that went up, across launches; None before the first)."""
-    return dict(last_timed_t=0.0, last_timed_step=0, timed=None)
+    count = the run's timed uploads that went up, across launches; None before the first). Also data_wait_s, the
+    steps' waits for the loader (log_step), for summary.json's throughput.data_wait_frac."""
+    return dict(last_timed_t=0.0, last_timed_step=0, timed=None, data_wait_s=0.0)
 
 
 def hf_roundtrip(R: Run) -> dict:
@@ -2422,6 +2424,7 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
     R.st["audio_s"] += out["audio_real"]
     R.st["tokens"] += n_tok
     R.st["step_time_s"] += step_s
+    R.st["data_wait_s"] = R.st.get("data_wait_s", 0.0) + wait_s  # summary.json's throughput.data_wait_frac
     R.st["last_objective"] = float(objective)
     flops = None
     if R.st["flops_per_padded_s"]:
@@ -4658,7 +4661,9 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         budget_s=R.budget_s,  # None = the full train_hours; else T clipped to the instance deadline
         throughput=dict(audio_s=st["audio_s"], tokens=st["tokens"], step_time_s=round(st["step_time_s"], 1),
                         audio_s_per_s=st["audio_s"] / st["step_time_s"] if st["step_time_s"] else None,
-                        tokens_per_s=st["tokens"] / st["step_time_s"] if st["step_time_s"] else None),
+                        tokens_per_s=st["tokens"] / st["step_time_s"] if st["step_time_s"] else None,
+                        # the share of the steps' time spent waiting for the loader (the full smoke's check 5)
+                        data_wait_frac=st.get("data_wait_s", 0.0) / st["step_time_s"] if st["step_time_s"] else None),
         memory=st["memory"], skipped=dict(nonfinite=st["nonfinite_total"], oom=st["oom_skips"]),
         cost=dict(dph=dph, usd=round(dph * elapsed / 3600, 2) if dph else None, note="trainer process time only"),
         best=dict(greedy_cer_ratio_mean=best(cer_ratio),  # the gate sets, as heldout_kl (eval_record)

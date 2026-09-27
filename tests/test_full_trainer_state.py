@@ -188,6 +188,7 @@ def test_keys_constants_and_state_defaults():
             m.load_config(None, bad)
     R = m.Run(cfg=cfg, run_dir=Path("r"), device=torch.device("cpu"), amp=False)
     assert (R.st["last_timed_t"], R.st["last_timed_step"], R.st["timed"], R.scratch) == (0.0, 0, None, None)
+    assert R.st["data_wait_s"] == 0.0
     assert m.st_timed_defaults() is not m.st_timed_defaults()
 
 
@@ -605,7 +606,8 @@ def test_heartbeats_threads_event_and_a_run_without_timed_states(env, monkeypatc
     """$KITSUNE_HEARTBEAT is touched by log_step, by the evaluators' batches (the Beating featuriser) and during the
     end phase's waits; setup_processing logs the threads event. The run (an output repo, no scratch repo) behaves as
     before: no timed event, no timed_states in summary.json, the runs repo's uploads ignore UPLOAD_MARK only; and with
-    log.full_scalars_every_steps 2 steps.parquet still has every step, the odd ones lean."""
+    log.full_scalars_every_steps 2 steps.parquet still has every step, the odd ones lean; summary.json's throughput
+    has data_wait_frac."""
     from kitsune import heartbeat
 
     hub = ScratchHub()
@@ -633,6 +635,7 @@ def test_heartbeats_threads_event_and_a_run_without_timed_states(env, monkeypatc
     assert not [e for e in events(run) if e["kind"].startswith("timed_state")]
     summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
     assert "timed_states" not in summary and summary["status"] == "complete"
+    assert 0.0 <= summary["throughput"]["data_wait_frac"] < 1.0  # the loader's share of the steps' time
     ups = [c for c in hub.commits if "/checkpoints/" in c.get("folder", "")]
     assert ups and all(c["ignore"] == [m.UPLOAD_MARK] for c in ups)
     steps = steps_of(run)
