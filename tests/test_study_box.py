@@ -1138,3 +1138,44 @@ def test_boxes_a_and_b_at_the_same_time_share_one_runs_repo_without_a_clash(tmp_
             assert remote.read_bytes() == (rd / "events.jsonl").read_bytes()
         starts = sorted(by_item[m]["t0"] for m in mains[n])
         assert all(b - a >= 0.04 for a, b in zip(starts, starts[1:]))
+
+
+# ============================================================================== the full-run queue's hooks (WP2)
+
+
+def test_an_injected_plan_replaces_box_plan_and_the_study_defaults_stay(tmp_path, monkeypatch):
+    """kitsune/full_queue.py's hooks in the study queue (build contract 0.3, H1-H5): a plan passed in is used instead of
+    box_plan (which is then never read), a shared_queue plan may train more runs than it has GPUs, and without one
+    everything is as before: MAX_ATTEMPTS, the command line start() always built (argv_for), no extra child env, and
+    the orphan matcher never matching the full-run queue itself."""
+    def no_plan(*a, **k):
+        raise AssertionError("box_plan read although a plan was given")
+
+    monkeypatch.setattr(Q, "box_plan", no_plan)
+    s = Q.Settings(root=tmp_path, state_dir=tmp_path / "state", out_repo="u/runs", gpus=["0"], rules=study_rules(),
+                   uploader=FakeUploader(), python=PY, train_cmd=[PY, "04.py"], stores_cmd=[PY, "stores.py"])
+    plan = dict(box="p01", shared_queue=True, runs=["a", "b", "c"], calibrate=[], extras=[])
+    q = Q.Queue("A", s, plan=plan)
+    assert q.plan is plan and q.max_attempts == Q.MAX_ATTEMPTS
+    with pytest.raises(Q.QueueError, match="one wave"):
+        Q.Queue("A", s, plan=dict(plan, shared_queue=False))
+    monkeypatch.undo()
+    q = Q.Queue("shakedown", s)
+    assert q.plan == Q.box_plan("shakedown", study_rules()) and q.max_attempts == Q.MAX_ATTEMPTS == 2
+    q.add_item("study-t06", "main", "configs/study/study-t06.json", ["optim.lr=0.0002"])
+    q.add_item("stores-aed", "stores", "configs/study/calib-study-t06.json", ["schedule.max_steps=20000"])
+    it = q.item("study-t06")
+    assert q.argv_for("study-t06", it, None) == [PY, "04.py", "--config", "configs/study/study-t06.json", "--set",
+                                                 "run_name=study-t06", "--set", "optim.lr=0.0002", "--set",
+                                                 "hf.output_repo=u/runs"]
+    (tmp_path / "runs" / "study-t06-20260926T000000Z").mkdir(parents=True)
+    assert q.argv_for("study-t06", it, tmp_path / "runs" / "study-t06-20260926T000000Z") == [
+        PY, "04.py", "--resume", "runs/study-t06-20260926T000000Z", "--set", "optim.lr=0.0002", "--set",
+        "hf.output_repo=u/runs"]
+    assert q.argv_for("stores-aed", q.item("stores-aed"), None) == [
+        PY, "stores.py", "--config", "configs/study/calib-study-t06.json", "--set", "schedule.max_steps=20000"]
+    assert q.child_env("study-t06", it, "0") == {}
+    for cmd in ("kitsune.full_queue build-stores", "kitsune.full_queue check-resume", "speed_probe", "whisper_eval",
+                "kitsune.quant", "04_distill", "05_evaluate"):
+        assert cmd in Q.ORPHAN_CMDS
+    assert not any(c in "/venv/main/bin/python -m kitsune.full_queue run --box p01" for c in Q.ORPHAN_CMDS)
