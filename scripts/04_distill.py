@@ -278,8 +278,9 @@ the trainer as it was before them; configs/full/*.json turn them on):
                     left ends the loop (`no_time_left`). Exit 0, summary.json's end_reason "deadline"
   4c                memory.probe_extended adds the micro-batch with the most rows (and, family ctc, the most CTC
                     targets and the largest CTC lattice) to the memory probe; memory.probe_shapes adds synthetic
-                    micro-batches of the train rows nearest given durations (synth_micro_batch; the full data's worst
-                    shapes on a smoke run). The memory_probe event gains extended, headroom_gb and shapes
+                    micro-batches of the train rows nearest given durations, held within the micro-batch as the
+                    planner packs one (synth_micro_batch; the full data's worst shapes on a smoke run; a shape larger
+                    than the micro-batch is skipped). The memory_probe event gains extended, headroom_gb and shapes
   summary.json      end_reason (schedule | early_stop | cooldown_file | stop_file | deadline) and resume_resets always;
                     dev_history, deadline_cooldown and schedule_resets when there are any
   also              the epoch clock refuses a schedule.max_steps; eval.dev refuses lr_probe.enabled;
@@ -3874,9 +3875,10 @@ def probe_passes(R: Run, planner: trainset.StepPlanner, rec: dict):
     memory.probe_extended (4c) adds the micro-batch with the most rows (both families: per-row buffers, the decoder's
     padded positions) and, for the frame planner, the one with the most CTC targets and the one with the largest CTC
     lattice (rows x frames x (2 max targets + 1): the CTC loss's alpha/beta). memory.probe_shapes adds a synthetic
-    micro-batch per shape (synth_micro_batch), probed as "shape:<name>" - at the configured micro_audio_s, and after an
-    OOM fallback only the shapes whose padded seconds fit the smaller one (the others are listed, skipped, in
-    rec["shapes"], the memory_probe event's)."""
+    micro-batch per shape (synth_micro_batch, held within the micro-batch the way the planner packs one), probed as
+    "shape:<name>" at the configured micro_audio_s; a shape of two or more rows whose target padded seconds (longest
+    x rows) exceed the micro-batch in use - after an OOM fallback, the smaller one - is one training never meets there
+    and is only listed, skipped, in rec["shapes"] (the memory_probe event's: n, padded_s, target_padded_s)."""
     cuda = R.device.type == "cuda"
     plan = planner.epoch_plan(0)
     rec["grads_held"] = held = max(len(step) for step in plan) > 1
@@ -3897,14 +3899,18 @@ def probe_passes(R: Run, planner: trainset.StepPlanner, rec: dict):
         micro0 = float(R.cfg["batch"]["micro_audio_s"])
         rec["shapes"] = {}
         for shape in mem["probe_shapes"]:
-            idx = synth_micro_batch(planner, shape["durations"])
-            padded = round(float(planner.dur[idx].max()) * len(idx), 3) if idx else 0.0
-            info = dict(n=len(idx), padded_s=padded)
-            if not idx or (planner.micro_audio_s < micro0 and padded > planner.micro_audio_s):
-                info["skipped"] = (f"larger than micro_audio_s {planner.micro_audio_s:g} after an OOM fallback"
-                                   if idx else "no train row to stand in")
+            durs = [float(x) for x in shape["durations"]]
+            info = dict(target_padded_s=round(max(durs) * len(durs), 3))
+            if len(durs) > 1 and max(durs) * len(durs) > planner.micro_audio_s:  # never packed at this micro-batch
+                info.update(n=0, padded_s=0.0, skipped=f"larger than micro_audio_s {planner.micro_audio_s:g}"
+                            + (" after an OOM fallback" if planner.micro_audio_s < micro0 else ""))
             else:
-                worst[f"shape:{shape['name']}"] = idx
+                idx = synth_micro_batch(planner, durs, fit=True)  # within the micro-batch, as training packs it
+                info.update(n=len(idx), padded_s=round(float(planner.dur[idx].max()) * len(idx), 3) if idx else 0.0)
+                if idx:
+                    worst[f"shape:{shape['name']}"] = idx
+                else:
+                    info["skipped"] = "no train row to stand in"
             rec["shapes"][shape["name"]] = info
     for name, idx in worst.items():
         if held:
@@ -3919,13 +3925,22 @@ def probe_passes(R: Run, planner: trainset.StepPlanner, rec: dict):
                                          round(torch.cuda.max_memory_reserved() / 2**30, 2))
 
 
-def synth_micro_batch(planner: trainset.StepPlanner, durations) -> list[int]:
+def synth_micro_batch(planner: trainset.StepPlanner, durations, fit: bool = False) -> list[int]:
     """A synthetic micro-batch for memory.probe_shapes: for each target duration, longest first, the unused train row
     whose duration is nearest (the longer one on a tie), among the rows the planner can use (a token planner excludes
     those past batch.max_dec_len). Store indices, in that order; fewer when the store has fewer rows. The shapes come
     from the full data's worst micro-batches (tools/full_plan.py worst_shapes), so a smoke run on a smaller selection
-    probes the full run's memory peak with its own rows."""
+    probes the full run's memory peak with its own rows. fit: hold a shape of two or more rows to the planner's packing
+    rule (trainset.pack_micro_batches: longest row x rows <= micro_audio_s, decoder positions within max_micro_tokens
+    when set) by standing in only rows of at most micro_audio_s / rows seconds - where the nearest row would overshoot,
+    the nearest shorter one - so the probe never measures a micro-batch that training cannot meet (one row stays
+    exempt: the planner gives a row longer than the micro-batch one of its own)."""
     elig = np.ones(len(planner.dur), dtype=bool) if planner.frames else planner.dec_len <= planner.max_dec_len
+    k = len(durations)
+    if fit and k > 1:
+        elig = elig & (planner.dur.astype(np.float64) * k <= float(planner.micro_audio_s))
+        if not planner.frames and planner.max_micro_tokens is not None:
+            elig = elig & (planner.dec_len * k <= planner.max_micro_tokens)
     order = np.flatnonzero(elig)
     order = order[np.argsort(planner.dur[order], kind="stable")]
     d, n = planner.dur[order], len(order)

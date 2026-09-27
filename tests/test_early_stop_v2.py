@@ -943,7 +943,8 @@ class _Rows:
 def test_the_extended_memory_probe(monkeypatch):
     """memory.probe_extended adds the micro-batch with the most rows (both planners) and, for the frame planner, the
     most CTC targets and the largest CTC lattice; probe_shapes adds one synthetic micro-batch per shape (the nearest
-    unused rows, longest first), skipped after an OOM fallback when it no longer fits the smaller micro-batch."""
+    unused rows, longest first, within the micro-batch as the planner packs one), skipped when its targets exceed the
+    micro-batch in use (after an OOM fallback, the smaller one)."""
     from kitsune import trainset
 
     m = load_script("04_distill")
@@ -990,12 +991,32 @@ def test_the_extended_memory_probe(monkeypatch):
     rest = sorted(range(len(utts)), key=lambda i: abs(utts[i].duration - 1.0))[:6]
     assert sorted(idx) == sorted(rest)  # the six rows nearest 1 s
     assert set(rec["shapes"]) == {"wide", "long"} and "skipped" not in rec["shapes"]["wide"]
+    assert rec["shapes"]["wide"]["target_padded_s"] == 6.0 and rec["shapes"]["wide"]["padded_s"] <= 10.0
     small = trainset.StepPlanner(utts, step_audio_s=40.0, micro_audio_s=5.0, pool_micro=4, seed=0, max_dec_len=None)
     rec, on = probe(small, probe_shapes=shapes)  # after an OOM fallback to 5 s: wide (6 x ~1 s) no longer fits
-    assert "skipped" in rec["shapes"]["wide"] and "skipped" not in rec["shapes"]["long"] and len(on) == 3
+    assert "OOM fallback" in rec["shapes"]["wide"]["skipped"] and "skipped" not in rec["shapes"]["long"]
+    assert len(on) == 3
     # the token planner draws only the rows it can use (decoder input within max_dec_len)
     usable = {i for i in range(len(utts)) if tok.dec_len[i] <= tok.max_dec_len}
     assert set(m.synth_micro_batch(tok, [4.9] * 20)) <= usable
+
+    # the nearest rows would overshoot the micro-batch (3 x 3.37 s > 10 s, targets 3 x 3.3 = 9.9 s): the probe stands
+    # in the nearest rows that fit, as the planner packs a micro-batch; a shape whose targets exceed the configured
+    # micro-batch is one training never meets (skipped); one row longer than it is probed (the planner gives such a row
+    # a micro-batch of its own)
+    near = [trainset.Utt(id=f"n{i}", source="s", duration=d, n_tok=5, audio_off=0, audio_len=0, tok_off=0)
+            for i, d in enumerate([3.35, 3.36, 3.37, 1.0, 1.1, 1.2, 2.0, 2.1, 12.0])]
+    p = trainset.StepPlanner(near, step_audio_s=40.0, micro_audio_s=10.0, pool_micro=4, seed=0, max_dec_len=None)
+    assert float(p.dur[m.synth_micro_batch(p, [3.3] * 3)].max()) * 3 > 10.0  # nearest of all: over the micro
+    shapes = [{"name": "tight", "durations": [3.3, 3.3, 3.3]}, {"name": "over", "durations": [3.0] * 4},
+              {"name": "one", "durations": [11.0]}]
+    rec, on = probe(p, probe_shapes=shapes)
+    tight, over, one = (rec["shapes"][k] for k in ("tight", "over", "one"))
+    assert tight["n"] == 3 and tight["padded_s"] <= 10.0 and tight["target_padded_s"] == 9.9 and "skipped" not in tight
+    assert sorted(round(float(x), 2) for x in p.dur[on[-2]]) == [1.2, 2.0, 2.1]  # the nearest rows of <= 10 / 3 s
+    assert over["n"] == 0 and over["skipped"] == "larger than micro_audio_s 10" and over["target_padded_s"] == 12.0
+    assert one["n"] == 1 and one["padded_s"] == 12.0 and on[-1] == [8]
+    assert len(on) == 2 + 2  # the frame planner's two passes, then tight and one
 
 
 # ---------------------------------------------------------------------------------------------------- 4d
