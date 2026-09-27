@@ -50,7 +50,9 @@ tools/               export_run.py: a run -> parquet/CSV tables + README; regrou
                      TensorBoard files in the three groups; label_checks.py: the size study's label checks K1-K12 on
                      a local pull of the label root (what the label box stored is what the study reads);
                      study_report.py: the size study's pre-registered answer and readouts from every system's eval
-                     tables (statistics in kitsune/study_stats.py)
+                     tables (statistics in kitsune/study_stats.py); full_report.py: the full-data runs' descriptive
+                     report on the same manifest (offer table, study -> full, quantised variants, Whisper, the
+                     error-vs-speed charts)
 vast/                training image, CI build and the vast.ai run scripts: the A100 training run and the RTX 5090
                      label box that labels the full download with both teachers (see vast/README.md)
 python -m kitsune.prereg  the size study's pre-registration: --write study/ regenerates study/PREREG.{json,md} from
