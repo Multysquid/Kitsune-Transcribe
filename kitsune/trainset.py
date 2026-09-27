@@ -688,7 +688,8 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
             f"frame preflight failed (decision 15) for {cache_dir}: {report['n_mismatch']} of {n} rows have another "
             f"frame count than their stored n_frames ("
             + ", ".join(f"{sp} {b['mismatch']}/{b['rows']}" for sp, b in sorted(by.items()))
-            + f"; train share {100 * report['train_mismatch_frac']:.3f} %, limit {100 * max_mismatch_frac:g} %, any "
+            + f"; train share {100 * report['train_mismatch_frac']:.3f} %, dev share "
+            f"{100 * report.get('dev_mismatch_frac', 0.0):.3f} %, limit {100 * max_mismatch_frac:g} % each, any "
             f"eval row fails), e.g. {report['mismatches'][:3]}", report)
     keep = [r for r in range(n) if r not in drop]
     dropped_rows = idx.iloc[sorted(drop)]

@@ -945,7 +945,8 @@ def test_frame_preflight_holds_the_dev_split_to_the_train_rule_on_its_own():
 
 def test_the_dev_split_frame_store_reads_its_rows_train_shards(big, monkeypatch):
     """build_frame_stores for split "dev" packs the kept dev rows from exactly the shards their teacher_file names (and
-    their parakeet_out targets from the same stems), and runs the frame preflight on them as split dev."""
+    their parakeet_out targets from the same stems), and runs the frame preflight on them as split dev: two planted
+    mismatches fail the build, and its message names the dev share."""
     from kitsune import trainset
 
     fc = big["fc"]
@@ -972,3 +973,8 @@ def test_the_dev_split_frame_store_reads_its_rows_train_shards(big, monkeypatch)
     assert rep["ok"] and rep["by_split"] == {"dev": dict(rows=int(dev.sum()), mismatch=0, undecodable=0)}
     for i in range(0, len(st), 37):  # its targets are the stored ones of that shard
         assert st.targets(i).n_frames == trainset.ctc_frames(n_samples(fc.utts[st.utts[i].id].audio))
+    two = planted_parakeet_out(fc, big["root"] / "po_dev_two", unique_length(fc, df["id"][dev].tolist())[:2],
+                               monkeypatch)
+    with pytest.raises(trainset.FramePreflightFailed, match=r"dev 2/\d+; train share 0\.000 %, dev share [1-9]"):
+        trainset.build_frame_stores(sel, fc.data, two.root, big["root"] / "cache" / "dev_two", ["src_big"], ["dev"],
+                                    log=lambda s: None)
