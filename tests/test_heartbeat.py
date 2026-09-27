@@ -121,12 +121,68 @@ def test_beating_stops_after_max_s_while_the_block_goes_on(tmp_path):
         assert _mtime(p) == OLD, "beating went on after max_s: a hung call would never go stale"
 
 
-def test_beating_exit_is_bounded(tmp_path):
+def test_beating_exit_is_bounded_when_the_thread_hangs(tmp_path, monkeypatch):
+    # the contract's <= 1 s join: the heartbeat thread is stuck inside a touch (a hung filesystem) when the block ends;
+    # the exit must not wait for it. (stop.set() alone would wake a thread that is only waiting, so the beat must hang.)
+    p = tmp_path / "x"
+    entered, release = threading.Event(), threading.Event()
+    real = hb.beat
+
+    def hanging_beat(path=None, **kw):
+        if threading.current_thread().name == "kitsune-heartbeat":
+            entered.set()
+            release.wait(10)
+            return None
+        return real(path, **kw)
+    monkeypatch.setattr(hb, "beat", hanging_beat)
+    try:
+        with hb.beating(p, every_s=0.01):
+            assert entered.wait(5), "the heartbeat thread never beat"
+            t = time.monotonic()
+        took = time.monotonic() - t
+        assert hb._JOIN_S <= took + 0.05 and took < 2.5, took  # it waited for the join bound, and no longer
+    finally:
+        release.set()
+
+
+def test_beating_exit_does_not_wait_for_the_interval(tmp_path):
     p = tmp_path / "x"
     t = time.monotonic()
-    with hb.beating(p, every_s=30.0):  # the thread sleeps 30 s; the exit must not wait for it
+    with hb.beating(p, every_s=30.0):  # the thread sleeps 30 s; stop wakes it at once
         pass
     assert time.monotonic() - t < 3.0
+
+
+@pytest.mark.parametrize("max_s", [float("nan"), float("inf"), "abc", [1]])
+def test_beating_a_bad_max_s_is_the_entry_beat_only(tmp_path, max_s):
+    # a max_s that is not a finite number must never lift the bound (NaN compares False, so `age > nan` never trips):
+    # it counts as 0, so a hung block goes stale after its entry beat
+    p = tmp_path / "hb" / "bad"
+    with hb.beating(p, every_s=0.05, max_s=max_s):
+        assert p.is_file()  # the entry beat
+        _age_old(p)
+        time.sleep(0.5)  # 10 intervals: an unbounded thread would have beaten
+        assert _mtime(p) == OLD
+        assert not [t for t in threading.enumerate() if t.name == "kitsune-heartbeat" and t.is_alive()]
+
+
+@pytest.mark.parametrize("every_s", [float("nan"), float("inf"), 1e300, "abc", None, 0, -5])
+def test_beating_a_bad_every_s_neither_spins_nor_kills_the_thread(tmp_path, monkeypatch, every_s):
+    # Event.wait(nan) returns at once (a spinning thread), Event.wait(inf) raises OverflowError (a dead thread): a
+    # value that is not a finite number is the 30 s default; 0 and below are 0.01 s
+    p = tmp_path / "hb" / "every"
+    errors, calls = [], []
+    monkeypatch.setattr(threading, "excepthook", lambda a: errors.append(a.exc_type))
+    real = hb.beat
+    monkeypatch.setattr(hb, "beat", lambda path=None, **kw: (calls.append(1), real(path, **kw)))
+    with hb.beating(p, every_s=every_s, max_s=60):
+        time.sleep(0.3)
+        alive = [t for t in threading.enumerate() if t.name == "kitsune-heartbeat" and t.is_alive()]
+    assert errors == [] and len(alive) == 1
+    if isinstance(every_s, (int, float)) and every_s is not None and every_s <= 0:
+        assert len(calls) > 3  # 0.01 s: it beats
+    else:
+        assert len(calls) == 1  # the default 30 s: only the entry beat within 0.3 s, no spinning
 
 
 def test_beating_uses_the_env_path(tmp_path, monkeypatch):

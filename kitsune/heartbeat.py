@@ -19,8 +19,10 @@ beats runs unchanged on the laptop, in the tests and in any run outside a full b
   beating(path=None, every_s, max_s)       a context manager: a daemon thread beats at entry and every every_s while
                                            the block runs. max_s BOUNDS it: after max_s the beats stop while the block
                                            goes on, so a truly hung call (an upload, a store build) still goes stale
-                                           and its stall check or watchdog fires. The thread is joined for at most 1 s
-                                           at exit
+                                           and its stall check or watchdog fires. Only an explicit None is unbounded:
+                                           a max_s that is not a finite number (NaN, inf, "abc") counts as 0, the entry
+                                           beat only, because a bound lost to a bad value would keep a hung box alive.
+                                           The thread is joined for at most 1 s at exit
   Beating(fn, path=None)                   wraps a featuriser: every call beats, then calls fn. The evaluators call
                                            the featuriser once per batch, so wrapping it gives per-batch beats with no
                                            edit to kitsune/evaluate.py or kitsune/ctc_eval.py; attributes delegate to
@@ -30,6 +32,7 @@ beats runs unchanged on the laptop, in the tests and in any run outside a full b
 Nothing here ever raises: a heartbeat that cannot be written must never end the run it reports on (an unwritable path
 only makes the file go stale, which is what its reader is for). Stdlib only.
 """
+import math
 import os
 import threading
 import time
@@ -38,8 +41,10 @@ from pathlib import Path
 
 ENV = "KITSUNE_HEARTBEAT"
 MIN_INTERVAL_S = 5.0
-# the shortest beating() interval: a zero or negative every_s would spin the thread
+# beating()'s interval bounds: a zero, negative or NaN every_s would spin the thread (Event.wait(nan) returns at
+# once), an infinite or huge one would kill it (Event.wait raises OverflowError past threading.TIMEOUT_MAX)
 _MIN_EVERY_S = 0.01
+_DEFAULT_EVERY_S = 30.0
 _JOIN_S = 1.0  # beating()'s bound on joining its thread at exit
 
 _last: dict[str, float] = {}  # resolved path -> time.monotonic() of its last touch (the rate limit)
@@ -76,20 +81,30 @@ def beat(path: str | os.PathLike | None = None, *, force: bool = False) -> None:
         pass
 
 
+def _finite(v, default: float) -> float:
+    """v as a finite float; default when it is not a number or not finite (NaN, +-inf)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return f if math.isfinite(f) else default
+
+
 @contextmanager
 def beating(path=None, every_s: float = 30.0, max_s: float | None = None):
     """Beat at entry and every every_s from a daemon thread until the block exits or max_s has passed; after max_s the
     thread stops beating while the block goes on (a hung call still goes stale). No path -> a plain context, no
-    thread. The thread is joined for at most 1 s at exit."""
+    thread. The thread is joined for at most 1 s at exit.
+
+    Bad values never lift the bound: max_s None (explicit) is the only unbounded case; a max_s that is not a finite
+    number counts as 0 (the entry beat only). An every_s that is not a finite number is the default 30 s; it is kept
+    between 0.01 s and threading.TIMEOUT_MAX."""
     p = _resolve(path)
     if p is None:
         yield
         return
-    try:
-        every = max(float(every_s), _MIN_EVERY_S)
-        limit = None if max_s is None else float(max_s)
-    except (TypeError, ValueError):
-        every, limit = 30.0, None
+    every = min(max(_finite(every_s, _DEFAULT_EVERY_S), _MIN_EVERY_S), threading.TIMEOUT_MAX)
+    limit = None if max_s is None else _finite(max_s, 0.0)
     stop = threading.Event()
     t0 = time.monotonic()
     beat(p, force=True)  # at entry, in the caller's thread: the file is fresh before the block starts
