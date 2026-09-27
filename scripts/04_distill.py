@@ -4976,6 +4976,42 @@ def selection_sha256(R: Run) -> str | None:
         return None
 
 
+def end_reason(R: Run) -> str:
+    """What set the run's last step (summary.json's end_reason): a "stop" trigger's reason - "stop_file", else
+    "early_stop" (patience / floor) -, else the record with the smallest T among the schedule's own ("schedule"), the
+    early stop's cooldown ("early_stop", or "cooldown_file" for the COOLDOWN file's) and 4d's ("deadline"), the first
+    on a tie; on the wall clock a budget clipped to the deadline (fit_budget) is "deadline" too."""
+    st, sch = R.st, R.cfg["schedule"]
+    es = st["early_stop"]
+    trig = es.get("triggered") or {}
+    if es.get("stop"):
+        return "stop_file" if trig.get("reason") == "stop_file" else "early_stop"
+    try:
+        _, T = R.base_progress()
+    except TypeError:  # a run that failed before its plan (epoch clock: no total_steps yet); the summary must go out
+        T = float("inf")
+    budget = getattr(R, "budget_s", None)
+    clipped = sch["clock"] == "wall" and budget is not None and budget < float(sch["train_hours"]) * 3600
+    cands = [("deadline" if clipped else "schedule", T)]
+    if es.get("cooldown"):
+        cands.append(("cooldown_file" if trig.get("reason") == "cooldown_file" else "early_stop", es["cooldown"]["T"]))
+    if st.get("deadline_cooldown"):
+        cands.append(("deadline", st["deadline_cooldown"]["T"]))
+    return min(cands, key=lambda c: c[1])[0]
+
+
+def summary_full(R: Run) -> dict:
+    """summary.json's full-data fields: end_reason and resume_resets always; dev_history (the dev evals' records),
+    deadline_cooldown (4d's record) and schedule_resets (the resume resets') when there are any. stopped_early keeps
+    its meaning (a trigger that shortened the run), now also for a dev metric's trigger and the COOLDOWN file's."""
+    st = R.st
+    out = dict(end_reason=end_reason(R), resume_resets=int(st.get("resume_resets") or 0))
+    for key in ("dev_history", "deadline_cooldown", "schedule_resets"):
+        if st.get(key):
+            out[key] = st[key]
+    return out
+
+
 def make_summary(R: Run, status: str, **extra) -> dict:
     st, hist = R.st, R.st["history"]
     elapsed = R.log.elapsed() if R.log else time.time() - R.t_start
@@ -5027,42 +5063,6 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         early_stop_trigger=trig,  # every trigger; None: none
         history=hist, mini_history=st["mini_history"], checkpoints=dict(weights=st["weights"], full=st["fulls"]),
         **summary_full(R), config=R.cfg, **extra)
-
-
-def end_reason(R: Run) -> str:
-    """What set the run's last step (summary.json's end_reason): a "stop" trigger's reason - "stop_file", else
-    "early_stop" (patience / floor) -, else the record with the smallest T among the schedule's own ("schedule"), the
-    early stop's cooldown ("early_stop", or "cooldown_file" for the COOLDOWN file's) and 4d's ("deadline"), the first
-    on a tie; on the wall clock a budget clipped to the deadline (fit_budget) is "deadline" too."""
-    st, sch = R.st, R.cfg["schedule"]
-    es = st["early_stop"]
-    trig = es.get("triggered") or {}
-    if es.get("stop"):
-        return "stop_file" if trig.get("reason") == "stop_file" else "early_stop"
-    try:
-        _, T = R.base_progress()
-    except TypeError:  # a run that failed before its plan (epoch clock: no total_steps yet); the summary must go out
-        T = float("inf")
-    budget = getattr(R, "budget_s", None)
-    clipped = sch["clock"] == "wall" and budget is not None and budget < float(sch["train_hours"]) * 3600
-    cands = [("deadline" if clipped else "schedule", T)]
-    if es.get("cooldown"):
-        cands.append(("cooldown_file" if trig.get("reason") == "cooldown_file" else "early_stop", es["cooldown"]["T"]))
-    if st.get("deadline_cooldown"):
-        cands.append(("deadline", st["deadline_cooldown"]["T"]))
-    return min(cands, key=lambda c: c[1])[0]
-
-
-def summary_full(R: Run) -> dict:
-    """summary.json's full-data fields: end_reason and resume_resets always; dev_history (the dev evals' records),
-    deadline_cooldown (4d's record) and schedule_resets (the resume resets') when there are any. stopped_early keeps
-    its meaning (a trigger that shortened the run), now also for a dev metric's trigger and the COOLDOWN file's."""
-    st = R.st
-    out = dict(end_reason=end_reason(R), resume_resets=int(st.get("resume_resets") or 0))
-    for key in ("dev_history", "deadline_cooldown", "schedule_resets"):
-        if st.get(key):
-            out[key] = st[key]
-    return out
 
 
 # set by main() when it returns or fails with an upload still running: run_script (the __main__ entry) then skips
