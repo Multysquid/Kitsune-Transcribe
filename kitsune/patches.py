@@ -51,9 +51,11 @@ def _relpos_one_row(self, hidden_states: torch.Tensor) -> torch.Tensor:
 
 
 def _linear_once_over_batch(self, x: torch.Tensor) -> torch.Tensor:
+    # type(self).forward, not nn.Linear.forward: a Linear subclass swapped in place (kitsune.quant.QuantLinear: its
+    # padding, fake-quantised activation and counters) must run here too. For a plain nn.Linear it is the same call
     if x.dim() == 3 and x.shape[0] > 1 and x.stride(0) == 0:
-        return nn.Linear.forward(self, x[:1]).expand(x.shape[0], -1, -1)
-    return nn.Linear.forward(self, x)
+        return type(self).forward(self, x[:1]).expand(x.shape[0], -1, -1)
+    return type(self).forward(self, x)
 
 
 def patch_relpos_once_per_batch(model: nn.Module) -> Callable[[], None]:
