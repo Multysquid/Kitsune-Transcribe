@@ -532,6 +532,9 @@ def test_full_preflight_refuses_a_box_whose_tools_the_sha_lacks(repo, monkeypatc
 
 def test_full_preflight_without_devslice_refuses_the_sidecar(repo, monkeypatch):
     monkeypatch.setitem(sys.modules, "kitsune.devslice", None)  # an import of it raises ImportError
+    # as when WP1's tests imported the real module earlier in the session: the package attribute is set, which a
+    # `from kitsune import devslice` would return despite the sys.modules entry
+    monkeypatch.setattr(kitsune, "devslice", types.ModuleType("kitsune.devslice"), raising=False)
     reg = launch.full_registry(SHA)[0]
     problems, _ = preflight(monkeypatch, FullHub(box_data("p01", reg, repo.root)))
     assert any("kitsune.devslice is not in this checkout" in p for p in problems), problems

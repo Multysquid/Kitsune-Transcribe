@@ -64,6 +64,7 @@ box times its Hub link first (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours;
 Needs the vastai CLI (`pip install vastai==1.8.0`, then `vastai set api-key <key>`); --help works without it.
 """
 import argparse
+import importlib
 import json
 import math
 import re
@@ -1323,7 +1324,9 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
                     side = json.loads(Path(download(data_repo, sidecar, repo_type="dataset", revision=data_rev,
                                                     local_dir=tmp)).read_text(encoding="utf-8"))
                     try:
-                        from kitsune import devslice
+                        # import_module, not `from kitsune import devslice`: that form returns the package attribute
+                        # once an earlier import in the process set it, whatever sys.modules says now
+                        devslice = importlib.import_module("kitsune.devslice")
                     except ImportError as e:
                         problems.append(f"cannot check {sidecar}: kitsune.devslice is not in this checkout ({e})")
                     else:
