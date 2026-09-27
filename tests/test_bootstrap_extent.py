@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -659,16 +660,17 @@ case "$1" in scripts/*) ;; *.py) line="HELPER ${*:2}" ;; esac
 echo "$line" >> "$log"
 case "$*" in
     "-m kitsune.netgate --out"*) printf '{"verdict": "pass"}\n' > "$3"; exit "${FAKE_GATE_RC:-0}" ;;
-    "-m kitsune.netgate --timeouts"*) echo "41 400"; exit 0 ;;
+    "-m kitsune.netgate --timeouts"*) echo "${FAKE_TIMEOUTS:-41 400}"; exit 0 ;;
     "-m kitsune.full_queue resume-pull"*) exit "${FAKE_RESUME_RC:-0}" ;;
     "-m kitsune.fullrun check-students"*) exit 0 ;;
-    scripts/01_prepare_data.py*) exit 0 ;;
+    scripts/01_prepare_data.py*) exit "${FAKE_REBUILD_RC:-0}" ;;
 esac
 case "${2:-}" in
     plan) printf '{"data_root": "data", "rebuild": ["galgame"], "extent": %s}\n' "${FAKE_EXTENT:-true}" \
               > "$STATE/bootstrap_plan.json"; exit 0 ;;
     pull) exit 0 ;;
-    pull_labels) command sleep 1; [ "${FAKE_LABELS_RC:-0}" = 0 ] && touch "$STATE/labels_done"; exit "${FAKE_LABELS_RC:-0}" ;;
+    pull_labels) echo $$ > "$STATE/labels_pid"; command sleep "${FAKE_LABELS_S:-1}"
+                 [ "${FAKE_LABELS_RC:-0}" = 0 ] && touch "$STATE/labels_done"; exit "${FAKE_LABELS_RC:-0}" ;;
     coverage) exit 0 ;;
 esac
 echo "unexpected call: $*" >&2
@@ -754,6 +756,78 @@ def test_a_failed_label_pull_fails_the_bootstrap_after_the_rebuild(tmp_path):
     assert len([c for c in calls if c.startswith("HELPER pull_labels")]) == 3, calls  # retried like the pull
     assert any(c.startswith("scripts/01") for c in calls) and not any("coverage" in c for c in calls)
     assert "phase pull_labels_wait ..." in r.stdout
+
+
+def budget_s(tries: int, minutes: int) -> int:
+    """bootstrap's phase_budget_s: the longest `retry <tries> timeout -k <=60 <minutes>m` runs (each attempt + 60 s of
+    kill grace, retry's pauses of 60, 120, ... s) plus 10 min."""
+    return tries * (minutes * 60 + 60) + sum(60 * i for i in range(1, tries)) + 600
+
+
+def hb_bounds(stdout: str) -> dict:
+    return {m.group(1): int(m.group(2))
+            for m in re.finditer(r"phase (\S+) keeps train_hb fresh for at most (\d+) s", stdout)}
+
+
+def test_each_phase_keeps_train_hb_fresh_for_its_own_worst_case(tmp_path):
+    """The rebuild may legitimately run three attempts of the gate's KITSUNE_REBUILD_TIMEOUT_MIN: at the gate's floor
+    rate the full extent's 481 min per attempt make ~24 h, past the 12 h default. Its train_hb toucher lasts exactly its
+    worst case (so is the label pull's, and pull_labels_wait's), so the watchdog stops a box only once the rebuild's
+    own timeouts have run out; the other phases keep KITSUNE_PHASE_HB_MAX_S (default 12 h)."""
+    r, _, _ = run_bootstrap(tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = hb_bounds(r.stdout)
+    assert got == {"download_gate": 43200, "plan": 43200, "pull_derived": 43200, "check_students": 43200,
+                   "pull_labels": budget_s(3, 41), "rebuild_audio": budget_s(3, 400),
+                   "pull_labels_wait": budget_s(3, 41), "coverage": 43200}, got
+    r, _, _ = run_bootstrap(tmp_path / "floor", FAKE_TIMEOUTS="77 481", KITSUNE_PHASE_HB_MAX_S="600")
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = hb_bounds(r.stdout)
+    assert got["rebuild_audio"] == budget_s(3, 481) == 87540 > 43200 and got["pull_labels"] == budget_s(3, 77)
+    assert got["plan"] == got["coverage"] == 600  # the default is the operator's to set
+    r, _, _ = run_bootstrap(tmp_path / "short", FAKE_TIMEOUTS="30 45")
+    assert hb_bounds(r.stdout)["rebuild_audio"] == budget_s(3, 60), "never below the non-extent line's 60 min"
+
+
+def test_a_failed_bootstrap_stops_the_background_label_pull_and_its_toucher(tmp_path):
+    """The rebuild fails while the labels are still coming down: bootstrap's exit stops the pull's whole tree, its
+    subshell, the timeout and the pull under it, and the phase's toucher, so nothing keeps train_hb fresh or holds
+    onstart's supervise.lock after bootstrap (a subshell killed alone leaves its children running)."""
+    bash = find_bash()
+    r, calls, state = run_bootstrap(tmp_path, FAKE_REBUILD_RC="1", FAKE_LABELS_S="60")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert len([c for c in calls if c.startswith("scripts/01")]) == 3 and "HELPER coverage" not in calls, calls
+    assert any(c.startswith("HELPER pull_labels") for c in calls) and "phase pull_labels_wait" not in r.stdout
+    hb = state / "train_hb"
+    before = hb.stat().st_mtime_ns
+    pid = (state / "labels_pid").read_text().strip()
+    alive = None
+    for _ in range(50):  # SIGTERM reaches the pull through timeout within moments
+        alive = subprocess.run([bash, "-c", f"kill -0 {pid}"], capture_output=True).returncode == 0
+        if not alive:
+            break
+        time.sleep(0.1)
+    assert not alive, "the label pull outlived bootstrap"
+    time.sleep(1.0)  # 20 of the fake toucher's 0.05 s beats
+    assert hb.stat().st_mtime_ns == before, "a train_hb toucher outlived bootstrap"
+    assert not (state / "labels_done").exists()
+
+
+def test_a_toucher_stops_at_its_bound(tmp_path):
+    """beat_train_hb <max_s> touches train_hb until max_s has passed, then returns by itself."""
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    text = BOOTSTRAP.read_text(encoding="utf-8")
+    func = re.search(r"^beat_train_hb\(\) \{.*?^\}\n", text, re.M | re.S).group(0)
+    script = tmp_path / "hb.sh"
+    script.write_text("\n".join(["set -euo pipefail", f'STATE="{tmp_path.as_posix()}"',
+                                 'sleep() { command sleep 0.2; }', func, "beat_train_hb 2", 'echo "returned"', ""]),
+                      encoding="utf-8", newline="\n")
+    t0 = time.monotonic()
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "returned" in r.stdout, r.stdout + r.stderr
+    assert 1.0 < time.monotonic() - t0 < 30 and (tmp_path / "train_hb").exists()  # date +%s: whole seconds
 
 
 def test_other_jobs_run_no_full_phase(tmp_path):

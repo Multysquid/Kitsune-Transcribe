@@ -50,8 +50,10 @@
 # and write KITSUNE_SCRATCH_REPO; a box with timed states refuses without it), pull_derived (all but the labels),
 # resume_pull (KITSUNE_RESUME=1: python -m kitsune.full_queue resume-pull; exit 3 not retried), check_students (python
 # -m kitsune.fullrun check-students), pull_labels in the background while 01 rebuilds the audio (decision 13), the
-# rebuild, pull_labels_wait, coverage. Each phase keeps $STATE/train_hb fresh (vast/watchdog.sh reads it) for at most
-# KITSUNE_PHASE_HB_MAX_S (12 h). vast/README.md "Full-data runs" has the box's whole life.
+# rebuild, pull_labels_wait, coverage. Each phase keeps $STATE/train_hb fresh (vast/watchdog.sh reads it) while it runs,
+# for at most its own worst case (the label pull and the rebuild: their three attempts' timeouts) or else
+# KITSUNE_PHASE_HB_MAX_S (12 h), and never after bootstrap has exited. vast/README.md "Full-data runs" has the box's
+# whole life.
 set -euo pipefail
 
 KITSUNE_DIR="${KITSUNE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -83,25 +85,48 @@ cd "$KITSUNE_DIR"
 mkdir -p "$STATE"
 TIMINGS="$STATE/bootstrap_timings.jsonl"
 HELPER="$(mktemp --suffix=.py)"
-trap 'rm -f "$HELPER"; [ -z "${LABELS_PID:-}" ] || kill "$LABELS_PID" 2>/dev/null || true' EXIT
 
-beat_train_hb() {  # job full: touch $STATE/train_hb every 60 s (the watchdog's heartbeat), for at most max_s
-    local end=$(( $(date +%s) + ${KITSUNE_PHASE_HB_MAX_S:-43200} ))
-    while [ "$(date +%s)" -lt "$end" ]; do
+stop_label_pull() {  # job full, at exit: the background label pull and everything it started. Killing its subshell
+    # alone leaves its children running, holding onstart's supervise.lock (fd 7): the pull's timeout (SIGTERM reaches
+    # its python through timeout) and the phase's train_hb toucher (which also ends by itself once bootstrap is gone).
+    # The children are listed first: once the subshell is dead they belong to init. ps -ef has PID in column 2 and
+    # PPID in column 3, with procps and Git Bash alike
+    [ -n "${LABELS_PID:-}" ] || return 0
+    local kids
+    kids=$(ps -ef 2>/dev/null | awk -v p="$LABELS_PID" '$3 == p { print $2 }') || true
+    kill "$LABELS_PID" 2>/dev/null || true
+    [ -z "$kids" ] || kill $kids 2>/dev/null || true
+    LABELS_PID=""
+}
+trap 'rm -f "$HELPER"; stop_label_pull' EXIT
+
+beat_train_hb() {  # beat_train_hb <max_s>: touch $STATE/train_hb (the watchdog's heartbeat on a full box) every 60 s
+    # for at most max_s, and only while this bootstrap runs ($$ is its pid in every subshell): a toucher left behind
+    # by a killed bootstrap would keep an orphaned box looking alive
+    local end=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "$end" ] && kill -0 "$$" 2>/dev/null; do
         touch "$STATE/train_hb" 2>/dev/null || true
         sleep 60
     done
 }
 
+phase_budget_s() {  # phase_budget_s <tries> <minutes>: the longest `retry <tries> timeout -k <=60 <minutes>m ...` runs
+    # (every attempt with its kill grace, retry's pauses of 60, 120, ... s), plus 10 min: a long phase's toucher bound
+    echo $(( $1 * ($2 * 60 + 60) + 30 * $1 * ($1 - 1) + 600 ))
+}
+
 phase() {  # phase <name> <command...>: run it and append its wall time
-    local name=$1 t0 t1 hb rc=0
+    local name=$1 t0 t1 hb max_s rc=0
     shift
     t0=$(date +%s.%N)
     log "phase $name ..."
     if [ "${KITSUNE_JOB:-}" = full ]; then
-        # the box controller's heartbeat while the phase runs: every phase is bounded by its own timeout (and the
-        # toucher by KITSUNE_PHASE_HB_MAX_S), so a hung bootstrap still goes stale
-        beat_train_hb &
+        # the box controller's heartbeat while the phase runs. Every phase is bounded by its own timeout, and so is
+        # its toucher: by PHASE_HB_MAX_S, the budget of a phase that may run long (the label pull, the rebuild), else
+        # by KITSUNE_PHASE_HB_MAX_S (12 h, far above the other phases' timeouts). A hung bootstrap still goes stale
+        max_s=${PHASE_HB_MAX_S:-${KITSUNE_PHASE_HB_MAX_S:-43200}}
+        log "phase $name keeps train_hb fresh for at most $max_s s"
+        beat_train_hb "$max_s" &
         hb=$!
         "$@" || rc=$?
         kill "$hb" 2>/dev/null || true
@@ -584,10 +609,19 @@ if [ "${KITSUNE_JOB:-}" = "full" ]; then
     # exit 2 refuses
     phase check_students "$PY" -m kitsune.fullrun check-students --box "$KITSUNE_BOX" --root "$KITSUNE_DIR"
     # decision 13: the labels (tens of GB at the full extent) come down while 01 rebuilds the audio, per attempt
-    # within the gate's KITSUNE_PULL_TIMEOUT_MIN; pull_labels_wait below fails the bootstrap on a failed pull
+    # within the gate's KITSUNE_PULL_TIMEOUT_MIN; pull_labels_wait below fails the bootstrap on a failed pull, and a
+    # bootstrap that fails first stops the pull (stop_label_pull). Its toucher, and pull_labels_wait's, last as long
+    # as its three attempts may
+    LABELS_HB_MAX_S=$(phase_budget_s 3 "${KITSUNE_PULL_TIMEOUT_MIN:-30}")
+    PHASE_HB_MAX_S=$LABELS_HB_MAX_S
     phase pull_labels retry 3 timeout -k 30 "${KITSUNE_PULL_TIMEOUT_MIN:-30}m" "$PY" "$HELPER" pull_labels &
     LABELS_PID=$!
     log "pull_labels runs in the background (pid $LABELS_PID)"
+    # the rebuild's toucher lasts its three attempts of KITSUNE_REBUILD_TIMEOUT_MIN (at least the 60 min of the
+    # non-extent line): at the gate's floor rate the full extent's ~481 min per attempt make ~24 h, past the 12 h
+    # default, so the watchdog stops a box only once the rebuild's own timeouts have run out, never a slow healthy one
+    REBUILD_HB_MIN=${KITSUNE_REBUILD_TIMEOUT_MIN:-60}
+    PHASE_HB_MAX_S=$(phase_budget_s 3 "$(( REBUILD_HB_MIN > 60 ? REBUILD_HB_MIN : 60 ))")
 fi
 
 DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["data_root"])' "$STATE/bootstrap_plan.json")"
@@ -609,9 +643,13 @@ elif [ -n "$EXTENT" ]; then
 else
     log "every source has parked shards; nothing to rebuild"
 fi
-if [ -n "${LABELS_PID:-}" ]; then
+if [ "${KITSUNE_JOB:-}" = "full" ] && [ -n "${LABELS_PID:-}" ]; then
+    PHASE_HB_MAX_S=$LABELS_HB_MAX_S  # the wait lasts at most what is left of the pull's own budget
     phase pull_labels_wait wait "$LABELS_PID"  # the label pull's exit: a failed pull fails here, before coverage
     LABELS_PID=""
+fi
+if [ "${KITSUNE_JOB:-}" = "full" ]; then
+    PHASE_HB_MAX_S=""  # coverage: the default bound
 fi
 phase coverage "$PY" "$HELPER" coverage
 log "disk free after: $(df -h --output=avail "$KITSUNE_DIR" | tail -1 | tr -d ' ')"

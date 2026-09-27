@@ -815,7 +815,11 @@ extra files and dirs), **resume_pull** (`--resume` only), **check_students** (`p
 check-students`), **pull_labels** in the background while **rebuild_audio** (01 `--extent-config`) runs, then
 **pull_labels_wait** (a failed label pull fails here) and **coverage**. On box 1 (CTC, no `pull_parakeet`) the train
 stems have Parakeet labels only: the extent and coverage checks read their ids from `parakeet_out`
-(`kitsune.extent.label_root_for`, fix 9). Every phase keeps `$KITSUNE_STATE/train_hb` fresh.
+(`kitsune.extent.label_root_for`, fix 9). Every phase keeps `$KITSUNE_STATE/train_hb` fresh while it runs, for at
+most its own worst case: the label pull, pull_labels_wait and the rebuild for their three attempts' timeouts (with the
+gate's floor rate the full extent's rebuild may take ~24 h), every other phase for `KITSUNE_PHASE_HB_MAX_S` (12 h),
+and no toucher outlives bootstrap: a bootstrap that fails during the rebuild also stops the background label pull
+(its timeout and python) and its toucher.
 
 The watchdog reads `train_hb` (bootstrap's phases, the queue's poll and the supervisor's bounded finish calls touch
 it; each trainer, 05 and the store builds beat their own `hb/<item>`, which the queue's stall check reads). On boxes p01
