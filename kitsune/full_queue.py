@@ -65,6 +65,7 @@ Pure Python at import (stdlib, kitsune.fullrun, kitsune.heartbeat, kitsune.study
 build-stores and check-resume children, huggingface_hub only when the Hub is called.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -458,6 +459,12 @@ class FullQueue(Q.Queue):
             return None
         return Path(self.s.state_dir) / fullrun.TRAIN_HB
 
+    def ctl_beating(self, max_s: float = CTL_BEAT_MAX_S):
+        """heartbeat.beating on the controller heartbeat around one blocking call (bounded: a hung call still goes
+        stale for the watchdog); a plain context while a freeze fault holds it."""
+        p = self.ctl_beat_path()
+        return heartbeat.beating(p, max_s=max_s) if p is not None else contextlib.nullcontext()
+
     def box_deadline(self) -> float | None:
         """The watchdog's stop time ($KITSUNE_STATE/deadline, vast/onstart.sh); None without one (a local run)."""
         try:
@@ -557,7 +564,7 @@ class FullQueue(Q.Queue):
             return None
         dest = Path(self.s.state_dir) / "hub_reads"
         try:
-            with heartbeat.beating(self.ctl_beat_path(), max_s=CTL_BEAT_MAX_S):
+            with self.ctl_beating():
                 return json.loads(Path(self.uploader.download(path, dest)).read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001  unreadable: the caller's default
             log(f"{path}: not readable from the runs repo ({type(e).__name__}: {e})")
@@ -732,7 +739,7 @@ class FullQueue(Q.Queue):
                 self._end(name, "failed", "item_failed", reason="a Hub resume needs the runs repo (KITSUNE_OUT_REPO)")
                 return False
             try:
-                with heartbeat.beating(self.ctl_beat_path(), max_s=CTL_BEAT_MAX_S):
+                with self.ctl_beating():
                     got = pull_run(rid, self.root, runs, scratch)
             except ResumeRefused as e:
                 self._fault_failed(name)
@@ -769,7 +776,7 @@ class FullQueue(Q.Queue):
         logs = Path(self.s.state_dir) / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, **self.s.env, CUDA_VISIBLE_DEVICES="-1", KITSUNE_QUEUE_ITEM=name)
-        with open(logs / f"{name}.log", "ab") as out, heartbeat.beating(self.ctl_beat_path(), max_s=CTL_BEAT_MAX_S):
+        with open(logs / f"{name}.log", "ab") as out, self.ctl_beating():
             try:
                 rc = subprocess.run(argv, cwd=str(self.root), env=env, stdout=out, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, timeout=CHECK_RESUME_TIMEOUT_S).returncode
@@ -816,6 +823,11 @@ class FullQueue(Q.Queue):
             it["out"] = f"runs/{name}-{time.strftime(STAMP, time.gmtime())}"
         if spec["kind"] == "speed":
             it["out"] = self.speed_dir()
+        try:  # every placeholder fillable now: a registry template that is not fails this item, not the queue
+            self.argv_for(name, it, None)
+        except Q.QueueError as e:
+            self._end(name, "failed", "item_failed", reason=str(e))
+            return False
         return True
 
     def fetch_weights(self, pairs: list[tuple[str, int]]) -> str | None:
@@ -829,7 +841,7 @@ class FullQueue(Q.Queue):
             if self.uploader is None:
                 return f"no runs repo to fetch runs/{rid}/checkpoints/step_{step} from"
             try:
-                with heartbeat.beating(self.ctl_beat_path(), max_s=CTL_BEAT_MAX_S):
+                with self.ctl_beating():
                     self.uploader.download(f"runs/{rid}/config.json", hub_cache)
                     self.uploader.download_dir(f"runs/{rid}/checkpoints/step_{step}", hub_cache)
             except Exception as e:  # noqa: BLE001  a failed readout, recorded
@@ -1091,7 +1103,7 @@ class FullQueue(Q.Queue):
         inside the scheduler loop; under the controller heartbeat."""
         if not self._pending_uploads:
             return
-        with heartbeat.beating(self.ctl_beat_path(), max_s=CTL_BEAT_MAX_S):
+        with self.ctl_beating():
             while self._pending_uploads:
                 name = self._pending_uploads.pop(0)
                 entry = self.state["speed_dir"] if name == SPEED_DIR_KEY else self.item(name)
@@ -1133,7 +1145,9 @@ class FullQueue(Q.Queue):
         """Every poll: the controller beat, run-dir discovery (a summary put at once), the stall and overrun kills, the
         smoke faults, the resource peaks, a coalesced summary put that is due."""
         now = time.time()
-        heartbeat.beat(self.ctl_beat_path(), force=True)
+        hb = self.ctl_beat_path()
+        if hb is not None:  # never beat(None): that would beat this process's own $KITSUNE_HEARTBEAT, if any
+            heartbeat.beat(hb, force=True)
         self._freeze_windows(now)
         for r in running.values():
             name, proc = r["name"], r["proc"]
@@ -1367,7 +1381,7 @@ class FullQueue(Q.Queue):
         it = self.item(name)
         if self.uploader is not None:
             try:
-                with heartbeat.beating(self.ctl_beat_path(), max_s=CTL_BEAT_MAX_S):
+                with self.ctl_beating():
                     self.uploader.sync_run(rd)
             except Exception as e:  # noqa: BLE001  the pull then finds what the trainer's own syncs sent
                 log(f"{name}: log sync before the wipe failed: {type(e).__name__}: {e}")
@@ -1425,7 +1439,7 @@ class FullQueue(Q.Queue):
         if self.uploader is None:
             return
         try:
-            with heartbeat.beating(self.ctl_beat_path(), max_s=CTL_BEAT_MAX_S):
+            with self.ctl_beating():
                 self.uploader.put_file(path, path_in_repo)
         except Exception as e:  # noqa: BLE001  finish.py uploads the state dir with the infra logs anyway
             log(f"{path_in_repo} upload failed: {type(e).__name__}: {e}")
@@ -1435,7 +1449,7 @@ class FullQueue(Q.Queue):
     def write_verdict(self) -> dict:
         """$KITSUNE_STATE/smoke_verdict.json, put at full/box-<box>/smoke_verdict.json (smoke boxes). Its check 7 lists
         the scratch repo on the Hub: under the controller heartbeat too."""
-        with heartbeat.beating(self.ctl_beat_path(), max_s=CTL_BEAT_MAX_S):
+        with self.ctl_beating():
             v = SmokeVerdict(self).build()
         path = Path(self.s.state_dir) / fullrun.VERDICT_FILE
         Q._atomic_json(path, v)

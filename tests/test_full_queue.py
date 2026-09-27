@@ -373,6 +373,11 @@ def test_an_of_box_item_reads_the_other_boxs_summary_and_fetches_its_weights(fq)
     q2.register()
     assert q2._prepare(name) is False and q2.item(name)["status"] == "failed"
     assert "step_110520" in q2.state["readouts_failed"][name]
+    # a template the queue cannot fill (its `of` has no run dir) fails that item, never the queue
+    for n in ("full-p03", "m4-full-p03"):
+        q2.item(n)["status"] = "done"
+    assert q2._prepare("quant-int8-w8a8-full-p03") is False
+    assert "{config}" in q2.state["readouts_failed"]["quant-int8-w8a8-full-p03"]
 
 
 def test_exit_3_fails_that_item_only_and_the_box_ends_with_rc_4(fq):
