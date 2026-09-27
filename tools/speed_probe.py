@@ -18,7 +18,8 @@ Kinds (--kind), each decoded exactly as the study scores it:
                 as the label pass wrote `hyp`
   whisper       a Whisper yardstick (kitsune.whisper: a WHISPER_MODELS key, fetched at its pinned revision into
                 --hf-cache, or a model dir): the weights in bf16 (fp32 on CPU), its own log-mel features on the device
-                (every clip padded to 30 s), greedy_whisper with the fp32 head, decode_texts - the very functions
+                (every clip padded to 30 s), greedy_whisper with the fp32 head (the build's decision C15, as the AED
+                students; --no-fp32-head times the head in the weights' dtype), decode_texts - the very functions
                 tools/whisper_eval.py scores with. Its batches are the batched pass's below, row-capped at the model's
                 max_rows (--batch-rows overrides it): a 30 s encoder window per clip does not fit 400 s of short clips
 Both Parakeet paths and the CTC students take Parakeet's own features (ctc_features: 80 mel, no dither) on the device.
@@ -69,8 +70,9 @@ record}}. A record: kind, model, device, gpu, dtype, batch_s, n_utts, audio_s, b
 fields (n_latency, p50_s, p95_s, mean_s, rtf_1_p50), vram_peak_allocated_bytes / _reserved_bytes for each pass,
 vram_gb, params_total, weights_bytes, relpos_patch, decode_len, trained, tokens_per_utt, cer_ref_corpus, max_rows (the
 batched pass's row cap, null without one), n_truncated / n_timestamp_tokens (whisper's batched pass: rows the stop or
-the length cap cut, timestamp ids stripped; null for the other kinds), idle, versions (python, torch, transformers,
-cuda, host, machine_id = $KITSUNE_MACHINE_ID, cpu), time_utc. tools/study_report.py --speed reads it (the Pareto view:
+the length cap cut, timestamp ids stripped; null for the other kinds), fp32_head (whisper: whether its LM head ran in
+fp32; null for the other kinds, whose heads are fixed), idle, versions (python, torch, transformers, cuda, host,
+machine_id = $KITSUNE_MACHINE_ID, cpu), time_utc. tools/study_report.py --speed reads it (the Pareto view:
 rtf, vram_gb, p50_s, p95_s; kitsune.study_stats.speed_entry); the full runs' report groups records by machine_id + gpu.
 
 Usage (on the box, at its end, one call per system; kitsune/study_queue.py phase_speed passes these):
@@ -301,7 +303,7 @@ class WhisperRunner:
     n_truncated = 0
     n_timestamp_tokens = 0
 
-    def __init__(self, model_dir, spec, device, dtype: str, max_rows: int | None = None):
+    def __init__(self, model_dir, spec, device, dtype: str, max_rows: int | None = None, fp32_head: bool = True):
         from kitsune import heartbeat
         from kitsune import whisper as W
 
@@ -311,6 +313,7 @@ class WhisperRunner:
         self.params = self.wm.params_total
         self.weights_bytes = _weights_bytes(self.model)
         self.max_rows = int(max_rows or (spec.max_rows if spec else W.DEFAULT_MAX_ROWS))
+        self.fp32_head = bool(fp32_head)  # the record's fp32_head: whisper_eval's model.fp32_head, the same switch
 
     def context(self):
         from contextlib import ExitStack
@@ -319,7 +322,8 @@ class WhisperRunner:
 
         stack = ExitStack()
         stack.enter_context(torch.inference_mode())
-        stack.enter_context(_fp32_head(self.model))
+        if self.fp32_head:
+            stack.enter_context(_fp32_head(self.model))
         return stack
 
     def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
@@ -359,14 +363,14 @@ def decode_len_of(kind: str, choice: str, trained: bool | None) -> str | None:
 
 def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, store, revision: str,
                 relpos_patch: bool = True, decode_len: str | None = None, *, hf_cache: str | None = None,
-                max_rows: int | None = None):
+                max_rows: int | None = None, fp32_head: bool = True):
     """The runner of one kind and its model's description; relpos_patch: kitsune.patches.patch_relpos_once_per_batch
     on its encoder, as the trainer and the evaluator run every one of these encoders (perf.relpos_patch; never for
     whisper, which has no FastConformer: the patch refuses a model without Parakeet's rel-pos encoding); decode_len
-    "teacher": an AED runner pinned to the teacher's token counts; hf_cache / max_rows: whisper's snapshot cache and
-    row cap."""
+    "teacher": an AED runner pinned to the teacher's token counts; hf_cache / max_rows / fp32_head: whisper's snapshot
+    cache, row cap and LM-head precision."""
     runner, desc = _runner(kind, model, device, dtype, store.info or {}, revision, pin=decode_len == "teacher",
-                           hf_cache=hf_cache, max_rows=max_rows)
+                           hf_cache=hf_cache, max_rows=max_rows, fp32_head=fp32_head)
     if relpos_patch and kind != "whisper":
         from kitsune.patches import patch_relpos_once_per_batch
 
@@ -375,14 +379,14 @@ def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, 
 
 
 def _runner(kind: str, model: str | None, device: torch.device, dtype: str, info: dict, revision: str,
-            pin: bool = False, hf_cache: str | None = None, max_rows: int | None = None):
+            pin: bool = False, hf_cache: str | None = None, max_rows: int | None = None, fp32_head: bool = True):
     if kind == "whisper":
         from kitsune import heartbeat
         from kitsune import whisper as W
 
         with heartbeat.beating(max_s=W.LOAD_BEAT_MAX_S):  # a pinned snapshot's download + load
             path, spec = W.resolve(model, hf_cache)
-            runner = WhisperRunner(path, spec, device, dtype, max_rows=max_rows)
+            runner = WhisperRunner(path, spec, device, dtype, max_rows=max_rows, fp32_head=fp32_head)
         return runner, f"{spec.repo}@{spec.revision}" if spec else str(path)
     if kind in ("aed", "cohere"):
         from transformers import AutoProcessor
@@ -576,6 +580,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="whisper: the HF cache a key's pinned snapshot is fetched into (the box's <root>/cache/hf)")
     ap.add_argument("--batch-rows", type=int, default=None,
                     help="the batched pass's row cap (default: whisper, the model's max_rows; the others, none)")
+    ap.add_argument("--no-fp32-head", action="store_true",
+                    help="whisper: the LM head in the weights' dtype (default: fp32, as whisper_eval scores it)")
     ap.add_argument("--latency-n", type=int, default=None, help="batch-1 on the first N ids only (default: all)")
     ap.add_argument("--warmup", type=int, default=2, help="warm-up batches, not timed (default %(default)s)")
     ap.add_argument("--warmup-1", type=int, default=3, help="warm-up single utterances (default %(default)s)")
@@ -605,6 +611,8 @@ def parse_args(argv=None) -> argparse.Namespace:
             args.system = args.model  # a key names its system
     if args.batch_rows is not None and args.batch_rows < 1:
         ap.error("--batch-rows must be >= 1")
+    if args.no_fp32_head and args.kind != "whisper":
+        ap.error("--no-fp32-head is --kind whisper's: the other kinds time the head the evaluator scores them with")
     if args.kind in ("aed", "ctc") and not args.system:
         ap.error(f"--kind {args.kind} needs --system (the student's run name)")
     if args.per_set < 1 or args.batch_s <= 0 or args.warmup < 0 or args.warmup_1 < 0:
@@ -652,13 +660,13 @@ def main(argv=None) -> int:
     t0 = time.time()
     runner, desc = load_runner(args.kind, args.model, device, dtype, store, args.revision,
                                relpos_patch=not args.no_relpos_patch, decode_len=decode_len, hf_cache=args.hf_cache,
-                               max_rows=args.batch_rows)
+                               max_rows=args.batch_rows, fp32_head=not args.no_fp32_head)
     load_s = time.time() - t0
     rec = dict(kind=args.kind, model=desc, device=str(device),
                gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None, dtype=dtype,
                params_total=int(runner.params), weights_bytes=int(runner.weights_bytes), load_s=round(load_s, 2),
                relpos_patch=None if args.kind == "whisper" else not args.no_relpos_patch, decode_len=decode_len,
-               trained=trained)
+               trained=trained, fp32_head=getattr(runner, "fp32_head", None))
     rec.update(probe(runner, waves, durations, refs, device, batch_s=args.batch_s, warmup=args.warmup,
                      warmup_1=args.warmup_1, latency_n=args.latency_n, n_tok=n_tok, batch_rows=args.batch_rows))
     rec.update(idle=idle, gpu_state=gpu, versions=_versions(), store=str(args.store), time_utc=_now())

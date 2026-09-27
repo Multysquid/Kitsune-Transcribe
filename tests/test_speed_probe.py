@@ -338,7 +338,8 @@ def test_whisper_kind(env, whisper_dir, tmp_path, monkeypatch):
     """--kind whisper: the probe's real-seconds batches cut at the row cap (--batch-rows here; the model's max_rows by
     default), no rel-pos patch (relpos_patch null: Whisper has no FastConformer), the free decode (decode_len greedy),
     versions.machine_id from $KITSUNE_MACHINE_ID and the CPU model, a beat of the item's heartbeat; the decode it times
-    is whisper_eval's: greedy_whisper over the same batches gives the record's CER, tokens and truncated rows."""
+    is whisper_eval's: greedy_whisper over the same batches gives the record's CER, tokens and truncated rows; the
+    fp32 head by default, the model's own with --no-fp32-head, and the record's fp32_head says which."""
     import numpy as np
 
     from kitsune import evaluate as ev
@@ -353,7 +354,7 @@ def test_whisper_kind(env, whisper_dir, tmp_path, monkeypatch):
     doc = json.loads(out.read_text(encoding="utf-8"))
     r = doc["systems"]["whisper-tiny"]
     assert r["kind"] == "whisper" and r["model"] == str(whisper_dir) and r["relpos_patch"] is None
-    assert r["decode_len"] == "greedy" and r["trained"] is None and r["max_rows"] == 2
+    assert r["decode_len"] == "greedy" and r["trained"] is None and r["max_rows"] == 2 and r["fp32_head"] is True
     assert r["versions"]["machine_id"] == "m-31337" and "cpu" in r["versions"]
     assert r["n_timestamp_tokens"] == 0 and r["n_latency"] == r["n_utts"] == 6 and r["rtf"] > 0
     assert r["params_total"] > 0 and r["device"] == "cpu" and r["dtype"] == "fp32" and r["vram_gb"] is None
@@ -381,13 +382,30 @@ def test_whisper_kind(env, whisper_dir, tmp_path, monkeypatch):
     # the other kinds' records name the new fields too (null: no row cap, no Whisper counts)
     assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "study-p01") == 0
     c = json.loads(out.read_text(encoding="utf-8"))["systems"]["study-p01"]
-    assert c["max_rows"] is None and c["n_truncated"] is None and c["relpos_patch"] is True
+    assert c["max_rows"] is None and c["n_truncated"] is None and c["relpos_patch"] is True and c["fp32_head"] is None
+    # the head each timed decode runs with: kitsune.evaluate's fp32 wrapper by default, the model's own Linear with
+    # --no-fp32-head (decision C15's off switch); the record says which
+    heads = []
+    real = W.greedy_whisper
+
+    def spy(wm, feats, longest_s, *, fp32_head=True):
+        heads.append(type(wm.model.proj_out).__name__)
+        return real(wm, feats, longest_s, fp32_head=fp32_head)
+
+    monkeypatch.setattr(W, "greedy_whisper", spy)
+    for flag, want in (([], "_FP32Head"), (["--no-fp32-head"], "Linear")):
+        heads.clear()
+        rec = tmp_path / f"speed{len(flag)}.json"
+        assert run(env, rec, "--kind", "whisper", "--model", str(whisper_dir), "--system", "whisper-tiny", "--per-set",
+                   "1", *flag) == 0
+        assert json.loads(rec.read_text(encoding="utf-8"))["systems"]["whisper-tiny"]["fp32_head"] is (not flag)
+        assert heads and set(heads) == {want}
 
 
 def test_whisper_command_lines():
     """--kind whisper needs --model; a key names its own system, a model dir needs --system; --decode-len teacher (an
-    AED decode pinned to Cohere's token counts) and a row cap below 1 are refused; the free decode is its length
-    rule."""
+    AED decode pinned to Cohere's token counts), a row cap below 1 and --no-fp32-head on another kind are refused;
+    the free decode is its length rule."""
     common = ["--store", "cache/eval", "--per-set", "40", "--out", "runs/speed-smoke-b-x/speed.json", "--require-idle"]
     a = sp.parse_args(["--kind", "whisper", "--model", "whisper-large-v3", "--hf-cache", "cache/hf", *common])
     assert (a.system, a.hf_cache, a.batch_rows, a.decode_len) == ("whisper-large-v3", "cache/hf", None, "auto")
@@ -395,7 +413,9 @@ def test_whisper_command_lines():
     for bad in (["--kind", "whisper", *common],
                 ["--kind", "whisper", "--model", "some/dir", *common],
                 ["--kind", "whisper", "--model", "whisper-small", "--decode-len", "teacher", *common],
-                ["--kind", "ctc", "--model", "m", "--system", "s", "--batch-rows", "0", *common]):
+                ["--kind", "ctc", "--model", "m", "--system", "s", "--batch-rows", "0", *common],
+                ["--kind", "aed", "--model", "m", "--system", "s", "--no-fp32-head", *common]):
         with pytest.raises(SystemExit):
             sp.parse_args(bad)
     assert sp.parse_args(["--kind", "whisper", "--model", "some/dir", "--system", "w", *common]).system == "w"
+    assert sp.parse_args(["--kind", "whisper", "--model", "whisper-small", "--no-fp32-head", *common]).no_fp32_head
