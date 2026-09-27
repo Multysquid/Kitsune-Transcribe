@@ -1695,11 +1695,17 @@ class SmokeVerdict:
             ok = ok and commits <= SCRATCH_COMMITS_MAX
         return ok, ev
 
+    def forced(self) -> list[str]:
+        """The smoke train items whose config forces the early-stop trigger (early_stop.min_delta_abs >=
+        FORCED_MIN_DELTA_ABS: no dev eval can improve by that much)."""
+        return [n for n in self.ran() if float((self.config(n).get("early_stop") or {}).get("min_delta_abs") or 0)
+                >= FORCED_MIN_DELTA_ABS]
+
     def check8(self):
-        early = [n for n in self.ran() if self.kinds(n, "early_stop")]
+        forced = set(self.forced())
         natural = []
         for n in self.ran():
-            if n in early:
+            if n in forced or (self.config(n).get("schedule") or {}).get("clock") != "epochs":
                 continue
             pre = [e for e in self.kinds(n, "checkpoint") if e.get("reason") == "pre_cooldown"]
             names = {e.get("name") for e in pre}
@@ -1715,8 +1721,8 @@ class SmokeVerdict:
         readouts = {n: (self.items[n]["status"], (self.items[n].get("result") or {}).get("jsut_cer_nostyle"))
                     for n in self.q.kind_names("readout")}
         ro_ok = all(st == "done" and v is not None for st, v in readouts.values())
-        return bool(natural) and dl_ok and ro_ok, dict(scheduled_cooldown=natural, deadline_item_ok=dl_ok,
-                                                       readouts=readouts)
+        return bool(natural) and dl_ok and ro_ok, dict(scheduled_cooldown=natural, forced=sorted(forced),
+                                                       deadline_item_ok=dl_ok, readouts=readouts)
 
     def check9(self):
         bad, dev_fp = [], {}
@@ -1731,8 +1737,7 @@ class SmokeVerdict:
         return not bad and bool(self.ran()), dict(not_ok=sorted(set(bad)), frame_preflight_dev=dev_fp)
 
     def check10(self):
-        forced = [n for n in self.ran() if float((self.config(n).get("early_stop") or {}).get("min_delta_abs") or 0)
-                  >= FORCED_MIN_DELTA_ABS]
+        forced = self.forced()
         trains, ev, ok = self.trains(), {}, bool(forced)
         for n in forced:
             es = [e for e in self.kinds(n, "early_stop") if e.get("action") == "cooldown"]

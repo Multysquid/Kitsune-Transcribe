@@ -710,6 +710,33 @@ def test_a_smoke_b_box_reports_its_registry_specs_only(fq):
     assert F.SmokeVerdict(q).build()["checks"]["14"]["pass"] is False
 
 
+def test_check_8_takes_a_non_forced_run_on_the_epochs_clock_even_when_it_stopped_early_by_itself(fq):
+    reg = box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p03", "smoke-p01"])
+    q = fq.make("full-smoke", registry=reg)
+    q.register()
+
+    def ran(name, min_delta_abs, clock="epochs"):
+        rd = fq.root / "runs" / f"{name}-20260927T000000Z"
+        rd.mkdir(parents=True, exist_ok=True)
+        (rd / "config.json").write_text(json.dumps({"config": {"schedule": {"clock": clock},
+                                                               "early_stop": {"min_delta_abs": min_delta_abs}}}))
+        with open(rd / "events.jsonl", "w", encoding="utf-8") as f:
+            for e in ({"kind": "early_stop", "action": "cooldown", "trigger": "patience"},
+                      {"kind": "checkpoint", "ckpt": "full", "reason": "pre_cooldown", "name": "full_step_80"},
+                      {"kind": "ckpt_upload_ok", "ckpt": "full", "name": "full_step_80"},
+                      {"kind": "phase", "name": "cooldown"}):
+                f.write(json.dumps(e) + "\n")
+        q.item(name).update(status="done", run_dir=f"runs/{rd.name}", attempts=[dict(t0=1.0, gpu="0", rc=0)])
+
+    ran("smoke-p03", 1e9)  # forced (check 10's items): never check 8's scheduled-cooldown item
+    ran("smoke-p01", 0.0)  # not forced; its dev_ce stopped it early by itself, which check 8 does not hold against it
+    ok, ev = F.SmokeVerdict(q).check8()
+    assert ok and ev["scheduled_cooldown"] == ["smoke-p01"] and ev["forced"] == ["smoke-p03"]
+    ran("smoke-p01", 0.0, clock="steps")  # the cooldown must come on the epochs clock
+    ok, ev = F.SmokeVerdict(q).check8()
+    assert not ok and ev["scheduled_cooldown"] == []
+
+
 def test_only_if_new_machine_skips_a_re_time_on_the_same_machine(fq):
     summary = {"machine_id": "m1", "items": {}}
     up = FakeUploader(remote={fullrun.box_summary_path("full-smoke"): json.dumps(summary).encode()})
