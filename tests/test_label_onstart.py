@@ -228,3 +228,58 @@ def test_watchdog_uses_kitsune_py():
     text = (VAST / "watchdog.sh").read_text(encoding="utf-8")
     assert 'PY="${KITSUNE_PY:-/venv/main/bin/python}"' in text
     assert 'ORPHAN_S="${KITSUNE_WATCHDOG_ORPHAN_S:-0}"' in text
+
+
+# ------------------------------------------------------------------------------------------ full-data boxes (WP3)
+
+
+def test_rearm_also_moves_a_full_boxs_lifecycle_state(tmp_path):
+    """A re-armed full box starts its heartbeats, resume plan, gate record, watchdog alerts and smoke verdict afresh;
+    its queue.json stays (the queue resumes from it), as a study box's does."""
+    text = (VAST / "onstart.sh").read_text(encoding="utf-8")
+    body = re.search(r"^rearm\(\) \{[^\n]*\n.*?^\}\n", text, re.M | re.S).group(0)
+    bash = need_bash()
+    state = tmp_path / "state"
+    (state / "hb").mkdir(parents=True)
+    (state / "hb" / "full-p01").write_text("", encoding="utf-8")
+    moved_names = ["halt", "deadline", "train_hb", "resume_plan.json", "watchdog_alerts.jsonl", "smoke_verdict.json",
+                   "download_gate.json"]
+    for name in moved_names + ["queue.json"]:
+        (state / name).write_text("x", encoding="utf-8")
+    script = tmp_path / "rearm.sh"
+    script.write_text("\n".join(["set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }",
+                                 f'KITSUNE_STATE="{state.as_posix()}"', body, "rearm", ""]),
+                      encoding="utf-8", newline="\n")
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (moved,) = [d for d in state.iterdir() if d.name.startswith("rearm-")]
+    assert sorted(p.name for p in moved.iterdir()) == sorted(moved_names + ["hb"])
+    assert (moved / "hb" / "full-p01").exists() and (state / "queue.json").exists()
+
+
+def test_a_full_box_boots_bootstrap_then_the_supervisor_with_a_fresh_train_hb(tmp_path):
+    """KITSUNE_JOB=full takes the train path (bootstrap.sh, then supervise.py), and train_hb is touched before
+    bootstrap starts, so the watchdog's rule is armed from the first minute."""
+    bash = need_bash()
+    state, repo = tmp_path / "state", tmp_path / "repo"
+    (repo / "vast").mkdir(parents=True)
+    state.mkdir()
+    for name in ("bootstrap.sh", "supervise.py", "label.py"):
+        (repo / "vast" / name).write_text(f'echo {name} >> "$KITSUNE_STATE/ran"\n'
+                                          f'[ -e "$KITSUNE_STATE/train_hb" ] && echo hb >> "$KITSUNE_STATE/ran"\n',
+                                          encoding="utf-8", newline="\n")
+    script = tmp_path / "subshell.sh"
+    script.write_text("\n".join(["set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }", "PY=bash", subshell_body()]),
+                      encoding="utf-8", newline="\n")
+    env = dict(os.environ, KITSUNE_STATE=state.as_posix(), KITSUNE_DIR=repo.as_posix(), KITSUNE_JOB="full")
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (state / "ran").read_text(encoding="utf-8").split() == ["bootstrap.sh", "hb", "supervise.py", "hb"]
+
+
+def test_the_watchdog_keeps_the_label_defaults():
+    """Without the full box's env the watchdog reads label_hb and stops (the label box's rule, unchanged)."""
+    text = (VAST / "watchdog.sh").read_text(encoding="utf-8")
+    assert 'HB_NAME="${KITSUNE_WATCHDOG_HB_FILE:-label_hb}"' in text and 'HB="$STATE/$HB_NAME"' in text
+    assert 'ACTION="${KITSUNE_WATCHDOG_ORPHAN_ACTION:-stop}"' in text
+    assert 'REASON="watchdog: label controller dead"' in text
