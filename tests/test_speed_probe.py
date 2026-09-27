@@ -321,3 +321,81 @@ def test_the_study_queues_command_lines_parse():
         a = sp.parse_args(["--kind", kind, *(["--model", model] if model else []), "--system", system, *common])
         assert (a.kind, a.model, a.system, a.per_set, a.require_idle, a.decode_len) == (kind, model, system, 40, True,
                                                                                         "auto")
+
+
+# ------------------------------------------------------------------------------------------------ whisper (WP6)
+
+
+@pytest.fixture(scope="module")
+def whisper_dir(tmp_path_factory):
+    """A tiny random Whisper snapshot dir (tests/fixtures_whisper.py: pad == EOS, 128 mel, 64 target positions)."""
+    from fixtures_whisper import tiny_whisper_dir
+
+    return tiny_whisper_dir(tmp_path_factory.mktemp("whisper") / "model")
+
+
+def test_whisper_kind(env, whisper_dir, tmp_path, monkeypatch):
+    """--kind whisper: the probe's real-seconds batches cut at the row cap (--batch-rows here; the model's max_rows by
+    default), no rel-pos patch (relpos_patch null: Whisper has no FastConformer), the free decode (decode_len greedy),
+    versions.machine_id from $KITSUNE_MACHINE_ID and the CPU model, a beat of the item's heartbeat; the decode it times
+    is whisper_eval's: greedy_whisper over the same batches gives the record's CER, tokens and truncated rows."""
+    import numpy as np
+
+    from kitsune import evaluate as ev
+    from kitsune import whisper as W
+
+    monkeypatch.setenv("KITSUNE_MACHINE_ID", "m-31337")
+    hb = tmp_path / "hb" / "speed-whisper-tiny"
+    monkeypatch.setenv("KITSUNE_HEARTBEAT", str(hb))
+    out = tmp_path / "speed.json"
+    assert run(env, out, "--kind", "whisper", "--model", str(whisper_dir), "--system", "whisper-tiny", "--per-set", "3",
+               "--batch-rows", "2") == 0
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    r = doc["systems"]["whisper-tiny"]
+    assert r["kind"] == "whisper" and r["model"] == str(whisper_dir) and r["relpos_patch"] is None
+    assert r["decode_len"] == "greedy" and r["trained"] is None and r["max_rows"] == 2
+    assert r["versions"]["machine_id"] == "m-31337" and "cpu" in r["versions"]
+    assert r["n_timestamp_tokens"] == 0 and r["n_latency"] == r["n_utts"] == 6 and r["rtf"] > 0
+    assert r["params_total"] > 0 and r["device"] == "cpu" and r["dtype"] == "fp32" and r["vram_gb"] is None
+    assert hb.is_file()
+    store = env["store"]
+    pos = {u.id: i for i, u in enumerate(store.utts)}
+    ids = doc["ids"]
+    dur = np.array([store.utts[pos[i]].duration for i in ids])
+    waves = [store.wave(pos[i]) for i in ids]
+    refs = store.frame().set_index("id").loc[ids, "ref"].tolist()
+    plan = trainset.pack_micro_batches(np.argsort(-dur, kind="stable"), dur, 6.0, dec_len=np.ones(len(dur)),
+                                       cap_tokens=2)
+    assert r["batches"] == len(plan) and max(len(b) for b in plan) <= 2 < max(
+        len(b) for b in trainset.pack_micro_batches(np.argsort(-dur, kind="stable"), dur, 6.0))
+    wm = W.load_whisper(whisper_dir, "cpu", torch.float32)
+    hyps, tokens, trunc = [None] * len(ids), 0, 0
+    for b in plan:
+        rows = W.greedy_whisper(wm, W.features(wm, [waves[i] for i in b]), max(float(dur[i]) for i in b))
+        for i, t in zip(b, W.decode_texts(wm, rows)):
+            hyps[i] = t
+        tokens += sum(len(x["hyp_ids"]) for x in rows)
+        trunc += sum(x["truncated"] for x in rows)
+    assert r["cer_ref_corpus"] == ev.corpus_cer(hyps, refs)["cer"]
+    assert r["tokens_per_utt"] == pytest.approx(tokens / len(ids)) and r["n_truncated"] == trunc
+    # the other kinds' records name the new fields too (null: no row cap, no Whisper counts)
+    assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "study-p01") == 0
+    c = json.loads(out.read_text(encoding="utf-8"))["systems"]["study-p01"]
+    assert c["max_rows"] is None and c["n_truncated"] is None and c["relpos_patch"] is True
+
+
+def test_whisper_command_lines():
+    """--kind whisper needs --model; a key names its own system, a model dir needs --system; --decode-len teacher (an
+    AED decode pinned to Cohere's token counts) and a row cap below 1 are refused; the free decode is its length
+    rule."""
+    common = ["--store", "cache/eval", "--per-set", "40", "--out", "runs/speed-smoke-b-x/speed.json", "--require-idle"]
+    a = sp.parse_args(["--kind", "whisper", "--model", "whisper-large-v3", "--hf-cache", "cache/hf", *common])
+    assert (a.system, a.hf_cache, a.batch_rows, a.decode_len) == ("whisper-large-v3", "cache/hf", None, "auto")
+    assert sp.decode_len_of("whisper", "auto", None) == "greedy" and "whisper" in sp.KINDS
+    for bad in (["--kind", "whisper", *common],
+                ["--kind", "whisper", "--model", "some/dir", *common],
+                ["--kind", "whisper", "--model", "whisper-small", "--decode-len", "teacher", *common],
+                ["--kind", "ctc", "--model", "m", "--system", "s", "--batch-rows", "0", *common]):
+        with pytest.raises(SystemExit):
+            sp.parse_args(bad)
+    assert sp.parse_args(["--kind", "whisper", "--model", "some/dir", "--system", "w", *common]).system == "w"

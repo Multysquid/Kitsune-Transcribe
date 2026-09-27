@@ -16,9 +16,15 @@ Kinds (--kind), each decoded exactly as the study scores it:
                 modules: encoder bf16 on CUDA, projector, prediction net and joint fp32), greedy TDT with NeMo's
                 max-symbols guard (kitsune.parakeet.greedy_tdt, k_tdt 1, max_symbols 10), the processor's batch_decode
                 as the label pass wrote `hyp`
+  whisper       a Whisper yardstick (kitsune.whisper: a WHISPER_MODELS key, fetched at its pinned revision into
+                --hf-cache, or a model dir): the weights in bf16 (fp32 on CPU), its own log-mel features on the device
+                (every clip padded to 30 s), greedy_whisper with the fp32 head, decode_texts - the very functions
+                tools/whisper_eval.py scores with. Its batches are the batched pass's below, row-capped at the model's
+                max_rows (--batch-rows overrides it): a 30 s encoder window per clip does not fit 400 s of short clips
 Both Parakeet paths and the CTC students take Parakeet's own features (ctc_features: 80 mel, no dither) on the device.
-Every encoder (all five kinds are FastConformers) runs with kitsune.patches.patch_relpos_once_per_batch, as the trainer
-and the evaluator run it (perf.relpos_patch; --no-relpos-patch times it without, and the record says which).
+Every FastConformer encoder (the five kinds above whisper) runs with kitsune.patches.patch_relpos_once_per_batch, as the
+trainer and the evaluator run it (perf.relpos_patch; --no-relpos-patch times it without, and the record says which);
+Whisper has no such encoder (relpos_patch null).
 
 What the clock covers: from the decoded 16 kHz waveforms in host memory (the FLAC decode and resampling happen before,
 off the clock) to the text - host->device copy, log-mel features on the device, the model, the decode loop and
@@ -61,9 +67,11 @@ Idle host: before loading, nvidia-smi lists the GPU's compute processes (and uti
 Output (--out, JSON, merged, written atomically): {"schema": 1, "ids": [...], "ids_sha256": ..., "systems": {name:
 record}}. A record: kind, model, device, gpu, dtype, batch_s, n_utts, audio_s, batches, rtf, wall_s, the batch-1
 fields (n_latency, p50_s, p95_s, mean_s, rtf_1_p50), vram_peak_allocated_bytes / _reserved_bytes for each pass,
-vram_gb, params_total, weights_bytes, relpos_patch, decode_len, trained, tokens_per_utt, cer_ref_corpus, idle,
-versions, time_utc. tools/study_report.py --speed reads it (the Pareto view: rtf, vram_gb, p50_s, p95_s;
-kitsune.study_stats.speed_entry).
+vram_gb, params_total, weights_bytes, relpos_patch, decode_len, trained, tokens_per_utt, cer_ref_corpus, max_rows (the
+batched pass's row cap, null without one), n_truncated / n_timestamp_tokens (whisper's batched pass: rows the stop or
+the length cap cut, timestamp ids stripped; null for the other kinds), idle, versions (python, torch, transformers,
+cuda, host, machine_id = $KITSUNE_MACHINE_ID, cpu), time_utc. tools/study_report.py --speed reads it (the Pareto view:
+rtf, vram_gb, p50_s, p95_s; kitsune.study_stats.speed_entry); the full runs' report groups records by machine_id + gpu.
 
 Usage (on the box, at its end, one call per system; kitsune/study_queue.py phase_speed passes these):
   python tools/speed_probe.py --kind aed --model students/study/t03 --system study-t03 \
@@ -72,6 +80,8 @@ Usage (on the box, at its end, one call per system; kitsune/study_queue.py phase
       --out runs/speed-B/speed.json --require-idle
   python tools/speed_probe.py --kind parakeet-tdt --model models/parakeet-tdt_ctc-0.6b-ja-hf --system parakeet-tdt \
       --store cache/eval --per-set 40 --out runs/speed-B/speed.json --require-idle
+  python tools/speed_probe.py --kind whisper --model whisper-large-v3 --hf-cache cache/hf --store cache/eval \
+      --per-set 40 --out runs/speed-smoke-b-<stamp>/speed.json --require-idle      # system = the key
 """
 import argparse
 import json
@@ -95,7 +105,7 @@ from kitsune import trainset  # noqa: E402
 from kitsune.store import ids_sha256  # noqa: E402
 
 SCHEMA = 1
-KINDS = ("aed", "cohere", "ctc", "parakeet-ctc", "parakeet-tdt")
+KINDS = ("aed", "cohere", "ctc", "parakeet-ctc", "parakeet-tdt", "whisper")
 AED_KINDS = ("aed", "cohere")  # the autoregressive decodes: their time depends on the tokens they emit
 DECODE_LENS = ("auto", "greedy", "teacher")
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
@@ -281,6 +291,47 @@ class TdtRunner:
         return t.processor.batch_decode(seqs, skip_special_tokens=True)
 
 
+class WhisperRunner:
+    """A Whisper model (kitsune.whisper): features on the device, greedy_whisper, decode_texts - whisper_eval's decode.
+    max_rows: the row cap of the batched pass (probe). It counts the rows the stop cut (n_truncated) and the timestamp
+    ids it stripped, and beats the item's heartbeat once per decode (kitsune.heartbeat.beat: rate-limited, a no-op
+    without KITSUNE_HEARTBEAT)."""
+
+    tokens = 0
+    n_truncated = 0
+    n_timestamp_tokens = 0
+
+    def __init__(self, model_dir, spec, device, dtype: str, max_rows: int | None = None):
+        from kitsune import heartbeat
+        from kitsune import whisper as W
+
+        self.W, self.heartbeat, self.device = W, heartbeat, device
+        self.wm = W.load_whisper(model_dir, device, torch.bfloat16 if dtype == "bf16" else torch.float32, spec=spec)
+        self.model = self.wm.model
+        self.params = self.wm.params_total
+        self.weights_bytes = _weights_bytes(self.model)
+        self.max_rows = int(max_rows or (spec.max_rows if spec else W.DEFAULT_MAX_ROWS))
+
+    def context(self):
+        from contextlib import ExitStack
+
+        from kitsune.evaluate import _fp32_head
+
+        stack = ExitStack()
+        stack.enter_context(torch.inference_mode())
+        stack.enter_context(_fp32_head(self.model))
+        return stack
+
+    def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
+        self.heartbeat.beat()
+        feats = self.W.features(self.wm, waves)
+        rows = self.W.greedy_whisper(self.wm, feats, max(durations), fp32_head=False)  # context() holds the fp32 head
+        self.tokens += sum(len(r["hyp_ids"]) for r in rows)
+        self.n_truncated += sum(bool(r["truncated"]) for r in rows)
+        self.n_timestamp_tokens += sum(int(r["n_timestamp_tokens"]) for r in rows)
+        return self.W.decode_texts(self.wm, rows)
+
+
 def trained_weights(kind: str, model: str | None) -> bool | None:
     """Whether a student dir holds trained weights: the trainer's "trained" record in its student_meta.json (a
     checkpoint the trainer exported has it, a student init dir from 03 / 03c does not); None for the teachers."""
@@ -295,7 +346,10 @@ def trained_weights(kind: str, model: str | None) -> bool | None:
 
 def decode_len_of(kind: str, choice: str, trained: bool | None) -> str | None:
     """The AED decode length a probe runs (module docstring): None for the non-autoregressive kinds; "auto" is
-    "teacher" for an untrained student dir, "greedy" otherwise."""
+    "teacher" for an untrained student dir, "greedy" otherwise; Whisper always decodes freely ("greedy": it has no
+    stored token counts of its own, parse_args refuses "teacher")."""
+    if kind == "whisper":
+        return "greedy"
     if kind not in AED_KINDS:
         return None
     if choice != "auto":
@@ -304,12 +358,16 @@ def decode_len_of(kind: str, choice: str, trained: bool | None) -> str | None:
 
 
 def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, store, revision: str,
-                relpos_patch: bool = True, decode_len: str | None = None):
+                relpos_patch: bool = True, decode_len: str | None = None, *, hf_cache: str | None = None,
+                max_rows: int | None = None):
     """The runner of one kind and its model's description; relpos_patch: kitsune.patches.patch_relpos_once_per_batch
-    on its encoder, as the trainer and the evaluator run every one of these encoders (perf.relpos_patch); decode_len
-    "teacher": an AED runner pinned to the teacher's token counts."""
-    runner, desc = _runner(kind, model, device, dtype, store.info or {}, revision, pin=decode_len == "teacher")
-    if relpos_patch:
+    on its encoder, as the trainer and the evaluator run every one of these encoders (perf.relpos_patch; never for
+    whisper, which has no FastConformer: the patch refuses a model without Parakeet's rel-pos encoding); decode_len
+    "teacher": an AED runner pinned to the teacher's token counts; hf_cache / max_rows: whisper's snapshot cache and
+    row cap."""
+    runner, desc = _runner(kind, model, device, dtype, store.info or {}, revision, pin=decode_len == "teacher",
+                           hf_cache=hf_cache, max_rows=max_rows)
+    if relpos_patch and kind != "whisper":
         from kitsune.patches import patch_relpos_once_per_batch
 
         patch_relpos_once_per_batch(runner.teacher.model if isinstance(runner, TdtRunner) else runner.model)
@@ -317,7 +375,15 @@ def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, 
 
 
 def _runner(kind: str, model: str | None, device: torch.device, dtype: str, info: dict, revision: str,
-            pin: bool = False):
+            pin: bool = False, hf_cache: str | None = None, max_rows: int | None = None):
+    if kind == "whisper":
+        from kitsune import heartbeat
+        from kitsune import whisper as W
+
+        with heartbeat.beating(max_s=W.LOAD_BEAT_MAX_S):  # a pinned snapshot's download + load
+            path, spec = W.resolve(model, hf_cache)
+            runner = WhisperRunner(path, spec, device, dtype, max_rows=max_rows)
+        return runner, f"{spec.repo}@{spec.revision}" if spec else str(path)
     if kind in ("aed", "cohere"):
         from transformers import AutoProcessor
 
@@ -374,16 +440,22 @@ def free_cache(device: torch.device):
 
 
 def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[str], device: torch.device, *,
-          batch_s: float, warmup: int, warmup_1: int, latency_n: int | None, n_tok: list[int] | None = None) -> dict:
+          batch_s: float, warmup: int, warmup_1: int, latency_n: int | None, n_tok: list[int] | None = None,
+          batch_rows: int | None = None) -> dict:
     """The timed passes over `waves` (module docstring): the batched pass after its warm-up, then the batch-1 pass
     after its own. durations: the store's seconds of each wave (the batching and the RTF's audio seconds); n_tok: the
-    teacher's tokens of each (an AED runner pinned to them reads them). Returns the record's numbers."""
+    teacher's tokens of each (an AED runner pinned to them reads them); the batched pass's row cap: the runner's
+    max_rows (whisper), else batch_rows, else none - the same real-seconds batches as every kind, cut at that many
+    rows (pack_micro_batches' cap_tokens over one "token" per row). Returns the record's numbers."""
     from kitsune.evaluate import corpus_cer
 
     dur = np.asarray(durations, dtype=np.float64)
     tok = [1] * len(waves) if n_tok is None else [int(x) for x in n_tok]
     order = np.argsort(-dur, kind="stable")
-    plan = trainset.pack_micro_batches(order, dur, float(batch_s))
+    max_rows = getattr(runner, "max_rows", None) or batch_rows
+    plan = trainset.pack_micro_batches(order, dur, float(batch_s), dec_len=np.ones(len(dur)) if max_rows else None,
+                                       cap_tokens=int(max_rows) if max_rows else None)
+    counted = [k for k in ("n_truncated", "n_timestamp_tokens") if hasattr(runner, k)]  # whisper's per-pass counts
     n1 = len(waves) if latency_n is None else min(int(latency_n), len(waves))
 
     def run(idx):
@@ -394,6 +466,8 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
             run(b)
         reset_peak(device)
         runner.tokens = 0
+        for k in counted:
+            setattr(runner, k, 0)
         hyps: list[str | None] = [None] * len(waves)
         sync(device)
         t0 = time.perf_counter()
@@ -404,6 +478,7 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
         wall = time.perf_counter() - t0
         peak_b = _peak(device)
         tokens_b = int(runner.tokens)
+        counts_b = {k: int(getattr(runner, k)) for k in counted}
         free_cache(device)  # the batched pass's blocks go: batch-1's own reserved VRAM is measured
         warm_1 = ([max(range(n1), key=lambda i: dur[i])] if n1 and warmup_1 else []) + list(
             range(min(int(warmup_1), len(waves))))
@@ -433,7 +508,9 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
                 vram_peak_allocated_bytes=peak_b["allocated"], vram_peak_reserved_bytes=peak_b["reserved"],
                 vram_peak_allocated_bytes_1=peak_1["allocated"], vram_peak_reserved_bytes_1=peak_1["reserved"],
                 vram_gb=max(reserved) / 1e9 if reserved else None,
-                cer_ref_corpus=corpus_cer([h or "" for h in hyps], refs)["cer"])
+                cer_ref_corpus=corpus_cer([h or "" for h in hyps], refs)["cer"],
+                max_rows=int(max_rows) if max_rows else None, n_truncated=counts_b.get("n_truncated"),
+                n_timestamp_tokens=counts_b.get("n_timestamp_tokens"))
 
 
 def merge_out(path: Path, ids: list[str], system: str, record: dict) -> dict:
@@ -455,11 +532,27 @@ def merge_out(path: Path, ids: list[str], system: str, record: dict) -> dict:
     return doc
 
 
+def _cpu_model() -> str | None:
+    """The CPU's model name (/proc/cpuinfo on Linux; platform.processor() elsewhere, which on Linux is only the
+    architecture), None when unknown."""
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip() or None
+    except OSError:
+        pass
+    return platform.processor() or None
+
+
 def _versions() -> dict:
+    """The software and the host. host is the container's hostname, which differs per rental: machine_id
+    ($KITSUNE_MACHINE_ID, the vast machine launch rented) and the CPU model group records of one host."""
     import transformers
 
     return dict(python=sys.version.split()[0], torch=torch.__version__, transformers=transformers.__version__,
-                cuda=torch.version.cuda, host=platform.node())
+                cuda=torch.version.cuda, host=platform.node(), machine_id=os.environ.get("KITSUNE_MACHINE_ID") or None,
+                cpu=_cpu_model())
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -479,6 +572,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--out", required=True, help="the speed JSON, merged per system")
     ap.add_argument("--batch-s", type=float, default=400.0,
                     help="padded audio seconds per batch of the batched pass (default %(default)s: the eval's)")
+    ap.add_argument("--hf-cache", default=None,
+                    help="whisper: the HF cache a key's pinned snapshot is fetched into (the box's <root>/cache/hf)")
+    ap.add_argument("--batch-rows", type=int, default=None,
+                    help="the batched pass's row cap (default: whisper, the model's max_rows; the others, none)")
     ap.add_argument("--latency-n", type=int, default=None, help="batch-1 on the first N ids only (default: all)")
     ap.add_argument("--warmup", type=int, default=2, help="warm-up batches, not timed (default %(default)s)")
     ap.add_argument("--warmup-1", type=int, default=3, help="warm-up single utterances (default %(default)s)")
@@ -494,8 +591,20 @@ def parse_args(argv=None) -> argparse.Namespace:
                          "the free decode, auto = teacher for an untrained student dir, else greedy (default "
                          "%(default)s)")
     args = ap.parse_args(argv)
-    if args.kind in ("aed", "ctc", "parakeet-ctc", "parakeet-tdt") and not args.model:
-        ap.error(f"--kind {args.kind} needs --model")
+    if args.kind in ("aed", "ctc", "parakeet-ctc", "parakeet-tdt", "whisper") and not args.model:
+        ap.error(f"--kind {args.kind} needs --model" + (" (a Whisper key or a model dir)" if args.kind == "whisper"
+                                                        else ""))
+    if args.kind == "whisper":
+        from kitsune.whisper import WHISPER_MODELS
+
+        if args.decode_len == "teacher":
+            ap.error("--kind whisper decodes freely: --decode-len teacher pins an AED decode to Cohere's token counts")
+        if not args.system:
+            if args.model not in WHISPER_MODELS:
+                ap.error("--kind whisper with a model dir needs --system")
+            args.system = args.model  # a key names its system
+    if args.batch_rows is not None and args.batch_rows < 1:
+        ap.error("--batch-rows must be >= 1")
     if args.kind in ("aed", "ctc") and not args.system:
         ap.error(f"--kind {args.kind} needs --system (the student's run name)")
     if args.per_set < 1 or args.batch_s <= 0 or args.warmup < 0 or args.warmup_1 < 0:
@@ -542,14 +651,16 @@ def main(argv=None) -> int:
     refs = store.frame().set_index("id").loc[ids, "ref"].tolist()
     t0 = time.time()
     runner, desc = load_runner(args.kind, args.model, device, dtype, store, args.revision,
-                               relpos_patch=not args.no_relpos_patch, decode_len=decode_len)
+                               relpos_patch=not args.no_relpos_patch, decode_len=decode_len, hf_cache=args.hf_cache,
+                               max_rows=args.batch_rows)
     load_s = time.time() - t0
     rec = dict(kind=args.kind, model=desc, device=str(device),
                gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None, dtype=dtype,
                params_total=int(runner.params), weights_bytes=int(runner.weights_bytes), load_s=round(load_s, 2),
-               relpos_patch=not args.no_relpos_patch, decode_len=decode_len, trained=trained)
+               relpos_patch=None if args.kind == "whisper" else not args.no_relpos_patch, decode_len=decode_len,
+               trained=trained)
     rec.update(probe(runner, waves, durations, refs, device, batch_s=args.batch_s, warmup=args.warmup,
-                     warmup_1=args.warmup_1, latency_n=args.latency_n, n_tok=n_tok))
+                     warmup_1=args.warmup_1, latency_n=args.latency_n, n_tok=n_tok, batch_rows=args.batch_rows))
     rec.update(idle=idle, gpu_state=gpu, versions=_versions(), store=str(args.store), time_utc=_now())
     merge_out(out, ids, system, rec)
     print(f"{system}: RTF {rec['rtf']:.5f} batched ({rec['n_utts']} utts, {rec['audio_s']:.0f} s), batch-1 p50 "
