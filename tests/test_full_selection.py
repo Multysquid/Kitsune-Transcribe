@@ -6,9 +6,11 @@ shards) and, on top of its planted rows (one kind per study rule), texts planted
 reazon_small train shard share a long reference and one more shares a long Parakeet ctc_hyp, so whichever shards the
 dev draw picks, the copies inside the pair stay dev, the ones in its buffers are dev_buffer and the rest are dev_dup.
 The "frozen" manifest is a study build of the same corpus (its eval rows are what the full build must reproduce),
-passed with its own sha (--manifest-sha256). Two limits are patched for the toy sizes: the Emilia dev target
-(devslice.DEV_VIDEO_ROWS, 4096 rows on the real data) and K5 (prereg.ONE_ROOT_MAX_FRAC: the fixture's 2 rows missing
-from parakeet_out are more than 0.1 % of its ~160 train rows; the K5 test runs with the real limit). CPU only.
+passed with its own sha (--manifest-sha256). Three limits are patched for the toy sizes: the Emilia dev target
+(devslice.DEV_VIDEO_ROWS, 4096 rows on the real data), K5 (prereg.ONE_ROOT_MAX_FRAC: the fixture's 2 rows missing
+from parakeet_out are more than 0.1 % of its ~160 train rows; the K5 test runs with the real limit) and the greedy
+subsets' size (devslice.GREEDY_N, 500 on the real data; both toy builds use 3, so the subsets are a real draw).
+CPU only.
 """
 import copy
 import importlib
@@ -42,6 +44,7 @@ CORPUS = {"reazon_small": (64, "train"), "emilia_yodas": (48, "train"), "galgame
           "eval_jsut": (12, "eval"), "eval_cv8": (8, "eval"), "eval_reazon": (8, "eval")}
 VIDEO_ROWS = 7  # the patched Emilia dev target: 3 videos of 3 rows
 MAX_FRAC = 0.05  # the patched K5 limit
+GREEDY_N = 3  # the patched greedy subset size (the toy study build's --greedy-n)
 SMOKE_BUDGET_S = 60.0  # about half the toy pool left after the dev rules
 DEV_TEXT = "まみむめもやゆよらりるれろわをん"  # 16 characters: over the 15-character bar
 CTC_TEXT = "がぎぐげござじずぜぞだぢづでどば"
@@ -147,11 +150,12 @@ def run(st, frozen: Frozen, d: Path, cfg: dict | None = None, *extra, video_rows
     cfg_p.write_text(json.dumps(cfg), encoding="utf-8")
     out = out or d / cfg["selection"]
     argv = ["--config", str(cfg_p), "--labels-root", str(labels_root or st.fc.root), "--out", str(out),
-            "--skip-audio-check", "--greedy-n", "3"]
+            "--skip-audio-check", "--greedy-n", str(GREEDY_N)]
     if manifest is not False:
         argv += ["--manifest", str(manifest or frozen.manifest_path), "--manifest-sha256", manifest_sha or frozen.sha]
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(devslice, "DEV_VIDEO_ROWS", video_rows)
+        mp.setattr(devslice, "GREEDY_N", GREEDY_N)
         mp.setattr(prereg, "ONE_ROOT_MAX_FRAC", max_frac)
         return ms.main([*argv, *extra]), out
 
@@ -178,7 +182,7 @@ def frozen(st, tmp_path_factory) -> Frozen:
                           "neutral_max_cer": 0.5})
     (d / "study.json").write_text(json.dumps(cfg), encoding="utf-8")
     ms.main(["--config", str(d / "study.json"), "--out", str(d / prereg.SELECTION_FILE), "--extent-record",
-             str(st.fc.root / kextent.RECORD_FILE), "--greedy-n", "3", "--teacher-out", str(st.teacher_out),
+             str(st.fc.root / kextent.RECORD_FILE), "--greedy-n", str(GREEDY_N), "--teacher-out", str(st.teacher_out),
              "--second-out", str(st.second_out), "--data", str(st.data), "--parakeet-out", str(st.parakeet_out),
              "--kotoba-galgame", str(st.kotoba), "--skip-audio-check"])
     return Frozen(d)
@@ -362,15 +366,21 @@ def test_eval_rows_greedy_subsets_and_baselines_are_the_studys(built, frozen, ca
     assert side["manifest"] == {"path": fullrun.FROZEN_MANIFEST, "sha256": frozen.sha, "eval_ids_equal": True}
 
 
-def test_the_sidecar_passes_its_check(built, frozen):
+def test_the_sidecar_passes_its_check(built, frozen, monkeypatch):
+    """With the toy manifest as the frozen one (fullrun.FROZEN_MANIFEST_SHA256 patched, as launch's test does), the
+    sidecar passes; against the real frozen sha it does not, whatever manifest sha the caller passes."""
     side = built.sidecar
-    assert devslice.sidecar_problems(side, selection_sha256=ms.file_sha256(built.parquet),
-                                     manifest_sha256=frozen.sha) == []
+    sel_sha = ms.file_sha256(built.parquet)
+    assert any("not the frozen manifest's" in p
+               for p in devslice.sidecar_problems(side, selection_sha256=sel_sha, manifest_sha256=frozen.sha))
+    monkeypatch.setattr(fullrun, "FROZEN_MANIFEST_SHA256", frozen.sha)
+    assert devslice.sidecar_problems(side, selection_sha256=sel_sha, manifest_sha256=frozen.sha) == []
+    assert devslice.sidecar_problems(side, selection_sha256=sel_sha) == []
     assert side["kind"] == "full_study" and side["schema"] == 1
     assert side["selection"] == {"path": fullrun.FULL_SELECTION, "sha256": ms.file_sha256(built.parquet)}
     assert side["recipe"]["full_study"] == fullrun.FULL_STUDY and side["recipe"]["study"] is None
     assert side["extent"] == {"name": "full", "inputs": {"emilia_yodas": "300h"}}
-    assert side["labels_complete_digest"] == "d" * 64 and side["seed"] == 1234
+    assert side["labels_complete_digest"] == "d" * 64 and side["seed"] == 1234 and side["greedy_n"] == GREEDY_N
     assert side["k5"] == {"not_in_parakeet": 2, "candidates": int(built.sel["split"].isin(["train", "dev"]).sum()),
                           "frac": pytest.approx(2 / built.sel["split"].isin(["train", "dev"]).sum()),
                           "max_frac": MAX_FRAC, "ok": True, "by_source": side["k5"]["by_source"]}
@@ -420,20 +430,30 @@ def test_k5_over_the_limit_exits_3_and_writes_nothing(st, frozen, tmp_path, caps
 
 
 def test_the_script_exit_codes(st, frozen, tmp_path):
-    """As a script: 3 on K5 (the real limit), 1 on a refusal, 2 on bad arguments."""
+    """As a script (its __main__ block): 3 on K5 (the real limit), 1 on a refusal, 2 on bad arguments. The script runs
+    through runpy with the toy Emilia dev target set first (the dev draw comes before K5's Parakeet reads, and the
+    real 4096-row target would take every toy video: a refusal)."""
     cfg_p = tmp_path / "cfg.json"
     cfg_p.write_text(json.dumps(full_cfg()), encoding="utf-8")
     out = tmp_path / fullrun.FULL_SELECTION
-    base = [sys.executable, str(ROOT / "scripts" / "make_selection.py"), "--config", str(cfg_p), "--labels-root",
-            str(st.fc.root), "--out", str(out), "--skip-audio-check"]
+    script = str(ROOT / "scripts" / "make_selection.py")
+    runner = (f"import runpy, sys; sys.path.insert(0, {str(ROOT)!r}); from kitsune import devslice; "
+              f"devslice.DEV_VIDEO_ROWS = {VIDEO_ROWS}; sys.argv = [{script!r}] + sys.argv[1:]; "
+              f"runpy.run_path({script!r}, run_name='__main__')")
+    base = [sys.executable, "-c", runner, "--config", str(cfg_p), "--labels-root", str(st.fc.root), "--out", str(out),
+            "--skip-audio-check"]
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     man = ["--manifest", str(frozen.manifest_path), "--manifest-sha256", frozen.sha]
     r = subprocess.run(base + man, capture_output=True, text=True, env=env, encoding="utf-8")
-    assert r.returncode == 3, r.stderr[-2000:]
+    assert r.returncode == 3 and "K5 FAIL" in r.stdout, r.stderr[-2000:]
     r = subprocess.run(base, capture_output=True, text=True, env=env, encoding="utf-8")
     assert r.returncode == 1 and "--manifest is required" in r.stderr
     r = subprocess.run(base + man + ["--bogus"], capture_output=True, text=True, env=env, encoding="utf-8")
     assert r.returncode == 2
+    # without the toy target the Emilia draw refuses (exit 1), before the Parakeet reads K5 needs
+    plain = [sys.executable, script, *base[3:]]
+    r = subprocess.run(plain + man, capture_output=True, text=True, env=env, encoding="utf-8")
+    assert r.returncode == 1 and "would take every one of them" in r.stderr, r.stderr[-2000:]
 
 
 def test_the_smoke_draw(st, frozen, built, smoke):
@@ -506,11 +526,45 @@ def test_refusals_before_any_work(st, frozen, tmp_path):
     assert "no dev-slice method" in refused(st, frozen, d(), cfg)
     no_ext = {k: v for k, v in full_cfg().items() if k != "extent"}
     assert "no extent block" in refused(st, frozen, d(), no_ext)
+    # the seed and the greedy subsets' size are the study's (contract 3 rule 10)
+    assert "drop --seed" in refused(st, frozen, d(), None, "--seed", "7")
+    assert "drop --greedy-n" in refused(st, frozen, d(), None, "--greedy-n", str(GREEDY_N + 1))
     # the full-mode flags without a full config: argparse's refusal
     plain = full_cfg(full_study=None)
     with pytest.raises(SystemExit) as e:
         run(st, frozen, d(), plain)
     assert e.value.code == 2
+
+
+def test_config_and_extent_problems_are_refusals_not_argument_errors(st, frozen, tmp_path):
+    """Exit 1 (contract 1.5), not argparse's 2: a --labels-root whose extent record is not the config's, a missing
+    record, an agree_max_source of a source the config does not train."""
+    rec = toy_record(st.fc.root)
+    other = tmp_path / "other.json"
+    kextent.write_record(other, dict(rec, root="labels/other"))
+    assert "extent record is for root 'labels/other'" in refused(st, frozen, tmp_path / "a", None, "--extent-record",
+                                                                  str(other))
+    assert "nope.json" in refused(st, frozen, tmp_path / "b", None, "--extent-record", str(tmp_path / "nope.json"))
+    cfg = full_cfg(agree_max_source=["emilia_yodas=0.2", "emilia_nc=0.2"])
+    assert "--agree-max-source for sources not in --sources: ['emilia_nc']" in refused(st, frozen, tmp_path / "c", cfg)
+
+
+def test_an_extent_the_dev_draw_cannot_serve_fails_early(st, frozen, tmp_path, monkeypatch):
+    """A shards source with too few train stems is refused from the extent record, before any row is read; an
+    Emilia source whose videos cannot reach the target without taking every one is refused right after the first
+    pass over teacher_out, before the Parakeet reads."""
+    def no_rows(*a, **kw):
+        raise AssertionError("rows were read")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(ms, "build_selection", no_rows)
+        mp.setattr(devslice, "DEV_PAIR_SHARDS", 5)  # 7 stems needed: galgame has 6 train stems, reazon_small 8
+        msg = refused(st, frozen, tmp_path / "a")
+    assert "cannot serve the dev draw" in msg and "galgame: 6 train stems" in msg and "reazon_small" not in msg
+    with monkeypatch.context() as mp:
+        mp.setattr(ms, "parakeet_rows", no_rows)
+        msg = refused(st, frozen, tmp_path / "b", video_rows=10 ** 6)
+    assert "emilia_yodas" in msg and "would take every one of them" in msg
 
 
 def test_eval_rows_that_are_not_the_manifests_refuse(st, frozen, tmp_path):
@@ -586,6 +640,7 @@ def test_launch_accepts_the_built_selections(built, smoke, frozen, monkeypatch):
     sidecar or manifest, or a recorded manifest sha that is not the frozen one, is a problem. (The fixture's one
     null-agree Emilia row is a no_agree drop, which launch flags on every selection: left out here.)"""
     monkeypatch.setattr(prereg, "ONE_ROOT_MAX_FRAC", MAX_FRAC)
+    monkeypatch.setattr(devslice, "GREEDY_N", GREEDY_N)
     full, sm = dict(full_cfg(), pull_parakeet=True), dict(full_cfg(draw=SMOKE_BUDGET_S), pull_parakeet=True)
     assert problems_of(built.parquet, full["selection"], full)[0].startswith(
         f"{fullrun.FULL_SELECTION} was built against the manifest sha256 '{frozen.sha}'")  # not the real frozen one
@@ -601,6 +656,12 @@ def test_launch_accepts_the_built_selections(built, smoke, frozen, monkeypatch):
     problems = problems_of(smoke.parquet, full["selection"], full)
     assert any("was built with full_study" in p for p in problems)
     assert any("['not_drawn'], which the full recipe never does" in p for p in problems)
+    # the real greedy subset size: the toy builds' 3 is not it
+    monkeypatch.setattr(devslice, "GREEDY_N", 500)
+    assert problems_of(built.parquet, full["selection"], full) == [
+        f"{fullrun.FULL_SELECTION} was built with greedy_n 3, a full selection's is the study's 500 "
+        f"(kitsune.devslice.GREEDY_N): rebuild it with scripts/make_selection.py --config <the run config> and "
+        f"upload it"]
 
 
 FCFG = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"], "student": "students/s",
@@ -610,7 +671,7 @@ FCFG = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galg
                              "partial_second_opinion": [], "study": None, "full_study": dict(fullrun.FULL_STUDY)}}
 FARGS = {"sources": FCFG["sources"], "eval_sets": FCFG["eval_sets"], "agree_max": 0.5, "agree_max_source": [],
          "filter_eval_sets": [], "partial_second_opinion": [], "study": None, "full_study": dict(fullrun.FULL_STUDY),
-         "seed": 1234, "manifest_sha256": fullrun.FROZEN_MANIFEST_SHA256}
+         "seed": 1234, "greedy_n": 500, "manifest_sha256": fullrun.FROZEN_MANIFEST_SHA256}
 FROWS = [("reazon_small", "train", True, "kept"), ("galgame", "train", True, "kept"),
          ("reazon_small", "dev", True, "kept"), ("galgame", "dev", True, "kept"), ("galgame", "dev", False, "truncated"),
          ("reazon_small", "train", False, "dev_buffer"), ("reazon_small", "train", False, "dev_dup"),
@@ -647,6 +708,15 @@ def test_selection_problems_know_the_full_recipe(tmp_path):
     assert problems == ["the run config's selection_recipe.full_study.dev_rule 2, registered 1"]
     assert "was built against the manifest sha256 '00'" in launch.selection_problems(
         write_sel(path, FROWS, dict(FARGS, manifest_sha256="00")), name, FCFG)[0]
+    # the seed and greedy_n the dev slice and the greedy subsets hang on: the study's (a missing key too)
+    rebuild = "rebuild it with scripts/make_selection.py --config <the run config> and upload it"
+    assert launch.selection_problems(write_sel(path, FROWS, dict(FARGS, seed=7)), name, FCFG) == [
+        f"{name} was built with seed 7, a full selection's is the study's 1234: {rebuild}"]
+    assert launch.selection_problems(write_sel(path, FROWS, dict(FARGS, greedy_n=100)), name, FCFG) == [
+        f"{name} was built with greedy_n 100, a full selection's is the study's 500 (kitsune.devslice.GREEDY_N): "
+        f"{rebuild}"]
+    no_keys = {k: v for k, v in FARGS.items() if k not in ("seed", "greedy_n")}
+    assert len(launch.selection_problems(write_sel(path, FROWS, no_keys), name, FCFG)) == 2
     # not_drawn only with a draw
     rows = FROWS + [("galgame", "train", False, "not_drawn")]
     assert any("['not_drawn'], which the full recipe never does" in p for p in

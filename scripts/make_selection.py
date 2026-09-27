@@ -90,19 +90,24 @@ are the study's, computed on split in {train, eval} BEFORE any row becomes dev, 
                    (--manifest, sha fullrun.FROZEN_MANIFEST_SHA256) in order, else refused: the M4 readout of every
                    full run scores exactly the study's rows. The manifest is referenced, never copied or written
   (dev draw)       kitsune.devslice.draw: every row of a seeded shard pair (reazon_small, reazon_large, galgame) or of
-                   seeded whole Emilia videos gets split "dev" and keeps its reason (keep only for `kept`)
+                   seeded whole Emilia videos gets split "dev" and keeps its reason (keep only for `kept`). It is drawn
+                   right after F0 (it reads no reason; Emilia videos count every teacher_out train row) and applied
+                   here, so an extent it cannot serve fails before the Parakeet reads; a shards source with fewer
+                   than 4 train stems in the extent is refused from the extent record, before any row is read
   dev_buffer       a live train row of the shard before or after a dev pair
   dev_dup          a live train row whose normalised reference, Cohere hyp or Parakeet ctc_hyp equals the normalised
                    reference, Cohere hyp or ctc_hyp (>= dedup_min_chars) of a kept dev row
   not_drawn        only with full_study.draw_audio_s (the smoke): draw_budget over the live train rows, tag full:draw
   kept
 The probe is probe_n kept train rows per source (tag train:<source>), the greedy subsets greedy_n kept eval rows per
-set (eval:<set>): with the manifest's eval rows and seed 1234 they are the study's. Written (deterministic, no
+set (eval:<set>): with the manifest's eval rows, seed 1234 (kitsune.prereg.SELECTION_SEED) and greedy_n 500
+(kitsune.devslice.GREEDY_N) they are the study's, so another --seed or --greedy-n is refused. Written (deterministic, no
 timestamps and no machine paths): the parquet (the columns above; metadata args = FULL_ARGS + config_roots,
 extent_record_sha256, manifest_sha256, labels_complete_digest) and <selection stem>.json, the sidecar (kind
 "full_study": the files' hashes, the recipe, hours per stage and source, the K5 count, the dev slice per source, the
 draw, n and ids_sha256 of train/dev/probe/eval, the teachers' baselines on the manifest rows; kitsune.devslice.
-sidecar_problems checks it at launch). Exit 0 written, 3 K5 over the limit, 1 refused, 2 bad arguments.
+sidecar_problems checks it at launch). Exit 0 written, 3 K5 over the limit, 1 refused (the config's recipe and extent
+problems included), 2 bad arguments.
 
 Usage:
   python scripts/make_selection.py --config configs/viability.json       # the viability run's selection
@@ -791,19 +796,22 @@ def main(argv: list[str] | None = None):
     else:
         args.probe_n = 500 if args.probe_n is None else args.probe_n
 
+    # a full config's recipe and extent problems are refusals (exit 1, contract 1.5), not argument errors (exit 2):
+    # they come from the config and the label root, never from a flag
+    fail = _refuse if full is not None else ap.error
     by_source = {}
     for item in args.agree_max_source:
         src, _, val = item.partition("=")
         if not val:
-            ap.error(f"--agree-max-source expects SOURCE=A, got {item!r}")
+            fail(f"--agree-max-source expects SOURCE=A, got {item!r}")
         by_source[src] = float(val)
     if set(args.filter_eval_sets) & set(EVAL_SETS):
-        ap.error(f"the gate sets {EVAL_SETS} are never label-filtered")
+        fail(f"the gate sets {EVAL_SETS} are never label-filtered")
     unknown = set(by_source) - set(args.sources) - set(args.filter_eval_sets)
     if unknown:
-        ap.error(f"--agree-max-source for sources not in --sources: {sorted(unknown)}")
+        fail(f"--agree-max-source for sources not in --sources: {sorted(unknown)}")
     if stray := set(args.partial_second_opinion) - set(args.sources) - set(args.filter_eval_sets):
-        ap.error(f"--partial-second-opinion for sources not in --sources: {sorted(stray)}")
+        fail(f"--partial-second-opinion for sources not in --sources: {sorted(stray)}")
 
     # the extent: only its subset's stems, from the label run's record
     ext, stems, record = kextent.extent_block(cfg), None, None
@@ -812,11 +820,17 @@ def main(argv: list[str] | None = None):
         ap.error("--extent-record needs a --config with an extent block")
     if ext is not None:
         if problems := kextent.validate(cfg):
-            ap.error(f"{args.config}: " + "; ".join(problems))
+            fail(f"{args.config}: " + "; ".join(problems))
         rec_path = Path(args.extent_record) if args.extent_record else _repo_path(ext["root"]) / kextent.RECORD_FILE
-        record = kextent.load_record(rec_path)
+        if full is not None:  # a missing or foreign record under --labels-root: a refusal, not a traceback
+            try:
+                record = kextent.load_record(rec_path)
+            except (OSError, ValueError) as e:
+                _refuse(f"{rec_path}: {e}")
+        else:
+            record = kextent.load_record(rec_path)
         if problems := kextent.record_problems(record, cfg):
-            ap.error(f"{rec_path}: " + "; ".join(problems))
+            fail(f"{rec_path}: " + "; ".join(problems))
         stems = kextent.subset_stems(record, cfg)
 
     t0 = time.time()
@@ -1003,6 +1017,14 @@ def full_setup(args, cfg: dict) -> dict:
                 "(partial_second_opinion [])")
     if bad := [s for s in args.sources if s not in devslice.DEV_METHOD]:
         _refuse(f"train sources {bad} have no dev-slice method (kitsune.devslice.DEV_METHOD)")
+    # the dev draw, the probe and the greedy subsets hang on these two: the study's, so the greedy subsets are the
+    # frozen study selection's (launch refuses a selection that records others)
+    if args.seed != kprereg.SELECTION_SEED:
+        _refuse(f"--seed {args.seed}: a full selection is built with the study's seed {kprereg.SELECTION_SEED} "
+                f"(kitsune.prereg.SELECTION_SEED); drop --seed")
+    if args.greedy_n != devslice.GREEDY_N:
+        _refuse(f"--greedy-n {args.greedy_n}: a full selection's greedy subsets are {devslice.GREEDY_N} eval rows per "
+                f"set, the study's (kitsune.devslice.GREEDY_N); drop --greedy-n")
     sel_rel = str(cfg.get("selection") or "")
     if not sel_rel.startswith(fullrun.FULL_DIR + "/") or sel_rel == kprereg.SELECTION_FILE:
         _refuse(f"the config's selection {sel_rel!r} is not under {fullrun.FULL_DIR}/ (the frozen study files stay "
@@ -1082,6 +1104,13 @@ def build_full_selection(teacher_root, second_root, parakeet_root, data_root, so
     agree_max_by_source = agree_max_by_source or {}
     sel = build_selection(teacher_root, second_root, data_root, sources, eval_sets, agree_max, seed, greedy_n, 0,
                           audio_check, agree_max_by_source, (), (), stems)
+    ids = sel["id"].to_numpy(object)
+    src = sel["source"].to_numpy(object)
+    # the dev draw depends on the rows' ids, sources, stems and split only, never on their reasons: drawn here, right
+    # after the first pass over teacher_out, so an extent it cannot serve (an Emilia source whose videos reach the
+    # row target only with every one of them) is refused before the Parakeet reads and F1a; applied at step 7
+    tstem = sel["teacher_file"].str.rsplit("/", n=1).str[1].to_numpy(object)
+    draw = devslice.draw(ids, src, tstem, sel["split"].to_numpy(object) == "train", sources, seed, stems=stems)
     files = sorted(sel["teacher_file"].unique())
     tx = text_rows(teacher_root, files, ("hyp", "ref")).set_index("id")
     pk = parakeet_rows(parakeet_root, files)
@@ -1089,8 +1118,6 @@ def build_full_selection(teacher_root, second_root, parakeet_root, data_root, so
         raise ValueError(f"duplicate ids across parakeet_out, e.g. {pk['id'][pk['id'].duplicated()].iloc[0]}")
     in_pk = sel["id"].isin(pk["id"]).to_numpy()
     pk = pk.set_index("id")
-    ids = sel["id"].to_numpy(object)
-    src = sel["source"].to_numpy(object)
     dur = sel["duration"].to_numpy(np.float64)
     hyp, ref = sel["id"].map(tx["hyp"]).to_numpy(object), sel["id"].map(tx["ref"]).to_numpy(object)
     p_hyp = sel["id"].map(pk["p_hyp"]).fillna("").to_numpy(object)
@@ -1105,7 +1132,9 @@ def build_full_selection(teacher_root, second_root, parakeet_root, data_root, so
     def live():
         return (split == "train") & (reason == "kept")
 
-    # rule 1 and K5: the candidates are the rows in both roots
+    # rule 1 and K5. Two counts are called candidates (both scout s3's names): k5.candidates is K5's denominator, the
+    # train rows in teacher_out (the rows the Parakeet pass should have labelled; the Emilia dev videos are counted
+    # over the same rows), and hours.candidates the train rows in both roots, which the later stages start from
     reason[~in_pk] = "not_in_parakeet"
     one = train0 & ~in_pk
     k5 = {"not_in_parakeet": int(one.sum()), "candidates": int(train0.sum()),
@@ -1155,9 +1184,8 @@ def build_full_selection(teacher_root, second_root, parakeet_root, data_root, so
     man_ids = {i for b in (manifest.get("sets") or {}).values() for i in b.get("ids") or []}
     man_ids |= {i for b in (manifest.get("galgame_views") or {}).values() for i in b.get("ids") or []}
 
-    # the dev draw (whole shards / videos, independent of the row reasons), then its buffers and dev_dup
-    tstem = sel["teacher_file"].str.rsplit("/", n=1).str[1].to_numpy(object)
-    draw = devslice.draw(ids, src, tstem, train0, sources, seed, stems=stems)
+    # the dev draw (whole shards / videos, drawn after F0 above, independent of the row reasons), then its buffers
+    # and dev_dup
     reason[draw["buffer"] & live()] = "dev_buffer"
     split[draw["dev"]] = fullrun.DEV_SPLIT
     dev = split == fullrun.DEV_SPLIT
@@ -1305,6 +1333,8 @@ def full_main(args, cfg: dict, by_source: dict, stems, record, full: dict, t0: f
     when K5 is over its limit (nothing written). A refusal raises SystemExit (exit 1)."""
     if stems is None:
         _refuse("the extent names no stems")
+    if problems := devslice.draw_problems(stems, args.sources):  # from the record alone: before any row is read
+        _refuse("the extent cannot serve the dev draw: " + "; ".join(problems))
     if missing := partial_pull_problems(args.teacher_out, args.second_out, args.parakeet_out, args.sources, stems):
         _refuse(f"{len(missing)} label file(s) of the extent are not under the label root (a partial pull), e.g. "
                 f"{missing[:5]}")

@@ -34,6 +34,7 @@ def test_constants_and_reexports():
                  "FROZEN_MANIFEST", "FROZEN_MANIFEST_SHA256", "seeded_subset", "dev_pick", "shard_split"):
         assert getattr(devslice, name) is getattr(fullrun, name), name
     assert (devslice.SCORED_PER_SOURCE, devslice.SCORED_SEED) == (600, 1234)
+    assert devslice.GREEDY_N == 500 and prereg.SELECTION_SEED == 1234  # contract 3 rule 10: the study's subsets
 
 
 def test_import_is_stdlib_only():
@@ -154,6 +155,25 @@ def test_draw_marks_whole_shards_and_whole_videos():
         devslice.draw(ids, src, stem, train, ["reazon_small"], 1, stems=few)
 
 
+def test_draw_problems_come_from_the_stems_alone(monkeypatch):
+    """What make_selection refuses before it reads a row: a shards source with fewer train stems than the pair and its
+    buffers (eval stems do not count; the bound is read at call time), a source without a method. Videos sources are
+    judged on their rows by the build."""
+    ok = {"reazon_small": set(stems(4)), "galgame": set(stems(4)) | {"eval-00000"}, "emilia_yodas": {"train-00000"}}
+    assert devslice.draw_problems(ok, ["reazon_small", "galgame", "emilia_yodas"]) == []
+    few = dict(ok, galgame=set(stems(3)) | {"eval-00000"})
+    assert devslice.draw_problems(few, ["reazon_small", "galgame"]) == [
+        "galgame: 3 train stems in the extent, the dev pair and its buffers need at least 4"]
+    assert devslice.draw_problems({}, ["reazon_large"]) == [
+        "reazon_large: 0 train stems in the extent, the dev pair and its buffers need at least 4"]
+    assert "no dev-slice method" in devslice.draw_problems(ok, ["eval_cv8"])[0]
+    monkeypatch.setattr(devslice, "DEV_PAIR_SHARDS", 3)
+    assert "at least 5" in devslice.draw_problems(ok, ["reazon_small"])[0]
+    # the same bound as pick_shard_pair's
+    with pytest.raises(ValueError, match="at least 5"):
+        devslice.pick_shard_pair(stems(4), 1, "reazon_small")
+
+
 def test_selection_files():
     full = fullrun.FULL_DATA
     assert devslice.selection_files(full) == ["labels/full/selections/full_study/full.json", fullrun.FROZEN_MANIFEST]
@@ -177,13 +197,24 @@ def good_sidecar() -> dict:
             "dev": {"by_source": {"reazon_small": {"kept_rows": 5}, "galgame": {"kept_rows": 2}}}}
 
 
-def test_sidecar_problems():
+def test_sidecar_problems(monkeypatch):
     sc = good_sidecar()
     assert devslice.sidecar_problems(sc) == []
     assert devslice.sidecar_problems(sc, selection_sha256="a" * 64) == []
     assert "belongs to another build" in devslice.sidecar_problems(sc, selection_sha256="b" * 64)[0]
-    assert devslice.sidecar_problems(dict(sc, manifest=dict(sc["manifest"], sha256="c" * 64)),
-                                     manifest_sha256="c" * 64) == []
+    # the manifest: the sidecar's sha is always the frozen one; manifest_sha256 (the data repo file's) must be it too,
+    # so a caller's sha never stands in for the frozen one
+    assert devslice.sidecar_problems(sc, manifest_sha256=fullrun.FROZEN_MANIFEST_SHA256) == []
+    other = dict(sc, manifest=dict(sc["manifest"], sha256="c" * 64))
+    problems = devslice.sidecar_problems(other, manifest_sha256="c" * 64)
+    assert len(problems) == 2 and "is not the frozen manifest's" in problems[0] and "changed" in problems[1]
+    assert devslice.sidecar_problems(sc, manifest_sha256="c" * 64) == [
+        f"the manifest file has sha256 {'c' * 64}, not the frozen manifest's {fullrun.FROZEN_MANIFEST_SHA256}: the "
+        f"data repo's {fullrun.FROZEN_MANIFEST} changed"]
+    monkeypatch.setattr(fullrun, "FROZEN_MANIFEST_SHA256", "c" * 64)  # read at call time
+    assert devslice.sidecar_problems(other, manifest_sha256="c" * 64) == []
+    assert "is not the frozen manifest's" in devslice.sidecar_problems(sc)[0]
+    monkeypatch.undo()
 
     def broken(**change) -> list[str]:
         s = copy.deepcopy(sc)
@@ -211,3 +242,19 @@ def test_sidecar_problems():
     del s["dev"]
     assert "no kept dev rows for ['reazon_small', 'galgame']" in devslice.sidecar_problems(s)[0]
     assert devslice.sidecar_problems([]) == ["the sidecar list is not an object"]
+
+
+def test_sidecar_problems_never_raise_on_a_malformed_sidecar():
+    """launch prints the problems of a downloaded sidecar: a part of the wrong type is a problem, not a traceback."""
+    sc = good_sidecar()
+    for by in ({"reazon_small": 3, "galgame": {"kept_rows": 2}}, {"reazon_small": {"kept_rows": "5"}, "galgame": None},
+               {"reazon_small": {"kept_rows": True}, "galgame": {"kept_rows": 2.5}}, ["reazon_small"], "x"):
+        problems = devslice.sidecar_problems(dict(sc, dev={"by_source": by}))
+        assert problems and "no kept dev rows for ['reazon_small'" in problems[-1], (by, problems)
+    s = dict(sc, sources=["reazon_small", 7, None], dev="x", k5=[], manifest="m", selection=5)
+    problems = devslice.sidecar_problems(s)
+    assert any("no kept dev rows for ['reazon_small', 7, None]" in p for p in problems)
+    assert any("manifest.path None" in p for p in problems) and any("k5.ok" in p for p in problems)
+    assert any("selection.path None" in p for p in problems)
+    assert devslice.sidecar_problems({"kind": "full_study", "schema": 1, "sources": ["a"],
+                                      "dev": {"by_source": {"a": 3}}})

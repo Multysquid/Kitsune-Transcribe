@@ -511,11 +511,12 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
     without pull_parakeet needs the teacher files of its kept eval rows only.
     A full-data run's selection (selection_recipe.full_study, kitsune/devslice.py) must carry the same full_study
     block as the config, which must be the registered one (kitsune.fullrun.full_recipe_problems), and record the frozen
-    study manifest's sha (fullrun.FROZEN_MANIFEST_SHA256) its eval rows equal. Its splits are train, dev and eval (only
-    a full_study selection may have dev rows), every train source keeps dev rows (the trainer's early stop scores them),
-    its drop reasons are kitsune.devslice.FULL_REASONS (not_drawn only with a draw_audio_s), K6 and K5 hold with K5
-    counted over the train and dev rows (the dev rows were train rows), and with `have` its sidecar and the frozen
-    manifest (devslice.selection_files) are in the data repo."""
+    study manifest's sha (fullrun.FROZEN_MANIFEST_SHA256) its eval rows equal, the study's seed (SELECTION_SEED) and
+    greedy_n (kitsune.devslice.GREEDY_N), on which its dev slice and greedy subsets hang. Its splits are train, dev
+    and eval (only a full_study selection may have dev rows), every train source keeps dev rows (the trainer's early
+    stop scores them), its drop reasons are kitsune.devslice.FULL_REASONS (not_drawn only with a draw_audio_s), K6 and
+    K5 hold with K5 counted over the train and dev rows (the dev rows were train rows), and with `have` its sidecar and
+    the frozen manifest (devslice.selection_files) are in the data repo."""
     import pandas as pd
     import pyarrow.parquet as pq
 
@@ -561,6 +562,14 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
             if args.get("manifest_sha256") != fullrun.FROZEN_MANIFEST_SHA256:
                 problems.append(f"{name} was built against the manifest sha256 {args.get('manifest_sha256')!r}, not "
                                 f"the frozen {fullrun.FROZEN_MANIFEST} ({fullrun.FROZEN_MANIFEST_SHA256}): {rebuild}")
+            # the dev draw, the probe and the greedy subsets hang on the seed, the greedy subsets on greedy_n: the
+            # study's, so the dev slice is the registered one and the greedy subsets are the study selection's
+            if args.get("seed") != prereg.SELECTION_SEED:
+                problems.append(f"{name} was built with seed {args.get('seed')!r}, a full selection's is the study's "
+                                f"{prereg.SELECTION_SEED}: {rebuild}")
+            if args.get("greedy_n") != devslice.GREEDY_N:
+                problems.append(f"{name} was built with greedy_n {args.get('greedy_n')!r}, a full selection's is the "
+                                f"study's {devslice.GREEDY_N} (kitsune.devslice.GREEDY_N): {rebuild}")
 
     full = isinstance(recipe, dict) and recipe.get("full_study") is not None
     sel = pd.read_parquet(path, columns=["source", "split", "keep", "reason", "teacher_file"])
