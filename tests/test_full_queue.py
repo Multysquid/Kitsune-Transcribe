@@ -298,12 +298,17 @@ def test_box_full_shares_two_gpus_stores_first_and_the_pool_after_training(fq):
     (fq.state).mkdir(parents=True, exist_ok=True)
     deadline = time.time() + 100 * 3600
     (fq.state / "deadline").write_text(f"{deadline}\n")
-    env = dict(FAKE_ITEM_S=json.dumps({"stores-aed": 0.8}), FAKE_EPOCH_STEPS=json.dumps({"full-t06": 250}),
-               FAKE_STEP_S="0.004")
+    env = dict(FAKE_ITEM_S=json.dumps({"stores-aed": 0.8, "speed-": 0.3}),
+               FAKE_EPOCH_STEPS=json.dumps({"full-t06": 250}), FAKE_STEP_S="0.004")
     q = fq.make("full", uploader=up, env=env)
     assert q.run() == F.EXIT_OK
     recs = fq.records()
     it = {x["item"]: x for x in recs}
+    # a speed item has the host to itself: no other item runs and no upload runs while it times
+    for sp in ("speed-full-t06", "speed-study-t06"):
+        s = it[sp]
+        assert all(x["t1"] <= s["t0"] or x["t0"] >= s["t1"] for x in recs if x is not s), sp
+        assert not [t for t, _, _ in up.synced if s["t0"] <= t <= s["t1"]], sp
     ctc, aed = it["stores-ctc"], it["stores-aed"]
     assert all(x["t0"] >= ctc["t1"] for x in recs if x is not ctc)  # the CTC store first, alone
     assert aed["t0"] < it["full-p03"]["t0"] < aed["t1"] and it["full-t06"]["t0"] >= aed["t1"]  # p03 during stores-aed
@@ -438,6 +443,30 @@ def test_the_no_start_rule_skips_a_droppable_item_and_overrides_the_others(fq):
     assert st["items"]["full-t06"]["status"] == "done" and st["no_start"]["full-t06"]["overridden"] is True
     assert {x["item"]: int(x["deadline"]) for x in fq.records("train")} == {
         "full-t06": int(deadline - 3600), "full-p03": int(deadline - 3600)}
+
+
+def test_a_held_item_is_tried_once_per_poll_while_its_gpu_takes_the_next_ready_item(fq):
+    """check-resume exit 1 (the store is not built yet) holds the resumed item for a poll: on two GPUs it is tried
+    once per poll, not once per free GPU, and the GPU starts the next ready training item meanwhile."""
+    rid = "full-p03-20260927T120000Z"
+    local_run(fq.root, rid, 10, config="full-p03", st={"total_steps": 20, "t_c": None, "pre_cooldown_done": False,
+                                                       "early_stop": {"triggered": None}, "resume_resets": 0,
+                                                       "end_reason": "schedule"})
+    write_plan(fq, {"stores-ctc": {"status": "fresh"}, "full-p03": {"status": "resume", "run_dir": f"runs/{rid}"},
+                    "full-p005": {"status": "fresh"}}, box="full")
+    poll = 0.3
+    q = fq.make("full", registry=box_only(fq.reg, "full", keep=["stores-ctc", "full-p03", "full-p005"]), poll_s=poll,
+                env=dict(FAKE_CHECK_RESUME=json.dumps({"full-p03": 1})))
+    assert q.run() == F.EXIT_STOP  # full-p03 held max_attempts times, then failed for good
+    cr = fq.records("check-resume")
+    assert len(cr) == 4 and len(fq.events("item_held")) == 4  # the 4th: held no more, failed
+    gaps = [b["t0"] - a["t0"] for a, b in zip(cr, cr[1:])]
+    assert all(g >= 0.8 * poll for g in gaps), gaps
+    p005 = next(x for x in fq.records("train") if x["item"] == "full-p005")
+    assert p005["t0"] < cr[1]["t0"]  # started on the GPU the held item left free, before its next try
+    st = fq.st()
+    assert st["items"]["full-p03"]["status"] == "failed" and "check-resume exit 1" in st["items"]["full-p03"]["why"]
+    assert st["items"]["full-p005"]["status"] == "done"
 
 
 # ============================================================================================ stalls and beats
@@ -971,12 +1000,12 @@ def test_resume_pull_cli_exit_codes(fq, hubs, monkeypatch):
 # ================================================================================================= adoption
 
 
-def local_run(root: Path, rid: str, step: int, st: dict | None = None):
+def local_run(root: Path, rid: str, step: int, st: dict | None = None, config: str = "full-p01"):
     """A pulled run dir as resume-pull leaves it: config.json, events.jsonl, one full state."""
     rd = root / "runs" / rid
     (rd / "metrics").mkdir(parents=True, exist_ok=True)
     (rd / "config.json").write_text(json.dumps({"config": json.loads(
-        (root / "configs/full/full-p01.json").read_text(encoding="utf-8"))}), encoding="utf-8")
+        (root / f"configs/full/{config}.json").read_text(encoding="utf-8"))}), encoding="utf-8")
     (rd / "events.jsonl").write_text(json.dumps({"kind": "phase", "name": "setup", "wall": 1.0}) + "\n")
     d = rd / "checkpoints" / f"full_step_{step}"
     d.mkdir(parents=True)
@@ -986,9 +1015,9 @@ def local_run(root: Path, rid: str, step: int, st: dict | None = None):
     return rd
 
 
-def write_plan(fq, items: dict):
+def write_plan(fq, items: dict, box: str = "p01"):
     fq.state.mkdir(parents=True, exist_ok=True)
-    (fq.state / fullrun.RESUME_PLAN).write_text(json.dumps({"format": 1, "box": "p01", "created_utc": "x",
+    (fq.state / fullrun.RESUME_PLAN).write_text(json.dumps({"format": 1, "box": box, "created_utc": "x",
                                                             "summary_sha256": "0" * 64, "items": items}))
 
 

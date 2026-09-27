@@ -13,7 +13,12 @@ machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it neve
   choice     per free GPU: (1) a ready readout whose training item last ran on this GPU (it follows its run, ahead of
              the next training item), (2) the first ready stores or train item in registry order, (3) the eval pool
              (readout, speed and eval items in registry order), only once no train item is waiting to start. Stores
-             items take a GPU slot: no two store builds run at once (a store build takes no lock)
+             items take a GPU slot: no two store builds run at once (a store build takes no lock). A speed item has the
+             host to itself (the study's "one model at a time on an idle host": speed_probe's --require-idle sees only
+             its own GPU, and two probes would share one speed.json): it starts only when nothing runs and no upload is
+             pending, nothing starts beside it and no upload runs under it, and the pool items after it wait for it. An
+             item held by a transient refusal (check-resume exit 1, a failed Hub pull) is tried again a poll later,
+             once per poll; the GPU takes the next ready item meanwhile
   per child  KITSUNE_HEARTBEAT=$KITSUNE_STATE/hb/<item> (touched by the queue at start; the child beats it) and
              KITSUNE_DEADLINE = the box deadline ($KITSUNE_STATE/deadline) - deadline_reserve_min (no deadline file: no
              variable). A fresh start of an item with max_hours that cannot end before that deadline is skipped
@@ -495,7 +500,7 @@ class FullQueue(Q.Queue):
             if new:
                 self.item(name).update(needs=list(spec["needs"]), of=spec.get("of"), out=None, hb_max_gap_s=None,
                                        stalls=0, peak_rss_gb=None, hub_resume=False, sets_once=[], check_resume=None,
-                                       check_resume_tries=0, why=None)
+                                       check_resume_tries=0, held_until=None, why=None)
         plan_path = Path(self.s.state_dir) / fullrun.RESUME_PLAN
         if self._fresh and plan_path.is_file() and self.state.get("resumed") is None:
             self.adopt(json.loads(plan_path.read_text(encoding="utf-8")))
@@ -649,35 +654,48 @@ class FullQueue(Q.Queue):
 
     def _next_for(self, gpu: str, todo: list[str], running: dict) -> str | None:
         """The module docstring's choice for this GPU: its training item's readout, then the first ready stores or
-        train item, then the eval pool once no training item waits to start."""
+        train item, then the eval pool once no training item waits to start. A running speed item holds the whole
+        host; a speed item starts only on an idle host (nothing running, no upload pending), and the pool items after
+        it wait for it (so it is never starved). An item held by a transient refusal is passed over until its hold
+        ends: this GPU takes the next ready item."""
         busy = {r["name"] for r in running.values()}
+        if any(self.item(n)["kind"] == "speed" for n in busy):
+            return None
+
+        def candidate(name: str) -> bool:
+            return name not in busy and not self._held(name) and self._ready(name)
+
         for name in self.kind_names("readout"):
             of = self.item(self.item(name)["of"])
             last = (of["attempts"] or [{}])[-1].get("gpu")
-            if name not in busy and last == str(gpu) and self._ready(name):
-                ok = self._prepare(name)
-                if ok:
-                    return name
-                if ok is None:
-                    return None
+            if last == str(gpu) and candidate(name) and self._prepare(name):
+                return name
         for name in self.kind_names("stores", "train"):
-            if name in busy or not self._ready(name):
-                continue
-            ok = self._prepare(name)
-            if ok:
+            if candidate(name) and self._prepare(name):
                 return name
-            if ok is None:
-                return None
         if any(self.item(n)["status"] in RUNNABLE for n in self.kind_names("train")):
-            return None
+            return self._none(running)
         for name in self.kind_names(*POOL_KINDS):
-            if name in busy or not self._ready(name):
+            if not candidate(name):
                 continue
-            ok = self._prepare(name)
-            if ok:
+            if self.item(name)["kind"] == "speed" and (running or self._pending_uploads):
+                return self._none(running)  # it waits for an idle host; nothing after it starts first
+            if self._prepare(name):
                 return name
-            if ok is None:
-                return None
+        return self._none(running)
+
+    def _held(self, name: str) -> bool:
+        return time.time() < float(self.item(name).get("held_until") or 0)
+
+    def _none(self, running: dict) -> None:
+        """_next_for's None. With nothing running, execute() loops without its poll sleep: while an item is held,
+        wait here until its hold ends (at most a poll), so a held item is tried once per poll and the loop never
+        spins."""
+        if not running:
+            ends = [float(it.get("held_until") or 0) for it in self.state["items"].values()
+                    if it["status"] in RUNNABLE and float(it.get("held_until") or 0) > time.time()]
+            if ends:
+                time.sleep(max(0.0, min(min(ends) - time.time(), self.s.poll_s)))
         return None
 
     def _end(self, name: str, status: str, kind: str, **fields):
@@ -718,15 +736,16 @@ class FullQueue(Q.Queue):
         return True
 
     def _hold(self, name: str, why: str) -> bool | None:
-        """A transient refusal before an item's start: tried again after a poll, max_attempts times, then failed."""
+        """A transient refusal before an item's start: held for a poll (_next_for passes it over and takes the next
+        ready item meanwhile), tried again then, max_attempts times in all, then failed."""
         it = self.item(name)
         it["check_resume_tries"] = int(it.get("check_resume_tries") or 0) + 1
         self.event("item_held", item=name, why=why, tries=it["check_resume_tries"])
         if it["check_resume_tries"] >= self.max_attempts:
             self._end(name, "failed", "item_failed", reason=f"{why} ({it['check_resume_tries']} tries)")
             return False
+        it["held_until"] = time.time() + self.s.poll_s
         self.save()
-        time.sleep(self.s.poll_s)
         return None
 
     def _prepare_train(self, name: str) -> bool | None:
@@ -757,7 +776,7 @@ class FullQueue(Q.Queue):
             rc = self.check_resume(name)
             if rc == 0:
                 it["check_resume"] = "ok"
-                it["check_resume_tries"] = 0
+                it["check_resume_tries"], it["held_until"] = 0, None
             elif rc == EXIT_REFUSED:
                 it["check_resume"] = "refused"
                 self._fault_failed(name)
@@ -1100,8 +1119,11 @@ class FullQueue(Q.Queue):
 
     def drain_uploads(self, one: bool = False):
         """Upload and verify the finished run dirs, readout and eval out dirs and the speed dir (lean), one per call
-        inside the scheduler loop; under the controller heartbeat."""
+        inside the scheduler loop (none while a speed probe runs: it times on an idle host); under the controller
+        heartbeat."""
         if not self._pending_uploads:
+            return
+        if one and any(self.item(n)["kind"] == "speed" for n in self.procs):
             return
         with self.ctl_beating():
             while self._pending_uploads:
