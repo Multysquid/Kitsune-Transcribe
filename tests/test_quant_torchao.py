@@ -9,8 +9,9 @@ constants, never by widening a tolerance here.
                        (weight-only and W8A8) equal torchao's quantize_ of the same weight; NVFP4, MXFP4 (RCEIL) and
                        FP8 per-row packs equal torchao's own quantisers where it runs them on CPU (a torchao that
                        refuses a format on CPU skips that part, which smoke B's selftest then covers); an int8
-                       to_torchao dequantises to the pack; an int8 W8A8 Linear through torchao on CPU gives the
-                       emulation's outputs (the activation recipe: INT8_ACT_DIV, INT8_ACT_QMIN, INT8_ACT_EPS)
+                       to_torchao dequantises to the pack; an int8 W8A8 Linear through torchao on CPU is reproduced
+                       bit for bit from kitsune's activation grid (INT8_ACT_DIV, INT8_ACT_QMIN, INT8_ACT_SCALE_DTYPE),
+                       and the emulation is within the selftest's tolerance of it
   CUDA (smoke B, a     every timed format's to_torchao dequantises to its pack; kitsune.quant.selftest passes (real
   5090)                kernels within SELFTEST_TOL of the emulation at every M, no int8 fp32 fallback after padding,
                        weights quantised under autocast); a pack computed on CUDA equals the CPU one bit for bit
@@ -142,34 +143,43 @@ def test_to_torchao_int8_on_cpu(fmt):
 
 
 def _int8_act_candidates(x: torch.Tensor, pw: Q.QuantPack, yr: torch.Tensor) -> list:
-    """On a mismatch: the share of torchao's outputs each variant of the activation recipe and of the output's
-    rescaling reproduces bit for bit, best first - what to set INT8_ACT_* to (the assertion message shows it)."""
+    """The share of torchao's W8A8 outputs that each variant of the activation recipe (divisor, lowest code, scale
+    dtype) and of the output's rescaling (fp32 dequantised GEMM; exact integer GEMM rescaled in fp32; in bf16 steps;
+    by the bf16 product of the scales) reproduces bit for bit, best first."""
     import itertools
 
     qw = pw.qweight.double()
     out = []
     for div, qmin, sdt, form in itertools.product((127.0, 127.5), (-127, -128), (torch.bfloat16, torch.float32),
-                                                  ("dequant_fp32", "int_fp32", "int_bf16_chain", "int_scale_bf16")):
+                                                  ("dequant_fp32", "int_fp32", "int_bf16_chain", "int_scale_bf16",
+                                                   "int_to_bf16_first")):
         xf = x.float()
         sx = torch.clamp((xf.abs().amax(1) / div).to(sdt), min=Q.INT8_ACT_EPS).float()
         qx = torch.clamp(torch.round(xf / sx[:, None]), qmin, 127)
         yint = (qx.double() @ qw.T).float()
+        sw = pw.scale[None, :]
         if form == "dequant_fp32":
             y = torch.nn.functional.linear(qx * sx[:, None], Q.unpack_weight(pw)).to(torch.bfloat16)
         elif form == "int_fp32":
-            y = (yint * sx[:, None] * pw.scale[None, :]).to(torch.bfloat16)
+            y = (yint * sx[:, None] * sw).to(torch.bfloat16)
         elif form == "int_bf16_chain":
-            y = (yint * sx[:, None]).to(torch.bfloat16) * pw.scale[None, :].to(torch.bfloat16)
+            y = (yint * sx[:, None]).to(torch.bfloat16) * sw.to(torch.bfloat16)
+        elif form == "int_scale_bf16":
+            y = (yint * (sx[:, None] * sw).to(torch.bfloat16).float()).to(torch.bfloat16)
         else:
-            y = (yint * (sx[:, None] * pw.scale[None, :]).to(torch.bfloat16).float()).to(torch.bfloat16)
-        out.append((round(float((y == yr).float().mean()), 4), div, qmin, str(sdt), form))
-    return sorted(out, reverse=True)[:6]
+            y = yint.to(torch.bfloat16) * sx[:, None].to(torch.bfloat16) * sw.to(torch.bfloat16)
+        out.append((round(float((y == yr).float().mean()), 4), div, qmin, str(sdt).replace("torch.", ""), form))
+    return sorted(out, reverse=True)
 
 
-def test_int8_w8a8_forward_on_cpu_is_the_emulations():
-    """A W8A8 Linear through torchao on CPU and its emulation: the same activation grid (per token, INT8_ACT_DIV over
-    [INT8_ACT_QMIN, 127], the scale in INT8_ACT_SCALE_DTYPE) gives the same bf16 outputs but for rare rounding flips
-    of the last bf16 bit. (No bias: both paths add it the same way, outside the GEMM.)"""
+def test_int8_w8a8_activation_recipe_is_torchaos():
+    """A W8A8 Linear through torchao on CPU against kitsune's activation grid: with kitsune's recipe (per token, the
+    scale INT8_ACT_SCALE_DTYPE(amax / INT8_ACT_DIV), codes clamped to [INT8_ACT_QMIN, 127]) some rescaling of the exact
+    integer GEMM gives torchao's bf16 outputs bit for bit (the image CI of 772e3b7 found torchao rescaling in bf16); the
+    emulation itself rescales in fp32 (one rounding, scout s7's emulate rule), so it is compared within the selftest's
+    tolerance. (No bias: both paths add it the same way, outside the GEMM.)"""
+    import json
+
     g = torch.Generator().manual_seed(2)
     w = weight(64, 128)
     real, emu = nn.Linear(128, 64, bias=False), nn.Linear(128, 64, bias=False)
@@ -182,10 +192,12 @@ def test_int8_w8a8_forward_on_cpu_is_the_emulations():
     with torch.no_grad():
         yr, ye = real(x), emu(x)
     assert yr.dtype == ye.dtype == torch.bfloat16
-    same = float((yr == ye).float().mean())
     rel = float((yr.float() - ye.float()).norm() / ye.float().norm())
-    assert same >= 0.98 and rel < 1e-2, dict(same=same, rel=rel, weight=type(real.weight).__name__,
-                                             best=_int8_act_candidates(x, Q.pack_weight(w, "int8"), yr))
+    cands = _int8_act_candidates(x, Q.pack_weight(w, "int8"), yr)
+    mine = (Q.INT8_ACT_DIV, Q.INT8_ACT_QMIN, str(Q.INT8_ACT_SCALE_DTYPE).replace("torch.", ""))
+    exact = [c for c in cands if c[1:4] == mine and c[0] == 1.0]
+    if not exact or not rel < Q.SELFTEST_TOL["int8-w8a8"]:
+        pytest.fail(json.dumps(dict(rel=rel, weight=type(real.weight).__name__, mine=mine, best=cands[:8])))
 
 
 @needs_cuda

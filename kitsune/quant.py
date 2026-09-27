@@ -63,7 +63,9 @@ Numerics (the exact recipes; the constants are the torchao parity test's to pin)
   emulate GEMM  the input is rounded to the autocast dtype when autocast is on (the real path sees autocast's bf16),
                 then fake-quantised (W*A* formats), then F.linear in fp32 with autocast off on the exact dequantised
                 weight (weight-only formats: rounded to bf16, which is what the real path dequantises to); the output
-                is cast to the autocast dtype, and the bias added in it (as the real path adds it to its GEMM's output). The process's matmul precision applies: emulate and real are compared
+                is cast to the autocast dtype, and the bias added in it (as the real path adds it to its GEMM's output).
+                torchao's int8 W8A8 rescales its exact integer GEMM in bf16 steps: the emulation (one fp32 rounding)
+                differs from it by a bf16 ulp on some outputs, on the same activation codes (the parity test) The process's matmul precision applies: emulate and real are compared
                 with tolerances only
 
 Layer filter (select_layers): every nn.Linear except one whose weight is shared with another module (T-0.6B's
