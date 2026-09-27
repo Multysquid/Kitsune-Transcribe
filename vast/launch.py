@@ -1725,8 +1725,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\nproblems:\n  " + "\n  ".join(errors) if errors else "git, image and HF checks passed")
         print(install_help())
         return 2
-    if full and resume:  # two boxes of one full box would write the same run dirs
-        for live in live_instances(exe, f"kitsune-full-{args.box}"):
+    if full and resume:  # two boxes of one full box would write the same run dirs (its labels: the one below)
+        for live in live_instances(exe, f"{job.label_prefix}-{Path(config).stem}-"):
             print(f"WARNING: a live instance of box {args.box}: {live}: destroy it (it keeps writing the runs this "
                   f"resume pulls) before renting")
 

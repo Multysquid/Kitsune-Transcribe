@@ -342,6 +342,15 @@ def test_resume_flags_go_to_the_box_env(full_launch, capsys):
     assert not any(c[1:3] == ["show", "instances"] for c in fake.calls)
 
 
+def test_live_instances_are_the_boxs_own(monkeypatch):
+    """Box full's labels start kitsune-full-full-data-full-: the smoke box's (kitsune-full-full-smoke-...) is not one."""
+    fake = FakeVastai([], instances=[{"id": 1, "label": "kitsune-full-full-data-full-0123456", "actual_status": "running"},
+                                     {"id": 2, "label": "kitsune-full-full-smoke-data-smoke-0123456"}, {"id": 3}])
+    monkeypatch.setattr(launch.subprocess, "run", fake)
+    assert launch.live_instances("/fake/vastai", "kitsune-full-full-data-full-") == [
+        "kitsune-full-full-data-full-0123456 (instance 1, running)"]
+
+
 def test_the_gate_follows_the_registry_and_the_flag(full_launch, repo, capsys):
     rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--gate-hours",
                            "8", "--dry-run")

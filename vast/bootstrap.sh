@@ -431,7 +431,8 @@ def pull_labels():
 def label_dir(s: str, stem: str) -> tuple:
     """(name, root) of the label root that holds stem's ids on this box (kitsune.extent label_root_for, fix 9): a CTC
     run without pull_parakeet pulled parakeet_out for every stem and teacher_out only for its eval sets' eval stems."""
-    sys.path.insert(0, str(root))  # this helper runs from a mktemp path
+    if str(root) not in sys.path:  # this helper runs from a mktemp path (and this is called once per stem)
+        sys.path.insert(0, str(root))
     from kitsune.extent import label_root_for
 
     which = label_root_for(cfg, s, stem)
