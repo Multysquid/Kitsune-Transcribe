@@ -46,9 +46,10 @@ Numerics (the exact recipes; the constants are the torchao parity test's to pin)
   export runs on CPU); torch.round is round half to even; values are clamped to +-448 before any cast to e4m3
   E2M1          codes 0-7 = {0, .5, 1, 1.5, 2, 3, 4, 6}, bit 3 the sign (torch.signbit: -0.2 is code 8, as torchao);
                 round to nearest, ties to the even code; two codes per byte, element 2i in the low nibble
-  int8 weights  s = max(amax_row, INT8_EPS) / INT8_DIV (in INT8_SCALE_DTYPE), q = clamp(round(w / s), -128, 127);
-                dequant q * s
-  int8 acts     per token: s = max(amax_row, INT8_ACT_EPS) / INT8_ACT_DIV, q = clamp(round(x / s), INT8_ACT_QMIN, 127)
+  int8 weights  s = max(bf16(amax_row / INT8_DIV), INT8_EPS) (torchao keeps the weight's dtype for the scale:
+                INT8_SCALE_DTYPE), q = clamp(round(w / s), -128, 127); dequant q * s
+  int8 acts     per token: s = max(bf16(amax_row / INT8_ACT_DIV), INT8_ACT_EPS), q = clamp(round(x / s),
+                INT8_ACT_QMIN, 127)
   nvfp4         t = amax(|w|) / (448 * 6) (an all-zero tensor: 1); per 16 along K bs = e4m3(clamp((b / 6) / t,
                 NVFP4_SCALE_MIN, 448)); codes of clamp(w / (bs * t), +-6); dequant E2M1[c] * (bs * t). Activations
                 (w4a4): the same with t from the amax of the whole call input (padding included, as torchao's dynamic
@@ -174,13 +175,14 @@ E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _E2M1_MIDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 INT8_DIV = 127.5  # torchao choose_qparams_affine SYMMETRIC over [-128, 127]: amax / ((127 - -128) / 2)
 INT8_EPS = float(torch.finfo(torch.float32).eps)
-# the dtype torchao keeps an int8 weight's per-row scale in (the file stores it as F32, which holds either exactly):
-# the scale is rounded to it before the codes are computed. fp32 until the parity test says torchao keeps the weight's
-# own dtype (bf16)
-INT8_SCALE_DTYPE = torch.float32
+# torchao computes an int8 scale in the tensor's own dtype (bf16), then clamps it to eps: the scale is rounded to it
+# before the codes are computed, and the file's F32 holds it exactly. Measured by the parity test in the image (CI of
+# 4278cea: torchao 0.18's int8 weight scales were bf16(amax / 127.5) on every row, fp32 ones differed)
+INT8_SCALE_DTYPE = torch.bfloat16
 INT8_ACT_DIV = 127.0  # torchao's per-token activation quant uses the reduced range [-127, 127]
 INT8_ACT_QMIN = -127
 INT8_ACT_EPS = 1e-5
+INT8_ACT_SCALE_DTYPE = torch.bfloat16  # the activation's scale in its own (autocast) dtype, as the weight's
 NVFP4_SCALE_MIN = float(torch.finfo(torch.float8_e4m3fn).tiny)  # torchao nvfp4_quantize clamps the block scale here
 NVFP4_BLOCK, MXFP4_BLOCK = 16, 32
 E8M0_BIAS = 127
@@ -375,8 +377,10 @@ class QuantPack:
 
 def _int8_rows(x: torch.Tensor, div: float, eps: float, qmin: int, scale_dtype=torch.float32
                ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-row int8 (torchao's choose_qparams_affine order): the scale amax / div rounded to scale_dtype,
+    then clamped to eps (an all-zero row gets eps), the codes round(x / s) in fp32, clamped to [qmin, 127]."""
     amax = x.abs().amax(dim=1)
-    s = (amax.clamp(min=eps) / div).to(scale_dtype).float()
+    s = torch.clamp((amax / div).to(scale_dtype), min=eps).float()
     q = torch.clamp(torch.round(x / s[:, None]), qmin, 127)
     return q, s
 
@@ -483,7 +487,7 @@ def fake_quant_act(x: torch.Tensor, act: str, *, mx_rounding: str = "rceil") -> 
     if x2.shape[0] == 0:
         return x2.reshape(x.shape)
     if act == "int8":
-        q, s = _int8_rows(x2, INT8_ACT_DIV, INT8_ACT_EPS, INT8_ACT_QMIN)
+        q, s = _int8_rows(x2, INT8_ACT_DIV, INT8_ACT_EPS, INT8_ACT_QMIN, scale_dtype=INT8_ACT_SCALE_DTYPE)
         y = q * s[:, None]
     elif act == "fp8":
         q, s = _fp8_rows(x2)
@@ -771,7 +775,8 @@ def _recipe_consts(fmt: str, mx_rounding: str) -> dict:
                     autocast="float16")
     rec = dict(base, block=FORMAT_INFO[fmt]["block"])
     if wfmt == "int8":
-        rec.update(int8_div=INT8_DIV, int8_eps=INT8_EPS, int8_range=[-128, 127])
+        rec.update(int8_div=INT8_DIV, int8_eps=INT8_EPS, int8_range=[-128, 127],
+                   int8_scale_dtype=str(INT8_SCALE_DTYPE).replace("torch.", ""))
     if wfmt == "fp8":
         rec.update(fp8_scale="amax/448 per row (0 -> 1)")
     if wfmt == "nvfp4":
@@ -779,7 +784,8 @@ def _recipe_consts(fmt: str, mx_rounding: str) -> dict:
     if wfmt == "mxfp4":
         rec.update(mx_rounding=mx_rounding, e8m0="uint8 = e + 127")
     if act == "int8":
-        rec.update(act_int8_div=INT8_ACT_DIV, act_qmin=INT8_ACT_QMIN, act_eps=INT8_ACT_EPS, pad_rows_min=PAD_ROWS)
+        rec.update(act_int8_div=INT8_ACT_DIV, act_qmin=INT8_ACT_QMIN, act_eps=INT8_ACT_EPS, pad_rows_min=PAD_ROWS,
+                   act_scale_dtype=str(INT8_ACT_SCALE_DTYPE).replace("torch.", ""))
     if act == "nvfp4":
         rec.update(act_tensor_scale="whole call input")
     if act in ("fp8", "mxfp4"):

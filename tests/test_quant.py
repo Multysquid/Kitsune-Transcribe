@@ -147,9 +147,10 @@ def test_scales():
     wi = torch.tensor([[1.0, -2.0, 0.5] + [0.0] * 5, [0.0] * 8])
     pi = Q.pack_weight(wi, "int8")
     assert pi.qweight.dtype == torch.int8 and pi.scale.dtype == torch.float32
-    # s = fl32(2 / 127.5) is a hair above 2 / 127.5, so -2 / s rounds to -127, not to the tie's -128
-    assert pi.scale[0].item() == pytest.approx(2.0 / 127.5, rel=1e-6) and pi.qweight[0, :3].tolist() == [64, -127, 32]
-    assert pi.scale[1].item() == pytest.approx(Q.INT8_EPS / 127.5) and (pi.qweight[1] == 0).all()
+    # s = bf16(2 / 127.5) (torchao's scale dtype) = 0.01575 rounds up: -2 / s = -127.007 -> -127; 1 / s = 63.5 -> 64
+    s0 = torch.tensor(2.0 / 127.5).to(torch.bfloat16).float().item()
+    assert pi.scale[0].item() == s0 == 0.0157470703125 and pi.qweight[0, :3].tolist() == [64, -127, 32]
+    assert pi.scale[1].item() == Q.INT8_EPS and (pi.qweight[1] == 0).all()  # an all-zero row: the eps clamp
     pf = Q.pack_weight(wi, "fp8")
     assert pf.qweight.dtype == torch.float8_e4m3fn and pf.scale[0].item() == pytest.approx(2.0 / 448)
     assert pf.scale[1].item() == 1.0 and torch.equal(Q.unpack_weight(pf)[0, :3], wi[0, :3])
@@ -168,8 +169,8 @@ def test_pack_dequant_error_bounds(wfmt):
                                                   b.view(torch.uint8) if b.element_size() == 1 else b)
     d = Q.unpack_weight(p)
     err = (d - w.float()).abs()
-    if wfmt == "int8":
-        bound = p.scale[:, None] / 2
+    if wfmt == "int8":  # half a step, or what the clamp at 127 cuts off when the bf16 scale rounded down
+        bound = torch.maximum(p.scale / 2, w.float().abs().amax(1) - 127 * p.scale)[:, None]
     elif wfmt == "fp8":  # e4m3 has 3 mantissa bits: half an ulp is 1/16 of the value's power of two
         bound = w.float().abs() / 16 + p.scale[:, None] * 2.0 ** -9
     elif wfmt == "nvfp4":  # the E2M1 grid's widest step (4 -> 6) is 2 block units, half of it is 1 unit
@@ -336,7 +337,8 @@ def test_row_padding_logic(fmt):
     x = torch.randn(2, 3, 64, generator=g)
     with torch.no_grad():
         ya, yb = a(x), b(x)
-    assert torch.equal(ya, yb) and b.kq.padded == 1 and a.kq.padded == 0 and b.kq.rows == 6
+    # equal up to the matmul's accumulation order (a BLAS may pick another kernel for 17 rows than for 6)
+    assert torch.allclose(ya, yb, rtol=1e-5, atol=1e-6) and b.kq.padded == 1 and a.kq.padded == 0 and b.kq.rows == 6
     with torch.no_grad():
         assert b(torch.zeros(0, 64)).shape == (0, 32) and b(torch.randn(20, 64, generator=g)).shape == (20, 32)
     assert b.kq.padded == 1 and b.kq.calls == 3
@@ -709,8 +711,8 @@ def test_the_torchao_adapter_swaps_a_subclass_inner_tensors(monkeypatch):
     assert torch.equal(t.scale.reshape(-1), pack.scale) and torch.equal(t.dequantize(), Q.unpack_weight(pack))
     back = Q.from_torchao(t, "int8-w8a8")
     assert torch.equal(back.qweight, pack.qweight) and torch.equal(back.scale, pack.scale)
-    bf16 = FakeAOTensor(torch.zeros(n, k, dtype=torch.int8), torch.ones(n, 1, dtype=torch.bfloat16), (n, k))
-    monkeypatch.setattr(Q, "_template", lambda n_, k_, fmt, device: bf16)
+    e4m3 = FakeAOTensor(torch.zeros(n, k, dtype=torch.int8), torch.ones(n, 1).to(torch.float8_e4m3fn), (n, k))
+    monkeypatch.setattr(Q, "_template", lambda n_, k_, fmt, device: e4m3)
     with pytest.raises(Q.QuantError, match="does not hold the pack"):
         Q.to_torchao(pack, "int8-w8a8", "cpu")
     odd = FakeAOTensor(torch.zeros(n, k, dtype=torch.int8), torch.ones(n, 1), (n, k), extra=torch.zeros(3, 3))
