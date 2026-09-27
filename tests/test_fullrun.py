@@ -467,6 +467,20 @@ RULES = {
                                r"times one model"),
     "cohere with a model": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
         model="models/parakeet-tdt_ctc-0.6b-ja-hf"), r"cohere"),
+    # speed_probe refuses these kinds without --model at once: a dropped source must fail here, not on the rented box
+    "aed speed item without a model source": (lambda r: _item(r, "full", "speed-study-t06").pop("weights"),
+                                              r"speed_kind aed times one student"),
+    "ctc speed item without a model source": (lambda r: _item(r, "full-smoke", "speed-study-p01").update(weights=[]),
+                                              r"speed_kind ctc times one student"),
+    "speed item with two weights entries": (lambda r: _item(r, "full-smoke", "speed-study-p01")["weights"].append(
+        {"name": "study-p03", "run_id": "study-p03-20260926T172336Z", "step": 25120}), r"times one model .* got 2"),
+    "parakeet speed item without model": (lambda r: _item(r, "full-smoke", "speed-parakeet-tdt").pop("model"),
+                                          r"speed_kind parakeet-tdt times the Parakeet teacher: give model"),
+    "parakeet speed item on student weights": (lambda r: _item(r, "full-smoke", "speed-parakeet-tdt").update(
+        model=None, weights=_item(r, "full-smoke", "speed-study-p01")["weights"]),
+        r"speed_kind parakeet-tdt times the Parakeet teacher"),
+    "whisper speed item on student weights": (lambda r: _item(r, "full-smoke", "speed-study-p01").update(
+        speed_kind="whisper"), r"speed_kind whisper times a Whisper model"),
     "unknown speed kind": (lambda r: _item(r, "full", "speed-study-t06").update(speed_kind="tdt"),
                            r"speed_kind 'tdt'"),
     "only_if_new_machine unknown": (lambda r: _item(r, "smoke-b", "speed-study-p03").update(
@@ -534,6 +548,28 @@ def test_family_must_be_the_configs(tmp_path, reg):
     assert _problems(reg, tmp_path) == []
 
 
+def test_family_must_be_the_data_configs_without_pull_parakeet(tmp_path, reg):
+    # p01's data config trains ctc without pull_parakeet: bootstrap pulls parakeet_out, and teacher_out only for the
+    # eval stems (extent.pull_plan), so an aed item there would find no train labels after the paid rebuild
+    folder = tmp_path / "configs" / "full"
+    cfg = json.loads((folder / "full-p01.json").read_text(encoding="utf-8"))
+    (folder / "p01-aed.json").write_text(json.dumps(dict(cfg, family="aed")), encoding="utf-8")
+    _item(reg, "p01", "stores-ctc")["config"] = "configs/full/p01-aed.json"  # a stores item: it has no family field
+    _refused(reg, tmp_path, r"stores-ctc: configs/full/p01-aed.json trains family aed, but the box data config "
+                            r"configs/full/data-p01.json is family ctc without pull_parakeet")
+    # the other way round: a ctc item on an aed data config without pull_parakeet (no parakeet_out is pulled)
+    reg = tiny_registry(tmp_path)
+    data = json.loads((folder / "data-p01.json").read_text(encoding="utf-8"))
+    del data["family"]  # aed by default
+    (folder / "data-p01.json").write_text(json.dumps(data), encoding="utf-8")
+    probs = _refused(reg, tmp_path, r"full-p01: configs/full/full-p01.json trains family ctc, but the box data "
+                                    r"config configs/full/data-p01.json is family aed")
+    assert any(p.startswith("boxes.p01.items.stores-ctc:") for p in probs)
+    # with pull_parakeet both teachers' labels come for every stem, so one box trains both families (box full)
+    loaded = fr.load_registry(tiny_registry(tmp_path))
+    assert {i["family"] for i in fr.train_items("full", loaded)} == {"aed", "ctc"}
+
+
 def test_missing_configs_are_refused_only_with_check_files(tmp_path, reg):
     (tmp_path / "configs" / "full" / "smoke-b-t06.json").unlink()
     (tmp_path / "configs" / "full" / "data-p01.json").unlink()
@@ -555,8 +591,33 @@ def test_item_configs_outside_configs_full_are_allowed(tmp_path, reg):
 def test_comments_are_allowed_anywhere(tmp_path, reg):
     _box(reg, "p01")["_comment"] = "box 1"
     _item(reg, "p01", "full-p01")["_why"] = "the plan's P-0.1B"
+    # the blocks checked as exact key sets too: a hand-written boxes.json may annotate them
+    _box(reg, "full-smoke")["watchdog"]["_comment"] = "600 s alert: the freeze fault must only alert"
+    _item(reg, "smoke-b", "selftest")["weights"][0]["_why"] = "the study's final P-0.3B"
+    _box(reg, "full-smoke")["faults"][0]["_c"] = "F1"
+    _item(reg, "smoke-b", "selftest")["verdict"][0]["_c"] = "check 12"
     assert _problems(reg, tmp_path) == []
-    assert fr.load_registry(reg, root=tmp_path)["boxes"]["p01"]["_comment"] == "box 1"
+    loaded = fr.load_registry(reg, root=tmp_path)
+    assert loaded["boxes"]["p01"]["_comment"] == "box 1"
+    assert fr.box_env("full-smoke", loaded)["KITSUNE_WATCHDOG_ORPHAN_ACTION"] == "alert"
+    # a comment never stands in for a real key
+    del _box(reg, "full-smoke")["watchdog"]["orphan_s"]
+    _refused(reg, tmp_path, r"watchdog .* is not \{orphan_s, action\}")
+
+
+def test_speed_sources_that_pass(tmp_path, reg):
+    # whisper: none (speed_probe --model <key> comes from args, WP6) or a data-repo `model`; aed/ctc: exactly one source
+    items = _box(reg, "full-smoke")["items"]
+    items.append({"name": "speed-whisper-small", "kind": "speed", "system": "whisper-small", "speed_kind": "whisper",
+                  "args": ["--model", "whisper-small", "--hf-cache", "{hf_cache}"], "stall_min": None,
+                  "max_hours": 0.3})
+    items.append({"name": "speed-whisper-dir", "kind": "speed", "system": "whisper-dir", "speed_kind": "whisper",
+                  "model": "models/parakeet-tdt_ctc-0.6b-ja-hf", "stall_min": None, "max_hours": 0.3})
+    items.append({"name": "speed-student-dir", "kind": "speed", "system": "student-dir", "speed_kind": "ctc",
+                  "model": "models/parakeet-tdt_ctc-0.6b-ja-hf", "stall_min": None, "max_hours": 0.3})
+    items.append({"name": "speed-parakeet-ctc", "kind": "speed", "system": "parakeet-ctc", "speed_kind": "parakeet-ctc",
+                  "model": "models/parakeet-tdt_ctc-0.6b-ja-hf", "stall_min": None, "max_hours": 0.3})
+    assert _problems(reg, tmp_path) == []
 
 
 def test_malformed_registries_do_not_crash(tmp_path):
@@ -611,6 +672,64 @@ def test_load_registry_problems_are_listed(tmp_path, reg):
     with pytest.raises(fr.RegistryError) as e:
         fr.load_registry(reg, root=tmp_path)
     assert len(e.value.problems) == 2 and "gpus 0" in str(e.value) and "max_dph -1" in str(e.value)
+
+
+def test_a_loaded_registry_remembers_its_checkout(tmp_path, monkeypatch):
+    # code that loads a registry file once and passes the dict on must read that file's checkout, not this repo
+    monkeypatch.delenv("KITSUNE_FULL_REGISTRY", raising=False)
+    tiny_registry(tmp_path, write_boxes=True)
+    loaded = fr.load_registry(tmp_path / "configs" / "full" / "boxes.json")  # a path, no root=
+    assert fr.box_students("p01", loaded) == ["students/study/p01"]
+    assert fr.box_ctc_students("full", loaded) == ["students/study/p03", "students/study/p005"]
+    assert fr.student_checks("full", lambda s: _metas()[s], loaded) == []
+    assert fr.registry_problems(loaded) == []
+    assert fr.load_registry(loaded) == loaded
+    assert fr.box_students("p01", copy.deepcopy(loaded)) == ["students/study/p01"]  # a copy keeps it
+    assert json.loads(json.dumps(loaded)) == loaded  # it is the plain registry otherwise
+    with pytest.raises(fr.RegistryError, match="cannot read it under"):
+        fr.box_students("p01", loaded, tmp_path / "other")  # an explicit root wins
+
+
+def test_tiny_registry_remembers_its_root(tmp_path):
+    reg = tiny_registry(tmp_path)
+    assert fr.registry_problems(reg) == []  # no root=: the configs are read under tmp_path
+    assert fr.box_students("p01", reg) == ["students/study/p01"]
+    assert fr.load_registry(reg) == fr.load_registry(reg, root=tmp_path)
+
+
+def test_read_json_reads_the_configs_instead_of_a_root(tmp_path, reg):
+    # launch reads the configs at the sha it rents (git_show), never the working tree: a reader replaces root
+    files = {f"configs/full/{p.name}": json.loads(p.read_text(encoding="utf-8"))
+             for p in (tmp_path / "configs" / "full").glob("*.json")}
+    seen = []
+
+    def read(rel):
+        seen.append(rel)
+        return copy.deepcopy(files[rel])  # KeyError for a file the sha does not have
+    plain = json.loads(json.dumps(reg))  # the registry JSON at the sha: it remembers no root
+    nowhere = tmp_path / "nowhere"
+    assert fr.registry_problems(plain, root=nowhere, read_json=read) == []
+    assert "configs/full/data-p01.json" in seen and "configs/full/smoke-b-t06.json" in seen
+    loaded = fr.load_registry(plain, root=nowhere, read_json=read)
+    assert fr.box_students("full", loaded, read_json=read) == ["students/study/t06", "students/study/p03",
+                                                               "students/study/p005"]
+    assert fr.box_ctc_students("full", loaded, read_json=read) == ["students/study/p03", "students/study/p005"]
+    assert fr.student_checks("full", lambda s: _metas()[s], loaded, read_json=read) == []
+    # what the reader gives is checked like a file: a data-key mismatch at the sha is refused
+    files["configs/full/full-p03.json"]["selection"] = fr.SMOKE_SELECTION
+    assert any("full-p03.json differs from the box data config" in p
+               for p in fr.registry_problems(plain, root=nowhere, read_json=read))
+    # a file the reader cannot give is a problem (any error of the read), never a crash
+    del files["configs/full/full-p03.json"]
+    probs = fr.registry_problems(plain, root=nowhere, read_json=read)
+    assert any("full-p03.json: not readable JSON (KeyError" in p for p in probs), probs
+    with pytest.raises(fr.RegistryError, match="full-p03.json: cannot read it with read_json"):
+        fr.box_students("full", loaded, read_json=read)
+
+    def missing(rel):
+        raise FileNotFoundError(rel)
+    probs = fr.registry_problems(plain, read_json=missing)
+    assert any("configs/full/data-p01.json does not exist (read_json)" in p for p in probs), probs
 
 
 # ------------------------------------------------------------------------------------------------ box readers

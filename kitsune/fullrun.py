@@ -22,8 +22,10 @@ build contract (sections 1 and 2); this module is its code.
                load_registry validates it and fills the defaults; box_* read one box; the CLI serves bootstrap
 
 Registry (contract 2.3). Top level {"version": 1, "boxes": {<box>: <box spec>}} with box names from BOX_NAMES; any key
-starting with "_" is a comment, anywhere. Paths (data_config, item config) are repo-relative POSIX paths resolved
-against `root` (the checkout; default the one this file is in). A box spec:
+starting with "_" is a comment, anywhere (in the watchdog block and a weights entry too). Paths (data_config, item
+config) are repo-relative POSIX paths resolved against `root` (the checkout; default the one the registry file is in,
+else this one), or read with a `read_json(rel)` callable instead (launch: the file at the sha it rents). A registry
+load_registry returns remembers its root, so the box readers given it read the configs there. A box spec:
 
   gpus int >= 1; data_config (under configs/full/); est_hours <= max_hours, max_dph (> 0; launch's defaults);
   deadline_reserve_min >= 0 (the queue's per-item KITSUNE_DEADLINE = box deadline - this); watchdog {orphan_s int
@@ -42,8 +44,10 @@ Per kind:
   train    config, study_run (a kitsune.prereg run: the student's registered build), family (aed|ctc, the config's),
            plan_total_steps / plan_hours (both or neither; the matching full run's plan, for smoke check 3; null)
   readout  of (an earlier train item of the box)
-  speed    system, speed_kind (tools/speed_probe.py --kind), at most one model source (none: cohere), args ([]),
-           only_if_new_machine (another registry box, or null)
+  speed    system, speed_kind (tools/speed_probe.py --kind), args ([]), only_if_new_machine (another registry box, or
+           null), and the model source speed_probe needs: aed / ctc exactly one (of, one weights entry or model);
+           parakeet-ctc / parakeet-tdt `model` (the teacher's data-repo dir); cohere none; whisper none (the key goes
+           in args, --model <key>) or `model`
   eval     argv (a template), model sources
 
 Model sources: `of` (an earlier train item of this box: its run dir's config and final checkpoint), `of_box` + `of` (a
@@ -57,8 +61,11 @@ condition needs a path. Fault {id, action (FAULT_ACTIONS), item (a train item of
 min_attempt (1), seconds}: only on smoke boxes; sigstop/kill need at_step, wipe_run_dir after_event, deadline seconds,
 freeze_controller_hb at_step and seconds > watchdog.orphan_s on a box whose watchdog only alerts. Item configs must
 exist (check_files) and carry the box data config's DATA_KEYS values (a missing pull_parakeet counts as false); a train
-item's family is its config's (default aed). Every name and path the box env or a command line carries is one
-env-string word (vast/launch.py env_string).
+item's family is its config's (default aed). Without pull_parakeet, every stores and train item config has the data
+config's family (default aed): bootstrap pulls the labels the data config's pull plan names (kitsune/extent.py
+pull_plan), which then hold the train labels of that family only (ctc: parakeet_out, plus teacher_out for the eval
+stems; aed: teacher_out). Every name and path the box env or a command line carries is one env-string word
+(vast/launch.py env_string).
 
 CLI (vast/bootstrap.sh; exit 0 ok, 2 refused - a bad registry, an unknown box, a student that is not the registered
 build):
@@ -423,6 +430,11 @@ _VERDICT_KEYS = ("check", "json", "path", "min", "max", "equals")
 _WATCHDOG_ACTIONS = ("stop", "alert")
 
 
+def _keys(d: dict) -> set:
+    """d's keys without the comments (keys starting with "_")."""
+    return {k for k in d if not str(k).startswith("_")}
+
+
 def _fill(where: str, spec: dict, fields: dict, p: list[str]) -> dict:
     """spec with its defaults filled (a copy); unknown keys and missing required ones are problems. Keys starting with
     "_" are comments and kept as they are."""
@@ -549,7 +561,7 @@ def _check_sources(where: str, it: dict, bname: str, box: dict, train_names: lis
         names = []
         for j, w in enumerate(weights):
             ww = f"{where}.weights[{j}]"
-            if not isinstance(w, dict) or set(w) != {"name", "run_id", "step"}:
+            if not isinstance(w, dict) or _keys(w) != {"name", "run_id", "step"}:
                 p.append(f"{ww} {w!r} is not {{name, run_id, step}}")
                 continue
             if _word(f"{ww}.name", w["name"], p) and w["name"] in names:
@@ -628,12 +640,23 @@ def _check_item(where: str, it: dict, bname: str, box: dict, earlier: list[str],
             _word(f"{where}.system", g("system"), p)
         if "speed_kind" in out and g("speed_kind") not in SPEED_KINDS:
             p.append(f"{where}.speed_kind {g('speed_kind')!r} is not one of {SPEED_KINDS}")
-        n_src = (g("of") is not None) + (len(g("weights")) if isinstance(g("weights"), list) else 0) + (
-            g("model") is not None)
+        # the model source speed_probe needs per --kind (it refuses aed, ctc and the Parakeet kinds without --model at
+        # once): a registry typo here would otherwise surface only on the rented box, as a failed speed item
+        sk, n_ckpt = g("speed_kind"), (g("of") is not None) + (
+            len(g("weights")) if isinstance(g("weights"), list) else 0)
+        n_src = n_ckpt + (g("model") is not None)
         if n_src > 1:
             p.append(f"{where}: a speed item times one model (of, one weights entry or model), got {n_src}")
-        if g("speed_kind") == "cohere" and n_src:
+        elif sk == "cohere" and n_src:
             p.append(f"{where}: speed_kind cohere times the teacher, no model source")
+        elif sk in ("aed", "ctc") and n_src != 1:
+            p.append(f"{where}: speed_kind {sk} times one student: give of, one weights entry or model")
+        elif sk in ("parakeet-ctc", "parakeet-tdt") and g("model") is None:
+            p.append(f"{where}: speed_kind {sk} times the Parakeet teacher: give model (its data-repo dir, in "
+                     f"extra_dirs), not of or weights")
+        elif sk == "whisper" and n_ckpt:
+            p.append(f"{where}: speed_kind whisper times a Whisper model: give none (--model <key> in args) or "
+                     f"model, not of or weights")
         for j, a in enumerate(_str_list(f"{where}.args", g("args"), p)):
             implicit += _placeholders(f"{where}.args[{j}]", a, out, earlier, p)
         o = g("only_if_new_machine")
@@ -722,7 +745,7 @@ def _check_box(bname: str, box, reg_boxes: dict, p: list[str]) -> dict | None:
             p.append(f"{where}.{k} {out[k]!r} is not a number >= 0")
     wd = out.get("watchdog")
     if "watchdog" in out:
-        if not isinstance(wd, dict) or set(wd) != {"orphan_s", "action"}:
+        if not isinstance(wd, dict) or _keys(wd) != {"orphan_s", "action"}:
             p.append(f"{where}.watchdog {wd!r} is not {{orphan_s, action}}")
         else:
             if not (_int(wd["orphan_s"]) and wd["orphan_s"] >= 0):
@@ -763,13 +786,23 @@ def _check_box(bname: str, box, reg_boxes: dict, p: list[str]) -> dict | None:
     return out
 
 
-def _read_json(root: Path, rel: str, cache: dict):
+def _read_config(root: Path, rel: str, read_json=None):
+    """The parsed JSON of the repo-relative path rel: read_json(rel) when given (launch: the file at its sha), else
+    root/rel. Raises what the read raises."""
+    if read_json is not None:
+        return read_json(rel)
+    return json.loads((root / rel).read_text(encoding="utf-8"))
+
+
+def _read_json(root: Path, rel: str, cache: dict, read_json=None):
+    """_read_config once per path; a failed read is cached as the exception that says why."""
     if rel not in cache:
         try:
-            cache[rel] = json.loads((root / rel).read_text(encoding="utf-8"))
+            cache[rel] = _read_config(root, rel, read_json)
         except FileNotFoundError:
-            cache[rel] = FileNotFoundError(f"{rel} does not exist under {root}")
-        except (OSError, ValueError) as e:
+            cache[rel] = FileNotFoundError(f"{rel} does not exist " + (
+                f"under {root}" if read_json is None else "(read_json)"))
+        except Exception as e:  # noqa: BLE001  a git read may raise anything; every failure is a problem, not a crash
             cache[rel] = ValueError(f"{rel}: not readable JSON ({type(e).__name__}: {e})")
     return cache[rel]
 
@@ -778,13 +811,14 @@ def _data_keys(cfg: dict) -> dict:
     return {k: (cfg.get(k, False) if k == "pull_parakeet" else cfg.get(k)) for k in DATA_KEYS}
 
 
-def _check_files(boxes: dict, root: Path, p: list[str]):
+def _check_files(boxes: dict, root: Path, p: list[str], read_json=None):
     """Every box's data config and item configs exist and are objects; the item configs carry the data config's
-    DATA_KEYS values; a train item's family is its config's."""
+    DATA_KEYS values; a train item's family is its config's; without pull_parakeet every stores and train item config
+    has the data config's family (the box pulls only that family's train labels)."""
     cache: dict = {}
     for bname, box in boxes.items():
         dc = box.get("data_config")  # a path that is not repo-relative is a problem already; it is never read
-        data = _read_json(root, dc, cache) if _is_rel_path(dc) else None
+        data = _read_json(root, dc, cache, read_json) if _is_rel_path(dc) else None
         if isinstance(data, Exception) or (_is_rel_path(dc) and not isinstance(data, dict)):
             p.append(f"boxes.{bname}.data_config: {data if isinstance(data, Exception) else 'not a JSON object'}")
             data = None
@@ -793,19 +827,28 @@ def _check_files(boxes: dict, root: Path, p: list[str]):
             if not _is_rel_path(cfg_path):
                 continue
             w = f"boxes.{bname}.items.{it.get('name')}"
-            cfg = _read_json(root, cfg_path, cache)
+            cfg = _read_json(root, cfg_path, cache, read_json)
             if isinstance(cfg, Exception) or not isinstance(cfg, dict):
                 p.append(f"{w}.config: {cfg if isinstance(cfg, Exception) else 'not a JSON object'}")
                 continue
+            family = cfg.get("family") or "aed"  # 04_distill's default
             if data is not None:
                 got, want = _data_keys(cfg), _data_keys(data)
                 if diff := [k for k in DATA_KEYS if got[k] != want[k]]:
                     p.append(f"{w}: {cfg_path} differs from the box data config {dc} in {diff}")
-            if it.get("kind") == "train" and (cfg.get("family") or "aed") != it.get("family"):
-                p.append(f"{w}: family {it.get('family')!r}, but {cfg_path} trains {cfg.get('family') or 'aed'!r}")
+                # bootstrap pulls what extent.pull_plan(data config) names: both teachers' labels for every stem only
+                # with pull_parakeet; else the train labels of the data config's family alone (ctc: parakeet_out,
+                # plus teacher_out for the eval stems; aed: teacher_out), so an item of the other family would find
+                # its train labels missing on the box, after the paid rebuild
+                data_family = data.get("family") or "aed"
+                if not data.get("pull_parakeet") and family != data_family:
+                    p.append(f"{w}: {cfg_path} trains family {family}, but the box data config {dc} is family "
+                             f"{data_family} without pull_parakeet, so the box pulls only {data_family} train labels")
+            if it.get("kind") == "train" and family != it.get("family"):
+                p.append(f"{w}: family {it.get('family')!r}, but {cfg_path} trains {family!r}")
 
 
-def _check(reg, root, check_files: bool) -> tuple[list[str], dict | None]:
+def _check(reg, root, check_files: bool, read_json=None) -> tuple[list[str], dict | None]:
     """(problems, the registry with its defaults filled)."""
     if not isinstance(reg, dict):
         return [f"the registry {type(reg).__name__} is not an object"], None
@@ -839,14 +882,38 @@ def _check(reg, root, check_files: bool) -> tuple[list[str], dict | None]:
                                                    if x.get("kind") == "train"]:
                 p.append(f"boxes.{bname}.items.{it.get('name')}: of {of!r} is not a train item of box {ob}")
     if check_files:
-        _check_files(out["boxes"], Path(root) if root is not None else REPO, p)
+        _check_files(out["boxes"], Path(root) if root is not None else REPO, p, read_json)
     return p, out
 
 
-def registry_problems(reg: dict, *, root=None, check_files=True) -> list[str]:
+class _Registry(dict):
+    """A registry as load_registry returns it: the plain registry dict (equal to, and serialised as, the dict it holds)
+    that also remembers `root`, the checkout its config paths resolved against. The box readers and registry_problems
+    given it without a root read the configs there, so code that loads a registry file once and passes the dict on
+    reads that file's checkout, never this repo's by accident. A copy (copy.deepcopy) keeps it; dict(reg) or a JSON
+    round trip drops it, and the paths then resolve against this repo again."""
+    root: Path | None = None
+
+
+def _with_root(reg: dict, root) -> dict:
+    """reg as a _Registry that remembers root (a shallow copy: its nested objects are reg's)."""
+    out = _Registry(reg)
+    out.root = Path(root) if root is not None else None
+    return out
+
+
+def _root_of(reg, root):
+    """The root reg's paths resolve against: root when given, else the one a loaded registry remembers, else None
+    (this repo)."""
+    return root if root is not None else getattr(reg, "root", None)
+
+
+def registry_problems(reg: dict, *, root=None, check_files=True, read_json=None) -> list[str]:
     """Why reg is not a valid registry (contract 2.3); empty: it is. root: the checkout its paths resolve against
-    (default this one); check_files False skips reading the data and item configs (launch reads them at its sha)."""
-    return _check(reg, root, check_files)[0]
+    (default the one a loaded registry remembers, else this one); check_files False skips reading the data and item
+    configs; read_json(rel) -> the parsed JSON of a repo-relative path reads them instead of root (launch: the files
+    at the sha it rents, e.g. lambda rel: json.loads(git_show(sha, rel)))."""
+    return _check(reg, _root_of(reg, root), check_files, read_json)[0]
 
 
 def _registry_root(path: Path) -> Path:
@@ -855,9 +922,10 @@ def _registry_root(path: Path) -> Path:
     return path.resolve().parents[2] if tuple(parts[-3:]) == tuple(BOXES_FILE.split("/")) else REPO
 
 
-def _load(path_or_dict, root, check_files: bool) -> tuple[dict, Path]:
+def _load(path_or_dict, root, check_files: bool, read_json=None) -> tuple[dict, Path]:
     if isinstance(path_or_dict, dict):
         reg, where = path_or_dict, "registry"
+        root = _root_of(path_or_dict, root)
     else:
         env = os.environ.get(ENV_REGISTRY) if path_or_dict is None else None
         f = Path(path_or_dict if path_or_dict is not None else env or Path(root or REPO) / BOXES_FILE)
@@ -873,26 +941,29 @@ def _load(path_or_dict, root, check_files: bool) -> tuple[dict, Path]:
         if root is None:
             root = _registry_root(f)
     root = Path(root) if root is not None else REPO
-    problems, filled = _check(reg, root, check_files)
+    problems, filled = _check(reg, root, check_files, read_json)
     if problems:
         raise RegistryError(f"{where} is not a valid box registry:\n  " + "\n  ".join(problems), problems)
-    return filled, root
+    return _with_root(filled, root), root
 
 
-def load_registry(path_or_dict=None, *, root=None, check_files=True) -> dict:
+def load_registry(path_or_dict=None, *, root=None, check_files=True, read_json=None) -> dict:
     """The validated registry with its defaults filled (a copy). None reads $KITSUNE_FULL_REGISTRY, else
     <root or this repo>/configs/full/boxes.json; a path reads that file; a dict (launch: the JSON at the launched sha)
     is validated the same way. RegistryError when it is missing or invalid. Paths resolve against root, by default the
-    checkout the file is in (<X> for <X>/configs/full/boxes.json), else this repo."""
-    return _load(path_or_dict, root, check_files)[0]
+    checkout the file is in (<X> for <X>/configs/full/boxes.json), for a dict the root a loaded registry remembers,
+    else this repo; read_json(rel) reads the configs instead (registry_problems). The dict returned remembers its root
+    (_Registry), so box_students(box, reg) and student_checks read the configs where this call did."""
+    return _load(path_or_dict, root, check_files, read_json)[0]
 
 
-def _resolved(registry, root, check_files: bool = False) -> tuple[dict, Path]:
-    """A loaded registry and the root its paths resolve against: None loads the file with every check; a given
-    registry (loaded or raw) is validated and filled again without reading files (idempotent, cheap)."""
+def _resolved(registry, root, read_json=None) -> tuple[dict, Path]:
+    """A loaded registry and the root its paths resolve against: None loads the file with every check (the configs
+    read with read_json when given); a given registry (loaded or raw) is validated and filled again without reading
+    files (idempotent, cheap), against root, else the root it remembers, else this repo."""
     if registry is None:
-        return _load(None, root, True)
-    return _load(registry, root, check_files)
+        return _load(None, root, True, read_json)
+    return _load(registry, root, False)
 
 
 def box_spec(box, registry=None) -> dict:
@@ -921,30 +992,32 @@ def box_configs(box, registry=None) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def _config_student(root: Path, rel: str) -> str:
+def _config_student(root: Path, rel: str, read_json=None) -> str:
     try:
-        cfg = json.loads((root / rel).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        raise RegistryError(f"{rel}: cannot read it under {root} ({type(e).__name__}: {e})") from None
+        cfg = _read_config(root, rel, read_json)
+    except Exception as e:  # noqa: BLE001  a git read may raise anything; it refuses like a missing file
+        where = "with read_json" if read_json is not None else f"under {root}"
+        raise RegistryError(f"{rel}: cannot read it {where} ({type(e).__name__}: {e})") from None
     s = cfg.get("student") if isinstance(cfg, dict) else None
     if not isinstance(s, str) or not s:
         raise RegistryError(f"{rel} names no student")
     return s.rstrip("/")
 
 
-def box_students(box, registry=None, root=None) -> list[str]:
+def box_students(box, registry=None, root=None, *, read_json=None) -> list[str]:
     """The student dirs (repo paths) of the box's train items' configs, in item order, once each: what bootstrap pulls
-    and check-students checks."""
-    reg, r = _resolved(registry, root)
+    and check-students checks. The configs are read under root (default: the root a loaded registry remembers, else
+    this repo), or with read_json(rel) when given (launch: at its sha)."""
+    reg, r = _resolved(registry, root, read_json)
     items = box_spec(box, reg)["items"]
-    return list(dict.fromkeys(_config_student(r, it["config"]) for it in items if it["kind"] == "train"))
+    return list(dict.fromkeys(_config_student(r, it["config"], read_json) for it in items if it["kind"] == "train"))
 
 
-def box_ctc_students(box, registry=None, root=None) -> list[str]:
+def box_ctc_students(box, registry=None, root=None, *, read_json=None) -> list[str]:
     """The Parakeet-family ones among box_students (family ctc): they carry the CC-BY-4.0 attribution card."""
-    reg, r = _resolved(registry, root)
+    reg, r = _resolved(registry, root, read_json)
     items = box_spec(box, reg)["items"]
-    return list(dict.fromkeys(_config_student(r, it["config"]) for it in items
+    return list(dict.fromkeys(_config_student(r, it["config"], read_json) for it in items
                               if it["kind"] == "train" and it["family"] == "ctc"))
 
 
@@ -959,19 +1032,20 @@ def box_extra_dirs(box, registry=None) -> list[str]:
     return list(box_spec(box, registry)["extra_dirs"])
 
 
-def student_checks(box, read_meta, registry=None, root=None) -> list[str]:
+def student_checks(box, read_meta, registry=None, root=None, *, read_json=None) -> list[str]:
     """Why the students the box trains are not the registered builds: each train item's config must train its
     study_run's registered student dir, and read_meta(student dir) -> its student_meta.json (a dict) must pass
     kitsune.prereg.student_problems(study_run, meta). A meta it cannot read is a problem too. Empty: every student is
-    the registered build (launch checks the data repo's copies, bootstrap the pulled ones)."""
+    the registered build (launch checks the data repo's copies, bootstrap the pulled ones). The item configs are read
+    as box_students reads them (root, or read_json at launch's sha)."""
     from kitsune import prereg
-    reg, r = _resolved(registry, root)
+    reg, r = _resolved(registry, root, read_json)
     problems, metas = [], {}
     for it in box_spec(box, reg)["items"]:
         if it["kind"] != "train":
             continue
         run = it["study_run"]
-        s, want = _config_student(r, it["config"]), prereg.RUNS[run]["student"]
+        s, want = _config_student(r, it["config"], read_json), prereg.RUNS[run]["student"]
         if s != want:
             problems.append(f"{it['name']}: {it['config']} trains {s}, {run} registers {want}")
         if s not in metas:

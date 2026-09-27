@@ -3,6 +3,8 @@
     from fixtures_full import tiny_registry
     reg = tiny_registry(tmp_path)                    # writes tmp_path/configs/full/*.json, returns the registry dict
     fullrun.load_registry(reg, root=tmp_path)        # validates (the configs are read under tmp_path)
+    fullrun.box_students("p01", reg)                 # the dict remembers tmp_path: no root= needed (a JSON round trip
+                                                     # or dict(reg) forgets it, and then root= is needed again)
     tiny_registry(tmp_path, write_boxes=True)        # + tmp_path/configs/full/boxes.json (for KITSUNE_FULL_REGISTRY)
 
 It has the four boxes of section 7 in miniature, and between them every registry feature, so a test takes the box it
@@ -44,7 +46,8 @@ def _weights(*names: str) -> list[dict]:
 
 
 def _study_data() -> dict:
-    """configs/study/data.json's data keys (the frozen study selection): smoke-b's data block."""
+    """study/data.json's data keys (the frozen study selection; every configs/study/*.json carries them): smoke-b's
+    data block."""
     d = json.loads((ROOT / "study" / "data.json").read_text(encoding="utf-8"))
     return {k: d[k] for k in fullrun.DATA_KEYS if k in d}
 
@@ -188,8 +191,9 @@ def _box_smoke_b() -> dict:
 
 def tiny_registry(root, *, write_boxes: bool = False) -> dict:
     """Write minimal data and item configs under root/configs/full/ and return a valid registry dict whose paths are
-    repo-relative (resolve them against root: fullrun.load_registry(reg, root=root)). write_boxes also writes it to
-    root/configs/full/boxes.json, so KITSUNE_FULL_REGISTRY (or load_registry(None, root=root)) can find it."""
+    repo-relative. The dict remembers root (as a loaded registry does), so fullrun's readers resolve its paths there
+    without root=; passing root=root explicitly works too. write_boxes also writes it to root/configs/full/boxes.json,
+    so KITSUNE_FULL_REGISTRY (or load_registry(None, root=root)) can find it."""
     folder = Path(root) / "configs" / "full"
     folder.mkdir(parents=True, exist_ok=True)
     data = _data_configs()
@@ -200,4 +204,4 @@ def tiny_registry(root, *, write_boxes: bool = False) -> dict:
                      "smoke-b": _box_smoke_b()}}
     if write_boxes:
         (Path(root) / fullrun.BOXES_FILE).write_text(json.dumps(reg, indent=2) + "\n", encoding="utf-8")
-    return reg
+    return fullrun._with_root(reg, root)
