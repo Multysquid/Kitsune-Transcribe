@@ -1,0 +1,6 @@
+{
+  "_comment": "vast machine_ids no launch rents, for good (vast/launch.py load_blocklist merges them into every job's avoid set; a machine whose full box's download gate said slow is avoided for GATE_BLOCK_DAYS without an entry here). One line per machine: why, and when.",
+  "machines": {
+    "151760": "study box A #1, 2026-09-26: a ~2.9 MB/s Hub link, three failed 67-minute rebuild attempts"
+  }
+}
