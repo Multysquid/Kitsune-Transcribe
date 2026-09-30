@@ -23,7 +23,9 @@ machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it neve
              KITSUNE_DEADLINE = the box deadline ($KITSUNE_STATE/deadline) - deadline_reserve_min (no deadline file: no
              variable). A fresh start of an item with max_hours that cannot end before that deadline is skipped
              (item_not_started) when droppable, else started anyway (no_start_overridden; the trainer's 4d cooldown
-             shortens it)
+             shortens it). A readout is tested against the box deadline less readout_margin_s() instead (10 min before
+             the watchdog's log sync): a run the 4d cooldown shortened ends inside deadline_reserve_min, and its M4
+             readout (box 1's go/no-go number) must still run
   stalls     every poll: an item whose heartbeat is older than its stall_min (the registry's, default
              fullrun.STALL_MIN_DEFAULT) is killed (item_stalled: SIGCONT, SIGTERM, SIGKILL after kill_grace_s) and a
              train item resumes from its newest local full state; an item without a stall check (stall_min null) is
@@ -133,6 +135,19 @@ DATA_WAIT_MAX = 0.02  # check 5
 FORCED_MIN_DELTA_ABS = 1e8  # check 10: a config whose early_stop.min_delta_abs is this large forces the trigger
 SCRATCH_COMMITS_MAX = 2  # check 7: the scratch repo's history after its squashes
 ALERT_SLACK_S = 300  # check 7: an alert counts for the freeze when it falls in its window + this
+# the no-start rule of a readout (start_deadline): it must end this long before the watchdog's log sync, which runs
+# KITSUNE_WATCHDOG_SYNC_LEAD_S (vast/watchdog.sh, default 600) before the box deadline
+READOUT_SYNC_MARGIN_S = 600
+WATCHDOG_SYNC_LEAD_S = 600
+
+
+def readout_margin_s() -> float:
+    """How long before the box deadline a readout must end: the watchdog's log-sync lead + READOUT_SYNC_MARGIN_S."""
+    try:
+        lead = float(os.environ.get("KITSUNE_WATCHDOG_SYNC_LEAD_S") or WATCHDOG_SYNC_LEAD_S)
+    except ValueError:
+        lead = WATCHDOG_SYNC_LEAD_S
+    return lead + READOUT_SYNC_MARGIN_S
 
 
 def log(msg: str):
@@ -512,15 +527,24 @@ class FullQueue(Q.Queue):
     def item_deadline(self, name: str) -> float | None:
         """The item's KITSUNE_DEADLINE: a fired deadline fault's (its start + seconds), else the box deadline less the
         box's deadline_reserve_min (the drain and finish.py's upload fit in that reserve); None without one. The
-        no-start rule tests every item against it, readouts included (build contract 5, Resolution 17): a readout
-        after a run that the trainer's deadline cooldown (4d) shortened has to fit in the trainer's own end reserve
-        (schedule.end_reserve_min), not in this one."""
+        no-start rule tests every item but the readouts against it (build contract 5, Resolution 17; start_deadline)."""
         for f in self.spec["faults"]:
             fs = self.state["faults"].get(f["id"]) or {}
             if f["action"] == "deadline" and f["item"] == name and fs.get("deadline") is not None:
                 return float(fs["deadline"])
         dl = self.box_deadline()
         return None if dl is None else dl - float(self.spec["deadline_reserve_min"]) * 60
+
+    def start_deadline(self, name: str) -> float | None:
+        """The no-start rule's deadline. A readout (the M4 readout of a training item: box 1's go/no-go number) must end
+        readout_margin_s() before the box deadline - 10 min before the watchdog's log sync - not inside the item
+        deadline's deadline_reserve_min: a run that the trainer's deadline cooldown (4d) shortened ends inside that
+        reserve, and a readout tested against it would be skipped, leaving the box without its number. Every other item
+        (eval, speed, stores, train): item_deadline."""
+        if self.spec_of(name)["kind"] == "readout":
+            dl = self.box_deadline()
+            return None if dl is None else dl - readout_margin_s()
+        return self.item_deadline(name)
 
     # ------------------------------------------------------------------------------------------ registration
 
@@ -771,7 +795,7 @@ class FullQueue(Q.Queue):
         now (a transient check: this GPU waits a poll)."""
         it, spec = self.item(name), self.spec_of(name)
         if not it["attempts"] and it["status"] == "pending" and spec.get("max_hours"):
-            dl = self.item_deadline(name)
+            dl = self.start_deadline(name)
             if dl is not None:
                 need, left = float(spec["max_hours"]) * 3600, dl - time.time()
                 if need > left:
