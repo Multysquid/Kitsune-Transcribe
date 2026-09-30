@@ -126,12 +126,13 @@ def _parakeet_utt(u, rng: np.random.Generator, col0: np.ndarray, n_frames: int) 
 
 
 def make_study_corpus(root, *, seed: int = 0, sources: dict | None = None, n_missing: int = 2, n_disagree: int = 3,
-                      n_dup: int = 1, n_infeasible: int = 2, missing_eval: int = 0) -> FakeStudy:
+                      n_dup: int = 1, n_infeasible: int = 2, missing_eval: int = 0, id_fn=None) -> FakeStudy:
+    """id_fn: passed to make_fake_corpus (Emilia-style ids for the full selection's dev videos)."""
     root = Path(root)
     fc = make_fake_corpus(root, sources or STUDY_SOURCES, rows_per_shard=8, seed=seed,
                           truncated={"reazon_small": 2, "galgame": 2}, null_agree={"emilia_yodas": 1},
                           no_second=("eval_jsut", "eval_cv8", "eval_reazon"), teacher_skipped={"reazon_small": 1},
-                          dur_range=(0.6, 6.0))
+                          dur_range=(0.6, 6.0), id_fn=id_fn)
     rng = np.random.default_rng([seed, 7])
     st = FakeStudy(fc, root / "parakeet_out", root / "kotoba" / "galgame_eval.jsonl")
     utts = list(fc.utts.values())

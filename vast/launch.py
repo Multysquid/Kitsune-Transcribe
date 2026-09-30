@@ -508,11 +508,19 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
     set whole, K6), leaves at most kitsune.prereg.ONE_ROOT_MAX_FRAC of its train rows in teacher_out only (K5), and,
     with `have`, has its sidecar (<selection>.json) and manifest (study_manifest.json) uploaded next to it. A CTC
     student (family "ctc") or pull_parakeet also needs parakeet_out's npz and jsonl of every kept row; a CTC run
-    without pull_parakeet needs the teacher files of its kept eval rows only."""
+    without pull_parakeet needs the teacher files of its kept eval rows only.
+    A full-data run's selection (selection_recipe.full_study, kitsune/devslice.py) must carry the same full_study
+    block as the config, which must be the registered one (kitsune.fullrun.full_recipe_problems), and record the frozen
+    study manifest's sha (fullrun.FROZEN_MANIFEST_SHA256) its eval rows equal, the study's seed (SELECTION_SEED) and
+    greedy_n (kitsune.devslice.GREEDY_N), on which its dev slice and greedy subsets hang. Its splits are train, dev
+    and eval (only a full_study selection may have dev rows), every train source keeps dev rows (the trainer's early
+    stop scores them), its drop reasons are kitsune.devslice.FULL_REASONS (not_drawn only with a draw_audio_s), K6 and
+    K5 hold with K5 counted over the train and dev rows (the dev rows were train rows), and with `have` its sidecar and
+    the frozen manifest (devslice.selection_files) are in the data repo."""
     import pandas as pd
     import pyarrow.parquet as pq
 
-    from kitsune import prereg
+    from kitsune import devslice, fullrun, prereg
 
     rebuild = "rebuild it with scripts/make_selection.py --config <the run config> and upload it"
     problems = []
@@ -528,14 +536,15 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
                    agree_max=args.get("agree_max"), agree_max_source=_by_source(args.get("agree_max_source")),
                    filter_eval_sets=set(args.get("filter_eval_sets") or []),
                    partial_second_opinion=set(args.get("partial_second_opinion") or []),
-                   extent=args.get("extent") or None, study=args.get("study") or None)
+                   extent=args.get("extent") or None, study=args.get("study") or None,
+                   full_study=args.get("full_study") or None)  # older selections lack the key: None
         ext = cfg.get("extent") or None  # make_selection records {name, inputs} of the config's extent (None: none)
         want = dict(sources=set(cfg.get("sources", [])), eval_sets=set(cfg.get("eval_sets", [])),
                     agree_max=float(recipe["agree_max"]), agree_max_source=_by_source(recipe["agree_max_source"]),
                     filter_eval_sets=set(recipe["filter_eval_sets"]),
                     partial_second_opinion=set(recipe.get("partial_second_opinion", [])),
                     extent=dict(name=ext.get("name"), inputs=ext.get("inputs") or {}) if ext else None,
-                    study=recipe.get("study") or None)
+                    study=recipe.get("study") or None, full_study=recipe.get("full_study") or None)
         for k, v in want.items():
             if got[k] != v:
                 shown = [sorted(x.items()) if isinstance(x, dict) else sorted(x) if isinstance(x, set) else x
@@ -548,10 +557,29 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
             if args.get("seed") != prereg.SELECTION_SEED:
                 problems.append(f"{name} was built with seed {args.get('seed')!r}, the study selection's is "
                                 f"pre-registered as {prereg.SELECTION_SEED}: {rebuild}")
+        if want["full_study"] is not None:  # the full runs' recipe and the frozen manifest its eval rows equal
+            problems += [f"the run config's {p}" for p in fullrun.full_recipe_problems(want["full_study"])]
+            if args.get("manifest_sha256") != fullrun.FROZEN_MANIFEST_SHA256:
+                problems.append(f"{name} was built against the manifest sha256 {args.get('manifest_sha256')!r}, not "
+                                f"the frozen {fullrun.FROZEN_MANIFEST} ({fullrun.FROZEN_MANIFEST_SHA256}): {rebuild}")
+            # the dev draw, the probe and the greedy subsets hang on the seed, the greedy subsets on greedy_n: the
+            # study's, so the dev slice is the registered one and the greedy subsets are the study selection's
+            if args.get("seed") != prereg.SELECTION_SEED:
+                problems.append(f"{name} was built with seed {args.get('seed')!r}, a full selection's is the study's "
+                                f"{prereg.SELECTION_SEED}: {rebuild}")
+            if args.get("greedy_n") != devslice.GREEDY_N:
+                problems.append(f"{name} was built with greedy_n {args.get('greedy_n')!r}, a full selection's is the "
+                                f"study's {devslice.GREEDY_N} (kitsune.devslice.GREEDY_N): {rebuild}")
 
+    full = isinstance(recipe, dict) and recipe.get("full_study") is not None
     sel = pd.read_parquet(path, columns=["source", "split", "keep", "reason", "teacher_file"])
+    splits = {"train", fullrun.DEV_SPLIT, "eval"} if full else {"train", "eval"}
+    if odd := sorted(set(sel["split"].unique()) - splits):
+        problems.append(f"{name} has rows of split {odd}, which {'a full' if full else 'this'} recipe never "
+                        f"writes{'' if full else ' (dev rows belong to a selection_recipe.full_study selection)'}: "
+                        f"{rebuild}")
     kept = sel[sel["keep"]].groupby(["source", "split"]).size()
-    for split, key in (("train", "sources"), ("eval", "eval_sets")):
+    for split, key in (("train", "sources"), ("eval", "eval_sets")) + ((fullrun.DEV_SPLIT, "sources"),) * full:
         empty = [s for s in cfg.get(key, []) if not kept.get((s, split), 0)]
         if empty:
             problems.append(f"{name} keeps no {split} rows of {empty} (in the config's {key}): {rebuild}")
@@ -562,16 +590,20 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
     study = isinstance(recipe, dict) and recipe.get("study") is not None
     allowed = {"kept", "truncated", "not_judged", "no_agree", "no_audio"}
     allowed |= set(prereg.STUDY_REASONS) if study else set()
+    if full:  # a draw only with draw_audio_s (the smoke selection); a malformed block is reported above
+        fs = recipe["full_study"] if isinstance(recipe["full_study"], dict) else {}
+        allowed |= set(devslice.FULL_REASONS) - (set() if fs.get("draw_audio_s") is not None else {"not_drawn"})
     if odd := sorted(r for r in sel["reason"].unique() if r not in allowed and not str(r).startswith("agree>")):
-        problems.append(f"{name} drops rows as {odd}, which {'the study' if study else 'this'} recipe never does: "
-                        f"{rebuild}")
-    if study:
+        problems.append(f"{name} drops rows as {odd}, which {'the study' if study else 'the full' if full else 'this'} "
+                        f"recipe never does: {rebuild}")
+    if study or full:
         ev = sel[(sel["split"] == "eval") & (sel["reason"] == "not_in_parakeet")]
         if not ev.empty:
             problems.append(f"{name}: {len(ev)} eval rows have no Parakeet labels "
                             f"({ev['source'].value_counts().to_dict()}): the eval sets must be labelled whole by both "
                             f"passes (K6)")
-        train = sel[sel["split"] == "train"]
+        # K5 over the rows that were train rows before the dev draw (a dev row keeps its not_in_parakeet reason)
+        train = sel[sel["split"].isin(["train", fullrun.DEV_SPLIT] if full else ["train"])]
         n_one = int((train["reason"] == "not_in_parakeet").sum())
         if n_one > prereg.ONE_ROOT_MAX_FRAC * len(train):
             problems.append(f"{name}: {n_one} of {len(train)} train rows are in teacher_out only, more than "
@@ -597,6 +629,10 @@ def selection_problems(path: Path, name: str, cfg: dict, have: set[str] | None =
             for f in prereg.study_files(name):
                 if f not in have:
                     problems.append(f"no {f}: upload the study selection's sidecar and manifest with it")
+        if full:
+            for f in devslice.selection_files(cfg):
+                if f not in have:
+                    problems.append(f"no {f}: a full selection needs its sidecar and the frozen study manifest")
     return problems
 
 
