@@ -54,12 +54,22 @@ state file: finished items skipped, runs resumed from their local full states) u
 --stop. The queue resumes its runs itself; the supervisor restarts only the queue. Same history file, lock, bounded
 final finish and halt-marker handling as the trainer path.
 
+A full-data runs box (KITSUNE_JOB=full, vast/launch.py --job full) runs `python -m kitsune.full_queue run --box
+$KITSUNE_BOX` (kitsune/full_queue.py) the same way, with the same decide_queue: its exit 0 destroys, 4 (a training or
+store item failed for good) stops with the disk kept, anything else restarts it. The box watchdog of a full box reads
+the controllers' heartbeat $KITSUNE_STATE/train_hb: the queue beats it while it runs (the supervisor does not), and the
+supervisor beats it, bounded (kitsune.heartbeat.beating, max_s = the call's timeout + 60 s), around its own finish.py
+calls - the --sync-only after a queue failure and the final --stop/--destroy - so a slow but live upload is not taken
+for a dead controller, while a hung one still goes stale.
+
 Usage (started by vast/onstart.sh; KITSUNE_CONFIG / KITSUNE_OUT_REPO come from the instance env):
   python vast/supervise.py
   python vast/supervise.py --dry-run --train-cmd "python -c 'import sys; sys.exit(3)'"   # exercise the policy locally
   KITSUNE_JOB=study KITSUNE_BOX=A python vast/supervise.py                               # the study box's queue
+  KITSUNE_JOB=full KITSUNE_BOX=p01 python vast/supervise.py                              # a full-data runs box
 """
 import argparse
+import contextlib
 import json
 import os
 import shlex
@@ -70,11 +80,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+if str(ROOT) not in sys.path:  # kitsune.heartbeat (a full box's bounded beats around finish.py)
+    sys.path.insert(1, str(ROOT))
 
 from finish import FULL_RE, newest_checkpoint  # noqa: E402
 
-EXIT_OK, EXIT_THROUGHPUT, EXIT_HALT = 0, 3, 4  # EXIT_HALT: kitsune.study_queue's pre-registered halt
-MAX_QUEUE_RESTARTS = 2  # the study queue: restarted after a crash at most this often, then the box stops
+EXIT_OK, EXIT_THROUGHPUT, EXIT_HALT = 0, 3, 4  # EXIT_HALT: the queue's halt (study: a rule; full: an item failed)
+MAX_QUEUE_RESTARTS = 2  # a queue (study or full): restarted after a crash at most this often, then the box stops
+QUEUE_JOBS = ("study", "full")  # KITSUNE_JOB values whose box runs a queue (--queue by default)
+FINISH_BEAT_EVERY_S = 30.0  # a full box: train_hb beats while a finish.py call runs (kitsune.heartbeat.beating)
 MIN_RESUME_STEP = 100
 MAX_FAILURES = 2
 SYNC_TIMEOUT_S = 1800
@@ -131,9 +145,21 @@ def queue_reason(state_dir: Path) -> str | None:
         return None
 
 
-def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = False) -> int:
-    """The study box: run the queue, restart it after a failure (decide_queue), then the final finish.py call. The
-    history (attempts with rc, the final decision) and its crash handling are the trainer path's (supervise)."""
+def beating(hb: Path | None, timeout: float):
+    """A full box's bounded controller beat around one finish.py call (kitsune.heartbeat.beating, max_s = timeout +
+    60 s); a plain context without hb (the study box, the trainer path)."""
+    if hb is None:
+        return contextlib.nullcontext()
+    from kitsune import heartbeat
+
+    return heartbeat.beating(hb, every_s=FINISH_BEAT_EVERY_S, max_s=float(timeout) + 60)
+
+
+def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = False, *, hb: Path | None = None) -> int:
+    """The study box and the full-data runs' boxes: run the queue, restart it after a failure (decide_queue), then the
+    final finish.py call. The history (attempts with rc, the final decision) and its crash handling are the trainer
+    path's (supervise). hb: the controllers' heartbeat file a full box's watchdog reads, beaten around the finish.py
+    calls (none for the study box)."""
     lock = acquire_lock(state_path.with_suffix(".lock"))
     if lock is None:
         log(f"another supervisor holds {state_path.with_suffix('.lock')}; not starting a second one")
@@ -146,14 +172,14 @@ def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = Fals
         state["final"] = {"action": "stop", "reason": reason, "wall": time.time(), "corrupt_state": aside}
         save_state(state_path, state)
         log(f"decision: stop ({reason})")
-        final_finish("stop", reason, dry)
+        final_finish("stop", reason, dry, hb=hb)
         return 1
     final = state.get("final")
     if final:
         log(f"a final decision is already recorded ({final}); not starting the queue again")
         if not state_path.with_name("halt").exists():
             log("no halt marker: the container restarted before finish acted on that decision; running it again")
-            final_finish(final["action"], final.get("reason", ""), dry)
+            final_finish(final["action"], final.get("reason", ""), dry, hb=hb)
         return 0
     for a in state["attempts"]:
         if "rc" not in a:  # the container died while the queue ran
@@ -167,7 +193,7 @@ def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = Fals
             if action != "restart":
                 state["final"] = {"action": action, "reason": reason, "wall": time.time()}
                 save_state(state_path, state)
-                final_finish(action, reason, dry)
+                final_finish(action, reason, dry, hb=hb)
                 return last["rc"] if last["rc"] is not None else 1
         attempt = {"t0": time.time(), "queue": True}
         state["attempts"].append(attempt)
@@ -181,7 +207,8 @@ def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = Fals
         save_state(state_path, state)
         log(f"queue attempt {len(state['attempts'])} exited {rc} after {(attempt['t1'] - attempt['t0']) / 60:.1f} min")
         if rc not in (EXIT_OK, EXIT_HALT, EXIT_THROUGHPUT):  # the stop path syncs everything anyway
-            call_finish(["--sync-only", *dry], timeout=SYNC_TIMEOUT_S)
+            with beating(hb, SYNC_TIMEOUT_S):
+                call_finish(["--sync-only", *dry], timeout=SYNC_TIMEOUT_S)
 
 
 def find_run_dir(runs_root: Path, since: float) -> Path | None:
@@ -277,14 +304,17 @@ def call_finish(args: list[str], timeout: float | None = None) -> int:
         return 124
 
 
-def final_finish(action: str, reason: str, dry: list[str]):
-    """The final finish.py --stop/--destroy, bounded; `finish.py --stop --no-sync` after a timeout or failure."""
-    rc = call_finish([f"--{action}", "--reason", reason, *dry], timeout=FINISH_TIMEOUT_S[action])
+def final_finish(action: str, reason: str, dry: list[str], hb: Path | None = None):
+    """The final finish.py --stop/--destroy, bounded; `finish.py --stop --no-sync` after a timeout or failure. hb: a
+    full box's controller heartbeat, beaten (bounded) while each call runs."""
+    with beating(hb, FINISH_TIMEOUT_S[action]):
+        rc = call_finish([f"--{action}", "--reason", reason, *dry], timeout=FINISH_TIMEOUT_S[action])
     log(f"finish exited {rc}")
     if rc not in (0, 2):  # 2: --destroy's verification failed and the instance was stopped
         why = "timed out" if rc == 124 else f"exited {rc}"
-        rc = call_finish(["--stop", "--no-sync", "--reason", f"finish --{action} {why} ({reason})", *dry],
-                         timeout=FALLBACK_TIMEOUT_S)
+        with beating(hb, FALLBACK_TIMEOUT_S):
+            rc = call_finish(["--stop", "--no-sync", "--reason", f"finish --{action} {why} ({reason})", *dry],
+                             timeout=FALLBACK_TIMEOUT_S)
         log(f"fallback stop exited {rc}")
 
 
@@ -443,10 +473,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--state", default=str(Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state")) / "supervise.json"))
     ap.add_argument("--train-cmd", default=None, help="override the trainer command (default: python scripts/04_distill.py)")
     ap.add_argument("--dry-run", action="store_true", help="run the trainer, but finish.py only prints (no stop/destroy)")
-    ap.add_argument("--queue", action="store_true", default=os.environ.get("KITSUNE_JOB") == "study",
-                    help="the study box: run kitsune.study_queue for KITSUNE_BOX (default when KITSUNE_JOB=study)")
+    ap.add_argument("--queue", action="store_true", default=os.environ.get("KITSUNE_JOB") in QUEUE_JOBS,
+                    help="a queue box: run kitsune.study_queue (KITSUNE_JOB=study) or kitsune.full_queue "
+                         "(KITSUNE_JOB=full) for KITSUNE_BOX (the default for those jobs)")
     args = ap.parse_args(argv)
 
+    if args.queue and os.environ.get("KITSUNE_JOB") == "full":
+        box = os.environ.get("KITSUNE_BOX") or ""
+        queue_cmd = shlex.split(args.train_cmd) if args.train_cmd else [sys.executable, "-m", "kitsune.full_queue",
+                                                                         "run", "--box", box]
+        hb = Path(args.state).parent / "train_hb"  # kitsune.fullrun.TRAIN_HB in $KITSUNE_STATE
+        log(f"full queue: box={box} out_repo={args.out_repo} state={args.state} dry_run={args.dry_run}")
+        return supervise_queue(queue_cmd, Path(args.state), args.dry_run, hb=hb)
     if args.queue:
         box = os.environ.get("KITSUNE_BOX") or ""
         queue_cmd = shlex.split(args.train_cmd) if args.train_cmd else [sys.executable, "-m", "kitsune.study_queue",
