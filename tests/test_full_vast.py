@@ -1148,3 +1148,128 @@ def test_a_plain_full_box_and_a_chains_other_modes_are_unchanged(chain_finish, m
     rc, hub = chain_finish("--destroy")
     assert rc == 0 and actions[-1] == "destroy" and hub.files_put == [] and "listing" not in hub.order
 
+
+# ------------------------------------------------------------------------------------------------- watchdog
+
+
+def later(seconds: float, fn):
+    import threading
+
+    th = threading.Timer(seconds, fn)
+    th.start()
+    return th
+
+
+def test_the_mode_file_switches_the_watchdog_from_alert_to_stop(tmp_path):
+    """Stage 1 alerts on a stale heartbeat; once the controller writes "stop 1" the same stale heartbeat syncs and
+    stops the box."""
+    bash = need_bash()
+    env, state, record = box_watchdog(tmp_path, "1", "alert", FAKE_SLEEP_MAX="20")
+    hb = state / "train_hb"
+    hb.write_text("", encoding="utf-8")
+    t0 = int(time.time())
+    os.utime(hb, (t0 + 1, t0 + 1))
+
+    def write_mode():
+        (state / "watchdog_mode.tmp").write_bytes(b"stop 1\n")  # as the controller writes it: LF
+        (state / "watchdog_mode.tmp").replace(state / "watchdog_mode")
+
+    th = later(4.5, write_mode)
+    try:
+        r = subprocess.run([bash, str(VAST / "watchdog.sh")], capture_output=True, text=True, env=env, timeout=90)
+    finally:
+        th.cancel()
+    assert r.returncode == 0, r.stdout + r.stderr
+    alerts = (state / "watchdog_alerts.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(alerts) == 1, "alert mode before the mode file"
+    got = calls(record)
+    assert [a for _, a in got] == ["--sync-only", "--stop --no-sync --reason watchdog: box controller heartbeat stale"]
+    assert "mode file: stop 1 (was alert 1)" in r.stdout and got[0][0] >= t0 + 4
+
+
+@pytest.mark.parametrize("content", [b"", b"banana x\n", b"stop\n", b"alert -3\n", b"\x00\x01garbage"],
+                         ids=["empty", "garbage", "no-limit", "negative", "binary"])
+def test_an_empty_or_malformed_mode_file_is_ignored(tmp_path, content):
+    bash = need_bash()
+    env, state, record = box_watchdog(tmp_path, "1", "alert", FAKE_SLEEP_MAX="5")
+    (state / "watchdog_mode").write_bytes(content)
+    hb = state / "train_hb"
+    hb.write_text("", encoding="utf-8")
+    t0 = int(time.time())
+    os.utime(hb, (t0 + 1, t0 + 1))
+    r = subprocess.run([bash, str(VAST / "watchdog.sh")], capture_output=True, text=True, env=env, timeout=90)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert calls(record) == [] and (state / "watchdog_alerts.jsonl").is_file(), "still in its env's alert mode"
+    assert r.stdout.count("ignoring malformed") == (1 if content.strip() else 0), r.stdout
+
+
+def test_a_stage_1_that_does_not_hand_over_is_stopped_whatever_its_heartbeat(tmp_path):
+    """KITSUNE_WATCHDOG_HANDOVER_S: no mode file by first boot + that -> sync, then stop, with a fresh heartbeat (a
+    hung controller or a stage-1 bootstrap's toucher can no longer hold the box); a mode file disarms it."""
+    bash = need_bash()
+    for moded in (False, True):
+        d = tmp_path / str(moded)
+        env, state, record = box_watchdog(d, "600", "alert", KITSUNE_WATCHDOG_HANDOVER_S="2", FAKE_SLEEP_MAX="8")
+        (state / "first_boot").write_text(f"{int(time.time())}\n")
+        if moded:
+            (state / "watchdog_mode").write_bytes(b"stop 600\r\n")  # a CRLF line is read too
+        hb = state / "train_hb"
+        hb.write_text("", encoding="utf-8")
+        toucher = subprocess.Popen([sys.executable, "-c", "import os, sys, time\nfor _ in range(60):\n"
+                                    "    os.utime(sys.argv[1], None); time.sleep(0.2)", str(hb)])
+        try:
+            r = subprocess.run([bash, str(VAST / "watchdog.sh")], capture_output=True, text=True, env=env,
+                               timeout=90)
+        finally:
+            toucher.kill()
+        assert r.returncode == 0, r.stdout + r.stderr
+        got = [a for _, a in calls(record)]
+        if moded:
+            assert got == [] and "did not hand over" not in r.stdout
+        else:
+            assert got == ["--sync-only", "--stop --no-sync --reason watchdog: chain stage 1 over its sub-deadline"]
+            assert "chain stage 1 did not hand over by first boot + 2 s" in r.stdout
+
+
+@pytest.mark.parametrize("case", ["fires", "no-self-stop", "old-halt", "not-full"])
+def test_the_halt_retry(tmp_path, case):
+    """A halt marker written during this container's life and older than HALT_RETRY_S (1 s here) with the instance
+    still up: the stop is requested again (job full only; never with KITSUNE_NO_SELF_STOP=1, nor for a marker older
+    than the watchdog)."""
+    bash = need_bash()
+    extra = dict(KITSUNE_JOB="full" if case != "not-full" else "study", KITSUNE_WATCHDOG_HALT_RETRY_S="1",
+                 FAKE_SLEEP_MAX="6")
+    env, state, record = box_watchdog(tmp_path, "0", "stop", **extra)
+    if case == "no-self-stop":
+        env["KITSUNE_NO_SELF_STOP"] = "1"  # after watchdog_env, which clears it
+    halt = state / "halt"
+    th = None
+    if case == "old-halt":
+        halt.write_text('{"action": "destroy"}\n')
+        os.utime(halt, (time.time() - 3600, time.time() - 3600))
+    else:
+        th = later(1.0, lambda: halt.write_text('{"action": "destroy"}\n'))
+    try:
+        r = subprocess.run([bash, str(VAST / "watchdog.sh")], capture_output=True, text=True, env=env, timeout=90)
+    finally:
+        if th is not None:
+            th.cancel()
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = [a for _, a in calls(record)]
+    if case == "fires":
+        assert len(got) == 1 and got[0].startswith("--stop --no-sync --reason watchdog: halt marker ") and \
+            got[0].endswith(" s old, instance still up"), got
+    else:
+        assert got == [], got
+
+
+def test_the_watchdogs_dry_run_prints_the_chain_rules(tmp_path):
+    bash = need_bash()
+    env, state, _ = box_watchdog(tmp_path, "600", "alert", KITSUNE_WATCHDOG_HANDOVER_S="34200", KITSUNE_JOB="full")
+    (state / "first_boot").write_text("1000000000\n")
+    r = subprocess.run([bash, str(VAST / "watchdog.sh"), "--dry-run"], capture_output=True, text=True, env=env,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "chain stage 1: with no mode file by first boot + 34200 s (2001-09-09T11:16:40Z)" in r.stdout
+    assert "halt retry: a halt marker written after this start and older than 1200 s" in r.stdout
+    assert "mode file" in r.stdout and not (state / "deadline").exists()
