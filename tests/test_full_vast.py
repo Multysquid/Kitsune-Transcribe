@@ -823,3 +823,197 @@ def test_watchdog_dry_run_names_the_file_and_the_action(tmp_path):
                        timeout=60)
     assert r.returncode == 0 and "train_hb is stale by 600 s" in r.stdout and "orphan_alert" in r.stdout, r.stdout
     assert "then stop the instance" not in r.stdout and "no sync, no stop" in r.stdout
+
+
+# ================================================================================ the chained box (addendum E)
+
+from fixtures_chain import CHAIN_BOX, with_chain  # noqa: E402
+
+SMOKE_SIZING = dict(down_gb=59.2, shard_gb=100.0, sel_gb=12.0, stores=2, labels_gb=5.5, hours=1000.0, extra_gb=0.0,
+                    disk_gb=400, rebuild_timeout_min=120)
+
+
+@pytest.fixture
+def chain_launch(repo, monkeypatch):
+    """launch.main for --job full --box p01-chain on the tiny registry + the E.1.7 entry, the Hub side recorded: every
+    hf_preflight / extent_preflight / full_preflight call (a part's problems from .seen["part_problems"]), and
+    chain_preflight's."""
+    write_reg(repo.root, with_chain(repo.reg))
+    seen = {"hf": [], "extent": [], "preflight": [], "chain": [], "part_problems": {}}
+
+    def hf_preflight(data, out, cfg):
+        seen["hf"].append(cfg["selection"])
+        return "d" * 40, []
+
+    def extent_preflight(data, rev, cfg, extra_gb=0.0):
+        seen["extent"].append((cfg["selection"], extra_gb))
+        full = not (cfg.get("extent") or {}).get("inputs")  # box 1's uncapped extent, else stage 1's
+        return [], dict(SIZING if full else SMOKE_SIZING, extra_gb=extra_gb)
+
+    def full_preflight(*a, **kw):
+        seen["preflight"].append((a, kw))
+        return list(seen["part_problems"].get(a[5], [])), [f"{a[5]} preflight ok"]
+
+    monkeypatch.setattr(launch, "hf_preflight", hf_preflight)
+    monkeypatch.setattr(launch, "extent_preflight", extent_preflight)
+    monkeypatch.setattr(launch, "full_preflight", full_preflight)
+    monkeypatch.setattr(launch, "chain_preflight",
+                        lambda *a, **kw: seen["chain"].append((a, kw)) or ([], ["chain preflight ok"]))
+    monkeypatch.setattr(launch, "avoided_machines", lambda data, rev: (set(), []))
+    monkeypatch.setattr(launch, "gate_refusals", lambda out: ({}, []))
+
+    def go(searches, *args, box=CHAIN_BOX, instances=()):
+        fake = FakeVastai(searches, instances)
+        monkeypatch.setattr(launch.shutil, "which", lambda name: "/fake/vastai" if name == "vastai" else None)
+        monkeypatch.setattr(launch.subprocess, "run", fake)
+        rc = launch.main(["--job", "full", "--box", box, "--data-repo", DATA, "--out-repo", RUNS, "--sha", SHA,
+                          "--image", DIGEST_IMAGE, "--skip-git-checks", *args])
+        return rc, fake
+    go.seen = seen
+    return go
+
+
+def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
+    """E.1.8: KITSUNE_CONFIG is stage 1's rebuild, the watchdog's stage-1 env with its hand-over bound, the disk and
+    the gate on box 1's extent (+ the chain's extra_gb), the boot's rebuild bytes and timeout on stage 1's; every part
+    preflighted as a box, each distinct data config's selection checked, the chain's own files; 35 h, 25.2 h, $1.00."""
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    create = created(fake)
+    env = env_of(create)
+    assert env == {
+        "KITSUNE_JOB": "full", "KITSUNE_BOX": CHAIN_BOX, "KITSUNE_SHA": SHA,
+        "KITSUNE_CONFIG": "configs/full/data-smoke.json", "KITSUNE_DATA_REPO": DATA, "KITSUNE_OUT_REPO": RUNS,
+        "KITSUNE_N_GPUS": "1", "KITSUNE_WATCHDOG_HB_FILE": "train_hb", "KITSUNE_WATCHDOG_ORPHAN_S": "600",
+        "KITSUNE_WATCHDOG_ORPHAN_ACTION": "alert", "KITSUNE_CHAIN_STAGE": "1", "KITSUNE_WATCHDOG_HANDOVER_S": "34200",
+        "KITSUNE_SCRATCH_REPO": SCRATCH, "KITSUNE_GATE_BYTES": str(int(571.3e9)), "KITSUNE_GATE_MAX_H": "5",
+        "KITSUNE_REBUILD_BYTES": str(int(59.2e9)), "KITSUNE_PULL_BYTES": str(int(1e9 * (5.5 + 2))),
+        "KITSUNE_MAX_HOURS": "35", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
+        "KITSUNE_REBUILD_TIMEOUT_MIN": "120", "KITSUNE_DPH": "0.8100", "KITSUNE_MACHINE_ID": "54650"}
+    assert create[create.index("--disk") + 1] == "1400" and create[create.index("--label") + 1].startswith(
+        "kitsune-full-p01-chain-data-smoke-")
+    s = chain_launch.seen
+    assert sorted(s["extent"]) == sorted([(fullrun.FULL_SELECTION, 120.0), (fullrun.SMOKE_SELECTION, 0.0)])
+    assert s["hf"] == [fullrun.SMOKE_SELECTION, "labels/full/selections/study_1000h.parquet", fullrun.FULL_SELECTION]
+    parts = {a[5]: (a, kw) for a, kw in s["preflight"]}
+    assert list(parts) == ["full-smoke", "smoke-b", "p01"]
+    assert parts["smoke-b"][0][3] is None and parts["p01"][0][3] == SCRATCH, "the scratch repo only for timed parts"
+    assert parts["smoke-b"][0][7]["selection"] == "labels/full/selections/study_1000h.parquet"
+    assert all(not kw.get("resume") for _, kw in parts.values())
+    assert len(s["chain"]) == 1 and "chain preflight ok" in out and "part p01: p01 preflight ok" in out
+    assert "x ~25.2 h (box p01-chain; watchdog cap 35 h)" in out
+    assert "chain p01-chain: the gate part must end by first boot + 9 h" in out and "+ 9.5 h" in out
+    assert "chain stage 1 (configs/full/data-smoke.json): ~59 GB upstream down" in out
+
+
+@pytest.mark.parametrize("args, err", [
+    (["--config", "configs/full/data-smoke.json"], "--config is refused for chain box p01-chain"),
+    (["--gate-hours", "0"], "--gate-hours 0 is refused for chain box p01-chain"),
+    (["--max-hours", "29"], "--max-hours 29 is below chain p01-chain's floor 30"),
+], ids=["config", "gate-off", "max-hours"])
+def test_launch_chain_refusals(chain_launch, capsys, args, err):
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, *args, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and err in out and created(fake) is None, out
+
+
+def test_launch_chain_warns_below_its_cap_and_a_parts_problem_refuses(chain_launch, capsys):
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--max-hours", "32", "--dry-run")
+    out = capsys.readouterr().out
+    assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 35 h" in out
+    assert env_of(created_or_printed(out))["KITSUNE_MAX_HOURS"] == "32"
+    chain_launch.seen["part_problems"]["smoke-b"] = ["tools/whisper_eval.py (item whisper-large-v3) does not exist"]
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and "part smoke-b: tools/whisper_eval.py (item whisper-large-v3) does not exist" in out
+    assert created(fake) is None
+
+
+@pytest.mark.parametrize("flag", [["--resume"], ["--resume-reset", "full-p01-20260927T120000Z"],
+                                  ["--resume-set", "full-p01-20260927T120000Z:schedule.epochs=5"]])
+def test_a_chain_is_never_resumed_as_a_chain(chain_launch, capsys, flag):
+    """E.8: launch --box p01-chain --resume exits 1 with what to run instead; nothing is searched or rented."""
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, *flag, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and "is not resumed as a chain" in out and "--box p01 --resume" in out and fake.calls == []
+
+
+def test_a_resume_of_box_1_checks_the_chains_summary_and_its_live_instances(chain_launch, monkeypatch, capsys):
+    """--box p01 --resume with p01-chain in the registry: E.8's summary check runs (its refusal refuses), and a live
+    p01-chain instance is warned about as a live p01 one is."""
+    got = []
+    monkeypatch.setattr(launch, "chain_resume_checks", lambda out, box, chain: got.append((box, chain)) or (
+        ["the newest p01 summary on the Hub is from another rental (container X)"], []))
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--yes", box="p01",
+                            instances=[{"id": 9, "label": "kitsune-full-p01-chain-data-smoke-abc",
+                                        "actual_status": "running"}])
+    out = capsys.readouterr().out
+    assert rc == 1 and got == [("p01", CHAIN_BOX)] and "from another rental (container X)" in out
+    assert "WARNING: a live instance of box p01: kitsune-full-p01-chain-data-smoke-abc (instance 9" in out
+    monkeypatch.setattr(launch, "chain_resume_checks", lambda out, box, chain: ([], ["continues stage 2 of chain"]))
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--dry-run", box="p01")
+    assert rc == 0 and "continues stage 2 of chain" in capsys.readouterr().out
+
+
+def chain_summaries(container="C1", started=100.0, queue_started=150.0, status="running", p01_container="C1",
+                    p01_started=150.0) -> dict:
+    return {fullrun.box_summary_path(CHAIN_BOX): {"kind": "chain", "box": CHAIN_BOX, "container_id": container,
+                                                  "started": started, "gate": {"result": "pass", "time_utc": "T"},
+                                                  "parts": {"p01": {"status": status,
+                                                                    "queue_started": queue_started}}},
+            fullrun.box_summary_path("p01"): {"kind": "full", "box": "p01", "container_id": p01_container,
+                                              "started": p01_started, "items": {}}}
+
+
+@pytest.mark.parametrize("case, problem, note", [
+    ("match", None, "--box p01 --resume continues stage 2 of chain p01-chain (gate pass T, container C1)"),
+    ("other-rental", "from another rental (container C0); chain p01-chain on container C1 died before box p01 "
+                     "started", None),
+    ("p01-newer", None, None),
+    ("no-chain", None, None),
+])
+def test_chain_resume_checks(monkeypatch, case, problem, note):
+    runs = {"match": chain_summaries(),
+            "other-rental": chain_summaries(status="pending", queue_started=None, p01_container="C0", p01_started=50.0),
+            "p01-newer": chain_summaries(status="pending", p01_container="C9", p01_started=500.0),
+            "no-chain": {k: v for k, v in chain_summaries().items() if "chain" not in k}}[case]
+    hub = FullHub({}, runs)
+    monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+    problems, notes = launch.chain_resume_checks(RUNS, "p01", CHAIN_BOX)
+    if problem is None:
+        assert problems == [], problems
+    else:
+        assert len(problems) == 1 and problem in problems[0], problems
+    assert notes == ([note] if note else []), notes
+
+
+def test_chain_preflight_checks_the_chains_configs_and_stage_files(repo, monkeypatch):
+    write_reg(repo.root, with_chain(repo.reg))
+    reg, reader, _, _ = launch.full_registry(SHA)
+    have = {f: b"x" for f in fullrun.box_extra_files(CHAIN_BOX, reg, read_json=reader)}
+    have["models/parakeet-tdt_ctc-0.6b-ja-hf/config.json"] = b"x"
+    hub = FullHub(have)
+    monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+    problems, notes = launch.chain_preflight(DATA, "d" * 40, SHA, CHAIN_BOX, reg)
+    assert problems == [], problems
+    assert any(n.startswith("chain p01-chain stage 1: parts full-smoke, smoke-b; rebuilds configs/full/data-smoke.json"
+                            "; gate part full-smoke gates stage 2 (checks 1-11) by first boot + 9 h") for n in notes)
+    del hub.data["labels/full/selections/study_1000h.parquet"]  # smoke-b's frozen selection, stage 1 pulls it
+    problems, _ = launch.chain_preflight(DATA, "d" * 40, SHA, CHAIN_BOX, reg)
+    assert problems == [f"{DATA}: no labels/full/selections/study_1000h.parquet (chain p01-chain pulls it in a stage)"]
+    (repo.root / "configs/full/data-smoke-b.json").rename(repo.root / "moved.json")  # not committed at the sha
+    problems, _ = launch.chain_preflight(DATA, "d" * 40, SHA, CHAIN_BOX, reg)
+    assert any("configs/full/data-smoke-b.json does not exist at 0123456789ab" in p for p in problems), problems
+    assert any("cannot check chain p01-chain's stage files" in p for p in problems), problems
+    (repo.root / "moved.json").rename(repo.root / "configs/full/data-smoke-b.json")
+
+
+def test_a_smoke_b_item_whose_cli_the_sha_lacks_is_refused_by_its_part_preflight(repo, monkeypatch, devslice):
+    reg = launch.full_registry(SHA)[0]
+    data = box_data("smoke-b", reg, repo.root)
+    assert preflight(monkeypatch, FullHub(data), box="smoke-b", scratch=None)[0] == []
+    (repo.root / "tools/whisper_eval.py").unlink()
+    problems, _ = preflight(monkeypatch, FullHub(data), box="smoke-b", scratch=None)
+    assert any("tools/whisper_eval.py (item whisper-large-v3) does not exist" in p for p in problems), problems
+
