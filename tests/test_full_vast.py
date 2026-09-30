@@ -1017,3 +1017,134 @@ def test_a_smoke_b_item_whose_cli_the_sha_lacks_is_refused_by_its_part_preflight
     problems, _ = preflight(monkeypatch, FullHub(data), box="smoke-b", scratch=None)
     assert any("tools/whisper_eval.py (item whisper-large-v3) does not exist" in p for p in problems), problems
 
+
+# --------------------------------------------------------------------------------------------------- finish
+
+
+class ChainHub(FinishHub):
+    """FinishHub (the run dir's verification passes) plus what a chain's --destroy reads: the infra commits kept by
+    path (their listing), files downloaded and put by path. keep_old: a put that never takes (a Hub that keeps the
+    old copy); slow_infra_s: every infra commit takes that long."""
+
+    def __init__(self, run, remote=None, keep_old=False, slow_infra_s=0.0):
+        super().__init__(run)
+        self.remote, self.keep_old, self.slow = dict(remote or {}), keep_old, slow_infra_s
+        self.order, self.files_put = [], []
+
+    def create_commit(self, **kw):
+        time.sleep(self.slow)
+        super().create_commit(**kw)
+        self.order.append("infra")
+        for op in kw["operations"]:
+            self.remote[op.path_in_repo] = op.path_or_fileobj
+
+    def list_repo_tree(self, repo, path_in_repo=None, recursive=False, repo_type=None):
+        if path_in_repo and "/infra/" in path_in_repo:
+            self.order.append("listing")
+            return [SimpleNamespace(path=p, size=len(v)) for p, v in self.remote.items()
+                    if p.startswith(path_in_repo + "/")]
+        return super().list_repo_tree(repo, path_in_repo, recursive, repo_type)
+
+    def hf_hub_download(self, repo_id, filename, repo_type=None, local_dir=None):
+        if filename not in self.remote:
+            e = FileNotFoundError(f"404: {filename}")
+            e.response = SimpleNamespace(status_code=404)  # huggingface_hub's EntryNotFoundError: not retried
+            raise e
+        p = Path(local_dir) / filename
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(self.remote[filename])
+        return str(p)
+
+    def upload_file(self, path_or_fileobj=None, path_in_repo=None, repo_id=None, repo_type=None, commit_message=None):
+        self.files_put.append(path_in_repo)
+        self.order.append(f"put {path_in_repo}")
+        if not self.keep_old:
+            self.remote[path_in_repo] = Path(path_or_fileobj).read_bytes()
+
+
+def chain_state_dir(state: Path) -> dict:
+    """A chain box's state dir after its controller: chain.json, each part's records, the chain summary; returns the
+    Hub copies the controller put (repo path -> bytes)."""
+    files = {"chain/chain.json": {"box": CHAIN_BOX, "gate_box": "full-smoke", "gate": {"part": "full-smoke"}},
+             "chain/full-smoke/queue.json": {"box": "full-smoke"}, "chain/full-smoke/events.jsonl": None,
+             "chain/full-smoke/queue_summary.json": {"box": "full-smoke", "status": "complete"},
+             "chain/full-smoke/smoke_verdict.json": {"box": "full-smoke", "overall": "pass"},
+             "chain/full-smoke/logs/smoke-p03.log": None, "chain/smoke-b/queue_summary.json": {"box": "smoke-b"},
+             "chain/smoke-b/smoke_verdict.json": {"box": "smoke-b"}, "chain/p01/queue_summary.json": {"box": "p01"},
+             "chain/stage1/bootstrap_plan.json": {"record": "x"}, "queue_summary.json": {"kind": "chain"},
+             "download_gate.json": {"verdict": "pass"}, "watchdog_alerts.jsonl": None, "events.jsonl": None}
+    hub = {}
+    for rel, doc in files.items():
+        p = state / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps(doc).encode() if doc is not None else b'{"kind": "x"}\n'
+        p.write_bytes(data)
+        if rel == "queue_summary.json":
+            hub[fullrun.box_summary_path(CHAIN_BOX)] = data
+        elif rel.startswith("chain/") and rel.endswith(("queue_summary.json", "smoke_verdict.json")):
+            hub[f"full/box-{rel.split('/')[1]}/{Path(rel).name}"] = data
+    return hub
+
+
+@pytest.fixture
+def chain_finish(full_finish, monkeypatch):
+    monkeypatch.setenv("KITSUNE_BOX", CHAIN_BOX)
+    monkeypatch.setenv("KITSUNE_CHAIN_STAGE", "2")
+    monkeypatch.setattr(finish, "HUB_RETRY_WAITS", (0.01,))
+    hub_copies = chain_state_dir(full_finish.state)
+
+    def go(*args, **hub_kw):
+        hub = ChainHub(full_run(full_finish.state.parent), dict(hub_copies), **hub_kw)
+        monkeypatch.setattr(finish, "hf_api", lambda: hub)
+        rc = finish.main([*args, "--repo", RUNS, "--runs-root", str(full_finish.state.parent / "runs")])
+        return rc, hub
+    go.hub_copies, go.state = hub_copies, full_finish.state
+    return go
+
+
+def test_a_chains_destroy_verifies_its_records_after_a_synchronous_infra_upload(chain_finish, monkeypatch):
+    """E.7.2: the deep infra (chain/** included) goes up first, then every summary and verdict is compared with the
+    Hub's (a differing one put once and compared again), then the infra listing: destroy."""
+    actions = []
+    monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
+    chain_finish.hub_copies["full/box-smoke-b/queue_summary.json"] = b'{"box": "smoke-b", "old": true}'
+    rc, hub = chain_finish("--destroy")
+    assert rc == 0 and actions == ["destroy"]
+    assert hub.files_put == ["full/box-smoke-b/queue_summary.json"]
+    put = hub.order.index("put full/box-smoke-b/queue_summary.json")
+    assert hub.order.index("infra") < put < hub.order.index("listing") and hub.order[-1] == "infra", hub.order
+    infra = set(hub.commits[0])
+    dest = f"full/box-{CHAIN_BOX}/infra/C77"
+    for rel in ("chain/chain.json", "chain/full-smoke/events.jsonl", "chain/full-smoke/queue.json",
+                "chain/full-smoke/logs/smoke-p03.log", "chain/stage1/bootstrap_plan.json", "events.jsonl",
+                "download_gate.json", "watchdog_alerts.jsonl", "queue_summary.json"):
+        assert f"{dest}/{rel}" in infra, rel
+    ev = [json.loads(x) for x in (chain_finish.state / "events.jsonl").read_text().splitlines() if x.startswith("{")]
+    assert [e["problems"] for e in ev if e.get("kind") == "chain_verify"] == [[]]
+
+
+@pytest.mark.parametrize("hub_kw, why", [
+    (dict(keep_old=True), "the Hub's copy still differs"),
+    (dict(slow_infra_s=0.5), "did not finish within"),
+], ids=["put-does-not-take", "slow-infra"])
+def test_a_chain_whose_records_do_not_verify_is_stopped(chain_finish, monkeypatch, hub_kw, why):
+    actions = []
+    monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
+    monkeypatch.setattr(finish, "CHAIN_INFRA_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(finish, "INFRA_TIMEOUT_S", 0.2)
+    chain_finish.hub_copies["full/box-p01/queue_summary.json"] = b'{"box": "p01", "old": true}'
+    rc, hub = chain_finish("--destroy", **hub_kw)
+    assert rc == 2 and actions == ["stop"]
+    halt = json.loads((chain_finish.state / "halt").read_text(encoding="utf-8"))
+    assert halt["action"] == "stop" and halt["reason"].startswith("chain verification failed") and why in halt["reason"]
+
+
+def test_a_plain_full_box_and_a_chains_other_modes_are_unchanged(chain_finish, monkeypatch):
+    actions = []
+    monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
+    rc, hub = chain_finish("--stop", "--reason", "x")
+    assert rc == 0 and actions == ["stop"] and hub.files_put == [] and "listing" not in hub.order
+    monkeypatch.delenv("KITSUNE_CHAIN_STAGE")
+    rc, hub = chain_finish("--destroy")
+    assert rc == 0 and actions[-1] == "destroy" and hub.files_put == [] and "listing" not in hub.order
+

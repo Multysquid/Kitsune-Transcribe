@@ -99,3 +99,79 @@ def test_the_finish_beat_is_bounded_by_the_calls_timeout(tmp_path, monkeypatch):
     assert got == [("train_hb", 0.05, supervise.SYNC_TIMEOUT_S + 60),
                    ("train_hb", 0.05, supervise.FINISH_TIMEOUT_S["stop"] + 60)]
     assert json.loads((tmp_path / "state" / "supervise.json").read_text())["final"]["action"] == "stop"
+
+
+# ============================================================================== a chain box (contract addendum E)
+
+
+def chain_supervisor(tmp_path, monkeypatch, attempts):
+    """supervise_queue for a chain box: each attempt is (rc, the chain summary the controller leaves or None)."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    calls, finishes = [], []
+    plan = list(attempts)
+
+    def queue(argv, env):
+        rc, summ = plan.pop(0)
+        calls.append(rc)
+        p = state / "queue_summary.json"
+        if summ is None:
+            p.unlink(missing_ok=True)
+        else:
+            p.write_text(json.dumps(summ), encoding="utf-8")
+        return rc
+
+    monkeypatch.setattr(supervise, "run_trainer", queue)
+    monkeypatch.setattr(supervise, "call_finish", lambda args, timeout=None: finishes.append(list(args)) or 0)
+    rc = supervise.supervise_queue(["python", "-m", "kitsune.full_queue", "run", "--box", "p01-chain"],
+                                   state / "supervise.json", hb=state / "train_hb")
+    return rc, calls, finishes, json.loads((state / "supervise.json").read_text(encoding="utf-8"))
+
+
+def chain_summary(status="running", stage=1, rc=None, reason=None, box="p01-chain"):
+    return {"format": 1, "kind": "chain", "box": box, "status": status, "stage": stage, "rc": rc, "reason": reason}
+
+
+def test_a_chain_that_ended_before_box_1_is_destroyed_without_a_sync(tmp_path, monkeypatch):
+    """Exit 5 with its chain summary (gate_failed, or failed: a stage-2 bootstrap) destroys, with no --sync-only before
+    it (finish --destroy verifies the chain's records on the Hub)."""
+    for status in ("gate_failed", "failed"):
+        rc, calls, finishes, st = chain_supervisor(
+            tmp_path / status, monkeypatch, [(5, chain_summary(status, stage=1 if status == "gate_failed" else 2,
+                                                                rc=5, reason="chain gate failed: checks ['2']"))])
+        assert rc == 5 and [f[0] for f in finishes] == ["--destroy"], finishes
+        assert st["final"]["action"] == "destroy" and "chain ended before box 1 trained" in st["final"]["reason"]
+        assert "chain gate failed" in st["final"]["reason"]
+
+
+@pytest.mark.parametrize("summ", [None, {"kind": "full", "box": "p01", "status": "failed"},
+                                  chain_summary("running"), chain_summary("gate_failed", box="p01")],
+                         ids=["no-summary", "a-queue-summary", "a-running-chain", "not-a-chain-name"])
+def test_any_other_exit_5_is_an_ordinary_failure(tmp_path, monkeypatch, summ):
+    rc, calls, finishes, st = chain_supervisor(tmp_path, monkeypatch, [(5, summ), (0, summ)])
+    assert calls == [5, 0] and st["final"]["action"] == "destroy" and st["final"]["reason"].endswith("(exit 0)")
+    assert supervise.decide_queue(5, 1, "x", summ)[0] == "restart"
+
+
+def test_a_chains_restart_budget_is_per_stage(tmp_path, monkeypatch):
+    """Two stage-1 failures, then one in stage 2: restarted (3 failures in all, but only 1 of stage 2's); a third in
+    stage 2 exceeds its budget: stop. Every attempt records its stage."""
+    s1, s2 = chain_summary(stage=1), chain_summary(stage=2)
+    rc, calls, finishes, st = chain_supervisor(tmp_path, monkeypatch, [(1, s1), (1, s1), (1, s2), (0, s2)])
+    assert calls == [1, 1, 1, 0] and st["final"]["action"] == "destroy"
+    assert [a["stage"] for a in st["attempts"]] == [1, 1, 2, 2]
+    assert [f[0] for f in finishes] == ["--sync-only"] * 3 + ["--destroy"]
+    rc, calls, finishes, st = chain_supervisor(tmp_path / "b", monkeypatch, [(1, s1), (1, s2), (1, s2), (1, s2)])
+    assert calls == [1, 1, 1, 1] and st["final"]["action"] == "stop" and "failed 3 times" in st["final"]["reason"]
+
+
+def test_the_study_and_plain_full_paths_count_every_failure_as_before(tmp_path, monkeypatch):
+    """Without a chain summary every attempt's stage is None: one budget, as before (3 failures -> stop)."""
+    rc, calls, finishes, st = chain_supervisor(tmp_path, monkeypatch, [(1, None), (1, None), (1, None)])
+    assert calls == [1, 1, 1] and st["final"]["action"] == "stop"
+    assert [a["stage"] for a in st["attempts"]] == [None, None, None]
+    assert supervise.decide_queue(0, 0) == ("destroy", "study queue finished (exit 0)")
+    assert supervise.decide_queue(4, 1)[0] == "stop" and supervise.decide_queue(3, 1)[0] == "stop"
+    from kitsune import fullrun
+
+    assert supervise.CHAIN_NAMES == fullrun.CHAIN_NAMES  # supervise stays stdlib-only: a copy

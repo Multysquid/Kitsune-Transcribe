@@ -57,6 +57,15 @@ over (a slow download gate, a refused plan): the infra goes up (bounded), then t
 dir (nothing on its disk is unique yet: a failed bootstrap, the gate's refusal) and stopped once it has one (a resume
 pulled run dirs, or training began); a slow download_gate.json gives the reason. For every other job --abort is
 --stop --no-sync, resolved before the label dispatch.
+
+A chain box (KITSUNE_CHAIN_STAGE set; contract addendum E): the deep infra also holds $KITSUNE_STATE/chain/ (chain.json,
+stage 1's bootstrap records, every part's queue state, events, logs, summaries and verdicts; each file its last 32
+MB). Its --destroy - after p01 completed, or when the chain ended before box 1 trained (a failed gate, a failed
+stage-2 bootstrap) - does more after the lean sync and the run-dir verification: the deep infra upload synchronously
+(within CHAIN_INFRA_TIMEOUT_S), then the chain's summary and every part's summary and verdict compared byte for byte
+with the Hub's (a missing or different one is put once and compared again), then the infra listing (the chain's
+events, chain.json, the gate part's events and queue.json, the download gate, the watchdog's alerts). Any problem
+stops the box instead (exit 2), as a failed verification does.
 """
 import argparse
 import hashlib
@@ -107,6 +116,11 @@ UPLOAD_MARK = ".upload_pending"
 SCRATCH_MARK = ".scratch_pending"
 MARKERS = (UPLOAD_MARK, SCRATCH_MARK)
 GATE_FILE = "download_gate.json"  # kitsune.fullrun.GATE_FILE: the full box's download gate record in STATE_DIR
+# a chain box (contract addendum E; KITSUNE_CHAIN_STAGE set): kitsune.fullrun's CHAIN_DIR / CHAIN_STATE / ALERTS_FILE /
+# SUMMARY_FILE / VERDICT_FILE, and how long its --destroy waits for the synchronous deep infra upload it verifies
+CHAIN_DIR, CHAIN_STATE, ALERTS_FILE = "chain", "chain.json", "watchdog_alerts.jsonl"
+SUMMARY_FILE, VERDICT_FILE = "queue_summary.json", "smoke_verdict.json"
+CHAIN_INFRA_TIMEOUT_S = 900
 HASH_CHUNK = 8 << 20
 EXIT_INTEGRITY = 65  # label mode: a write-once conflict or a sealed root (vast/label.py ends such a box with a stop)
 SYNC_LOCK_WAIT_S = 1500  # label mode: sync.lock is polled up to 25 min, then the sync is skipped
@@ -394,8 +408,8 @@ def infra_files(deep: bool = False) -> list[tuple[str, Path]]:
     out = [(Path(p).name, Path(p)) for p in INFRA_LOGS]
     if STATE_DIR.is_dir():
         out += [(f.name, f) for f in sorted(STATE_DIR.glob("*"))]
-        if deep:
-            for sub in [STATE_DIR / "logs", *sorted(STATE_DIR.glob("rearm-*"))]:
+        if deep:  # a chain box: chain/ (chain.json, stage1/, each part's queue.json, events, logs, summaries, verdicts)
+            for sub in [STATE_DIR / "logs", STATE_DIR / CHAIN_DIR, *sorted(STATE_DIR.glob("rearm-*"))]:
                 if sub.is_dir():
                     out += [(f.relative_to(STATE_DIR).as_posix(), f) for f in sorted(sub.rglob("*"))]
     return [(n, f) for n, f in out if f.is_file() and not f.name.endswith(".lock")]
@@ -624,7 +638,106 @@ def main(argv: list[str] | None = None) -> int:
     if problems:
         why = f"verification failed ({len(problems)} problems); {args.reason}".rstrip("; ")
         return 2 if instance_action("stop", why, args.dry_run, push_infra) else 1
+    if args.job == "full" and is_chain_box():  # addendum E.7.2: what the Hub must hold before the disk goes
+        chain_problems = chain_checks(api, args.repo, args.repo_type, infra_dest, args.dry_run)
+        if chain_problems:
+            why = f"chain verification failed: {'; '.join(chain_problems[:5])}"
+            return 2 if instance_action("stop", why, args.dry_run, push_infra) else 1
     return 0 if instance_action("destroy", args.reason or "run verified on the hub", args.dry_run, push_infra) else 1
+
+
+# ---------------------------------------------------------------------------------------------------------- chain
+
+def is_chain_box() -> bool:
+    """A chain box (vast/launch.py sets KITSUNE_CHAIN_STAGE on one, and its controller on its stage-2 bootstrap)."""
+    return bool(os.environ.get("KITSUNE_CHAIN_STAGE"))
+
+
+def _hub_sha256(api, repo: str, repo_type: str, path: str, tmp: Path) -> str | None:
+    """sha256 of a fresh download of the repo file (each into its own dir: never a cached older copy), or None when
+    the repo lacks it or it cannot be read."""
+    dest = Path(tempfile.mkdtemp(dir=tmp))
+    try:
+        got = hub_retry(lambda: api.hf_hub_download(repo_id=repo, filename=path, repo_type=repo_type,
+                                                    local_dir=str(dest)), f"download {path}")
+        return sha256_file(Path(got))
+    except Exception as e:  # noqa: BLE001  missing (404) or unreadable: the caller puts it and compares again
+        log(f"{path}: not read from {repo} ({type(e).__name__}: {e})")
+        return None
+
+
+def verify_chain(api, repo: str, repo_type: str) -> list[str]:
+    """The chain's records on the Hub, byte for byte (the sha256 of a downloaded copy): its summary at
+    full/box-<KITSUNE_BOX>/, and each part's summary and verdict at full/box-<part>/ (the standalone boxes' paths, which
+    box 2's of_box and the report read). A missing or different file is put once and compared again."""
+    box = os.environ.get("KITSUNE_BOX") or "unknown"
+    pairs = [(STATE_DIR / SUMMARY_FILE, f"full/box-{box}/{SUMMARY_FILE}")]
+    chain = STATE_DIR / CHAIN_DIR
+    for d in sorted(p for p in (chain.iterdir() if chain.is_dir() else ()) if p.is_dir() and p.name != "stage1"):
+        pairs += [(d / n, f"full/box-{d.name}/{n}") for n in (SUMMARY_FILE, VERDICT_FILE) if (d / n).is_file()]
+    problems = []
+    with tempfile.TemporaryDirectory(prefix="kitsune-finish-") as tmp:
+        for local, path in pairs:
+            if not local.is_file():
+                problems.append(f"{local} is not on the box")
+                continue
+            want = sha256_file(local)
+            if _hub_sha256(api, repo, repo_type, path, Path(tmp)) == want:
+                continue
+            log(f"{path}: not the box's copy on the Hub; putting it once more")
+            try:
+                hub_retry(lambda: api.upload_file(path_or_fileobj=str(local), path_in_repo=path, repo_id=repo,
+                                                  repo_type=repo_type, commit_message=f"finish: chain {path}"),
+                          f"put {path}")
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"{path}: the put failed ({type(e).__name__}: {e})")
+                continue
+            if _hub_sha256(api, repo, repo_type, path, Path(tmp)) != want:
+                problems.append(f"{path}: the Hub's copy still differs from {local} after a put")
+    return problems
+
+
+def chain_gate_box() -> str | None:
+    """The chain's gate part (chain.json gate_box, else its gate record's part)."""
+    try:
+        st = json.loads((STATE_DIR / CHAIN_DIR / CHAIN_STATE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(st, dict):
+        return None
+    return st.get("gate_box") or (st.get("gate") or {}).get("part")
+
+
+def chain_checks(api, repo: str, repo_type: str, infra_dest: str, dry_run: bool) -> list[str]:
+    """A chain box's --destroy, after the lean sync and the run-dir verification (addendum E.7.2), in order: (a) the
+    deep infra upload, synchronously and within CHAIN_INFRA_TIMEOUT_S (its failure is a problem); (b) verify_chain;
+    (c) the infra listing holds the chain's events, chain.json, the gate part's events and queue.json, the download gate
+    record and the watchdog's alerts when there are any. On a failed gate this is decision D3's "verify the verdict,
+    logs and events on the Hub, then destroy". The problems (empty: destroy)."""
+    if api is None:
+        return ["no HF output repo or huggingface_hub: the chain's records cannot be verified"]
+    problems = []
+    if not best_effort(lambda: upload_infra(api, repo, repo_type, infra_dest, dry_run, deep=True),
+                       "infra upload (chain)", timeout=CHAIN_INFRA_TIMEOUT_S):
+        problems.append(f"the infra upload to {infra_dest} failed or did not finish within {CHAIN_INFRA_TIMEOUT_S} s")
+    if dry_run:
+        log("dry run: would verify the chain's summaries and verdicts and list its infra")
+        return problems
+    problems += verify_chain(api, repo, repo_type)
+    gate = chain_gate_box()
+    want = ["events.jsonl", f"{CHAIN_DIR}/{CHAIN_STATE}", GATE_FILE]
+    want += [f"{CHAIN_DIR}/{gate}/events.jsonl", f"{CHAIN_DIR}/{gate}/queue.json"] if gate else []
+    want += [ALERTS_FILE] if (STATE_DIR / ALERTS_FILE).is_file() else []
+    if gate is None:
+        problems.append(f"{STATE_DIR / CHAIN_DIR / CHAIN_STATE} names no gate part")
+    try:
+        listing = hub_retry(lambda: remote_listing(api, repo, repo_type, infra_dest), f"listing {infra_dest}")
+        have = {p[len(infra_dest) + 1:] for p in listing if p.startswith(infra_dest + "/")}
+        problems += [f"{infra_dest}/{w} is not on the Hub" for w in want if w not in have]
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"{infra_dest}: cannot list it ({type(e).__name__}: {e})")
+    event("chain_verify", problems=problems[:50])
+    return problems
 
 
 def gate_reason() -> str | None:
