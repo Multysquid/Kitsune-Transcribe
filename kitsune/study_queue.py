@@ -279,8 +279,11 @@ def shm_fit(workers: int, prefetch: int, micro_audio_s: float, budget: float) ->
 
 
 def auto_workers() -> int:
-    """perf.num_workers "auto" on the box, as kitsune.trainset.default_num_workers resolves it on Linux."""
-    return max(1, min(8, (os.cpu_count() or 2) // 2))
+    """perf.num_workers "auto" on the box, as kitsune.trainset.default_num_workers resolves it on Linux: half of one
+    GPU's share of the usable CPUs (kitsune.ctc_preflight.per_gpu_cpus), at most 8."""
+    from kitsune.ctc_preflight import per_gpu_cpus
+
+    return max(1, min(8, per_gpu_cpus() // 2))
 
 
 # ============================================================================================================ plans

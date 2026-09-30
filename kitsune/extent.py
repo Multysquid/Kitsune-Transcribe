@@ -25,7 +25,8 @@ Files:
     <root>/extent.json           build_record, at the label box's finalize: every upstream input of every ingested
                                  source with the stems it produced (split, step, rows, hours, ids_sha256, shard_bytes)
 The A100 reads extent.json to pull only a subset's label files (pull_plan), to size its disk and rebuild timeout
-(sizing) and to check that its rebuilt stems are the labelled ones (the sidecars' ids_sha256 against the record's).
+(sizing) and to check that its rebuilt stems are the labelled ones (the sidecars' ids_sha256 against the record's; the
+ids of each stem come from the label root label_root_for names: parakeet_out on a CTC box without pull_parakeet).
 
 Pure Python (stdlib + kitsune.store); no torch.
 """
@@ -427,6 +428,16 @@ def subset_stems(record: dict, cfg: dict) -> dict[str, set[str]]:
         if src in out:
             out[src].add(st["stem"])
     return out
+
+
+def label_root_for(cfg: dict, name: str, stem: str) -> str:
+    """Which label root holds the ids of stem `stem` of source/eval set `name` on a box that pulled pull_plan(cfg):
+    "parakeet" for a CTC run without pull_parakeet (box 1: parakeet_out for every stem, teacher_out only for the eval
+    stems of its eval sets), except those eval stems; "teacher" otherwise (an AED run, or both roots pulled). The one
+    rule pull_plan's teacher_all applies, for bootstrap's extent and coverage checks (fix 9)."""
+    ctc_only = cfg.get("family", "aed") == "ctc" and not cfg.get("pull_parakeet")
+    teacher_eval = name in (cfg.get("eval_sets") or []) and stem.startswith("eval-")
+    return "parakeet" if ctc_only and not teacher_eval else "teacher"
 
 
 def pull_plan(cfg: dict, record: dict, files: list[str]) -> dict:

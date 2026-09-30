@@ -1854,7 +1854,10 @@ def main(argv=None) -> int:
                 D.setup_model(R, grad_ckpt=False)
                 D.setup_processing(R)
             ctx.R = R
-            ctx.feat = Guarded(R.feat_eval, ctx.guard) if ctx.guard else R.feat_eval
+            from kitsune import heartbeat  # a queue item beats $KITSUNE_HEARTBEAT per batch (its stall check); once
+            feat = R.feat_eval if isinstance(R.feat_eval, heartbeat.Beating) or not os.environ.get(heartbeat.ENV) \
+                else heartbeat.Beating(R.feat_eval)
+            ctx.feat = Guarded(feat, ctx.guard) if ctx.guard else feat
             if todo:
                 run_pass(ctx, todo)
             if do_probe:
