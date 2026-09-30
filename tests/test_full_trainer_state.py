@@ -284,11 +284,13 @@ def test_timed_saves_carry_the_mark_and_a_same_step_one_reuses_the_dir(tmp_path,
     assert (d / "model.pt").read_bytes() == weights
     assert (saved(d)["reason"], saved(d)["st"]["last_timed_step"], saved(d)["st"]["last_timed_t"]) == ("timed", 4, 7.0)
     assert json.loads((d / "trainer.json").read_text(encoding="utf-8"))["reason"] == "timed"
+    R.st["dev_history"] = [dict(step=2, dev_ce=1.0)]  # WP4a's dev evals: in trainer.pt, never in the brief
     d6 = m.save_full(R, 6, m.TIMED_REASON, scratch=True)
     assert (d6 / m.SCRATCH_MARK).exists() and not (d6 / m.UPLOAD_MARK).exists()
     brief = json.loads((d6 / "trainer.json").read_text(encoding="utf-8"))
     assert brief["reason"] == "timed" and brief["host"]["container_id"] == "c42"
     assert saved(d6)["host"] == brief["host"]
+    assert "dev_history" not in brief["st"] and saved(d6)["st"]["dev_history"] == [dict(step=2, dev_ce=1.0)]
 
     # a study run (no scratch uploader): a pre_cooldown state at an existing step is not rewritten, as before
     evs.clear()

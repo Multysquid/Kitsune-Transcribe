@@ -3193,7 +3193,10 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False, keep: bool =
                        planner=R.planner.state_dict(), logger=R.log.state_dict(), rng=_rng_state(),
                        time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"), host=host_info())
         brief = {k: v for k, v in trainer.items() if k not in ("rng", "st")}
-        brief["st"] = {k: v for k, v in st.items() if k not in ("history", "smoke_losses", "mini_history")}
+        # the growing per-eval lists stay in trainer.pt only (dev_history: the full runs' dev evals, WP4a; one record
+        # per dev eval in every state's brief would only grow it)
+        brief["st"] = {k: v for k, v in st.items()
+                       if k not in ("history", "smoke_losses", "mini_history", "dev_history")}
         return trainer, brief, st
 
     if not (d.exists() and step in R.st["fulls"]):
