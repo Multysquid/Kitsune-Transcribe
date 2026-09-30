@@ -52,7 +52,9 @@ tools/               export_run.py: a run -> parquet/CSV tables + README; regrou
                      study_report.py: the size study's pre-registered answer and readouts from every system's eval
                      tables (statistics in kitsune/study_stats.py); full_report.py: the full-data runs' descriptive
                      report on the same manifest (offer table, study -> full, quantised variants, Whisper, the
-                     error-vs-speed charts)
+                     error-vs-speed charts); make_full_configs.py: the full-data runs' trainer and data configs
+                     configs/full/*.json from the study's generator (--check also validates the hand-written box
+                     registry configs/full/boxes.json; --import-plan records a new tools/full_plan.py measurement)
 vast/                training image, CI build and the vast.ai run scripts: the A100 training run and the RTX 5090
                      label box that labels the full download with both teachers (see vast/README.md)
 python -m kitsune.prereg  the size study's pre-registration: --write study/ regenerates study/PREREG.{json,md} from
