@@ -9,6 +9,8 @@ event, 4e (scalars.parquet at close: tests/test_runlog.py) and fix 7 (the lean s
   .json are rewritten (reason and cadence; a pre_cooldown state at an existing step too, in a run with timed states,
   after waiting for a timed upload of that dir); trainer.pt/.json name the host
 - a busy upload: one timed_state_skipped per missed due window, with the upload's running_s
+- a crash that cut a timed upload short: the resume sends the state it resumes from at once; a resume without a
+  scratch repo drops the marks instead
 - build: a run asking for timed states with an output repo but no scratch repo is refused before its logger exists; no
   output repo: timed states skipped; the new-host guard refuses a state that records its host in a run dir without
   events.jsonl, before anything is written
@@ -632,6 +634,54 @@ def test_a_timed_state_at_a_periodic_step_records_itself(env, monkeypatch):
         "pre_cooldown", True, "full_step_5")
     assert "full_step_5" in [e["name"] for e in events(run, "ckpt_upload_ok")]
     assert not list(run.rglob(m.SCRATCH_MARK))
+
+
+def test_a_crash_during_a_timed_upload_sends_the_state_again_on_resume(env, monkeypatch, tmp_path):
+    """A crash cuts the upload of the newest timed state short (its dir keeps SCRATCH_MARK; the scratch repo still
+    holds the state before it). The resume on the same host sends the state it resumes from at once, before any window
+    falls due, so the scratch repo is not two windows behind. A hand resume of the same crash without a scratch repo
+    drops the mark instead, so rotation no longer keeps that dir."""
+    hub = ScratchHub()
+    snaps = {}
+
+    def snap(sc, local):  # the scratch repo right after each upload
+        with hub.lock:
+            snaps[int(local.name.split("_")[-1])] = dict(hub.repos[SCRATCH])
+
+    m = trainer(monkeypatch, hub, synchronous=True, after=snap)
+    monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "8")
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        m.main(["--config", write_config(env, "requeue", TIMED)])
+    monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
+    run = one_run(env["root"], "requeue")
+    rid = run.name
+    with hub.lock:  # the crash cut the upload of full_step_7 short: the Hub holds full_step_6, the dir keeps its mark
+        hub.repos[SCRATCH] = dict(snaps[6])
+    (run / "checkpoints" / "full_step_7" / m.SCRATCH_MARK).touch()
+    assert pointer(hub, rid)["step"] == 6
+    hand = tmp_path / "hand" / "runs" / rid
+    shutil.copytree(run, hand)
+
+    # the same host resumes, with a cadence that lets nothing fall due: only the state resumed from goes up
+    n_ok = len(events(run, "timed_state_upload_ok"))
+    assert m.main(["--resume", str(run), "--set", "ckpt.upload_full_every_min=1000"]) == 0
+    again = events(run, "timed_state")[-1]
+    assert (again["name"], again["step"], again["requeued"]) == ("full_step_7", 7, True)
+    assert [e["step"] for e in events(run, "timed_state_upload_ok")[n_ok:]] == [7]
+    assert pointer(hub, rid)["step"] == 7 and run_states(hub, rid) == ["full_step_7"]
+    assert pointer(hub, rid)["host"] == events(run, "resume")[-1]["prev_host"]  # the host that saved it
+    assert not list(run.rglob(m.SCRATCH_MARK))
+    timed = json.loads((run / "summary.json").read_text(encoding="utf-8"))["timed_states"]
+    assert timed["count"] == 7 and timed["last"]["step"] == 7
+
+    # by hand, without the scratch repo: the mark is dropped, and the dir is rotated away like any other
+    commits = len(hub.commits)
+    assert m.main(["--resume", str(hand), "--set", "hf.scratch_repo=null", "--set", "ckpt.upload_full_every_min=null",
+                   "--set", "ckpt.keep_local=1"]) == 0
+    assert events(hand, "resume")[-1]["scratch_marks_dropped"] == ["full_step_7"]
+    assert not list(hand.rglob(m.SCRATCH_MARK))
+    assert sorted(p.name for p in (hand / "checkpoints").iterdir() if p.name.startswith("full_")) == ["full_step_10"]
+    assert not [c for c in hub.commits[commits:] if c["repo"] == SCRATCH]
 
 
 def test_a_new_host_resumes_from_the_scratch_state_and_the_hubs_older_logs(env, monkeypatch, tmp_path):

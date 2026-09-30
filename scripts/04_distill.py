@@ -246,12 +246,13 @@ Full-data runs: timed states, heartbeats, 4e, fix 7 (the full-run build contract
                     a time: a state due while one runs waits for it (no local save; one timed_state_skipped per due
                     window it misses, with the running upload's running_s, so a hung one shows). The uploads are never
                     awaited - the end phase and the failure path cancel the queued ones - except by a trainer-only
-                    rewrite of the same step's dir (end, kept fraction, pre_cooldown), for at most UPLOAD_WAIT_S. After
-                    a timed upload went up, and after the pre_cooldown state is queued for the runs repo, the loop
-                    forces a log sync (sync_due), so the Hub's logs are as fresh as the newest state. With
-                    hf.output_repo set it needs hf.scratch_repo (build refuses: the full-run queue passes it); without
-                    an output repo timed states are skipped (one timed_state_skipped). summary.json: timed_states
-                    {repo, count, last}
+                    rewrite of the same step's dir (end, kept fraction, pre_cooldown), for at most UPLOAD_WAIT_S. A
+                    resume whose checkpoints/ still hold SCRATCH_MARK (a crash cut an upload short) sends the state it
+                    resumes from at once; one without a scratch uploader drops such marks. After a timed upload went
+                    up, and after the pre_cooldown state is queued for the runs repo, the loop forces a log sync
+                    (sync_due), so the Hub's logs are as fresh as the newest state. With hf.output_repo set it needs
+                    hf.scratch_repo (build refuses: the full-run queue passes it); without an output repo timed states
+                    are skipped (one timed_state_skipped). summary.json: timed_states {repo, count, last}
   resume on a new host  (4b) trainer.pt/.json name the saving host; the `resume` event has host, prev_host and
                     new_host. With hf.output_repo set, a resume of a state that records its host refuses a run dir
                     without events.jsonl (a new host must pull the run's logs first: kitsune.full_queue resume-pull; the
@@ -3351,6 +3352,43 @@ def abandon_timed(R: Run, why: str = "end"):
         R.log.event("timed_state_upload_abandoned", names=left, at=why)
 
 
+def requeue_timed(R: Run, full: Path, state: dict):
+    """A resume (train; never a T/2 branch's start) whose checkpoints/ still hold SCRATCH_MARK: a crash cut a timed
+    upload short (the full-run queue retries on the same host), so the scratch repo is a window or more behind, and
+    nothing else would send a state before the next due window - a host that died meanwhile would cost up to two
+    windows of training. The state resumed from (the newest one left: newer ones were set aside) goes up at once,
+    marked as a timed save is; its pointer names the host that saved it, and bytes the Hub already holds only dedup.
+    No save, and the cadence stays the state's. Not for an LR probe (no timed states) nor a run that goes straight to
+    its end phase (early_stop.stop: the end phase would cancel it or wait for it). One `timed_state` event, requeued."""
+    sc = getattr(R, "scratch", None)
+    if sc is None or lr_probe_on(R.cfg) or R.st["early_stop"]["stop"]:
+        return
+    if not any((p / SCRATCH_MARK).is_file() for p in R.ckpt_dir.iterdir() if FULL_RE.match(p.name)):
+        return
+    from kitsune.scratch import host_info
+
+    step = int(state["step"])
+    (full / SCRATCH_MARK).touch()  # as a timed save's: rotation keeps it until the upload ends, a crash retries it
+    sc.submit(full, full.name, meta=dict(timed_meta(R, step), host=state.get("host") or host_info()))
+    R.log.event("timed_state", name=full.name, step=step, epoch=R.st["epoch_progress"], requeued=True)
+
+
+def drop_scratch_marks(ckpt_dir: Path) -> list[str]:
+    """A resume without a scratch uploader (hf.scratch_repo unset, e.g. by hand on another host) of a run that sent
+    timed states: nothing will ever send the dirs a crash left SCRATCH_MARK in, so the marks go - rotate_full would
+    otherwise pin the newest marked ~9 GB dir for the rest of the run, and the runs repo's uploads (which ignore only
+    UPLOAD_MARK then) would carry the empty file. Returns the dirs' names (the `resume` event)."""
+    names = []
+    for p in sorted(ckpt_dir.iterdir()) if ckpt_dir.is_dir() else ():
+        if FULL_RE.match(p.name) and (p / SCRATCH_MARK).is_file():
+            try:
+                (p / SCRATCH_MARK).unlink()
+                names.append(p.name)
+            except OSError:
+                pass  # kept: rotation then keeps this dir too, as before
+    return names
+
+
 def _timed_last(R: Run, sc, n: int | None = None) -> dict | None:
     """st["timed"] with the uploads that went up since the loop last looked (sc.ok[sc.seen:n]) folded in."""
     last = R.st.get("timed")
@@ -4100,10 +4138,12 @@ def build(args) -> tuple[Run, dict | None]:
         host, prev = host_info(), state.get("host")
         new_host = None if prev is None else any(prev.get(k) != host[k] for k in ("hostname", "machine_id",
                                                                                    "container_id"))
+        # no scratch uploader: marks a timed upload cut short left behind go (with one, train() sends the state)
+        dropped = drop_scratch_marks(R.ckpt_dir) if getattr(R, "scratch", None) is None else []
         R.log.event("resume", from_state=str(full), at_step=state["step"], overrides=overrides, unchanged=repeated,
                     config_arg_ignored=args.config, set_aside=moved, upload_again=again,
                     **({"upload_again_fracs": again_fracs} if again_fracs else {}), host=host, prev_host=prev,
-                    new_host=new_host)
+                    new_host=new_host, **({"scratch_marks_dropped": dropped} if dropped else {}))
         for name in ([again] if again else []) + again_fracs:
             R.uploader.submit(R.ckpt_dir / name, name)
     return R, state
@@ -4205,6 +4245,9 @@ def train(R: Run, state: dict | None) -> int:
         else:
             log.event("resumed", at_step=R.st["step"], train_s=round(R.st["train_s"], 1),
                       epoch=R.st["epoch_progress"], planner=state["planner"])
+            # a timed upload a crash cut short: the state resumed from goes to the scratch repo now (after every
+            # refusal of the resume, so a refused one sends nothing)
+            requeue_timed(R, full, state)
     else:
         if cfg["smoke"]["enabled"]:
             log.event("phase", name="smoke")
