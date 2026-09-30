@@ -870,3 +870,57 @@ A dead or stopped box continues elsewhere from what the Hub has:
   the box's own label prefix `kitsune-full-<box>-<data config stem>-` (not `kitsune-full-<box>*`, which for box `full`
   would also match the smoke box's `kitsune-full-full-smoke-...`): destroy the old box first, two boxes must never
   write the same run dirs.
+
+### The chained box: smoke A, smoke B and box 1 on one rental (`p01-chain`)
+
+Owner decision D (2026-09-30; contract addendum E): smoke A, smoke B and box 1 run on ONE 1x RTX 5090, with an
+automatic gate between them. `p01-chain` is a registry entry that names the boxes `full-smoke`, `smoke-b` and `p01` as
+its **parts**, in two stages; it has no items of its own. `python -m kitsune.full_queue run --box p01-chain` (what
+supervise.py runs) is its controller (`ChainController`), which runs the parts one at a time, each an unchanged box
+queue with its own state dir `$KITSUNE_STATE/chain/<part>/`, writing its summary and verdict at the standalone box's
+Hub paths (`full/box-<part>/...`): box 2's `of_box: p01`, the report and a box-1 resume read them as they are. The
+standalone boxes stay defined as fallbacks.
+
+```powershell
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01-chain --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+```
+Look-only first, then the same line with `--yes`. Re-check the machine's free disk right before renting (the chain
+asks for box 1's disk, ~1,450 GB). The disk and the download gate are sized on box 1's extent (with the chain's
+`extra_gb` 120: p01's own 25 GB and ~95 GB of stage-1 leftovers), the boot's rebuild on the smoke (study) extent. Launch
+refuses `--config`, `--gate-hours 0`, `--max-hours` below 30 (stage 1's 10.5 h + box 1's 19.5 h; a warning below the
+chain's 35 h) and every resume flag, and prints the chain's deadlines: the gate part by first boot + 9 h, stage 1 by
++ 10.5 h, the cap.
+
+What happens on the box:
+
+| step | what | watchdog |
+|---|---|---|
+| boot | bootstrap on the study extent (`KITSUNE_CHAIN_STAGE=1`: the stage-1 view pulls both parts' students, extra files and both selections) | alert 600 (stage 1's env) |
+| smoke A | the `full-smoke` part until `gate_by` (first boot + 9 h: its deadline and stop time; its items' `KITSUNE_DEADLINE` 20 min before) | alert 600: F5's frozen heartbeat must be alerted, never stopped |
+| mode switch | the controller writes `$KITSUNE_STATE/watchdog_mode` = `stop 3600` as soon as smoke A returns, before the gate | stop 3600 from here on |
+| the gate | automatic: smoke A's verdict checks 1-11 all true, the part's rc 0, the verdict its own and of this commit; recorded once (event `chain_gate`, `chain/chain.json`, the chain summary) | |
+| smoke B | the `smoke-b` part until the stage-1 sub-deadline (first boot + 10.5 h), pass or fail: report only (checks 12-16 never gate); one retry, then recorded as failed | |
+| gate failed | exit 5: finish verifies the verdict, summaries, logs and events on the Hub, then **destroys** (a failed verification stops) | |
+| stage 2 | stage 1's bootstrap records to `chain/stage1/`; box 1 must still fit (else exit 5, destroy); the stage-2 bootstrap (`KITSUNE_CHAIN_STAGE=2`, the full CTC-only extent on the same data root: 01 reuses the study extent's shards, coverage checks every stem) runs as the controller's child, bounded by its own budget and by box 1's fit; rc 2/3 are not retried, anything else once; a failure or its bound exits 5 (destroy: nothing unique is on the disk) | |
+| box 1 | the `p01` part (stores-ctc, full-p01, m4-full-p01): its rc is the chain's (0 destroy, 4 stop with the disk kept, 1 a restart that resumes it) | |
+
+- **Heartbeat:** the controller beats `train_hb` only between steps: never while a part runs (its queue beats, and
+  F5's freeze must hold) nor while the stage-2 bootstrap runs (its phases' bounded touchers keep it fresh, 3 h at most
+  for a phase without a timeout, so a hung phase goes stale and the watchdog stops the box).
+- **A stage 1 that never hands over:** with no mode file by first boot + 9.5 h (`KITSUNE_WATCHDOG_HANDOVER_S`), the
+  watchdog syncs and **stops** the box, whatever the heartbeat says (a hung controller may hold files the owner reads).
+- **A halt that did not take:** a halt marker written during the container's life, 20 min old with the instance still
+  up (a failed stop or destroy REST call): the watchdog requests the stop again every 5 min.
+- **Restarts:** the supervisor restarts the controller at most twice per stage; `chain/chain.json` records every step,
+  so ended parts are not run again and the gate is never evaluated twice; a stage-2 bootstrap left running is killed
+  when `/proc` shows it is that process (its start time and command line), else ignored, and started again.
+- **Watching it:** the chain summary `full/box-p01-chain/queue_summary.json` (stage, step, gate, each part's status,
+  both verdicts' checks); each part's own summary and verdict at `full/box-<part>/`; on the box
+  `$KITSUNE_STATE/chain/<part>/logs/` and `$KITSUNE_STATE/logs/bootstrap-s2.log`; at the end the infra folder
+  `full/box-p01-chain/infra/<container>/` with `chain/` (chain.json, stage1/, every part's records).
+- **A chain is not resumed as a chain** (`launch --box p01-chain --resume` exits 1, `resume-pull` exits 3, both say
+  what to run): dead in stage 1 (the gate null or failed) -> the chain again, fresh; dead in stage 2 after p01 started
+  on that rental -> `--box p01 --resume ...` (stage 2's part is box p01: its Hub summary, timed states and run ids are
+  box 1's, and launch checks that the Hub's p01 summary is that rental's); dead during the stage-2 bootstrap -> `--box
+  p01` fresh or the chain fresh (the owner's call: the gate passed on the old machine only).
+- **Cost** (addendum E.9.5, m54650's rates): ~25.2 h central, ~$21; the 35 h cap ~$29.3; a failed gate ~6.6 h, ~$5.5.
