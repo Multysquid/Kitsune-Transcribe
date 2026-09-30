@@ -904,6 +904,8 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     assert len(s["chain"]) == 1 and "chain preflight ok" in out and "part p01: p01 preflight ok" in out
     assert "x ~25.2 h (box p01-chain; watchdog cap 35 h)" in out
     assert "chain p01-chain: the gate part must end by first boot + 9 h" in out and "+ 9.5 h" in out
+    assert "free disk was re-checked just now: the offer search keeps only offers with disk_space >= 1400 GB" in out
+    assert "disk_space>=1400" in search_query(fake).split(" "), "the offer search itself filters on the chain's disk"
     assert "chain stage 1 (configs/full/data-smoke.json): ~59 GB upstream down" in out
 
 
@@ -967,9 +969,10 @@ def chain_summaries(container="C1", started=100.0, queue_started=150.0, status="
 
 
 @pytest.mark.parametrize("case, problem, note", [
-    ("match", None, "--box p01 --resume continues stage 2 of chain p01-chain (gate pass T, container C1)"),
-    ("other-rental", "from another rental (container C0); chain p01-chain on container C1 died before box p01 "
-                     "started", None),
+    ("match", None, "--box p01 --resume continues stage 2 of chain p01-chain (gate passed T); the chain's container "
+                    "C1"),
+    ("other-rental", "the newest p01 summary on the Hub is from another rental (container C0); chain p01-chain on "
+                     "container C1 died before box 1 started: launch --box p01 fresh or the chain", None),
     ("p01-newer", None, None),
     ("no-chain", None, None),
 ])

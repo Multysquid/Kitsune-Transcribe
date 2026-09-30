@@ -884,8 +884,9 @@ standalone boxes stay defined as fallbacks.
 ```powershell
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01-chain --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
-Look-only first, then the same line with `--yes`. Re-check the machine's free disk right before renting (the chain
-asks for box 1's disk, ~1,450 GB). The disk and the download gate are sized on box 1's extent (with the chain's
+Look-only first, then the same line with `--yes`. Launch re-checks the machine's free disk every time it runs: its
+offer search keeps only offers with `disk_space` >= the chain's disk (box 1's, ~1,450 GB), so a pinned `--machine`
+that no longer has it is refused. The disk and the download gate are sized on box 1's extent (with the chain's
 `extra_gb` 120: p01's own 25 GB and ~95 GB of stage-1 leftovers), the boot's rebuild on the smoke (study) extent. Launch
 refuses `--config`, `--gate-hours 0`, `--max-hours` below 30 (stage 1's 10.5 h + box 1's 19.5 h; a warning below the
 chain's 35 h) and every resume flag, and prints the chain's deadlines: the gate part by first boot + 9 h, stage 1 by
@@ -913,7 +914,10 @@ What happens on the box:
   up (a failed stop or destroy REST call): the watchdog requests the stop again every 5 min.
 - **Restarts:** the supervisor restarts the controller at most twice per stage; `chain/chain.json` records every step,
   so ended parts are not run again and the gate is never evaluated twice; a stage-2 bootstrap left running is killed
-  when `/proc` shows it is that process (its start time and command line), else ignored, and started again.
+  when `/proc` shows it is that process (its start time and command line), else ignored, and started again. A kill of
+  the stage-2 bootstrap (at its bound, on a restart, or when the controller fails) takes its whole session: GNU
+  `timeout` moves each wrapped phase (01's rebuild among them) into a process group of its own, but never out of the
+  session.
 - **Watching it:** the chain summary `full/box-p01-chain/queue_summary.json` (stage, step, gate, each part's status,
   both verdicts' checks); each part's own summary and verdict at `full/box-<part>/`; on the box
   `$KITSUNE_STATE/chain/<part>/logs/` and `$KITSUNE_STATE/logs/bootstrap-s2.log`; at the end the infra folder

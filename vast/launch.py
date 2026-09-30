@@ -1498,14 +1498,16 @@ def chain_resume_checks(out_repo: str, box: str, chain: str) -> tuple[list[str],
     part = (cs.get("parts") or {}).get(box) or {}
     match = part.get("status") not in (None, "pending") and ps.get("container_id") == cs.get("container_id") \
         and ps.get("started") is not None and ps.get("started") == part.get("queue_started")
+    who = "box 1" if box == "p01" else f"box {box}"  # addendum E.8's words for p01-chain's last part
     if match:
         gate = cs.get("gate") or {}
-        notes.append(f"--box {box} --resume continues stage 2 of chain {chain} (gate {gate.get('result')} "
-                     f"{gate.get('time_utc')}, container {cs.get('container_id')})")
+        passed = "passed" if gate.get("result") == "pass" else f"result {gate.get('result')}"
+        notes.append(f"--box {box} --resume continues stage 2 of chain {chain} (gate {passed} {gate.get('time_utc')}); "
+                     f"the chain's container {cs.get('container_id')}")
     elif float(cs.get("started") or 0) > float(ps.get("started") or 0):
         problems.append(f"the newest {box} summary on the Hub is from another rental (container "
                         f"{ps.get('container_id')}); chain {chain} on container {cs.get('container_id')} died before "
-                        f"box {box} started: launch --box {box} fresh or the chain")
+                        f"{who} started: launch --box {box} fresh or the chain")
     return problems, notes
 
 
@@ -2043,7 +2045,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"chain {args.box}: the gate part must end by first boot + {by:g} h (the watchdog stops a stage 1 "
                   f"that has not handed over by + {by + 0.5:g} h), stage 1 ends by + {chain[0]['max_hours']:g} h, the "
                   f"cap is + {max_hours:g} h; a failed gate destroys the box after its records are verified on the "
-                  f"Hub, a passed one runs box 1 on the same machine")
+                  f"Hub, a passed one runs box 1 on the same machine. The machine's free disk was re-checked just "
+                  f"now: the offer search keeps only offers with disk_space >= {disk_gb} GB (box 1's disk)")
     elif offer:
         dph = offer.get("dph_total", 0)
         down, up = (offer.get(k) if isinstance(offer.get(k), (int, float)) else None
