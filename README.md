@@ -56,6 +56,10 @@ vast/                training image, CI build and the vast.ai run scripts: the A
 python -m kitsune.prereg  the size study's pre-registration: --write study/ regenerates study/PREREG.{json,md} from
                      kitsune/prereg.py, --check study/ verifies the committed files; the study boxes write their
                      numbers (calibrated max_steps, LR probe results) with its write_numbers
+python -m kitsune.fullrun  the full-data runs' shared core: the box registry configs/full/boxes.json (its schema and
+                     validator, the boxes' items and faults), the shared names, paths and helpers; its CLI gives
+                     bootstrap a box's students and extra files. kitsune/heartbeat.py: the heartbeat files a box's
+                     queue (stall check) and watchdog read
 ```
 
 ### Data
