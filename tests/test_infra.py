@@ -143,7 +143,8 @@ def test_workflow():
     on = wf.get("on", wf.get(True))  # YAML 1.1 reads the bare key `on` as True
     push = on["push"]
     assert push.get("branches") in (None, ["**"])
-    assert set(push["paths"]) == {"docker/**", "requirements-train.txt", ".github/workflows/image.yml"}
+    assert set(push["paths"]) == {"docker/**", "requirements-train.txt", ".github/workflows/image.yml",
+                                  "kitsune/quant.py", "tests/test_quant*.py"}  # the quant tests run in the image
     assert wf["permissions"]["packages"] == "write"
     assert wf["env"]["IMAGE"] == "ghcr.io/multysquid/kitsune-train"
     steps = wf["jobs"]["build"]["steps"]
@@ -2171,3 +2172,64 @@ def test_onstart_full_job_needs_its_box_and_out_repo_and_aborts_through_finish()
     body = re.search(r"^stop_instance\(\) \{[^\n]*\n.*?^\}\n", text, re.M | re.S).group(0)
     assert '"$PY" "$KITSUNE_DIR/vast/finish.py" --abort --reason "$1"' in body
     assert "vast/README.md" in text.split("set -euo pipefail", 1)[0], "the header points to the moved prose"
+
+
+# ------------------------------------------------------------------------------------------ the quant pin and image step
+# (the full runs' quantised variants, kitsune/quant.py: contract 0.5 and 8)
+
+BASE_PINS = {  # requirements-train.txt before the torchao pin: every one of them stays exactly as it is
+    "transformers": "5.13.1", "tokenizers": "0.22.2", "sentencepiece": "0.2.2", "safetensors": "0.8.0",
+    "huggingface_hub": "1.23.0", "hf_xet": "1.5.1", "numpy": "2.5.3", "pyarrow": "25.0.1", "pandas": "2.3.2",
+    "soundfile": "0.14.0", "librosa": "1.0.0", "soxr": "1.1.0", "numba": "0.67.0", "llvmlite": "0.49.0",
+    "scipy": "1.16.2", "scikit-learn": "1.7.2", "jiwer": "4.0.0", "tensorboard": "2.20.0", "setuptools": "80.9.0",
+    "tqdm": "4.68.4", "nvidia-ml-py": "13.610.43", "psutil": "7.1.0", "pyyaml": "6.0.3", "pytest": "9.1.1",
+    "vastai": "1.8.0"}
+
+
+def test_requirements_keep_every_pin_and_add_only_torchao():
+    """The quant PR adds torchao==0.18.0 and changes nothing else: setuptools stays 80.9.0 (< 81, the TensorBoard
+    server), torch is still the base image's."""
+    lines = [ln.split("#", 1)[0].strip() for ln in (ROOT / "requirements-train.txt").read_text(
+        encoding="utf-8").splitlines()]
+    pins = dict(ln.split("==", 1) for ln in lines if ln)
+    assert pins == {**BASE_PINS, "torchao": "0.18.0"}
+    assert "torch" not in pins and tuple(int(x) for x in pins["setuptools"].split(".")[:2]) < (81, 0)
+
+
+def test_smoke_import_checks_torchao_and_skips_it_without():
+    """smoke_import imports torchao (a pin) and looks up every torchao name kitsune/quant.py uses, in quant's module
+    order; without torchao (the laptop) its check says skipped under --skip-missing and fails otherwise."""
+    from kitsune import quant as Q
+
+    smoke = load_path("smoke_import", ROOT / "docker" / "smoke_import.py")
+    assert smoke.MODULES["torchao"] == "torchao" and smoke.TORCHAO_MODULES == Q._AO_MODULES
+    assert set(Q.TORCHAO_CONFIGS.values()) <= set(smoke.TORCHAO_NAMES)
+    used = set(re.findall(r'_ao\("([A-Za-z_]+)"\)', (ROOT / "kitsune" / "quant.py").read_text(encoding="utf-8")))
+    # to_blocked is only needed for swizzled NVFP4 scales (the adapter's tests catch it); the rest must be there
+    assert used - {"to_blocked"} <= set(smoke.TORCHAO_NAMES) and "quantize_" in used
+    if importlib.util.find_spec("torchao") is None:
+        assert smoke.torchao_check(skip_missing=True) == "skipped (torchao not installed)"
+        with pytest.raises(ModuleNotFoundError):
+            smoke.torchao_check(skip_missing=False)
+    else:  # inside the image
+        rec = smoke.torchao_check()
+        assert rec["version"] and rec["int8_w8a8_cpu_rel_err"] < 5e-2
+
+
+def test_workflow_runs_the_quant_tests_in_the_image_before_the_tag():
+    """After the smoke and before the tag, the pushed image runs tests/test_quant.py and tests/test_quant_torchao.py
+    with the repo mounted, on CPU, offline, without real data: a failure blocks the tag."""
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load((ROOT / ".github" / "workflows" / "image.yml").read_text(encoding="utf-8"))
+    steps = wf["jobs"]["build"]["steps"]
+    runs = [s.get("run", "") for s in steps]
+    smoke = next(i for i, r in enumerate(runs) if "smoke_import.py" in r)
+    quant = next(i for i, r in enumerate(runs) if "tests/test_quant.py" in r)
+    tag = next(i for i, r in enumerate(runs) if "imagetools create" in r)
+    assert smoke < quant < tag
+    cmd = " ".join(runs[quant].split())
+    assert cmd == ('docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo -e CUDA_VISIBLE_DEVICES=-1 -e '
+                   'HF_HUB_OFFLINE=1 -e KITSUNE_REAL_DATA_ROOT=/nonexistent --entrypoint /venv/main/bin/python '
+                   '"$IMAGE@$DIGEST" -m pytest -q -p no:cacheprovider tests/test_quant.py tests/test_quant_torchao.py')
+    assert steps[quant]["env"]["DIGEST"] == "${{ steps.build.outputs.digest }}"
+    assert not steps[quant].get("continue-on-error")

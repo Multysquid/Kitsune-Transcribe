@@ -65,6 +65,23 @@ vram_gb, params_total, weights_bytes, relpos_patch, decode_len, trained, tokens_
 versions, time_utc. tools/study_report.py --speed reads it (the Pareto view: rtf, vram_gb, p50_s, p95_s;
 kitsune.study_stats.speed_entry).
 
+Quantised variants (the full runs; kitsune.quant, contract section 8; aed and ctc kinds): --quant <fmt> times the
+student quantised after its dtype cast (kitsune.quant.apply: torchao's kernels on CUDA; --quant-impl emulate only when
+asked, recorded emulated: true and never a speed; mxfp4 has no kernel here and needs it; fp16 keeps the model fp16
+under fp16 autocast, dtype "fp16"), then the rel-pos patch. The bf16 export is what is timed: a variant dir as --model
+is refused (its weights are the same bits). The system must be <base>@<fmt> (+compile with --compile: the encoder, and
+the aed decoder, compiled in place, counters off, --warmup >= 2). --profile-kernels adds an untimed batched and
+batch-1 decode under kitsune.quant.kernel_census (kernels: the matmul ops and GEMM kernel classes, the int8 fallbacks:
+the int8 calls whose torch._int_mm did not return); --threads sets torch's threads before loading; --hyps-out writes
+the list's hypotheses (id, ref, hyp, hyp_1, duration). With --compile the layers' counters are off, so quant_counters
+and the census's int8 counts are null (not counted, rather than zeros that would read as a measurement).
+Every record gains quant, quant_impl, quant_scope, mx_rounding, emulated, compile, threads, autocast_dtype,
+quant_counters, kernels, weights_bytes_resident and hyp_diff_1 (the latency ids whose batch-1 hypothesis differs from
+the batched one: NVFP4 W4A4's whole-call activation scale makes a row depend on its batch-mates); weights_bytes is the
+deployable packed bytes for a format. The idle check counts only the processes on the probe's own GPU (by PCI bus
+id), so --require-idle works while the box's other GPU trains. The probe beats $KITSUNE_HEARTBEAT once per timed
+repeat, and under kitsune.heartbeat.beating (max 1800 s) through the model load and the warm-ups (torch.compile's).
+
 Usage (on the box, at its end, one call per system; kitsune/study_queue.py phase_speed passes these):
   python tools/speed_probe.py --kind aed --model students/study/t03 --system study-t03 \
       --store cache/eval --per-set 40 --out runs/speed-B/speed.json --require-idle
@@ -141,20 +158,48 @@ def read_ids(path: Path) -> list[str]:
 # ------------------------------------------------------------------------------------------------ the host
 
 
+def _bus_tuple(s) -> tuple[int, ...]:
+    """'00000000:01:00.0' / '0000:01:00.0' / '01:00.0' -> (domain, bus, device, function) (as 05_evaluate's)."""
+    head, _, fn = str(s).strip().partition(".")
+    parts = [int(x, 16) for x in head.split(":")]
+    return tuple(([0] * (3 - len(parts)) + parts) + [int(fn or "0", 16)])
+
+
+def _pci_bus_id(device: torch.device) -> str | None:
+    """The PCI bus id of the probe's CUDA device (nvidia-smi numbers GPUs its own way), None when unknown."""
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        p = torch.cuda.get_device_properties(idx)
+        return f"{int(p.pci_domain_id):08X}:{int(p.pci_bus_id):02X}:{int(p.pci_device_id):02X}.0"
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def gpu_state(device: torch.device) -> dict | None:
-    """What nvidia-smi shows before the probe: the compute processes on the GPUs (other than this one) and their
+    """What nvidia-smi shows before the probe: the compute processes on the probe's GPU (other than this one; matched
+    by PCI bus id when both are known, so a 2-GPU box's training on the other GPU is not "busy") and the GPUs'
     utilisation; None on CPU or without nvidia-smi."""
     if device.type != "cuda" or not shutil.which("nvidia-smi"):
         return None
     exe = shutil.which("nvidia-smi")
-    out = dict(processes=[], utilization=None)
+    bus = _pci_bus_id(device)
+    out = dict(processes=[], utilization=None, gpu_bus_id=bus, other_gpus=[])
     try:
-        r = subprocess.run([exe, "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=30, check=True)
+        r = subprocess.run([exe, "--query-compute-apps=pid,process_name,used_memory,gpu_bus_id",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=30, check=True)
         for line in r.stdout.splitlines():
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 3 and parts[0].isdigit() and int(parts[0]) != os.getpid():
-                out["processes"].append(dict(pid=int(parts[0]), name=parts[1], used_mib=parts[2]))
+                proc = dict(pid=int(parts[0]), name=parts[1], used_mib=parts[2])
+                if len(parts) >= 4 and parts[3]:
+                    proc["gpu_bus_id"] = parts[3]
+                    try:
+                        if bus and _bus_tuple(parts[3]) != _bus_tuple(bus):
+                            out["other_gpus"].append(proc)
+                            continue
+                    except ValueError:  # an unparsable bus id: counted, as without one
+                        pass
+                out["processes"].append(proc)
         r = subprocess.run([exe, "--query-gpu=index,utilization.gpu,memory.used", "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=30, check=True)
         out["utilization"] = [line.strip() for line in r.stdout.splitlines() if line.strip()]
@@ -166,8 +211,10 @@ def gpu_state(device: torch.device) -> dict | None:
 # ------------------------------------------------------------------------------------------------ the models
 
 
-def _amp(device: torch.device, dtype: str) -> bool:
-    return dtype == "bf16" and device.type == "cuda"
+def _amp(device: torch.device, dtype: str):
+    """A runner's autocast: torch.bfloat16 for bf16 on CUDA, else False (a dtype or False: kitsune.evaluate.amp_dtype;
+    a fp16 variant sets torch.float16 after load_runner quantised it)."""
+    return torch.bfloat16 if dtype == "bf16" and device.type == "cuda" else False
 
 
 def _weights_bytes(model) -> int:
@@ -234,9 +281,11 @@ class CtcRunner:
         return torch.inference_mode()
 
     def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
+        from kitsune.evaluate import amp_dtype
+
         feats, lens = self.feat(waves)
         mask = self.CS.lengths_to_mask(lens, feats.shape[1])
-        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=self.amp):
+        with torch.autocast(device_type=self.device.type, dtype=amp_dtype(self.amp), enabled=bool(self.amp)):
             lp, n = self.CS.ctc_log_probs(self.model, feats, mask)
         paths = self.CS.greedy_ctc_ids(lp, n)
         self.tokens += sum(len(x) for x in paths)
@@ -304,15 +353,45 @@ def decode_len_of(kind: str, choice: str, trained: bool | None) -> str | None:
 
 
 def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, store, revision: str,
-                relpos_patch: bool = True, decode_len: str | None = None):
+                relpos_patch: bool = True, decode_len: str | None = None, quant: dict | None = None,
+                compile: bool = False):
     """The runner of one kind and its model's description; relpos_patch: kitsune.patches.patch_relpos_once_per_batch
     on its encoder, as the trainer and the evaluator run every one of these encoders (perf.relpos_patch); decode_len
-    "teacher": an AED runner pinned to the teacher's token counts."""
-    runner, desc = _runner(kind, model, device, dtype, store.info or {}, revision, pin=decode_len == "teacher")
+    "teacher": an AED runner pinned to the teacher's token counts. quant {fmt, impl, scope, mx_rounding}: the model
+    quantised after the runner's dtype cast and before the patch (fp16: the runner keeps fp32 weights, kitsune.quant
+    casts them, autocast fp16), runner.quant = the recipe, weights_bytes = the deployable bytes. The runner's bf16 cast
+    comes first (the study's timing convention: BatchNorm statistics bf16 too), and kitsune.quant.apply leaves those
+    statistics as it finds them. compile: the encoder (and an AED's decoder) compiled in place last, the quant counters
+    off (their increments are Python side effects; quant_counters then records null)."""
+    fp16 = bool(quant) and quant["fmt"] == "fp16"
+    runner, desc = _runner(kind, model, device, "fp32" if fp16 else dtype, store.info or {}, revision,
+                           pin=decode_len == "teacher")
+    runner.quant = None
+    runner.weights_bytes_resident = runner.weights_bytes
+    if quant:
+        from kitsune import quant as Q
+
+        runner.quant = Q.apply(runner.model, quant["fmt"], impl=quant.get("impl") or "auto",
+                               scope=quant.get("scope") or "linear+pw", mx_rounding=quant.get("mx_rounding") or "rceil")
+        if fp16:
+            runner.amp = torch.float16
+        wb = Q.weight_bytes(runner.model)
+        runner.weights_bytes, runner.weights_bytes_resident = wb["deployable"], wb["resident"]
     if relpos_patch:
         from kitsune.patches import patch_relpos_once_per_batch
 
         patch_relpos_once_per_batch(runner.teacher.model if isinstance(runner, TdtRunner) else runner.model)
+    if compile:
+        m = runner.model
+        if quant:
+            from kitsune import quant as Q
+
+            Q.set_counting(m, False)
+        if kind in ("ctc", "parakeet-ctc"):
+            m.encoder.compile(dynamic=True)
+        else:
+            m.model.encoder.compile(dynamic=True)
+            m.model.decoder.compile(dynamic=True)
     return runner, desc
 
 
@@ -374,10 +453,15 @@ def free_cache(device: torch.device):
 
 
 def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[str], device: torch.device, *,
-          batch_s: float, warmup: int, warmup_1: int, latency_n: int | None, n_tok: list[int] | None = None) -> dict:
+          batch_s: float, warmup: int, warmup_1: int, latency_n: int | None, n_tok: list[int] | None = None,
+          profile_kernels: bool = False) -> dict:
     """The timed passes over `waves` (module docstring): the batched pass after its warm-up, then the batch-1 pass
     after its own. durations: the store's seconds of each wave (the batching and the RTF's audio seconds); n_tok: the
-    teacher's tokens of each (an AED runner pinned to them reads them). Returns the record's numbers."""
+    teacher's tokens of each (an AED runner pinned to them reads them). Returns the record's numbers, with the
+    batch-1 hypotheses kept (hyp_diff_1; "_hyps": (batched, batch-1) for --hyps-out) and, with profile_kernels, an
+    untimed batched and batch-1 decode under kitsune.quant.kernel_census (kernels). Beats the item's heartbeat once per
+    timed repeat, and under beating (max 1800 s) through the warm-ups."""
+    from kitsune import heartbeat
     from kitsune.evaluate import corpus_cer
 
     dur = np.asarray(durations, dtype=np.float64)
@@ -390,8 +474,9 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
         return runner.decode([waves[i] for i in idx], [float(dur[i]) for i in idx], [tok[i] for i in idx])
 
     with runner.context():
-        for b in plan[:warmup]:  # the longest batches: the allocator grows to the pass's size here
-            run(b)
+        with heartbeat.beating(max_s=1800):  # a torch.compile warm-up can take minutes
+            for b in plan[:warmup]:  # the longest batches: the allocator grows to the pass's size here
+                run(b)
         reset_peak(device)
         runner.tokens = 0
         hyps: list[str | None] = [None] * len(waves)
@@ -400,6 +485,7 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
         for b in plan:
             for i, h in zip(b, run(b)):
                 hyps[i] = h
+            heartbeat.beat()  # rate-limited: a file touch every 5 s at most
         sync(device)
         wall = time.perf_counter() - t0
         peak_b = _peak(device)
@@ -407,17 +493,27 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
         free_cache(device)  # the batched pass's blocks go: batch-1's own reserved VRAM is measured
         warm_1 = ([max(range(n1), key=lambda i: dur[i])] if n1 and warmup_1 else []) + list(
             range(min(int(warmup_1), len(waves))))
-        for i in warm_1:  # the longest latency id first: the allocator grows to batch-1's largest need
-            run([i])
+        with heartbeat.beating(max_s=1800):
+            for i in warm_1:  # the longest latency id first: the allocator grows to batch-1's largest need
+                run([i])
         reset_peak(device)
-        lat = []
+        lat, hyps_1 = [], []
         for i in range(n1):
             sync(device)
             t = time.perf_counter()
-            run([i])
+            hyps_1 += run([i])
             sync(device)
             lat.append(time.perf_counter() - t)
+            heartbeat.beat()
         peak_1 = _peak(device)
+        kernels = None
+        if profile_kernels:  # untimed, after both clocks
+            from kitsune.quant import kernel_census, quant_layers
+
+            m = getattr(runner, "model", None)
+            qm = m if m is not None and quant_layers(m) else None
+            kernels = dict(batched=kernel_census(lambda: run(plan[0]), device, model=qm),
+                           batch1=kernel_census(lambda: run([0]), device, model=qm) if waves else None)
     lat_a = np.asarray(lat, np.float64)
     rtf1 = lat_a / dur[:n1] if n1 else np.zeros(0)
     audio = float(dur.sum())
@@ -433,7 +529,30 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
                 vram_peak_allocated_bytes=peak_b["allocated"], vram_peak_reserved_bytes=peak_b["reserved"],
                 vram_peak_allocated_bytes_1=peak_1["allocated"], vram_peak_reserved_bytes_1=peak_1["reserved"],
                 vram_gb=max(reserved) / 1e9 if reserved else None,
-                cer_ref_corpus=corpus_cer([h or "" for h in hyps], refs)["cer"])
+                cer_ref_corpus=corpus_cer([h or "" for h in hyps], refs)["cer"],
+                hyp_diff_1=sum(a != b for a, b in zip(hyps_1, hyps)), kernels=kernels, _hyps=(hyps, hyps_1))
+
+
+def quant_counters(model) -> dict | None:
+    """The record's quant_counters: the quantised layers' {calls, padded, fallback_risk}; None when they were not
+    counted (--compile turns the counters off, and zeros would then read as a measurement)."""
+    from kitsune import quant as Q
+
+    if any(not m.kq.count for m in Q.quant_layers(model).values()):
+        return None
+    return {k: v for k, v in Q.counters(model).items() if k != "rows"}
+
+
+def write_hyps(path: Path, ids: list[str], refs: list[str], hyps: list, hyps_1: list, durations: list[float]):
+    """--hyps-out: the list's batched and batch-1 hypotheses (hyp_1 null past --latency-n), zstd parquet."""
+    import pandas as pd
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    h1 = list(hyps_1) + [None] * (len(ids) - len(hyps_1))
+    df = pd.DataFrame(dict(id=ids, ref=refs, hyp=[h or "" for h in hyps], hyp_1=h1, duration=durations))
+    tmp = path.with_name(path.name + ".tmp")
+    df.to_parquet(tmp, index=False, compression="zstd")
+    os.replace(tmp, path)
 
 
 def merge_out(path: Path, ids: list[str], system: str, record: dict) -> dict:
@@ -458,8 +577,10 @@ def merge_out(path: Path, ids: list[str], system: str, record: dict) -> dict:
 def _versions() -> dict:
     import transformers
 
+    from kitsune.quant import torchao_version
+
     return dict(python=sys.version.split()[0], torch=torch.__version__, transformers=transformers.__version__,
-                cuda=torch.version.cuda, host=platform.node())
+                cuda=torch.version.cuda, host=platform.node(), torchao=torchao_version())
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -493,7 +614,43 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="aed / cohere: teacher = every batch decodes its longest row's teacher token count, greedy = "
                          "the free decode, auto = teacher for an untrained student dir, else greedy (default "
                          "%(default)s)")
+    from kitsune.quant import COMPILE_SUFFIX, IMPLS, MX_ROUNDINGS, QUANT_FORMATS, SCOPES
+
+    ap.add_argument("--quant", default="none", choices=("none", *QUANT_FORMATS),
+                    help="aed / ctc: time the student quantised in this format (the system must end in @<fmt>)")
+    ap.add_argument("--quant-impl", default="auto", choices=IMPLS,
+                    help="auto: torchao on CUDA (emulate on CPU); emulate: simulated, recorded emulated (mxfp4 on "
+                         "CUDA needs it)")
+    ap.add_argument("--quant-scope", default="linear+pw", choices=SCOPES)
+    ap.add_argument("--mx-rounding", default="rceil", choices=MX_ROUNDINGS)
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the encoder (and the aed decoder) in place; the system ends in +compile")
+    ap.add_argument("--profile-kernels", action="store_true",
+                    help="an untimed batched and batch-1 decode under the kernel census (record: kernels)")
+    ap.add_argument("--threads", type=int, default=None, help="torch.set_num_threads before loading")
+    ap.add_argument("--hyps-out", default=None, help="a parquet of the list's hypotheses (id, ref, hyp, hyp_1, "
+                                                     "duration)")
     args = ap.parse_args(argv)
+    if args.quant != "none":
+        from kitsune.quant import split_system
+
+        if args.kind not in ("aed", "ctc"):
+            ap.error(f"--quant times a student: kinds aed and ctc, not {args.kind}")
+        base = (args.system or "")[:-len(COMPILE_SUFFIX)] if args.compile else (args.system or "")
+        if split_system(base)[1] != args.quant or base.endswith(COMPILE_SUFFIX):
+            suffix = COMPILE_SUFFIX if args.compile else ""
+            ap.error(f"--quant {args.quant} needs --system <base>@{args.quant}{suffix}: a variant's record must never "
+                     "replace the base system's")
+        if args.quant == "fp16" and args.dtype != "auto":
+            ap.error("--quant fp16 sets the dtype (fp16 weights under fp16 autocast): no --dtype")
+    if args.compile and args.kind == "parakeet-tdt":
+        ap.error("--compile compiles a ParakeetForCTC or Cohere ASR encoder: not the TDT path")
+    if args.compile and not (args.system or "").endswith(COMPILE_SUFFIX):
+        ap.error(f"--compile needs a --system ending in {COMPILE_SUFFIX}")
+    if args.compile and args.warmup < 2:
+        ap.error("--compile needs --warmup >= 2 (the compile happens in the warm-up)")
+    if args.threads is not None and args.threads < 1:
+        ap.error("--threads must be >= 1")
     if args.kind in ("aed", "ctc", "parakeet-ctc", "parakeet-tdt") and not args.model:
         ap.error(f"--kind {args.kind} needs --model")
     if args.kind in ("aed", "ctc") and not args.system:
@@ -505,9 +662,31 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    from kitsune import heartbeat
+    from kitsune import quant as Q
+
+    if args.threads:
+        torch.set_num_threads(int(args.threads))
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device)
     dtype = ("bf16" if device.type == "cuda" else "fp32") if args.dtype == "auto" else args.dtype
     system = args.system or args.kind
+    quant = None
+    if args.quant != "none":
+        if args.model and Q.is_quantized_dir(args.model):
+            print(f"REFUSED: {args.model} is a quantised variant dir: time the bf16 export with --quant "
+                  f"{Q.read_recipe(args.model)['format']} (the variant's weights are the same bits)", file=sys.stderr)
+            return EXIT_REFUSED
+        if device.type == "cuda" and args.quant_impl == "auto" and args.quant == "mxfp4-w4a4":
+            print("REFUSED: mxfp4-w4a4 has no kernel on this GPU (decision 20): --quant-impl emulate times its "
+                  "simulation, recorded emulated", file=sys.stderr)
+            return EXIT_REFUSED
+        try:
+            impl = Q.resolve_impl(args.quant, args.quant_impl, device)
+        except Q.QuantError as e:
+            print(f"REFUSED: {e}", file=sys.stderr)
+            return EXIT_REFUSED
+        quant = dict(fmt=args.quant, impl=args.quant_impl, resolved=impl, scope=args.quant_scope,
+                     mx_rounding=args.mx_rounding)
     out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     gpu = gpu_state(device)
@@ -541,15 +720,29 @@ def main(argv=None) -> int:
     n_tok = [int(store.utts[pos[i]].n_tok) for i in ids]  # the teacher's tokens with EOS (a token store's)
     refs = store.frame().set_index("id").loc[ids, "ref"].tolist()
     t0 = time.time()
-    runner, desc = load_runner(args.kind, args.model, device, dtype, store, args.revision,
-                               relpos_patch=not args.no_relpos_patch, decode_len=decode_len)
+    with heartbeat.beating(max_s=1800):
+        runner, desc = load_runner(args.kind, args.model, device, dtype, store, args.revision,
+                                   relpos_patch=not args.no_relpos_patch, decode_len=decode_len, quant=quant,
+                                   compile=args.compile)
     load_s = time.time() - t0
+    amp = getattr(runner, "amp", None)
     rec = dict(kind=args.kind, model=desc, device=str(device),
-               gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None, dtype=dtype,
+               gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+               dtype="fp16" if quant and quant["fmt"] == "fp16" else dtype,
                params_total=int(runner.params), weights_bytes=int(runner.weights_bytes), load_s=round(load_s, 2),
-               relpos_patch=not args.no_relpos_patch, decode_len=decode_len, trained=trained)
-    rec.update(probe(runner, waves, durations, refs, device, batch_s=args.batch_s, warmup=args.warmup,
-                     warmup_1=args.warmup_1, latency_n=args.latency_n, n_tok=n_tok))
+               relpos_patch=not args.no_relpos_patch, decode_len=decode_len, trained=trained,
+               quant=quant["fmt"] if quant else None, quant_impl=quant["resolved"] if quant else None,
+               quant_scope=quant["scope"] if quant else None, mx_rounding=quant["mx_rounding"] if quant else None,
+               emulated=bool(quant) and quant["resolved"] == "emulate", compile=bool(args.compile),
+               threads=torch.get_num_threads(), autocast_dtype=str(amp).replace("torch.", "") if amp else None,
+               weights_bytes_resident=int(getattr(runner, "weights_bytes_resident", runner.weights_bytes)))
+    res = probe(runner, waves, durations, refs, device, batch_s=args.batch_s, warmup=args.warmup,
+                warmup_1=args.warmup_1, latency_n=args.latency_n, n_tok=n_tok, profile_kernels=args.profile_kernels)
+    hyps, hyps_1 = res.pop("_hyps")
+    rec.update(res)
+    rec["quant_counters"] = quant_counters(runner.model) if quant else None
+    if args.hyps_out:
+        write_hyps(Path(args.hyps_out), ids, refs, hyps, hyps_1, durations)
     rec.update(idle=idle, gpu_state=gpu, versions=_versions(), store=str(args.store), time_utc=_now())
     merge_out(out, ids, system, rec)
     print(f"{system}: RTF {rec['rtf']:.5f} batched ({rec['n_utts']} utts, {rec['audio_s']:.0f} s), batch-1 p50 "
