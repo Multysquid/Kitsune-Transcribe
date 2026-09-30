@@ -1437,8 +1437,11 @@ def chart_svg(points: list[dict], *, x_key: str, title: str, x_label: str, bette
                 (x0, y0_), (x1_, y1_) = pos[p["base"]], pos[p["system"]]
                 L.append(f'<line class="j s-{p["family"]}" x1="{x0:.1f}" y1="{y0_:.1f}" x2="{x1_:.1f}" '
                          f'y2="{y1_:.1f}"/>')
-        # labels avoid every mark and every label placed before them
+        # labels avoid every mark, every label placed before them and the legend (drawn below at lx, top + 6: its
+        # headers and 7 rows end by top + 174); a label may run past the plot's right edge only beside the legend
+        lx = W - right + 24
         boxes: list[tuple[float, float, float, float]] = [(x - 7, y - 7, 14, 14) for x, y in pos.values()]
+        boxes.append((lx - 4, top - 8, W - lx + 4, 182))
         order = sorted(drawn, key=lambda p: (p["kind"] == "variant", -p["m4_all_pct"], p["system"]))
         for p in sorted(drawn, key=lambda p: (p["kind"] != "variant", p["system"])):  # variants under the rest
             x, y = pos[p["system"]]
@@ -1458,7 +1461,9 @@ def chart_svg(points: list[dict], *, x_key: str, title: str, x_label: str, bette
             L.append(f'<g><title>{_esc(tip)}</title>{mark}</g>')
         for p in order:  # direct labels: bf16 rows first, a variant's format only where it fits
             x, y = pos[p["system"]]
-            small = p["kind"] == "variant"
+            # a variant joined to its bf16 point is named by its format; one without it (a study variant whose bf16
+            # row is shown as its full-data twin) by its whole name, or it would read as the twin's variant
+            small = p["kind"] == "variant" and p["base"] in pos
             text = FORMAT_LABEL.get(p["format"], p["format"]) if small else p["display"]
             size = 9.5 if small else 11.0
             w, h = 0.58 * size * len(text), size + 2
@@ -1472,7 +1477,7 @@ def chart_svg(points: list[dict], *, x_key: str, title: str, x_label: str, bette
                 L.append(f'<text class="{"lab2" if small else "lab"}" x="{bx:.1f}" y="{y + dy:.1f}">{_esc(text)}'
                          f'</text>')
                 break
-        lx, ly = W - right + 24, top + 6  # the legend
+        ly = top + 6  # the legend (its box is in boxes above)
         L.append(f'<text class="axl" x="{lx}" y="{ly}">Family</text>')
         for i, (fam, name) in enumerate(CHART_FAMILIES):
             yy = ly + 20 + 18 * i

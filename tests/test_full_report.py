@@ -493,6 +493,13 @@ def test_chart_svg_points(world, tmp_path):
         assert svg.count('class="h s-parakeet"') == 2  # the two timed variants, hollow
         assert svg.count("<polygon class=\"m f-") == 3  # two Parakeet stars, study-p01's diamond
         assert "@media (prefers-color-scheme: dark)" in svg and svg.startswith("<svg ")
+        # no direct label runs into the legend (x >= 750 from y 62 to 244; chart_svg's geometry, 0.58 em a glyph);
+        # the fastest student sits top right, next to it (here P-0.1B study)
+        labels = re.findall(r'<text class="(lab2?)" x="([^"]*)" y="([^"]*)">([^<]*)</text>', svg)
+        placed = [(float(x), float(y), 9.5 if c == "lab2" else 11.0, t) for c, x, y, t in labels if float(x) < 750]
+        assert any(t == "P-0.1B study" for *_, t in placed)
+        for x, y, size, t in placed:
+            assert x + 0.58 * size * len(t) <= 750 or y - size >= 244 or y + 2 <= 62, (name, t, x, y)
     rc, _ = run(world["args"], tmp_path / "again")
     assert rc == 0
     for name in ("chart_error_vs_speed.svg", "chart_error_vs_latency.svg", "chart_points.csv"):
@@ -715,6 +722,11 @@ def test_s2_retime_keeps_variants_on_the_bf16_basis_and_chart_twins(world, tmp_p
     pts = {p["system"]: p for p in rep["chart"]["points"]}
     assert pts["study-p03@nvfp4-w4a4"]["drawn"] and "S4" in pts["full-p03@nvfp4-w4a4"]["not_drawn"]
     assert pts["study-p03"]["not_drawn"] == "shown as its full-data row full-p03" and pts["full-p03"]["drawn"]
+    # the study variant has no bf16 point to join (study-p03 is shown as full-p03): it carries its whole name, never
+    # just "NVFP4 W4A4" next to P-0.3B full; the joined full-t06 variant keeps its format label
+    labels = re.findall(r'<text class="(lab2?)" x="[^"]*" y="[^"]*">([^<]*)</text>', svg)
+    assert ("lab", "P-0.3B study NVFP4 W4A4") in labels and ("lab2", "NVFP4 W4A4") not in labels
+    assert ("lab2", "INT8 W8A8") in labels
     nd = next(ln for ln in md.splitlines() if ln.startswith("Not drawn:"))
     assert "P-0.3B full NVFP4 W4A4" in nd and "P-0.3B study NVFP4 W4A4" not in nd
 
