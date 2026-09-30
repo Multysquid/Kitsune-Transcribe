@@ -538,10 +538,16 @@ def test_summary_puts_are_coalesced_but_never_lost(fq):
 # ================================================================================================ smoke A
 
 
-def smoke_registry(reg: dict, *, sigstop: bool) -> dict:
-    """box full-smoke of tiny_registry, sized for the fakes: the freeze fault 1 s on a watchdog of 0 s; without SIGSTOP
-    (Windows) F1 is dropped and the wipe fires on the first attempt."""
+def smoke_registry(reg: dict, *, sigstop: bool, stall_min: float | None = None) -> dict:
+    """box full-smoke of tiny_registry, sized for the fakes: the freeze fault 30 s on a watchdog of 0 s; without SIGSTOP
+    (Windows) F1 is dropped and the wipe fires on the first attempt. stall_min: the smoke trainers' stall limit (the
+    registry's 10 min otherwise; the SIGSTOP run needs seconds, as its stopped trainer is recovered by the stall
+    check)."""
     reg = box_only(reg, "full-smoke", watchdog={"orphan_s": 0, "action": "alert"})
+    if stall_min is not None:
+        for it in reg["boxes"]["full-smoke"]["items"]:
+            if it["kind"] == "train":
+                it["stall_min"] = stall_min
     for f in reg["boxes"]["full-smoke"]["faults"]:
         if f["action"] == "freeze_controller_hb":
             f["seconds"] = 30.0  # longer than the rest of smoke-p005: its end falls inside, whatever the load
@@ -553,9 +559,10 @@ def smoke_registry(reg: dict, *, sigstop: bool) -> dict:
     return reg
 
 
-def run_smoke(fq, monkeypatch, *, sigstop: bool):
+def run_smoke(fq, monkeypatch, *, sigstop: bool, stall_min: float | None = None):
     """Smoke A on the fakes against DirHub runs and scratch repos (the queue's uploads through HubUploader and
-    vast/finish.py), with a stand-in watchdog that appends an alert while train_hb is stale."""
+    vast/finish.py), with a stand-in watchdog that appends an alert while train_hb is stale; stall_min as in
+    smoke_registry."""
     import finish
     import huggingface_hub
 
@@ -577,8 +584,8 @@ def run_smoke(fq, monkeypatch, *, sigstop: bool):
                FAKE_EARLY=json.dumps({"smoke-t06": 0.7, "smoke-p03": 0.7}),
                FAKE_TIMED=json.dumps({"smoke-p01": 50}), FAKE_SCRATCH=str(scratch_hub.dir), FAKE_DEADLINE_S="1200",
                FAKE_STEP_VALUE=json.dumps({"smoke-t06": 1.5, "smoke-p03": 0.6, "smoke-p01": 0.4, "smoke-p005": 0.25}))
-    q = fq.make("full-smoke", registry=smoke_registry(fq.reg, sigstop=sigstop), uploader=up, env=env,
-                out_repo="u/kitsune-runs", scratch_repo="u/kitsune-scratch", machine_id="m1",
+    q = fq.make("full-smoke", registry=smoke_registry(fq.reg, sigstop=sigstop, stall_min=stall_min), uploader=up,
+                env=env, out_repo="u/kitsune-runs", scratch_repo="u/kitsune-scratch", machine_id="m1",
                 runs_hub=F.Hub("u/kitsune-runs", api=FakeApi(runs_hub, "q")),
                 scratch_hub=F.Hub("u/kitsune-scratch", api=FakeApi(scratch_hub, "q")),
                 kill_grace_s=0.3)
@@ -662,11 +669,14 @@ def check_smoke(fq, rc, runs_hub, scratch_hub, seen):
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGSTOP and process groups are posix only")
 def test_smoke_a_with_every_fault_including_sigstop(fq, monkeypatch):
-    reg = smoke_registry(fq.reg, sigstop=True)
-    for it in reg["boxes"]["full-smoke"]["items"]:
-        if it["name"].startswith("smoke-") and it["kind"] == "train":
-            it["stall_min"] = 0.02
-    rc, q, runs_hub, scratch_hub, seen = run_smoke(fq, monkeypatch, sigstop=True)
+    """F1 stops smoke-p01 with SIGSTOP: the stall check recovers it (SIGCONT, SIGTERM, SIGKILL) and the retry resumes;
+    a fault-ended attempt is no failure. The stall limit is 15 s here, not the registry's 10 min, but longer than the
+    fake scratch repo's stale-lock steal (fake_runs_repo.STALE_LOCK_S): a trainer stopped inside a timed upload leaves
+    its commit lock behind, and the next attempt's first upload waits for it without a beat."""
+    from fake_runs_repo import STALE_LOCK_S
+
+    assert 0.25 * 60 > STALE_LOCK_S
+    rc, q, runs_hub, scratch_hub, seen = run_smoke(fq, monkeypatch, sigstop=True, stall_min=0.25)
     st, v = check_smoke(fq, rc, runs_hub, scratch_hub, seen)
     assert st["faults"]["F1"]["outcome"] == "recovered" and st["items"]["smoke-p01"]["stalls"] == 1
 
