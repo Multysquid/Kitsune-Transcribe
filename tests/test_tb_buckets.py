@@ -845,3 +845,93 @@ def test_export_describes_the_combined_loss_only_when_logged(tmp_path):
             "(`train`)") in r_new
     assert ("overlays and the `combined_loss` table holds; then `00_summary/full/` and `00_summary/mini/`: every "
             "eval's headline numbers") in r_new
+
+
+# the full runs' tags (WP4a): the dev-slice eval's (scripts/04_distill.py run_dev_eval, AED and CTC), the smoothed
+# early stop's raw value, 4d's deadline T
+DEV_SPOT = [
+    ("eval/dev/objective", "2_loss_accuracy/00_dev/objective"),
+    ("eval/dev/ce", "2_loss_accuracy/00_dev/ce"),
+    ("eval/dev/kl", "2_loss_accuracy/00_dev/kl"),
+    ("eval/dev/wall_s", "1_operational/eval/dev/wall_s"),
+    ("eval/dev/tf/reazon_small/kl", "2_loss_accuracy/dev_loss/reazon_small/kl"),
+    ("eval/dev/tf/all/ce_utt_mean", "2_loss_accuracy/dev_loss/all/ce_utt_mean"),
+    ("eval/dev/tf/galgame/kl_p1_gt_0.99", "2_loss_accuracy/dev_loss/galgame/kl_p1_gt_0.99"),
+    ("eval/dev/tf/emilia_nc/top1", "2_loss_accuracy/dev_accuracy/emilia_nc/top1"),
+    ("eval/dev/greedy/reazon_large/cer_ref_corpus", "2_loss_accuracy/dev_accuracy/reazon_large/cer_ref_corpus"),
+    ("eval/dev/greedy/all/cer_teacher_corpus", "2_loss_accuracy/dev_accuracy/all/cer_teacher_corpus"),
+    ("eval/dev/greedy/all/ref_chars", "1_operational/eval/dev/greedy/all/ref_chars"),
+    ("eval/dev/tf/reazon_small/ctc", "2_loss_accuracy/eval_ctc/dev/reazon_small/ctc"),
+    ("eval/dev/tf/all/argmax_blank", "2_loss_accuracy/eval_ctc/dev/all/argmax_blank"),
+    ("eval/dev/tf/all/kl_per_frame", "2_loss_accuracy/eval_ctc/dev/all/kl_per_frame"),
+    ("eval/dev/tf/all/n_frames", "1_operational/eval/dev/tf/all/n_frames"),
+    ("eval/dev/tf/wall_s", "1_operational/eval/dev/tf/wall_s"),
+    ("eval/dev/tf/n_utts", "1_operational/eval/dev/tf/n_utts"),
+    ("eval/dev/greedy/rtf", "1_operational/eval/dev/greedy/rtf"),
+    ("eval/dev/tf/galgame/n_tok", "1_operational/eval/dev/tf/galgame/n_tok"),
+    ("eval/dev/tf/galgame/n_bad_audio", "1_operational/eval/dev/tf/galgame/n_bad_audio"),
+    ("eval/dev/tf/all/student_tail", "3_misc/eval/dev/tf/all/student_tail"),
+    ("eval/dev/tf/all/frac_dense", "3_misc/eval/dev/tf/all/frac_dense"),
+    ("early_stop/raw", "2_loss_accuracy/early_stop/raw"),
+    ("sched/deadline_T", "1_operational/sched/deadline_T"),
+]
+
+
+@pytest.mark.parametrize("tag,want", DEV_SPOT, ids=[t for t, _ in DEV_SPOT])
+def test_full_run_tags_have_their_rules(tag, want):
+    assert tb_tag(tag) == (want, want.split("/", 1)[0])
+    assert TagMapper().resolve(tag) == (want, False)
+
+
+def test_every_dev_eval_tag_is_mapped_next_to_the_runs_own():
+    """Every tag a dev eval logs (evaluate.flatten of its summaries, AED and CTC, with the greedy decode) lands on a
+    rule of its own - no tb_tag_unmapped event, no TensorBoard tag shared with the frozen run's tags - and the
+    combined-loss chart still draws exactly its three curves."""
+    import numpy as np
+
+    from kitsune import evaluate as ev
+
+    rng = np.random.default_rng(0)
+    n = 6
+
+    def raw_aed(src):
+        d = dict(id=[f"{src}/{i}" for i in range(n)], source=[src] * n, n_tok=rng.integers(3, 9, n),
+                 duration=rng.uniform(1, 3, n))
+        for k in ("kl", "ce", "top1_match", "student_entropy_coarse", "teacher_entropy_coarse", "student_tail",
+                  "teacher_tail", "teacher_p1"):
+            d[f"sum_{k}"] = rng.uniform(0, 5, n)
+        for b in ("hi", "lo"):
+            d[f"_n_{b}"] = rng.integers(0, 3, n).astype(float)
+            for k in ("kl", "ce", "top1_match"):
+                d[f"_{k}_{b}"] = rng.uniform(0, 2, n)
+        return pd.DataFrame(d)
+
+    tf, _ = ev.summarise_tf(pd.concat([raw_aed("reazon_small"), raw_aed("galgame")], ignore_index=True),
+                            n_bad_audio=1, bad_audio=["x"], bad_audio_per_set={"galgame": 1}, wall_s=1.0)
+    per_utt = pd.DataFrame(dict(id=["a", "b"], source=["reazon_small", "galgame"], duration=[1.0, 2.0],
+                                ref=["あい", "う"], teacher_hyp=["あい", "え"], hyp=["あ", "う"], cer_ref=[0.5, 0.0],
+                                cer_teacher=[0.5, 1.0], truncated=[False, False], n_tok=[2, 1], teacher_cer=[0.0, 1.0],
+                                teacher_truncated=[False, False], hyp_ids=[[1], [2]], has_teacher=[True, True]))
+    gr = ev.summarise_greedy(per_utt, n_bad_audio=0, bad_audio=[], bad_audio_per_set={}, wall_s=1.0, rtf=0.1)
+    ctc_raw = pd.DataFrame(dict(id=["c", "d"], source=["reazon_small", "galgame"], duration=[1.0, 2.0], n_tok=[3, 4],
+                                **{f"sum_{k}": [1.0, 2.0] for k in ev.CTC_TF_SUMS}))
+    ctc_tf, _ = ev.summarise_ctc_tf(ctc_raw, n_bad_audio=0, bad_audio=[], bad_audio_per_set={}, wall_s=1.0)
+    dev_tags = sorted({*ev.flatten(tf, "eval/dev/tf"), *ev.flatten(gr, "eval/dev/greedy"),
+                       *ev.flatten(ctc_tf, "eval/dev/tf"), "eval/dev/objective", "eval/dev/ce", "eval/dev/kl",
+                       "eval/dev/wall_s", "early_stop/raw", "sched/deadline_T"})
+    assert len(dev_tags) > 100
+    everything = [*FIXTURE["scalars"], *FIXTURE["added_scalars"], *FIXTURE["combined_scalars"], *dev_tags]
+    tm = TagMapper()
+    for tag in everything:
+        tb, warn = tm.resolve(tag)
+        assert not warn, tag
+        assert tb.split("/", 1)[0] in TB_BUCKETS
+    tbs = [e["tb_tag"] for e in tm.map.values()]
+    assert len(set(tbs)) == len(tbs) == len(everything)
+    assert all(tm.lookup(t)["tb_tag"].startswith(("2_loss_accuracy/00_dev/", "2_loss_accuracy/dev_",
+                                                  "2_loss_accuracy/eval_ctc/dev/", "1_operational/eval/dev/",
+                                                  "3_misc/eval/dev/"))
+               for t in dev_tags if t.startswith("eval/dev/"))
+    run_tbs = [tm.lookup(t)["tb_tag"] for t in everything]
+    (kind, regexes), = TB_LAYOUT["combined_loss"].values()
+    assert [[t for t in run_tbs if re.match(rx, t)] for rx in regexes] == [[tb_tag(t)[0]] for t in COMBINED_LOSS_TAGS]

@@ -248,8 +248,10 @@ def test_overfit_configs_resolve():
         assert c["optim"]["offload_fused"] is True  # the fused CPU AdamW kernel: ~1 s per step less than foreach
         # stop once the probe KL (teacher-forced on the whole train subset) is flat: memorised, nothing left to learn
         patience, min_evals = (3, 3) if name == "overfit_1h" else (20, 10)
+        # smooth / allow_test_sets (the full runs' early-stop keys) at their defaults: no smoothing, any metric
         assert c["early_stop"] == dict(enabled=True, metric="probe_kl", patience=patience, min_delta_rel=0.02,
-                                       min_delta_abs=0.001, min_evals=min_evals, floor=None, action="stop")
+                                       min_delta_abs=0.001, min_evals=min_evals, floor=None, action="stop",
+                                       smooth=1, allow_test_sets=True)
         assert c["eval"]["every_epochs"] == 1 and c["eval"]["probe"] and c["eval"]["probe_is_train"]
         # no GO/NO-GO for a sanity run ("N/A" with the numbers); a mini eval every 200 steps (never at an epoch end)
         assert c["eval"]["gate"] is False and c["eval"]["full_every_epochs"] is None
@@ -274,7 +276,8 @@ def test_overfit_configs_resolve():
     assert via["optim"]["offload"] == "none" and via["specaug"]["enabled"] and via["schedule"]["clock"] == "wall"
     assert via["subset"]["train_audio_s"] is None and via["eval"]["every_epochs"] is None
     assert via["early_stop"] == dict(enabled=True, metric="heldout_kl", patience=3, min_delta_rel=0.005,
-                                     min_delta_abs=0.0, min_evals=3, floor=None, action="cooldown")
+                                     min_delta_abs=0.0, min_evals=3, floor=None, action="cooldown", smooth=1,
+                                     allow_test_sets=True)
 
 
 # --------------------------------------------------------------------------------------------- the 8 GB laptop

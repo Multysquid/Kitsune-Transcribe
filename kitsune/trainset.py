@@ -154,7 +154,12 @@ def _teacher_meta(teacher_root: Path) -> dict:
 
 
 def read_selection(selection_path: Path, sources: Sequence[str], splits: Sequence[str]) -> pd.DataFrame:
-    """Kept rows of the selection for these sources/splits, in selection order."""
+    """Kept rows of the selection for these sources/splits, in selection order. A split outside
+    kitsune.fullrun.SPLITS (train, dev, eval) is a ValueError: a typo would silently select nothing."""
+    from kitsune.fullrun import SPLITS
+
+    if bad := [s for s in splits if s not in SPLITS]:
+        raise ValueError(f"splits {bad} are not selection splits {list(SPLITS)}")
     sel = pd.read_parquet(selection_path)
     sel = sel[sel["keep"] & sel["source"].isin(list(sources)) & sel["split"].isin(list(splits))].reset_index(drop=True)
     if sel["id"].duplicated().any():
@@ -217,6 +222,28 @@ def _pack_audio(sel: pd.DataFrame, shard_files: list[Path], data_root: Path, sha
     return order, lens, used, lost
 
 
+def _shard_files(sel: pd.DataFrame, data_root: Path, sources: Sequence[str], splits: Sequence[str]) -> list[Path]:
+    """The audio shards a store build reads: per source and split, data/shards/<source>/<split>-*.parquet (sorted),
+    except the dev split, which has no shards of its own: a dev row's audio (and its labels, joined by teacher_file)
+    lives in its train shard (kitsune.fullrun.shard_split), so the dev split reads exactly the existing shards its
+    selected rows' teacher_file names (<source>/train-NNNNN) - not every train shard, whose id columns alone are
+    hundreds of GB of row groups to scan on the full data. Deduplicated, in that order."""
+    from kitsune.fullrun import DEV_SPLIT, shard_split
+
+    out: list[Path] = []
+    for s in sources:
+        for sp in splits:
+            if sp != DEV_SPLIT:
+                out += sorted((data_root / "shards" / s).glob(f"{sp}-*.parquet"))
+                continue
+            stems = sorted(set(sel["teacher_file"][(sel["source"] == s) & (sel["split"] == sp)]))
+            if bad := [f for f in stems if not Path(f).name.startswith(f"{shard_split(sp)}-")]:
+                raise ValueError(f"{DEV_SPLIT} rows must name their {shard_split(sp)} shard in teacher_file, got "
+                                 f"{bad[:3]}")
+            out += [p for p in (data_root / "shards" / f"{f}.parquet" for f in stems) if p.is_file()]
+    return list(dict.fromkeys(out))
+
+
 def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Sequence[str], splits: Sequence[str],
                  *, ids: Iterable[str] | None = None, log: Callable[[str], None] = print) -> Stores:
     """Pack the kept selection rows of `sources` x `splits` into <cache_dir> (layout in the module docstring).
@@ -240,7 +267,7 @@ def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Se
     if sel.empty:
         raise ValueError(f"{selection_path}: no kept rows for sources={sources} splits={splits}")
     meta = _teacher_meta(teacher_root)
-    shard_files = [p for s in sources for sp in splits for p in sorted((data_root / "shards" / s).glob(f"{sp}-*.parquet"))]
+    shard_files = _shard_files(sel, data_root, sources, splits)  # the dev split: its rows' train shards only
     npz_files = [teacher_root / f"{f}.npz" for f in sorted(set(sel["teacher_file"]))]
     missing_npz = [p for p in npz_files if not p.exists()]
     if missing_npz:
@@ -261,6 +288,7 @@ def build_stores(selection_path, data_root, teacher_root, cache_dir, sources: Se
             old["dropped"]["no_audio"]["n"] == 0 or sorted(shard_size) == old.get("all_shards"))
         if old.get("fingerprint") == fingerprint and same_audio:
             st = load_stores(cache_dir)
+            st.info["reused"] = True  # in memory only, as build_frame_stores (04_distill's data event: stores_reused)
             log(f"stores: reusing {cache_dir} ({len(st)} utts, {st.hours:.2f} h, built {old.get('created')})")
             return st
 
@@ -488,7 +516,9 @@ def frame_preflight(ids: Sequence[str], sources: Sequence[str], splits: Sequence
     does not decode (its frames cannot be shown to align; also counted as undecodable, with its error). Returns the
     report: counts per split (mismatch includes undecodable), the mismatched rows (dropped, with their stored and
     expected frames; expected None and the error for an undecodable one), the undecodable ones, and ok = no eval row
-    mismatched and at most max_frac of the train rows."""
+    mismatched and at most max_frac of the train rows. The dev split (the full runs' early-stop rows, cut from train
+    shards) is held to the train rule on its own: at most max_frac of the dev rows (dev_mismatch_frac); any other
+    split's mismatch fails (lenient_splits names the two)."""
     mism, bad = [], []
     by_split: dict[str, dict] = {}
     for i, (uid, src, sp, dur, t, ns) in enumerate(zip(ids, sources, splits, durations, stored, decoded)):
@@ -506,16 +536,21 @@ def frame_preflight(ids: Sequence[str], sources: Sequence[str], splits: Sequence
             b["mismatch"] += 1
             mism.append(dict(i=i, id=uid, source=src, split=sp, stored=int(t), expected=want, n_samples=int(ns),
                              duration=round(float(dur), 4)))
-    n_train = by_split.get("train", {}).get("rows", 0)
-    m_train = by_split.get("train", {}).get("mismatch", 0)
-    m_other = sum(b["mismatch"] for sp, b in by_split.items() if sp != "train")
-    frac = m_train / n_train if n_train else 0.0
-    ok = m_other == 0 and frac <= max_frac
+    lenient = ("train", "dev")  # each against max_frac on its own (kitsune.fullrun.DEV_SPLIT: train shards' rows)
+
+    def frac_of(sp: str) -> float:
+        b = by_split.get(sp) or {}
+        return b["mismatch"] / b["rows"] if b.get("rows") else 0.0
+
+    m_other = sum(b["mismatch"] for sp, b in by_split.items() if sp not in lenient)
+    frac, dev_frac = frac_of("train"), frac_of("dev")
+    ok = m_other == 0 and frac <= max_frac and dev_frac <= max_frac
     return dict(policy=f"decision 15: a row whose decoded audio gives another frame count than its stored n_frames, "
                        f"or whose audio does not decode, is dropped and counted; more than {100 * max_frac:g} % of the "
-                       f"train rows, or any eval row, fails",
+                       f"train rows (or of the dev rows), or any eval row, fails",
                 max_frac=float(max_frac), ok=bool(ok), n_rows=len(ids), n_checked=len(ids) - len(bad),
-                n_mismatch=len(mism), train_mismatch_frac=frac, by_split=by_split, n_undecodable=len(bad),
+                n_mismatch=len(mism), train_mismatch_frac=frac, dev_mismatch_frac=dev_frac,
+                lenient_splits=list(lenient), by_split=by_split, n_undecodable=len(bad),
                 undecodable=bad[:50], mismatches=[{k: v for k, v in m.items() if k != "i"} for m in mism],
                 _rows=[m["i"] for m in mism])
 
@@ -547,7 +582,7 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
     if sel.empty:
         raise ValueError(f"{selection_path}: no kept rows for sources={sources} splits={splits}")
     pmeta = parakeet_meta(parakeet_root)
-    shard_files = [p for s in sources for sp in splits for p in sorted((data_root / "shards" / s).glob(f"{sp}-*.parquet"))]
+    shard_files = _shard_files(sel, data_root, sources, splits)  # the dev split: its rows' train shards only
     npz_files = [parakeet_root / f"{f}.npz" for f in sorted(set(sel["teacher_file"]))]
     # the pair of each shard: the npz holds the targets, its jsonl the reference and the teacher's text every CER reads
     missing = [q for p in npz_files for q in (p, p.with_suffix(".jsonl")) if not q.is_file()]
@@ -653,7 +688,8 @@ def build_frame_stores(selection_path, data_root, parakeet_root, cache_dir, sour
             f"frame preflight failed (decision 15) for {cache_dir}: {report['n_mismatch']} of {n} rows have another "
             f"frame count than their stored n_frames ("
             + ", ".join(f"{sp} {b['mismatch']}/{b['rows']}" for sp, b in sorted(by.items()))
-            + f"; train share {100 * report['train_mismatch_frac']:.3f} %, limit {100 * max_mismatch_frac:g} %, any "
+            + f"; train share {100 * report['train_mismatch_frac']:.3f} %, dev share "
+            f"{100 * report.get('dev_mismatch_frac', 0.0):.3f} %, limit {100 * max_mismatch_frac:g} % each, any "
             f"eval row fails), e.g. {report['mismatches'][:3]}", report)
     keep = [r for r in range(n) if r not in drop]
     dropped_rows = idx.iloc[sorted(drop)]
