@@ -1,6 +1,6 @@
 """The chained box's registry entry for the tests (contract addendum E.1.7), built on top of
-tests/fixtures_full.tiny_registry - never the committed configs/full/boxes.json, whose p01-chain entry a finalize step
-adds once WP2c's configs are merged.
+tests/fixtures_full.tiny_registry - never the committed configs/full/boxes.json, whose p01-chain entry is this one
+(tests/test_full_configs.py test_the_chained_box holds the two equal).
 
     from fixtures_chain import CHAIN_BOX, with_chain
     reg = with_chain(tiny_registry(tmp_path))       # the tiny registry + p01-chain (a copy; it remembers its root)

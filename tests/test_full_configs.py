@@ -1,5 +1,7 @@
 """tools/make_full_configs.py and configs/full/: the full-data runs' generated trainer and data configs, the hand-written
-box registry configs/full/boxes.json, and the plan record they take their measured numbers from (build contract 7).
+box registry configs/full/boxes.json (with its chained box p01-chain, contract addendum E: the entry, its derived spec
+and stage views, and launch's look-only resolution of it), and the plan record they take their measured numbers from
+(build contract 7).
 
 CPU only; the trainer is imported (04_distill.load_config) but runs nothing. The real selections are read only with
 KITSUNE_FULL_SELECTION_DIR pointing at a local labels/full/selections/full_study (the last test).
@@ -9,6 +11,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -447,8 +450,8 @@ def test_the_registry_loads_with_its_boxes(reg, monkeypatch):
     monkeypatch.delenv(fullrun.ENV_REGISTRY, raising=False)
     assert fullrun.load_registry() == reg  # this checkout's configs/full/boxes.json, every file checked
     assert fullrun.registry_problems(json.loads((FULL / "boxes.json").read_text(encoding="utf-8")), root=ROOT) == []
-    # every plain box (a chained box, contract addendum E, may join them; its entry is WP8's)
-    assert set(fullrun.BOX_NAMES) == set(BOX_TABLE) and set(BOX_TABLE) <= set(reg["boxes"])
+    # every plain box, and the chained box of contract addendum E (test_the_chained_box)
+    assert set(fullrun.BOX_NAMES) == set(BOX_TABLE) and set(reg["boxes"]) == set(fullrun.ALL_BOX_NAMES)
     for box, (gpus, dc, est, mx, dph, extra, reserve, wd, timed, gate, smoke) in BOX_TABLE.items():
         b = fullrun.box_spec(box, reg)
         assert (b["gpus"], b["data_config"], b["est_hours"], b["max_hours"], b["max_dph"], b["extra_gb"],
@@ -772,6 +775,244 @@ def test_every_items_command_line_is_one_its_tool_accepts(tmp_path, reg, trainer
                         {"stores", "train", "readout"} if box == "p01" else
                         {"stores", "train", "readout", "eval", "speed"} if box == "full" else
                         {"stores", "eval", "speed"}), box
+
+
+# ================================================================================================ the chained box
+
+CHAIN = "p01-chain"
+# contract addendum E.1.7's entry (DECISIONS D), its _comment aside
+CHAIN_ENTRY = {"est_hours": 25.2, "max_hours": 35, "max_dph": 1.00, "extra_gb": 120, "gate": True,
+               "chain": [{"parts": ["full-smoke", "smoke-b"], "gate_box": "full-smoke",
+                          "rebuild": "configs/full/data-smoke.json", "gate_by_hours": 9, "max_hours": 10.5},
+                         {"parts": ["p01"], "rebuild": "configs/full/data-p01.json"}]}
+STUDY_SELECTION = "labels/full/selections/study_1000h.parquet"  # smoke-b's frozen study selection (data-smoke-b)
+SIDECAR = {sel: sel[:-len(".parquet")] + ".json" for sel in (fullrun.FULL_SELECTION, fullrun.SMOKE_SELECTION,
+                                                               STUDY_SELECTION)}
+STAGE_1_ENV = {"KITSUNE_N_GPUS": "1", "KITSUNE_WATCHDOG_HB_FILE": "train_hb", "KITSUNE_WATCHDOG_ORPHAN_S": "600",
+               "KITSUNE_WATCHDOG_ORPHAN_ACTION": "alert", "KITSUNE_CHAIN_STAGE": "1",
+               "KITSUNE_WATCHDOG_HANDOVER_S": "34200"}  # 3600 x (gate_by_hours 9 + 0.5)
+
+
+def test_the_chained_box(reg):
+    """p01-chain as committed (contract addendum E.1.7): the addendum's entry, valid in the committed registry (the reg
+    fixture's load_registry read every config: E.1.4's rules, each part's extent within its stage's rebuild config,
+    stage 1's within stage 2's), kept in its normalised raw form (a loaded registry loads again unchanged), and what
+    kitsune.fullrun derives from it: the spec launch rents by (E.1.5), both stage views (E.1.6, E.2.1), the readers and
+    the stage env."""
+    from fixtures_chain import CHAIN as TEST_ENTRY  # tests/test_full_chain.py's controller runs on this entry too
+
+    raw = json.loads((FULL / "boxes.json").read_text(encoding="utf-8"))["boxes"][CHAIN]
+    assert {k: v for k, v in raw.items() if k != "_comment"} == CHAIN_ENTRY and "addendum E" in raw["_comment"]
+    assert {k: v for k, v in TEST_ENTRY.items() if k != "_comment"} == CHAIN_ENTRY
+    assert reg["boxes"][CHAIN] == raw, "the entry writes every field it has, so validation fills nothing in"
+    assert fullrun.load_registry(reg) == reg and fullrun.registry_problems(reg) == []
+    assert [b for b in reg["boxes"] if fullrun.is_chain(b, reg)] == list(fullrun.CHAIN_NAMES) == [CHAIN]
+    manifest, smoke_side, full_side = fullrun.FROZEN_MANIFEST, SIDECAR[fullrun.SMOKE_SELECTION], SIDECAR[
+        fullrun.FULL_SELECTION]
+    # E.1.5: the derived spec (computed, never stored)
+    spec = fullrun.box_spec(CHAIN, reg)
+    assert {k: v for k, v in spec.items() if k != "chain"} == dict(
+        gpus=1, data_config="configs/full/data-p01.json", est_hours=25.2, max_hours=35, max_dph=1.0, extra_gb=120,
+        gate=True, watchdog={"orphan_s": 600, "action": "alert"}, deadline_reserve_min=45, timed_states=True,
+        extra_files=[manifest, smoke_side, STUDY_SELECTION, SIDECAR[STUDY_SELECTION], full_side],
+        extra_dirs=[PARAKEET], smoke=False, faults=[], items=[], max_attempts=4)
+    s1_configs = {"full-smoke": "configs/full/data-smoke.json", "smoke-b": "configs/full/data-smoke-b.json"}
+    assert spec["chain"] == fullrun.chain_stages(CHAIN, reg) == [
+        dict(stage=1, parts=["full-smoke", "smoke-b"], gate_box="full-smoke", gate_by_hours=9, max_hours=10.5,
+             rebuild="configs/full/data-smoke.json", data_configs=s1_configs,
+             watchdog={"orphan_s": 600, "action": "alert"}),
+        dict(stage=2, parts=["p01"], gate_box=None, gate_by_hours=None, max_hours=None,
+             rebuild="configs/full/data-p01.json", data_configs={"p01": "configs/full/data-p01.json"},
+             watchdog={"orphan_s": 3600, "action": "stop"})]
+    # E.1.6 / E.2.1: the stage views (bootstrap pulls and check-students checks one stage's)
+    v1, v2 = fullrun.stage_view(CHAIN, 1, reg), fullrun.stage_view(CHAIN, 2, reg)
+    assert v1 == dict(stage=1, parts=["full-smoke", "smoke-b"], gate_box="full-smoke",
+                      rebuild="configs/full/data-smoke.json", data_configs=s1_configs,
+                      students=[f"students/study/{x}" for x in STUDENTS],
+                      ctc_students=[f"students/study/{x}" for x in STUDENTS if x.startswith("p")],
+                      extra_files=[manifest, smoke_side, STUDY_SELECTION, SIDECAR[STUDY_SELECTION]],
+                      extra_dirs=[PARAKEET], timed_states=True, watchdog={"orphan_s": 600, "action": "alert"})
+    assert v2 == dict(stage=2, parts=["p01"], gate_box=None, rebuild="configs/full/data-p01.json",
+                      data_configs={"p01": "configs/full/data-p01.json"}, students=["students/study/p01"],
+                      ctc_students=["students/study/p01"], extra_files=[manifest, full_side], extra_dirs=[],
+                      timed_states=True, watchdog={"orphan_s": 3600, "action": "stop"})
+    # the files are the data configs' own: each part's selection sidecar, and smoke-b's frozen study selection, which
+    # stage 1's rebuild (the smoke selection) does not bring
+    assert (cfg("data-smoke")["selection"], cfg("data-p01")["selection"], cfg("data-smoke-b")["selection"]) == (
+        fullrun.SMOKE_SELECTION, fullrun.FULL_SELECTION, STUDY_SELECTION)
+    assert fullrun.box_extra_files("full-smoke", reg) + [STUDY_SELECTION, SIDECAR[STUDY_SELECTION]] == v1["extra_files"]
+    assert fullrun.box_extra_files("p01", reg) == v2["extra_files"]
+    # the readers: stage N's view, or (launch) the union of both
+    for s, v in ((1, v1), (2, v2)):
+        assert fullrun.box_students(CHAIN, reg, stage=s) == v["students"]
+        assert fullrun.box_ctc_students(CHAIN, reg, stage=s) == v["ctc_students"]
+        assert fullrun.box_extra_files(CHAIN, reg, stage=s) == v["extra_files"]
+        assert fullrun.box_extra_dirs(CHAIN, reg, stage=s) == v["extra_dirs"]
+    assert fullrun.box_students(CHAIN, reg) == v1["students"]  # box 1's student is smoke A's too
+    assert (fullrun.box_extra_files(CHAIN, reg), fullrun.box_extra_dirs(CHAIN, reg)) == (spec["extra_files"],
+                                                                                        spec["extra_dirs"])
+    assert fullrun.box_configs(CHAIN, reg) == [
+        "configs/full/data-smoke.json", "configs/full/smoke-p03.json", "configs/full/smoke-t06.json",
+        "configs/full/smoke-p01.json", "configs/full/smoke-p005.json", fullrun.BOXES_FILE,
+        "configs/full/data-smoke-b.json", "configs/study/study-t06.json", "configs/full/data-p01.json",
+        "configs/full/full-p01.json"]
+    # the stage env: launch's (stage 1: full-smoke's alert watchdog and the hand-over bound), the controller's stage-2
+    # bootstrap (stop 3600)
+    assert fullrun.box_env(CHAIN, reg) == fullrun.box_env(CHAIN, reg, stage=1) == STAGE_1_ENV
+    assert fullrun.box_env(CHAIN, reg, stage=2) == {
+        "KITSUNE_N_GPUS": "1", "KITSUNE_WATCHDOG_HB_FILE": "train_hb", "KITSUNE_WATCHDOG_ORPHAN_S": "3600",
+        "KITSUNE_WATCHDOG_ORPHAN_ACTION": "stop", "KITSUNE_CHAIN_STAGE": "2"}
+    for fn in (fullrun.box_items, fullrun.train_items):  # a chain has no items: its controller runs its parts' queues
+        with pytest.raises(fullrun.RegistryError, match="chain controller"):
+            fn(CHAIN, reg)
+
+
+def test_the_chained_box_numbers(reg):
+    """The chain's hours, disk and price against its parts (addendum E.1.4 rule 3, E.6, E.9.5): box 1 fits after
+    stage 1's sub-deadline, launch's floor is 30 h, the 35 h cap covers the worst case the gate lets through, 25.2 h is
+    the central wall, the gate part ends by its standalone cap, the extra disk holds box 1's and stage 1's leftovers."""
+    from kitsune import full_queue as F
+
+    spec, parts = fullrun.box_spec(CHAIN, reg), {b: fullrun.box_spec(b, reg) for b in ("full-smoke", "smoke-b", "p01")}
+    s1 = spec["chain"][0]
+    readout = sum(it["max_hours"] for it in parts["p01"]["items"] if it["kind"] == "readout")  # m4-full-p01 0.3
+    assert spec["max_hours"] - s1["max_hours"] >= parts["p01"]["est_hours"]  # rule 3: 35 - 10.5 = 24.5 >= 19.5
+    assert s1["max_hours"] + parts["p01"]["est_hours"] == 30  # launch refuses a --max-hours below this
+    assert s1["gate_by_hours"] == parts["full-smoke"]["max_hours"] == 9 < s1["max_hours"]
+    # E.6: stage 1 + the pessimistic stage-2 setup 6.1 h [X] + smoke check 3's box-1 limit + readout + end 0.35 h +
+    # p01's reserve; E.9.5's central wall: smoke A 5.2 + smoke B's items 1.1 + stage-2 setup 4.7 + full-p01 13.56 +
+    # readout + end (the plan's hours [X])
+    assert math.isclose(s1["max_hours"] + 6.1 + F.BOX1_H_MAX + readout + 0.35
+                        + parts["p01"]["deadline_reserve_min"] / 60, spec["max_hours"])
+    assert math.isclose(5.2 + 1.1 + 4.7 + 13.56 + readout + 0.35, spec["est_hours"], abs_tol=0.05)
+    assert spec["extra_gb"] - parts["p01"]["extra_gb"] == 95  # stage 1's leftovers on box 1's disk
+    assert spec["max_dph"] == parts["p01"]["max_dph"] == parts["full-smoke"]["max_dph"] == 1.0
+    # E.1.4 rule 2: only the gate part injects faults or merely alerts
+    assert [b for b, p in parts.items() if p["faults"] or p["watchdog"]["action"] != "stop"] == ["full-smoke"]
+
+
+def test_check_holds_the_chain(tmp_path, capsys):
+    """make_full_configs --check validates the chain with the rest of the registry (fullrun.registry_problems)."""
+    out = repo_copy(tmp_path)
+    reg = json.loads((out / "boxes.json").read_text(encoding="utf-8"))
+    reg["boxes"][CHAIN]["max_hours"] = 29
+    reg["boxes"]["smoke-b"]["watchdog"]["action"] = "alert"
+    (out / "boxes.json").write_text(json.dumps(reg), encoding="utf-8")
+    assert sorted(M.check(out)) == sorted([
+        f"boxes.json: boxes.{CHAIN}: max_hours 29 - stage 1's 10.5 leaves 18.5 h, below the last stage's est_hours "
+        f"19.5",
+        f"boxes.json: boxes.{CHAIN}.chain[0]: part 'smoke-b''s watchdog action is 'alert': every part but the gate "
+        f"part runs with the watchdog in stop mode"])
+    assert M.main(["--check", "--out-dir", str(out)]) == 1 and "2 problem(s)" in capsys.readouterr().out
+
+
+def test_the_cli_shows_the_chained_box(reg, monkeypatch, capsys):
+    """python -m kitsune.fullrun show --box p01-chain (this checkout's registry): the derived spec, both stage views and
+    the stage-1 env; students / extra-files of a stage as bootstrap reads them ($KITSUNE_CHAIN_STAGE)."""
+    monkeypatch.delenv(fullrun.ENV_REGISTRY, raising=False)
+    monkeypatch.delenv(fullrun.ENV_CHAIN_STAGE, raising=False)
+    assert fullrun.main(["show", "--box", CHAIN]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["spec"] == fullrun.box_spec(CHAIN, reg) and doc["env"] == STAGE_1_ENV
+    assert doc["stages"] == {str(s): fullrun.stage_view(CHAIN, s, reg) for s in (1, 2)}
+    assert doc["configs"] == fullrun.box_configs(CHAIN, reg) and doc["students"] == doc["stages"]["1"]["students"]
+    monkeypatch.setenv(fullrun.ENV_CHAIN_STAGE, "2")
+    assert fullrun.main(["students", "--box", CHAIN]) == 0 and capsys.readouterr().out.split() == [
+        "students/study/p01"]
+    assert fullrun.main(["extra-files", "--box", CHAIN]) == 0 and capsys.readouterr().out.split() == [
+        fullrun.FROZEN_MANIFEST, SIDECAR[fullrun.FULL_SELECTION]]
+
+
+def test_launch_resolves_the_chained_box(monkeypatch, capsys):
+    """vast/launch.py --job full --box p01-chain --dry-run on this checkout's registry and configs (served as the
+    commit a box runs; the vastai CLI and the Hub faked, nothing rented): addendum E.1.8. The boot's KITSUNE_CONFIG is
+    stage 1's rebuild; the disk and the gate are sized on box 1's extent with the chain's extra_gb, the boot's rebuild
+    bytes, pull bytes and timeout on stage 1's without it; the stage-1 watchdog env; 35 h, 25.2 h, $1.00; every part
+    preflighted as a box with its own data config (the scratch repo only for parts with timed states), each distinct
+    data config's selection checked, then the chain's own files."""
+    sys.path.insert(0, str(ROOT / "vast"))
+    import launch
+
+    sha, image = "0123456789abcdef0123456789abcdef01234567", "ghcr.io/multysquid/kitsune-train@sha256:" + "ab" * 32
+    data, runs, scratch = "Multy123/kitsune-data", "Multy123/kitsune-runs", "Multy123/kitsune-scratch"
+
+    def at(s, rel):
+        assert s == sha, s
+        return (ROOT / rel).read_bytes()
+
+    monkeypatch.setattr(launch, "git_show", at)
+    monkeypatch.setattr(launch, "config_at", lambda s, c: json.loads(at(s, c)))
+    monkeypatch.setattr(launch, "git", lambda *a: sha if a[:1] == ("rev-parse",) else "")
+    monkeypatch.setattr(launch, "worktree_file", lambda rel: None)
+    # the sizings kitsune.extent.sizing gives on the sealed labels/full record with the built selections' kept hours
+    # (2026-10-01): box 1's extent with the chain's extra_gb 120 (1.1 x 1,324 GB -> 1,500 GB; addendum E.9.5 estimated
+    # 1,450 with ~486 GB of selected audio, the selection keeps 492), and stage 1's study extent
+    size = {fullrun.FULL_SELECTION: dict(down_gb=571.22, shard_gb=546.74, sel_gb=492.0, stores=1, labels_gb=38.3,
+                                         hours=13028.5, disk_gb=1500, rebuild_timeout_min=388),
+            fullrun.SMOKE_SELECTION: dict(down_gb=58.31, shard_gb=54.92, sel_gb=9.23, stores=2, labels_gb=3.41,
+                                          hours=1160.7, disk_gb=250, rebuild_timeout_min=67)}
+    seen = {"hf": [], "extent": [], "preflight": [], "chain": []}
+
+    def hf_preflight(data_repo, out_repo, c):
+        seen["hf"].append(c["selection"])
+        return "d" * 40, []
+
+    def extent_preflight(data_repo, rev, c, extra_gb=0.0):
+        seen["extent"].append((c["selection"], extra_gb))
+        return [], dict(size[c["selection"]], extra_gb=extra_gb)
+
+    def full_preflight(*a, **kw):
+        seen["preflight"].append((a, kw))
+        return [], [f"{a[5]} preflight ok"]
+
+    def vastai(exe, args):
+        assert args[:2] == ["search", "offers"], f"only the offer search runs look-only, not {args[:2]}"
+        return json.dumps([{"id": 1, "machine_id": 54650, "gpu_name": "RTX 5090", "gpu_ram": 32607, "num_gpus": 1,
+                            "dph_total": 0.816, "reliability": 0.99, "verification": "verified",
+                            "duration": 30 * 86400, "cpu_ram": 64439, "disk_space": 1568, "inet_down_cost": 0.00117,
+                            "inet_up_cost": 0.001, "storage_cost": 0.1}])
+
+    monkeypatch.setattr(launch, "hf_preflight", hf_preflight)
+    monkeypatch.setattr(launch, "extent_preflight", extent_preflight)
+    monkeypatch.setattr(launch, "full_preflight", full_preflight)
+    monkeypatch.setattr(launch, "chain_preflight",
+                        lambda *a, **kw: seen["chain"].append((a, kw)) or ([], ["chain preflight ok"]))
+    monkeypatch.setattr(launch, "avoided_machines", lambda data_repo, rev: (set(), []))
+    monkeypatch.setattr(launch, "gate_refusals", lambda out_repo: ({}, []))
+    monkeypatch.setattr(launch, "vastai", vastai)
+    monkeypatch.setattr(launch.shutil, "which", lambda name: "/fake/vastai" if name == "vastai" else None)
+    rc = launch.main(["--job", "full", "--box", CHAIN, "--data-repo", data, "--out-repo", runs, "--scratch-repo",
+                      scratch, "--sha", sha, "--image", image, "--skip-git-checks", "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "not creating anything (--dry-run)" in out, out
+    create = out.split("create command:\n  vastai ", 1)[1].splitlines()[0]  # as printed look-only
+    cargs = shlex.split(create)
+    env_value = cargs[cargs.index("--env") + 1]
+    env = dict(p.split("=", 1) for p in env_value.split(" ")[1::2])
+    full, smoke = size[fullrun.FULL_SELECTION], size[fullrun.SMOKE_SELECTION]
+    assert env == {
+        "KITSUNE_JOB": "full", "KITSUNE_BOX": CHAIN, "KITSUNE_SHA": sha, "KITSUNE_CONFIG": "configs/full/data-smoke.json",
+        "KITSUNE_DATA_REPO": data, "KITSUNE_OUT_REPO": runs, **STAGE_1_ENV, "KITSUNE_SCRATCH_REPO": scratch,
+        "KITSUNE_GATE_BYTES": str(int(1e9 * max(full["down_gb"], 571.2))), "KITSUNE_GATE_MAX_H": "5",
+        "KITSUNE_REBUILD_BYTES": str(int(1e9 * smoke["down_gb"])),
+        "KITSUNE_PULL_BYTES": str(int(1e9 * (smoke["labels_gb"] + 2))), "KITSUNE_MAX_HOURS": "35", "TZ": "UTC",
+        "KITSUNE_DATA_REVISION": "d" * 40, "KITSUNE_REBUILD_TIMEOUT_MIN": str(smoke["rebuild_timeout_min"]),
+        "KITSUNE_DPH": "0.8160", "KITSUNE_MACHINE_ID": "54650"}
+    assert cargs[cargs.index("--disk") + 1] == "1500" and "HF_TOKEN" not in create
+    assert "disk_space>=1500" in out, "the offer search filters on box 1's disk (the machine's free disk)"
+    assert cargs[cargs.index("--label") + 1] == f"kitsune-full-{CHAIN}-data-smoke-{sha[:7]}"
+    # the sizing inputs: box 1's extent with the chain's extra_gb 120, stage 1's with none
+    assert sorted(seen["extent"]) == sorted([(fullrun.FULL_SELECTION, 120.0), (fullrun.SMOKE_SELECTION, 0.0)])
+    assert seen["hf"] == [fullrun.SMOKE_SELECTION, STUDY_SELECTION, fullrun.FULL_SELECTION]
+    parts = {a[5]: (a, kw) for a, kw in seen["preflight"]}
+    assert list(parts) == ["full-smoke", "smoke-b", "p01"]
+    assert {p: (a[3], a[7]["selection"]) for p, (a, _) in parts.items()} == {
+        "full-smoke": (scratch, fullrun.SMOKE_SELECTION), "smoke-b": (None, STUDY_SELECTION),
+        "p01": (scratch, fullrun.FULL_SELECTION)}
+    assert len(seen["chain"]) == 1 and seen["chain"][0][0][3:4] == (CHAIN,)
+    assert "x ~25.2 h (box p01-chain; watchdog cap 35 h)" in out and "part smoke-b: smoke-b preflight ok" in out
+    assert "chain p01-chain: the gate part must end by first boot + 9 h" in out and "+ 9.5 h" in out
+    assert "stage 1 ends by + 10.5 h" in out and "chain stage 1 (configs/full/data-smoke.json)" in out
 
 
 @pytest.mark.skipif(not os.environ.get("KITSUNE_FULL_SELECTION_DIR"),
