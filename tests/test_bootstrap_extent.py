@@ -638,7 +638,8 @@ def test_the_full_phases_are_new_lines_and_the_shared_lines_stay_byte_identical(
     at = [text.index(o) for o in order]
     assert at == sorted(at), [o for o, _ in sorted(zip(order, at), key=lambda x: x[1])]
     body = text.split("PYEOF\n")[-1]
-    for name in ("download_gate", "resume_pull", "check_students \"$PY\" -m kitsune.fullrun", "pull_labels retry"):
+    for name in ("download_gate", "resume_pull", "check_students \"$PY\" -m kitsune.fullrun", "pull_labels retry",
+                 "pull_labels_wait"):
         i = body.index(f"phase {name}")
         assert 'if [ "${KITSUNE_JOB:-}" = "full" ]' in body[max(0, body.rfind("\nif ", 0, i)):i], name
     assert 'retry 3 timeout -k 30 "${KITSUNE_PULL_TIMEOUT_MIN:-30}m" "$PY" "$HELPER" pull_labels &' in text
