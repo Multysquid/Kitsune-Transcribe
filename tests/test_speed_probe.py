@@ -448,3 +448,19 @@ def test_quant_after_the_runners_bf16_cast(env):
             hyps = runner.decode([store.wave(0), store.wave(1)], [float(u.duration) for u in store.utts[:2]], [1, 1])
         assert len(hyps) == 2 and Q.uncalled(runner.model) == []
 
+
+def test_quant_counters_are_null_when_not_counted():
+    """--compile turns the layers' counters off: the record's quant_counters is then None, never zeros that would read
+    as a measurement; counted layers give {calls, padded, fallback_risk}."""
+    from torch import nn
+
+    from kitsune import quant as Q
+
+    lin = nn.Linear(64, 32)
+    Q.quantize_linear(lin, "int8-w8a8", "emulate")
+    m = Q._One(lin)
+    with torch.no_grad():
+        lin(torch.randn(3, 64))
+    assert sp.quant_counters(m) == dict(calls=1, padded=0, fallback_risk=0)
+    Q.set_counting(m, False)
+    assert sp.quant_counters(m) is None

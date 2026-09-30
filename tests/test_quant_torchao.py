@@ -73,6 +73,11 @@ def test_every_name_and_config_resolves():
     for name in ("quantize_", "PerRow", "MXDynamicActivationMXWeightConfig", "KernelPreference"):
         assert Q._ao(name) is not None
     assert Q.resolve_impl("int8-w8a8", "torchao", torch.device("cpu")) == "torchao"
+    # the selftest's decision-20 canary: the MXFP4 W4A4 config with the AUTO kernel preference, as it builds it
+    cfg = Q.mxfp4_auto_config()
+    assert type(cfg).__name__ == "MXDynamicActivationMXWeightConfig"
+    assert cfg.kernel_preference == Q._ao("KernelPreference").AUTO
+    assert cfg.activation_dtype == cfg.weight_dtype == torch.float4_e2m1fn_x2
 
 
 @pytest.mark.parametrize("fmt", ["int8-w8a16", "int8-w8a8"])

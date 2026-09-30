@@ -649,14 +649,99 @@ def test_weight_bytes_formula():
 
 
 def test_kernel_census_on_cpu():
+    """The op counts and kernel classes; an emulated int8 layer's calls are counted, but it runs no int8 GEMM, so
+    fallback_mm is None (not applicable) and torch._int_mm is not wrapped."""
     lin = nn.Linear(64, 32)
     Q.quantize_linear(lin, "int8-w8a8", "emulate")
     x = torch.randn(4, 64)
     with torch.no_grad():
         c = Q.kernel_census(lambda: lin(x), "cpu", model=Q._One(lin))
     assert c["ops"].get("aten::linear", 0) >= 1 and c["int8_act_calls"] == 1 and c["fallback_mm"] is None
+    assert c["int8_mm"] is None
     assert Q._kernel_class("sm120_xmma_gemm_e2m1_e2m1") == "fp4" and Q._kernel_class("cutlass_i8i8_gemm") == "int8"
     assert Q._kernel_class("sm90_gemm_e4m3") == "fp8" and Q._kernel_class("ampere_bf16_s16816gemm") == "bf16"
+    assert "fallback_mm" not in Q.kernel_census(lambda: lin(x), "cpu")  # no model: ops and kernels only
+
+
+def test_kernel_census_counts_int8_gemms_that_returned():
+    """fallback_mm counts successes, not attempts: torchao's safe_int_mm runs torch._int_mm in try/except and silently
+    runs an fp32 matmul when it raises, and the profiler records aten::_int_mm for the raising call too. A layer
+    standing in for a torchao int8-activation one (impl torchao; its call counted) with: a raising torch._int_mm and
+    the fp32 fallback -> fallback_mm 1; a torch._int_mm that returns -> 0; an int8 GEMM run past the wrapper
+    (torch.ops.aten._int_mm) -> None (cannot be told); the counters off (speed_probe --compile) -> None. The wrapper is
+    gone afterwards."""
+    lin = nn.Linear(64, 32)
+    Q.quantize_linear(lin, "int8-w8a8", "emulate")
+    lin.kq.impl = "torchao"  # the census only reads the impl; this forward stays the plain one on CPU
+    x = torch.randn(4, 64)
+    a, b = torch.randint(-5, 5, (17, 64), dtype=torch.int8), torch.randint(-5, 5, (64, 32), dtype=torch.int8)
+    a4, bad = torch.randint(-5, 5, (4, 16), dtype=torch.int8), torch.randint(-5, 5, (8, 16), dtype=torch.int8)
+
+    def fallback():
+        lin(x)
+        try:
+            torch._int_mm(a4, bad)  # the inner dims differ: it raises, as _int_mm does at M <= 16 on CUDA
+        except RuntimeError:
+            torch.matmul(a4.float(), bad.float().t())
+
+    def ran():
+        lin(x)
+        torch._int_mm(a, b)
+
+    def past():
+        lin(x)
+        torch.ops.aten._int_mm(a, b)
+
+    orig = torch._int_mm
+    with torch.no_grad():
+        c = Q.kernel_census(fallback, "cpu", model=Q._One(lin))
+        assert c["ops"]["aten::_int_mm"] == 1 and c["int8_mm"] == dict(calls=1, ok=0, raised=1)
+        assert c["int8_act_calls"] == 1 and c["fallback_mm"] == 1
+        c = Q.kernel_census(ran, "cpu", model=Q._One(lin))
+        assert c["int8_mm"] == dict(calls=1, ok=1, raised=0) and c["fallback_mm"] == 0
+        c = Q.kernel_census(past, "cpu", model=Q._One(lin))
+        assert c["int8_mm"]["unseen"] == 1 and c["fallback_mm"] is None and c["int8_act_calls"] == 1
+        Q.set_counting(lin, False)
+        c = Q.kernel_census(ran, "cpu", model=Q._One(lin))
+        assert c["int8_act_calls"] is None and c["int8_mm"] is None and c["fallback_mm"] is None
+    assert torch._int_mm is orig
+
+
+def test_low_gemm_evidence():
+    """The selftest's autocast check reads ops, not kernel names: cuBLASLt's sm_120 GEMMs (nvjet_*) carry no dtype
+    in their names. fp4 / fp8: a scaled-matmul op (or a named kernel of that class) passes, an unrecognised kernel
+    name alongside is a warning, neither fails; int8: every int8 call's GEMM returned (fallback_mm 0); weight-only
+    formats need no low-precision GEMM."""
+    nvjet = dict(ops={"aten::_scaled_mm": 1, "aten::linear": 1}, gemm_classes={},
+                 kernels={"nvjet_sm120_tst_128x256_64x4_1x2_h_bz_coopA_TNT": 1})
+    assert Q._kernel_class("nvjet_sm120_tst_128x256_64x4_1x2_h_bz_coopA_TNT") == "other"
+    for fmt in ("nvfp4-w4a4", "fp8-w8a8"):
+        r = Q.low_gemm_evidence(fmt, nvjet)
+        assert r["ok"] and r["warning"] and "1 scaled-matmul op" in r["evidence"]
+        assert not Q.low_gemm_evidence(fmt, dict(ops={"aten::mm": 1}, gemm_classes={"bf16": 1}))["ok"]
+    named = Q.low_gemm_evidence("nvfp4-w4a4", dict(ops={}, gemm_classes={"fp4": 2}))
+    assert named["ok"] and named["warning"] is None
+    assert Q.low_gemm_evidence("fp8-w8a8", dict(ops={"mslk::f8f8bf16_rowwise": 1}, gemm_classes={}))["ok"]
+    assert Q.low_gemm_evidence("int8-w8a8", dict(ops={"aten::_int_mm": 1}, gemm_classes={}, int8_act_calls=1,
+                                                 fallback_mm=0))["ok"]
+    for fb, calls in ((1, 1), (None, 1), (0, 0)):
+        assert not Q.low_gemm_evidence("int8-w8a8", dict(ops={"aten::_int_mm": 1}, gemm_classes={"int8": 1},
+                                                         int8_act_calls=calls, fallback_mm=fb))["ok"]
+    for fmt in ("int8-w8a16", "nvfp4-w4a16"):
+        assert Q.low_gemm_evidence(fmt, dict(ops={}, gemm_classes={}))["ok"]
+
+
+def test_the_mxfp4_canary_tells_a_config_error_from_a_refusal(monkeypatch):
+    """Decision 20's canary builds torchao's MXFP4 AUTO config on its own first: a config that does not build is a
+    warning with its error (config_error), never counted as "AUTO refused MXFP4" (raised stays None)."""
+    def no_config():
+        raise TypeError("__init__() got an unexpected keyword argument 'kernel_preference'")
+
+    monkeypatch.setattr(Q, "mxfp4_auto_config", no_config)
+    rec = dict(warnings=[])
+    Q._selftest_mxfp4(rec, torch.device("cpu"), (64, 64))
+    assert rec["mxfp4_auto"]["raised"] is None and "kernel_preference" in rec["mxfp4_auto"]["config_error"]
+    assert "not tried" in rec["warnings"][0]
 
 
 def _eval_dir(d: Path, hyps: dict, refs: dict, tf=None):

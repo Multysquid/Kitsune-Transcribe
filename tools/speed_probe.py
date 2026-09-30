@@ -71,8 +71,10 @@ asked, recorded emulated: true and never a speed; mxfp4 has no kernel here and n
 under fp16 autocast, dtype "fp16"), then the rel-pos patch. The bf16 export is what is timed: a variant dir as --model
 is refused (its weights are the same bits). The system must be <base>@<fmt> (+compile with --compile: the encoder, and
 the aed decoder, compiled in place, counters off, --warmup >= 2). --profile-kernels adds an untimed batched and
-batch-1 decode under kitsune.quant.kernel_census (kernels: the matmul ops and GEMM kernel classes, the int8 fallbacks);
---threads sets torch's threads before loading; --hyps-out writes the list's hypotheses (id, ref, hyp, hyp_1, duration).
+batch-1 decode under kitsune.quant.kernel_census (kernels: the matmul ops and GEMM kernel classes, the int8 fallbacks:
+the int8 calls whose torch._int_mm did not return); --threads sets torch's threads before loading; --hyps-out writes
+the list's hypotheses (id, ref, hyp, hyp_1, duration). With --compile the layers' counters are off, so quant_counters
+and the census's int8 counts are null (not counted, rather than zeros that would read as a measurement).
 Every record gains quant, quant_impl, quant_scope, mx_rounding, emulated, compile, threads, autocast_dtype,
 quant_counters, kernels, weights_bytes_resident and hyp_diff_1 (the latency ids whose batch-1 hypothesis differs from
 the batched one: NVFP4 W4A4's whole-call activation scale makes a row depend on its batch-mates); weights_bytes is the
@@ -357,8 +359,10 @@ def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, 
     on its encoder, as the trainer and the evaluator run every one of these encoders (perf.relpos_patch); decode_len
     "teacher": an AED runner pinned to the teacher's token counts. quant {fmt, impl, scope, mx_rounding}: the model
     quantised after the runner's dtype cast and before the patch (fp16: the runner keeps fp32 weights, kitsune.quant
-    casts them, autocast fp16), runner.quant = the recipe, weights_bytes = the deployable bytes. compile: the encoder
-    (and an AED's decoder) compiled in place last, the quant counters off (their increments are Python side effects)."""
+    casts them, autocast fp16), runner.quant = the recipe, weights_bytes = the deployable bytes. The runner's bf16 cast
+    comes first (the study's timing convention: BatchNorm statistics bf16 too), and kitsune.quant.apply leaves those
+    statistics as it finds them. compile: the encoder (and an AED's decoder) compiled in place last, the quant counters
+    off (their increments are Python side effects; quant_counters then records null)."""
     fp16 = bool(quant) and quant["fmt"] == "fp16"
     runner, desc = _runner(kind, model, device, "fp32" if fp16 else dtype, store.info or {}, revision,
                            pin=decode_len == "teacher")
@@ -527,6 +531,16 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
                 vram_gb=max(reserved) / 1e9 if reserved else None,
                 cer_ref_corpus=corpus_cer([h or "" for h in hyps], refs)["cer"],
                 hyp_diff_1=sum(a != b for a, b in zip(hyps_1, hyps)), kernels=kernels, _hyps=(hyps, hyps_1))
+
+
+def quant_counters(model) -> dict | None:
+    """The record's quant_counters: the quantised layers' {calls, padded, fallback_risk}; None when they were not
+    counted (--compile turns the counters off, and zeros would then read as a measurement)."""
+    from kitsune import quant as Q
+
+    if any(not m.kq.count for m in Q.quant_layers(model).values()):
+        return None
+    return {k: v for k, v in Q.counters(model).items() if k != "rows"}
 
 
 def write_hyps(path: Path, ids: list[str], refs: list[str], hyps: list, hyps_1: list, durations: list[float]):
@@ -726,7 +740,7 @@ def main(argv=None) -> int:
                 warmup_1=args.warmup_1, latency_n=args.latency_n, n_tok=n_tok, profile_kernels=args.profile_kernels)
     hyps, hyps_1 = res.pop("_hyps")
     rec.update(res)
-    rec["quant_counters"] = {k: v for k, v in Q.counters(runner.model).items() if k != "rows"} if quant else None
+    rec["quant_counters"] = quant_counters(runner.model) if quant else None
     if args.hyps_out:
         write_hyps(Path(args.hyps_out), ids, refs, hyps, hyps_1, durations)
     rec.update(idle=idle, gpu_state=gpu, versions=_versions(), store=str(args.store), time_utc=_now())

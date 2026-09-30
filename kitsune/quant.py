@@ -102,8 +102,9 @@ CLI (python -m kitsune.quant; exit codes of contract 1.5):
   compare A B [--exact | --tol-cer x] [--json-out FILE]   two 05 --out dirs, over the sets both hold: {same, sets}
                                                                                                 0 same / 1 differ
   selftest --device cuda:0 --out FILE [--ckpt DIR ...] [--rows 1,7,17,128,1000]   smoke B check 12: real torchao
-          kernels against emulate per format and M, the kernel census (the int8 GEMM ran, no fallback after
-          padding), weights quantised under autocast, MXFP4 refused by torchao's AUTO kernel. {ok, ...}     0 / 1
+          kernels against emulate per format and M, the kernel census (every int8 GEMM returned after padding: no
+          fp32 fallback), weights quantised and the low-precision GEMM run under autocast, MXFP4 refused by
+          torchao's AUTO kernel. {ok, ...}                                                                  0 / 1
 export, compare and selftest beat the item's heartbeat (kitsune.heartbeat.beating, max 1800 s; a no-op without
 KITSUNE_HEARTBEAT); readout's 05 part beats through 05's featuriser.
 """
@@ -116,6 +117,7 @@ import shutil
 import sys
 import time
 from collections import Counter
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1745,7 +1747,14 @@ def merge_nonfinite(records: list[dict]) -> dict:
     return out
 
 
-_OPS = ("aten::_int_mm", "aten::_scaled_mm", "aten::mm", "aten::addmm", "aten::linear", "aten::bmm", "aten::matmul")
+_OPS = ("aten::_int_mm", "aten::_scaled_mm", "aten::_scaled_mm_v2", "aten::mm", "aten::addmm", "aten::linear",
+        "aten::bmm", "aten::matmul")
+
+
+def _low_op(name: str) -> bool:
+    """A profiler op that is itself a low-precision (fp8 / fp4) GEMM: torch's scaled matmuls (torchao 0.18's NVFP4 and
+    FP8 linears call torch._scaled_mm) and the MSLK / FBGEMM kernels a torchao kernel preference may pick instead."""
+    return "scaled_mm" in name or name.startswith(("mslk::", "fbgemm::"))
 
 
 def _kernel_class(name: str) -> str:
@@ -1763,28 +1772,67 @@ def _kernel_class(name: str) -> str:
     return "other"
 
 
+@contextmanager
+def count_int_mm():
+    """torch._int_mm wrapped for the with-block, yielding {calls, ok, raised}: ok counts the int8 GEMMs that RETURNED.
+    That is the evidence the int8 path ran: torchao's safe_int_mm calls torch._int_mm (through torch's out_dtype op,
+    which looks torch._int_mm up at call time) inside try/except and silently runs an fp32 matmul when it raises
+    (M <= 16 on CUDA, a layout it refuses), and the profiler records an aten::_int_mm for the call that raised as
+    well. Only while nothing is compiled (a compiled graph does not look the name up)."""
+    orig = torch._int_mm
+    n = dict(calls=0, ok=0, raised=0)
+
+    def counted(*args, **kwargs):
+        n["calls"] += 1
+        try:
+            out = orig(*args, **kwargs)
+        except BaseException:
+            n["raised"] += 1
+            raise
+        n["ok"] += 1
+        return out
+
+    torch._int_mm = counted
+    try:
+        yield n
+    finally:
+        torch._int_mm = orig
+
+
 def kernel_census(fn, device, *, model: nn.Module | None = None) -> dict:
     """What fn() ran, under torch.profiler: the counts of the matmul ops (aten::_int_mm, _scaled_mm, mm, addmm,
-    linear, ...) and, on CUDA, the GEMM kernels by class (int8, fp4, fp8, bf16, other_gemm). With the quantised model:
-    fallback_mm = its int8-activation QuantLinear calls less the aten::_int_mm ops (torchao's silent fp32 fallback;
-    0 when every int8 call reached the int8 GEMM)."""
+    linear, ...; any other scaled-matmul op too) and, on CUDA, the GEMM kernels by class (int8, fp4, fp8, bf16,
+    other_gemm). With the quantised model (any device):
+      int8_act_calls  its int8-activation QuantLinear calls during fn
+      int8_mm         {calls, ok, raised} of torch._int_mm under count_int_mm (ok: the int8 GEMMs that returned),
+                      when the model has a torchao int8-activation layer
+      fallback_mm     the int8-activation calls of its torchao layers less the int8 GEMMs that returned: torchao's
+                      silent fp32 fallback, 0 when every such call ran the int8 GEMM. None when it cannot be told:
+                      a model without a torchao int8-activation layer (emulate runs no int8 GEMM), counters off, or
+                      an int8 GEMM that ran past the wrapper (the profiler saw aten::_int_mm, the wrapper no call)
+    The profiler's aten::_int_mm count is information only: it counts a call that raised. With the model's counters
+    off (speed_probe --compile: the calls were not counted), int8_act_calls, int8_mm and fallback_mm are None."""
     from torch.profiler import ProfilerActivity, profile
 
     dev = torch.device(device)
     acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if dev.type == "cuda" else [])
-    int8_before = None
-    if model is not None:
-        int8_before = sum(m.kq.calls for m in quant_layers(model).values() if m.kq.act == "int8")
+    qls = list(quant_layers(model).values()) if model is not None else []
+    counted = model is not None and all(m.kq.count for m in qls)
+    int8 = [m for m in qls if m.kq.act == "int8"]
+    real = [m for m in int8 if m.kq.impl == "torchao"]
+    before = (sum(m.kq.calls for m in int8), sum(m.kq.calls for m in real))
     t0 = time.perf_counter()
-    with profile(activities=acts) as prof:
-        fn()
-        if dev.type == "cuda":
-            torch.cuda.synchronize(dev)
+    with ExitStack() as stack:
+        n = stack.enter_context(count_int_mm()) if counted and real else None
+        with profile(activities=acts) as prof:
+            fn()
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
     wall = time.perf_counter() - t0
     ops, kernels, classes = Counter(), Counter(), Counter()
     for e in prof.events():
         name = e.name
-        if name in _OPS:
+        if name in _OPS or _low_op(name):
             ops[name] += 1
         dt = getattr(e, "device_type", None)
         if dt is not None and "cuda" in str(dt).lower():
@@ -1794,10 +1842,42 @@ def kernel_census(fn, device, *, model: nn.Module | None = None) -> dict:
                 classes[cls] += 1
     rec = dict(ops=dict(ops), gemm_classes=dict(classes), kernels=dict(kernels.most_common(40)), wall_s=wall)
     if model is not None:
-        int8_calls = sum(m.kq.calls for m in quant_layers(model).values() if m.kq.act == "int8") - int8_before
-        rec["int8_act_calls"] = int8_calls
-        rec["fallback_mm"] = max(int8_calls - ops.get("aten::_int_mm", 0), 0) if dev.type == "cuda" else None
+        rec.update(int8_act_calls=None, int8_mm=None, fallback_mm=None)
+        if counted:
+            rec["int8_act_calls"] = sum(m.kq.calls for m in int8) - before[0]
+        if n is not None:
+            rec["int8_mm"] = dict(n)
+            if n["calls"] == 0 and ops.get("aten::_int_mm", 0) > 0:  # ran past the wrapper: success unknown
+                rec["int8_mm"]["unseen"] = ops["aten::_int_mm"]
+            else:
+                rec["fallback_mm"] = max(sum(m.kq.calls for m in real) - before[1] - n["ok"], 0)
     return rec
+
+
+def low_gemm_evidence(fmt: str, census: dict) -> dict:
+    """{ok, evidence, warning}: whether a kernel census (with the model) proves the format's low-precision GEMM ran -
+    the selftest's autocast check. A weight-only format needs none (torchao dequantises its weight to bf16). int8
+    activations: every int8-activation call of the torchao layer returned from torch._int_mm (fallback_mm 0 over at
+    least one call). fp4 / fp8 activations: a scaled-matmul op ran (_low_op), or a GEMM kernel of that class by name.
+    The kernel name is not required: cuBLASLt's sm_120 GEMMs (nvjet_*) carry no dtype in their names; op evidence
+    without a recognised name is a warning, never a failure."""
+    act = _SPLIT[fmt][1] if fmt in _SPLIT else None
+    classes = census.get("gemm_classes") or {}
+    named = sum(v for c, v in classes.items() if c in ("int8", "fp4", "fp8"))
+    if not act:
+        return dict(ok=True, evidence="weight-only: its weight is dequantised to bf16, no low-precision GEMM",
+                    warning=None)
+    if act == "int8":
+        calls, fb = census.get("int8_act_calls"), census.get("fallback_mm")
+        ok = bool(calls) and fb == 0
+        evidence = f"{calls} int8-activation call(s), fallback_mm {fb}, torch._int_mm {census.get('int8_mm')}"
+    else:
+        n = sum(v for k, v in (census.get("ops") or {}).items() if _low_op(k))
+        ok = n > 0 or named > 0
+        evidence = f"{n} scaled-matmul op(s), {named} low-precision GEMM kernel(s) by name"
+    warning = None if not ok or named else ("no GEMM kernel name recognised as int8 / fp4 / fp8 (op evidence only): "
+                                            "the census's kernels list what ran")
+    return dict(ok=bool(ok), evidence=evidence, warning=warning)
 
 
 # ---------------------------------------------------------------------------------------------- compare
@@ -1875,10 +1955,12 @@ def quantize_linear(lin: nn.Linear, fmt: str, impl: str, *, mx_rounding: str = "
 def selftest(device, *, ckpt=None, rows=(1, 7, 17, 128, 1000), shape=(2560, 1024)) -> dict:
     """Smoke B check 12 (module docstring). Per timed format on an (N, K) Linear: torchao against emulate at every M
     (relative Frobenius error within SELFTEST_TOL), the kernel census and the wall time; int8 W8A8: no fp32 fallback
-    after padding (fallback_mm 0) and, unpadded at M=1, whether the trap shows; under torch.autocast(bf16) with an fp32
-    input the weight stays torchao's and a low-precision GEMM runs (W*A* formats); MXFP4 through torchao's AUTO kernel
-    must raise (a warning, "re-evaluate decision 20", when it does not). With ckpt dirs: the same comparison on the
-    student (a CTC encoder batch; an AED greedy_generate(pin_new=8) at batch 1 and 8). ok = every hard check passed."""
+    after padding (every call's torch._int_mm returned: fallback_mm 0, kernel_census) and, unpadded at M=1, whether
+    the trap shows (torch._int_mm raising; a warning when it returned); under torch.autocast(bf16) with an fp32 input
+    the weight stays torchao's and the low-precision GEMM runs (W*A* formats, by op evidence: low_gemm_evidence);
+    MXFP4 through torchao's AUTO kernel must raise (a warning, "re-evaluate decision 20", when it does not). With ckpt
+    dirs: the same comparison on the student (a CTC encoder batch; an AED greedy_generate(pin_new=8) at batch 1 and
+    8). ok = every hard check passed."""
     dev = torch.device(device)
     rec = dict(schema=SCHEMA, device=str(dev), versions=_versions(), rows=[int(r) for r in rows], shape=list(shape),
                formats={}, checks=[], warnings=[], ckpt={}, ok=False, time_utc=_now())
@@ -1936,27 +2018,39 @@ def _selftest_layers(rec, check, dev, rows, shape):
                                              census=census)
                 check(f"{fmt} M={m} real vs emulate", err <= SELFTEST_TOL[fmt] and bool(torch.isfinite(yr).all()),
                       f"rel_err {err:.3g} (tol {SELFTEST_TOL[fmt]})")
-                if _SPLIT[fmt][1] == "int8":
-                    check(f"{fmt} M={m} no fp32 fallback", census.get("fallback_mm") == 0,
-                          f"fallback_mm {census.get('fallback_mm')}")
-            # fp32 input under bf16 autocast: the weight stays torchao's, the low-precision GEMM runs (W*A*)
+                if _SPLIT[fmt][1] == "int8":  # every int8 call's torch._int_mm returned (kernel_census)
+                    check(f"{fmt} M={m} no fp32 fallback",
+                          census.get("fallback_mm") == 0 and bool(census.get("int8_act_calls")),
+                          f"fallback_mm {census.get('fallback_mm')}, int8_act_calls {census.get('int8_act_calls')}, "
+                          f"torch._int_mm {census.get('int8_mm')}")
+            # fp32 input under bf16 autocast: the weight stays torchao's, the low-precision GEMM runs (W*A*: by op
+            # evidence, low_gemm_evidence; a kernel name is recorded, not required)
             before = type(real.weight)
             x = torch.randn(64, k, generator=g).to(dev)
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 census = kernel_census(lambda: real(x), dev, model=_One(real))
-            low = sum(v for c, v in census["gemm_classes"].items() if c in ("int8", "fp4", "fp8"))
-            ok = type(real.weight) is before and (low > 0 or not _SPLIT[fmt][1])
-            frec["autocast"] = dict(census=census, weight_type=type(real.weight).__name__)
-            check(f"{fmt} autocast keeps the weight quantised", ok, census["gemm_classes"])
-            if fmt == "int8-w8a8":
+            low = low_gemm_evidence(fmt, census)
+            frec["autocast"] = dict(census=census, weight_type=type(real.weight).__name__, low_gemm=low)
+            check(f"{fmt} autocast keeps the weight quantised", type(real.weight) is before and low["ok"],
+                  dict(weight_type=type(real.weight).__name__, evidence=low["evidence"],
+                       gemm_classes=census["gemm_classes"]))
+            if low["warning"]:
+                rec["warnings"].append(f"{fmt} under autocast: {low['warning']}")
+            if fmt == "int8-w8a8":  # the trap the padding avoids: unpadded at M=1, torch._int_mm must raise
                 trap = make(fmt, "torchao", min_rows=0)
                 x1 = torch.randn(1, k, generator=g).to(dev, torch.bfloat16)
-                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    c1 = kernel_census(lambda: trap(x1), dev, model=_One(trap))
+                try:
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                        c1 = kernel_census(lambda: trap(x1), dev, model=_One(trap))
+                except Exception as e:  # noqa: BLE001 - torchao let the refusal through: no silent fallback either
+                    c1 = dict(raised=f"{type(e).__name__}: {e}"[:400], fallback_mm=1)
                 frec["unpadded_m1"] = c1
-                if not c1.get("fallback_mm"):
-                    rec["warnings"].append("int8-w8a8 unpadded at M=1 reached the int8 GEMM: torch._int_mm now "
-                                           "takes M <= 16 here, the padding is no longer needed")
+                if c1.get("fallback_mm") is None:
+                    rec["warnings"].append(f"int8-w8a8 unpadded at M=1: whether the int8 GEMM returned could not be "
+                                           f"counted (torch._int_mm {c1.get('int8_mm')})")
+                elif c1["fallback_mm"] == 0:
+                    rec["warnings"].append("int8-w8a8 unpadded at M=1: torch._int_mm returned, so it takes M <= 16 "
+                                           "here now and the padding to 17 rows may no longer be needed")
         except Exception as e:  # noqa: BLE001 - recorded: the selftest reports every format
             frec["error"] = f"{type(e).__name__}: {e}"[:600]
             check(f"{fmt} builds and runs", False, frec["error"])
@@ -1965,22 +2059,34 @@ def _selftest_layers(rec, check, dev, rows, shape):
 def _selftest_mxfp4(rec, dev, shape):
     """Decision 20: MXFP4 has no kernel on sm_120, so torchao's AUTO kernel preference must raise here."""
     n, k = shape
-    out = dict(raised=None, error=None)
+    out = dict(raised=None, error=None, config_error=None)
+    rec["mxfp4_auto"] = out
+    try:  # the config first, on its own: a torchao whose config API moved must not read as "AUTO refused MXFP4"
+        cfg = mxfp4_auto_config()
+    except Exception as e:  # noqa: BLE001
+        out["config_error"] = f"{type(e).__name__}: {e}"[:400]
+        rec["warnings"].append("MXFP4 through torchao's KernelPreference.AUTO was not tried: its config does not "
+                               f"build ({out['config_error']}); decision 20 is unchecked here")
+        return
     try:
-        cfg_cls = _ao("MXDynamicActivationMXWeightConfig")
-        pref = _ao("KernelPreference")
         lin = nn.Linear(k, n, bias=False, device=dev, dtype=torch.bfloat16)
-        _ao("quantize_")(lin, cfg_cls(activation_dtype=torch.float4_e2m1fn_x2, weight_dtype=torch.float4_e2m1fn_x2,
-                                      kernel_preference=pref.AUTO))
+        _ao("quantize_")(lin, cfg)
         with torch.no_grad():
             lin(torch.randn(32, k, device=dev, dtype=torch.bfloat16))
         torch.cuda.synchronize(dev)
         out["raised"] = False
     except Exception as e:  # noqa: BLE001
         out.update(raised=True, error=f"{type(e).__name__}: {e}"[:400])
-    rec["mxfp4_auto"] = out
     if out["raised"] is False:
         rec["warnings"].append("MXFP4 through torchao's KernelPreference.AUTO ran on this GPU: re-evaluate decision 20")
+
+
+def mxfp4_auto_config():
+    """torchao 0.18's MXFP4 W4A4 config with its AUTO kernel preference (the selftest's decision-20 canary; the image
+    CI builds it on CPU, tests/test_quant_torchao.py)."""
+    fp4 = torch.float4_e2m1fn_x2
+    return _ao("MXDynamicActivationMXWeightConfig")(activation_dtype=fp4, weight_dtype=fp4,
+                                                     kernel_preference=_ao("KernelPreference").AUTO)
 
 
 def _selftest_ckpt(rec, check, dev, d: Path):
