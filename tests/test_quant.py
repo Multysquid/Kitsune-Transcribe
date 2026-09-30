@@ -1,12 +1,14 @@
 """kitsune.quant on CPU (emulate and fp16; torchao is not on the laptop, tests/test_quant_torchao.py covers it inside
 the training image): the exact grids (E2M1 round-half-even, sign, saturation and packing; the E4M3 / E8M0 / int8 /
-fp8 scales), the error bound of every pack, the layer filter on tiny CTC and AED students (the tied head, the CTC
-head, the pointwise adapter, the alignment skips), apply for every format on both families, the rel-pos patch
-routing through the quantised forward, the activation semantics (int8 per token, the W4A4 batch-mate trap, the
-autocast rounding), the row padding, the variant dir (a reloaded variant gives the in-memory outputs to the bit, its
-bytes are deterministic, w8a16 and w8a8 are one file, corruption is caught, fp16 loads with from_pretrained), the
-non-finite monitor, the byte formulas, the kernel census, compare, the selftest's refusal off CUDA, the CLI's exit
-codes and the heartbeat of an export.
+fp8 scales; NVFP4's data scaled by torchao's reciprocal), the error bound of every pack, the layer filter on tiny CTC
+and AED students (the tied head, the CTC head, the pointwise adapter, the alignment skips), apply for every format on
+both families (and on a model cast to bf16 as a whole, as speed_probe's runners do; a changed BatchNorm statistic
+fails assert_quantized), the rel-pos patch routing through the quantised forward, the activation semantics (int8 per
+token, the W4A4 batch-mate trap, the autocast rounding), the row padding, the variant dir (a reloaded variant gives
+the in-memory outputs to the bit, its bytes are deterministic, w8a16 and w8a8 are one file, corruption is caught, fp16
+loads with from_pretrained), the non-finite monitor, the byte formulas, the kernel census (int8 GEMMs counted when they
+return, not when attempted; nothing counted with the counters off), the selftest's autocast evidence (ops, not kernel
+names) and MXFP4 canary, compare, the selftest's refusal off CUDA, the CLI's exit codes and the heartbeat of an export.
 
 CPU only, tiny random models built in the test; nothing needs the network or torchao."""
 import json
@@ -292,6 +294,7 @@ def test_apply_emulate_every_format_ctc_and_aed(fmt):
               if isinstance(b, nn.BatchNorm1d)}
         rec = Q.apply(m, fmt)
         assert rec["impl"] == ("native" if fmt == "fp16" else "emulate") and rec["format"] == fmt
+        assert set(Q.RECIPE_KEYS) <= set(rec["recipe"])  # scout s7's recipe keys, null where they do not apply
         y = out(m, amp=torch.float16 if fmt == "fp16" else None)
         assert torch.isfinite(y).all()
         rel = ((y.float() - ref).norm() / ref.norm()).item()

@@ -67,8 +67,8 @@ Numerics (the exact recipes; the constants are the torchao parity test's to pin)
                 weight (weight-only formats: rounded to bf16, which is what the real path dequantises to); the output
                 is cast to the autocast dtype, and the bias added in it (as the real path adds it to its GEMM's output).
                 torchao's int8 W8A8 rescales its exact integer GEMM in bf16 steps: the emulation (one fp32 rounding)
-                differs from it by a bf16 ulp on some outputs, on the same activation codes (the parity test) The process's matmul precision applies: emulate and real are compared
-                with tolerances only
+                differs from it by a bf16 ulp on some outputs, on the same activation codes (the parity test). The
+                process's matmul precision applies: emulate and real are compared with tolerances only
 
 Layer filter (select_layers): every nn.Linear except one whose weight is shared with another module (T-0.6B's
 proj_out, tied to the token embedding) and names ending in proj_out or lm_head; scope "linear+pw" (the default,
@@ -170,9 +170,10 @@ TORCHAO_CONFIGS = {"int8-w8a16": "Int8WeightOnlyConfig", "int8-w8a8": "Int8Dynam
                    "fp8-w8a8": "Float8DynamicActivationFloat8WeightConfig"}
 # where torchao keeps them (its prototype namespaces move between releases; the first module that has a name wins)
 _AO_MODULES = ("torchao.quantization", "torchao.prototype.mx_formats",
-               "torchao.prototype.mx_formats.inference_workflow", "torchao.prototype.mx_formats.nvfp4_tensor", "torchao.prototype.mx_formats.mx_tensor",
-               "torchao.prototype.mx_formats.utils", "torchao.prototype.mx_formats.config",
-               "torchao.quantization.granularity", "torchao.quantization.quantize_.common")
+               "torchao.prototype.mx_formats.inference_workflow", "torchao.prototype.mx_formats.nvfp4_tensor",
+               "torchao.prototype.mx_formats.mx_tensor", "torchao.prototype.mx_formats.utils",
+               "torchao.prototype.mx_formats.config", "torchao.quantization.granularity",
+               "torchao.quantization.quantize_.common")
 
 # ------------------------------------------------------------------------------------------ recipe constants
 # (pinned by tests/test_quant_torchao.py against torchao 0.18: a mismatch is fixed here)
@@ -783,9 +784,15 @@ def _install(module: nn.Linear, pack: QuantPack, fmt: str, impl: str, sel_name: 
         module.kpack = pack
 
 
+# the recipe block's keys every variant carries (scout s7 section 7), null where they do not apply
+RECIPE_KEYS = ("block", "tensor_scale", "e2m1_rounding", "mx_rounding", "int8_div", "bf16_cast_before_quant", "bias",
+               "act_tensor_scale", "pad_rows_min")
+
+
 def _recipe_consts(fmt: str, mx_rounding: str) -> dict:
     wfmt, act = _SPLIT.get(fmt, ("fp16", None))
-    base = dict(bf16_cast_before_quant=fmt != "fp16", bias="outside_gemm" if fmt != "fp16" else "fp16",
+    base = dict(dict.fromkeys(RECIPE_KEYS), bf16_cast_before_quant=fmt != "fp16",
+                bias="outside_gemm" if fmt != "fp16" else "fp16",
                 e2m1_rounding="rne" if wfmt in ("nvfp4", "mxfp4") else None)
     if fmt == "fp16":
         return dict(base, cast="Linear/Conv/Embedding weights and biases to fp16; norms and BatchNorm fp32",
