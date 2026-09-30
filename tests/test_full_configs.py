@@ -613,6 +613,67 @@ def test_every_tool_and_flag_an_item_runs_exists(reg):
     assert tuple(QF) == QUANT_FORMATS and set(WHISPER_KEYS) <= set(WHISPER_MODELS)
 
 
+def test_every_items_command_line_is_one_its_tool_accepts(tmp_path, reg, trainer):
+    """The command line kitsune.full_queue builds for every item of every box (FullQueue.argv_for, its placeholders
+    filled as on a box once the items it reads have run) is one its tool's own parser accepts: 05's, kitsune.quant's,
+    whisper_eval's and speed_probe's (with their checks: a --quant system ends in @<fmt>, --compile in +compile, a
+    Whisper key names its system); a trainer's config loads with the queue's --set values (run name, both repos)."""
+    import speed_probe
+    import whisper_eval
+
+    from kitsune import full_queue as F
+    from kitsune import quant
+
+    ev05 = load_script("05_evaluate")
+    stamp, steps = "20261001T000000Z", 1234
+    for box in fullrun.BOX_NAMES:
+        spec = fullrun.box_spec(box, reg)
+        s = F.FullSettings(root=ROOT, state_dir=tmp_path / box, gpus=[str(i) for i in range(spec["gpus"])],
+                           n_gpus=None, python="python", out_repo="Multy123/kitsune-runs",
+                           scratch_repo="Multy123/kitsune-scratch", uploader=object(), machine_id=None,
+                           proc_root=tmp_path / "no-proc", cgroup=tmp_path / "no-cgroup")
+        q = F.FullQueue(box, s, registry=reg)
+        q.register()
+        for name in q.order:  # every item has run: the run dirs, results and out dirs the placeholders read
+            it, sp = q.item(name), q.spec_of(name)
+            if sp["kind"] == "train":
+                it.update(run_dir=f"runs/{name}-{stamp}", result=dict(steps=steps))
+            elif sp["kind"] == "speed":
+                it["out"] = f"runs/speed-{box}-{stamp}"
+            else:
+                it["out"] = f"runs/{'m4-' + name if sp['kind'] == 'readout' else name}-{stamp}"
+            if sp.get("of_box"):
+                it["source"] = dict(box=sp["of_box"], run_id=f"{sp['of']}-{stamp}", steps=steps)
+        seen = set()
+        for name in q.order:
+            sp = q.spec_of(name)
+            argv = q.argv_for(name, q.item(name), None)
+            assert not any(re.search(r"\{[a-z_]+(:[^{}]*)?\}", a) for a in argv), (box, name, argv)
+            if sp["kind"] == "train":
+                sets = [argv[i + 1] for i, a in enumerate(argv) if a == "--set"]
+                assert spec["timed_states"] and sets == [f"run_name={name}", "hf.output_repo=Multy123/kitsune-runs",
+                                                         "hf.scratch_repo=Multy123/kitsune-scratch"], (box, name)
+                c = trainer.load_config(str(ROOT / argv[argv.index("--config") + 1]), sets)
+                assert c["run_name"] == name and c["hf"]["scratch_repo"] == "Multy123/kitsune-scratch"
+            elif sp["kind"] == "stores":
+                assert argv[1:4] == ["-m", "kitsune.full_queue", "build-stores"]
+            elif sp["kind"] == "speed":
+                a = speed_probe.parse_args(argv[[x.endswith("speed_probe.py") for x in argv].index(True) + 1:])
+                assert (a.kind, a.system) == (sp["speed_kind"], sp["system"]), (box, name)
+            elif "-m" in argv and argv[argv.index("-m") + 1] == "kitsune.quant":
+                quant.parse_args(argv[argv.index("-m") + 2:])
+            elif any(x.endswith("whisper_eval.py") for x in argv):
+                a = whisper_eval.parse_args(argv[[x.endswith("whisper_eval.py") for x in argv].index(True) + 1:])
+                assert a.system == name
+            else:  # a readout or a 05 eval
+                ev05.parse_args(argv[[x.endswith("05_evaluate.py") for x in argv].index(True) + 1:])
+            seen.add(sp["kind"])
+        assert seen == ({"stores", "train", "readout", "speed"} if box == "full-smoke" else
+                        {"stores", "train", "readout"} if box == "p01" else
+                        {"stores", "train", "readout", "eval", "speed"} if box == "full" else
+                        {"stores", "eval", "speed"}), box
+
+
 @pytest.mark.skipif(not os.environ.get("KITSUNE_FULL_SELECTION_DIR"),
                     reason="KITSUNE_FULL_SELECTION_DIR (a local labels/full/selections/full_study) not set")
 def test_the_real_selections_fit_the_configs(plan):
