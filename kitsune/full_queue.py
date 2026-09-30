@@ -52,7 +52,20 @@ machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it neve
 Exit of `run` (vast/supervise.py decide_queue): 0 when no train or stores item failed and every non-droppable train
 item is done and verified (-> destroy); EXIT_STOP 4 when a train or stores item failed for good or a non-droppable
 train item did not finish (-> stop, the disk kept for the owner); 1 on a queue error or an upload that did not verify
-(-> the supervisor restarts the queue, which resumes from queue.json). Never 3.
+(-> the supervisor restarts the queue, which resumes from queue.json). Never 3. A chain box also exits
+EXIT_CHAIN_DESTROY 5: it ended before its last stage trained (a failed gate, a failed stage-2 bootstrap, box 1 no
+longer fits), nothing unique is on its disk -> finish verifies what it put on the Hub, then destroys.
+
+Chain boxes (contract addendum E; `run --box p01-chain`): ChainController runs the chain's parts one at a time, each an
+unchanged FullQueue whose state lives in $KITSUNE_STATE/chain/<part>/ while the box-wide files (train_hb, deadline,
+the watchdog's alerts, the download gate) stay in $KITSUNE_STATE (FullSettings box_state_dir; a part's deadline and
+stop_at are its sub-deadline, past which it halts). Stage 1: the gate part (full-smoke, until gate_by), the watchdog's
+mode file set to stop 3600, the automatic gate on its verdict checks 1-11 (chain_gate), then smoke-b (report only,
+until the stage-1 sub-deadline). A failed gate exits 5. Else the stage-2 bootstrap (vast/bootstrap.sh with
+KITSUNE_CHAIN_STAGE=2 on the full extent, stage 1's shards reused; timeouts from stage2_timeouts) runs as a
+synchronous child, bounded by its own budget and by box 1's fit, and box p01 runs; its rc is the chain's. chain.json
+records every step, so a restart goes on where it stopped; the chain summary is at full/box-<chain>/queue_summary.json.
+`plan` prints the stages and their parts' items; `resume-pull` refuses a chain (exit 3; fullrun.chain_resume_hint).
 
 Resume on a new host (launch --resume / --resume-reset <run_id> / --resume-set <run_id>:schedule.epochs=<E>): bootstrap
 runs `resume-pull` before its paid rebuild. It reads the box's queue summary from the runs repo, pulls every started
@@ -81,6 +94,7 @@ set-only run that is past its cooldown: use --resume-reset), 1 anything transien
 Usage (vast/supervise.py runs `run` for KITSUNE_JOB=full; KITSUNE_BOX, KITSUNE_OUT_REPO, KITSUNE_SCRATCH_REPO,
 KITSUNE_STATE from the env):
   python -m kitsune.full_queue run --box p01 [--gpus 0,1]
+  python -m kitsune.full_queue run --box p01-chain               # a chain box: its ChainController
   python -m kitsune.full_queue plan --box full                   # the registry items, in order, nothing started
   python -m kitsune.full_queue build-stores --config configs/full/full-p03.json [--eval-only] [--set k=v]
   python -m kitsune.full_queue resume-pull --box full --root /workspace/Kitsune-Transcribe
@@ -100,7 +114,7 @@ import statistics
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -425,6 +439,13 @@ class FullSettings(Q.Settings):
     summary_min_s: float = SUMMARY_MIN_S
     proc_root: Path = field(default_factory=lambda: Path("/proc"))
     cgroup: Path = field(default_factory=lambda: Path(os.environ.get(fullrun.ENV_CGROUP) or "/sys/fs/cgroup"))
+    # a chain part (ChainController): the box's own state dir, where the box-wide files live (train_hb, deadline,
+    # watchdog_alerts.jsonl, download_gate.json) while the part's queue state stays in state_dir (<box state>/chain/
+    # <part>); None: state_dir. deadline replaces the deadline file's (the part's sub-deadline); past stop_at the
+    # queue halts (rc 4, "halted": the running items are stopped, the verdict written)
+    box_state_dir: Path | None = None
+    deadline: float | None = None
+    stop_at: float | None = None
 
 
 class FullQueue(Q.Queue):
@@ -438,10 +459,14 @@ class FullQueue(Q.Queue):
         try:
             reg = fullrun.load_registry(reg, root=s.root, check_files=False) if reg is not None else \
                 fullrun.load_registry(None, root=s.root)
+            if fullrun.is_chain(box, reg):
+                raise fullrun.RegistryError(f"box {box} is a chain box: a chain box runs through the chain controller "
+                                            f"(ChainController; `python -m kitsune.full_queue run --box {box}`)")
             self.spec = fullrun.box_spec(box, reg)
         except fullrun.RegistryError as e:
             raise Q.QueueError(str(e)) from None
         self.registry = reg
+        self.box_state = Path(s.box_state_dir or s.state_dir)  # train_hb, deadline, alerts, download gate
         self.registry_sha256 = hashlib.sha256(json.dumps(reg, sort_keys=True, separators=(",", ":"),
                                                          ensure_ascii=False).encode()).hexdigest()
         self.items_spec = {it["name"]: it for it in self.spec["items"]}
@@ -509,7 +534,7 @@ class FullQueue(Q.Queue):
         every controller beat goes through here, so beat() and beating() are no-ops for that window."""
         if time.time() < self._freeze_until:
             return None
-        return Path(self.s.state_dir) / fullrun.TRAIN_HB
+        return self.box_state / fullrun.TRAIN_HB
 
     def ctl_beating(self, max_s: float = CTL_BEAT_MAX_S):
         """heartbeat.beating on the controller heartbeat around one blocking call (bounded: a hung call still goes
@@ -518,9 +543,12 @@ class FullQueue(Q.Queue):
         return heartbeat.beating(p, max_s=max_s) if p is not None else contextlib.nullcontext()
 
     def box_deadline(self) -> float | None:
-        """The watchdog's stop time ($KITSUNE_STATE/deadline, vast/onstart.sh); None without one (a local run)."""
+        """The watchdog's stop time ($KITSUNE_STATE/deadline, vast/onstart.sh; a chain part: its settings' deadline);
+        None without one (a local run)."""
+        if self.s.deadline is not None:
+            return float(self.s.deadline)
         try:
-            return float((Path(self.s.state_dir) / fullrun.DEADLINE_FILE).read_text().split()[0])
+            return float((self.box_state / fullrun.DEADLINE_FILE).read_text().split()[0])
         except (OSError, ValueError, IndexError):
             return None
 
@@ -738,6 +766,8 @@ class FullQueue(Q.Queue):
         host; a speed item starts only on an idle host (nothing running, no upload pending), and the pool items after
         it wait for it (so it is never starved). An item held by a transient refusal is passed over until its hold
         ends: this GPU takes the next ready item."""
+        if running or any(self.item(n)["status"] in RUNNABLE for n in self.order):  # a part that ended is not halted
+            self.stage_deadline_check()
         busy = {r["name"] for r in running.values()}
         if any(self.item(n)["kind"] == "speed" for n in busy):
             return None
@@ -763,6 +793,14 @@ class FullQueue(Q.Queue):
             if self._prepare(name):
                 return name
         return self._none(running)
+
+    def stage_deadline_check(self):
+        """A chain part past its stop_at (FullSettings): event stage_deadline, then Halt. execute() stops the running
+        items (SIGTERM, SIGKILL after 60 s: interrupted) and run() records rc 4, "halted", and writes the verdict."""
+        if self.s.stop_at is not None and time.time() >= float(self.s.stop_at):
+            self.event("stage_deadline", stop_at=float(self.s.stop_at))
+            raise Q.Halt(f"stage deadline {datetime.fromtimestamp(float(self.s.stop_at), timezone.utc).isoformat()} "
+                         f"passed")
 
     def _held(self, name: str) -> bool:
         return time.time() < float(self.item(name).get("held_until") or 0)
@@ -1327,7 +1365,8 @@ class FullQueue(Q.Queue):
 
     def monitor(self, running: dict):
         """Every poll: the controller beat, run-dir discovery (a summary put at once), the stall and overrun kills, the
-        smoke faults, the resource peaks, a coalesced summary put that is due."""
+        smoke faults, the resource peaks, a coalesced summary put that is due; a chain part's stop_at first."""
+        self.stage_deadline_check()
         now = time.time()
         hb = self.ctl_beat_path()
         if hb is not None:  # never beat(None): that would beat this process's own $KITSUNE_HEARTBEAT, if any
@@ -1726,7 +1765,7 @@ class SmokeVerdict:
                     faults=self.q.faults_list(), hb_max_gap_s=hb, alerts=self.alerts())
 
     def alerts(self) -> list[dict]:
-        p = Path(self.q.s.state_dir) / fullrun.ALERTS_FILE
+        p = self.q.box_state / fullrun.ALERTS_FILE  # the box watchdog's file (a chain part: the box's state dir)
         out = []
         if p.is_file():
             for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -1789,7 +1828,7 @@ class SmokeVerdict:
     def check4(self):
         if not self.q.spec["gate"]:
             return None, dict(note="this box has no download gate")
-        g = _read_json(Path(self.q.s.state_dir) / fullrun.GATE_FILE)
+        g = _read_json(self.q.box_state / fullrun.GATE_FILE)  # the boot's gate record (a chain: the box's)
         return (g or {}).get("verdict") == "pass", dict(gate=g)
 
     def check5(self):
@@ -1982,6 +2021,652 @@ class SmokeVerdict:
         if "max" in spec:
             ok = ok and isinstance(val, (int, float)) and val <= spec["max"]
         return bool(ok), ev
+
+
+# ========================================================================================================== chain
+
+EXIT_CHAIN_DESTROY = 5  # a chain that ended before its last stage trained: nothing unique on the disk -> destroy
+CHAIN_FORMAT = 1
+CHAIN_STEPS = ("s1_gate_part", "s1_gate", "s1_rest", "s2_boot", "s2_p01", "done")
+BOOT2_MAX_ATTEMPTS = 2  # stage-2 bootstrap attempts that exited (an interrupted one does not count)
+BOOT2_NO_RETRY = (2, 3)  # check_students refused, a plan or 01 refusal: the same attempt fails the same way
+BOOT2_POLL_S = 30.0
+BOOT2_KILL_GRACE_S = 60.0  # SIGTERM -> SIGKILL of the stage-2 bootstrap's process group
+BOOT2_MIN_LEFT_S = 1800  # H2: the stage-2 bootstrap needs at least this long before its bound
+BOOT2_PHASE_HB_MAX_S = 10800  # KITSUNE_PHASE_HB_MAX_S of the stage-2 bootstrap: phases without a timeout, 3 h each
+BOOT2_MARK = "vast/bootstrap.sh"  # a live stage-2 bootstrap's command line (its identity after a controller restart)
+STORES_ALLOWANCE_H, FINISH_ALLOWANCE_H = 0.5, 0.35  # the fit rule: the full-extent stores-ctc [X], and finish
+REPORT_PART_TRIES = 2  # a report-only part (smoke-b): one retry in the same process, then recorded as failed
+STAGE1_FILES = ("bootstrap_plan.json", "bootstrap_coverage.json", "bootstrap_timings.jsonl", fullrun.GATE_FILE)
+PULL_FALLBACK_BYTES = 50e9  # stage2_timeouts without the stage-1 plan's record: the full extent's labels, generously
+# the launch env the stage-2 bootstrap must not see: the gate ran at boot (its record stays in place), and a chain is
+# never resumed as a chain
+BOOT2_ENV_DROP = (fullrun.ENV_GATE_BYTES, fullrun.ENV_GATE_MAX_H, fullrun.ENV_RESUME, fullrun.ENV_RESUME_RESET,
+                  fullrun.ENV_RESUME_SETS)
+
+
+def phase_budget_s(tries: int, minutes: float) -> int:
+    """vast/bootstrap.sh phase_budget_s: the longest `retry <tries> timeout -k <=60 <minutes>m ...` runs (every attempt
+    with its kill grace, retry's pauses of 60, 120, ... s), plus 10 min."""
+    return int(tries * (minutes * 60 + 60) + 30 * tries * (tries - 1) + 600)
+
+
+def boot2_budget_s(pull_min: float, rebuild_min: float, phase_hb_max_s: float = BOOT2_PHASE_HB_MAX_S) -> int:
+    """The stage-2 bootstrap's own bound, its phases' worst cases added up: plan (retry 3 x 10 min) and pull_derived
+    (3 x 30 min), check_students and coverage (no timeout: phase_hb_max_s each), and the label pull alongside the
+    rebuild (the longer of their three attempts; the rebuild's never below 60 min, as bootstrap's toucher)."""
+    return (phase_budget_s(3, 10) + phase_budget_s(3, 30) + 2 * int(phase_hb_max_s)
+            + max(phase_budget_s(3, pull_min), phase_budget_s(3, max(rebuild_min, 60))))
+
+
+def chain_gate(verdict: dict | None, part: str, part_rc: int, sha: str | None, *, local: Path | None = None) -> dict:
+    """The automatic gate between a chain's stages (addendum E.3.1): pass only when the gate part ended with rc 0,
+    its verdict is there, is its own (box) and of this checkout (sha, when KITSUNE_SHA is set), and every one of
+    checks 1-11 is true (false, null or missing all fail; checks 12-16 never enter it). rc 4 always fails: a train or
+    stores item that failed for good, or the part's stop_at halt. local: the verdict file, for its sha256."""
+    checks = (verdict or {}).get("checks") or {}
+    got = {n: (checks.get(n) or {}).get("pass") for n in fullrun.GATE_CHECKS}
+    failed = [n for n, v in got.items() if v is not True]
+    problems = ([] if verdict else ["verdict missing"]) \
+        + ([] if part_rc == 0 else [f"part {part} ended with rc {part_rc}"]) \
+        + ([] if not verdict or verdict.get("box") == part else [f"verdict of box {verdict.get('box')!r}"]) \
+        + ([] if not verdict or not sha or verdict.get("sha") == sha else [f"verdict sha {verdict.get('sha')}"])
+    ev3 = (checks.get("3") or {}).get("evidence") or {}
+    return dict(part=part, part_rc=part_rc, result="pass" if not failed and not problems else "fail", checks=got,
+                failed=failed, problems=problems, verdict=fullrun.box_verdict_path(part),
+                verdict_sha256=_sha256_file(local) if local is not None and Path(local).is_file() else None,
+                projected_box1_h=ev3.get("box1_h") if isinstance(ev3, dict) else None, time_utc=_now_utc())
+
+
+def stage2_timeouts(state_dir: Path, root: Path, rebuild1: str, rebuild2: str) -> dict:
+    """The stage-2 bootstrap's per-attempt timeouts (addendum E.4.2), computed on the box: what is left to download
+    (the last stage's upstream bytes less stage 1's: tar 8 is counted twice in both, as 01 reads it), its labels + 2 GB
+    to pull, at the boot's download gate rate (else kitsune.extent's 40 MB/s sizing), through kitsune.netgate.timeouts.
+    The record is the one stage 1's plan read (chain/stage1/bootstrap_plan.json). Without it (a record that cannot be
+    read), the gate's full download and PULL_FALLBACK_BYTES: longer timeouts, never shorter."""
+    from kitsune import extent, netgate
+
+    state_dir, root = Path(state_dir), Path(root)
+    gate = _read_json(state_dir / fullrun.GATE_FILE) or {}
+    rate = float(gate.get("rate_bytes_s") or extent.REBUILD_BYTES_PER_S)
+    try:
+        plan = json.loads((state_dir / fullrun.CHAIN_DIR / "stage1" / "bootstrap_plan.json").read_text(
+            encoding="utf-8"))
+        rec = extent.load_record(Path(plan["record"]))
+        cfg1 = json.loads((root / rebuild1).read_text(encoding="utf-8"))
+        cfg2 = json.loads((root / rebuild2).read_text(encoding="utf-8"))
+        s2, s1 = extent.sizing(rec, cfg2), extent.sizing(rec, cfg1)
+        rest, pullb, source = max(0.0, s2["down_gb"] - s1["down_gb"]) * 1e9, (s2["labels_gb"] + 2) * 1e9, "record"
+    except Exception as e:  # noqa: BLE001  never a crash of the controller: conservative bytes instead
+        log(f"stage-2 timeouts without the extent record ({type(e).__name__}: {e}): the gate's full download")
+        rest = float(os.environ.get(fullrun.ENV_GATE_BYTES) or netgate.GATE_REF_GB * 1e9)
+        pullb, source = PULL_FALLBACK_BYTES, f"fallback: {type(e).__name__}"
+    pull_min, rebuild_min = netgate.timeouts(rate, rest, pullb)
+    return dict(rest_bytes=int(rest), pull_bytes=int(pullb), rate_bytes_s=rate, pull_min=int(pull_min),
+                rebuild_min=int(rebuild_min), source=source)
+
+
+class ChainController:
+    """A chain box (addendum E; `python -m kitsune.full_queue run --box p01-chain`, which vast/supervise.py runs): its
+    parts, one at a time, each an ordinary FullQueue with its own state dir ($KITSUNE_STATE/chain/<part>/) that writes
+    its summary and verdict at the standalone box's Hub paths (full/box-<part>/...).
+
+      stage 1   the gate part (full-smoke) with deadline = stop_at = gate_by; the watchdog's mode file set to stage 2's
+                (stop 3600); the gate (chain_gate: decided, recorded in chain.json once, put on the Hub); then every
+                other stage-1 part (smoke-b: report only, deadline = stop_at = the stage-1 sub-deadline; one retry,
+                then recorded as failed), whatever the gate said
+      gate      failed -> exit 5: finish verifies the verdict, logs and events on the Hub, then destroys
+      handover  stage 1's bootstrap records copied to chain/stage1/, the stage-2 timeouts and bound computed; box 1
+                must still fit (else exit 5); the stage-2 bootstrap (vast/bootstrap.sh, KITSUNE_CHAIN_STAGE=2, the
+                last stage's rebuild config) runs as a synchronous child in its own session, killed at its bound
+                (boot2_until); rc 0 done, rc 2/3 not retried, anything else retried once; a failure exits 5
+      stage 2   box 1 must still fit after the bootstrap (else exit 5), then its parts (p01), whose rc is the chain's
+                (0 destroy, 4 stop, 1 restart: p01 resumes from its queue.json)
+
+    Every step is recorded in $KITSUNE_STATE/chain/chain.json (a restart goes on from it: ended parts are not run
+    again, the gate is never evaluated twice, a stage-2 bootstrap left running is killed when its identity is
+    verified, else ignored, and started again); the chain summary ($KITSUNE_STATE/queue_summary.json, put at
+    full/box-<chain>/queue_summary.json) on every step change and at the end. The controller beats train_hb only between
+    steps: never while a part runs (the part's queue beats, and a smoke's freeze fault must hold) nor while the stage-2
+    bootstrap runs (its phases' bounded touchers keep it fresh, so a hung phase still goes stale)."""
+
+    def __init__(self, box: str, settings: FullSettings | None = None, registry: dict | None = None, *,
+                 bootstrap_cmd: list[str] | None = None, boot_poll_s: float = BOOT2_POLL_S,
+                 boot_kill_grace_s: float = BOOT2_KILL_GRACE_S):
+        s = settings or FullSettings()
+        reg = registry if registry is not None else s.registry
+        try:
+            reg = fullrun.load_registry(reg, root=s.root, check_files=False) if reg is not None else \
+                fullrun.load_registry(None, root=s.root)
+            if not fullrun.is_chain(box, reg):
+                raise fullrun.RegistryError(f"box {box} is not a chain box")
+            self.stages = fullrun.chain_stages(box, reg)
+        except fullrun.RegistryError as e:
+            raise Q.QueueError(str(e)) from None
+        self.box, self.s, self.registry = box, s, reg
+        self.cspec = reg["boxes"][box]
+        self.root, self.state_dir = Path(s.root), Path(s.state_dir)
+        self.path = self.state_dir / fullrun.CHAIN_DIR / fullrun.CHAIN_STATE
+        self.hb = self.state_dir / fullrun.TRAIN_HB
+        self.registry_sha256 = hashlib.sha256(json.dumps(reg, sort_keys=True, separators=(",", ":"),
+                                                         ensure_ascii=False).encode()).hexdigest()
+        self.uploader = s.uploader if s.uploader is not None else (Q.HubUploader(s.out_repo) if s.out_repo else None)
+        self.bootstrap_cmd = list(bootstrap_cmd or ["bash", (self.root / "vast" / "bootstrap.sh").as_posix()])
+        self.boot_poll_s, self.boot_kill_grace_s = float(boot_poll_s), float(boot_kill_grace_s)
+        self._boot_proc = None
+        self.st = self._load()
+
+    # ------------------------------------------------------------------------------------------------ state
+
+    def _box_deadline(self) -> float | None:
+        try:
+            return float((self.state_dir / fullrun.DEADLINE_FILE).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def _first_boot(self, deadline: float | None) -> float:
+        """$STATE/first_boot (onstart); else the box deadline less KITSUNE_MAX_HOURS (the chain's max_hours), with a
+        warning; never the controller's own start, which would move on every restart (a local run without either
+        takes chain.json's creation time, which chain.json keeps)."""
+        try:
+            return float((self.state_dir / "first_boot").read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            pass
+        if deadline is not None:
+            mh = float(os.environ.get(fullrun.ENV_MAX_HOURS) or self.cspec["max_hours"])
+            log(f"warning: no {self.state_dir / 'first_boot'}: first boot = the deadline - {mh:g} h")
+            return deadline - mh * 3600
+        log("warning: neither first_boot nor deadline in the state dir (a local run): first boot = now")
+        return time.time()
+
+    def _load(self) -> dict:
+        if self.path.is_file():
+            st = json.loads(self.path.read_text(encoding="utf-8"))
+            if st.get("box") != self.box:
+                raise Q.QueueError(f"{self.path} is chain {st.get('box')!r}'s state, not {self.box!r}'s")
+            return st
+        deadline = self._box_deadline()
+        first = self._first_boot(deadline)
+        s1 = self.stages[0]
+        gate_by = first + float(s1["gate_by_hours"]) * 3600
+        s1_deadline = first + float(s1["max_hours"]) * 3600
+        if deadline is not None:
+            s1_deadline = min(deadline, s1_deadline)
+        parts = {p: dict(stage=st["stage"], status="pending", rc=None, tries=0, fails=0, started=None, ended=None,
+                         queue_started=None) for st in self.stages for p in st["parts"]}
+        return dict(format=CHAIN_FORMAT, box=self.box, sha=self.s.sha, created_utc=_now_utc(), started=time.time(),
+                    gate_box=s1["gate_box"], first_boot=first, deadline=deadline, gate_by=gate_by,
+                    stage1_deadline=s1_deadline, step=CHAIN_STEPS[0], stage=1, parts=parts, gate=None, boot2=None,
+                    watchdog_mode=None, final=None)
+
+    def save(self):
+        Q._atomic_json(self.path, self.st)
+
+    def event(self, kind: str, **fields):
+        """A chain record in $KITSUNE_STATE/events.jsonl (the parts' queues write theirs in chain/<part>/)."""
+        p = self.state_dir / Q.EVENTS_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"wall": time.time(), "source": "chain", "box": self.box, "kind": kind, **fields},
+                               default=str) + "\n")
+        log(f"{kind}: " + json.dumps(fields, default=str)[:600])
+
+    def beat(self):
+        heartbeat.beat(self.hb, force=True)
+
+    def _step(self, step: str, stage: int | None = None):
+        self.st["step"] = step
+        if stage is not None:
+            self.st["stage"] = stage
+        self.save()
+        self.put_summary()
+
+    def summary(self, status: str, reason: str | None, rc: int | None) -> dict:
+        st = self.st
+        parts, verdicts = {}, {}
+        for p, ps in st["parts"].items():
+            smoke = bool(self.registry["boxes"][p]["smoke"])
+            parts[p] = dict(stage=ps["stage"], status=ps["status"], rc=ps["rc"], queue_started=ps["queue_started"],
+                            summary=fullrun.box_summary_path(p), verdict=fullrun.box_verdict_path(p) if smoke else None)
+            v = _read_json(fullrun.part_state_dir(p, self.state_dir) / fullrun.VERDICT_FILE) if smoke else None
+            if isinstance(v, dict):
+                verdicts[p] = dict(overall=v.get("overall"),
+                                   checks={n: (c or {}).get("pass") for n, c in (v.get("checks") or {}).items()})
+        return dict(format=1, kind=fullrun.CHAIN_KIND, box=self.box, status=status, reason=reason, rc=rc,
+                    sha=self.s.sha, machine_id=self.s.machine_id, container_id=self.s.container_id,
+                    registry_sha256=self.registry_sha256, first_boot=st["first_boot"], deadline=st["deadline"],
+                    gate_by=st["gate_by"], stage1_deadline=st["stage1_deadline"], stage=st["stage"], step=st["step"],
+                    started=st["started"], ended=None if status == "running" else time.time(), gate=st["gate"],
+                    boot2=st["boot2"], parts=parts, verdicts=verdicts)
+
+    def put_summary(self, status: str = "running", reason: str | None = None, rc: int | None = None):
+        """$KITSUNE_STATE/queue_summary.json (vast/supervise.py reads its reason, kind and stage), put at
+        full/box-<chain>/queue_summary.json under the controller heartbeat (bounded)."""
+        path = self.state_dir / fullrun.SUMMARY_FILE
+        Q._atomic_json(path, self.summary(status, reason, rc))
+        if self.uploader is None:
+            return
+        try:
+            with heartbeat.beating(self.hb, max_s=CTL_BEAT_MAX_S):
+                self.uploader.put_file(path, fullrun.box_summary_path(self.box))
+        except Exception as e:  # noqa: BLE001  finish.py verifies and re-puts it at the end
+            log(f"{fullrun.box_summary_path(self.box)} upload failed: {type(e).__name__}: {e}")
+
+    def finish(self, status: str, reason: str | None, rc: int) -> int:
+        """The chain's end: recorded (a restart returns rc), the chain summary put."""
+        self.st["final"] = dict(rc=rc, status=status, reason=reason, wall=time.time())
+        self.st["step"] = "done"
+        self.save()
+        self.event("chain_end", status=status, reason=reason, rc=rc)
+        self.beat()
+        self.put_summary(status, reason, rc)
+        return rc
+
+    # ------------------------------------------------------------------------------------------------ parts
+
+    def part_settings(self, part: str, deadline: float | None, stop_at: float | None) -> FullSettings:
+        return replace(self.s, state_dir=fullrun.part_state_dir(part, self.state_dir), box_state_dir=self.state_dir,
+                       deadline=deadline, stop_at=stop_at, registry=self.registry, uploader=self.uploader)
+
+    def queue(self, part: str, deadline: float | None, stop_at: float | None) -> FullQueue:
+        return FullQueue(part, self.part_settings(part, deadline, stop_at), registry=self.registry)
+
+    def part_window(self, part: str) -> tuple[float | None, float | None]:
+        """(deadline, stop_at) of a part (E.4.5): the gate part gate_by, stage 1's other parts the stage-1
+        sub-deadline, the last stage's parts the box deadline file's (None, None)."""
+        ps = self.st["parts"][part]
+        if part == self.st["gate_box"]:
+            return self.st["gate_by"], self.st["gate_by"]
+        if ps["stage"] == 1:
+            return self.st["stage1_deadline"], self.st["stage1_deadline"]
+        return None, None
+
+    def _part_start(self, part: str):
+        ps = self.st["parts"][part]
+        ps.update(status="running", tries=int(ps["tries"]) + 1, started=ps["started"] or time.time())
+        self.save()
+        self.event("chain_part_start", part=part, attempt=ps["tries"], stage=ps["stage"])
+        self.beat()
+        self.put_summary()
+
+    def _part_end(self, part: str, rc, why: str | None = None):
+        ps = self.st["parts"][part]
+        ps["rc"] = rc
+        if rc in (EXIT_OK, EXIT_STOP):
+            ps.update(status="ended", ended=time.time())
+        self.save()
+        self.event("chain_part_end", part=part, rc=rc, status=ps["status"], why=why)
+        self.beat()
+        self.put_summary()
+
+    def run_part(self, part: str) -> int:
+        """A part whose failure is the chain's (the gate part, the last stage's): its rc (1 exits the controller, which
+        the supervisor restarts: the part resumes from its queue.json). An exception propagates (the same)."""
+        ps = self.st["parts"][part]
+        if ps["status"] == "ended":
+            return int(ps["rc"])
+        self._part_start(part)
+        q = self.queue(part, *self.part_window(part))
+        ps["queue_started"] = q.state.get("started")
+        self.save()
+        rc = q.run()
+        self._part_end(part, rc)
+        return rc
+
+    def run_report_part(self, part: str):
+        """A report-only part (smoke-b): rc 0 or 4 ends it; rc 1 or an exception while it is built or run is retried
+        once in this process (a new queue resumes from its queue.json), then recorded as failed (event
+        chain_part_failed) and the chain goes on. Finish's lean sync still uploads its run dirs."""
+        ps = self.st["parts"][part]
+        while ps["status"] not in ("ended", "failed"):
+            self._part_start(part)
+            why = None
+            try:
+                q = self.queue(part, *self.part_window(part))
+                ps["queue_started"] = q.state.get("started")
+                self.save()
+                rc = q.run()
+            except Exception as e:  # noqa: BLE001  a report-only part never ends the chain
+                rc, why = None, f"{type(e).__name__}: {e}"
+                log(f"part {part} raised: {why}")
+            if rc not in (EXIT_OK, EXIT_STOP):
+                ps["fails"] = int(ps["fails"]) + 1
+                why = why or f"exit {rc}"
+                if ps["fails"] >= REPORT_PART_TRIES:
+                    ps.update(status="failed", ended=time.time())
+                    self.event("chain_part_failed", part=part, rc=rc, why=why, fails=ps["fails"])
+            self._part_end(part, rc, why)
+
+    # ------------------------------------------------------------------------------------------------ the gate
+
+    def mode(self) -> tuple[str, int]:
+        """The watchdog mode from the gate part's end on: the last stage's watchdog (stop 3600 for p01-chain)."""
+        wd = self.stages[-1]["watchdog"]
+        return wd["action"], int(wd["orphan_s"])
+
+    def set_mode(self):
+        """$KITSUNE_STATE/watchdog_mode "<action> <orphan_s>" (tmp + rename): vast/watchdog.sh reads it every poll and
+        takes it over its env (stage 1's alert 600). Written once the gate part has returned, before the gate, whatever
+        it says: a failed gate never leaves the box in alert mode while finish runs, and smoke B runs in stop mode as it
+        does standalone. Idempotent (a restart writes it again when it is missing or different)."""
+        action, orphan_s = self.mode()
+        f = self.state_dir / fullrun.WATCHDOG_MODE_FILE
+        want = f"{action} {orphan_s}\n"
+        try:
+            if f.read_bytes() == want.encode() and self.st.get("watchdog_mode"):
+                return
+        except OSError:
+            pass
+        tmp = f.with_name(f.name + ".tmp")
+        tmp.write_bytes(want.encode())  # LF on every platform: bash's `read` would keep a CR in the limit
+        tmp.replace(f)
+        self.st["watchdog_mode"] = dict(action=action, orphan_s=orphan_s, written_utc=_now_utc())
+        self.save()
+        self.event("watchdog_mode", action=action, orphan_s=orphan_s)
+
+    def _verdict_current(self, v, final: dict) -> bool:
+        """A verdict that run() wrote after its final: parseable, and not older than queue.json's final.wall (time_utc
+        has whole seconds)."""
+        if not isinstance(v, dict) or not isinstance(v.get("checks"), dict):
+            return False
+        try:
+            t = datetime.fromisoformat(str(v.get("time_utc"))).timestamp()
+        except ValueError:
+            return False
+        return not final.get("wall") or t + 1.0 >= float(final["wall"])
+
+    def evaluate_gate(self) -> dict:
+        """E.3.1: the gate part's verdict made sure of (a restart between run()'s final and its verdict leaves none:
+        the verdict and the summary are built again from its queue.json), then chain_gate. Recorded once."""
+        part = self.st["gate_box"]
+        pdir = fullrun.part_state_dir(part, self.state_dir)
+        vpath = pdir / fullrun.VERDICT_FILE
+        final = (_read_json(pdir / Q.STATE_FILE) or {}).get("final") or {}
+        v = _read_json(vpath)
+        if not self._verdict_current(v, final):
+            try:
+                q = self.queue(part, *self.part_window(part))
+                q.write_verdict()
+                if final:
+                    q.write_summary(final.get("status"), final.get("reason"), final.get("rc"))
+                self.event("chain_verdict_rebuilt", part=part, had=v is not None)
+            except Exception as e:  # noqa: BLE001  the gate then fails: verdict missing
+                self.event("chain_verdict_rebuild_failed", part=part, error=f"{type(e).__name__}: {e}")
+                vpath.unlink(missing_ok=True)
+            v = _read_json(vpath)
+        rc = self.st["parts"][part]["rc"]
+        gate = chain_gate(v if isinstance(v, dict) else None, part, int(rc) if rc is not None else -1, self.s.sha,
+                          local=vpath)
+        self.event("chain_gate", part=gate["part"], part_rc=gate["part_rc"], result=gate["result"],
+                   failed=gate["failed"], problems=gate["problems"], checks=gate["checks"],
+                   verdict_sha256=gate["verdict_sha256"], projected_box1_h=gate["projected_box1_h"])
+        return gate
+
+    # ------------------------------------------------------------------------------------------------ handover
+
+    def need_s(self) -> int:
+        """The fit rule (E.6): the last stage's training (the gate's projected box-1 hours, else its train items'
+        max_hours) + its readouts' max_hours + the stores allowance + finish, and its deadline reserve."""
+        items = [it for p in self.stages[-1]["parts"] for it in self.registry["boxes"][p]["items"]]
+        proj = (self.st.get("gate") or {}).get("projected_box1_h")
+        train_h = float(proj) if isinstance(proj, (int, float)) else sum(
+            float(it["max_hours"] or 0) for it in items if it["kind"] == "train")
+        readout_h = sum(float(it.get("max_hours") or 0) for it in items if it["kind"] == "readout")
+        reserve = max(float(self.registry["boxes"][p]["deadline_reserve_min"]) for p in self.stages[-1]["parts"])
+        return int(3600 * (train_h + readout_h + STORES_ALLOWANCE_H + FINISH_ALLOWANCE_H) + 60 * reserve)
+
+    def handover(self) -> int | None:
+        """H1-H3 (E.3.3): stage 1's bootstrap records to chain/stage1/ (the stage-2 bootstrap overwrites the plan and
+        the coverage), the stage-2 timeouts, its bound boot2_until = min(now + its own budget, deadline - need_s), the
+        refusal when less than BOOT2_MIN_LEFT_S remain (box 1 no longer fits: exit 5), event chain_handover. None: go
+        on to the stage-2 bootstrap."""
+        s1dir = self.state_dir / fullrun.CHAIN_DIR / "stage1"
+        s1dir.mkdir(parents=True, exist_ok=True)
+        for name in STAGE1_FILES:
+            if (self.state_dir / name).is_file():
+                shutil.copy2(self.state_dir / name, s1dir / name)
+        t = stage2_timeouts(self.state_dir, self.root, self.stages[0]["rebuild"], self.stages[-1]["rebuild"])
+        now, need, deadline = time.time(), self.need_s(), self.st["deadline"]
+        budget = boot2_budget_s(t["pull_min"], t["rebuild_min"])
+        until = now + budget if deadline is None else min(now + budget, float(deadline) - need)
+        self.st["boot2"] = dict(status="running", until=until, t0=now, need_s=need, budget_s=budget,
+                                pull_min=t["pull_min"], rebuild_min=t["rebuild_min"], rest_bytes=t["rest_bytes"],
+                                pull_bytes=t["pull_bytes"], rate_bytes_s=t["rate_bytes_s"], timeouts=t["source"],
+                                attempts=[])
+        self.save()
+        left = None if deadline is None else round(float(deadline) - now)
+        self.event("chain_handover", left_s=left, need_s=need, boot2_until=until, rest_bytes=t["rest_bytes"],
+                   pull_min=t["pull_min"], rebuild_min=t["rebuild_min"], budget_s=budget)
+        if until - now < BOOT2_MIN_LEFT_S:
+            self.st["boot2"]["status"] = "failed"
+            return self.finish("failed", f"box 1 no longer fits: need {need} s, left {left} s (the stage-2 bootstrap "
+                                         f"would get {round(until - now)} s)", EXIT_CHAIN_DESTROY)
+        self._step("s2_boot", stage=2)
+        return None
+
+    # ------------------------------------------------------------------------------------------------ stage-2 bootstrap
+
+    def boot_env(self) -> dict:
+        b = self.st["boot2"]
+        env = dict(os.environ, **self.s.env)
+        for k in BOOT2_ENV_DROP:
+            env.pop(k, None)
+        env.update({fullrun.ENV_CHAIN_STAGE: "2", fullrun.ENV_CONFIG: self.stages[-1]["rebuild"],
+                    fullrun.ENV_PULL_TIMEOUT_MIN: str(b["pull_min"]),
+                    fullrun.ENV_REBUILD_TIMEOUT_MIN: str(b["rebuild_min"]),
+                    fullrun.ENV_PHASE_HB_MAX_S: str(BOOT2_PHASE_HB_MAX_S), fullrun.ENV_STATE: str(self.state_dir),
+                    "KITSUNE_DIR": str(self.root), fullrun.ENV_JOB: fullrun.JOB, fullrun.ENV_BOX: self.box})
+        return env
+
+    def _proc_file(self, pid, name: str) -> str | None:
+        try:
+            return (Path(self.s.proc_root) / str(int(pid)) / name).read_bytes().decode("utf-8", "replace")
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def starttime(self, pid) -> str | None:
+        """Field 22 of /proc/<pid>/stat (the process's start in clock ticks since boot): with the pid, a process's
+        identity across a controller restart (a pid alone may be recycled after a container restart)."""
+        stat = self._proc_file(pid, "stat")
+        try:
+            return stat.rsplit(")", 1)[1].split()[19] if stat else None
+        except IndexError:
+            return None
+
+    def _alive(self, pid, proc=None) -> bool:
+        if proc is not None:
+            return proc.poll() is None
+        return (Path(self.s.proc_root) / str(int(pid))).exists()
+
+    def signal_group(self, pid, sig, proc=None):
+        """sig to the bootstrap's process group (posix; it leads its own session); on Windows terminate / kill the
+        process itself."""
+        try:
+            if os.name == "posix":
+                os.killpg(int(pid), sig)
+            elif proc is not None:
+                proc.terminate() if sig == signal.SIGTERM else proc.kill()
+            else:
+                os.kill(int(pid), signal.SIGTERM)  # TerminateProcess: never signal 0, which is CTRL_C_EVENT there
+        except (OSError, ProcessLookupError, ValueError):
+            pass
+
+    def kill_boot(self, pid, proc=None):
+        """SIGTERM to the group, SIGKILL after boot_kill_grace_s: the bootstrap and every phase under it."""
+        self.signal_group(pid, signal.SIGTERM, proc)
+        end = time.time() + self.boot_kill_grace_s
+        while time.time() < end and self._alive(pid, proc):
+            time.sleep(min(0.5, max(0.0, end - time.time())))
+        if self._alive(pid, proc):
+            self.signal_group(pid, getattr(signal, "SIGKILL", signal.SIGTERM), proc)
+        if proc is not None:
+            try:
+                proc.wait(30)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _interrupted(self, a: dict):
+        """An attempt a dead controller left without an end (E.4.1): its process group is killed only when its
+        identity is verified (the stored starttime and a vast/bootstrap.sh command line), never a recycled pid;
+        recorded as interrupted, which does not count toward BOOT2_MAX_ATTEMPTS."""
+        pid, want = a.get("pid"), a.get("starttime")
+        cmd = (self._proc_file(pid, "cmdline") or "").replace("\0", " ")
+        verified = pid is not None and want is not None and self.starttime(pid) == want and BOOT2_MARK in cmd
+        if verified:
+            self.kill_boot(pid)
+        a.update(t1=time.time(), end="interrupted", killed=verified)
+        self.save()
+        self.event("chain_bootstrap_end", attempt=self.st["boot2"]["attempts"].index(a) + 1, rc=a.get("rc"),
+                   end="interrupted", seconds=round(a["t1"] - a["t0"], 1), killed=verified)
+
+    def boot_attempt(self) -> dict:
+        """One stage-2 bootstrap run: a child in its own session, its output appended to $STATE/logs/bootstrap-s2.log,
+        waited for (the controller does not beat meanwhile) and killed at boot2_until."""
+        b = self.st["boot2"]
+        logs = self.state_dir / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        self.beat()  # the last controller beat before the bootstrap's own phase touchers take over
+        with open(logs / "bootstrap-s2.log", "ab") as out:
+            kw = dict(cwd=str(self.root), env=self.boot_env(), stdout=out, stderr=subprocess.STDOUT,
+                      stdin=subprocess.DEVNULL)
+            if os.name == "posix":
+                kw["start_new_session"] = True
+            proc = subprocess.Popen(self.bootstrap_cmd, **kw)
+        self._boot_proc = proc
+        a = dict(t0=time.time(), t1=None, pid=proc.pid, starttime=self.starttime(proc.pid), rc=None, end=None)
+        b["attempts"].append(a)
+        self.save()
+        n = len(b["attempts"])
+        self.event("chain_bootstrap_start", attempt=n, pid=proc.pid, until=b["until"], argv=self.bootstrap_cmd)
+        until = float(b["until"])
+        while True:
+            try:
+                rc = proc.wait(timeout=max(0.05, min(self.boot_poll_s, until - time.time())))
+                end = "exit"
+                break
+            except subprocess.TimeoutExpired:
+                if time.time() >= until:
+                    log(f"stage-2 bootstrap past its bound ({until}): killing its process group {proc.pid}")
+                    self.kill_boot(proc.pid, proc)
+                    rc, end = proc.poll(), "timeout"
+                    break
+        self._boot_proc = None
+        a.update(t1=time.time(), rc=rc, end=end)
+        self.save()
+        self.event("chain_bootstrap_end", attempt=n, rc=rc, end=end, seconds=round(a["t1"] - a["t0"], 1))
+        self.beat()
+        self.put_summary()
+        return a
+
+    def boot2(self) -> int | None:
+        """The stage-2 bootstrap (E.4.1): attempts until one exits 0 (None: go on), rc 2/3 (not retried), the second
+        exited failure, or the bound -> exit 5, the chain failed (nothing unique on the disk: destroy)."""
+        b = self.st["boot2"]
+        for a in b["attempts"]:
+            if a.get("t1") is None:
+                self._interrupted(a)
+
+        def failed(why: str) -> int:
+            b["status"] = "failed"
+            return self.finish("failed", why, EXIT_CHAIN_DESTROY)
+
+        while b["status"] != "done":
+            if time.time() >= float(b["until"]):
+                return failed(f"stage 2 bootstrap timed out (its bound {round(float(b['until']))} passed)")
+            a = self.boot_attempt()
+            if a["end"] == "timeout":
+                return failed(f"stage 2 bootstrap timed out after {round(a['t1'] - a['t0'])} s (attempt "
+                              f"{len(b['attempts'])})")
+            if a["rc"] == 0:
+                b["status"] = "done"
+                self.save()
+                break
+            exited = sum(1 for x in b["attempts"] if x.get("end") == "exit")
+            if a["rc"] in BOOT2_NO_RETRY:
+                return failed(f"stage 2 bootstrap failed (exit {a['rc']}: a refusal, not retried)")
+            if exited >= BOOT2_MAX_ATTEMPTS:
+                return failed(f"stage 2 bootstrap failed (exit {a['rc']})")
+        return None
+
+    # ------------------------------------------------------------------------------------------------ the run
+
+    def run(self) -> int:
+        fin = self.st.get("final")
+        if fin:
+            log(f"chain {self.box} already ended ({fin['status']}: {fin.get('reason')}); nothing to do")
+            return int(fin["rc"])
+        try:
+            return self._run()
+        finally:
+            proc = self._boot_proc
+            if proc is not None and proc.poll() is None:  # the controller raised while its bootstrap ran
+                log(f"controller ended while the stage-2 bootstrap runs: killing its process group {proc.pid}")
+                self.kill_boot(proc.pid, proc)
+
+    def _run(self) -> int:
+        st = self.st
+        self.event("chain_start", step=st["step"], stage=st["stage"],
+                   restart=bool(st["parts"][st["gate_box"]]["tries"]), first_boot=st["first_boot"],
+                   deadline=st["deadline"], gate_by=st["gate_by"], stage1_deadline=st["stage1_deadline"])
+        self.beat()
+        self.put_summary()
+        s1 = self.stages[0]
+        if st["step"] == "s1_gate_part":
+            rc = self.run_part(s1["gate_box"])
+            if rc not in (EXIT_OK, EXIT_STOP):
+                self.put_summary("failed", f"gate part {s1['gate_box']} exited {rc}; the supervisor restarts the chain",
+                                 EXIT_FAIL)
+                return EXIT_FAIL
+            self.set_mode()
+            self._step("s1_gate")
+        if st["step"] == "s1_gate":
+            self.set_mode()
+            if st["gate"] is None:
+                st["gate"] = self.evaluate_gate()
+                self.save()
+            self._step("s1_rest")
+        if st["step"] == "s1_rest":
+            self.set_mode()
+            for part in s1["parts"][1:]:
+                self.run_report_part(part)
+            gate = st["gate"]
+            if gate["result"] != "pass":
+                return self.finish("gate_failed", f"chain gate failed: checks {gate['failed']} problems "
+                                                  f"{gate['problems']}", EXIT_CHAIN_DESTROY)
+            rc = self.handover()
+            if rc is not None:
+                return rc
+        if st["step"] == "s2_boot":
+            rc = self.boot2()
+            if rc is not None:
+                return rc
+            need, deadline, now = self.need_s(), st["deadline"], time.time()
+            if deadline is not None and now + need > float(deadline):
+                return self.finish("failed", f"box 1 no longer fits: need {need} s, left {round(float(deadline) - now)}"
+                                             f" s", EXIT_CHAIN_DESTROY)
+            self._step("s2_p01")
+        if st["step"] == "s2_p01":
+            for part in self.stages[-1]["parts"]:
+                rc = self.run_part(part)
+                if rc == EXIT_FAIL or rc not in (EXIT_OK, EXIT_STOP):
+                    self.put_summary("failed", f"part {part} exited {rc}; the supervisor restarts the chain", rc)
+                    return rc
+                if rc == EXIT_STOP:
+                    return self.finish("halted", f"part {part} halted (rc 4: the disk is kept)", EXIT_STOP)
+            return self.finish("complete", None, EXIT_OK)
+        return int((st.get("final") or {}).get("rc", EXIT_FAIL))
+
+
+def chain_plan(box: str, registry: dict | None = None, root: Path | None = None) -> list[dict]:
+    """The `plan` command of a chain: one row per stage, then each part's items (with its stage and part)."""
+    reg = registry if registry is not None else fullrun.load_registry(None, root=root)
+    rows = []
+    for st in fullrun.chain_stages(box, reg):
+        rows.append(dict(stage=st["stage"], parts=st["parts"], gate_box=st["gate_box"], rebuild=st["rebuild"],
+                         gate_by_hours=st["gate_by_hours"], max_hours=st["max_hours"], watchdog=st["watchdog"]))
+        for part in st["parts"]:
+            rows += [dict(row, stage=st["stage"], part=part) for row in plan_items(part, reg)]
+    return rows
 
 
 # ======================================================================================================= commands
@@ -2201,7 +2886,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     for c in ("run", "plan", "resume-pull"):
         p = sub.add_parser(c)
-        p.add_argument("--box", default=os.environ.get(fullrun.ENV_BOX), choices=fullrun.BOX_NAMES)
+        p.add_argument("--box", default=os.environ.get(fullrun.ENV_BOX), choices=fullrun.ALL_BOX_NAMES)
     sub.choices["run"].add_argument("--gpus", default=None, help="comma list of CUDA_VISIBLE_DEVICES values")
     sub.choices["resume-pull"].add_argument("--root", default=str(REPO), help="the box's checkout")
     b = sub.add_parser("build-stores")
@@ -2221,14 +2906,18 @@ def main(argv: list[str] | None = None) -> int:
         return check_resume(args.run_dir)
     if not args.box:
         ap.error(f"--box (or {fullrun.ENV_BOX}) is required")
+    chain = args.box in fullrun.CHAIN_NAMES  # a chain name is always a chain entry (the registry refuses one without)
     if args.cmd == "plan":
         try:
-            for row in plan_items(args.box):
+            for row in (chain_plan(args.box) if chain else plan_items(args.box)):
                 print(json.dumps(row))
         except fullrun.RegistryError as e:
             log(f"refused: {e}")
             return EXIT_FAIL
         return EXIT_OK
+    if args.cmd == "resume-pull" and chain:  # addendum E.8: a chain is not resumed as a chain
+        log(f"resume refused: {fullrun.chain_resume_hint(args.box)}")
+        return EXIT_REFUSED
     if args.cmd == "resume-pull":
         root = Path(args.root)
         try:
@@ -2253,6 +2942,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
     gpus = [g for g in args.gpus.split(",") if g] if args.gpus else None
     try:
+        if chain:
+            return ChainController(args.box, FullSettings(gpus=gpus)).run()
         return FullQueue(args.box, FullSettings(gpus=gpus)).run()
     except Q.QueueError as e:
         log(f"refused: {e}")
