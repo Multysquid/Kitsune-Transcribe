@@ -72,7 +72,7 @@ vram_gb, params_total, weights_bytes, relpos_patch, decode_len, trained, tokens_
 batched pass's row cap, null without one), n_truncated / n_timestamp_tokens (whisper's batched pass: rows the stop or
 the length cap cut, timestamp ids stripped; null for the other kinds), fp32_head (whisper: whether its LM head ran in
 fp32; null for the other kinds, whose heads are fixed), idle, versions (python, torch, transformers, cuda, host,
-machine_id = $KITSUNE_MACHINE_ID, cpu), time_utc. tools/study_report.py --speed reads it (the Pareto view:
+torchao, machine_id = $KITSUNE_MACHINE_ID, cpu), time_utc. tools/study_report.py --speed reads it (the Pareto view:
 rtf, vram_gb, p50_s, p95_s; kitsune.study_stats.speed_entry); the full runs' report groups records by machine_id + gpu.
 
 Usage (on the box, at its end, one call per system; kitsune/study_queue.py phase_speed passes these):
@@ -550,8 +550,9 @@ def _cpu_model() -> str | None:
 
 
 def _versions() -> dict:
-    """The software and the host. host is the container's hostname, which differs per rental: machine_id
-    ($KITSUNE_MACHINE_ID, the vast machine launch rented) and the CPU model group records of one host."""
+    """The software (python, torch, transformers, cuda, torchao: kitsune.quant's torchao_version) and the host (host,
+    machine_id, cpu). host is the container's hostname, which differs per rental: machine_id ($KITSUNE_MACHINE_ID,
+    the vast machine launch rented) and the CPU model group records of one host."""
     import transformers
 
     return dict(python=sys.version.split()[0], torch=torch.__version__, transformers=transformers.__version__,

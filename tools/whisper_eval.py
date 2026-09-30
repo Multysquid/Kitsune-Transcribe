@@ -34,8 +34,8 @@ Outputs in --out:
                         max_rows, pooled_max_rows_seen, n_batches, n_split}, store{path, fingerprint}, manifest{path,
                         sha256} | null, limit_per_set, seed, sets{<set>{n, dropped, cer_corpus, n_truncated,
                         n_repetition, n_length, n_empty_hyp, n_timestamp_rows, audio_s, wall_s, rtf, n_batches,
-                        n_split, pooled_max_rows}}, versions{python, torch, transformers, cuda, host, machine_id, cpu,
-                        gpu}, status, time_utc
+                        n_split, pooled_max_rows}}, versions{python, torch, transformers, cuda, host, torchao,
+                        machine_id, cpu, gpu} (speed_probe's _versions plus the GPU), status, time_utc
   events.jsonl          one JSON line per event (so the queue and finish see a run dir); .parts/ the resume state
   with --tables         05's study.json (family whisper, teacher null, the whisper.json model + decode blocks) and
                         <tables>/<system>/<set>.parquet
