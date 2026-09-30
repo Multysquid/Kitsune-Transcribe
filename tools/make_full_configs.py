@@ -35,16 +35,19 @@ Data configs (launch's --config and bootstrap's KITSUNE_CONFIG: what a box rebui
   data-smoke-b  study/data.json's data keys verbatim (smoke B: the frozen study selection, so every study-weight eval,
                 speed probe and Whisper eval of the box shares one eval store)
 
-Inputs besides the two generators' own: PLAN_FILE (configs/full/plan/full_study.json), the JSON tools/full_plan.py
-wrote for full.parquet and smoke.parquet (--import-plan records a new measurement; the local selection paths become
-the repo paths). The generator refuses a record measured with other step values than FULL_RUNS'. It gives the smoke
-configs' probe shapes, and the numbers the hand-written registry must carry, which tests/test_full_configs.py checks:
-the full runs' plan_total_steps (the smoke train items', for smoke check 3), their plan_hours = plan v3's hours at
-the step count measured on full.parquet (PLAN_V3: hours x measured T / plan T, 2 decimals), and the bound on the
-deadline fault F4 of smoke-p005 (deadline_fault_s).
+Inputs besides the two generators' own: PLAN_FILE (configs/full/plan/full_study.json, in a folder of its own so every
+configs/full/*.json is a config), the JSON tools/full_plan.py wrote for full.parquet and smoke.parquet (--import-plan
+records a new measurement; the local selection paths become the repo paths). The generator refuses a record measured
+with other step values than FULL_RUNS'. It gives the smoke configs' probe shapes, and the numbers the hand-written
+registry must carry (registry_numbers), which tests/test_full_configs.py checks: the full runs' plan_total_steps (the
+smoke train items', for smoke check 3), their plan_hours = plan v3's hours at the step count measured on full.parquet
+(PLAN_V3: hours x measured T / plan T, 2 decimals; also the full train items' max_hours until box 1's speed replaces
+them), and F4's seconds, the deadline fault of smoke-p005 (deadline_fault_s). After a rebuilt selection: tools/
+full_plan.py --json on full.parquet and on smoke.parquet, --import-plan with both, then the printed numbers into
+boxes.json by hand, then --check and the tests.
 
 configs/full/boxes.json, the box registry (kitsune/fullrun.py), is hand-written; --check validates it with
-fullrun.registry_problems (every item config committed, its data keys equal to its box's data config's).
+fullrun.registry_problems (every data and item config present, its data keys equal to its box's data config's).
 
 Usage:
   python tools/make_full_configs.py                  # write configs/full/*.json (and remove stale generated ones)
