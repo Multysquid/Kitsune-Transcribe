@@ -511,7 +511,10 @@ class FullQueue(Q.Queue):
 
     def item_deadline(self, name: str) -> float | None:
         """The item's KITSUNE_DEADLINE: a fired deadline fault's (its start + seconds), else the box deadline less the
-        box's deadline_reserve_min (the readout, the drain and finish.py's upload fit in it); None without one."""
+        box's deadline_reserve_min (the drain and finish.py's upload fit in that reserve); None without one. The
+        no-start rule tests every item against it, readouts included (build contract 5, Resolution 17): a readout
+        after a run that the trainer's deadline cooldown (4d) shortened has to fit in the trainer's own end reserve
+        (schedule.end_reserve_min), not in this one."""
         for f in self.spec["faults"]:
             fs = self.state["faults"].get(f["id"]) or {}
             if f["action"] == "deadline" and f["item"] == name and fs.get("deadline") is not None:
