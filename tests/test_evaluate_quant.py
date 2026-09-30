@@ -12,6 +12,9 @@ formats and fp16:
                 teacher-forced tables (compare --exact) for int8-w8a8, nvfp4-w4a4 and fp16 (--fp16); a variant with
                 another --quant, or with --quant-scope, is refused; the readout CLI (export + 05) end to end, reusing a
                 verified variant on its retry
+  aed           the same on a tiny Transcribe student (tests/test_evaluate_script.py's env, skipped without the
+                teacher processor in the local HF cache): a variant --ckpt through setup_aed_model equals in-memory
+                int8-w8a8, and fp16 in memory decodes with no non-finite row
   metrics       study_block's m4_nostyle, m4_all, m4_all_nostyle and m3 on synthetic tables, the teacher's and the
                 ratio for the raw ones only, the old keys unchanged
   amp           kitsune.evaluate.amp_dtype / _amp stay backward compatible, and greedy_generate runs a fp16-applied
@@ -36,6 +39,7 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from fixtures import load_script  # noqa: E402
+from test_evaluate_script import env as aed_env  # noqa: E402,F401  (a tiny Transcribe student and its trainer run)
 from test_evaluate_study import ctc_env  # noqa: E402,F401  (the module-scoped fixture: a CTC student on a manifest)
 
 from kitsune import evaluate as ev  # noqa: E402
@@ -101,7 +105,8 @@ def test_05_quant_in_memory_end_to_end(ctc_env, prereg, m05, mem_run):
     assert qb["counters"]["calls"] > 0 and qb["counters"]["padded"] == 0 and qb["counters"]["fallback_risk"] == 0
     assert qb["nonfinite"]["rows"] == 0 and qb["nonfinite"]["batches"] == 0 and qb["nonfinite"]["forwards"] > 0
     assert qb["uncalled"] == [] and qb["invocations"] == 1 and qb["fp32_fallbacks"] == {}
-    assert qb["weights_bytes"]["quantized"] > 0 and "torchao" in qb
+    assert isinstance(qb["weights_bytes"], int) and qb["weights_bytes"] == qb["bytes"]["deployable"] > 0
+    assert 0 < qb["bytes"]["quantized"] < qb["bytes"]["deployable"] and "torchao" in qb
     assert st["weights"]["path"] == str(ctc_env["student"]) and st["weights"]["file_bytes"] > 0
     m = st["metrics"]
     for k in ("m4", "m4_nostyle", "m4_all", "m4_all_nostyle", "m3", "m4_all_teacher", "m4_all_ratio", "m3_teacher",
@@ -174,6 +179,7 @@ def test_export_then_eval_equals_in_memory(ctc_env, prereg, m05, variants, tmp_p
     assert sa["quant"]["export_dir"] == str(variants[fmt]) and sa["quant"]["file_bytes"] == (
         variants[fmt] / Q.WEIGHTS_FILE).stat().st_size
     assert sa["quant"]["nonfinite"]["rows"] == 0 and sa["metrics"]["m4"] == sb["metrics"]["m4"]
+    assert sa["quant"]["weights_bytes"] == Q.read_recipe(variants[fmt])["bytes"]["deployable"]
     assert sa["quant"]["impl"] == ("native" if fmt == "fp16" else "emulate")
     if fmt != "fp16":
         other = "int8-w8a16" if fmt != "int8-w8a16" else "fp8-w8a8"
@@ -207,6 +213,27 @@ def test_the_readout_cli(ctc_env, prereg, tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     assert Q.main(argv) == 0
     assert "is reused" in capsys.readouterr().out and (out / "variant" / Q.QUANT_FILE).stat().st_mtime_ns == before
+
+
+def test_aed_variant_equals_in_memory_and_fp16(aed_env, prereg, m05, tmp_path):
+    """The AED paths box full's quant-<fmt>-full-t06 readouts take: 05 --quant int8-w8a8 in memory, and the exported
+    variant as --ckpt (load_quantized, setup_aed_model, the processor from the variant dir), give the same hypotheses
+    and teacher-forced tables; --fp16 in memory (smoke B's fp16-study-t06) decodes with no non-finite row."""
+    base = ["--root", str(aed_env["root"]), "--config", str(aed_env["relative"]), "--prereg", str(prereg)]
+    mem, from_file, variant, f16 = (tmp_path / x for x in ("mem", "file", "variant", "fp16"))
+    assert m05.main([*base, "--ckpt", str(aed_env["ckpt"]), "--out", str(mem), "--quant", "int8-w8a8"]) == 0
+    Q.export(aed_env["ckpt"], variant, "int8-w8a8")
+    assert m05.main([*base, "--ckpt", str(variant), "--out", str(from_file)]) == 0
+    res = Q.compare_eval_dirs(mem, from_file, exact=True)
+    assert res["same"] and res["sets"] and all(v["tf_equal"] for v in res["sets"].values()), res
+    qf, qm = load(from_file / "summary.json")["quant"], load(mem / "summary.json")["quant"]
+    assert qf["format"] == qm["format"] == "int8-w8a8" and (qf["source"], qm["source"]) == ("file", "memory")
+    assert qf["uncalled"] == qm["uncalled"] == [] and qf["counters"]["calls"] == qm["counters"]["calls"] > 0
+    assert qf["weights_bytes"] == Q.read_recipe(variant)["bytes"]["deployable"] == qm["weights_bytes"]
+    assert m05.main([*base, "--ckpt", str(aed_env["ckpt"]), "--out", str(f16), "--fp16"]) == 0
+    q = load(f16 / "summary.json")["quant"]
+    assert q["format"] == "fp16" and q["impl"] == "native" and q["nonfinite"]["rows"] == 0
+    assert q["nonfinite"]["forwards"] > 0
 
 
 def _manifest():

@@ -141,9 +141,10 @@ quantised layers' call counters under .parts/quant/ (flushed every 30 s, so a ki
 quant block of study.json, summary.json and evaluator.json totals them: format, impl, scope, mx_rounding, source
 (memory | file), simulated, base_system, file_bytes / export_dir (a variant), share_quantized, counters {calls, padded,
 fallback_risk}, nonfinite {batches, rows, by_module, first}, fp32_fallbacks (the in-scope layers left 16-bit, with
-why), torchao, weights_bytes. A quantised layer that no batch called fails the run. Every --ckpt eval's study.json also
-records weights {path, file_bytes}, and every system's metrics gain m4_nostyle, m4_all (M4 with Galgame's whole set,
-kitsune.evaluate.M4_ALL_STRATA), m4_all_nostyle and m3 (the gate sets; with _teacher / _ratio for the raw ones).
+why), torchao, weights_bytes (the deployable bytes) and bytes {deployable, quantized, kept}. A quantised layer that no
+batch called fails the run. Every --ckpt eval's study.json also records weights {path, file_bytes}, and every
+system's metrics gain m4_nostyle, m4_all (M4 with Galgame's whole set, kitsune.evaluate.M4_ALL_STRATA), m4_all_nostyle
+and m3 (the gate sets; with _teacher / _ratio for the raw ones).
 
 Usage:
   python scripts/05_evaluate.py --root D:/Shizu-ko-distill --config configs/viability.json \
@@ -1165,7 +1166,11 @@ def weights_record(ckpt: Path) -> dict:
 
 
 def quant_base(q: dict, impl: str, system: str, ckpt: Path, recipe: dict | None = None) -> dict:
-    """The static part of the quant block (the recipe's numbers: the variant's, or the in-memory apply's)."""
+    """The static part of the quant block (the recipe's numbers: the variant's, or the in-memory apply's).
+    weights_bytes is the deployable bytes (a number, as speed_probe's weights_bytes of a format), bytes the recipe's
+    split {deployable, quantized, kept}; fp32_fallbacks the in-scope layers left 16-bit ({layer: why}), not a runtime
+    fallback (torchao's fp32 fallback of an int8 GEMM is counted by kitsune.quant.kernel_census: the selftest and
+    speed_probe --profile-kernels)."""
     from kitsune import quant as Q
 
     rec = recipe or q.get("recipe") or {}
@@ -1176,7 +1181,7 @@ def quant_base(q: dict, impl: str, system: str, ckpt: Path, recipe: dict | None 
                 export_dir=str(ckpt) if q["variant"] else None,
                 share_quantized=(rec.get("counts") or {}).get("share_quantized"),
                 fp32_fallbacks=dict(rec.get("skipped") or {}) if rec else None, torchao=Q.torchao_version(),
-                weights_bytes=rec.get("bytes"))
+                weights_bytes=(rec.get("bytes") or {}).get("deployable"), bytes=rec.get("bytes"))
 
 
 def quant_totals(out: Path, base: dict) -> dict:
