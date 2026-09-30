@@ -21,6 +21,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -337,10 +338,11 @@ class FakeParts:
     """ChainController.queue replaced: each part's queue plays a scripted rc (an exception is raised), writes its
     final, summary and (a smoke part) verdict into its state dir and puts them through the controller's uploader."""
 
-    def __init__(self, rcs: dict | None = None, verdict=None, lose_verdict=False, rebuild_fails=False):
+    def __init__(self, rcs: dict | None = None, verdict=None, lose_verdict=False, rebuild_fails=False, on_run=None):
         self.rcs = {p: list(v) for p, v in (rcs or {}).items()}
         self.verdict = verdict or (lambda part: verdict_doc(part))
         self.lose_verdict, self.rebuild_fails = lose_verdict, rebuild_fails
+        self.on_run = on_run  # on_run(queue): called as a part's run() starts (what the Hub holds meanwhile)
         self.calls, self.built = [], []
 
     def make(self, ctl, part, deadline, stop_at):
@@ -364,6 +366,8 @@ class FakeQueue:
     def run(self) -> int:
         self.parts.calls.append(dict(part=self.part, deadline=self.s.deadline, stop_at=self.s.stop_at,
                                      box_state=self.s.box_state_dir, state=self.s.state_dir))
+        if self.parts.on_run is not None:
+            self.parts.on_run(self)
         seq = self.parts.rcs.setdefault(self.part, [0])
         rc = seq.pop(0) if len(seq) > 1 else seq[0]
         if isinstance(rc, BaseException):
@@ -425,7 +429,8 @@ def ch(tmp_path, monkeypatch):
                     env=dict(FAKE_LOG=str(log), FAKE_BOOT_LOG=str(boot_log), **(boot_env or {}), **(env or {})))
         base.update(settings)
         c = F.ChainController(CHAIN_BOX, F.FullSettings(**base), registry=registry if registry is not None else reg,
-                              bootstrap_cmd=[PY, str(boot)], boot_poll_s=0.05, boot_kill_grace_s=0.5)
+                              bootstrap_cmd=[PY, str(boot)], boot_poll_s=0.05, boot_kill_grace_s=0.5,
+                              boot_reap_s=3.0)
         if parts is not None:
             c.queue = lambda part, deadline, stop_at: parts.make(c, part, deadline, stop_at)
         return c
@@ -789,8 +794,8 @@ def test_a_failed_stage_2_bootstrap_ends_the_chain_with_5(ch, plan, attempts, wh
 
 
 def test_a_hung_stage_2_bootstrap_is_killed_at_its_bound(ch, monkeypatch):
-    """E.9.3 (6): a bootstrap that sleeps forever is killed at boot2_until (its process group: its child too, on posix),
-    the chain ends with 5, and the controller wrote no train_hb while it waited."""
+    """E.9.3 (6): a bootstrap that sleeps forever is killed at boot2_until (its session: its child too, on posix), the
+    chain ends with 5, and the controller wrote no train_hb while it waited."""
     monkeypatch.setattr(F, "boot2_budget_s", lambda *a, **k: 3)  # the bound: 3 s after the handover
     monkeypatch.setattr(F, "BOOT2_MIN_LEFT_S", 1)
     ch.boot_state()
@@ -809,9 +814,148 @@ def test_a_hung_stage_2_bootstrap_is_killed_at_its_bound(ch, monkeypatch):
             if not Path(f"/proc/{child}").exists():
                 break
             time.sleep(0.1)
-        assert not Path(f"/proc/{child}").exists(), "the bootstrap's child outlived its group's kill"
+        assert not Path(f"/proc/{child}").exists(), "the bootstrap's child outlived its session's kill"
     else:  # Windows: terminate() takes the bootstrap only (no process groups); the child is cleaned up here
         subprocess.run(["taskkill", "/F", "/PID", str(child)], capture_output=True)
+
+
+def _gone(pid: int, wait_s: float = 10.0) -> bool:
+    """posix: /proc/<pid> gone, or a zombie, within wait_s."""
+    end = time.time() + wait_s
+    while True:
+        try:
+            if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                return True
+        except OSError:
+            return True
+        if time.time() >= end:
+            return False
+        time.sleep(0.1)
+
+
+def _reap(pid: int):
+    if not _gone(pid, 0):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+POSIX_TIMEOUT = pytest.mark.skipif(
+    os.name != "posix" or not shutil.which("timeout") or not shutil.which("bash"),
+    reason="sessions, process groups and GNU timeout: posix only (the box's Linux)")
+# a stand-in bootstrap's foreground phase as bootstrap.sh runs them: under GNU timeout (its own process group); the
+# EXIT trap keeps bash from exec'ing the command in its place
+PHASE = "trap 'echo exit trap' EXIT; timeout -k 5 600 sh -c 'echo $$ > {pidf}; exec sleep 600'"
+
+
+def test_the_bootstraps_session_is_read_from_proc(ch):
+    """ChainController.session: every live process whose /proc/<pid>/stat field 6 (session) is the bootstrap's pid,
+    with its process group - a timeout-wrapped phase's own group included; zombies, other sessions and the controller
+    itself left out. No /proc (Windows, the other tests' fake root): empty."""
+    proc_root = ch.tmp / "proc"
+
+    def stat(pid, state, pgrp, sid, start="7"):
+        d = proc_root / str(pid)
+        d.mkdir(parents=True, exist_ok=True)
+        fields = [state, "1", str(pgrp), str(sid)] + ["0"] * 15 + [start] + ["0"] * 10
+        (d / "stat").write_text(f"{pid} (a (b) c) " + " ".join(fields) + "\n", encoding="utf-8")
+
+    stat(100, "S", 100, 100)  # the bootstrap: leads its session and its group
+    stat(101, "S", 101, 100)  # timeout: a group of its own (setpgid), the same session
+    stat(102, "R", 101, 100)  # 01 under timeout
+    stat(103, "Z", 100, 100)  # a zombie
+    stat(200, "S", 200, 200)  # another session
+    stat(os.getpid(), "S", 100, 100)  # never the controller
+    (proc_root / "self").mkdir()
+    ctl = ch.make(proc_root=proc_root)
+    assert ctl.session(100) == {100: 100, 101: 101, 102: 101}
+    assert ctl.starttime(100) == "7" and ctl.session(999) == {} and ctl.pidns() is None
+    assert ch.make(proc_root=ch.tmp / "no-such-proc").session(100) == {}
+
+
+@POSIX_TIMEOUT
+def test_a_timeout_wrapped_phase_dies_with_the_bootstraps_session(ch, monkeypatch):
+    """bootstrap.sh runs its phases under GNU timeout, which moves itself and its command into a process group of their
+    own (setpgid): a kill of the bootstrap's group alone left 01's rebuild running, reparented to init. A stand-in
+    bootstrap whose foreground phase is `timeout 600 sleep`: at its bound the whole session goes, the sleep too."""
+    monkeypatch.setattr(F, "boot2_budget_s", lambda *a, **k: 3)
+    monkeypatch.setattr(F, "BOOT2_MIN_LEFT_S", 1)
+    ch.boot_state()
+    pidf = ch.tmp / "phase.pid"
+    ctl = ch.make(parts=FakeParts(), proc_root=Path("/proc"))
+    ctl.bootstrap_cmd = ["bash", "-c", PHASE.format(pidf=pidf)]
+    assert ctl.run() == F.EXIT_CHAIN_DESTROY
+    pid = int(pidf.read_text())
+    try:
+        assert _gone(pid), "the timeout-wrapped phase outlived the kill of the bootstrap"
+        (a,) = ch.chain_state()["boot2"]["attempts"]
+        assert a["end"] == "timeout" and a["pidns"] and a["pidns"].startswith("pid:")
+    finally:
+        _reap(pid)
+
+
+@POSIX_TIMEOUT
+@pytest.mark.parametrize("same_ns", [True, False], ids=["same-container", "another-container"])
+def test_a_restart_kills_what_a_dead_bootstrap_left_in_its_session(ch, same_ns):
+    """E.4.1 with the bootstrap itself gone (killed alone) and its timeout-wrapped phase still running in its session:
+    a restarted controller kills that session while the pid namespace is the attempt's (a session id's pid is not
+    reused while the session has a process); with another namespace (a container restart) nothing is killed."""
+    ch.boot_state()
+    pidf = ch.tmp / "phase.pid"
+    boot = subprocess.Popen(["bash", "-c", PHASE.format(pidf=pidf)], start_new_session=True)
+    orphan = None
+    try:
+        for _ in range(200):
+            if pidf.is_file() and pidf.read_text().strip():
+                break
+            time.sleep(0.05)
+        orphan = int(pidf.read_text())
+        ctl = ch.make(parts=FakeParts(), proc_root=Path("/proc"))
+        starttime = ctl.starttime(boot.pid)
+        os.kill(boot.pid, signal.SIGKILL)  # the bootstrap alone dies; its phase runs on in its session
+        boot.wait(10)
+        assert not _gone(orphan, 0.3) and set(ctl.session(boot.pid)) >= {orphan}
+        ctl.st.update(step="s2_boot", stage=2, gate=F.chain_gate(verdict_doc("full-smoke"), "full-smoke", 0,
+                                                                 "test-sha"))
+        for p in ("full-smoke", "smoke-b"):
+            ctl.st["parts"][p].update(status="ended", rc=0)
+        ctl.st["boot2"] = dict(status="running", until=time.time() + 3600, t0=time.time(), need_s=1, budget_s=1,
+                               pull_min=30, rebuild_min=60, rest_bytes=0, pull_bytes=0, rate_bytes_s=1.0,
+                               timeouts="test", attempts=[dict(t0=time.time() - 5, t1=None, pid=boot.pid,
+                                                              starttime=starttime, rc=None, end=None,
+                                                              pidns=ctl.pidns() if same_ns else "pid:[1]")])
+        ctl.save()
+        assert ch.make(parts=FakeParts(), proc_root=Path("/proc")).run() == F.EXIT_OK
+        a = ch.chain_state()["boot2"]["attempts"]
+        assert [x["end"] for x in a] == ["interrupted", "exit"] and a[0]["killed"] is same_ns
+        assert _gone(orphan, 10 if same_ns else 1) is same_ns
+    finally:
+        if boot.poll() is None:
+            boot.kill()
+        if orphan:
+            _reap(orphan)
+
+
+def test_a_failed_attempt_with_no_time_left_names_its_exit(ch, monkeypatch):
+    """E.4.1's words: an attempt that exited 1 and left no time before the bound for its retry ends the chain as
+    "stage 2 bootstrap failed (exit 1)" (rc 5), not as a timeout that loses the exit code."""
+    ch.boot_state()
+
+    def attempt(self):
+        b = self.st["boot2"]
+        a = dict(t0=time.time(), t1=time.time(), pid=1, starttime=None, pidns=None, rc=1, end="exit")
+        b["attempts"].append(a)
+        b["until"] = time.time() - 1  # the attempt used the bound up
+        self.save()
+        return a
+
+    monkeypatch.setattr(F.ChainController, "boot_attempt", attempt)
+    parts = FakeParts()
+    assert ch.make(parts=parts).run() == F.EXIT_CHAIN_DESTROY
+    s = ch.summary()
+    assert s["reason"].startswith("stage 2 bootstrap failed (exit 1) and its bound ") and s["status"] == "failed"
+    assert len(s["boot2"]["attempts"]) == 1 and "p01" not in parts.ran()
 
 
 def test_the_fit_rule(ch, monkeypatch):
@@ -960,6 +1104,62 @@ def test_p01_rc_1_exits_1_and_resumes_it(ch):
     assert ch.chain_state()["step"] == "s2_p01" and ch.summary()["rc"] == 1
     assert ch.make(parts=parts).run() == F.EXIT_OK
     assert parts.ran() == ["full-smoke", "smoke-b", "p01", "p01"] and len(ch.boots()) == 1
+
+
+def test_the_hub_chain_summary_names_each_parts_queue_started_while_it_runs(ch, monkeypatch):
+    """E.8's "started on this rental": a chain that dies in stage 2 leaves its Hub summary as it last put it, so that
+    summary must name parts.p01.queue_started for the whole of box 1's run, not only once p01 has ended; with it and
+    the Hub's p01 summary, launch --box p01 --resume says it continues the chain's stage 2."""
+    import launch
+
+    ch.boot_state()
+    up, seen = FakeUploader(), {}
+
+    def on_run(q):
+        seen[q.part] = (json.loads(up.remote[fullrun.box_summary_path(CHAIN_BOX)]), q.state["started"])
+
+    assert ch.make(parts=FakeParts(on_run=on_run), uploader=up).run() == F.EXIT_OK
+    for part in ("full-smoke", "smoke-b", "p01"):
+        hub, started = seen[part]
+        assert (hub["parts"][part]["status"], hub["parts"][part]["queue_started"]) == ("running", started), part
+    # the box dies during p01: the Hub keeps the chain summary seen then, and p01's own summary
+    files = {fullrun.box_summary_path(CHAIN_BOX): json.dumps(seen["p01"][0]).encode(),
+             fullrun.box_summary_path("p01"): up.remote[fullrun.box_summary_path("p01")]}
+
+    class Hub:
+        def file_exists(self, repo, path):
+            return path in files
+
+        def download(self, repo, path, local_dir):
+            out = Path(local_dir) / Path(path).name
+            out.write_bytes(files[path])
+            return str(out)
+
+    hub = Hub()
+    monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+    problems, notes = launch.chain_resume_checks("u/kitsune-runs", "p01", CHAIN_BOX)
+    assert problems == [] and len(notes) == 1 and "continues stage 2 of chain p01-chain (gate passed " in notes[0]
+
+
+def test_an_ended_chain_writes_its_summary_again_on_a_restart(ch):
+    """A controller that died between finish()'s chain.json and its summary: the restart returns the recorded rc and
+    writes the summary to match it, so vast/supervise.py destroys on that exit 5 instead of restarting a chain whose
+    summary still says running (and stopping it after its restarts)."""
+    import supervise
+
+    ch.boot_state()
+    parts = FakeParts(verdict=lambda part: verdict_doc(part, {"2": False}))
+    assert ch.make(parts=parts).run() == F.EXIT_CHAIN_DESTROY
+    done = ch.summary()
+    (ch.state / fullrun.SUMMARY_FILE).write_text(json.dumps(dict(done, status="running", rc=None, reason=None,
+                                                                 ended=None)), encoding="utf-8")
+    assert supervise.decide_queue(5, 0, summary=supervise.queue_summary(ch.state))[0] != "destroy"
+    up = FakeUploader()
+    assert ch.make(parts=parts, uploader=up).run() == F.EXIT_CHAIN_DESTROY
+    assert ch.summary() == done, "the same record, its end time included"
+    assert json.loads(up.remote[fullrun.box_summary_path(CHAIN_BOX)]) == done
+    assert supervise.decide_queue(5, 0, summary=supervise.queue_summary(ch.state))[0] == "destroy"
+    assert parts.ran() == ["full-smoke", "smoke-b"]
 
 
 def test_smoke_b_failing_twice_is_recorded_and_the_chain_goes_on(ch):

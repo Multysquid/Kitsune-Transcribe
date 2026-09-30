@@ -2031,7 +2031,8 @@ CHAIN_STEPS = ("s1_gate_part", "s1_gate", "s1_rest", "s2_boot", "s2_p01", "done"
 BOOT2_MAX_ATTEMPTS = 2  # stage-2 bootstrap attempts that exited (an interrupted one does not count)
 BOOT2_NO_RETRY = (2, 3)  # check_students refused, a plan or 01 refusal: the same attempt fails the same way
 BOOT2_POLL_S = 30.0
-BOOT2_KILL_GRACE_S = 60.0  # SIGTERM -> SIGKILL of the stage-2 bootstrap's process group
+BOOT2_KILL_GRACE_S = 60.0  # SIGTERM -> SIGKILL of the stage-2 bootstrap's session (every process group in it)
+BOOT2_REAP_S = 30.0  # after the SIGKILL: how long the controller waits for the session to be gone
 BOOT2_MIN_LEFT_S = 1800  # H2: the stage-2 bootstrap needs at least this long before its bound
 BOOT2_PHASE_HB_MAX_S = 10800  # KITSUNE_PHASE_HB_MAX_S of the stage-2 bootstrap: phases without a timeout, 3 h each
 BOOT2_MARK = "vast/bootstrap.sh"  # a live stage-2 bootstrap's command line (its identity after a controller restart)
@@ -2132,7 +2133,7 @@ class ChainController:
 
     def __init__(self, box: str, settings: FullSettings | None = None, registry: dict | None = None, *,
                  bootstrap_cmd: list[str] | None = None, boot_poll_s: float = BOOT2_POLL_S,
-                 boot_kill_grace_s: float = BOOT2_KILL_GRACE_S):
+                 boot_kill_grace_s: float = BOOT2_KILL_GRACE_S, boot_reap_s: float = BOOT2_REAP_S):
         s = settings or FullSettings()
         reg = registry if registry is not None else s.registry
         try:
@@ -2153,6 +2154,7 @@ class ChainController:
         self.uploader = s.uploader if s.uploader is not None else (Q.HubUploader(s.out_repo) if s.out_repo else None)
         self.bootstrap_cmd = list(bootstrap_cmd or ["bash", (self.root / "vast" / "bootstrap.sh").as_posix()])
         self.boot_poll_s, self.boot_kill_grace_s = float(boot_poll_s), float(boot_kill_grace_s)
+        self.boot_reap_s = float(boot_reap_s)
         self._boot_proc = None
         self.st = self._load()
 
@@ -2232,12 +2234,13 @@ class ChainController:
             if isinstance(v, dict):
                 verdicts[p] = dict(overall=v.get("overall"),
                                    checks={n: (c or {}).get("pass") for n, c in (v.get("checks") or {}).items()})
+        ended = None if status == "running" else ((st.get("final") or {}).get("wall") or time.time())
         return dict(format=1, kind=fullrun.CHAIN_KIND, box=self.box, status=status, reason=reason, rc=rc,
                     sha=self.s.sha, machine_id=self.s.machine_id, container_id=self.s.container_id,
                     registry_sha256=self.registry_sha256, first_boot=st["first_boot"], deadline=st["deadline"],
                     gate_by=st["gate_by"], stage1_deadline=st["stage1_deadline"], stage=st["stage"], step=st["step"],
-                    started=st["started"], ended=None if status == "running" else time.time(), gate=st["gate"],
-                    boot2=st["boot2"], parts=parts, verdicts=verdicts)
+                    started=st["started"], ended=ended, gate=st["gate"], boot2=st["boot2"], parts=parts,
+                    verdicts=verdicts)
 
     def put_summary(self, status: str = "running", reason: str | None = None, rc: int | None = None):
         """$KITSUNE_STATE/queue_summary.json (vast/supervise.py reads its reason, kind and stage), put at
@@ -2307,11 +2310,18 @@ class ChainController:
             return int(ps["rc"])
         self._part_start(part)
         q = self.queue(part, *self.part_window(part))
-        ps["queue_started"] = q.state.get("started")
-        self.save()
+        self._queue_started(part, q)
         rc = q.run()
         self._part_end(part, rc)
         return rc
+
+    def _queue_started(self, part: str, q):
+        """parts.<part>.queue_started = the part queue's started, saved and put on the Hub before the part runs: a
+        chain that dies in stage 2 leaves this summary, and launch --box p01 --resume matches the Hub's p01 summary to
+        this rental by it (addendum E.8), so it must be there for the whole of box 1's first run."""
+        self.st["parts"][part]["queue_started"] = q.state.get("started")
+        self.save()
+        self.put_summary()
 
     def run_report_part(self, part: str):
         """A report-only part (smoke-b): rc 0 or 4 ends it; rc 1 or an exception while it is built or run is retried
@@ -2323,8 +2333,7 @@ class ChainController:
             why = None
             try:
                 q = self.queue(part, *self.part_window(part))
-                ps["queue_started"] = q.state.get("started")
-                self.save()
+                self._queue_started(part, q)
                 rc = q.run()
             except Exception as e:  # noqa: BLE001  a report-only part never ends the chain
                 rc, why = None, f"{type(e).__name__}: {e}"
@@ -2464,41 +2473,94 @@ class ChainController:
         except (OSError, ValueError, TypeError):
             return None
 
-    def starttime(self, pid) -> str | None:
-        """Field 22 of /proc/<pid>/stat (the process's start in clock ticks since boot): with the pid, a process's
-        identity across a controller restart (a pid alone may be recycled after a container restart)."""
+    def _stat(self, pid) -> list[str] | None:
+        """/proc/<pid>/stat's fields from field 3 on (after the command name): [0] state, [2] pgrp, [3] session,
+        [19] starttime."""
         stat = self._proc_file(pid, "stat")
         try:
-            return stat.rsplit(")", 1)[1].split()[19] if stat else None
+            return stat.rsplit(")", 1)[1].split() if stat else None
         except IndexError:
             return None
 
-    def _alive(self, pid, proc=None) -> bool:
-        if proc is not None:
-            return proc.poll() is None
-        return (Path(self.s.proc_root) / str(int(pid))).exists()
+    def starttime(self, pid) -> str | None:
+        """Field 22 of /proc/<pid>/stat (the process's start in clock ticks since boot): with the pid, a process's
+        identity across a controller restart (a pid alone may be recycled after a container restart)."""
+        f = self._stat(pid)
+        return f[19] if f and len(f) > 19 else None
 
-    def signal_group(self, pid, sig, proc=None):
-        """sig to the bootstrap's process group (posix; it leads its own session); on Windows terminate / kill the
-        process itself."""
+    def pidns(self) -> str | None:
+        """The controller's pid namespace (the /proc/self/ns/pid link, "pid:[<inode>]"), recorded with each attempt: a
+        container restart makes a new one, whose pids name other processes."""
         try:
-            if os.name == "posix":
-                os.killpg(int(pid), sig)
-            elif proc is not None:
-                proc.terminate() if sig == signal.SIGTERM else proc.kill()
-            else:
-                os.kill(int(pid), signal.SIGTERM)  # TerminateProcess: never signal 0, which is CTRL_C_EVENT there
-        except (OSError, ProcessLookupError, ValueError):
-            pass
+            return os.readlink(Path(self.s.proc_root) / "self" / "ns" / "pid")
+        except (OSError, NotImplementedError, AttributeError):
+            return None
+
+    def session(self, sid) -> dict[int, int]:
+        """{pid: pgid} of every live (not zombie) process in session `sid` (field 6 of /proc/<pid>/stat), never the
+        controller itself. The stage-2 bootstrap leads its own session (start_new_session), and everything under it stays
+        in that session - unlike its process group: GNU timeout, which bootstrap wraps its phases in (plan,
+        pull_derived, the label pull, 01's rebuild), calls setpgid(0, 0), so the timeout and its command sit in a group
+        of their own that a kill of the bootstrap's group never reaches. Empty off posix or without /proc."""
+        out, me = {}, os.getpid()
+        try:
+            names = [d.name for d in Path(self.s.proc_root).iterdir() if d.name.isdigit()]
+        except OSError:
+            return out
+        for name in names:
+            f = self._stat(name)
+            try:
+                if f and f[0] != "Z" and int(f[3]) == int(sid) and int(name) != me:
+                    out[int(name)] = int(f[2])
+            except (ValueError, IndexError):
+                continue
+        return out
+
+    def _leader_alive(self, pid, proc=None) -> bool:
+        if proc is not None:
+            return proc.poll() is None  # also reaps it: a zombie leader is gone
+        f = self._stat(pid)
+        return f is not None and f[0] != "Z"
+
+    def _boot_left(self, pid, proc=None) -> bool:
+        """The bootstrap, or any process of its session, still running."""
+        return self._leader_alive(pid, proc) or (os.name == "posix" and bool(self.session(pid)))
+
+    def signal_boot(self, pid, sig, proc=None):
+        """sig to the bootstrap's whole session on posix: its own process group and every other group in the session
+        (each timeout-wrapped phase's), never the controller's own group; on Windows (no sessions) terminate / kill the
+        process itself."""
+        if os.name != "posix":
+            try:
+                if proc is not None:
+                    proc.terminate() if sig == signal.SIGTERM else proc.kill()
+                else:
+                    os.kill(int(pid), signal.SIGTERM)  # TerminateProcess: never signal 0, which is CTRL_C_EVENT there
+            except (OSError, ValueError):
+                pass
+            return
+        for g in sorted({int(pid), *self.session(pid).values()} - {os.getpgrp()}):
+            try:
+                os.killpg(g, sig)
+            except OSError:  # the group is gone (ProcessLookupError) or not ours
+                pass
 
     def kill_boot(self, pid, proc=None):
-        """SIGTERM to the group, SIGKILL after boot_kill_grace_s: the bootstrap and every phase under it."""
-        self.signal_group(pid, signal.SIGTERM, proc)
+        """SIGTERM to the bootstrap's session, SIGKILL after boot_kill_grace_s to whatever is left of it, then up to
+        boot_reap_s for it to go: the bootstrap and every phase under it, a timeout-wrapped 01 rebuild included, so no
+        later attempt and no p01 store ever meets an old 01 still writing the same data root."""
+        self.signal_boot(pid, signal.SIGTERM, proc)
         end = time.time() + self.boot_kill_grace_s
-        while time.time() < end and self._alive(pid, proc):
+        while time.time() < end and self._boot_left(pid, proc):
             time.sleep(min(0.5, max(0.0, end - time.time())))
-        if self._alive(pid, proc):
-            self.signal_group(pid, getattr(signal, "SIGKILL", signal.SIGTERM), proc)
+        if self._boot_left(pid, proc):
+            self.signal_boot(pid, getattr(signal, "SIGKILL", signal.SIGTERM), proc)
+            end = time.time() + self.boot_reap_s
+            while time.time() < end and self._boot_left(pid, proc):
+                time.sleep(0.2)
+            if self._boot_left(pid, proc):
+                log(f"stage-2 bootstrap session {pid} still has processes after SIGKILL: "
+                    f"{sorted(self.session(pid))}")
         if proc is not None:
             try:
                 proc.wait(30)
@@ -2506,18 +2568,23 @@ class ChainController:
                 pass
 
     def _interrupted(self, a: dict):
-        """An attempt a dead controller left without an end (E.4.1): its process group is killed only when its
-        identity is verified (the stored starttime and a vast/bootstrap.sh command line), never a recycled pid;
-        recorded as interrupted, which does not count toward BOOT2_MAX_ATTEMPTS."""
+        """An attempt a dead controller left without an end (E.4.1): its session is killed only when it is verified to
+        be that attempt's - the bootstrap itself by its stored starttime and a vast/bootstrap.sh command line, or, with
+        the bootstrap gone, the processes it left in its session while the pid namespace is still the attempt's (a
+        session id's pid is not reused while a process is in that session) - never a recycled pid's; recorded as
+        interrupted, which does not count toward BOOT2_MAX_ATTEMPTS."""
         pid, want = a.get("pid"), a.get("starttime")
         cmd = (self._proc_file(pid, "cmdline") or "").replace("\0", " ")
-        verified = pid is not None and want is not None and self.starttime(pid) == want and BOOT2_MARK in cmd
-        if verified:
+        leader = pid is not None and want is not None and self.starttime(pid) == want and BOOT2_MARK in cmd
+        orphans = (not leader and pid is not None and os.name == "posix" and a.get("pidns") is not None
+                   and a.get("pidns") == self.pidns() and bool(self.session(pid)))
+        if leader or orphans:
             self.kill_boot(pid)
-        a.update(t1=time.time(), end="interrupted", killed=verified)
+        a.update(t1=time.time(), end="interrupted", killed=leader or orphans)
         self.save()
         self.event("chain_bootstrap_end", attempt=self.st["boot2"]["attempts"].index(a) + 1, rc=a.get("rc"),
-                   end="interrupted", seconds=round(a["t1"] - a["t0"], 1), killed=verified)
+                   end="interrupted", seconds=round(a["t1"] - a["t0"], 1), killed=leader or orphans,
+                   orphans=orphans)
 
     def boot_attempt(self) -> dict:
         """One stage-2 bootstrap run: a child in its own session, its output appended to $STATE/logs/bootstrap-s2.log,
@@ -2533,7 +2600,8 @@ class ChainController:
                 kw["start_new_session"] = True
             proc = subprocess.Popen(self.bootstrap_cmd, **kw)
         self._boot_proc = proc
-        a = dict(t0=time.time(), t1=None, pid=proc.pid, starttime=self.starttime(proc.pid), rc=None, end=None)
+        a = dict(t0=time.time(), t1=None, pid=proc.pid, starttime=self.starttime(proc.pid), pidns=self.pidns(),
+                 rc=None, end=None)
         b["attempts"].append(a)
         self.save()
         n = len(b["attempts"])
@@ -2546,10 +2614,17 @@ class ChainController:
                 break
             except subprocess.TimeoutExpired:
                 if time.time() >= until:
-                    log(f"stage-2 bootstrap past its bound ({until}): killing its process group {proc.pid}")
+                    log(f"stage-2 bootstrap past its bound ({until}): killing its session {proc.pid}")
                     self.kill_boot(proc.pid, proc)
                     rc, end = proc.poll(), "timeout"
                     break
+        if end == "exit" and os.name == "posix" and self.session(proc.pid):
+            # an exited bootstrap left processes in its session (its EXIT trap stops the label pull; anything else
+            # would still write the data root under the next attempt or p01's stores): they go with it
+            left = sorted(self.session(proc.pid))
+            log(f"stage-2 bootstrap exited {rc} and left {left} in its session: killing them")
+            self.kill_boot(proc.pid, proc)
+            a["left"] = left
         self._boot_proc = None
         a.update(t1=time.time(), rc=rc, end=end)
         self.save()
@@ -2572,6 +2647,10 @@ class ChainController:
 
         while b["status"] != "done":
             if time.time() >= float(b["until"]):
+                last = b["attempts"][-1] if b["attempts"] else {}
+                if last.get("end") == "exit":  # a failed attempt, and no time left for its retry: name its exit
+                    return failed(f"stage 2 bootstrap failed (exit {last.get('rc')}) and its bound "
+                                  f"{round(float(b['until']))} passed before a retry")
                 return failed(f"stage 2 bootstrap timed out (its bound {round(float(b['until']))} passed)")
             a = self.boot_attempt()
             if a["end"] == "timeout":
@@ -2593,14 +2672,18 @@ class ChainController:
     def run(self) -> int:
         fin = self.st.get("final")
         if fin:
+            # the chain summary written again (idempotent): a controller that died between finish()'s chain.json and
+            # its summary left the summary "running", and vast/supervise.py destroys on exit 5 only with the chain
+            # summary's gate_failed / failed status
             log(f"chain {self.box} already ended ({fin['status']}: {fin.get('reason')}); nothing to do")
+            self.put_summary(fin["status"], fin.get("reason"), int(fin["rc"]))
             return int(fin["rc"])
         try:
             return self._run()
         finally:
             proc = self._boot_proc
-            if proc is not None and proc.poll() is None:  # the controller raised while its bootstrap ran
-                log(f"controller ended while the stage-2 bootstrap runs: killing its process group {proc.pid}")
+            if proc is not None and self._boot_left(proc.pid, proc):  # the controller raised while its bootstrap ran
+                log(f"controller ended while the stage-2 bootstrap runs: killing its session {proc.pid}")
                 self.kill_boot(proc.pid, proc)
 
     def _run(self) -> int:
