@@ -289,3 +289,27 @@ def test_the_watchdog_keeps_the_label_defaults():
     assert 'HB_NAME="${KITSUNE_WATCHDOG_HB_FILE:-label_hb}"' in text and 'HB="$STATE/$HB_NAME"' in text
     assert 'ACTION="${KITSUNE_WATCHDOG_ORPHAN_ACTION:-stop}"' in text
     assert 'REASON="watchdog: label controller dead"' in text
+
+
+def test_rearm_also_moves_a_chain_boxs_mode_file_and_its_chain_state(tmp_path):
+    """A re-armed chain box (contract addendum E) starts with the watchdog in its env's mode (no watchdog_mode left)
+    and its controller from the gate part again (chain/ moved aside: chain.json, the parts' state dirs, stage1/)."""
+    text = (VAST / "onstart.sh").read_text(encoding="utf-8")
+    body = re.search(r"^rearm\(\) \{[^\n]*\n.*?^\}\n", text, re.M | re.S).group(0)
+    bash = need_bash()
+    state = tmp_path / "state"
+    (state / "chain" / "full-smoke").mkdir(parents=True)
+    (state / "chain" / "chain.json").write_text("{}", encoding="utf-8")
+    (state / "chain" / "full-smoke" / "queue.json").write_text("{}", encoding="utf-8")
+    (state / "watchdog_mode").write_text("stop 3600\n", encoding="utf-8")
+    (state / "queue.json").write_text("x", encoding="utf-8")
+    script = tmp_path / "rearm.sh"
+    script.write_text("\n".join(["set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }",
+                                 f'KITSUNE_STATE="{state.as_posix()}"', body, "rearm", ""]),
+                      encoding="utf-8", newline="\n")
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (moved,) = [d for d in state.iterdir() if d.name.startswith("rearm-")]
+    assert sorted(p.name for p in moved.iterdir()) == ["chain", "watchdog_mode"]
+    assert (moved / "chain" / "full-smoke" / "queue.json").exists() and (state / "queue.json").exists()
+    assert len((VAST / "onstart.sh").read_bytes()) < 16 * 1024

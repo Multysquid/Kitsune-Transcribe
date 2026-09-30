@@ -8,7 +8,8 @@
   unresolved of_box skipped
 - failures: exit 3 on one item (failed alone, rc 4 at the end), a store build that fails for good (its dependants
   skipped, no QueueError), a retried train item resuming in its run dir, a readout that fails (recorded, not retried)
-- the no-start rule (a droppable item skipped, a non-droppable one overridden) and KITSUNE_DEADLINE
+- the no-start rule (a droppable item skipped, a non-droppable one overridden) and KITSUNE_DEADLINE; a readout is
+  tested against the box deadline less the watchdog's sync margin instead (a shortened run still gets its M4)
 - stalls (a hung trainer killed and resumed; an overrun kill for an item without a stall check), the controller
   heartbeat (beaten every poll, held during a freeze fault, across a summary put)
 - smoke A end to end: the faults (kill, wipe_run_dir through the Hub and check-resume, deadline, freeze; sigstop on
@@ -1325,3 +1326,48 @@ def test_the_queue_never_imports_the_trainer_or_reads_the_study_box_plans(fq, mo
     monkeypatch.setattr(Q, "box_plan", no_plan)
     q = fq.make("full")
     assert q.plan["shared_queue"] and q.plan["runs"] == ["full-t06", "full-p03", "full-p005"]
+
+
+# ================================================================ the readout rule (a readout gets its number)
+
+
+def test_a_readout_is_tested_against_the_box_deadline_not_kitsune_deadline(tmp_path, monkeypatch):
+    """The no-start rule of a readout: the box deadline less readout_margin_s() (10 min before the watchdog's log
+    sync), so a run that the deadline cooldown shortened into deadline_reserve_min still gets its M4 readout (box 1's
+    go/no-go); an eval or speed item keeps KITSUNE_DEADLINE (box deadline - deadline_reserve_min)."""
+    monkeypatch.delenv("KITSUNE_WATCHDOG_SYNC_LEAD_S", raising=False)
+    root, state = tmp_path / "box", tmp_path / "state"
+    reg = fake_evals(tiny_registry(root))
+    state.mkdir(parents=True)
+    now = time.time()
+    (state / "deadline").write_text(f"{now + 40 * 60}\n")  # 40 min left: inside p01's 45 min reserve
+    s = F.FullSettings(root=root, state_dir=state, gpus=["0"], out_repo=None, n_gpus=None, python=PY,
+                       uploader=FakeUploader(), proc_root=tmp_path / "np", cgroup=tmp_path / "nc")
+    q = F.FullQueue("p01", s, registry=reg)
+    q.register()
+    assert F.readout_margin_s() == 1200
+    assert q.start_deadline("m4-full-p01") == pytest.approx(now + 40 * 60 - 1200, abs=1)
+    assert q.start_deadline("full-p01") == q.item_deadline("full-p01") == pytest.approx(now + 40 * 60 - 45 * 60,
+                                                                                        abs=1)
+    rd = "runs/full-p01-20260930T000000Z"
+    (root / rd / "checkpoints" / "step_20").mkdir(parents=True)
+    q.item("full-p01").update(status="done", run_dir=rd, result={"steps": 20, "resume_resets": 0})
+    assert q._prepare("m4-full-p01") is True, "18 min of readout fit in the 40 - 20 min left"
+    assert "m4-full-p01" not in q.state["no_start"]
+    # a readout that no longer fits before the watchdog's sync: skipped, as before
+    (state / "deadline").write_text(f"{now + 30 * 60}\n")
+    assert q._prepare("m4-full-p01") is False and q.item("m4-full-p01")["status"] == "skipped"
+    assert q.state["no_start"]["m4-full-p01"]["skipped"] is True
+    # the watchdog's sync lead is read from its env
+    monkeypatch.setenv("KITSUNE_WATCHDOG_SYNC_LEAD_S", "1800")
+    assert F.readout_margin_s() == 2400
+    # an eval item keeps the item deadline (box full: the box deadline less its 60 min reserve), a readout does not
+    (tmp_path / "state2").mkdir()
+    (tmp_path / "state2" / "deadline").write_text(f"{now + 3 * 3600}\n")
+    q2 = F.FullQueue("full", F.FullSettings(root=root, state_dir=tmp_path / "state2", gpus=["0", "1"], out_repo=None,
+                                            n_gpus=None, python=PY, uploader=FakeUploader(),
+                                            proc_root=tmp_path / "np", cgroup=tmp_path / "nc"), registry=reg)
+    q2.register()
+    assert q2.start_deadline("whisper-small") == q2.item_deadline("whisper-small") == pytest.approx(
+        now + 2 * 3600, abs=1)
+    assert q2.start_deadline("m4-full-p03") == pytest.approx(now + 3 * 3600 - 2400, abs=1)  # the 1800 s sync lead

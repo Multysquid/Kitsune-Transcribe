@@ -54,6 +54,12 @@
 # for at most its own worst case (the label pull and the rebuild: their three attempts' timeouts) or else
 # KITSUNE_PHASE_HB_MAX_S (12 h), and never after bootstrap has exited. vast/README.md "Full-data runs" has the box's
 # whole life.
+#
+# Chain box (KITSUNE_BOX=p01-chain, contract addendum E): the helper serves the view of stage KITSUNE_CHAIN_STAGE (its
+# parts' students, extra files and dirs, timed states) and refuses (exit 3) a KITSUNE_CONFIG that is not that stage's
+# rebuild config; each timing record carries "stage". Stage 1 is the boot's (onstart); stage 2 is run by the chain
+# controller on the full extent with the same data root (01 skips stage 1's finished inputs; coverage checks every
+# stem), without the gate (its record stays) and with the controller's timeouts and a 3 h KITSUNE_PHASE_HB_MAX_S.
 set -euo pipefail
 
 KITSUNE_DIR="${KITSUNE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -136,8 +142,9 @@ phase() {  # phase <name> <command...>: run it and append its wall time
         "$@"
     fi
     t1=$(date +%s.%N)
-    printf '{"phase": "%s", "seconds": %s, "end": %s}\n' "$name" \
-        "$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')" "${t1%.*}" >> "$TIMINGS"
+    printf '{"phase": "%s", "seconds": %s, "end": %s%s}\n' "$name" \
+        "$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')" "${t1%.*}" \
+        "${KITSUNE_CHAIN_STAGE:+, \"stage\": $KITSUNE_CHAIN_STAGE}" >> "$TIMINGS"
     log "phase $name done in $(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }') s"
 }
 
@@ -208,9 +215,20 @@ elif os.environ.get("KITSUNE_JOB") == "full":
     _box = os.environ["KITSUNE_BOX"]
     try:
         _reg = _f.load_registry(root=root)
-        students, ctc_students = _f.box_students(_box, _reg), set(_f.box_ctc_students(_box, _reg))
-        extra_dirs, extra_files = _f.box_extra_dirs(_box, _reg), _f.box_extra_files(_box, _reg)
-        timed_states = _f.box_spec(_box, _reg)["timed_states"]
+        if _f.is_chain(_box, _reg):
+            # a chain box (contract addendum E): this stage's view of its parts (KITSUNE_CHAIN_STAGE: launch 1, the
+            # chain controller's stage-2 bootstrap 2), which rebuilds exactly the stage's rebuild config
+            _stage = os.environ.get("KITSUNE_CHAIN_STAGE") or "1"
+            _v = _f.stage_view(_box, int(_stage) if _stage.isdigit() else -1, _reg, root)
+            if os.environ["CONFIG"] != _v["rebuild"]:
+                raise _f.RegistryError(f"chain stage {_v['stage']} rebuilds {_v['rebuild']}, not KITSUNE_CONFIG "
+                                       f"{os.environ['CONFIG']}")
+            students, ctc_students = _v["students"], set(_v["ctc_students"])
+            extra_dirs, extra_files, timed_states = _v["extra_dirs"], _v["extra_files"], _v["timed_states"]
+        else:
+            students, ctc_students = _f.box_students(_box, _reg), set(_f.box_ctc_students(_box, _reg))
+            extra_dirs, extra_files = _f.box_extra_dirs(_box, _reg), _f.box_extra_files(_box, _reg)
+            timed_states = _f.box_spec(_box, _reg)["timed_states"]
     except _f.RegistryError as e:
         print(f"box {_box}: {e} (not retried)", file=sys.stderr)
         sys.exit(3)
