@@ -239,13 +239,19 @@ Full-data runs: timed states, heartbeats, 4e, fix 7 (the full-run build contract
                     ScratchUploader through kitsune.scratch: one commit adds the state under runs/<run_id>/checkpoints/
                     full_step_<N>/ with its pointer runs/<run_id>/timed_state.json and deletes the run's previous one,
                     then the repo's history is squashed. The dir carries SCRATCH_MARK (never UPLOAD_MARK) until its
-                    upload ends; rotate_full keeps it meanwhile, and of the marked dirs only the newest. One upload at
-                    a time: a state due while one runs waits for it (one timed_state_skipped event, no local save). The
-                    uploads are never awaited: the end phase and the failure path cancel the queued ones. After a timed
-                    upload went up, and after the pre_cooldown state is queued for the runs repo, the loop forces a log
-                    sync (sync_due), so the Hub's logs are as fresh as the newest state. With hf.output_repo set it
-                    needs hf.scratch_repo (build refuses: the full-run queue passes it); without an output repo timed
-                    states are skipped (one timed_state_skipped). summary.json: timed_states {repo, count, last}
+                    upload ends; rotate_full keeps it meanwhile, and of the marked dirs only the newest. A timed state
+                    at the step of a periodic one rewrites its trainer.pt/.json (so it records its own reason and
+                    cadence), and so does a pre_cooldown state at the step of a periodic or timed one in a run with
+                    timed states (the full-run queue's reset picks the runs repo's state by that reason). One upload at
+                    a time: a state due while one runs waits for it (no local save; one timed_state_skipped per due
+                    window it misses, with the running upload's running_s, so a hung one shows). The uploads are never
+                    awaited - the end phase and the failure path cancel the queued ones - except by a trainer-only
+                    rewrite of the same step's dir (end, kept fraction, pre_cooldown), for at most UPLOAD_WAIT_S. After
+                    a timed upload went up, and after the pre_cooldown state is queued for the runs repo, the loop
+                    forces a log sync (sync_due), so the Hub's logs are as fresh as the newest state. With
+                    hf.output_repo set it needs hf.scratch_repo (build refuses: the full-run queue passes it); without
+                    an output repo timed states are skipped (one timed_state_skipped). summary.json: timed_states
+                    {repo, count, last}
   resume on a new host  (4b) trainer.pt/.json name the saving host; the `resume` event has host, prev_host and
                     new_host. With hf.output_repo set, a resume of a state that records its host refuses a run dir
                     without events.jsonl (a new host must pull the run's logs first: kitsune.full_queue resume-pull; the
@@ -1207,7 +1213,9 @@ class ScratchUploader(Uploader):
     from every older full_step_* dir (one left by a cancelled or crashed upload), so rotate_full never keeps more than
     the newest marked dir. The loop reads what went up from `ok` (the worker appends; timed_state) and `sync_due`: a
     log sync after each success (and after the pre_cooldown submit, save_full), which the loop runs, never this thread.
-    Timed uploads are never awaited: the end phase and the failure path cancel the queued ones (abandon(0))."""
+    Timed uploads are never awaited - the end phase and the failure path cancel the queued ones (abandon(0)) - except
+    by save_full's trainer-only rewrite of the same step's dir, for at most UPLOAD_WAIT_S (the pointer must name the
+    bytes the upload commits)."""
 
     def __init__(self, api, repo: str, run_id: str, log, retries=None):
         from kitsune import scratch
@@ -1217,7 +1225,15 @@ class ScratchUploader(Uploader):
         self.ok: list[dict] = []  # {name, step, time_utc} of every upload that went up in this launch (worker thread)
         self.seen = 0  # how many of them the loop has put into st["timed"]
         self.sync_due = threading.Event()
-        self.skipped_at: int | None = None  # the due window (st["last_timed_step"]) whose busy skip was logged
+        # the busy skip last logged: (st["last_timed_step"], the due window since it); timed_state logs one per window
+        self.skipped_at: tuple[int, int] | None = None
+        self.running: tuple[str, float] | None = None  # (name, time.monotonic() at its start) of the upload under way
+
+    def running_s(self) -> float | None:
+        """How long the upload under way has run (None: none): a hung one (xet transfers have no timeout) keeps
+        growing in the loop's timed_state_skipped events."""
+        run = self.running  # one read: the worker replaces the tuple
+        return None if run is None else round(time.monotonic() - run[1], 1)
 
     def submit(self, local: Path, name: str, meta: dict | None = None) -> Future | None:
         """Queue the upload of the full state `local` (checkpoints/<name>/); meta: make_pointer's keyword arguments."""
@@ -1235,6 +1251,7 @@ class ScratchUploader(Uploader):
         from kitsune import scratch
 
         local, ok, ptr = Path(local), False, None
+        self.running = (name, time.monotonic())
         try:
             ptr = scratch.make_pointer(self.run_id, local, **self.meta.pop(local, {}))
             ok = bool(scratch.upload_state(self.api, self.repo, self.run_id, local, ptr, log=self.log,
@@ -1245,6 +1262,7 @@ class ScratchUploader(Uploader):
                            error=f"{type(e).__name__}: {e}"[:2000])
         finally:
             self._unmark(local)
+            self.running = None
         if ok:
             m = FULL_RE.match(local.name)
             for p in local.parent.iterdir():
@@ -3149,8 +3167,12 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False, keep: bool =
     ckpt.full_at_fracs state, which rotation never deletes (st["fulls_kept"], in its own trainer.pt too). With the
     aux-CTC head, its weights go in as aux_ctc.pt (and only here). scratch: a timed state (TIMED_REASON) for the
     scratch repo, which the caller submits to R.scratch: the dir carries SCRATCH_MARK from its creation (renamed in
-    with it), or gets it when this step's state already exists (the same-step skip: the weights are the same). trainer.pt
-    and trainer.json name the saving host (kitsune.scratch.host_info), which a resume compares with its own."""
+    with it), or gets it when this step's state already exists (the same-step skip: the weights are the same, and only
+    trainer.pt/.json are rewritten, so the state records its reason and the timed cadence the caller just set: a
+    resume from it is not due at once). In a run with timed states a pre_cooldown state at the step of an existing one
+    is rewritten the same way (the full-run queue's reset picks the runs repo's state whose trainer.json says
+    "pre_cooldown", and its smoke check reads the checkpoint event). trainer.pt and trainer.json name the saving host
+    (kitsune.scratch.host_info), which a resume compares with its own."""
     from kitsune.scratch import host_info
 
     name = f"full_step_{step}"
@@ -3159,6 +3181,8 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False, keep: bool =
     newly_kept = keep and name not in R.st.setdefault("fulls_kept", [])
     if newly_kept:
         R.st["fulls_kept"].append(name)
+    # the same-step rewrites of the full runs (a run with a scratch uploader); off elsewhere, as before them
+    restate = scratch or (reason == "pre_cooldown" and getattr(R, "scratch", None) is not None)
 
     def trainer_state():
         st = copy.deepcopy(R.st)
@@ -3195,10 +3219,11 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False, keep: bool =
         R.log.event("checkpoint", ckpt="full", name=name, reason=reason, save_s=round(time.time() - t0, 1),
                     gb=round(sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) / 1e9, 3),
                     disk_free_gb=_disk_free_gb(d))
-    elif reason == "end" or newly_kept:
+    elif reason == "end" or newly_kept or restate:
         # a periodic/after-smoke full state already holds this step's weights and optimizer, but its trainer state
-        # predates the stop (early_stop.stop / triggered), or its becoming a kept fraction state (st["fulls_kept"]);
-        # rewrite only trainer.pt/.json so a resume ends the run, or keeps the state.
+        # predates the stop (early_stop.stop / triggered), or its becoming a kept fraction state (st["fulls_kept"]),
+        # a timed state (st["last_timed_*"]) or the pre_cooldown one (st["pre_cooldown_done"] / ["pre_cooldown_full"]);
+        # rewrite only trainer.pt/.json so a resume ends the run, keeps the state, or knows what the state is.
         # The pre_cooldown upload of this very dir may still be pending (the loop ended at its step: a STOP file and
         # a skipped step): one not started yet is cancelled and queued again after the rewrite, a running one gets up
         # to UPLOAD_WAIT_S to finish first, so it does not commit one trainer.pt's size with the other's hash
@@ -3207,10 +3232,13 @@ def save_full(R: Run, step: int, reason: str, upload: bool = False, keep: bool =
             upload = True
         elif fut is not None:
             concurrent.futures.wait([fut], timeout=UPLOAD_WAIT_S)  # not .result(): its error is the Uploader's to log
-        # the same for a timed upload of this dir (a timed state saved at the loop's last step; the end phase has
-        # cancelled a queued one): its pointer hashed the old trainer.pt, and must name the bytes it commits
+        # the same for a timed upload of this dir (a timed state saved at the loop's last step, or at the step the
+        # pre_cooldown state falls on): its pointer hashed the old trainer.pt, and must name the bytes it commits. The
+        # end phase has cancelled a queued one (abandon_timed); before it a queued one is waited for too (a cancel
+        # would drop the state from the scratch repo). The only wait for a timed upload, and a rare one: the step's
+        # timed save and the cooldown's start (or the run's end) must coincide
         sfut = getattr(getattr(R, "scratch", None), "pending", {}).get(d)
-        if sfut is not None and not sfut.cancel():
+        if sfut is not None and not (reason == "end" and sfut.cancel()):
             concurrent.futures.wait([sfut], timeout=UPLOAD_WAIT_S)
         trainer, brief, _ = trainer_state()
         for fname, write in (("trainer.pt", lambda f: torch.save(trainer, f)),
@@ -3284,9 +3312,11 @@ def timed_state(R: Run, t: float, step: int):
     nothing): records the uploads that went up since the last step in st["timed"]; when a state is due (every N minutes
     of loop clock t) saves it (reason TIMED_REASON, SCRATCH_MARK; a timed save is a full state, so the periodic full
     cadence restarts from it too) and queues its upload, unless one is still running: then nothing is saved, one
-    `timed_state_skipped` says so, and the state goes as soon as the upload ends (never two ~9 GB uploads at once);
-    and runs the log sync a success or the pre_cooldown submit asked for (sync_due), once no sync is running - so the
-    Hub's logs are as fresh as the newest state a new host would resume from. Timed uploads are never awaited."""
+    `timed_state_skipped` per due window it misses says so (with the running upload's running_s: an upload that hangs
+    - xet transfers have no timeout - shows as a growing number every window, not as one early event), and the state
+    goes as soon as the upload ends (never two ~9 GB uploads at once); and runs the log sync a success or the
+    pre_cooldown submit asked for (sync_due), once no sync is running - so the Hub's logs are as fresh as the newest
+    state a new host would resume from. Timed uploads are never awaited (save_full's rare same-step rewrite aside)."""
     sc = getattr(R, "scratch", None)
     if sc is None:
         return
@@ -3295,10 +3325,12 @@ def timed_state(R: Run, t: float, step: int):
     every = R.cfg["ckpt"]["upload_full_every_min"]
     if every is not None and due(t, step, st["last_timed_t"], st["last_timed_step"], every, None):
         if sc.busy():
-            if sc.skipped_at != st["last_timed_step"]:  # once per due window
-                sc.skipped_at = st["last_timed_step"]
+            # the due windows since the last timed save (1: the first missed one); one event per window
+            window = (st["last_timed_step"], int((t - st["last_timed_t"]) // (float(every) * 60)))
+            if sc.skipped_at != window:
+                sc.skipped_at = window
                 R.log.event("timed_state_skipped", reason="busy", at_step=step,
-                            uploading=sorted(p.name for p in sc.busy()))
+                            uploading=sorted(p.name for p in sc.busy()), running_s=sc.running_s())
         else:
             st["last_timed_t"] = st["last_full_t"] = R.clock()  # set first: the state records itself
             st["last_timed_step"] = st["last_full_step"] = step
@@ -4209,7 +4241,9 @@ def train(R: Run, state: dict | None) -> int:
 
     step = R.st["step"]
     log.event("phase", name="end", at_step=step, train_s=round(R.clock(), 1))
-    abandon_timed(R)  # timed states are never awaited: the queued ones are cancelled, a running one goes on meanwhile
+    # timed states are not awaited: the queued ones are cancelled, a running one goes on meanwhile (the end save waits,
+    # UPLOAD_WAIT_S at most, only for one of its own step's dir, whose trainer.pt it rewrites)
+    abandon_timed(R)
     if lr_probe_on(cfg):
         return end_lr_probe(R, step)
     save_weights(R, step, "end")

@@ -5,8 +5,10 @@ event, 4e (scalars.parquet at close: tests/test_runlog.py) and fix 7 (the lean s
 - ScratchUploader: one upload at a time, SCRATCH_MARK gone when an upload ends (a failure too), older marks cleared on
   a success, UPLOAD_MARK never touched, create_repo never called; rotate_full keeps a dir while its timed upload runs
   and only the newest marked dir, so no marked dir leaks past rotation; the Uploader leaves SCRATCH_MARK behind
-- save_full(scratch=True): the mark renamed in with a new dir, touched in an existing same-step one; trainer.pt/.json
-  name the host
+- save_full(scratch=True): the mark renamed in with a new dir, touched in an existing same-step one whose trainer.pt/
+  .json are rewritten (reason and cadence; a pre_cooldown state at an existing step too, in a run with timed states,
+  after waiting for a timed upload of that dir); trainer.pt/.json name the host
+- a busy upload: one timed_state_skipped per missed due window, with the upload's running_s
 - build: a run asking for timed states with an output repo but no scratch repo is refused before its logger exists; no
   output repo: timed states skipped; the new-host guard refuses a state that records its host in a run dir without
   events.jsonl, before anything is written
@@ -250,34 +252,130 @@ def test_rotation_keeps_scratch_busy_dirs_and_only_the_newest_marked(tmp_path):
 
 def test_timed_saves_carry_the_mark_and_a_same_step_one_reuses_the_dir(tmp_path, monkeypatch):
     """save_full(scratch=True): SCRATCH_MARK renamed in with a new dir (never UPLOAD_MARK), touched in the existing dir
-    of the same step (no second save: the weights are the same); trainer.pt/.json name the host; a pre_cooldown submit
-    of a run with timed states asks the loop for a log sync."""
+    of the same step, whose weights are not saved again but whose trainer.pt/.json are rewritten (the state records
+    its reason and the timed cadence); trainer.pt/.json name the host; a pre_cooldown submit of a run with timed states
+    asks the loop for a log sync, and a pre_cooldown state at an existing step is rewritten in such a run only."""
     m = load_script("04_distill")
     monkeypatch.setenv("CONTAINER_ID", "c42")
     evs = []
     run = tmp_path / "runs" / "run"
     R = SimpleNamespace(cfg={"ckpt": {"keep_local": 5}}, run_dir=run, ckpt_dir=run / "checkpoints", st=dict(fulls=[]),
                         clock=lambda: 0.0, planner=SimpleNamespace(state_dict=dict),
-                        log=SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw.get("reason"))),
+                        log=SimpleNamespace(event=lambda kind, **kw: evs.append((kind, kw.get("reason"),
+                                                                                 kw.get("trainer_only"))),
                                             state_dict=dict),
                         model=torch.nn.Linear(1, 1), opt=SimpleNamespace(state_dict=dict),
-                        l2sp=SimpleNamespace(state_dict=dict), uploader=SimpleNamespace(repo=None, busy=set, pending={}))
+                        l2sp=SimpleNamespace(state_dict=dict),
+                        uploader=SimpleNamespace(repo=None, busy=set, pending={}))
     R.ckpt_dir.mkdir(parents=True)
+
+    def saved(d: Path) -> dict:
+        return torch.load(d / "trainer.pt", weights_only=False)
+
     d = m.save_full(R, 4, "periodic")
     assert not (d / m.SCRATCH_MARK).exists()
+    weights = (d / "model.pt").read_bytes()
+    R.st.update(last_timed_step=4, last_timed_t=7.0)  # timed_state sets these before its save
     assert m.save_full(R, 4, m.TIMED_REASON, scratch=True) == d
     assert (d / m.SCRATCH_MARK).exists() and not (d / m.UPLOAD_MARK).exists()
-    assert evs == [("checkpoint", "periodic")]  # the same-step skip saved nothing
+    assert evs == [("checkpoint", "periodic", None), ("checkpoint", "timed", True)]  # trainer.pt/.json only
+    assert (d / "model.pt").read_bytes() == weights
+    assert (saved(d)["reason"], saved(d)["st"]["last_timed_step"], saved(d)["st"]["last_timed_t"]) == ("timed", 4, 7.0)
+    assert json.loads((d / "trainer.json").read_text(encoding="utf-8"))["reason"] == "timed"
     d6 = m.save_full(R, 6, m.TIMED_REASON, scratch=True)
     assert (d6 / m.SCRATCH_MARK).exists() and not (d6 / m.UPLOAD_MARK).exists()
     brief = json.loads((d6 / "trainer.json").read_text(encoding="utf-8"))
     assert brief["reason"] == "timed" and brief["host"]["container_id"] == "c42"
-    assert torch.load(d6 / "trainer.pt", weights_only=False)["host"] == brief["host"]
+    assert saved(d6)["host"] == brief["host"]
 
-    R.uploader = SimpleNamespace(repo="u/r", busy=set, pending={}, submit=lambda d, n: evs.append(("submit", n)))
+    # a study run (no scratch uploader): a pre_cooldown state at an existing step is not rewritten, as before
+    evs.clear()
+    R.uploader = SimpleNamespace(repo="u/r", busy=set, pending={}, submit=lambda d, n: evs.append(("submit", n, None)))
+    m.save_full(R, 6, "pre_cooldown", upload=True)
+    assert evs == [("submit", "full_step_6", None)] and saved(d6)["reason"] == "timed"
+    # a run with timed states: rewritten, so the runs repo's trainer.json says pre_cooldown (full_queue's reset pick)
+    evs.clear()
     R.scratch = SimpleNamespace(sync_due=threading.Event(), busy=set, pending={})
+    R.st.update(pre_cooldown_done=True, pre_cooldown_full="full_step_6")
+    m.save_full(R, 6, "pre_cooldown", upload=True)
+    assert evs == [("checkpoint", "pre_cooldown", True), ("submit", "full_step_6", None)]
+    assert saved(d6)["reason"] == "pre_cooldown" and saved(d6)["st"]["pre_cooldown_done"] is True
+    assert json.loads((d6 / "trainer.json").read_text(encoding="utf-8"))["reason"] == "pre_cooldown"
+    assert R.scratch.sync_due.is_set() and (d6 / m.UPLOAD_MARK).exists()
+    R.scratch.sync_due.clear()
     m.save_full(R, 8, "pre_cooldown", upload=True)
-    assert R.scratch.sync_due.is_set() and ("submit", "full_step_8") in evs
+    assert R.scratch.sync_due.is_set() and ("submit", "full_step_8", None) in evs
+
+
+def test_a_same_step_rewrite_waits_for_the_timed_upload_of_its_dir(tmp_path):
+    """The cooldown starts at the step of a timed state whose upload is still running: the pre_cooldown rewrite of
+    trainer.pt waits for it, so the scratch repo gets exactly the bytes its pointer hashed (the timed trainer.pt) and
+    the runs repo the rewritten one."""
+    m = load_script("04_distill")
+    hub, log = ScratchHub(), Log()
+    hub.gate = threading.Event()
+    run = tmp_path / "runs" / "full-p01-20260927T120000Z"
+    R = SimpleNamespace(cfg={"ckpt": {"keep_local": 5}}, run_dir=run, ckpt_dir=run / "checkpoints", st=dict(fulls=[]),
+                        clock=lambda: 0.0, planner=SimpleNamespace(state_dict=dict), log=log,
+                        model=torch.nn.Linear(1, 1), opt=SimpleNamespace(state_dict=dict),
+                        l2sp=SimpleNamespace(state_dict=dict),
+                        uploader=SimpleNamespace(repo=None, busy=set, pending={}))
+    log.state_dict = dict
+    R.ckpt_dir.mkdir(parents=True)
+    R.scratch = m.ScratchUploader(hub, SCRATCH, run.name, log, retries=())
+    d = m.save_full(R, 12, m.TIMED_REASON, scratch=True)
+    timed_pt = (d / "trainer.pt").read_bytes()
+    R.scratch.submit(d, d.name, meta=meta(12))
+    deadline = time.monotonic() + 10
+    while R.scratch.running is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert R.scratch.running is not None and R.scratch.running_s() >= 0
+    threading.Timer(0.5, hub.gate.set).start()
+    t0 = time.monotonic()
+    try:
+        R.st.update(pre_cooldown_done=True, pre_cooldown_full=d.name)
+        m.save_full(R, 12, "pre_cooldown")
+        assert time.monotonic() - t0 >= 0.4  # it waited for the upload
+    finally:
+        hub.gate.set()
+    ptr = pointer(hub, run.name)
+    got = hub.files(SCRATCH)[f"{fullrun.scratch_state_dir(run.name, 12)}/trainer.pt"]
+    assert got == timed_pt and hashlib.sha256(got).hexdigest() == ptr["files"]["trainer.pt"]["sha256"]
+    assert torch.load(d / "trainer.pt", weights_only=False)["reason"] == "pre_cooldown"
+    assert R.scratch.running is None and not (d / m.SCRATCH_MARK).exists()
+    R.scratch.shutdown(5)
+
+
+def test_a_hung_upload_logs_one_skip_per_missed_window(tmp_path):
+    """While a timed upload hangs, every due window it makes the loop miss logs one timed_state_skipped with the
+    upload's growing running_s (not one event for the rest of the run); nothing is saved meanwhile."""
+    m = load_script("04_distill")
+    hub, log = ScratchHub(), Log()
+    hub.gate = threading.Event()
+    run = tmp_path / "runs" / "run"
+    sc = m.ScratchUploader(hub, SCRATCH, "run", log, retries=())
+    d = state_dir(run, 3, extra={m.SCRATCH_MARK: b""})
+    sc.submit(d, d.name, meta=meta(3))
+    deadline = time.monotonic() + 10
+    while sc.running is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    R = SimpleNamespace(scratch=sc, cfg={"ckpt": {"upload_full_every_min": 2}}, log=log,
+                        st=dict(m.st_timed_defaults(), last_timed_t=100.0, last_timed_step=3))
+    log.wait_sync = lambda timeout=None: True
+    try:
+        # due from t = 220 (every 2 min after 100): windows 1 (220, 300), 2 (340, 400), 3 (460)
+        for step, t in ((4, 150.0), (5, 220.0), (6, 300.0), (7, 340.0), (8, 400.0), (9, 460.0)):
+            m.timed_state(R, t, step)
+            time.sleep(0.02)
+        skips = [e for e in log.events if e["kind"] == "timed_state_skipped"]
+        assert [e["at_step"] for e in skips] == [5, 7, 9]
+        assert all(e["reason"] == "busy" and e["uploading"] == ["full_step_3"] for e in skips)
+        assert 0 <= skips[0]["running_s"] <= skips[1]["running_s"] <= skips[2]["running_s"]
+        assert (R.st["last_timed_step"], R.st["timed"]) == (3, None)  # nothing saved
+    finally:
+        hub.gate.set()
+    sc.shutdown(5)
+    assert sc.running is None and sc.running_s() is None
 
 
 def test_log_step_lean_rows_and_the_reserved_peak(tmp_path, monkeypatch):
@@ -473,7 +571,8 @@ def test_timed_states_go_to_the_scratch_repo_one_per_run(env, monkeypatch):
 
 def test_a_busy_upload_skips_the_due_states_without_saving(env, monkeypatch):
     """One upload at a time: while the first timed upload hangs, the states that fall due are not saved (one
-    timed_state_skipped); the end phase abandons the upload without waiting for it and the run still ends 0."""
+    timed_state_skipped per due window: every step here); the end phase abandons the upload without waiting for it and
+    the run still ends 0."""
     hub = ScratchHub()
     hub.gate = threading.Event()
     m = trainer(monkeypatch, hub)
@@ -485,7 +584,11 @@ def test_a_busy_upload_skips_the_due_states_without_saving(env, monkeypatch):
         assert len(first) == 1
         name = first[0]["name"]
         skipped = events(run, "timed_state_skipped")
-        assert len(skipped) == 1 and skipped[0]["reason"] == "busy" and skipped[0]["uploading"] == [name]
+        assert [e["at_step"] for e in skipped] == list(range(first[0]["step"] + 1, 11))
+        assert all(e["reason"] == "busy" and e["uploading"] == [name] for e in skipped)
+        # the hung upload's growing age (None only before the worker thread picked it up)
+        ages = [e["running_s"] for e in skipped if e["running_s"] is not None]
+        assert ages and ages == sorted(ages) and skipped[-1]["running_s"] is not None
         saved = [e["name"] for e in events(run, "checkpoint") if e["ckpt"] == "full" and e["reason"] == "timed"]
         assert saved == [name] and (run / "checkpoints" / name / m.SCRATCH_MARK).exists()
         assert [e["names"] for e in events(run, "timed_state_upload_abandoned")] == [[name]]
@@ -496,6 +599,39 @@ def test_a_busy_upload_skips_the_due_states_without_saving(env, monkeypatch):
         if th.name == "ckpt-upload":
             th.join(10)
     assert run_states(hub, run.name) == [name] and not (run / "checkpoints" / name / m.SCRATCH_MARK).exists()
+
+
+def test_a_timed_state_at_a_periodic_step_records_itself(env, monkeypatch):
+    """A timed state due at the step of a periodic full state (full_every_steps 1: every step here) reuses its dir and
+    rewrites only trainer.pt/.json, so each state the scratch repo gets says reason "timed" and has its own step as the
+    timed cadence's (a resume from it is not due at once). The pre_cooldown state at such a step is rewritten too: the
+    runs repo's trainer.json says pre_cooldown (full_queue's reset pick) and the checkpoint event names it."""
+    hub = ScratchHub()
+    uploaded = {}
+
+    def keep(sc, local):  # the trainer.pt each timed upload committed, read back from the scratch repo
+        step = int(local.name.split("_")[-1])
+        data = hub.files(SCRATCH)[f"{fullrun.scratch_state_dir(local.parent.parent.name, step)}/trainer.pt"]
+        uploaded[step] = torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
+
+    m = trainer(monkeypatch, hub, synchronous=True, after=keep)
+    assert m.main(["--config", write_config(env, "samestep", merged(TIMED, {"ckpt": {"full_every_steps": 1}}))]) == 0
+    run = one_run(env["root"], "samestep")
+    assert [e["step"] for e in events(run, "timed_state")] == sorted(uploaded) == list(range(1, 11))
+    full = [e for e in events(run, "checkpoint") if e["ckpt"] == "full"]
+    assert [(e["reason"], e.get("trainer_only", False)) for e in full if e["name"] == "full_step_3"] == [
+        ("periodic", False), ("timed", True)]  # one save of the weights, then the trainer files only
+    for step, tp in uploaded.items():
+        assert (tp["reason"], tp["step"], tp["st"]["last_timed_step"], tp["st"]["last_full_step"]) == (
+            "timed", step, step, step), step
+        assert tp["st"]["last_timed_t"] <= tp["st"]["train_s"]
+    pre = [e for e in full if e["reason"] == "pre_cooldown"]
+    assert [(e["name"], e.get("trainer_only")) for e in pre] == [("full_step_5", True)]
+    tj = json.loads(hub.files(RUNS)[f"runs/{run.name}/checkpoints/full_step_5/trainer.json"])
+    assert (tj["reason"], tj["st"]["pre_cooldown_done"], tj["st"]["pre_cooldown_full"]) == (
+        "pre_cooldown", True, "full_step_5")
+    assert "full_step_5" in [e["name"] for e in events(run, "ckpt_upload_ok")]
+    assert not list(run.rglob(m.SCRATCH_MARK))
 
 
 def test_a_new_host_resumes_from_the_scratch_state_and_the_hubs_older_logs(env, monkeypatch, tmp_path):
