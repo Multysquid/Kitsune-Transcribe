@@ -11,7 +11,9 @@ study/data.json, the study's settings; the queue fills max_steps, lr and the min
   2. the student's row of FULL_RUNS: the epochs clock (schedule.epochs 3/3/4/4, no max_steps), the study's warm-up,
      optim.lr, the micro-batch and the step audio (the study's REALISED audio per step at the new micro-batch,
      measured with tools/full_plan.py: FULL_RUNS' step values realise it within 0.01 % on full.parquet, PLAN_FILE),
-     eval.dev.greedy (the P students' argmax is free, T-0.6B's decode is not);
+     eval.dev.greedy (the P students' argmax is free, T-0.6B's decode is not), schedule.end_reserve_min (the
+     default 30; full-t06 55, so its 45 min M4 readout still starts after a run the deadline cooldown shortened:
+     READOUT_RESERVE);
   3. COMMON: the deadline cooldown (4d), the memory probe's extended passes and 50 OOM skips, the 5090's bf16 peak for
      the MFU, a complete eval every epoch and a mini eval every 2,000 steps, the dev slice (600 rows per source, seed
      1234) every 0.1 epoch, local full states every 30 min, the pre_cooldown state uploaded and a timed state to the
@@ -43,11 +45,13 @@ registry must carry (registry_numbers), which tests/test_full_configs.py checks:
 smoke train items', for smoke check 3), their plan_hours = plan v3's hours at the step count measured on full.parquet
 (PLAN_V3: hours x measured T / plan T, 2 decimals; also the full train items' max_hours until box 1's speed replaces
 them), and F4's seconds, the deadline fault of smoke-p005 (deadline_fault_s). After a rebuilt selection: tools/
-full_plan.py --json on full.parquet and on smoke.parquet, --import-plan with both, then the printed numbers into
-boxes.json by hand, then --check and the tests.
+full_plan.py --json on full.parquet and on smoke.parquet, --import-plan with both (it prints what boxes.json must be
+changed in), then those numbers into boxes.json by hand, then --check and the tests.
 
 configs/full/boxes.json, the box registry (kitsune/fullrun.py), is hand-written; --check validates it with
-fullrun.registry_problems (every data and item config present, its data keys equal to its box's data config's).
+fullrun.registry_problems (every data and item config present, its data keys equal to its box's data config's), checks
+that every readout of a full box fits in its run's end reserve (readout_reserve_problems) and that the numbers bound to
+the plan record equal it (registry_drift: smoke A's plan_total_steps / plan_hours, F4's seconds, box 1's train hours).
 
 Usage:
   python tools/make_full_configs.py                  # write configs/full/*.json (and remove stale generated ones)
@@ -80,17 +84,32 @@ STUDY_DATA = ROOT / "study" / "data.json"
 
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
-# eval.dev.greedy and whether the run pulls both label roots (full-p01: box 1 has the Parakeet labels only)
+# eval.dev.greedy, whether the run pulls both label roots (full-p01: box 1 has the Parakeet labels only) and
+# schedule.end_reserve_min (end_reserve: the trainer's default 30, full-t06 55; READOUT_RESERVE below)
 FULL_RUNS = {
     "t06": dict(study_run="study-t06", epochs=3, warmup=300, lr=2e-4, micro=450, step=1730, dev_greedy=False,
-                pull_parakeet=True),
+                pull_parakeet=True, end_reserve=55),
     "p03": dict(study_run="study-p03", epochs=3, warmup=300, lr=2e-4, micro=600, step=1350, dev_greedy=True,
-                pull_parakeet=True),
+                pull_parakeet=True, end_reserve=30),
     "p01": dict(study_run="study-p01", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
-                pull_parakeet=False),
+                pull_parakeet=False, end_reserve=30),
     "p005": dict(study_run="study-p005", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
-                 pull_parakeet=True),
+                 pull_parakeet=True, end_reserve=30),
 }
+# READOUT_RESERVE. A readout runs right after its training item on the same GPU (Resolution 25) under the same
+# KITSUNE_DEADLINE (kitsune.full_queue item_deadline: the box deadline less deadline_reserve_min). After a run that the
+# deadline cooldown (4d) shortened, 04_distill.fit_epochs_deadline has planned the end phase to finish
+# schedule.end_reserve_min before that deadline (plus the final eval's and the last dev eval's estimates), so the
+# readout gets what the trainer's final saves and uploads leave of the end reserve, and the no-start rule skips a
+# droppable readout whose max_hours need more (item_not_started): box 2 would lose T-0.6B's binding M4 and, through
+# their needs, its 7 quantised readouts and speed-full-t06. So every full run's end reserve holds its readout's
+# max_hours (boxes.json: m4-full-t06 0.75 h, the P readouts 0.3 h) + END_PHASE_SLACK_MIN of its own end phase and the
+# queue's hand-off [X]: t06 45 + 10 = 55 (the default 30 would leave about 28 min), the P runs 18 + 10 <= 30.
+# --check refuses a registry whose readout no longer fits (readout_reserve_problems), e.g. after the PR that refreshes
+# box full's hours from box 1. It costs only when 4d acts: the shortened run then trains 25 min less. Smoke boxes are
+# exempt: contract 7's 2 min smoke reserve is what lets F4 make 4d act within the smoke, and a smoke run that 4d
+# shortens without a fault is a late smoke.
+END_PHASE_SLACK_MIN = 10
 DEV_PER_SOURCE, DEV_SEED, SMOKE_DEV_PER_SOURCE = 600, 1234, 60
 COMMON = {
     "schedule": {"clock": "epochs", "max_steps": None, "deadline_cooldown": True},
@@ -223,6 +242,68 @@ def registry_numbers(plan: dict) -> dict:
                 deadline_fault_bound_s=round(deadline_fault_bound_s(plan), 2))
 
 
+# the registry's numbers that must always equal the plan record's (registry_drift): smoke A's train items (smoke check
+# 3's projection), F4's seconds and box 1's train hours. Box full's train hours start as the plan's too
+# (tests/test_full_configs.py test_box_2), but the PR after box 1 replaces them with box 1's measured speed (contract 7)
+PLAN_BOUND_BOXES = {"full-smoke": "smoke", "p01": "full"}
+
+
+def registry_drift(reg: dict, plan: dict) -> list[str]:
+    """Where a loaded registry's plan-bound numbers (PLAN_BOUND_BOXES) differ from registry_numbers(plan): after
+    --import-plan of a rebuilt selection, what boxes.json must be changed in by hand."""
+    nums, p = registry_numbers(plan), []
+    boxes = reg.get("boxes") or {}
+    for box, prefix in PLAN_BOUND_BOXES.items():
+        if box not in boxes:
+            continue
+        items = {it["name"]: it for it in boxes[box].get("items") or []}
+        for x, want in nums["students"].items():
+            it = items.get(f"{prefix}-{x}")
+            if it is None:
+                continue
+            got = ({"plan_total_steps": it.get("plan_total_steps"), "plan_hours": it.get("plan_hours")}
+                   if prefix == "smoke" else {"max_hours": it.get("max_hours")})
+            exp = dict(want) if prefix == "smoke" else {"max_hours": want["plan_hours"]}
+            if got != exp:
+                p.append(f"boxes.{box}.items.{it['name']}: {got}, the plan record gives {exp}")
+        for f in boxes[box].get("faults") or []:
+            if f.get("action") == "deadline" and f.get("item") == DEADLINE_FAULT_ITEM \
+                    and f.get("seconds") != nums["deadline_fault_s"]:
+                p.append(f"boxes.{box}.faults.{f.get('id')}: seconds {f.get('seconds')}, the plan record gives "
+                         f"{nums['deadline_fault_s']} (bound {nums['deadline_fault_bound_s']} s)")
+    return p
+
+
+def readout_reserve_problems(reg: dict, root: Path) -> list[str]:
+    """Every readout of a plain non-smoke box of a loaded registry whose max_hours + END_PHASE_SLACK_MIN exceed its
+    run's schedule.end_reserve_min (the config under root): after a run that 4d shortened, the no-start rule would
+    skip it (READOUT_RESERVE). A chained box (contract addendum E) has no items of its own: its parts are checked."""
+    p = []
+    for bname, box in (reg.get("boxes") or {}).items():
+        if box.get("smoke") or "chain" in box:
+            continue
+        items = {it["name"]: it for it in box.get("items") or []}
+        for it in items.values():
+            run = items.get(it.get("of"))
+            if it["kind"] != "readout" or not it.get("max_hours") or run is None:
+                continue
+            try:
+                reserve = json.loads((Path(root) / run["config"]).read_text(encoding="utf-8"))["schedule"][
+                    "end_reserve_min"]
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                p.append(f"boxes.{bname}.items.{it['name']}: no schedule.end_reserve_min in {run['config']} "
+                         f"({type(e).__name__})")
+                continue
+            need = float(it["max_hours"]) * 60 + END_PHASE_SLACK_MIN
+            if float(reserve) < need:
+                p.append(f"boxes.{bname}.items.{it['name']}: max_hours {it['max_hours']} "
+                         f"({float(it['max_hours']) * 60:g} min) + {END_PHASE_SLACK_MIN} min of the trainer's end "
+                         f"phase exceed {run['config']}'s schedule.end_reserve_min {reserve}: after a run the "
+                         f"deadline cooldown shortened, the no-start rule would skip the readout (make_full_configs "
+                         f"READOUT_RESERVE)")
+    return p
+
+
 # ------------------------------------------------------------------------------------------------ the configs
 
 
@@ -260,7 +341,7 @@ def full_config(x: str, r: dict | None = None) -> dict:
     cfg = study._merge(cfg, COMMON)
     return study._merge(cfg, {
         "run_name": f"full-{x}",
-        "schedule": {"epochs": run["epochs"], "warmup_steps": run["warmup"]},
+        "schedule": {"epochs": run["epochs"], "warmup_steps": run["warmup"], "end_reserve_min": run["end_reserve"]},
         "optim": {"lr": run["lr"]},
         "batch": {"micro_audio_s": run["micro"], "step_audio_s": run["step"]},
         "eval": {"dev": {"greedy": run["dev_greedy"]}},
@@ -309,9 +390,10 @@ def data_configs() -> dict[str, dict]:
     }
 
 
-def all_configs(out_dir: Path = OUT_DIR, r: dict | None = None) -> dict[str, dict]:
-    """name -> config for every generated file under configs/full/ (PlanError without a valid PLAN_FILE)."""
-    plan = load_plan(out_dir)
+def all_configs(out_dir: Path = OUT_DIR, r: dict | None = None, plan: dict | None = None) -> dict[str, dict]:
+    """name -> config for every generated file under configs/full/ (PlanError without a valid PLAN_FILE; plan: the
+    record already loaded)."""
+    plan = plan if plan is not None else load_plan(out_dir)
     out = {f"full-{x}": full_config(x, r) for x in FULL_RUNS}
     out.update({f"smoke-{x}": smoke_config(x, plan, r) for x in FULL_RUNS})
     out.update(data_configs())
@@ -340,9 +422,10 @@ def write_all(out_dir: Path = OUT_DIR) -> tuple[list[str], list[str]]:
     return sorted(cfgs), stale
 
 
-def registry_check(out_dir: Path = OUT_DIR) -> list[str]:
+def registry_check(out_dir: Path = OUT_DIR, plan: dict | None = None) -> list[str]:
     """fullrun.registry_problems of out_dir/boxes.json, its config paths resolved in the checkout out_dir belongs to
-    (<X> for <X>/configs/full)."""
+    (<X> for <X>/configs/full); for a valid registry also readout_reserve_problems and, given the plan record,
+    registry_drift."""
     f = Path(out_dir) / BOXES
     if not f.is_file():
         return [f"{BOXES}: missing (the box registry is hand-written next to the generated configs)"]
@@ -351,15 +434,21 @@ def registry_check(out_dir: Path = OUT_DIR) -> list[str]:
     except (OSError, ValueError) as e:
         return [f"{BOXES}: not readable JSON ({type(e).__name__}: {e})"]
     root = Path(out_dir).resolve().parents[1]
-    return [f"{BOXES}: {p}" for p in fullrun.registry_problems(reg, root=root)]
+    if problems := fullrun.registry_problems(reg, root=root):
+        return [f"{BOXES}: {p}" for p in problems]
+    reg = fullrun.load_registry(reg, root=root, check_files=False)
+    problems = readout_reserve_problems(reg, root) + (registry_drift(reg, plan) if plan is not None else [])
+    return [f"{BOXES}: {p}" for p in problems]
 
 
 def check(out_dir: Path = OUT_DIR) -> list[str]:
     """The differences between the files in out_dir and the generator's output (parsed JSON, so a CRLF checkout
-    compares equal), and every problem of the hand-written registry (fullrun.registry_problems)."""
+    compares equal), and every problem of the hand-written registry (registry_check: fullrun.registry_problems, the
+    readouts' end reserve and the numbers bound to the plan record)."""
     out_dir = Path(out_dir)
     try:
-        cfgs = all_configs(out_dir)
+        plan = load_plan(out_dir)
+        cfgs = all_configs(out_dir, plan=plan)
     except PlanError as e:
         return [str(e)] + registry_check(out_dir)
     problems = []
@@ -370,7 +459,7 @@ def check(out_dir: Path = OUT_DIR) -> list[str]:
         elif json.loads(p.read_text(encoding="utf-8")) != json.loads(render(cfg)):
             problems.append(f"{p.name}: differs from the generator's")
     problems += [f"{p.name}: not made by the generator" for p in _generated(out_dir) if p.stem not in cfgs]
-    return problems + registry_check(out_dir)
+    return problems + registry_check(out_dir, plan)
 
 
 def import_plan(full_json: Path, smoke_json: Path, out_dir: Path = OUT_DIR) -> dict:
@@ -413,6 +502,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{out_dir}: " + ("up to date" if not problems else f"{len(problems)} problem(s)")
               + "".join(f"\n  {p}" for p in problems))
         return 1 if problems else 0
+    plan = None
     try:
         if args.import_plan:
             plan = import_plan(Path(args.import_plan[0]), Path(args.import_plan[1]), out_dir)
@@ -426,6 +516,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"refused: {e}", file=sys.stderr)
         return 1
     print(f"wrote {len(written)} configs to {out_dir}" + (f"; removed {removed}" if removed else ""))
+    if plan is not None:  # what the hand-written registry must now be changed in (--check fails until it is)
+        todo = registry_check(out_dir, plan)
+        print(f"{BOXES}: " + ("carries the plan record's numbers" if not todo else f"{len(todo)} change(s) by hand")
+              + "".join(f"\n  {p}" for p in todo))
     return 0
 
 

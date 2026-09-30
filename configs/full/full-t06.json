@@ -45,7 +45,7 @@
   "train_hours": 4.0,
   "clock": "epochs",
   "max_steps": null,
-  "end_reserve_min": 30,
+  "end_reserve_min": 55,
   "epochs": 3,
   "deadline_cooldown": true
  },

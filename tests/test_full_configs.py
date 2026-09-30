@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -121,6 +122,47 @@ def test_check_reports_differences_stale_files_and_registry_problems(tmp_path, c
     assert any("boxes.json: missing" in x for x in M.check(out))
 
 
+def test_check_holds_the_plan_numbers_and_the_readout_reserve(tmp_path):
+    """--check also refuses a valid registry whose plan-bound numbers differ from the plan record's (registry_drift:
+    smoke A's plan_total_steps / plan_hours, F4's seconds, box 1's train hours; box full's train hours are not held,
+    the PR after box 1 refreshes them), or whose readout of a full box does not fit in its run's end reserve
+    (readout_reserve_problems; smoke boxes are exempt)."""
+    out = repo_copy(tmp_path)
+    reg = json.loads((out / "boxes.json").read_text(encoding="utf-8"))
+
+    def item(box, name):
+        return next(it for it in reg["boxes"][box]["items"] if it["name"] == name)
+
+    item("full-smoke", "smoke-t06")["plan_total_steps"] = 73452
+    item("full-smoke", "smoke-p005")["plan_hours"] = 9.92
+    next(f for f in reg["boxes"]["full-smoke"]["faults"] if f["id"] == "F4")["seconds"] = 140
+    item("p01", "full-p01")["max_hours"] = 13.56
+    item("full", "full-t06")["max_hours"] = 30.5  # box 1's refresh: not the plan's, and not refused
+    item("full", "m4-full-p03")["max_hours"] = 0.4  # 24 + 10 min > full-p03's 30
+    item("full-smoke", "m4-smoke-p03")["max_hours"] = 0.4  # smoke-p03's 2 min: exempt
+    (out / "boxes.json").write_text(json.dumps(reg), encoding="utf-8")
+    probs = M.check(out)
+    want = ["boxes.full-smoke.items.smoke-t06: {'plan_total_steps': 73452, 'plan_hours': 34.47}, the plan record "
+            "gives {'plan_total_steps': 71946, 'plan_hours': 34.47}",
+            "boxes.full-smoke.items.smoke-p005: {'plan_total_steps': 107910, 'plan_hours': 9.92}, the plan record "
+            "gives {'plan_total_steps': 107910, 'plan_hours': 9.69}",
+            "boxes.full-smoke.faults.F4: seconds 140, the plan record gives 150 (bound 151.05 s)",
+            "boxes.p01.items.full-p01: {'max_hours': 13.56}, the plan record gives {'max_hours': 13.24}",
+            "boxes.full.items.m4-full-p03: max_hours 0.4 (24 min) + 10 min of the trainer's end phase exceed "
+            "configs/full/full-p03.json's schedule.end_reserve_min 30"]
+    assert len(probs) == len(want) and all(any(p.startswith(f"boxes.json: {w}") for p in probs) for w in want), probs
+    # the trainer's default end reserve on full-t06 (contract 7 as written): its 45 min readout no longer fits
+    shutil.copyfile(FULL / "boxes.json", out / "boxes.json")
+    c = cfg("full-t06")
+    c["schedule"]["end_reserve_min"] = 30
+    (out / "full-t06.json").write_text(json.dumps(c), encoding="utf-8")
+    assert sorted(M.check(out)) == sorted([
+        "full-t06.json: differs from the generator's",
+        "boxes.json: boxes.full.items.m4-full-t06: max_hours 0.75 (45 min) + 10 min of the trainer's end phase exceed "
+        "configs/full/full-t06.json's schedule.end_reserve_min 30: after a run the deadline cooldown shortened, the "
+        "no-start rule would skip the readout (make_full_configs READOUT_RESERVE)"])
+
+
 def test_write_all_keeps_the_hand_written_files(tmp_path):
     """write_all rewrites the generated files byte for byte and removes a stale one, never boxes.json or the plan."""
     out = repo_copy(tmp_path)
@@ -152,7 +194,8 @@ def test_every_config_loads_with_the_trainer(trainer, reg):
 # the keys a full config may differ in from its study run's config (make_study_configs.run_config): contract 7's
 # table; smoke configs also SMOKE_ONLY. Data keys are compared whole (DATA_KEYS).
 FULL_KEYS = {"run_name", "schedule.clock", "schedule.epochs", "schedule.max_steps", "schedule.warmup_steps",
-             "schedule.deadline_cooldown", "optim.lr", "batch.micro_audio_s", "batch.step_audio_s",
+             "schedule.deadline_cooldown", "schedule.end_reserve_min", "optim.lr", "batch.micro_audio_s",
+             "batch.step_audio_s",
              "memory.max_oom_skips", "memory.probe_extended", "perf.peak_tflops", "eval.every_min", "eval.every_steps",
              "eval.full_every_epochs", "eval.full_at_fracs", "eval.mini.every_steps",
              *(f"eval.dev.{k}" for k in ("every_epochs", "every_steps", "per_source", "seed", "greedy", "at_start",
@@ -162,8 +205,8 @@ FULL_KEYS = {"run_name", "schedule.clock", "schedule.epochs", "schedule.max_step
              "log.full_scalars_every_steps", "log.scalars_parquet", "hf.output_repo", "hf.scratch_repo",
              *(f"early_stop.{k}" for k in ("enabled", "metric", "patience", "min_delta_rel", "min_delta_abs",
                                            "min_evals", "floor", "action", "smooth", "allow_test_sets"))}
-SMOKE_ONLY = {"eval.final_full_greedy", "eval.greedy_subset", "schedule.end_reserve_min",
-              "schedule.deadline_check_steps", "schedule.deadline_window_steps", "memory.probe_shapes"}
+SMOKE_ONLY = {"eval.final_full_greedy", "eval.greedy_subset", "schedule.deadline_check_steps",
+              "schedule.deadline_window_steps", "memory.probe_shapes"}
 
 
 @pytest.mark.parametrize("x", STUDENTS)
@@ -185,16 +228,18 @@ def test_a_config_is_its_study_run_but_for_the_contract_keys(x):
 
 
 def test_the_section_7_table():
-    want = {"t06": (3, 300, 2e-4, 450, 1730, False), "p03": (3, 300, 2e-4, 600, 1350, True),
-            "p01": (4, 1000, 1e-3, 1600, 1500, True), "p005": (4, 1000, 1e-3, 1600, 1500, True)}
-    for x, (epochs, warmup, lr, micro, step, greedy) in want.items():
+    """Contract 7's table, and the end reserve: the trainer's default 30 min but full-t06's 55 (READOUT_RESERVE, a
+    deviation from contract 7 that test_a_readout_starts_after_a_shortened_run explains)."""
+    want = {"t06": (3, 300, 2e-4, 450, 1730, False, 55), "p03": (3, 300, 2e-4, 600, 1350, True, 30),
+            "p01": (4, 1000, 1e-3, 1600, 1500, True, 30), "p005": (4, 1000, 1e-3, 1600, 1500, True, 30)}
+    for x, (epochs, warmup, lr, micro, step, greedy, reserve) in want.items():
         c = cfg(f"full-{x}")
         assert (c["schedule"]["epochs"], c["schedule"]["warmup_steps"], c["optim"]["lr"], c["batch"]["micro_audio_s"],
                 c["batch"]["step_audio_s"], c["eval"]["dev"]["greedy"]) == (epochs, warmup, lr, micro, step, greedy), x
         assert warmup == prereg.rules()["runs"][f"study-{x}"]["warmup_steps"]  # the study's warm-up
         assert c["schedule"] | {"epochs": 0, "warmup_steps": 0} == {
             "warmup_steps": 0, "cooldown_frac": 0.2, "train_hours": 4.0, "clock": "epochs", "max_steps": None,
-            "end_reserve_min": 30, "epochs": 0, "deadline_cooldown": True}
+            "end_reserve_min": reserve, "epochs": 0, "deadline_cooldown": True}
         assert c["memory"]["max_oom_skips"] == 50 and c["memory"]["probe_extended"] is True
         assert "probe_shapes" not in c["memory"]  # the trainer's default null: the full runs probe their own data
         assert c["perf"]["peak_tflops"] == 209.5
@@ -347,8 +392,19 @@ def test_import_plan(tmp_path, plan, capsys):
     assert M.main(["--out-dir", str(out), "--import-plan", str(src["full"]), str(src["smoke"])]) == 0
     printed = capsys.readouterr().out
     assert "t06 plan_total_steps 71946 plan_hours 34.47" in printed and "F4 seconds 150" in printed
+    assert "boxes.json: carries the plan record's numbers" in printed
     assert json.loads((out / M.PLAN_FILE).read_text(encoding="utf-8")) == json.loads(before)
     assert M.check(out) == []
+    # a measurement the registry does not carry yet: recorded, the change printed, --check fails until boxes.json has it
+    moved = json.loads(src["smoke"].read_text(encoding="utf-8"))
+    moved["students"]["p005"]["total_steps"] = 1200  # F4's bound 0.5 x 1200 x 0.3231 s = 193.9 s
+    src["smoke"].write_text(json.dumps(moved), encoding="utf-8")
+    assert M.main(["--out-dir", str(out), "--import-plan", str(src["full"]), str(src["smoke"])]) == 0
+    printed = capsys.readouterr().out
+    assert "F4 seconds 190" in printed and "boxes.json: 1 change(s) by hand" in printed
+    assert "boxes.full-smoke.faults.F4: seconds 150, the plan record gives 190 (bound 193.86 s)" in printed
+    assert M.check(out) == ["boxes.json: boxes.full-smoke.faults.F4: seconds 150, the plan record gives 190 (bound "
+                            "193.86 s)"]
     bad = json.loads(src["full"].read_text(encoding="utf-8"))
     bad["students"]["p03"]["step_audio_s"] = 1200.0
     src["full"].write_text(json.dumps(bad), encoding="utf-8")
@@ -417,15 +473,54 @@ def test_the_registry_loads_with_its_boxes(reg, monkeypatch):
             assert not any("{state}" in t for t in templates), (box, it["name"])
 
 
-def test_box_1(reg):
+def test_box_1(reg, plan):
     it = items(reg, "p01")
     assert list(it) == ["stores-ctc", "full-p01", "m4-full-p01"]
     assert it["stores-ctc"]["config"] == it["full-p01"]["config"] == "configs/full/full-p01.json"
     t = it["full-p01"]
+    # the run's hours: plan v3's at the step count measured on full.parquet (the plan record; --check holds it too)
     assert (t["kind"], t["study_run"], t["family"], t["max_hours"], t["needs"], t["droppable"], t["stall_min"],
-            t["plan_total_steps"]) == ("train", "study-p01", "ctc", 13.24, ["stores-ctc"], False, 45, None)
+            t["plan_total_steps"]) == ("train", "study-p01", "ctc", M.registry_numbers(plan)["students"]["p01"][
+                "plan_hours"], ["stores-ctc"], False, 45, None)
+    assert t["max_hours"] == 13.24
     assert (it["m4-full-p01"]["of"], it["m4-full-p01"]["max_hours"], it["m4-full-p01"]["needs"]) == (
         "full-p01", 0.3, ["full-p01"])
+
+
+@pytest.mark.parametrize("box", ["p01", "full"])
+def test_a_readout_starts_after_a_shortened_run(tmp_path, reg, box):
+    """A readout runs right after its run, and the run's KITSUNE_DEADLINE (full_queue.item_deadline) is the one the
+    trainer's deadline cooldown (4d) plans against: 04_distill.fit_epochs_deadline ends a shortened run's end phase
+    schedule.end_reserve_min before it, and the readout gets what the trainer's final saves and uploads leave of that.
+    Here, on the real queue, for every readout of a full box: the trainer's end phase used all of END_PHASE_SLACK_MIN
+    but a minute, and the no-start rule still starts the readout. With contract 7's default 30 min on full-t06, the
+    rule tested against item_deadline left m4-full-t06 (0.75 h) about 28 min and skipped it, and every quantised
+    readout and the speed re-time that need it with it: full-t06's end reserve is 55 min (make_full_configs
+    READOUT_RESERVE). A no-start rule that gives a readout more room than item_deadline passes this too."""
+    from kitsune import full_queue as F
+
+    spec, its = fullrun.box_spec(box, reg), items(reg, box)
+    readouts = [n for n, it in its.items() if it["kind"] == "readout"]
+    assert readouts
+    for n in readouts:
+        r = its[n]
+        reserve = cfg(Path(its[r["of"]]["config"]).stem)["schedule"]["end_reserve_min"]
+        assert reserve >= r["max_hours"] * 60 + M.END_PHASE_SLACK_MIN, n
+        assert box != "full" or n != "m4-full-t06" or r["max_hours"] * 60 + M.END_PHASE_SLACK_MIN > 30
+        state = tmp_path / n
+        state.mkdir()
+        left = (reserve - M.END_PHASE_SLACK_MIN + 1) * 60  # at the readout's start, before the run's KITSUNE_DEADLINE
+        (state / fullrun.DEADLINE_FILE).write_text(str(time.time() + spec["deadline_reserve_min"] * 60 + left))
+        s = F.FullSettings(root=tmp_path, state_dir=state, gpus=[str(i) for i in range(spec["gpus"])], n_gpus=None,
+                           python="python", out_repo=None, scratch_repo=None, uploader=None, machine_id=None,
+                           proc_root=tmp_path / "no-proc", cgroup=tmp_path / "no-cgroup")
+        q = F.FullQueue(box, s, registry=reg)
+        q.register()
+        rd = f"runs/{r['of']}-20261001T000000Z"
+        q.item(r["of"]).update(status="done", run_dir=rd, result=dict(steps=100))
+        (tmp_path / rd / "checkpoints" / "step_100").mkdir(parents=True, exist_ok=True)
+        assert q._prepare(n) is True and q.item(n)["status"] == "pending", n
+        assert n not in q.state["no_start"], n
 
 
 def quant_argv(fmt: str, config="{config}", ckpt="{ckpt}") -> list[str]:
@@ -439,7 +534,7 @@ def whisper_argv(key: str, *extra: str) -> list[str]:
             "--max-temp", "0", *extra]
 
 
-def test_box_2(reg):
+def test_box_2(reg, plan):
     it = items(reg, "full")
     quant = {x: [f"quant-{f}-full-{x}" for f in QUANT_FORMATS] for x in ("p03", "p005", "p01", "t06")}
     assert list(it) == ["stores-ctc", "stores-aed", "full-t06", "full-p03", "full-p005", "m4-full-t06", "m4-full-p03",
@@ -447,11 +542,16 @@ def test_box_2(reg):
                         "speed-full-t06", "speed-study-t06"]
     assert (it["stores-ctc"]["config"], it["stores-aed"]["config"], it["stores-aed"]["needs"]) == (
         "configs/full/full-p03.json", "configs/full/full-t06.json", ["stores-ctc"])
+    # the train hours are the plan record's until the PR after box 1 refreshes them from box 1's measured speed
+    # (contract 7); that PR replaces the plan_hours here with its own numbers (--check does not hold box full's)
+    nums = M.registry_numbers(plan)["students"]
     for x, h, st, drop in (("t06", 34.47, "stores-aed", False), ("p03", 21.53, "stores-ctc", False),
                            ("p005", 9.69, "stores-ctc", True)):
         t = it[f"full-{x}"]
         assert (t["config"], t["study_run"], t["family"], t["max_hours"], t["needs"], t["droppable"]) == (
-            f"configs/full/full-{x}.json", f"study-{x}", "aed" if x == "t06" else "ctc", h, [st], drop), x
+            f"configs/full/full-{x}.json", f"study-{x}", "aed" if x == "t06" else "ctc", nums[x]["plan_hours"], [st],
+            drop), x
+        assert t["max_hours"] == h, x
         assert it[f"m4-full-{x}"]["max_hours"] == (0.75 if x == "t06" else 0.3)
     for x, names in quant.items():
         for f, n in zip(QUANT_FORMATS, names):
