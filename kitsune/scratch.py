@@ -15,10 +15,11 @@ that repo is enough. Layout (kitsune.fullrun, contract 1.2 / 2.4), exactly one s
                                           (marker files never), hashed; fullrun.pointer_problems(pointer) == []
   upload_state(api, repo, run_id, local_dir, pointer, *, log, retries)   ONE create_commit that adds the state's files
                                           and the pointer and deletes every other runs/<run_id>/checkpoints/full_step_*
-                                          folder (found with list_repo_tree: a run resumed on a new host does not know
-                                          the old step), then super_squash_history, so the repo keeps one commit and
-                                          the replaced states' storage is freed. A commit is atomic: the pointer and
-                                          the files it names change together. Retried on the Hub's transient answers
+                                          folder (found with list_repo_tree, bounded by LIST_TIMEOUT_S: a run resumed
+                                          on a new host does not know the old step), then super_squash_history, so the
+                                          repo keeps one commit and the replaced states' storage is freed. A commit is
+                                          atomic: the pointer and the files it names change together. Retried on the
+                                          Hub's transient answers
                                           (RETRY_STATUS and 5xx, and errors without a status: a dropped connection)
                                           after RETRY_S; box 2's two trainers commit and squash the same repo, so a
                                           409/412 from a squash racing a commit is expected. A failed squash is
@@ -41,6 +42,7 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -49,6 +51,10 @@ from kitsune import fullrun
 
 RETRY_S = (15, 60, 180, 600)  # seconds before each retry of an upload (4 retries: ~14 min in all)
 RETRY_STATUS = (408, 409, 412, 429)  # the Hub's transient answers, retried; so is every 5xx
+# the bound on the listing of a run's previous states: huggingface_hub (1.23) passes timeout=None to list_repo_tree
+# itself, so the trainer's client timeout (bound_hub_http) does not cover it, and a request the Hub never answers would
+# hold the scratch thread (and every later timed state) for the rest of the run
+LIST_TIMEOUT_S = 300
 _FULL_RE = re.compile(r"^full_step_(\d+)$")  # scripts/04_distill.py FULL_RE
 _HASH_CHUNK = 8 << 20
 _code_sha: dict[str, str | None] = {}  # checkout -> git HEAD (one subprocess per process)
@@ -152,13 +158,36 @@ def make_pointer(run_id: str, local_dir, *, step: int, epoch: float, planner_fin
 # ------------------------------------------------------------------------------------------------------ the upload
 
 
+def _bounded(fn, timeout_s: float, what: str):
+    """fn() in a daemon thread, waited for at most timeout_s: TimeoutError (retryable: a new attempt) when it has not
+    returned by then. The thread, blocked in a request the Hub never answers, is left behind and dies with the
+    process; only read-only calls go through here (a commit left running could land after its retry)."""
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001  (re-raised in the caller's thread)
+            box["error"] = e
+
+    th = threading.Thread(target=run, name="scratch-list", daemon=True)
+    th.start()
+    th.join(timeout_s)
+    if th.is_alive():
+        raise TimeoutError(f"{what}: no answer within {timeout_s:g} s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 def previous_states(api, repo: str, run_id: str, keep: str) -> list[str]:
     """The repo paths of the run's timed state folders other than `keep` (runs/<run_id>/checkpoints/full_step_*, a
-    non-recursive listing; a folder entry has no size). A run whose checkpoints/ folder does not exist yet (its first
-    upload: a 404) has none."""
+    non-recursive listing; a folder entry has no size), listed within LIST_TIMEOUT_S (else TimeoutError: the attempt
+    is retried). A run whose checkpoints/ folder does not exist yet (its first upload: a 404) has none."""
     base = f"runs/{run_id}/checkpoints"
     try:
-        entries = list(api.list_repo_tree(repo, path_in_repo=base, repo_type="model"))
+        entries = _bounded(lambda: list(api.list_repo_tree(repo, path_in_repo=base, repo_type="model")),
+                           LIST_TIMEOUT_S, f"list_repo_tree {repo}:{base}")
     except Exception as e:  # noqa: BLE001
         if http_status(e) == 404 or type(e).__name__ in ("EntryNotFoundError", "RemoteEntryNotFoundError"):
             return []

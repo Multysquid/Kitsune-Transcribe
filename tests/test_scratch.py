@@ -5,8 +5,8 @@ fake Hub (never the real one).
   kitsune.fullrun.pointer_problems; a dir that is not full_step_<step>/ or lacks a required file is refused
 - upload_state: ONE create_commit that adds the state and the pointer and deletes the run's other full_step_* folders
   (another run's untouched), then a history squash; never create_repo; the first upload of a run (its folder 404s);
-  retried on the Hub's transient answers only; a failed squash is recorded, not a failure; a state rewritten after its
-  pointer was made is not committed; the events
+  retried on the Hub's transient answers only; a listing that never answers is a retried attempt (LIST_TIMEOUT_S); a
+  failed squash is recorded, not a failure; a state rewritten after its pointer was made is not committed; the events
 
 ScratchHub is also the fake HfApi of tests/test_full_trainer_state.py (the scratch and the runs repo at once: every repo
 a dict path -> bytes)."""
@@ -309,6 +309,31 @@ def test_transient_errors_are_retried_and_others_are_not(tmp_path, monkeypatch):
     out = scratch.upload_state(hub, REPO, RUN, d, ptr, log=log, retries=(0, 0))
     assert not out["ok"] and out["attempts"] == 3 and out["squash_ok"] is None
     assert log.kinds() == ["timed_state_upload_error"] * 3 + ["timed_state_upload_failed"]
+
+
+def test_a_listing_the_hub_never_answers_is_a_retried_attempt(tmp_path, monkeypatch):
+    """list_repo_tree gets no HTTP timeout from huggingface_hub: a listing that hangs ends its attempt after
+    LIST_TIMEOUT_S (a TimeoutError, retried) instead of holding the scratch thread for the rest of the run."""
+    monkeypatch.setattr(scratch, "LIST_TIMEOUT_S", 0.2)
+    hub, log = ScratchHub(), Log()
+    hang, calls, listing = threading.Event(), [], hub.list_repo_tree
+
+    def list_repo_tree(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            hang.wait(30)  # the first listing never answers (until the test lets it go)
+        return listing(*a, **kw)
+
+    hub.list_repo_tree = list_repo_tree
+    d = state_dir(tmp_path, 5)
+    try:
+        out = scratch.upload_state(hub, REPO, RUN, d, scratch.make_pointer(RUN, d, **meta(5)), log=log, retries=(0,))
+    finally:
+        hang.set()
+    assert out["ok"] and out["attempts"] == 2 and len(calls) == 2 and len(hub.commits) == 1
+    err = log.events[0]
+    assert (err["kind"], err["attempt"], err["status"]) == ("timed_state_upload_error", 0, None)
+    assert "TimeoutError" in err["error"] and "list_repo_tree" in err["error"]
 
 
 def test_a_failed_squash_is_recorded_not_a_failure(tmp_path):
