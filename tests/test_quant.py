@@ -156,6 +156,39 @@ def test_scales():
     assert pf.scale[1].item() == 1.0 and torch.equal(Q.unpack_weight(pf)[0, :3], wi[0, :3])
 
 
+def _torchao_nvfp4_codes(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """torchao 0.18's nvfp4_quantize (two-level, per_tensor_amax_to_scale), its arithmetic verbatim: fp32 from the
+    start, block scales (amax / 6) / t clamped to [e4m3 tiny, 448] in e4m3, and the data MULTIPLIED by (1 / t) / bs
+    "to match the MSLK triton kernel numerics". Returns (E2M1 codes (N, K), block scales)."""
+    t = x.float().abs().max().to(torch.float32) / (448.0 * 6.0)
+    d = x.float().reshape(x.shape[0], -1, 16)
+    bs = torch.clamp((torch.amax(torch.abs(d), dim=-1) / 6.0).to(torch.float32) / t,
+                     min=torch.finfo(torch.float8_e4m3fn).tiny, max=448.0).to(torch.float8_e4m3fn)
+    recip = (1.0 / t) / bs.to(torch.float32)
+    return Q.e2m1_encode(torch.clamp(d * recip.unsqueeze(-1), -6.0, 6.0).reshape(x.shape)), bs
+
+
+def test_nvfp4_codes_use_torchaos_reciprocal_scaling():
+    """The NVFP4 pack and the W4A4 activation grid scale the data as torchao 0.18 does, x * ((1 / t) / bs): on a
+    real-sized weight and on activations the codes equal that form's, and they differ from the division x / (bs * t)
+    on some (the form is what decides a value near an E2M1 midpoint). tests/test_quant_torchao.py checks the same
+    against torchao itself in the image."""
+    g = torch.Generator().manual_seed(0)
+    w = (torch.randn(2560, 1024, generator=g) * 0.02).to(torch.bfloat16)
+    codes, bs = _torchao_nvfp4_codes(w)
+    ours = Q.pack_weight(w, "nvfp4")
+    assert torch.equal(ours.block_scale.view(torch.uint8), bs.view(torch.uint8))
+    assert torch.equal(Q.unpack_nibbles(ours.qweight), codes)
+    t = ours.tensor_scale
+    divided = Q.e2m1_encode((w.float().reshape(2560, 64, 16) / (bs.float() * t)[..., None]).clamp(-6, 6)).reshape(
+        2560, 1024)
+    assert int((divided != codes).sum()) > 0  # the test tells the two forms apart
+    x = (torch.randn(400, 1024, generator=g) * torch.logspace(-1, 1, 400)[:, None]).to(torch.bfloat16)
+    xc, xbs = _torchao_nvfp4_codes(x)
+    kc, kbs, _ = Q._nvfp4(x.float())
+    assert torch.equal(kc, xc) and torch.equal(kbs.view(torch.uint8), xbs.view(torch.uint8))
+
+
 @pytest.mark.parametrize("wfmt", Q.WFMTS)
 def test_pack_dequant_error_bounds(wfmt):
     """Each element's dequantisation is within half a grid step of its bf16 value, and the pack is bitwise the same

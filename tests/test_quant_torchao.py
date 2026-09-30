@@ -5,13 +5,16 @@ the laptop: these run inside the training image (.github/workflows/image.yml run
 after the smoke; a failure blocks the image tag) and on smoke B. A mismatch is fixed in kitsune/quant.py's recipe
 constants, never by widening a tolerance here.
 
-  CPU (the image CI)   every torchao name kitsune uses resolves and every format's config builds; the int8 packs
-                       (weight-only and W8A8) equal torchao's quantize_ of the same weight; NVFP4, MXFP4 (RCEIL) and
-                       FP8 per-row packs equal torchao's own quantisers where it runs them on CPU (a torchao that
-                       refuses a format on CPU skips that part, which smoke B's selftest then covers); an int8
-                       to_torchao dequantises to the pack; an int8 W8A8 Linear through torchao on CPU is reproduced
-                       bit for bit from kitsune's activation grid (INT8_ACT_DIV, INT8_ACT_QMIN, INT8_ACT_SCALE_DTYPE),
-                       and the emulation is within the selftest's tolerance of it
+  CPU (the image CI)   every torchao name kitsune uses resolves and every format's config builds (the MXFP4 AUTO
+                       config of the selftest's decision-20 canary too); the int8 packs (weight-only and W8A8) equal
+                       torchao's quantize_ of the same weight; the NVFP4 pack (on a real-sized weight, where the
+                       reciprocal scaling decides codes) and the W4A4 activation grid, and the MXFP4 (RCEIL) pack,
+                       equal torchao's own quantisers (they run on CPU in the image: an API error there fails, it is
+                       drift; only a CPU-kernel refusal skips); the FP8 per-row pack where torchao runs it on CPU (it
+                       refuses there today: smoke B's selftest covers it); an int8 to_torchao dequantises to the pack;
+                       an int8 W8A8 Linear through torchao on CPU is reproduced bit for bit from kitsune's activation
+                       grid (INT8_ACT_DIV, INT8_ACT_QMIN, INT8_ACT_SCALE_DTYPE), and the emulation is within the
+                       selftest's tolerance of it
   CUDA (smoke B, a     every timed format's to_torchao dequantises to its pack; kitsune.quant.selftest passes (real
   5090)                kernels within SELFTEST_TOL of the emulation at every M, no int8 fp32 fallback after padding,
                        weights quantised under autocast); a pack computed on CUDA equals the CPU one bit for bit
@@ -91,25 +94,57 @@ def test_int8_pack_equals_torchaos(fmt):
     assert torch.equal(theirs.scale.float(), ours.scale), "int8 scales differ from torchao's"
 
 
-def _cpu_or_skip(fn, what: str):
+def _cpu_or_skip(fn, what: str, *, strict: bool = False):
+    """fn(), or a skip when torchao does not run it on CPU. strict (the quantisers known to run in the image: NVFP4,
+    MXFP4): only a CPU-kernel refusal (NotImplementedError, RuntimeError) skips; a TypeError, AttributeError,
+    AssertionError or QuantError is API drift, and fails."""
+    refusals = (NotImplementedError, RuntimeError) + (() if strict else (AssertionError, AttributeError, TypeError,
+                                                                           Q.QuantError))
     try:
         return fn()
-    except (NotImplementedError, RuntimeError, AssertionError, AttributeError, TypeError, Q.QuantError) as e:
+    except refusals as e:
         pytest.skip(f"torchao {torchao.__version__} does not run {what} on CPU here ({type(e).__name__}: "
                     f"{str(e)[:160]}): smoke B's selftest covers it")
 
 
-def test_nvfp4_pack_equals_torchaos():
-    """torchao's NVFP4 quantiser (two-level: the per-tensor amax / (448 x 6) scale, e4m3 block scales per 16, packed
-    E2M1) on the same bf16 weight gives kitsune's pack bit for bit."""
-    w = weight()
-    t = _cpu_or_skip(lambda: Q._ao("per_tensor_amax_to_scale")(w.float().abs().max()), "per_tensor_amax_to_scale")
+def real_weight(seed: int = 0) -> torch.Tensor:
+    """A real-sized bf16 weight, N(0, 0.02) (2560 x 1024): on it the NVFP4 data scaling's form decides about a
+    thousand codes (on weight() the division and torchao's reciprocal happen to agree everywhere)."""
+    g = torch.Generator().manual_seed(seed)
+    return (torch.randn(2560, 1024, generator=g) * 0.02).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("which", ["spread", "real"])
+def test_nvfp4_pack_equals_torchaos(which):
+    """torchao's NVFP4 quantiser (two-level: the per-tensor amax / (448 x 6) scale, e4m3 block scales per 16, the data
+    multiplied by (1 / t) / bs, packed E2M1) on the same bf16 weight gives kitsune's pack bit for bit."""
+    w = weight() if which == "spread" else real_weight()
+    t = _cpu_or_skip(lambda: Q._ao("per_tensor_amax_to_scale")(w.float().abs().max()), "per_tensor_amax_to_scale",
+                     strict=True)
     scales, data = _cpu_or_skip(lambda: Q._ao("nvfp4_quantize")(w, block_size=16, per_tensor_scale=t),
-                                "nvfp4_quantize")
+                                "nvfp4_quantize", strict=True)
     ours = Q.pack_weight(w, "nvfp4")
     assert torch.equal(t.float().reshape(()), ours.tensor_scale), "the NVFP4 tensor scale differs"
     assert same_bits(scales.reshape(ours.block_scale.shape), ours.block_scale), "NVFP4 block scales differ"
-    assert same_bits(data.reshape(ours.qweight.shape).view(torch.uint8), ours.qweight), "NVFP4 codes differ"
+    theirs = data.reshape(ours.qweight.shape).view(torch.uint8)
+    n_diff = int((Q.unpack_nibbles(theirs) != Q.unpack_nibbles(ours.qweight)).sum())
+    assert same_bits(theirs, ours.qweight), f"NVFP4 codes differ on {n_diff} of {w.numel()}"
+
+
+def test_nvfp4_activation_grid_equals_torchaos():
+    """The W4A4 activation: torchao's dynamic path quantises the call input with the tensor scale from its whole amax
+    (per_tensor_amax_to_scale(max |x|)) through the same nvfp4_quantize; kitsune's fake-quant (_nvfp4 on the input
+    rounded to bf16) gives the same tensor scale, block scales and codes."""
+    g = torch.Generator().manual_seed(1)
+    x = (torch.randn(400, 1024, generator=g) * torch.logspace(-1, 1, 400)[:, None]).to(torch.bfloat16)
+    t = _cpu_or_skip(lambda: Q._ao("per_tensor_amax_to_scale")(x.abs().max()), "per_tensor_amax_to_scale",
+                     strict=True)
+    scales, data = _cpu_or_skip(lambda: Q._ao("nvfp4_quantize")(x, 16, t), "nvfp4_quantize", strict=True)
+    codes, bs, tt = Q._nvfp4(x.float())
+    assert torch.equal(t.float().reshape(()), tt), "the activation's tensor scale differs"
+    assert same_bits(scales.reshape(bs.shape), bs), "the activation's block scales differ"
+    theirs = Q.unpack_nibbles(data.reshape(400, 512).view(torch.uint8))
+    assert torch.equal(theirs, codes), f"the activation's codes differ on {int((theirs != codes).sum())}"
 
 
 def test_mxfp4_pack_equals_torchaos_rceil():
@@ -117,7 +152,7 @@ def test_mxfp4_pack_equals_torchaos_rceil():
     w = weight()
     elem = getattr(torch, "float4_e2m1fn_x2", None)
     scale, data = _cpu_or_skip(lambda: Q._ao("to_mx")(w, elem, 32, scaling_mode=Q._ao("ScaleCalculationMode").RCEIL),
-                               "to_mx (MXFP4, RCEIL)")
+                               "to_mx (MXFP4, RCEIL)", strict=True)
     ours = Q.pack_weight(w, "mxfp4", mx_rounding="rceil")
     assert same_bits(scale.reshape(ours.block_scale.shape).view(torch.uint8), ours.block_scale), "E8M0 differs"
     assert same_bits(data.reshape(ours.qweight.shape).view(torch.uint8), ours.qweight), "MXFP4 codes differ"

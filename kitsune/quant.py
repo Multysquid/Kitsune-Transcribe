@@ -51,7 +51,9 @@ Numerics (the exact recipes; the constants are the torchao parity test's to pin)
   int8 acts     per token: s = max(bf16(amax_row / INT8_ACT_DIV), INT8_ACT_EPS), q = clamp(round(x / s),
                 INT8_ACT_QMIN, 127)
   nvfp4         t = amax(|w|) / (448 * 6) (an all-zero tensor: 1); per 16 along K bs = e4m3(clamp((b / 6) / t,
-                NVFP4_SCALE_MIN, 448)); codes of clamp(w / (bs * t), +-6); dequant E2M1[c] * (bs * t). Activations
+                NVFP4_SCALE_MIN, 448)); codes of clamp(w * ((1 / t) / bs), +-6): torchao 0.18's nvfp4_quantize
+                multiplies by that reciprocal (to match its triton kernel), which rounds differently from w / (bs * t)
+                near an E2M1 midpoint (about 0.05 % of a real weight's codes); dequant E2M1[c] * (bs * t). Activations
                 (w4a4): the same with t from the amax of the whole call input (padding included, as torchao's dynamic
                 per-tensor scale)
   mxfp4         per 32 along K, b the block amax: rceil e = ceil(log2(b / 6)) exactly through frexp; floor e =
@@ -408,7 +410,9 @@ def _nvfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     blocks = x.reshape(n, k // NVFP4_BLOCK, NVFP4_BLOCK)
     b = blocks.abs().amax(dim=-1)
     bs = ((b / F4_MAX) / t).clamp(NVFP4_SCALE_MIN, F8_MAX).to(torch.float8_e4m3fn)
-    d = (blocks / (bs.float() * t)[..., None]).clamp(-F4_MAX, F4_MAX)
+    # torchao 0.18's nvfp4_quantize: x * ((1 / t) / bs), not x / (bs * t) - the two round differently, and a value
+    # near an E2M1 midpoint then gets another code (tests/test_quant.py and test_quant_torchao.py pin this form)
+    d = (blocks * ((1.0 / t) / bs.float())[..., None]).clamp(-F4_MAX, F4_MAX)
     return e2m1_encode(d).reshape(n, k), bs, t.float()
 
 
@@ -793,7 +797,8 @@ def _recipe_consts(fmt: str, mx_rounding: str) -> dict:
     if wfmt == "fp8":
         rec.update(fp8_scale="amax/448 per row (0 -> 1)")
     if wfmt == "nvfp4":
-        rec.update(tensor_scale="amax/(448*6)", block_scale_min=NVFP4_SCALE_MIN)
+        rec.update(tensor_scale="amax/(448*6)", block_scale_min=NVFP4_SCALE_MIN,
+                   code_scaling="x * ((1 / tensor_scale) / block_scale) (torchao 0.18's reciprocal form)")
     if wfmt == "mxfp4":
         rec.update(mx_rounding=mx_rounding, e8m0="uint8 = e + 127")
     if act == "int8":
