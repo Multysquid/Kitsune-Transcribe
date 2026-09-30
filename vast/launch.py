@@ -1241,8 +1241,9 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
     extent_preflight:
     - every config the box reads (fullrun.box_configs: its data config, its item configs, the registry) committed at
       `sha`, and every tool its items run: the queue (kitsune/full_queue.py), the trainer, 05, speed_probe (with the
-      items' speed kinds) and each eval item's argv target (`-m pkg.mod` -> pkg/mod.py, or its *.py): a box whose
-      items need a CLI the commit does not have yet is refused here, not after its paid bootstrap;
+      items' speed kinds and every --flag in their args) and each eval item's argv target (`-m pkg.mod` ->
+      pkg/mod.py, or its *.py): a box whose items need a CLI the commit does not have yet is refused here, not after
+      its paid bootstrap;
     - its students (fullrun.box_students, read at `sha`) with STUDENT_FILES (+ CTC_CARD for a Parakeet-derived one), each
       the registered build (fullrun.student_checks on the data repo's student_meta.json); its extra files and dirs;
     - the scratch repo (the trainers' timed states) readable and private;
@@ -1260,12 +1261,17 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
         if not _at_sha(sha, c):
             problems.append(f"{c} does not exist at {sha[:12]}: python tools/make_full_configs.py, commit and push")
     tools = {"kitsune/full_queue.py": "the box's queue"}
-    kinds = set()
+    kinds, flags = set(), {}
     for it in spec["items"]:
         if it["kind"] in FULL_TOOLS:
             tools.setdefault(FULL_TOOLS[it["kind"]], f"{it['kind']} item {it['name']}")
         if it["kind"] == "speed":
             kinds.add(it["speed_kind"])
+            # the flags an item adds to the queue's speed argv (WP5's --quant/--compile, WP6's --hf-cache): a sha
+            # with the kind but not the flag would end the item in argparse's exit 2 on the rented box
+            for a in it.get("args") or ():
+                if isinstance(a, str) and a.startswith("--") and len(a) > 2:
+                    flags.setdefault(a.split("=", 1)[0], it["name"])
         if it["kind"] == "eval":
             target = argv_target(it["argv"])
             if target is None:
@@ -1275,11 +1281,16 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
     for path, who in tools.items():
         if not _at_sha(sha, path) and not (path.endswith(".py") and _at_sha(sha, path[:-3] + "/__main__.py")):
             problems.append(f"{path} ({who}) does not exist at {sha[:12]}: this box needs a commit that has it")
-    if kinds and _at_sha(sha, FULL_TOOLS["speed"]):
+    if (kinds or flags) and _at_sha(sha, FULL_TOOLS["speed"]):
+        # textual: KINDS lists each kind as a "<kind>" literal, and argparse declares each flag as a "--flag" one
         probe = git_show(sha, FULL_TOOLS["speed"]).decode("utf-8", "replace")
         for k in sorted(kinds):
             if f'"{k}"' not in probe:
                 problems.append(f"{FULL_TOOLS['speed']} at {sha[:12]} has no --kind {k} (a speed item of box {box})")
+        for f, name in sorted(flags.items()):
+            if f'"{f}"' not in probe:
+                problems.append(f"{FULL_TOOLS['speed']} at {sha[:12]} has no {f} (in the args of speed item {name} "
+                                f"of box {box})")
     try:
         api, download = _hub()
         files = api.list_repo_files(data_repo, repo_type="dataset", revision=data_rev)

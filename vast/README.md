@@ -792,8 +792,9 @@ What launch checks and decides, before anything is rented:
   label runs' failed hosts, and a machine whose full box's download gate said slow in the last 30 days
   (`full/box-*/infra/*/download_gate.json` in the runs repo). A `--machine` on that list is refused.
 - **full_preflight:** every config the box reads committed at the commit; every tool its items run there (the queue,
-  the trainer, 05, speed_probe with the items' `--kind`s, each eval item's `-m` module or script: a box whose items need
-  a CLI not merged yet is refused here); its students present and the registered builds
+  the trainer, 05, speed_probe with the items' `--kind`s and every `--flag` in their `args`, each eval item's `-m`
+  module or script: a box whose items need a CLI or a flag not merged yet is refused here, not by argparse on the
+  rented box); its students present and the registered builds
   (`kitsune.prereg.student_problems`); its extra files and dirs; the scratch repo private; the full selection's sidecar
   (`kitsune.devslice.sidecar_problems`) against the Hub's selection and frozen manifest; plus the selection and extent
   checks every extent config gets. `--no-hf-check` is refused.

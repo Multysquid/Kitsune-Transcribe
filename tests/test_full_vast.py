@@ -4,9 +4,9 @@ vast/watchdog.sh on train_hb, vast/blocklist.json.
 launch: the box registry (kitsune/fullrun.py, tests/fixtures_full.tiny_registry) read at the commit the box runs (a
 fake git serves a temp checkout), the query, env table and label of box p01 and the 2-GPU box full, the client filter
 (verification, max rental, RAM per GPU, avoided machines), the ranking by the estimated total, --machine, --tier a100,
-the flag refusals, full_preflight's refusals (configs and tools missing at the sha, students, extra files, the scratch
-repo, the selection sidecar via a stub kitsune.devslice, --resume's Hub summary and run ids), the blocklist and the
-gate refusals. finish: --job full is lean with its infra under full/box-<box>/, never uploads or expects SCRATCH_MARK,
+the flag refusals, full_preflight's refusals (configs, tools and speed_probe kinds or args flags missing at the sha,
+students, extra files, the scratch repo, the selection sidecar via a stub kitsune.devslice, --resume's Hub summary and
+run ids), the blocklist and the gate refusals. finish: --job full is lean with its infra under full/box-<box>/, never uploads or expects SCRATCH_MARK,
 and --abort destroys a box without a run dir, stops one with a run dir, and is --stop --no-sync for any other job.
 watchdog: train_hb stale -> sync and stop with the box reason; alert mode writes watchdog_alerts.jsonl and re-arms.
 No network, no vastai CLI, no GPU; the shell tests need Git Bash.
@@ -528,6 +528,36 @@ def test_full_preflight_refuses_a_box_whose_tools_the_sha_lacks(repo, monkeypatc
     assert launch.argv_target(["{python}", "-m", "kitsune.quant", "readout"]) == "kitsune/quant.py"
     assert launch.argv_target(["{python}", "tools/whisper_eval.py", "--model", "x"]) == "tools/whisper_eval.py"
     assert launch.argv_target(["{python}", "echo"]) is None
+
+
+def test_full_preflight_refuses_speed_args_the_sha_lacks(repo, monkeypatch, devslice):
+    """A speed item's args add flags to the queue's speed_probe argv (WP5's --quant/--profile-kernels/--compile, WP6's
+    --hf-cache); a sha whose speed_probe has the kind but not a flag is refused on the laptop, not by argparse's exit 2
+    on the rented box. Values and placeholders are not flags; --flag=value counts as --flag."""
+    reg = copy.deepcopy(dict(repo.reg))
+    speed = {it["name"]: it for it in reg["boxes"]["full"]["items"] if it["kind"] == "speed"}
+    speed["speed-full-t06"]["args"] = ["--quant", "int8-w8a8", "--profile-kernels", "--threads=8"]
+    speed["speed-study-t06"]["args"] = ["--hf-cache", "{hf_cache}", "--compile"]
+    write_reg(repo.root, reg)
+    reg = launch.full_registry(SHA)[0]
+    data = box_data("full", reg, repo.root)
+    probe = repo.root / "tools/speed_probe.py"
+    base = probe.read_text(encoding="utf-8")  # the kinds only: no flag of the args
+    problems, _ = preflight(monkeypatch, FullHub(data), box="full", reg=reg)
+    want = {"--quant": "speed-full-t06", "--profile-kernels": "speed-full-t06", "--threads": "speed-full-t06",
+            "--hf-cache": "speed-study-t06", "--compile": "speed-study-t06"}
+    for flag, item in want.items():
+        line = f"tools/speed_probe.py at 0123456789ab has no {flag} (in the args of speed item {item} of box full)"
+        assert line in problems, (flag, problems)
+    assert not any("int8-w8a8" in p or "{hf_cache}" in p or "--kind" in p for p in problems), problems
+    # a sha with every flag but --compile (WP5's, say, before its compile commit): only that one is refused
+    flags = [f for f in want if f != "--compile"]
+    probe.write_text(base + "".join(f'ap.add_argument("{f}")\n' for f in flags), encoding="utf-8")
+    problems, _ = preflight(monkeypatch, FullHub(data), box="full", reg=reg)
+    assert [p for p in problems if "speed_probe" in p] == [
+        "tools/speed_probe.py at 0123456789ab has no --compile (in the args of speed item speed-study-t06 of box full)"]
+    probe.write_text(base + "".join(f'ap.add_argument("{f}")\n' for f in want), encoding="utf-8")
+    assert preflight(monkeypatch, FullHub(data), box="full", reg=reg)[0] == []
 
 
 def test_full_preflight_without_devslice_refuses_the_sidecar(repo, monkeypatch):
