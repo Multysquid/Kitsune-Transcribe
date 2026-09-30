@@ -18,8 +18,9 @@
              decodes nothing; a stopped --force continues where it stopped (.parts/force.json); a partial re-run keeps
              every set's table; another --max-rows, a store that is not the manifest's, a frame store, a set outside
              the manifest and a --model typo refuse (exit 2) before any model is loaded, a store not built yet exits 1;
-             --limit-per-set is speed_probe's draw and cannot be tabled; a heartbeat per batch and a bounded one around
-             the load; --fetch-only; never exit 3
+             --limit-per-set is speed_probe's draw and cannot be tabled (the box template's --tables is skipped with a
+             note, not refused: smoke B's quick items); a heartbeat per batch and a bounded one around the load;
+             --fetch-only; never exit 3
 """
 import json
 import os
@@ -566,10 +567,9 @@ def test_a_partial_rerun_keeps_every_table(wenv, tiny_dir, first_run, tmp_path):
 
 def test_refusals_before_any_model_is_loaded(wenv, tiny_dir, tmp_path, monkeypatch):
     """Exit 2, no model loaded: a store whose rows are not the manifest's, a set outside the manifest, a frame store, a
-    manifest that does not hash to itself; --limit-per-set with --tables, a model dir without --system and a --model
-    that is neither a key nor a model dir (a typo: refused before --out's identity is written, so the corrected command
-    can use that --out) are argument errors (exit 2). A --store that is not built yet is no refusal: exit 1, as the
-    queue retries it."""
+    manifest that does not hash to itself; a model dir without --system and a --model that is neither a key nor a model
+    dir (a typo: refused before --out's identity is written, so the corrected command can use that --out) are argument
+    errors (exit 2). A --store that is not built yet is no refusal: exit 1, as the queue retries it."""
     def no_model(*a, **k):
         raise AssertionError("a model was loaded before the refusal")
 
@@ -596,7 +596,6 @@ def test_refusals_before_any_model_is_loaded(wenv, tiny_dir, tmp_path, monkeypat
     a = argv_of(wenv, tiny_dir, tmp_path / "o4")
     a[a.index("--manifest") + 1] = str(tmp_path / "bad.json")
     assert we.main(a) == 2
-    assert we.main(argv_of(wenv, tiny_dir, tmp_path / "o5", "--limit-per-set", "2", tables=tmp_path / "t")) == 2
     a = argv_of(wenv, tiny_dir, tmp_path / "o6")
     a[a.index("--system"):a.index("--system") + 2] = []
     assert we.main(a) == 2
@@ -624,6 +623,32 @@ def test_limit_per_set_is_the_speed_probes_draw(wenv, tiny_dir, tmp_path):
     w = load(out / "whisper.json")
     assert w["limit_per_set"] == 2 and w["manifest"] is None and set(w["sets"]) == {"eval_jsut", "galgame"}
     assert w["model"]["repo"] is None and w["batching"]["max_rows"] == W.DEFAULT_MAX_ROWS
+
+
+def test_limit_per_set_skips_the_box_templates_tables(wenv, tiny_dir, tmp_path, capsys):
+    """Smoke B's turbo / kotoba / small items are the box's Whisper argv template (contract 7: --manifest, --tables
+    {out}/tables) plus --limit-per-set: exit 0, not an argument error, so check 15's 'item done' can pass. The limited
+    sets are decoded and checked against the manifest; --tables is skipped with a note (stderr and a tables_skipped
+    event): no tables, no study.json, 05 never runs."""
+    import speed_probe as sp
+
+    out = tmp_path / "lim"
+    tables = out / "tables"
+    assert we.main(argv_of(wenv, tiny_dir, out, "--limit-per-set", "2", tables=tables)) == 0
+    assert "--tables" in capsys.readouterr().err
+    assert not tables.exists() and not (out / "study.json").exists()
+    assert [e["tables"] for e in events(out, "tables_skipped")] == [str(tables)]
+    assert events(out, "tables_skipped")[0]["limit_per_set"] == 2 and not events(out, "study_tables")
+    picked = sp.pick_ids(wenv["store"], 2, 1234)
+    for s in EVAL_SETS:
+        g = pd.read_parquet(out / f"greedy_{s}.parquet")
+        assert list(g["id"]) and sorted(g["id"]) == sorted(i for i in picked if i in wenv["manifest"]["sets"][s]["ids"])
+    w = load(out / "whisper.json")
+    assert w["status"] == "complete" and w["limit_per_set"] == 2 and set(w["sets"]) == set(EVAL_SETS)
+    assert w["manifest"]["sha256"]
+    # the same command again (a queue retry): nothing decoded, the note again, still no tables
+    assert we.main(argv_of(wenv, tiny_dir, out, "--limit-per-set", "2", tables=tables)) == 0
+    assert len(events(out, "tables_skipped")) == 2 and not tables.exists()
 
 
 def test_fetch_only_and_the_exit_codes(tiny_dir, monkeypatch):

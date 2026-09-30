@@ -20,9 +20,9 @@ Flow:
      deletes nothing and decodes only the sets not done since; the record goes once every set it names is done (delete
      it to start a stopped forced run over).
   5. whisper.json after every set (status running, then complete; failed with the error when it stops), then with
-     --tables 05 --from-evals on --out, over every manifest set done in --out (not only the sets this command named:
-     a partial re-run, e.g. --force --sets eval_cv8, must not drop the other sets' tables or M4 from study.json; the
-     identity check makes every set in --out the same model and settings).
+     --tables (never with --limit-per-set, below) 05 --from-evals on --out, over every manifest set done in --out (not
+     only the sets this command named: a partial re-run, e.g. --force --sets eval_cv8, must not drop the other sets'
+     tables or M4 from study.json; the identity check makes every set in --out the same model and settings).
 
 Outputs in --out:
   greedy_<set>.parquet  one row per decoded manifest row, in batch order: id, source, duration, ref (the store's), hyp,
@@ -41,10 +41,12 @@ Outputs in --out:
                         <tables>/<system>/<set>.parquet
 
 --limit-per-set N (smoke B's quick rows): N ids per set, speed_probe.pick_ids's seeded draw (--seed). Such a run
-scores part of each set, so it cannot be tabled: --limit-per-set with --tables is an argument error (exit 2), and a
-registry item that adds --limit-per-set to the box argv must also drop its --tables. --manifest is optional with it
-(given, the sets are still checked against it). --fetch-only: only step 3's download, on CPU (a prefetch; nothing
-else is read or written).
+scores part of each set, so it cannot be tabled (05 --from-evals refuses a set that is not its manifest ids): a
+--tables given with it is skipped, with a note on stderr and a tables_skipped event, and no study.json or tables are
+written. It is not refused, because smoke B's turbo, kotoba and small items are the box's Whisper argv template
+(contract 7, which carries --tables {out}/tables) plus --limit-per-set 50: a refusal would fail those items at once.
+--manifest is optional with it (given, the sets are still checked against it). --fetch-only: only step 3's download,
+on CPU (a prefetch; nothing else is read or written).
 
 Exit codes: 0 done; 2 refused (a store whose rows are not the manifest's, a frame store, the manifest, identity, tables
 refused by 05, bad arguments incl. a --model that is neither a key nor a model dir); 1 any other error, including a
@@ -55,8 +57,8 @@ Usage (box 2's registry eval item; smoke B's large-v3 item adds --sets eval_jsut
   python tools/whisper_eval.py --model whisper-large-v3 --store <root>/cache/eval \
       --manifest labels/full/selections/study_manifest.json --out runs/whisper-large-v3-<stamp> \
       --tables runs/whisper-large-v3-<stamp>/tables --hf-cache <root>/cache/hf --device cuda --max-temp 0
-smoke B's quick rows (turbo, kotoba, small): the same without --tables (and --manifest optional), plus
-  --limit-per-set 50
+smoke B's quick rows (turbo, kotoba, small): the same plus --limit-per-set 50 (its --tables is skipped; --manifest
+  is optional)
 """
 import argparse
 import importlib.util
@@ -132,7 +134,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--sets", nargs="+", default=None,
                     help="the sets to score (default: every manifest set, or every set of the store without one)")
     ap.add_argument("--limit-per-set", type=int, default=None,
-                    help="only this many seeded ids per set (smoke rows; speed_probe.pick_ids; no --tables)")
+                    help="only this many seeded ids per set (smoke rows; speed_probe.pick_ids; a --tables given with "
+                         "it is skipped with a note)")
     ap.add_argument("--seed", type=int, default=1234, help="the --limit-per-set draw's seed (default %(default)s)")
     ap.add_argument("--max-rows", type=int, default=None,
                     help="the row cap of a batch (default: the model's, kitsune.whisper.WHISPER_MODELS; "
@@ -157,6 +160,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="seconds between reads while paused (default %(default)s)")
     args = ap.parse_args(argv)
     args.argv = list(argv) if argv is not None else sys.argv[1:]
+    args.tables_skipped = None
     if args.system is None:
         if args.model in W.WHISPER_MODELS:
             args.system = args.model
@@ -173,7 +177,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     if args.model not in W.WHISPER_MODELS and not (Path(args.model) / "config.json").is_file():
         ap.error(f"--model {args.model!r} is neither a Whisper key ({', '.join(W.WHISPER_MODELS)}) nor a model dir")
     if args.limit_per_set is not None and args.tables:
-        ap.error("--limit-per-set scores part of each set, which cannot be tabled: drop --tables")
+        # a limited run scores part of each set, which 05 --from-evals cannot table (a set must be its manifest ids).
+        # Skipped, not refused: smoke B's quick items are the box's Whisper template (it carries --tables) plus
+        # --limit-per-set, and an argument error would fail them at once. run() logs the note.
+        args.tables_skipped, args.tables = args.tables, None
     if args.limit_per_set is None and not args.manifest:
         ap.error("--manifest is required (the frozen study manifest the tables are checked against)")
     if args.limit_per_set is not None and args.limit_per_set < 1:
@@ -369,6 +376,10 @@ def run(args) -> int:
     log.event("whisper_start", argv=args.argv, model=args.model, system=args.system, out=str(out),
               device=str(device), dtype=dname, max_rows=max_rows, batch_s=args.batch_s,
               limit_per_set=args.limit_per_set)
+    if args.tables_skipped:
+        print(f"NOTE: --tables {args.tables_skipped} skipped: --limit-per-set {args.limit_per_set} scores part of each "
+              "set, which 05's tables cannot hold (no study.json or tables are written)", file=sys.stderr, flush=True)
+        log.event("tables_skipped", tables=str(args.tables_skipped), limit_per_set=args.limit_per_set)
     try:
         store = trainset.load_stores(args.store)
     except FileNotFoundError as e:  # exit 1, not a refusal: the box's stores item may not have built it yet
