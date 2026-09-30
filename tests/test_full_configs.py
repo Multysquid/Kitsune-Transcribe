@@ -36,7 +36,7 @@ STUDY_WEIGHTS = {"study-t06": ("study-t06-20260926T174027Z", 9370), "study-t03":
                  "study-p03": ("study-p03-20260926T172336Z", 25120), "study-p01": ("study-p01-20260926T172421Z", 34620),
                  "study-p005": ("study-p005-20260926T172507Z", 47690)}
 PARAKEET = "models/parakeet-tdt_ctc-0.6b-ja-hf"
-# what tools/full_plan.py measured (STATE.md 2026-09-30, D:/kitsune-tmp/fullsel/plan_full.json)
+# what tools/full_plan.py measured on the built selections (the full-selection report of 2026-09-30)
 FULL_SHA, SMOKE_SHA = ("e9a0695ac45b6b325e6c5c3434ed382e46c63782ece0f375a5f6bbeb310ea509",
                        "93dd422d873c966a1cbd8aacadcd879ad0bab13481394f554ac9e143a0eaf5b2")
 MEASURED_T = {"t06": 71946, "p03": 105861, "p01": 107910, "p005": 107910}
