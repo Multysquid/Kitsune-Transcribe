@@ -239,7 +239,9 @@ the trainer as it was before them; configs/full/*.json turn them on):
                     shards, kitsune.trainset), a seeded per_source of them per train source (fullrun.dev_pick; seed
                     null: the run's) in a store of their own (build_dev_store: cache dir dev_p<n>_s<seed>_<sha8>, a
                     frame store with its frame preflight for family ctc; the box's store step builds it too). setup_data
-                    writes runs/<run_id>/dev_ids.json and a `dev_store` event (n_in_train must be 0), and a resume on
+                    writes runs/<run_id>/dev_ids.json and a `dev_store` event (n_in_train must be 0; ids_sha256 hashes
+                    the sorted ids and names the store, ids_sha256_selection hashes them in selection order and equals
+                    the selection sidecar's dev.scored_default.ids_sha256 at its per_source and seed), and a resume on
                     other dev rows stops (st["dev"]; per_source and seed are RESUME_FIXED). run_dev_eval (every
                     every_steps steps, or at each every_epochs fraction of an epoch; a step-0 one under at_start, a
                     final one under at_end): teacher-forced on every dev row, greedy too with greedy (CTC: the argmax
@@ -1795,18 +1797,28 @@ def dev_metric(cfg: dict) -> bool:
 
 
 def _ids_sha256(ids) -> str:
-    """sha256 of the sorted ids joined by newlines (the dev pick's identity: dev_store_name's sha8, st["dev"])."""
+    """sha256 of the sorted ids joined by newlines (the dev pick's identity: dev_store_name's sha8, st["dev"]). Not
+    the selection sidecar's digest, which hashes the ids in selection order (dev_ids' ids_sha256_selection)."""
     return hashlib.sha256("\n".join(sorted(ids)).encode()).hexdigest()
 
 
 def dev_ids(cfg: dict, log) -> tuple[list[str], dict]:
     """The dev rows the dev eval scores: kitsune.fullrun.dev_pick over the selection's kept split-"dev" rows of
     cfg["sources"] (a seeded eval.dev.per_source per source, all of a smaller one; seed eval.dev.seed, else the run's),
-    in selection order. A `subset` event (split "dev") gives the counts and ids_sha256; the ids go to dev_ids.json
-    (setup_data). Returns (ids, record: seed, per_source, n, ids_sha256, pool and picked per source, ids per source).
+    in selection order. A `subset` event (split "dev") gives the counts and both digests; the ids go to dev_ids.json
+    (setup_data). Returns (ids, record: seed, per_source, n, ids_sha256, ids_sha256_selection, pool and picked per
+    source, ids per source). The record holds two digests of the same ids:
+      ids_sha256            _ids_sha256, over the SORTED ids: the pick's identity (the store name's sha8, st["dev"]
+                            and the resume guard stay on it)
+      ids_sha256_selection  kitsune.store.ids_sha256 over the ids in selection order, the digest make_selection.py
+                            full mode records for its lists: it equals the selection sidecar's
+                            dev.scored_default.ids_sha256 when per_source, seed and cfg["sources"] are the sidecar's
+                            (per_source 600, seed 1234, every source of the selection), so a run's dev slice can be
+                            checked against the sidecar by hash (the sorted digest would never match it)
     A selection without dev rows for a source stops the run: a full selection (make_selection.py full mode) has
     them."""
     from kitsune import fullrun
+    from kitsune.store import ids_sha256
 
     dev = cfg["eval"]["dev"]
     sel = rpath(cfg["selection"])
@@ -1821,6 +1833,7 @@ def dev_ids(cfg: dict, log) -> tuple[list[str], dict]:
     src_of = dict(zip(rows["id"].tolist(), rows["source"].tolist()))
     by_src = {s: [i for i in ids if src_of[i] == s] for s in cfg["sources"]}
     rec = dict(seed=seed, per_source=per, n=len(ids), ids_sha256=_ids_sha256(ids),
+               ids_sha256_selection=ids_sha256(ids),  # ids in selection order, as dev_pick returns them
                pool={s: int((rows["source"] == s).sum()) for s in cfg["sources"]},
                picked={s: len(v) for s, v in by_src.items()})
     log.event("subset", split=fullrun.DEV_SPLIT, sources=cfg["sources"], **rec)
@@ -1929,15 +1942,16 @@ def setup_data(R: Run):
 
 def setup_dev(R: Run) -> dict:
     """setup_data's part for the dev store (eval.dev on): runs/<run_id>/dev_ids.json {seed, per_source, ids_sha256,
-    ids {source: [...]}} (informational: the ids are a pure function of the selection, per_source and the seed), the
-    frame preflight's `frame_preflight` event (family ctc), the `dev_store` event {name, n, per_source, seed,
-    ids_sha256, hours, n_in_train} and the guard: the dev rows are a train row nowhere (n_in_train must be 0), and a
-    resume scores the rows its state scored (st["dev"]; eval.dev.per_source / seed are RESUME_FIXED, the selection is
-    too, so only a changed file or dev_pick could move them). The store's own rows count too (n, store_ids_sha256): a
-    store rebuilt on a new host can hold fewer of the picked rows (a shard missing from the pull drops its rows, the
-    frame preflight drops some), and the early stop's smoothing and patience must not mix numbers over two row sets;
-    a state from before those keys takes them from this store. Returns the `data` event's dev_utts, dev_h and
-    dev_per_source."""
+    ids_sha256_selection, ids {source: [...]}} (informational: the ids are a pure function of the selection,
+    per_source and the seed; ids_sha256_selection is the digest to compare with the selection sidecar's
+    dev.scored_default.ids_sha256, dev_ids), the frame preflight's `frame_preflight` event (family ctc), the
+    `dev_store` event {name, n, per_source, seed, ids_sha256, ids_sha256_selection, hours, n_in_train} and the guard:
+    the dev rows are a train row nowhere (n_in_train must be 0), and a resume scores the rows its state scored
+    (st["dev"], on the sorted ids_sha256; eval.dev.per_source / seed are RESUME_FIXED, the selection is too, so only a
+    changed file or dev_pick could move them). The store's own rows count too (n, store_ids_sha256): a store rebuilt
+    on a new host can hold fewer of the picked rows (a shard missing from the pull drops its rows, the frame preflight
+    drops some), and the early stop's smoothing and patience must not mix numbers over two row sets; a state from
+    before those keys takes them from this store. Returns the `data` event's dev_utts, dev_h and dev_per_source."""
     cfg, log, store = R.cfg, R.log, getattr(R, "devstore", None)
     rec = store.info["dev_pick"]
     if is_ctc(cfg):
@@ -1945,7 +1959,8 @@ def setup_dev(R: Run) -> dict:
     ids = [i for v in rec["ids"].values() for i in v]
     n_in_train = len(set(ids) & {u.id for u in R.train.utts})
     info = dict(name=store.cache_dir.name, n=len(store), n_ids=rec["n"], per_source=rec["per_source"],
-                seed=rec["seed"], ids_sha256=rec["ids_sha256"], hours=round(store.hours, 4), n_in_train=n_in_train)
+                seed=rec["seed"], ids_sha256=rec["ids_sha256"], ids_sha256_selection=rec["ids_sha256_selection"],
+                hours=round(store.hours, 4), n_in_train=n_in_train)
     log.event("dev_store", **info)
     if n_in_train:
         raise SystemExit(f"{n_in_train} of the dev rows are in the train store too ({cfg['selection']}): the early "
@@ -1968,7 +1983,8 @@ def setup_dev(R: Run) -> dict:
     path = R.run_dir / "dev_ids.json"
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(dict(seed=rec["seed"], per_source=rec["per_source"], ids_sha256=rec["ids_sha256"],
-                                   ids=rec["ids"]), indent=1) + "\n", encoding="utf-8")
+                                   ids_sha256_selection=rec["ids_sha256_selection"], ids=rec["ids"]), indent=1) + "\n",
+                   encoding="utf-8")
     _replace_file(tmp, path)
     return dict(dev_utts=len(store), dev_h=round(store.hours, 3), dev_per_source=store.info.get("per_source"))
 

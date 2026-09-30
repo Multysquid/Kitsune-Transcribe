@@ -45,6 +45,7 @@ import torch  # noqa: E402
 
 from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa: E402
 from kitsune import fullrun  # noqa: E402
+from kitsune.store import ids_sha256 as store_ids_sha256  # noqa: E402
 
 EVAL = ["eval_jsut", "eval_cv8", "eval_reazon"]
 PEAK = 3e-3
@@ -396,8 +397,21 @@ def test_dev_ids_are_a_seeded_pick_of_the_dev_rows(env, tmp_path):
     (ev,) = evs
     assert ev["kind"] == "subset" and ev["split"] == "dev" and ev["ids_sha256"] == rec["ids_sha256"]
     assert "ids" not in ev  # the ids go to dev_ids.json
+    # the selection-order digest is the one make_selection.py full mode's sidecar records for the same pick
+    # (dev.scored_default.ids_sha256 = kitsune.store.ids_sha256 of fullrun.dev_pick's list)
+    sidecar_way = store_ids_sha256(fullrun.dev_pick(zip(dev["id"], dev["source"]), ["src_a", "src_b"], 4, 1234))
+    assert rec["ids_sha256_selection"] == sidecar_way == ev["ids_sha256_selection"]
     assert m.dev_ids(cfg, log)[0] == ids  # deterministic
     assert m.dev_store_name(rec) == f"dev_p4_s1234_{rec['ids_sha256'][:8]}"
+    # the same rows in another order: the same pick and store (the sorted digest), and the selection-order digest
+    # follows the file's order, as that file's sidecar would
+    table = pq.read_table(env["sel"])
+    rev = tmp_path / "reversed.parquet"
+    pq.write_table(table.take(pa.array(range(table.num_rows - 1, -1, -1))), rev)
+    ids_r, rec_r = m.dev_ids(dict(cfg, selection=str(rev)), log)
+    assert ids_r == ids[::-1] and rec_r["ids_sha256"] == rec["ids_sha256"]
+    assert m.dev_store_name(rec_r) == m.dev_store_name(rec)
+    assert rec_r["ids_sha256_selection"] == store_ids_sha256(ids[::-1]) != rec["ids_sha256_selection"]
     cfg2 = copy.deepcopy(cfg)
     cfg2["eval"]["dev"].update(seed=99, per_source=50)  # a larger per_source takes every dev row
     assert sorted(m.dev_ids(cfg2, log)[0]) == sorted(dev["id"])
@@ -422,13 +436,16 @@ def test_setup_data_opens_the_dev_store_and_guards_its_rows(env, tmp_path):
     assert not {u.id for u in R.devstore.utts} & {u.id for u in R.train.utts}
     assert R.devstore.cache_dir.name == m.dev_store_name(rec)
     (ds,) = [e for e in evs if e["kind"] == "dev_store"]
-    assert {k: ds[k] for k in ("name", "n", "n_ids", "per_source", "seed", "ids_sha256", "n_in_train")} == dict(
-        name=m.dev_store_name(rec), n=8, n_ids=8, per_source=4, seed=1234, ids_sha256=rec["ids_sha256"], n_in_train=0)
+    assert {k: ds[k] for k in ("name", "n", "n_ids", "per_source", "seed", "ids_sha256", "ids_sha256_selection",
+                               "n_in_train")} == dict(
+        name=m.dev_store_name(rec), n=8, n_ids=8, per_source=4, seed=1234, ids_sha256=rec["ids_sha256"],
+        ids_sha256_selection=store_ids_sha256(ids), n_in_train=0)
     data = next(e for e in evs if e["kind"] == "data")
     assert data["dev_utts"] == 8 and data["stores_reused"] == {"train": False, "eval": False, "dev": False}
     assert set(data["dev_per_source"]) == {"src_a", "src_b"}
     got = json.loads((tmp_path / "dev_ids.json").read_text(encoding="utf-8"))
-    assert got == dict(seed=1234, per_source=4, ids_sha256=rec["ids_sha256"], ids=rec["ids"])
+    assert got == dict(seed=1234, per_source=4, ids_sha256=rec["ids_sha256"],
+                       ids_sha256_selection=rec["ids_sha256_selection"], ids=rec["ids"])
     assert R.st["dev"] == dict(ids_sha256=rec["ids_sha256"], n_ids=8, per_source=4, n=8,
                                store_ids_sha256=m._ids_sha256(ids))
     # the same rows again (a resume): fine, and every store is a reused cache now (the token stores say so too)
@@ -538,6 +555,7 @@ def test_dev_evals_change_no_training_number(env):
     assert ds["n_in_train"] == 0 and ds["n"] == 8
     ids = json.loads((b / "dev_ids.json").read_text(encoding="utf-8"))
     assert ids["ids_sha256"] == ds["ids_sha256"] and sum(len(v) for v in ids["ids"].values()) == 8
+    assert ids["ids_sha256_selection"] == ds["ids_sha256_selection"]
     assert not any(e["kind"] == "early_stop" for e in events(b))
     from kitsune.runlog import load_tag_map
 
