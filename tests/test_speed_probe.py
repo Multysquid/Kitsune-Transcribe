@@ -423,3 +423,28 @@ def test_the_probe_beats_its_heartbeat(monkeypatch, tmp_path):
     sp.probe(RecordingRunner([]), [np.zeros(16000, np.float32)] * 3, [1.0, 2.0, 0.5], ["a"] * 3, torch.device("cpu"),
              batch_s=6.0, warmup=1, warmup_1=1, latency_n=2)
     assert hb.is_file()
+
+
+def test_quant_after_the_runners_bf16_cast(env):
+    """--dtype auto on CUDA is bf16: the runner casts the whole student (BatchNorm statistics included) before
+    load_runner quantises it. Every packed format loads that way (here emulated on CPU with --dtype bf16), its
+    BatchNorm statistics stay the runner's bf16 ones, the deployable bytes are below the fp32 record's, and a decode
+    under bf16 autocast (the runner's amp on CUDA) calls every quantised layer."""
+    from torch import nn
+
+    from kitsune import quant as Q
+
+    store = trainset.load_stores(env["store_dir"])
+    cpu = torch.device("cpu")
+    base, _ = sp.load_runner("ctc", str(env["ctc"]), cpu, "fp32", store, sp.TEACHER_REVISION)
+    for fmt in ("int8-w8a16", "int8-w8a8", "nvfp4-w4a16", "nvfp4-w4a4", "mxfp4-w4a4", "fp8-w8a8"):
+        runner, _ = sp.load_runner("ctc", str(env["ctc"]), cpu, "bf16", store, sp.TEACHER_REVISION,
+                                   quant=dict(fmt=fmt, impl="emulate", scope="linear+pw", mx_rounding="rceil"))
+        bns = [m for m in runner.model.modules() if isinstance(m, nn.BatchNorm1d)]
+        assert bns and all(m.running_mean.dtype == torch.bfloat16 for m in bns)
+        assert runner.quant["format"] == fmt and runner.weights_bytes < base.weights_bytes
+        runner.amp = torch.bfloat16  # _amp's CUDA value: autocast casts the fp32 features to the bf16 model's dtype
+        with runner.context():
+            hyps = runner.decode([store.wave(0), store.wave(1)], [float(u.duration) for u in store.utts[:2]], [1, 1])
+        assert len(hyps) == 2 and Q.uncalled(runner.model) == []
+

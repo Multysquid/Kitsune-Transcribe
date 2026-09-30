@@ -277,6 +277,61 @@ def test_apply_emulate_every_format_ctc_and_aed(fmt):
             Q.apply(m, fmt)
 
 
+def bf16_out(model) -> torch.Tensor:
+    """A forward of a model cast to bf16 as a whole (bf16 inputs, no autocast): the CTC log-probs, or the AED's
+    decoder states."""
+    from kitsune import ctc_student as CS
+
+    if hasattr(model, "ctc_head"):
+        feats, mask = ctc_batch()
+        with torch.no_grad():
+            return CS.ctc_log_probs(model, feats.to(torch.bfloat16), mask)[0]
+    g = torch.Generator().manual_seed(2)
+    feats = torch.randn(2, 120, 128, generator=g).to(torch.bfloat16)
+    dec = torch.tensor([[13764, 7, 4, 16, 98, 98, 5, 9], [13764, 7, 4, 16, 98, 98, 5, 2]])
+    with torch.no_grad():
+        return model.model(input_features=feats, attention_mask=torch.ones(2, 120, dtype=torch.long),
+                           decoder_input_ids=dec, decoder_attention_mask=(dec != 2).long(),
+                           use_cache=False).last_hidden_state
+
+
+@pytest.mark.parametrize("fmt", PACKED)
+def test_apply_on_a_bf16_cast_model(fmt):
+    """speed_probe's runners cast the whole model to bf16 before quantising (--dtype auto on CUDA), BatchNorm
+    statistics included: apply takes the model as it is, leaves those bf16 statistics bitwise unchanged,
+    assert_quantized passes, and a bf16 forward is finite and calls every quantised layer (CTC and AED)."""
+    for make in (tiny_ctc, tiny_aed):
+        m = patched(make().to(torch.bfloat16))
+        bn = {n: (b.running_mean.clone(), b.running_var.clone()) for n, b in m.named_modules()
+              if isinstance(b, nn.BatchNorm1d)}
+        assert bn and all(v[0].dtype == torch.bfloat16 for v in bn.values())
+        rec = Q.apply(m, fmt, impl="emulate")
+        assert torch.isfinite(bf16_out(m)).all() and Q.uncalled(m) == []
+        for n, b in m.named_modules():
+            if isinstance(b, nn.BatchNorm1d):
+                assert b.running_mean.dtype == torch.bfloat16 and torch.equal(b.running_mean, bn[n][0])
+                assert torch.equal(b.running_var, bn[n][1])
+        Q.assert_quantized(m, rec)
+
+
+def test_assert_quantized_catches_a_changed_bn_statistic():
+    """A BatchNorm statistic that changes after apply, in value or in dtype, fails assert_quantized."""
+    m = tiny_ctc()
+    rec = Q.apply(m, "int8-w8a16")
+    bn = m.encoder.layers[0].conv.norm
+    kept = bn.running_mean.clone()
+    with torch.no_grad():
+        bn.running_mean[0] += 1.0
+    with pytest.raises(Q.QuantError, match=r"conv\.norm\.running_mean: the BatchNorm statistic changed"):
+        Q.assert_quantized(m, rec)
+    with torch.no_grad():
+        bn.running_mean.copy_(kept)
+    Q.assert_quantized(m, rec)
+    bn.running_var = bn.running_var.to(torch.bfloat16)
+    with pytest.raises(Q.QuantError, match=r"running_var: .*bfloat16, was torch\.float32"):
+        Q.assert_quantized(m, rec)
+
+
 def test_relpos_patch_routes_through_quantlinear():
     """With the rel-pos patch, relative_k_proj's quantised forward runs once per call (not the base Linear's), the
     outputs equal the unpatched quantised model's, and a stride-0 input is projected once."""

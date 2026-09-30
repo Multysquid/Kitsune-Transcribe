@@ -74,7 +74,8 @@ decision 19) adds the pointwise_conv1/2 of every ParakeetEncoderConvolutionModul
 Conv1d(k=1), nor the subsampling's Conv2d(k=1)). A layer whose shape the format's kernels cannot take (K % 16 for
 nvfp4, K % 32 for mxfp4, K or N % 8 for int8/fp8) is `skipped` with the reason and stays 16-bit. Kept as they are: the
 heads (ctc_head is read in fp32 at eval), the embeddings, the subsampling and depthwise convolutions, the norms, the
-BatchNorm (its fp32 running statistics never change) and the attention's rel-pos biases.
+BatchNorm (its running statistics never change: fp32 from a master, bf16 after speed_probe's whole-model cast)
+and the attention's rel-pos biases.
 
 Variant dir (export; load_quantized reads it back, verify_export checks it):
   model.safetensors   plain tensors (no pickle). Every tensor that is not a quantised layer's weight under its HF key
@@ -645,7 +646,7 @@ def _kept_reason(name: str, m: nn.Module) -> str:
     if isinstance(m, nn.Conv1d):
         return "depthwise conv" if m.groups > 1 else "pointwise conv (scope linear)"
     if isinstance(m, nn.modules.batchnorm._BatchNorm):
-        return "batchnorm (fp32 running statistics, never changed)"
+        return "batchnorm (running statistics never changed)"
     if isinstance(m, nn.LayerNorm):
         return "norm"
     if isinstance(m, nn.Linear):
@@ -714,8 +715,11 @@ def model_family(model: nn.Module) -> str:
     raise QuantError(f"{name}: only the students (ParakeetForCTC, CohereAsrForConditionalGeneration) are quantised")
 
 
-def _bn_snapshot(model: nn.Module) -> dict[str, tuple]:
-    return {n: tuple(t.detach().clone() for t in (m.running_mean, m.running_var) if t is not None)
+def _bn_snapshot(model: nn.Module) -> dict[str, dict[str, torch.Tensor]]:
+    """Every BatchNorm's running statistics as they are (their dtype included): apply and load_quantized take it
+    before they touch the model, assert_quantized compares against it."""
+    return {n: {k: t.detach().clone() for k in ("running_mean", "running_var")
+                if (t := getattr(m, k, None)) is not None}
             for n, m in model.named_modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)}
 
 
@@ -893,15 +897,21 @@ def assert_quantized(model: nn.Module, recipe: dict) -> None:
     """Raise QuantError unless the model is what the recipe says: every recipe layer a QuantLinear of the format (a
     torchao weight a tensor subclass, an emulated one a plain fp32 Parameter), every relative_k_proj quantised or
     skipped and reaching its quantised forward, the heads plain tensors and the tie intact, the BatchNorm statistics
-    fp32 and bitwise unchanged, no in-scope Linear left behind (fp16: the fp16 tensors fp16, norms and BN fp32)."""
+    bitwise unchanged in the dtype they had when apply / load_quantized snapshotted them (fp32 from a master or a
+    variant dir; bf16 when speed_probe's runner cast the whole model before quantising, the study's timing
+    convention: apply never changes them either way), no in-scope Linear left behind (fp16: the fp16 tensors fp16,
+    norms and BN fp32)."""
     fmt = recipe["format"]
     problems = []
     state = getattr(model, "_kitsune_quant", None) or {}
-    for name, (mean, var) in (state.get("bn") or {}).items():
+    for name, snap in (state.get("bn") or {}).items():
         m = model.get_submodule(name)
-        if m.running_mean.dtype != torch.float32 or not (torch.equal(m.running_mean, mean)
-                                                          and torch.equal(m.running_var, var)):
-            problems.append(f"{name}: BatchNorm statistics changed or not fp32")
+        for k, want in snap.items():
+            got = getattr(m, k, None)
+            if got is None or got.dtype != want.dtype or not torch.equal(got, want):
+                problems.append(f"{name}.{k}: the BatchNorm statistic changed (" + (
+                    "gone" if got is None else f"{got.dtype}, was {want.dtype}" if got.dtype != want.dtype
+                    else "other values") + ")")
     if (recipe.get("tied") or {}).get("proj_out.weight") and model.proj_out.weight is not \
             model.model.decoder.embed_tokens.weight:
         problems.append("proj_out.weight is no longer tied to model.decoder.embed_tokens.weight")
