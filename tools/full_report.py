@@ -78,14 +78,15 @@ output has none (flag K1 over 1 %).
 Speed, per system: its own record in the chart group; else a full-data row takes its study weights' record (flag S1:
 same shape, same code); else a record from another group (S3). A full-data AED row whose readout emits more than 5 %
 more or fewer tokens on the 200 speed ids than the timed study weights did gets S2, and then its speed is the chart
-group's study-t06 record times the full-t06 / study-t06 ratio of box full's re-time pair (the two timed on one machine
-at one time), labelled so. Its quantised variants, which decode the same tokens, take the same bf16 ratio (the pair is
-bf16 only; labelled so), so a variant and its bf16 row stay on one basis: the chart's joins and the quantisation
-table's "x bf16 speed" compare like with like (speed.unscaled keeps the record's own numbers). MXFP4 and emulated
-variants have no speed ("n/a (simulated)", S4). File size, in order: study.json quant.file_bytes, quant.weights_bytes
-(a variant scored from memory: never its bf16 checkpoint's weights.file_bytes; WP5 writes it as {deployable, quantized,
-kept}, and deployable is what the exporter would write), weights.file_bytes, whisper.json model.weights_file_bytes,
-else the speed record's in-memory weights_bytes (both in-memory sources are marked so).
+group's study-t06 record times the full-t06 / study-t06 ratio of box full's re-time pair (the two timed in one speed
+file: one machine, one time; box full's group, or the chart group itself when box full rented the chart's machine and
+full-t06 has its own record there), labelled so. Its quantised variants, which decode the same tokens, take the same
+bf16 ratio (the pair is bf16 only; labelled so), so a variant and its bf16 row stay on one basis: the chart's joins and
+the quantisation table's "x bf16 speed" compare like with like (speed.unscaled keeps the record's own numbers). MXFP4
+and emulated variants have no speed ("n/a (simulated)", S4). File size, in order: study.json quant.file_bytes,
+quant.weights_bytes (a variant scored from memory: never its bf16 checkpoint's weights.file_bytes; WP5 writes it as
+{deployable, quantized, kept}, and deployable is what the exporter would write), weights.file_bytes, whisper.json
+model.weights_file_bytes, else the speed record's in-memory weights_bytes (both in-memory sources are marked so).
 
 Outputs (--out, written atomically): report.json; report.md (the offer table first, then study -> full, quantisation,
 Whisper with its seven caveats verbatim from plan v3 section 7, the charts, hallucinations, per-set CERs, the flags,
@@ -398,11 +399,14 @@ def load_readouts(dirs, man: ss.Manifest) -> tuple[dict, dict]:
                 continue
             durations, ntok = {}, {}
             for df in frames.values():
+                # a null or non-numeric cell is unknown for that row (never a crash: the counts that need it skip it)
                 ids = df["id"].astype(str).tolist()
                 if "duration" in df.columns:
-                    durations.update(zip(ids, df["duration"].astype(float).tolist()))
+                    durations.update((i, float(v)) for i, v in zip(ids, pd.to_numeric(df["duration"], errors="coerce"))
+                                     if math.isfinite(v))
                 if "n_tok" in df.columns:
-                    ntok.update(zip(ids, df["n_tok"].astype(int).tolist()))
+                    ntok.update((i, int(v)) for i, v in zip(ids, pd.to_numeric(df["n_tok"], errors="coerce"))
+                                if math.isfinite(v))
             summ = hit / "summary.json"
             wj = hit / "whisper.json"
             sets = sorted(set(table["set"].astype(str)))
@@ -811,14 +815,15 @@ def speed_fields(rec: dict) -> dict:
 
 
 def retime_pair(sp: dict, full: str, study: str) -> tuple[str, dict, dict] | None:
-    """Box full's re-time pair (decision 22): a group other than the chart group that timed both the full-data and
-    the study weights (the newest such group); None without one."""
+    """Box full's re-time pair (decision 22): the full-data and the study weights timed by one box launch, so in one
+    speed file (runs/speed-<box>-<stamp>: one machine, one time) and one group; the newest such pair, None without one.
+    Any group counts, the chart group too: when box full rented the chart's machine, full-t06 has its own record there
+    and only its variants, which fall back to their study variants, need the ratio."""
     best = None
     for g in sorted(sp["groups"]):
-        if g == sp["primary"]:
-            continue
         a, b = sp["records"].get((g, full)), sp["records"].get((g, study))
-        if a and b and (best is None or str(a.get("time_utc") or "") > str(best[1].get("time_utc") or "")):
+        if a and b and a["_file"] == b["_file"] and (
+                best is None or str(a.get("time_utc") or "") > str(best[1].get("time_utc") or "")):
             best = (g, a, b)
     return best
 
@@ -878,8 +883,8 @@ def resolve_speed(system: str, inf: dict, sp: dict, drift: dict | None) -> dict:
                                  note=f"{n}'s chart-group record x the {full}/{stu} ratio timed in {pg}"
                                       + (" (the bf16 pair's ratio, applied to the variant)" if full != system else ""))
         else:
-            out["retime"] = dict(group=None, note="no re-time pair (box full's speed-full-t06 / speed-study-t06) "
-                                                  "in another group: the study weights' speed is shown")
+            out["retime"] = dict(group=None, note="no re-time pair (box full's speed-full-t06 and speed-study-t06 "
+                                                  "in one speed file): the study weights' speed is shown")
     return out
 
 

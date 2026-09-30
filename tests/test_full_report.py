@@ -731,14 +731,64 @@ def test_s2_retime_keeps_variants_on_the_bf16_basis_and_chart_twins(world, tmp_p
     assert "P-0.3B full NVFP4 W4A4" in nd and "P-0.3B study NVFP4 W4A4" not in nd
 
 
+def test_s2_retime_pair_on_the_chart_machine(world, tmp_path):
+    """Box full rented the chart group's machine: full-t06 has its own record there (no S1, no S2) and box full's
+    speed-study-t06 re-time, newer and in the same file, stands for study-t06. A full-t06 variant still falls back to
+    its study variant (S1) with S2, so it takes that same-file pair's ratio from the chart group: its "x bf16 speed"
+    and its join stay on one basis. A pair from two files (two launches) is not a re-time pair."""
+    t, ids, refs = world["T"], world["ids"], world["refs"]
+    runs = tmp_path / "runs"
+    write_tables(tmp_path / "tables", {s: t[s] for s in ("cohere", "study-t06")})
+    h = noisy(refs, 0.095, 26)
+    write_readout(runs, "m4-full-t06", "full-t06", greedy=greedy_frames(ids, refs, h, n_tok=15), family="aed")
+    write_readout(runs, "quant-int8-w8a8-full-t06", "full-t06@int8-w8a8", text_table(ids, refs, h), family="aed",
+                  quant=dict(format="int8-w8a8", impl="torchao", simulated=False, source="file",
+                             base_system="full-t06", file_bytes=700_000_000))
+    sp_ids = world["sp_ids"]
+    a = write_speed(runs / SMOKE_A / "speed.json", sp_ids, {
+        "study-t06": srec(0.002, tokens=10.0, kind="aed", p50_s=0.06, t="2026-10-01T06:00:00+00:00"),
+        "cohere": srec(0.002, kind="cohere", t="2026-10-01T06:10:00+00:00")})
+    b = write_speed(runs / SMOKE_B / "speed.json", sp_ids, {
+        "study-t06@int8-w8a8": srec(0.0008, kind="aed", p50_s=0.032, t="2026-10-02T03:00:00+00:00")})
+    full = write_speed(runs / "speed-full-20261005T000000Z" / "speed.json", sp_ids, {
+        "full-t06": srec(0.003, p50_s=0.09, kind="aed", t="2026-10-05T01:00:00+00:00"),
+        "study-t06": srec(0.002, p50_s=0.06, tokens=10.0, kind="aed", t="2026-10-05T01:10:00+00:00")})
+    base = ["--manifest", world["man"], "--prereg", "none", "--tables", tmp_path / "tables", "--readouts", runs,
+            "--boot-b", 200]
+    rc, rep = run(base + ["--speed", a, b, full], tmp_path / "out")
+    assert rc == 0 and list(rep["speed_groups"]["groups"]) == [PRIMARY]
+    sp = {s: v["speed"] for s, v in rep["systems"].items()}
+    assert sp["full-t06"]["flags"] == [] and sp["full-t06"]["rtf"] == pytest.approx(0.003)
+    assert sp["study-t06"]["file"] == str(full)  # box full's re-time replaces smoke A's record (newer, listed)
+    v = sp["full-t06@int8-w8a8"]
+    assert v["flags"] == ["S1", "S2"] and v["retime"]["group"] == PRIMARY
+    assert v["rtf"] == pytest.approx(0.0008 * 1.5) and v["unscaled"]["rtf"] == pytest.approx(0.0008)
+    md = (tmp_path / "out" / "report.md").read_text(encoding="utf-8")
+    quant = md[md.index("## Quantisation"):md.index("## Charts")].splitlines()
+    head = next(ln for ln in quant if ln.startswith("| variant |"))
+    row = next(ln for ln in quant if ln.startswith("| T-0.6B full INT8 W8A8 |"))
+    col = [c.strip() for c in head.split("|")].index("x bf16 speed")
+    assert row.split("|")[col].strip() == "2.50"  # 0.002 / 0.0008: the study weights' own ratio
+    # full-t06 timed by one launch and study-t06 only by another: no re-time pair, the study speed is shown as it is
+    lone = write_speed(runs / "speed-full-20261006T000000Z" / "speed.json", sp_ids, {
+        "full-t06": srec(0.003, p50_s=0.09, kind="aed", t="2026-10-06T01:00:00+00:00")})
+    rc, rep = run(base + ["--speed", a, b, lone], tmp_path / "out2")
+    v = rep["systems"]["full-t06@int8-w8a8"]["speed"]
+    assert rc == 0 and v["flags"] == ["S1", "S2"] and v["retime"]["group"] is None
+    assert v["rtf"] == pytest.approx(0.0008) and "unscaled" not in v
+
+
 def test_greedy_set_refused_like_05(world, tmp_path):
     """A greedy-only readout with one set whose rows are not its manifest ids: that set is refused for that system
-    (05's tables_from_frames rule), listed, and the report is written with the other sets."""
+    (05's tables_from_frames rule), listed, and the report is written with the other sets. A null n_tok or duration
+    is unknown for that row, never a crash."""
     t, ids, refs = world["T"], world["ids"], world["refs"]
     runs = tmp_path / "runs"
     h = noisy(refs, 0.08, 40)
     fr = greedy_frames(ids, refs, h)
     fr["eval_cv8"] = fr["eval_cv8"].iloc[1:]
+    j = fr["eval_jsut"]
+    fr["eval_jsut"] = j.assign(n_tok=[None, *j["n_tok"].tolist()[1:]], duration=[None, *j["duration"].tolist()[1:]])
     write_readout(runs, "m4-full-p03", "full-p03", greedy=fr, family="ctc")
     write_tables(tmp_path / "tables", {"parakeet-ctc": t["parakeet-ctc"]})
     rc, rep = run(["--manifest", world["man"], "--prereg", "none", "--tables", tmp_path / "tables", "--readouts",
