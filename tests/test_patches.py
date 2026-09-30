@@ -285,3 +285,35 @@ def test_sdpa_backend_report_cpu(monkeypatch):
                         lambda q, k, v, attn_mask=None, **kw: real(q, k, v, attn_mask=attn_mask, **kw) * float("nan"))
     rep = sdpa_backend_report(device="cpu", dtype=torch.float32)
     assert rep["encoder_usable"]["math"] is not True and rep["decoder_usable"]["math"] is not True
+
+
+def test_patch_calls_the_subclass_forward():
+    """The rel-pos patch projects through the module's own class forward (type(self).forward), so a Linear subclass
+    swapped in place (kitsune.quant.QuantLinear: padding, fake-quantised activations, counters) runs on
+    relative_k_proj too: once per call on the stride-0 batch (row 0 only), once per call otherwise; a plain
+    nn.Linear's outputs are unchanged (the parity tests above)."""
+    class Counting(nn.Linear):
+        calls = 0
+        rows = 0
+
+        def forward(self, x):
+            type(self).calls += 1
+            type(self).rows += x.shape[0]
+            return super().forward(x)
+
+    model = tiny_model().eval()
+    batch = padded_batch()
+    with torch.no_grad():
+        ref = logits_of(model, batch)
+    for layer in model.model.encoder.layers:
+        layer.self_attn.relative_k_proj.__class__ = Counting
+    unpatch = patch_relpos_once_per_batch(model)
+    with torch.no_grad():
+        out = logits_of(model, batch)
+    assert Counting.calls == LAYERS and Counting.rows == LAYERS  # each layer: one call on the one row
+    unpatch()
+    with torch.no_grad():
+        again = logits_of(model, batch)
+    B = batch["input_features"].shape[0]
+    assert Counting.calls == 2 * LAYERS and Counting.rows == LAYERS + LAYERS * B  # unpatched: the whole batch
+    assert torch.allclose(out, ref, atol=1e-4, rtol=0) and torch.equal(again, ref)

@@ -78,11 +78,45 @@ pre-register):
 python -m kitsune.prereg --write study/ --sidecar <selection>.json then fills the PREREG's pending fields; it takes only
 the pre-registered selection (recipe, seed, sources, eval sets, extent and the rule's reazon_large cap).
 
+The full-data runs (a `selection_recipe.full_study` block, kitsune.fullrun.FULL_STUDY: kitsune.fullrun.FULL_DATA for
+labels/full/selections/full_study/full.parquet, SMOKE_DATA for smoke.parquet) keep every kept hour of the label root
+(no draw; the smoke draws 100 h) and hold out a dev slice for the trainer's early stop (kitsune/devslice.py). The rules
+are the study's, computed on split in {train, eval} BEFORE any row becomes dev, then the dev slice; first match wins:
+  (F0)             truncated / no_agree / agree>A / no_audio, as above
+  not_in_parakeet  as the study's. K5: more than kitsune.prereg.ONE_ROOT_MAX_FRAC (0.1 %) of the train rows -> the
+                   per-source and per-stem counts are printed, nothing is written, exit 3; any eval row -> refused (K6)
+  f1a_disagree, eval_dup, ctc_infeasible   as the study's (full_study's f1a_max, dedup_min_chars)
+  (eval rows)      the kept eval rows of every set, in selection order, must be the frozen study manifest's ids
+                   (--manifest, sha fullrun.FROZEN_MANIFEST_SHA256) in order, else refused: the M4 readout of every
+                   full run scores exactly the study's rows. The manifest is referenced, never copied or written
+  (dev draw)       kitsune.devslice.draw: every row of a seeded shard pair (reazon_small, reazon_large, galgame) or of
+                   seeded whole Emilia videos gets split "dev" and keeps its reason (keep only for `kept`). It is drawn
+                   right after F0 (it reads no reason; Emilia videos count every teacher_out train row) and applied
+                   here, so an extent it cannot serve fails before the Parakeet reads; a shards source with fewer
+                   than 4 train stems in the extent is refused from the extent record, before any row is read
+  dev_buffer       a live train row of the shard before or after a dev pair
+  dev_dup          a live train row whose normalised reference, Cohere hyp or Parakeet ctc_hyp equals the normalised
+                   reference, Cohere hyp or ctc_hyp (>= dedup_min_chars) of a kept dev row
+  not_drawn        only with full_study.draw_audio_s (the smoke): draw_budget over the live train rows, tag full:draw
+  kept
+The probe is probe_n kept train rows per source (tag train:<source>), the greedy subsets greedy_n kept eval rows per
+set (eval:<set>): with the manifest's eval rows, seed 1234 (kitsune.prereg.SELECTION_SEED) and greedy_n 500
+(kitsune.devslice.GREEDY_N) they are the study's, so another --seed or --greedy-n is refused. Written (deterministic, no
+timestamps and no machine paths): the parquet (the columns above; metadata args = FULL_ARGS + config_roots,
+extent_record_sha256, manifest_sha256, labels_complete_digest) and <selection stem>.json, the sidecar (kind
+"full_study": the files' hashes, the recipe, hours per stage and source, the K5 count, the dev slice per source, the
+draw, n and ids_sha256 of train/dev/probe/eval, the teachers' baselines on the manifest rows; kitsune.devslice.
+sidecar_problems checks it at launch). Exit 0 written, 3 K5 over the limit, 1 refused (the config's recipe and extent
+problems included), 2 bad arguments.
+
 Usage:
   python scripts/make_selection.py --config configs/viability.json       # the viability run's selection
   python scripts/make_selection.py --sources reazon_small --agree-max 0.5 --out selection/reazon_only.parquet
   python scripts/make_selection.py --config configs/full_sub3k.json --from-selection labels/full/selections/full.parquet
   python scripts/make_selection.py --config study/data.json --skip-audio-check     # the study (labels/full pulled)
+  python scripts/make_selection.py --config data-full.json --labels-root D:/kitsune-labels/full \\
+      --manifest D:/kitsune-study/selections/study_manifest.json --skip-audio-check \\
+      --out D:/stage/labels/full/selections/full_study/full.parquet             # full mode (data-full.json: FULL_DATA)
 """
 import argparse
 from collections.abc import Sequence
@@ -91,7 +125,7 @@ import json
 import sys
 import time
 import zlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -102,6 +136,8 @@ import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
 import kitsune.extent as kextent  # noqa: E402
+from kitsune import devslice  # noqa: E402
+from kitsune import fullrun  # noqa: E402
 from kitsune import prereg as kprereg  # noqa: E402
 from kitsune.parakeet_targets import BLANK as CTC_BLANK  # noqa: E402
 from kitsune.store import SIDECAR_DIR, fsync_path, ids_sha256  # noqa: E402
@@ -691,6 +727,19 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--probe-n", type=int, default=None,
                     help="train probe size per train source (default 500; a study recipe sets its own)")
     ap.add_argument("--skip-audio-check", action="store_true", help="do not look for the audio (no `no_audio` rows)")
+    ap.add_argument("--labels-root", default=None, metavar="DIR",
+                    help="full mode: a local copy of the config's extent.root (teacher_out/, parakeet_out/, "
+                         "second_out/, extent.json, COMPLETE.json): the config's roots and --extent-record are read "
+                         "under it (explicit root flags still win)")
+    ap.add_argument("--manifest", default=None, metavar="PATH",
+                    help="full mode (required): the frozen study manifest (labels/full/selections/study_manifest.json) "
+                         "the eval rows must equal")
+    ap.add_argument("--manifest-sha256", default=None, metavar="HEX",
+                    help="full mode: the manifest's expected sha256 (default kitsune.fullrun.FROZEN_MANIFEST_SHA256; "
+                         "for tests)")
+    ap.add_argument("--study-selection", default=None, metavar="PATH",
+                    help="full mode, report only: compare the greedy subsets (and, when its sidecar is next to it, "
+                         "the baselines) with this frozen study selection's")
     args = ap.parse_args(argv)
     recipe_flags = ("sources", "eval_sets", "agree_max", "agree_max_source", "filter_eval_sets",
                     "partial_second_opinion")
@@ -708,6 +757,7 @@ def main(argv: list[str] | None = None):
         args.filter_eval_sets = list(recipe["filter_eval_sets"])
         args.partial_second_opinion = list(recipe.get("partial_second_opinion", []))
         args.study = recipe.get("study")
+        args.full_study = recipe.get("full_study")
         args.out = args.out or str(_repo_path(cfg.get("selection", "selection/viability.parquet")))
     elif not args.sources:
         ap.error("--sources is required (or --config)")
@@ -717,7 +767,14 @@ def main(argv: list[str] | None = None):
         args.agree_max_source, args.filter_eval_sets = args.agree_max_source or [], args.filter_eval_sets or []
         args.partial_second_opinion = args.partial_second_opinion or []
         args.study = None  # the study recipe lives in a run config only (vast/launch.py checks it there)
+        args.full_study = None  # and so does the full runs' one
         args.out = args.out or str(ROOT / "selection" / "viability.parquet")
+    full = None
+    if args.full_study is not None:
+        full = full_setup(args, cfg)  # its refusals exit 1, before any heavy work; --labels-root fills the roots
+    elif given := [f"--{k.replace('_', '-')}" for k in ("labels_root", "manifest", "manifest_sha256", "study_selection")
+                   if getattr(args, k) is not None]:
+        ap.error(f"{' '.join(given)}: only for a config with selection_recipe.full_study")
     # the roots: explicit flags win, then the config's (the viability config's are these defaults)
     for flag, key, default in (("teacher_out", "teacher_root", "teacher_out"),
                                ("second_out", "second_root", "second_out"), ("data", "data_root", "data"),
@@ -739,19 +796,22 @@ def main(argv: list[str] | None = None):
     else:
         args.probe_n = 500 if args.probe_n is None else args.probe_n
 
+    # a full config's recipe and extent problems are refusals (exit 1, contract 1.5), not argument errors (exit 2):
+    # they come from the config and the label root, never from a flag
+    fail = _refuse if full is not None else ap.error
     by_source = {}
     for item in args.agree_max_source:
         src, _, val = item.partition("=")
         if not val:
-            ap.error(f"--agree-max-source expects SOURCE=A, got {item!r}")
+            fail(f"--agree-max-source expects SOURCE=A, got {item!r}")
         by_source[src] = float(val)
     if set(args.filter_eval_sets) & set(EVAL_SETS):
-        ap.error(f"the gate sets {EVAL_SETS} are never label-filtered")
+        fail(f"the gate sets {EVAL_SETS} are never label-filtered")
     unknown = set(by_source) - set(args.sources) - set(args.filter_eval_sets)
     if unknown:
-        ap.error(f"--agree-max-source for sources not in --sources: {sorted(unknown)}")
+        fail(f"--agree-max-source for sources not in --sources: {sorted(unknown)}")
     if stray := set(args.partial_second_opinion) - set(args.sources) - set(args.filter_eval_sets):
-        ap.error(f"--partial-second-opinion for sources not in --sources: {sorted(stray)}")
+        fail(f"--partial-second-opinion for sources not in --sources: {sorted(stray)}")
 
     # the extent: only its subset's stems, from the label run's record
     ext, stems, record = kextent.extent_block(cfg), None, None
@@ -760,11 +820,17 @@ def main(argv: list[str] | None = None):
         ap.error("--extent-record needs a --config with an extent block")
     if ext is not None:
         if problems := kextent.validate(cfg):
-            ap.error(f"{args.config}: " + "; ".join(problems))
+            fail(f"{args.config}: " + "; ".join(problems))
         rec_path = Path(args.extent_record) if args.extent_record else _repo_path(ext["root"]) / kextent.RECORD_FILE
-        record = kextent.load_record(rec_path)
+        if full is not None:  # a missing or foreign record under --labels-root: a refusal, not a traceback
+            try:
+                record = kextent.load_record(rec_path)
+            except (OSError, ValueError) as e:
+                _refuse(f"{rec_path}: {e}")
+        else:
+            record = kextent.load_record(rec_path)
         if problems := kextent.record_problems(record, cfg):
-            ap.error(f"{rec_path}: " + "; ".join(problems))
+            fail(f"{rec_path}: " + "; ".join(problems))
         stems = kextent.subset_stems(record, cfg)
 
     t0 = time.time()
@@ -799,6 +865,8 @@ def main(argv: list[str] | None = None):
             ap.error(f"{base_p}: {e}")
         args.from_selection = dict(path=str(base_p), sha256=file_sha256(base_p))
         sel.attrs["n_no_audio_any"] = 0
+    elif full is not None:  # before the study: a full selection never reaches study_main (it writes a manifest)
+        return full_main(args, cfg, by_source, stems, record, full, t0)
     elif args.study is not None:
         return study_main(args, cfg, by_source, stems, record, t0)
     else:
@@ -904,5 +972,454 @@ def study_main(args, cfg: dict, by_source: dict, stems, record, t0: float) -> in
     return 0
 
 
+# ------------------------------------------------------------------------------------------ the full-data runs
+
+
+# the full selection's recorded arguments (launch compares the recipe ones with the run config); STUDY_ARGS stays the
+# study's (tests/test_study_selection.py pins it), so this is its own tuple
+FULL_ARGS = ("sources", "eval_sets", "agree_max", "agree_max_source", "filter_eval_sets", "partial_second_opinion",
+             "study", "full_study", "extent", "seed", "greedy_n", "probe_n", "skip_audio_check", "from_selection")
+FULL_STAGES = ("teacher_out", "candidates", "after_f0", "after_f1a", "after_dedup", "after_ctc", "after_dev",
+               "after_dev_dup", "drawn")
+LEAVE_SHARE_WARN = (0.002, 0.01)  # the dev slice's share of the pool outside this range is printed as a warning
+
+
+def _refuse(msg: str):
+    raise SystemExit(f"full selection: {msg}")
+
+
+def _isin(ids: np.ndarray, values) -> np.ndarray:
+    """ids (an object array) in `values`, by hash (np.isin would sort millions of strings)."""
+    return pd.Series(ids).isin(set(values)).to_numpy()
+
+
+def full_setup(args, cfg: dict) -> dict:
+    """The full mode's refusals, before any heavy work (SystemExit: exit 1), and its inputs: --labels-root maps the
+    config's roots (and the extent record) from extent.root onto the local copy; the label root must be sealed
+    (COMPLETE.json); the manifest must have the expected sha and the config's eval sets in the config's order. Sets
+    args.probe_n from the recipe. Returns {manifest, manifest_sha256, labels_complete_digest, label_root}."""
+    fs = args.full_study
+    if args.study is not None:
+        _refuse("selection_recipe.study and selection_recipe.full_study are exclusive")
+    if problems := fullrun.full_recipe_problems(fs):
+        _refuse("; ".join(problems))
+    if kextent.extent_block(cfg) is None:
+        _refuse("the config has no extent block: a full selection is built from a sealed label root's extent")
+    if problems := kextent.validate(cfg):
+        _refuse(f"{args.config}: " + "; ".join(problems))
+    if args.from_selection:
+        _refuse("--from-selection: a full selection reads parakeet_out, which no selection records; build it from "
+                "scratch")
+    if args.probe_n is not None:
+        _refuse(f"the full recipe sets probe_n ({fs['probe_n']}); drop --probe-n")
+    if args.filter_eval_sets or args.partial_second_opinion:
+        _refuse("a full recipe keeps every eval row in both roots (filter_eval_sets []) and judges every shard "
+                "(partial_second_opinion [])")
+    if bad := [s for s in args.sources if s not in devslice.DEV_METHOD]:
+        _refuse(f"train sources {bad} have no dev-slice method (kitsune.devslice.DEV_METHOD)")
+    # the dev draw, the probe and the greedy subsets hang on these two: the study's, so the greedy subsets are the
+    # frozen study selection's (launch refuses a selection that records others)
+    if args.seed != kprereg.SELECTION_SEED:
+        _refuse(f"--seed {args.seed}: a full selection is built with the study's seed {kprereg.SELECTION_SEED} "
+                f"(kitsune.prereg.SELECTION_SEED); drop --seed")
+    if args.greedy_n != devslice.GREEDY_N:
+        _refuse(f"--greedy-n {args.greedy_n}: a full selection's greedy subsets are {devslice.GREEDY_N} eval rows per "
+                f"set, the study's (kitsune.devslice.GREEDY_N); drop --greedy-n")
+    sel_rel = str(cfg.get("selection") or "")
+    if not sel_rel.startswith(fullrun.FULL_DIR + "/") or sel_rel == kprereg.SELECTION_FILE:
+        _refuse(f"the config's selection {sel_rel!r} is not under {fullrun.FULL_DIR}/ (the frozen study files stay "
+                f"as they are)")
+    out = Path(args.out)
+    if out.name == PurePosixPath(kprereg.SELECTION_FILE).name:
+        _refuse(f"--out {out} is named like the frozen study selection")
+    if not out.resolve().as_posix().endswith("/" + sel_rel):
+        _refuse(f"--out {out} does not end in the config's selection {sel_rel} (the sidecar records that path, and "
+                f"the upload keeps the layout)")
+    if (out.parent / kprereg.MANIFEST_FILE).exists():
+        _refuse(f"{out.parent} holds a {kprereg.MANIFEST_FILE}: the full mode never writes next to the frozen study "
+                f"files")
+    root_rel = PurePosixPath(kextent.extent_block(cfg)["root"])
+    if args.labels_root:
+        label_root = Path(args.labels_root)
+        for flag, key in (("teacher_out", "teacher_root"), ("second_out", "second_root"),
+                          ("parakeet_out", "parakeet_root")):
+            if getattr(args, flag) is None and cfg.get(key):
+                setattr(args, flag, str(label_root / PurePosixPath(cfg[key]).relative_to(root_rel)))
+        args.extent_record = args.extent_record or str(label_root / kextent.RECORD_FILE)
+    else:
+        label_root = _repo_path(root_rel)
+    complete = label_root / "COMPLETE.json"
+    if not complete.is_file():
+        _refuse(f"no {complete}: the label root is not sealed (or --labels-root is not its copy)")
+    digest = json.loads(complete.read_text(encoding="utf-8")).get("files_digest")
+    if not args.manifest:
+        _refuse(f"--manifest is required: the frozen study manifest ({fullrun.FROZEN_MANIFEST})")
+    man_p = Path(args.manifest)
+    if not man_p.is_file():
+        _refuse(f"no manifest {man_p}")
+    want = args.manifest_sha256 or fullrun.FROZEN_MANIFEST_SHA256
+    if (got := file_sha256(man_p)) != want:
+        _refuse(f"{man_p} has sha256 {got}, not the frozen manifest's {want}")
+    manifest = json.loads(man_p.read_text(encoding="utf-8"))
+    if (sets := list((manifest.get("sets") or {}))) != list(args.eval_sets):
+        _refuse(f"the manifest's sets {sets} are not the config's eval_sets {list(args.eval_sets)} (in that order)")
+    args.probe_n = int(fs["probe_n"])
+    return dict(manifest=manifest, manifest_sha256=got, labels_complete_digest=digest, label_root=label_root)
+
+
+def partial_pull_problems(teacher_root, second_root, parakeet_root, sources, stems: dict[str, set[str]]) -> list[str]:
+    """The label files a full build reads that are missing: every extent stem's teacher and Parakeet npz + jsonl, and
+    every train stem's second_out jsonl. A missing second_out file would silently turn its rows into no_agree, and a
+    missing Parakeet file raise halfway through, so a partly pulled root is refused up front."""
+    teacher_root, second_root, parakeet_root = Path(teacher_root), Path(second_root), Path(parakeet_root)
+    missing = []
+    for name, sts in stems.items():
+        for st in sorted(sts):
+            need = [teacher_root / name / f"{st}{e}" for e in (".npz", ".jsonl")]
+            need += [parakeet_root / name / f"{st}{e}" for e in (".npz", ".jsonl")]
+            need += [second_root / name / f"{st}.jsonl"] if name in sources and st.startswith("train-") else []
+            missing += [p.as_posix() for p in need if not p.is_file()]
+    return missing
+
+
+class K5Exceeded(Exception):
+    """More train rows than kitsune.prereg.ONE_ROOT_MAX_FRAC are in teacher_out only: the Parakeet pass is incomplete
+    (decision 4: stop). .k5 is the sidecar's k5 block, .by_stem the counts per teacher file."""
+
+    def __init__(self, k5: dict, by_stem: dict):
+        super().__init__(f"K5: {k5['not_in_parakeet']} of {k5['candidates']} train rows not in parakeet_out")
+        self.k5, self.by_stem = k5, by_stem
+
+
+def build_full_selection(teacher_root, second_root, parakeet_root, data_root, sources: list[str],
+                         eval_sets: list[str], full: dict, manifest: dict, *, agree_max: float = 0.5,
+                         agree_max_by_source: dict[str, float] | None = None, seed: int = 1234, greedy_n: int = 500,
+                         audio_check: bool = True, stems: dict[str, set[str]] | None = None
+                         ) -> tuple[pd.DataFrame, dict]:
+    """The full selection (module docstring): -> (selection, sidecar body). F0 is build_selection; the rules then
+    overwrite `kept` rows only, in their order, every mask on the rows' split BEFORE the dev draw (train0) or the
+    explicit eval rows, never on "not train". Raises K5Exceeded (nothing to write) and ValueError (a refusal: an eval
+    row not in parakeet_out, eval rows that are not the manifest's, a dev draw the extent cannot serve)."""
+    teacher_root, parakeet_root = Path(teacher_root), Path(parakeet_root)
+    agree_max_by_source = agree_max_by_source or {}
+    sel = build_selection(teacher_root, second_root, data_root, sources, eval_sets, agree_max, seed, greedy_n, 0,
+                          audio_check, agree_max_by_source, (), (), stems)
+    ids = sel["id"].to_numpy(object)
+    src = sel["source"].to_numpy(object)
+    # the dev draw depends on the rows' ids, sources, stems and split only, never on their reasons: drawn here, right
+    # after the first pass over teacher_out, so an extent it cannot serve (an Emilia source whose videos reach the
+    # row target only with every one of them) is refused before the Parakeet reads and F1a; applied at step 7
+    tstem = sel["teacher_file"].str.rsplit("/", n=1).str[1].to_numpy(object)
+    draw = devslice.draw(ids, src, tstem, sel["split"].to_numpy(object) == "train", sources, seed, stems=stems)
+    files = sorted(sel["teacher_file"].unique())
+    tx = text_rows(teacher_root, files, ("hyp", "ref")).set_index("id")
+    pk = parakeet_rows(parakeet_root, files)
+    if pk["id"].duplicated().any():
+        raise ValueError(f"duplicate ids across parakeet_out, e.g. {pk['id'][pk['id'].duplicated()].iloc[0]}")
+    in_pk = sel["id"].isin(pk["id"]).to_numpy()
+    pk = pk.set_index("id")
+    dur = sel["duration"].to_numpy(np.float64)
+    hyp, ref = sel["id"].map(tx["hyp"]).to_numpy(object), sel["id"].map(tx["ref"]).to_numpy(object)
+    p_hyp = sel["id"].map(pk["p_hyp"]).fillna("").to_numpy(object)
+    p_ctc = sel["id"].map(pk["p_ctc_hyp"]).fillna("").to_numpy(object)
+    n_frames = sel["id"].map(pk["n_frames"]).fillna(0).to_numpy(np.int64)
+    ctc_need = sel["id"].map(pk["ctc_need"]).fillna(0).to_numpy(np.int64)
+    split = sel["split"].to_numpy(object).copy()
+    train0, is_eval = split == "train", split == "eval"  # before the dev draw; never "not train" (dev rows are not)
+    reason = sel["reason"].to_numpy(object).copy()
+    min_chars = int(full["dedup_min_chars"])
+
+    def live():
+        return (split == "train") & (reason == "kept")
+
+    # rule 1 and K5. Two counts are called candidates (both scout s3's names): k5.candidates is K5's denominator, the
+    # train rows in teacher_out (the rows the Parakeet pass should have labelled; the Emilia dev videos are counted
+    # over the same rows), and hours.candidates the train rows in both roots, which the later stages start from
+    reason[~in_pk] = "not_in_parakeet"
+    one = train0 & ~in_pk
+    k5 = {"not_in_parakeet": int(one.sum()), "candidates": int(train0.sum()),
+          "frac": float(one.sum() / train0.sum()) if train0.any() else 0.0,
+          "max_frac": float(kprereg.ONE_ROOT_MAX_FRAC), "ok": True,
+          "by_source": {s: {"not_in_parakeet": int((one & (src == s)).sum()),
+                            "candidates": int((train0 & (src == s)).sum())} for s in sources}}
+    k5["ok"] = k5["not_in_parakeet"] <= kprereg.ONE_ROOT_MAX_FRAC * k5["candidates"]
+    if not k5["ok"]:
+        by_stem = sel.loc[one, "teacher_file"].value_counts().sort_index()
+        raise K5Exceeded(k5, {k: int(v) for k, v in by_stem.items()})
+    if (bad := is_eval & ~in_pk).any():
+        raise ValueError(f"{int(bad.sum())} eval rows have no Parakeet labels "
+                         f"({pd.Series(src[bad]).value_counts().to_dict()}): the eval sets must be labelled whole by "
+                         f"both passes (K6)")
+    stage = {"teacher_out": train0.copy(), "candidates": train0 & in_pk, "after_f0": live()}
+    idx = np.flatnonzero(live())  # F1a: normalised by Parakeet's length (Parakeet's hyp is the reference)
+    f1a = np.full(len(sel), np.nan)
+    f1a[idx] = [cer_fn(h, p) for h, p in zip(hyp[idx], p_hyp[idx])]
+    reason[live() & (f1a > full["f1a_max"])] = "f1a_disagree"
+    stage["after_f1a"] = live()
+    # eval_dup against every eval row's reference (all eval sets, hold-outs included); the normalised texts are kept
+    # for dev_dup, whose train rows are a subset of these
+    held = {r for r in (normalize_ja(x) for x in ref[is_eval]) if len(r) >= min_chars}
+    idx = np.flatnonzero(live())
+    n_ref, n_hyp = np.empty(len(sel), dtype=object), np.empty(len(sel), dtype=object)
+    n_ref[idx] = [normalize_ja(r) for r in ref[idx]]
+    n_hyp[idx] = [normalize_ja(h) for h in hyp[idx]]
+    dup = np.zeros(len(sel), dtype=bool)
+    dup[idx] = [r in held or h in held for r, h in zip(n_ref[idx], n_hyp[idx])]
+    reason[dup] = "eval_dup"
+    stage["after_dedup"] = live()
+    reason[live() & (ctc_need > n_frames)] = "ctc_infeasible"
+    stage["after_ctc"] = live()
+
+    # the eval rows are the frozen manifest's, set by set, in order
+    diffs, sets = [], {}
+    for s in eval_sets:
+        m = (src == s) & is_eval & (reason == "kept")
+        got, want = ids[m].tolist(), list(((manifest.get("sets") or {}).get(s) or {}).get("ids") or [])
+        if got != want:
+            first = next((i for i, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want)))
+            diffs.append(f"{s}: {len(got)} kept eval rows vs the manifest's {len(want)}, first difference at {first}")
+        sets[s] = dict(sel=m, ids=got)
+    if diffs:
+        raise ValueError("the eval rows are not the frozen manifest's: " + "; ".join(diffs))
+    man_ids = {i for b in (manifest.get("sets") or {}).values() for i in b.get("ids") or []}
+    man_ids |= {i for b in (manifest.get("galgame_views") or {}).values() for i in b.get("ids") or []}
+
+    # the dev draw (whole shards / videos, drawn after F0 above, independent of the row reasons), then its buffers
+    # and dev_dup
+    reason[draw["buffer"] & live()] = "dev_buffer"
+    split[draw["dev"]] = fullrun.DEV_SPLIT
+    dev = split == fullrun.DEV_SPLIT
+    if overlap := set(ids[dev]) & man_ids:
+        raise ValueError(f"{len(overlap)} dev ids are in the frozen manifest, e.g. {sorted(overlap)[0]}")
+    stage["after_dev"] = live()
+    kept_dev = dev & (reason == "kept")
+    kd = np.flatnonzero(kept_dev)  # kept dev rows were live train rows after ctc: their n_ref / n_hyp exist
+    held_dev = {t for t in (*n_ref[kd], *n_hyp[kd], *(normalize_ja(c) for c in p_ctc[kd])) if len(t) >= min_chars}
+    idx = np.flatnonzero(live())
+    dup = np.zeros(len(sel), dtype=bool)
+    dup[idx] = [r in held_dev or h in held_dev or normalize_ja(c) in held_dev
+                for r, h, c in zip(n_ref[idx], n_hyp[idx], p_ctc[idx])]
+    reason[dup] = "dev_dup"
+    stage["after_dev_dup"] = pool = live()
+
+    draw_block = None
+    if full.get("draw_audio_s") is not None:  # the smoke: a seeded train draw of the pool
+        drawn = draw_budget(ids[pool].tolist(), dur[pool], float(full["draw_audio_s"]), seed, tag=devslice.DRAW_TAG)
+        reason[pool & ~_isin(ids, drawn)] = "not_drawn"
+    sel["split"], sel["reason"] = split, reason
+    sel["keep"] = sel["reason"] == "kept"
+    keep = sel["keep"].to_numpy()
+    stage["drawn"] = (split == "train") & keep
+    if full.get("draw_audio_s") is not None:
+        draw_block = {"budget_s": float(full["draw_audio_s"]), "pool_s": float(dur[pool].sum()),
+                      "drawn_s": float(dur[stage["drawn"]].sum()), "pool_utts": int(pool.sum()),
+                      "drawn_utts": int(stage["drawn"].sum())}
+    sel["in_probe"], sel["in_greedy_subset"] = False, False
+    for (source, sp), g in sel.groupby(["source", "split"], sort=False):
+        if sp == fullrun.DEV_SPLIT:
+            continue
+        chosen = seeded_subset(g["id"][g["keep"]].tolist(), int(full["probe_n"]) if sp == "train" else greedy_n,
+                               seed, f"{sp}:{source}")
+        sel.loc[g.index, "in_probe" if sp == "train" else "in_greedy_subset"] = g["id"].isin(chosen)
+    sel["in_probe"], sel["in_greedy_subset"] = sel["in_probe"].astype(bool), sel["in_greedy_subset"].astype(bool)
+
+    def uh(m) -> dict:
+        return {"utts": int(m.sum()), "hours": float(dur[m].sum() / 3600)}
+
+    hours = {k: {**{s: uh(m & (src == s)) for s in sources}, "total": uh(m)} for k, m in stage.items()}
+    assert list(hours) == list(FULL_STAGES)
+
+    # the dev slice, per source and in total
+    by_source = {}
+    for s in sources:
+        d, m = draw["by_source"][s], dev & (src == s)
+        km = m & keep
+        info = ({"method": "shards", "dev_stems": d["dev_stems"], "buffer_stems": d["buffer_stems"]}
+                if d["method"] == "shards" else
+                {"method": "videos", "videos_n": len(d["videos"]), "videos_sha256": ids_sha256(d["videos"]),
+                 "video_rows": d["video_rows"]})
+        by_source[s] = dict(info, rows=int(m.sum()), hours=float(dur[m].sum() / 3600), kept_rows=int(km.sum()),
+                            kept_hours=float(dur[km].sum() / 3600), ids_sha256=ids_sha256(ids[km].tolist()))
+    bufm, dupm = reason == "dev_buffer", reason == "dev_dup"
+    leave = hours["after_ctc"]["total"]["hours"] - hours["after_dev_dup"]["total"]["hours"]
+    scored = fullrun.dev_pick(zip(ids[kept_dev], src[kept_dev]), sources, devslice.SCORED_PER_SOURCE,
+                              devslice.SCORED_SEED)
+    sm = _isin(ids, scored) & kept_dev
+    dev_block = {
+        "rule": fullrun.DEV_RULE, "method": {s: devslice.DEV_METHOD[s] for s in sources},
+        "pair_shards": devslice.DEV_PAIR_SHARDS, "buffer_shards": devslice.DEV_BUFFER_SHARDS,
+        "video_rows": next((d["video_rows"] for d in draw["by_source"].values() if d["method"] == "videos"),
+                           devslice.DEV_VIDEO_ROWS),
+        "by_source": by_source,
+        "buffer": {"rows": int(bufm.sum()), "hours": float(dur[bufm].sum() / 3600)},
+        "dev_dup": {"rows": int(dupm.sum()), "hours": float(dur[dupm].sum() / 3600),
+                    "by_source": {s: uh(dupm & (src == s)) for s in sources}},
+        "leave_training_hours": float(leave),
+        "share_of_pool": float(leave / hours["after_ctc"]["total"]["hours"]) if hours["after_ctc"]["total"][
+            "hours"] else 0.0,
+        "scored_default": {"per_source": devslice.SCORED_PER_SOURCE, "seed": devslice.SCORED_SEED, "n": len(scored),
+                           "hours": float(dur[sm].sum() / 3600), "ids_sha256": ids_sha256(scored)}}
+
+    # the teachers' baselines on the manifest rows (the study's strata: the eval sets, Galgame as the manifest's views)
+    views = {}
+    if "galgame" in eval_sets:
+        for v, b in (manifest.get("galgame_views") or {}).items():
+            views[v] = sets["galgame"]["sel"] & _isin(ids, b.get("ids") or [])
+    keys = [(s, sets[s]["sel"]) for s in eval_sets if s != "galgame"] + [(f"galgame_{v}", m) for v, m in views.items()]
+    baselines = {}
+    for system, hyps in (("cohere", hyp), ("parakeet-ctc", p_ctc), ("parakeet-tdt", p_hyp)):
+        b = {}
+        for k, m in keys:
+            c = corpus_cer(list(hyps[m]), list(ref[m]))
+            b[k] = dict(c, cer=c["cer"] if np.isfinite(c["cer"]) else None)
+        if all(b.get(k, {}).get("cer") is not None for k in kprereg.M4_SETS):
+            b["m4"] = float(np.mean([b[k]["cer"] for k in kprereg.M4_SETS]))
+        baselines[system] = b
+
+    train_ids = ids[stage["drawn"]].tolist()
+    dev_ids = ids[kept_dev].tolist()
+    probe_ids = sel["id"][sel["in_probe"]].tolist()
+    q = f1a[~np.isnan(f1a)]
+    pk_trunc = pk["p_truncated"]
+    body = {
+        "k5": k5, "hours": hours, "dev": dev_block, "draw": draw_block,
+        "n": {"train": len(train_ids), "dev": len(dev_ids), "probe": len(probe_ids),
+              "eval": {s: len(v["ids"]) for s, v in sets.items()}},
+        "ids_sha256": {"train": ids_sha256(train_ids), "dev": ids_sha256(dev_ids), "probe": ids_sha256(probe_ids),
+                       "eval": {s: ids_sha256(v["ids"]) for s, v in sets.items()}},
+        "baselines": baselines,
+        "details": {
+            "reasons": {f"{s}/{sp}": {k: int(v) for k, v in g["reason"].value_counts().sort_index().items()}
+                        for (s, sp), g in sel.groupby(["source", "split"], sort=False)},
+            "f1a_quantiles": {str(p): float(np.quantile(q, p)) for p in (0.5, 0.9, 0.99)} if len(q) else {},
+            "parakeet_only_rows": int((~pk.index.isin(sel["id"])).sum()),
+            "parakeet_truncated": {k: int(pk_trunc[pk_trunc.index.isin(v)].sum()) for k, v in
+                                   (("train", train_ids), ("dev", dev_ids),
+                                    ("eval", [i for v in sets.values() for i in v["ids"]]))}},
+    }
+    return sel, body
+
+
+def full_meta_args(args, cfg: dict, record: dict | None, manifest_sha256: str, digest: str | None) -> dict:
+    """The full selection's recorded arguments, location-free like study_meta_args: FULL_ARGS, the config's own roots,
+    and the content hashes of the extent record, the manifest and the sealed label root (COMPLETE.json's
+    files_digest) instead of the paths they were read from."""
+    out = {k: getattr(args, k) for k in FULL_ARGS}
+    out["config_roots"] = {k: cfg.get(k) for k in ("teacher_root", "second_root", "parakeet_root", "data_root",
+                                                    "selection")}
+    out["extent_record_sha256"] = None if record is None else _json_sha256(record)
+    out["manifest_sha256"] = manifest_sha256
+    out["labels_complete_digest"] = digest
+    return out
+
+
+def _study_check(path: Path, sel: pd.DataFrame, baselines: dict) -> list[str]:
+    """Report lines of --study-selection: the eval rows' greedy subsets and (with its sidecar) the baselines against the
+    frozen study selection's."""
+    lines = []
+    st = pd.read_parquet(path, columns=["id", "split", "in_greedy_subset"])
+    ours = set(sel["id"][(sel["split"] == "eval") & sel["in_greedy_subset"]])
+    theirs = set(st["id"][(st["split"] == "eval") & st["in_greedy_subset"]])
+    lines.append(f"greedy subsets vs {path.name}: {'equal' if ours == theirs else 'DIFFERENT'} ({len(ours)} ids)")
+    side = path.with_suffix(".json")
+    if side.is_file():
+        want = json.loads(side.read_text(encoding="utf-8")).get("baselines")
+        lines.append(f"baselines vs {side.name}: {'equal' if want == baselines else 'DIFFERENT'}")
+    return lines
+
+
+def full_main(args, cfg: dict, by_source: dict, stems, record, full: dict, t0: float) -> int:
+    """Build and write the full selection and its sidecar (the sidecar last: it hashes the parquet). Returns 0, or 3
+    when K5 is over its limit (nothing written). A refusal raises SystemExit (exit 1)."""
+    if stems is None:
+        _refuse("the extent names no stems")
+    if problems := devslice.draw_problems(stems, args.sources):  # from the record alone: before any row is read
+        _refuse("the extent cannot serve the dev draw: " + "; ".join(problems))
+    if missing := partial_pull_problems(args.teacher_out, args.second_out, args.parakeet_out, args.sources, stems):
+        _refuse(f"{len(missing)} label file(s) of the extent are not under the label root (a partial pull), e.g. "
+                f"{missing[:5]}")
+    try:
+        sel, body = build_full_selection(
+            args.teacher_out, args.second_out, args.parakeet_out, args.data, args.sources, args.eval_sets,
+            args.full_study, full["manifest"], agree_max=args.agree_max, agree_max_by_source=by_source, seed=args.seed,
+            greedy_n=args.greedy_n, audio_check=not args.skip_audio_check, stems=stems)
+    except K5Exceeded as e:
+        k5 = e.k5
+        print(f"K5 FAIL: {k5['not_in_parakeet']} of {k5['candidates']} train rows ({100 * k5['frac']:.3f} %) are in "
+              f"teacher_out only, more than {100 * k5['max_frac']:g} %: the Parakeet pass is incomplete; nothing "
+              f"written")
+        for s, b in k5["by_source"].items():
+            print(f"  {s:>13}: {b['not_in_parakeet']} of {b['candidates']}")
+        for tf, n in sorted(e.by_stem.items(), key=lambda kv: (-kv[1], kv[0]))[:30]:
+            print(f"  {tf}: {n}")
+        return 3
+    except ValueError as e:
+        _refuse(str(e))
+    out = Path(args.out)
+    sel_rel = cfg["selection"]
+    summary = summarize(sel)
+    kept = sel[sel["keep"]].groupby(["source", "split"])["duration"].agg(["size", "sum"])
+    meta = dict(args=full_meta_args(args, cfg, record, full["manifest_sha256"], full["labels_complete_digest"]),
+                n_no_audio_any=int(sel.attrs.get("n_no_audio_any", 0)), summary=summary.to_dict(orient="records"),
+                kept={f"{s}/{sp}": dict(utts=int(r["size"]), hours=float(r["sum"] / 3600))
+                      for (s, sp), r in kept.iterrows()})
+    write_selection(sel, out, meta)
+    recipe = {k: cfg["selection_recipe"].get(k) for k in ("agree_max", "agree_max_source", "filter_eval_sets",
+                                                          "partial_second_opinion", "study", "full_study")}
+    sidecar = {"kind": devslice.SIDECAR_KIND, "schema": devslice.SIDECAR_SCHEMA,
+               "selection": {"path": sel_rel, "sha256": file_sha256(out)},
+               "manifest": {"path": fullrun.FROZEN_MANIFEST, "sha256": full["manifest_sha256"], "eval_ids_equal": True},
+               "recipe": recipe, "extent": args.extent,
+               "extent_record_sha256": meta["args"]["extent_record_sha256"],
+               "labels_complete_digest": full["labels_complete_digest"],
+               "seed": args.seed, "greedy_n": args.greedy_n, "sources": list(args.sources),
+               "eval_sets": list(args.eval_sets), **body}
+    side_out = out.parent / PurePosixPath(devslice.sidecar_path(sel_rel)).name
+    _write_json(side_out, sidecar)
+
+    # the report
+    print(f"label root: COMPLETE.json files_digest {full['labels_complete_digest']}; extent record sha256 "
+          f"{sidecar['extent_record_sha256']}; manifest sha256 {full['manifest_sha256']}")
+    with pd.option_context("display.width", 200, "display.max_rows", 400):
+        print(summary.to_string(index=False, formatters=dict(hours="{:.3f}".format)))
+    print("\nhours per source after each stage: " + " / ".join(FULL_STAGES))
+    for s in [*args.sources, "total"]:
+        print(f"  {s:>13}: " + " / ".join(f"{body['hours'][k][s]['hours']:.2f}" for k in FULL_STAGES))
+    k5 = body["k5"]
+    print(f"K5 PASS: {k5['not_in_parakeet']} of {k5['candidates']} train rows in teacher_out only "
+          f"({100 * k5['frac']:.4f} %, limit {100 * k5['max_frac']:g} %)")
+    print("eval rows = the frozen manifest: " + ", ".join(f"{s} {n}" for s, n in body["n"]["eval"].items()))
+    if args.study_selection:
+        for line in _study_check(Path(args.study_selection), sel, body["baselines"]):
+            print(line)
+    d = body["dev"]
+    print("dev slice (rule %d):" % d["rule"])
+    for s, b in d["by_source"].items():
+        what = (f"stems {'+'.join(b['dev_stems'])}, buffers {'+'.join(b['buffer_stems'])}" if b["method"] == "shards"
+                else f"{b['videos_n']} videos (target {b['video_rows']} rows)")
+        print(f"  {s:>13}: {what}; {b['rows']} rows {b['hours']:.2f} h, kept {b['kept_rows']} rows "
+              f"{b['kept_hours']:.2f} h")
+    share = d["share_of_pool"]
+    # the expected share is the full pool's (plan v3: 0.4-0.55 %); a smoke's pool is the study extent, about a
+    # twelfth of it, so its dev slice of the same size is a larger share and is not warned about
+    warn = "" if body["draw"] is not None or LEAVE_SHARE_WARN[0] <= share <= LEAVE_SHARE_WARN[1] else (
+        f"  WARNING: outside {100 * LEAVE_SHARE_WARN[0]:g}-{100 * LEAVE_SHARE_WARN[1]:g} %")
+    print(f"  buffers {d['buffer']['rows']} rows {d['buffer']['hours']:.2f} h; dev_dup {d['dev_dup']['rows']} rows "
+          f"{d['dev_dup']['hours']:.2f} h; leaving training {d['leave_training_hours']:.2f} h = {100 * share:.3f} % "
+          f"of the {body['hours']['after_ctc']['total']['hours']:.2f} h pool{warn}")
+    sc = d["scored_default"]
+    print(f"  scored by default (per_source {sc['per_source']}, seed {sc['seed']}): {sc['n']} rows, "
+          f"{sc['hours']:.2f} h")
+    if (dr := body["draw"]) is not None:
+        print(f"draw: {dr['drawn_s'] / 3600:.2f} h of a {dr['pool_s'] / 3600:.2f} h pool (budget "
+              f"{dr['budget_s'] / 3600:.2f} h)")
+    print(f"train {body['n']['train']} utts ({body['hours']['drawn']['total']['hours']:.2f} h: "
+          + ", ".join(f"{s} {body['hours']['drawn'][s]['hours']:.2f}" for s in args.sources)
+          + f"), dev kept {body['n']['dev']}, probe {body['n']['probe']}")
+    print(f"\nwrote {out} (sha256 {sidecar['selection']['sha256']}, {len(sel)} rows) and {side_out} (sha256 "
+          f"{file_sha256(side_out)}) in {time.time() - t0:.1f} s")
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())  # None -> 0; full mode returns 3 when K5 is over its limit

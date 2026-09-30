@@ -62,6 +62,10 @@ from kitsune.trainset import EOS, EVAL_SETS, PAD, PROMPT, AudioBatchDataset, eva
 
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 GATE_SETS = tuple(EVAL_SETS)  # the D32a gate: JSUT / CV8 / Reazon-test; eval_emilia and galgame are monitor-only
+# the full runs' extra macro metrics in 05's study.json (not in kitsune.study_stats.METRICS, which drives the frozen
+# pre-registered report): m4_all = M4 with Galgame's whole set in place of its neutral view, m3 = the gate sets
+M4_ALL_STRATA = ("eval_jsut", "eval_cv8", "eval_reazon", "galgame_all")
+M3_STRATA = GATE_SETS
 # D32a, pre-registered full-set teacher corpus CER (fractions). teacher_baselines() recomputes them from teacher_out
 # and refuses to proceed if they drift by more than 0.05 pp - a changed eval set would silently move every threshold.
 TEACHER_CER_PREREG = {"eval_jsut": 0.0830, "eval_cv8": 0.0407, "eval_reazon": 0.0628}
@@ -91,7 +95,11 @@ def corpus_cer(hyps: Sequence[str], refs: Sequence[str]) -> dict:
 
 
 def load_teacher_rows(teacher_root, sources: Iterable[str], split: str | None = None) -> dict[str, dict]:
-    """id -> teacher_out jsonl row (hyp, ref, cer, duration, n_tok, truncated) plus its source."""
+    """id -> teacher_out jsonl row (hyp, ref, cer, duration, n_tok, truncated) plus its source. Split "dev" is refused:
+    the dev slice has no files of its own (its rows sit in train shards), and the trainer's dev eval reads their text
+    from the dev store (scripts/04_distill.py run_dev_eval)."""
+    if split == "dev":
+        raise ValueError("dev rows are read from the dev store")
     rows = {}
     for src in sources:
         for f in sorted((Path(teacher_root) / src).glob(f"{split}-*.jsonl" if split else "*.jsonl")):
@@ -294,8 +302,16 @@ def _fp32_head(model):
         model.proj_out = inner
 
 
-def _amp(device, amp: bool | None) -> bool:
+def _amp(device, amp: bool | torch.dtype | None) -> bool | torch.dtype:
+    """None: autocast on CUDA; else amp as given (a bool, or the autocast dtype itself: torch.float16 for the fp16
+    variants of kitsune.quant)."""
     return torch.device(device).type == "cuda" if amp is None else amp
+
+
+def amp_dtype(amp) -> torch.dtype:
+    """The autocast dtype of an amp setting: a torch.dtype is itself, anything else (True: the students' default) is
+    bf16. autocast is enabled by bool(amp)."""
+    return amp if isinstance(amp, torch.dtype) else torch.bfloat16
 
 
 # ------------------------------------------------------------------------------------------ teacher-forced eval
@@ -347,7 +363,8 @@ def teacher_forced_records(model, store, featurizer, device, batch_s: float = 40
             if not n:
                 continue
             feats, fmask = _features(featurizer, item, device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=_amp(device, amp)):
+            a = _amp(device, amp)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype(a), enabled=bool(a)):
                 h = model.model(input_features=feats, attention_mask=fmask,
                                 decoder_input_ids=item["decoder_input_ids"].to(device),
                                 decoder_attention_mask=item["dec_mask"].to(device), use_cache=False).last_hidden_state
@@ -453,7 +470,7 @@ def greedy_generate(model, feats: torch.Tensor, fmask: torch.Tensor, max_duratio
         max_new = max(1, min(int(pin_new), max_new))
         stop = dict(min_new_tokens=max_new)
     prompt = torch.tensor([list(prompt_ids)] * n, dtype=torch.long, device=feats.device)
-    with torch.autocast(device_type=feats.device.type, dtype=torch.bfloat16, enabled=amp):
+    with torch.autocast(device_type=feats.device.type, dtype=amp_dtype(amp), enabled=bool(amp)):
         seq = model.generate(input_features=feats, attention_mask=fmask, decoder_input_ids=prompt,
                              max_new_tokens=max_new, do_sample=False, num_beams=1, eos_token_id=eos,
                              pad_token_id=pad, **stop)
@@ -630,7 +647,8 @@ def ctc_eval(model, store, ids: Iterable[str] | None, featurizer, device, batch_
             if not n:
                 continue
             feats, fmask = _features(featurizer, item, device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=_amp(device, amp)):
+            a = _amp(device, amp)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype(a), enabled=bool(a)):
                 lp, n_frames = CS.ctc_log_probs(model, feats, fmask)
             hyp_ids = CS.greedy_ctc_ids(lp, n_frames)
             frames = n_frames.cpu().tolist()

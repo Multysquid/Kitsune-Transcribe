@@ -114,3 +114,38 @@ def test_eight_processes_beat_one_on_real_emilia_mp3(tmp_path):
     print(f"\n{len(blobs)} Emilia MP3 rows: serial {len(blobs) / t_serial:.0f} rows/s, 8 processes "
           f"{len(blobs) / t_par:.0f} rows/s incl. start (x{t_serial / t_par:.2f})")
     assert t_par < t_serial
+
+
+def test_per_gpu_cpus_divides_the_quota_by_the_boxs_gpus(tmp_path, monkeypatch):
+    """Fix 2: a trainer's share of the container's CPUs is usable_cpus() (affinity, cgroup quota) over the box's GPU
+    count (the argument, else KITSUNE_N_GPUS, else 1), at least 1: box A's 61.44-CPU quota on 4 GPUs gives 15."""
+    cpu_max = tmp_path / "cpu.max"
+    monkeypatch.setattr(P, "CPU_MAX", cpu_max)
+    monkeypatch.setattr(P.os, "sched_getaffinity", lambda pid: set(range(128)), raising=False)
+    cpu_max.write_text("6144000 100000\n")  # 61.44 CPUs, rounded up to 62 by usable_cpus
+    monkeypatch.delenv("KITSUNE_N_GPUS", raising=False)
+    assert P.usable_cpus() == 62 and P.per_gpu_cpus() == 62
+    monkeypatch.setenv("KITSUNE_N_GPUS", "4")
+    assert P.per_gpu_cpus() == 15 and P.per_gpu_cpus(2) == 31
+    monkeypatch.setenv("KITSUNE_N_GPUS", "not-a-number")
+    assert P.per_gpu_cpus() == 62
+    cpu_max.write_text("50000 100000\n")  # half a CPU: never 0
+    assert P.per_gpu_cpus(4) == 1
+
+
+def test_the_loader_workers_are_half_a_gpus_share_on_linux(monkeypatch):
+    """kitsune.trainset.default_num_workers (the trainer's perf.num_workers "auto") and kitsune.study_queue.auto_workers
+    (the queue's shm budget for it) are one rule: min(8, per_gpu_cpus() // 2), at least 1; Windows keeps 2."""
+    from kitsune import study_queue, trainset
+
+    for cpus, want in ((64, 8), (16, 8), (15, 7), (3, 1), (1, 1)):
+        monkeypatch.setattr(P, "per_gpu_cpus", lambda n_gpus=None, c=cpus: c)
+        monkeypatch.setattr(trainset.os, "name", "posix")
+        got = trainset.default_num_workers()
+        monkeypatch.undo()
+        monkeypatch.setattr(P, "per_gpu_cpus", lambda n_gpus=None, c=cpus: c)
+        assert got == study_queue.auto_workers() == want, cpus
+    monkeypatch.setattr(trainset.os, "name", "nt")
+    windows = trainset.default_num_workers()
+    monkeypatch.undo()
+    assert windows == 2

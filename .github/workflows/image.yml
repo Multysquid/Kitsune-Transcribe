@@ -2,8 +2,9 @@
 #
 # Why here and not on the laptop: the free public-repo runner has the bandwidth (the base image is ~5.3 GB compressed)
 # and GITHUB_TOKEN can push to GHCR without a PAT; home upload is slow. The image is pushed by digest first, smoke-tested
-# (docker/smoke_import.py inside the pushed image), and only then tagged, so a tag never points at an image that failed
-# the smoke. Tags: sha-<short commit> and <branch>. vast/launch.py resolves the branch tag to a digest and rents by digest.
+# (docker/smoke_import.py inside the pushed image), quant-tested (tests/test_quant*.py inside it, the repo mounted), and
+# only then tagged, so a tag never points at an image that failed either. Tags: sha-<short commit> and <branch>.
+# vast/launch.py resolves the branch tag to a digest and rents by digest.
 # After the very first push, make the package public once (github.com/users/Multysquid/packages/container/kitsune-train
 # -> Package settings -> Change visibility) so vast pulls it without registry credentials (D39a).
 # Actions are pinned to commit SHAs (tag in the comment).
@@ -16,6 +17,9 @@ on:
       - "docker/**"
       - "requirements-train.txt"
       - ".github/workflows/image.yml"
+      # the quant tests run inside the image (the step after the smoke): a change to them rebuilds and re-checks it
+      - "kitsune/quant.py"
+      - "tests/test_quant*.py"
   workflow_dispatch:
 
 permissions:
@@ -94,6 +98,15 @@ jobs:
         run: |
           docker pull "$IMAGE@$DIGEST"
           docker run --rm --entrypoint /venv/main/bin/python "$IMAGE@$DIGEST" /opt/kitsune/smoke_import.py
+
+      # kitsune/quant.py's tests inside the pushed image, the repo mounted, CPU only: torchao's import and API and the
+      # recipe's bit-level parity with it (tests/test_quant_torchao.py: torchao is not on the laptop, so this is where
+      # it runs before smoke B). Its CUDA-kernel tests skip here; smoke B's selftest runs them. A failure blocks the tag
+      - name: Quant tests inside the pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo -e CUDA_VISIBLE_DEVICES=-1 -e HF_HUB_OFFLINE=1 -e KITSUNE_REAL_DATA_ROOT=/nonexistent --entrypoint /venv/main/bin/python "$IMAGE@$DIGEST" -m pytest -q -p no:cacheprovider tests/test_quant.py tests/test_quant_torchao.py
 
       - name: Tag the smoke-tested image
         env:

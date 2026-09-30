@@ -128,6 +128,27 @@ selection_recipe.study) are accepted here before that package lands: they are se
 A generated study config whose schedule.max_steps is still null (its box fills it) is validated with a stand-in; the
 eval never reads it.
 
+Quantised variants (the full runs; kitsune.quant, contract section 8). --quant <fmt> (fp16, int8-w8a16, int8-w8a8,
+nvfp4-w4a16, nvfp4-w4a4, mxfp4-w4a4, fp8-w8a8; --fp16 is --quant fp16) scores the checkpoint in that format: the
+student is loaded as always and quantised in memory (kitsune.quant.apply) before any batch. A --ckpt that is a
+variant dir (python -m kitsune.quant export; its quantization.json) is loaded with kitsune.quant.load_quantized and
+scored as it ships: its format, scope and MXFP4 rounding are its recipe's (--quant may repeat the format;
+--quant-scope and --mx-rounding are refused). --quant-impl auto runs torchao's kernels on CUDA (a CUDA box without
+torchao refuses) and emulates on CPU; emulate simulates on any device (recorded as simulated); mxfp4 is always emulated;
+fp16 runs its fp16 weights under fp16 autocast, on CPU too. A quantised eval is a system of its own, <run_name>@<fmt>
+(an explicit --system must carry the suffix: a variant's tables must never replace the bf16 ones), with no history and
+no verdict (verdict_skipped: the trends read the training run's history), not with --anchor, --teachers or
+--from-evals; the format, impl, scope and rounding enter the --out identity (only then: other --out dirs keep theirs).
+A NonFiniteMonitor counts the forwards, rows and modules with a non-finite value; every run records its counts and the
+quantised layers' call counters under .parts/quant/ (flushed every 30 s, so a killed run leaves them), and the
+quant block of study.json, summary.json and evaluator.json totals them: format, impl, scope, mx_rounding, source
+(memory | file), simulated, base_system, file_bytes / export_dir (a variant), share_quantized, counters {calls, padded,
+fallback_risk}, nonfinite {batches, rows, by_module, first}, fp32_fallbacks (the in-scope layers left 16-bit, with
+why), torchao, weights_bytes (the deployable bytes) and bytes {deployable, quantized, kept}. A quantised layer that no
+batch called fails the run. Every --ckpt eval's study.json also records weights {path, file_bytes}, and every
+system's metrics gain m4_nostyle, m4_all (M4 with Galgame's whole set, kitsune.evaluate.M4_ALL_STRATA), m4_all_nostyle
+and m3 (the gate sets; with _teacher / _ratio for the raw ones).
+
 Usage:
   python scripts/05_evaluate.py --root D:/Shizu-ko-distill --config configs/viability.json \
       --ckpt runs/<run_id>/checkpoints/step_<N> --out <dir> [--probe] [--sets eval_jsut eval_cv8] [--vram-frac 0.95]
@@ -139,6 +160,10 @@ Usage:
       --tables evals/study
   python scripts/05_evaluate.py --from-evals runs/<run_id>/evals/step_<N> --system study-t03 \
       --config configs/study/study-t03.json --out evals/study-t03 --tables evals/study
+  python scripts/05_evaluate.py --config runs/<rd>/config.json --ckpt runs/<rd>/checkpoints/step_<N> \
+      --quant nvfp4-w4a4 --out <dir> --tables <dir>/tables --cache-dir cache --max-temp 0   # in memory
+  python -m kitsune.quant readout --config runs/<rd>/config.json --ckpt runs/<rd>/checkpoints/step_<N> \
+      --fmt nvfp4-w4a4 --out <dir> --cache-dir cache --manifest <manifest>                 # export, then 05 on it
 """
 import argparse
 import hashlib
@@ -661,6 +686,9 @@ class Ctx:
     manifest: dict | None = None  # load_manifest's record (the study manifest the store was checked against), or None
     system: str | None = None  # the tables' system name (--system; the config's run_name; anchor-b20)
     verdict_off: str | None = None  # why no verdict is written (--anchor), or None
+    quant: dict | None = None  # a quantised eval's quant block (quant_totals), or None
+    weights: dict | None = None  # the --ckpt's weights: {path, file_bytes} (study.json)
+    monitor: object = None  # a quantised eval's kitsune.quant.NonFiniteMonitor while the model runs
 
     @property
     def bs(self) -> float:
@@ -1052,17 +1080,18 @@ def parakeet_data(cfg: dict, store, log, what: str = "eval") -> tuple[dict, dict
     return ev.ctc_teacher_rows(rows, refs=refs), targets, files
 
 
-def setup_ctc(R, ckpt: Path, fallback: str | None, log):
+def setup_ctc(R, ckpt: Path, fallback: str | None, log, model=None):
     """family ctc: the student in fp32 with sdpa attention, in eval mode (its BatchNorm on the running stats: the
     evaluator never trains), with the rel-pos-once-per-batch patch under perf.relpos_patch as the aed path has it (the
     same FastConformer encoder), its features (Parakeet's LogMel, no dither: kitsune.ctc_student.ctc_features) and its
-    tokenizer, from the checkpoint dir - or, without processor files there, from the config's own student dir."""
+    tokenizer, from the checkpoint dir - or, without processor files there, from the config's own student dir. model:
+    one loaded already (a quantised variant, kitsune.quant.load_quantized), used in place of loading the checkpoint."""
     from transformers import AutoProcessor
 
     from kitsune import ctc_student as CS
     from kitsune.patches import patch_relpos_once_per_batch
 
-    R.model = CS.load_ctc_student(ckpt, R.device, dtype=torch.float32)
+    R.model = model if model is not None else CS.load_ctc_student(ckpt, R.device, dtype=torch.float32)
     if R.cfg["perf"]["relpos_patch"]:
         patch_relpos_once_per_batch(R.model)
     R.student_meta = CS.load_meta(ckpt)
@@ -1077,6 +1106,153 @@ def setup_ctc(R, ckpt: Path, fallback: str | None, log):
     n_bn = sum(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in R.model.modules())
     log.event("ctc_model", ckpt=str(ckpt), processor=str(proc), params_total=counts["total"],
               encoder_layers=counts["encoder_layers"], bn=n_bn)
+
+
+# ------------------------------------------------------------------------------------------------ quantised variants
+
+
+QUANT_PARTS = "quant"  # .parts/quant/: base.json (the variant's static record), inv-<stamp>.json per run
+
+
+def setup_aed_model(R, model, ckpt: Path):
+    """The eval part of 04_distill.setup_model for an aed model loaded already (a quantised variant,
+    kitsune.quant.load_quantized): the decoder's position embedding frozen, the rel-pos patch per perf.relpos_patch,
+    BatchNorm frozen (train_mode "frozen"), the checkpoint's student_meta.json and the BN statistics' reference. The
+    processor and featurisers come from the variant dir as from any checkpoint (D.setup_processing: it holds the
+    source's processor files)."""
+    from kitsune import student as S
+    from kitsune.patches import patch_relpos_once_per_batch, train_mode
+
+    model.model.decoder.pos_emb.weight.requires_grad_(False)
+    if R.cfg["perf"]["relpos_patch"]:
+        patch_relpos_once_per_batch(model)
+    train_mode(model, "frozen")
+    R.model = model
+    R.student_meta = S.load_meta(ckpt)
+    R.bn0 = {n: (m.running_mean.detach().clone(), m.running_var.detach().clone())
+             for n, m in model.named_modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)}
+
+
+def quant_request(args, ckpt: Path) -> dict:
+    """The quantisation this eval scores: {fmt, scope, mx_rounding, impl_arg, variant, recipe}. A variant --ckpt (its
+    quantization.json) brings its format, scope and rounding: --quant must be omitted or the same, --quant-scope and
+    --mx-rounding are refused. Otherwise --quant (none by default), --quant-scope (linear+pw), --mx-rounding (rceil);
+    those two and --quant-impl need a format."""
+    from kitsune import quant as Q
+
+    impl_arg = args.quant_impl or "auto"
+    if Q.is_quantized_dir(ckpt):
+        try:
+            rec = Q.read_recipe(ckpt)
+        except Q.QuantError as e:
+            raise SystemExit(f"REFUSED: {e}") from e
+        fmt = rec["format"]
+        if args.quant not in (None, fmt):
+            raise SystemExit(f"REFUSED: {ckpt} is a {fmt} variant: --quant {args.quant} does not match it (omit "
+                             "--quant: the format is the variant's)")
+        if args.quant_scope or args.mx_rounding:
+            raise SystemExit("REFUSED: a variant --ckpt carries its scope and MXFP4 rounding in quantization.json: "
+                             "drop --quant-scope / --mx-rounding")
+        return dict(fmt=fmt, scope=rec.get("scope") or "linear+pw",
+                    mx_rounding=(rec.get("recipe") or {}).get("mx_rounding") or "rceil", impl_arg=impl_arg,
+                    variant=True, recipe=rec)
+    fmt = args.quant or "none"
+    if fmt == "none" and (args.quant_scope or args.mx_rounding or args.quant_impl):
+        raise SystemExit("REFUSED: --quant-impl, --quant-scope and --mx-rounding need --quant <format>")
+    return dict(fmt=fmt, scope=args.quant_scope or "linear+pw", mx_rounding=args.mx_rounding or "rceil",
+                impl_arg=impl_arg, variant=False, recipe=None)
+
+
+def weights_record(ckpt: Path) -> dict:
+    """study.json's weights: the --ckpt and the bytes of its weight files."""
+    return dict(path=str(ckpt), file_bytes=int(sum(f.stat().st_size for f in ckpt.glob("*.safetensors"))))
+
+
+def quant_base(q: dict, impl: str, system: str, ckpt: Path, recipe: dict | None = None) -> dict:
+    """The static part of the quant block (the recipe's numbers: the variant's, or the in-memory apply's).
+    weights_bytes is the deployable bytes (a number, as speed_probe's weights_bytes of a format), bytes the recipe's
+    split {deployable, quantized, kept}; fp32_fallbacks the in-scope layers left 16-bit ({layer: why}), not a runtime
+    fallback (torchao's fp32 fallback of an int8 GEMM is counted by kitsune.quant.kernel_census: the selftest and
+    speed_probe --profile-kernels)."""
+    from kitsune import quant as Q
+
+    rec = recipe or q.get("recipe") or {}
+    return dict(format=q["fmt"], impl=impl, scope=q["scope"], mx_rounding=q["mx_rounding"],
+                source="file" if q["variant"] else "memory", simulated=impl == "emulate",
+                base_system=Q.split_system(system)[0],
+                file_bytes=(rec.get("file_bytes") or {}).get(Q.WEIGHTS_FILE) if q["variant"] else None,
+                export_dir=str(ckpt) if q["variant"] else None,
+                share_quantized=(rec.get("counts") or {}).get("share_quantized"),
+                fp32_fallbacks=dict(rec.get("skipped") or {}) if rec else None, torchao=Q.torchao_version(),
+                weights_bytes=(rec.get("bytes") or {}).get("deployable"), bytes=rec.get("bytes"))
+
+
+def quant_totals(out: Path, base: dict) -> dict:
+    """The quant block: base (completed by .parts/quant/base.json, which the run that set the model up wrote) and the
+    counts of every run's .parts/quant/inv-*.json summed. A re-evaluated chunk of a killed run is counted twice (a
+    non-finite value is never missed); uncalled is the last completed run's."""
+    from kitsune.quant import merge_nonfinite
+
+    d = out / PARTS / QUANT_PARTS
+    saved = _load_json(d / "base.json") or {}
+    rec = {k: (v if v is not None else saved.get(k)) for k, v in base.items()}
+    invs = [r for r in (_load_json(p) for p in sorted(d.glob("inv-*.json"))) if isinstance(r, dict)]
+    c = dict(calls=0, padded=0, fallback_risk=0)
+    for r in invs:
+        for k in c:
+            c[k] += int((r.get("counters") or {}).get(k) or 0)
+    nf = merge_nonfinite([r.get("nonfinite") or {} for r in invs])
+    done = [r for r in invs if "uncalled" in r]
+    rec.update(counters=c, nonfinite=nf, uncalled=done[-1]["uncalled"] if done else None, invocations=len(invs))
+    return rec
+
+
+def start_quant(ctx: Ctx, R, q: dict, impl: str, system: str, ckpt: Path, recipe: dict | None, t0: float):
+    """After the model's setup, before any batch: an in-memory format is applied (kitsune.quant.apply; a variant came
+    quantised from load_quantized), its record saved (.parts/quant/base.json) and a `quant` event written; then the
+    NonFiniteMonitor is attached, flushing this run's counts to .parts/quant/inv-<stamp>.json."""
+    from kitsune import quant as Q
+
+    if not q["variant"]:
+        try:
+            recipe = Q.apply(R.model, q["fmt"], impl=q["impl_arg"], scope=q["scope"], mx_rounding=q["mx_rounding"])
+        except Q.QuantError as e:
+            raise SystemExit(f"REFUSED: {e}") from e
+    base = quant_base(q, impl, system, ckpt, recipe)
+    d = ctx.out / PARTS / QUANT_PARTS
+    d.mkdir(parents=True, exist_ok=True)
+    _write_json(d / "base.json", base)
+    ctx.log.event("quant", fmt=q["fmt"], impl=impl, scope=q["scope"], mx_rounding=q["mx_rounding"],
+                  layers=(recipe.get("counts") or {}).get("layers"), skipped=recipe.get("skipped"),
+                  share_quantized=base["share_quantized"], bytes=recipe.get("bytes"), torchao=base["torchao"],
+                  source=base["source"], wall_s=round(time.time() - t0, 2))
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    ctx.monitor = Q.NonFiniteMonitor(R.model, flush_path=d / f"inv-{stamp}.json").attach()
+    ctx.quant = quant_totals(ctx.out, base)
+
+
+def finish_quant(ctx: Ctx, inv: dict):
+    """After the passes: this run's non-finite counts and layer counters (and the layers no batch called) saved, the
+    quant_counters and nonfinite events, the totals into ctx.quant and evaluator.json. A quantised layer never called
+    fails the run (its format did not cover what it claims)."""
+    from kitsune import quant as Q
+
+    mon, ctx.monitor = ctx.monitor, None
+    rec = mon.record()
+    mon.detach()
+    c = Q.counters(ctx.R.model)
+    missed = Q.uncalled(ctx.R.model)
+    _write_json(mon.flush_path, dict(nonfinite=rec, counters=c, uncalled=missed, time_utc=_now()))
+    ctx.log.event("quant_counters", calls=c["calls"], padded=c["padded"], fallback_risk=c["fallback_risk"],
+                  uncalled=missed)
+    ctx.log.event("nonfinite", **rec)
+    base = {k: v for k, v in (ctx.quant or {}).items()
+            if k not in ("counters", "nonfinite", "uncalled", "invocations")}
+    ctx.quant = quant_totals(ctx.out, base)
+    inv["quant"] = dict(inv.get("quant") or {}, counters=c, nonfinite=rec, uncalled=missed)
+    if missed:
+        raise SystemExit(f"quant: {len(missed)} quantised layer(s) never called by the eval, e.g. {missed[:5]}: the "
+                         "format does not cover the model it claims to")
 
 
 def refuse_frame_mismatch(ctx: Ctx, what: str, mismatch: list[dict], n_rows: int):
@@ -1265,7 +1441,9 @@ def study_block(man, tables: dict[str, pd.DataFrame], teacher: dict[str, pd.Data
     table_cer), and its teacher's on the same rows with the ratio; M4 (the macro mean over JSUT, CV8, Reazon and
     Galgame-neutral), the qualifier pairs, JSUT + Galgame-neutral raw and no-style, and the gate-pooled CER
     (sum / sum over JSUT, CV8, Reazon: the first run's val_cer), each with the teacher's and the ratio when it has
-    them."""
+    them. The full runs' macro metrics next to them (kitsune.evaluate; never in study_stats.METRICS): m4_nostyle (M4's
+    sets, no-style), m4_all and m4_all_nostyle (M4 with Galgame's whole set, M4_ALL_STRATA) and m3 (the gate sets,
+    M3_STRATA), the raw ones with the teacher's and the ratio."""
     from kitsune import evaluate as ev
     from kitsune import study_stats as ss
 
@@ -1287,7 +1465,9 @@ def study_block(man, tables: dict[str, pd.DataFrame], teacher: dict[str, pd.Data
 
     metrics = {}
     for m, names, key in (("m4", ss.M4_SETS, "cer"), ("ood", ss.PAIRS["ood"], "cer"), ("ind", ss.PAIRS["ind"], "cer"),
-                          ("jg", ss.CROSS_SETS, "cer"), ("jg_nostyle", ss.CROSS_SETS, "cer_nostyle")):
+                          ("jg", ss.CROSS_SETS, "cer"), ("jg_nostyle", ss.CROSS_SETS, "cer_nostyle"),
+                          ("m4_nostyle", ss.M4_SETS, "cer_nostyle"), ("m4_all", ev.M4_ALL_STRATA, "cer"),
+                          ("m4_all_nostyle", ev.M4_ALL_STRATA, "cer_nostyle"), ("m3", ev.M3_STRATA, "cer")):
         if all(n in rows for n in names):
             metrics[m] = macro(names, key)
             if key == "cer" and all("teacher_cer" in rows[n] for n in names):
@@ -1331,7 +1511,9 @@ def write_study(ctx: Ctx, tables_dir: Path) -> dict:
     teacher, _ = tables_from_frames(man, frames, hyp_col="teacher_hyp", trunc_col="teacher_truncated")
     paths, stale = publish_tables(tables_dir, ctx.system, tables)
     rec = study_record(ctx.system, ctx.family, ctx.manifest, study_block(man, tables, teacher), paths, refused,
-                       missing_sets=missing, stale_removed=stale, out=str(ctx.out))
+                       missing_sets=missing, stale_removed=stale, out=str(ctx.out),
+                       **({"weights": ctx.weights} if ctx.weights else {}),
+                       **({"quant": ctx.quant} if ctx.quant else {}))
     _write_output_json(ctx.out / "study.json", rec)
     ctx.log.event("study_tables", system=ctx.system, sets=sorted(tables), refused=refused, missing_sets=missing,
                   stale_removed=stale, m4=rec["metrics"].get("m4"), tables=str(tables_dir / ctx.system))
@@ -1400,6 +1582,8 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
     summary = D.eval_summary(step, train_s, trained.get("reason") == "end", True, tf_sum, probe_sum, gr_sum, full_sum,
                              pg_sum, round(tf_wall + gr_wall + probe_wall, 1), n_probe_greedy=n_pg, n_probe=n_probe,
                              epoch=epoch, combined=combined)
+    if ctx.quant:  # a quantised eval's block (additive: every other summary.json keeps the trainer's keys)
+        summary["quant"] = ctx.quant
     _write_output_json(out / "summary.json", summary)
     print(D.headline_line("full", step, epoch or 0.0, summary["headline"], summary["headline_scope"]), flush=True)
     ctx.log.event("summary", sets=present, probe=probe_sum is not None, headline=summary["headline"],
@@ -1499,7 +1683,27 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--vram-frac", type=float, default=None,
                     help="also cap the CUDA allocator at this fraction of the card (on Windows it is capped at the "
                          "free VRAM less a margin in any case, as the trainer's)")
+    from kitsune.quant import IMPLS, MX_ROUNDINGS, QUANT_FORMATS, SCOPES
+
+    ap.add_argument("--quant", default=None, choices=("none", *QUANT_FORMATS),
+                    help="score the checkpoint quantised in memory in this format, as the system <name>@<fmt> "
+                         "(default none; a variant --ckpt brings its own)")
+    ap.add_argument("--fp16", action="store_true", help="the same as --quant fp16")
+    ap.add_argument("--quant-impl", default=None, choices=IMPLS,
+                    help="auto (default): torchao on CUDA, emulate on CPU; emulate: simulated anywhere")
+    ap.add_argument("--quant-scope", default=None, choices=SCOPES,
+                    help="linear+pw (default): every Linear and the conformers' pointwise convs; linear: Linear only")
+    ap.add_argument("--mx-rounding", default=None, choices=MX_ROUNDINGS,
+                    help="mxfp4's E8M0 scale rounding (default rceil)")
     args = ap.parse_args(argv)
+    if args.fp16:
+        if args.quant is not None:
+            ap.error("--fp16 is --quant fp16: use one of them")
+        args.quant = "fp16"
+    if args.quant not in (None, "none"):
+        if on := [f for f, v in (("--teachers", args.teachers), ("--from-evals", args.from_evals),
+                                 ("--anchor", args.anchor)) if v]:
+            ap.error(f"--quant scores a student's checkpoint: not with {' or '.join(on)}")
     modes = [m for m, on in (("--teachers", args.teachers), ("--from-evals", args.from_evals),
                              ("--anchor", args.anchor)) if on]
     if len(modes) > 1:
@@ -1533,20 +1737,26 @@ def _versions() -> dict:
         code = dict(sha=sha or None, dirty=bool(dirty))
     except Exception:  # noqa: BLE001
         pass
+    from kitsune.quant import torchao_version
+
     return dict(python=sys.version.split()[0], torch=torch.__version__, transformers=transformers.__version__,
-                cuda=torch.version.cuda, code=code, code_root=str(ROOT))
+                cuda=torch.version.cuda, code=code, code_root=str(ROOT), torchao=torchao_version())
 
 
 def _tables_dir(args, out: Path) -> Path:
     return Path(args.tables).resolve() if args.tables else out / "tables"
 
 
-def default_system(cfg: dict, args, trained: dict) -> str:
+def default_system(cfg: dict, args, trained: dict, fmt: str = "none") -> str:
     """The tables' system name without --system: anchor-b20 with --anchor, else the run's name as the trainer gave it -
     the config's run_name, and for a T/2 branch config (branch.parent) the name of the checkpoint's run (its trained
     run_id less the -<stamp>): <parent run_name>-half when the config kept its parent's run_name (04_distill.build),
     so a branch's tables never land on its parent's. A branch checkpoint without that run id needs a -half run_name
-    or --system."""
+    or --system. A quantised eval (fmt) is <that name>@<fmt> (kitsune.quant.system_name)."""
+    if fmt != "none":
+        from kitsune.quant import system_name
+
+        return system_name(default_system(cfg, args, trained), fmt)
     if args.anchor:
         return ANCHOR
     name = cfg["run_name"]
@@ -1744,6 +1954,7 @@ def main(argv=None) -> int:
         return main_from_evals(args)
     D = load_trainer()
     from kitsune import evaluate as ev
+    from kitsune import quant as Q
     from kitsune import student as S
 
     ckpt = Path(args.ckpt).resolve()
@@ -1767,7 +1978,19 @@ def main(argv=None) -> int:
     if args.anchor:
         args.history = "none"  # the anchor's history is another run's, on other eval sets
     trained = S.load_meta(ckpt).get("trained") or {}
-    system = args.system or default_system(cfg, args, trained)
+    q = quant_request(args, ckpt)  # the format this eval scores ("none": the checkpoint as it is)
+    fmt = q["fmt"]
+    if fmt != "none":
+        if args.anchor:
+            raise SystemExit(f"REFUSED: --quant scores a student's variant, not the anchor re-score (--anchor or an "
+                             f"{ANCHOR} config)")
+        if cfg["perf"]["compile"]:
+            raise SystemExit("REFUSED: a quantised eval runs without torch.compile: --set perf.compile=false")
+        args.history = "none"  # a variant has no eval history of its own: no verdict
+    system = args.system or default_system(cfg, args, trained, fmt)
+    if fmt != "none" and Q.split_system(system)[1] != fmt:
+        raise SystemExit(f"REFUSED: --system {system} must end in @{fmt}: a variant's tables must never replace "
+                         f"its base system's (the default is {default_system(cfg, args, trained, fmt)})")
     step = int(args.step if args.step is not None else trained.get("step", 0))
     sets = list(dict.fromkeys(args.sets or cfg["eval_sets"]))
     unknown = [s for s in sets if s not in cfg["eval_sets"]]
@@ -1780,6 +2003,12 @@ def main(argv=None) -> int:
                          "run (--manifest none evaluates a study config without tables)")
     dev = cfg["device"]
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if dev in (None, "auto") else dev)
+    impl = None
+    if fmt != "none":
+        try:
+            impl = Q.resolve_impl(fmt, q["impl_arg"], device)
+        except Q.QuantError as e:
+            raise SystemExit(f"REFUSED: {e}") from e
     inv = dict(time_utc=_now(), argv=list(argv) if argv is not None else sys.argv[1:], ckpt=str(ckpt), step=step,
                trained=trained, config=str(cfg_path), config_student=cfg_student, root=str(Path(args.root).resolve()),
                cache_dir=cfg["cache_dir"], sets=sets, probe=args.probe, force=args.force, device=str(device),
@@ -1787,10 +2016,14 @@ def main(argv=None) -> int:
                versions=_versions(), status="running")
     if family != "aed" or mpath is not None:  # the aed record without a manifest stays as it was
         inv.update(family=family, system=system, manifest=str(mpath) if mpath else None, anchor=bool(args.anchor))
+    if fmt != "none":
+        inv["quant"] = dict(fmt=fmt, impl=impl, scope=q["scope"], mx_rounding=q["mx_rounding"],
+                            source="file" if q["variant"] else "memory")
     log.event("evaluate_start", ckpt=str(ckpt), step=step, sets=sets, probe=args.probe, device=str(device),
               autocast=cfg["autocast"], batch_s=float(cfg["eval"]["batch_s"]), config=str(cfg_path),
               root=inv["root"], out=str(out), **({"family": family, "system": system} if "family" in inv else {}),
-              **({"anchor_implied": True} if anchor_implied else {}))
+              **({"anchor_implied": True} if anchor_implied else {}),
+              **({"quant": inv["quant"]} if fmt != "none" else {}))
     ctx = None
     refused = {}
     try:
@@ -1842,12 +2075,18 @@ def main(argv=None) -> int:
                                                                   ec["probe_greedy_audio_s"]])
         if family == "ctc":  # an aed --out keeps its identity as it was
             identity.update(family=family, parakeet=parakeet_fingerprint(pk_files))
+        if fmt != "none":  # only a quantised eval: every other --out keeps its identity as it was
+            identity.update(quant=Q.identity(fmt, impl, q["scope"], q["mx_rounding"]))
         check_identity(out, identity)
         ctx = Ctx(D=D, ev=ev, cfg=cfg, args=args, out=out, log=log, store=store, greedy_ids=set(greedy_ids),
                   identity_key=hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest(),
                   reference=reference, family=family, teacher_rows=teacher_rows, targets=targets, manifest=M,
                   system=system, verdict_off="anchor: its history is another run's on other eval sets; it gets "
-                                             "tables and a summary, no verdict" if args.anchor else None)
+                                             "tables and a summary, no verdict" if args.anchor else None,
+                  weights=weights_record(ckpt),
+                  quant=quant_totals(out, quant_base(q, impl, system, ckpt)) if fmt != "none" else None)
+        if fmt != "none":
+            ctx.verdict_off = "quant variant: the verdict reads the training run's history"
         want_probe = args.probe and bool(cfg["eval"]["probe"])
         if args.probe and not cfg["eval"]["probe"]:
             log.event("probe_off", note="the config has eval.probe false: no probe to evaluate")
@@ -1864,23 +2103,41 @@ def main(argv=None) -> int:
         log.event("todo", sets=todo, skipped_done=skipped, probe=do_probe)
         inv.update(evaluated=todo, skipped=skipped)
         if todo or do_probe:
-            R = D.Run(cfg=cfg, run_dir=out, device=device, amp=cfg["autocast"] == "bfloat16")
+            # fp16 variants run under fp16 autocast, on CPU too (kitsune.evaluate.amp_dtype)
+            R = D.Run(cfg=cfg, run_dir=out, device=device,
+                      amp=torch.float16 if fmt == "fp16" else cfg["autocast"] == "bfloat16")
             R.log = log
             ctx.guard = make_guard(device, args, log)
             # as the trainer: on Windows CUDA always (the driver's sysmem fallback would serve an oversized batch from
             # shared memory instead of raising OOM), --vram-frac on any OS; a no-op otherwise
             D.cap_vram(R, max_frac=args.vram_frac)
+            tq, vm, vrec = time.time(), None, None
+            if q["variant"]:  # a variant dir: its packs, loaded as they ship
+                try:
+                    vm, vrec = Q.load_quantized(ckpt, device, impl=q["impl_arg"])
+                except Q.QuantError as e:
+                    raise SystemExit(f"REFUSED: {e}") from e
             if family == "ctc":
-                setup_ctc(R, ckpt, cfg_student, log)
+                setup_ctc(R, ckpt, cfg_student, log, model=vm)
+            elif vm is not None:
+                setup_aed_model(R, vm, ckpt)
+                D.setup_processing(R)
             else:
                 D.setup_model(R, grad_ckpt=False)
                 D.setup_processing(R)
+            if fmt != "none":  # in memory: quantised here, before any batch; then the non-finite monitor
+                start_quant(ctx, R, q, impl, system, ckpt, vrec, tq)
             ctx.R = R
-            ctx.feat = Guarded(R.feat_eval, ctx.guard) if ctx.guard else R.feat_eval
+            from kitsune import heartbeat  # a queue item beats $KITSUNE_HEARTBEAT per batch (its stall check); once
+            feat = R.feat_eval if isinstance(R.feat_eval, heartbeat.Beating) or not os.environ.get(heartbeat.ENV) \
+                else heartbeat.Beating(R.feat_eval)
+            ctx.feat = Guarded(feat, ctx.guard) if ctx.guard else feat
             if todo:
                 run_pass(ctx, todo)
             if do_probe:
                 run_probe(ctx)
+            if ctx.monitor is not None:
+                finish_quant(ctx, inv)
         end_force(ctx)
         sweep_work(ctx)  # passes that hold a set done now can never continue
         check_frame_alignment(ctx)
@@ -1908,6 +2165,9 @@ def main(argv=None) -> int:
     finally:
         inv["wall_s"] = round(time.time() - t_start, 1)
         if ctx is not None:
+            if ctx.monitor is not None:  # a run that failed mid-pass: what the monitor saw is flushed
+                ctx.monitor.detach()
+                ctx.monitor = None
             inv["passes"] = ctx.passes
             if ctx.guard is not None:
                 inv["thermal"] = ctx.guard.record()

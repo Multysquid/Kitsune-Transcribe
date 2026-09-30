@@ -323,6 +323,149 @@ def test_the_study_queues_command_lines_parse():
                                                                                         "auto")
 
 
+# ------------------------------------------------------------------------------------------------ quantised variants
+
+
+def test_quant_records(env, tmp_path):
+    """--quant on a CTC student (emulated on CPU): the record's quant fields, the deployable bytes below the fp32
+    record's, the counters, the kernel census, --threads, the batch-1 hypotheses (hyp_diff_1, --hyps-out); fp16's
+    dtype and autocast; every system in one file."""
+    import pandas as pd
+
+    out = tmp_path / "speed.json"
+    assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "study-p01", "--per-set", "3") == 0
+    hy = tmp_path / "hyps.parquet"
+    assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "study-p01@int8-w8a8", "--quant",
+               "int8-w8a8", "--quant-impl", "emulate", "--profile-kernels", "--hyps-out", str(hy), "--threads", "2",
+               "--latency-n", "4") == 0
+    assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "study-p01@fp16", "--quant",
+               "fp16") == 0
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    base, q, f16 = (doc["systems"][k] for k in ("study-p01", "study-p01@int8-w8a8", "study-p01@fp16"))
+    assert base["quant"] is None and base["emulated"] is False and base["compile"] is False
+    assert base["kernels"] is None and base["quant_counters"] is None and base["hyp_diff_1"] == 0
+    assert base["weights_bytes_resident"] == base["weights_bytes"]
+    assert q["quant"] == "int8-w8a8" and q["quant_impl"] == "emulate" and q["emulated"] is True
+    assert q["quant_scope"] == "linear+pw" and q["mx_rounding"] == "rceil" and q["threads"] == 2
+    assert q["weights_bytes"] < base["weights_bytes"] and q["weights_bytes_resident"] > q["weights_bytes"]
+    assert q["quant_counters"]["calls"] > 0 and set(q["quant_counters"]) == {"calls", "padded", "fallback_risk"}
+    assert q["kernels"]["batched"]["ops"].get("aten::linear", 0) > 0 and q["kernels"]["batched"]["int8_act_calls"] > 0
+    assert isinstance(q["hyp_diff_1"], int) and q["n_latency"] == 4 and q["autocast_dtype"] is None
+    assert f16["dtype"] == "fp16" and f16["autocast_dtype"] == "float16" and f16["quant"] == "fp16"
+    assert f16["quant_impl"] == "native" and f16["emulated"] is False
+    h = pd.read_parquet(hy)
+    assert list(h.columns) == ["id", "ref", "hyp", "hyp_1", "duration"] and h["id"].tolist() == doc["ids"]
+    assert h["hyp_1"].notna().sum() == 4 and (h["hyp_1"].iloc[:4] != h["hyp"].iloc[:4]).sum() == q["hyp_diff_1"]
+    assert "torchao" in q["versions"]
+
+
+def test_quant_refusals(env, tmp_path, capsys):
+    """A variant dir as --model (time the bf16 export), a system without @<fmt> (or +compile with --compile), --quant
+    for a teacher kind, --compile with fewer than 2 warm-ups, mxfp4 on CUDA without --quant-impl emulate, a timed
+    format on CUDA without torchao, an explicit --dtype with fp16: refused before any model is loaded."""
+    from kitsune import quant as Q
+
+    variant = tmp_path / "variant"
+    Q.export(env["ctc"], variant, "int8-w8a8")
+    out = tmp_path / "s.json"
+    assert run(env, out, "--kind", "ctc", "--model", str(variant), "--system", "v@int8-w8a8", "--quant",
+               "int8-w8a8") == 2
+    common = ["--store", "cache/eval", "--out", "x.json"]
+    for argv in (["--kind", "ctc", "--model", "m", "--system", "study-p01", "--quant", "fp16"],
+                 ["--kind", "ctc", "--model", "m", "--system", "study-p01@fp16+compile", "--quant", "fp16"],
+                 ["--kind", "ctc", "--model", "m", "--system", "study-p01@fp16", "--quant", "fp16", "--compile"],
+                 ["--kind", "ctc", "--model", "m", "--system", "s@fp16+compile", "--quant", "fp16", "--compile",
+                  "--warmup", "1"],
+                 ["--kind", "parakeet-ctc", "--model", "m", "--system", "p@fp16", "--quant", "fp16"],
+                 ["--kind", "ctc", "--model", "m", "--system", "s@fp16", "--quant", "fp16", "--dtype", "fp32"],
+                 ["--kind", "parakeet-tdt", "--model", "m", "--system", "t+compile", "--compile"],
+                 ["--kind", "ctc", "--model", "m", "--system", "s@int8-cpu", "--quant", "int8-cpu"]):
+        with pytest.raises(SystemExit) as e:
+            sp.parse_args([*argv, *common])
+        assert e.value.code == 2, argv
+    a = sp.parse_args(["--kind", "ctc", "--model", "m", "--system", "study-p03@nvfp4-w4a4+compile", "--quant",
+                       "nvfp4-w4a4", "--compile", *common])
+    assert a.compile and a.quant == "nvfp4-w4a4" and a.warmup == 2
+    on_cuda = ["--store", str(env["store_dir"]), "--out", str(out), "--kind", "ctc", "--model", str(env["ctc"]),
+               "--device", "cuda"]  # refused before CUDA is touched
+    assert sp.main([*on_cuda, "--system", "s@mxfp4-w4a4", "--quant", "mxfp4-w4a4"]) == 2
+    if not Q.torchao_available():
+        assert sp.main([*on_cuda, "--system", "s@int8-w8a8", "--quant", "int8-w8a8"]) == 2
+    assert not out.exists()
+    capsys.readouterr()
+
+
+def test_gpu_state_counts_only_the_probes_gpu(monkeypatch):
+    """--require-idle on a 2-GPU box: a process on the other GPU (another bus id) is listed apart and does not make
+    this one busy; one on the probe's GPU does; a line without a bus id counts, as before."""
+    class Done:
+        def __init__(self, out):
+            self.stdout = out
+
+    monkeypatch.setattr(sp, "_pci_bus_id", lambda device: "00000000:02:00.0")
+    monkeypatch.setattr(sp.shutil, "which", lambda name: "nvidia-smi")
+    outs = iter([Done("4242, trainer, 30000, 00000000:01:00.0\n"), Done("0, 99, 30000\n1, 0, 10\n")])
+    monkeypatch.setattr(sp.subprocess, "run", lambda *a, **k: next(outs))
+    st = sp.gpu_state(torch.device("cuda:1"))
+    assert st["processes"] == [] and st["other_gpus"][0]["pid"] == 4242 and st["gpu_bus_id"] == "00000000:02:00.0"
+    outs = iter([Done("4242, trainer, 30000, 00000000:01:00.0\n77, probe2, 500, 0000:02:00.0\n9, x, 1\n"),
+                 Done("0, 99, 30000\n")])
+    st = sp.gpu_state(torch.device("cuda:1"))
+    assert [p["pid"] for p in st["processes"]] == [77, 9] and len(st["other_gpus"]) == 1
+
+
+def test_the_probe_beats_its_heartbeat(monkeypatch, tmp_path):
+    """Once per timed repeat (rate-limited), and through the warm-ups: $KITSUNE_HEARTBEAT is touched by a probe."""
+    import numpy as np
+
+    hb = tmp_path / "hb" / "speed-x"
+    monkeypatch.setenv("KITSUNE_HEARTBEAT", str(hb))
+    sp.probe(RecordingRunner([]), [np.zeros(16000, np.float32)] * 3, [1.0, 2.0, 0.5], ["a"] * 3, torch.device("cpu"),
+             batch_s=6.0, warmup=1, warmup_1=1, latency_n=2)
+    assert hb.is_file()
+
+
+def test_quant_after_the_runners_bf16_cast(env):
+    """--dtype auto on CUDA is bf16: the runner casts the whole student (BatchNorm statistics included) before
+    load_runner quantises it. Every packed format loads that way (here emulated on CPU with --dtype bf16), its
+    BatchNorm statistics stay the runner's bf16 ones, the deployable bytes are below the fp32 record's, and a decode
+    under bf16 autocast (the runner's amp on CUDA) calls every quantised layer."""
+    from torch import nn
+
+    from kitsune import quant as Q
+
+    store = trainset.load_stores(env["store_dir"])
+    cpu = torch.device("cpu")
+    base, _ = sp.load_runner("ctc", str(env["ctc"]), cpu, "fp32", store, sp.TEACHER_REVISION)
+    for fmt in ("int8-w8a16", "int8-w8a8", "nvfp4-w4a16", "nvfp4-w4a4", "mxfp4-w4a4", "fp8-w8a8"):
+        runner, _ = sp.load_runner("ctc", str(env["ctc"]), cpu, "bf16", store, sp.TEACHER_REVISION,
+                                   quant=dict(fmt=fmt, impl="emulate", scope="linear+pw", mx_rounding="rceil"))
+        bns = [m for m in runner.model.modules() if isinstance(m, nn.BatchNorm1d)]
+        assert bns and all(m.running_mean.dtype == torch.bfloat16 for m in bns)
+        assert runner.quant["format"] == fmt and runner.weights_bytes < base.weights_bytes
+        runner.amp = torch.bfloat16  # _amp's CUDA value: autocast casts the fp32 features to the bf16 model's dtype
+        with runner.context():
+            hyps = runner.decode([store.wave(0), store.wave(1)], [float(u.duration) for u in store.utts[:2]], [1, 1])
+        assert len(hyps) == 2 and Q.uncalled(runner.model) == []
+
+
+def test_quant_counters_are_null_when_not_counted():
+    """--compile turns the layers' counters off: the record's quant_counters is then None, never zeros that would read
+    as a measurement; counted layers give {calls, padded, fallback_risk}."""
+    from torch import nn
+
+    from kitsune import quant as Q
+
+    lin = nn.Linear(64, 32)
+    Q.quantize_linear(lin, "int8-w8a8", "emulate")
+    m = Q._One(lin)
+    with torch.no_grad():
+        lin(torch.randn(3, 64))
+    assert sp.quant_counters(m) == dict(calls=1, padded=0, fallback_risk=0)
+    Q.set_counting(m, False)
+    assert sp.quant_counters(m) is None
+
+
 # ------------------------------------------------------------------------------------------------ whisper (WP6)
 
 

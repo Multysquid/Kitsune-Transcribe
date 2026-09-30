@@ -6,8 +6,10 @@ private HF model repo, verifies the upload and destroys itself. A watchdog stops
 Nothing is rented until you run `launch.py --yes`.
 
 The same scripts also rent the **label box**: one RTX 5090 that labels the full download with both teachers and uploads
-the labels to the data repo (`--job label`, see "The label run" below), and the **size study's boxes**: 4x or 1x A100
-that run a queue of calibration, LR probes and study runs (`--job study --box ...`, see "Size study" at the end).
+the labels to the data repo (`--job label`, see "The label run" below), the **size study's boxes**: 4x or 1x A100
+that run a queue of calibration, LR probes and study runs (`--job study --box ...`, see "Size study"), and the
+**full-data boxes**: 1x or 2x RTX 5090 that train the full students from the box registry `configs/full/boxes.json`
+(`--job full --box ...`, see "Full-data runs" at the end).
 
 | file | runs where | what it does |
 |---|---|---|
@@ -17,7 +19,9 @@ that run a queue of calibration, LR probes and study runs (`--job study --box ..
 | `bootstrap.sh` | box | pull derived data from `KITSUNE_DATA_REPO`, rebuild audio with `scripts/01_prepare_data.py` (pinned upstream commits), check the id join |
 | `supervise.py` | box | run `scripts/04_distill.py`; resume once after a late crash; then `finish.py --destroy` or `--stop` |
 | `finish.py` | box | upload, verify every file in the HF output repo (path, size, hash), destroy; stop instead if anything is off |
-| `watchdog.sh` | box | stop the instance 5.5 h after first boot (log sync 10 min before) |
+| `watchdog.sh` | box | stop the instance 5.5 h after first boot (log sync 10 min before); stop (or only alert) when the controller's heartbeat goes stale |
+| `blocklist.json` | laptop | machines no job rents (launch.py adds them to every avoid set) |
+| `../kitsune/netgate.py` | box (full job) | the download gate: times three pinned upstream files before the paid rebuild, refuses a slow host |
 
 Everything on the box logs to `/workspace/kitsune.log`; lifecycle records and timings are in `/workspace/kitsune_state/`
 and get uploaded to `runs/<run_id>/infra/` in the output repo.
@@ -238,7 +242,7 @@ as on the box; the export's `combined_loss` table and `metrics/steps.parquet` ho
 | any other exit but 3, or a container restart, after `summary.json` says `complete` (a crash in teardown, a kill while the end state uploads), even a second crash | as for exit 0: **destroyed** once verified, otherwise **stopped**; no resume and no post-crash sync (`--destroy` uploads everything) |
 | exit 3 (throughput too low), a crash before step 100, or a second crash | **stopped** |
 | first crash after step 100 with a local full state (and no complete `summary.json`) | resumed once, then as above |
-| bootstrap or on-start failure | **stopped** |
+| bootstrap or on-start failure | **stopped** (`finish.py --abort`; a full box without a run dir yet is destroyed, see "Full-data runs") |
 | 5.5 h after first boot, whatever the state | **stopped** by the watchdog |
 
 A stopped instance keeps its disk. To inspect it: `vastai start instance <id>` (may wait in "scheduling" if the GPU was
@@ -260,6 +264,57 @@ again during a healthy run starts nothing (the supervisor holds `kitsune_state/s
 inside that quoted value: vastai has no `-e` option of its own, and a second `--env` replaces the first, dropping
 KITSUNE_SHA and the rest. The watchdog still stops the box at the cap once `onstart.sh` has started it; with the flag,
 a box whose stub fails before that (e.g. the clone) keeps running until you destroy it by hand.
+
+## onstart.sh: what runs at every container start
+
+vast/launch.py passes the small `vast/onstart_stub.sh` with `vastai create instance --onstart` (the API may cap that
+field near 4 KB); the stub clones the repo at `$KITSUNE_SHA` and execs `vast/onstart.sh` from the clone. onstart.sh
+still clones by itself if run on a box without the stub (its clone is a no-op when the checkout is already at
+`$KITSUNE_SHA`). It runs as root at EVERY container start (SSH launch mode), and stays under vast's 16 KB on-start
+limit (a test holds it there), which is why its story lives here.
+
+Steps: sync the env to `/etc/environment` (SSH/tmux sessions do not inherit the container env), raise the nofile
+limit, check `/dev/shm`, size the CPU thread pools (below), start TensorBoard and the vast portal, clone the repo at
+`$KITSUNE_SHA`, start `vast/watchdog.sh` (the hard cost cap), then detached: `vast/bootstrap.sh` (data) and
+`vast/supervise.py` (training + stop/destroy), all logging to `/workspace/kitsune.log`.
+- `KITSUNE_JOB=label` (the label box, `launch.py --job label`): the detached part is `vast/label.py` alone. It holds
+  `supervise.lock`, runs its own idempotent steps and resumes from `$KITSUNE_STATE/label.json`, so bootstrap.sh and
+  supervise.py are not run.
+- `KITSUNE_JOB=study` (a size-study box, `launch.py --job study --box A|B|replicate|shakedown`): the train job's path:
+  bootstrap.sh (the extent, both label roots, the box's students), then supervise.py, which runs the box's queue
+  (`kitsune/study_queue.py`) instead of one trainer; `KITSUNE_BOX` names the box. `--rearm` leaves
+  `$KITSUNE_STATE/queue.json` in place: the queue resumes where it stopped (its PREREG numbers are written once;
+  deleting the file by hand starts the box's study over).
+- `KITSUNE_JOB=full` (a full-data box, `launch.py --job full --box ...`): the same path with the full queue
+  (`kitsune/full_queue.py`); it needs `KITSUNE_BOX` and `KITSUNE_OUT_REPO`, and `$KITSUNE_STATE/train_hb` (the box
+  controllers' heartbeat, which its watchdog reads) is touched as bootstrap starts.
+
+Thread pools (fix 2): a vast container's `nproc` is the host's (the first A100 box: 128 CPUs, a cgroup quota of 15.36),
+so for every job but label the six pools (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
+`NUMEXPR_NUM_THREADS`, `RAYON_NUM_THREADS`, `TOKIO_WORKER_THREADS`) get the quota over the box's GPUs:
+`floor(cpu.max quota / period) / KITSUNE_N_GPUS` (box A's 61.44 CPUs on 4 GPUs: 15), nproc without a quota, at most
+16 on a pids budget below 16 per visible CPU (the base image's `12-cpu-thread-limits.sh` trigger), a value already set
+winning; `KITSUNE_CPU_QUOTA` and `KITSUNE_THREADS_PER_GPU` go to every child with them. The label job keeps its rule
+(16 on a low pids budget only). The loader workers follow the same share (`kitsune.ctc_preflight.per_gpu_cpus`).
+
+Restarts: the watchdog deadline is fixed at first boot; a `halt` marker (written by finish.py or by a failure here)
+means the run is over, so a restarted container only brings up the env and the portal for inspection. An interrupted
+run is handled by supervise.py's own history: a restart that finds `$KITSUNE_STATE/supervise.json` skips bootstrap
+(the data passed its coverage check before the supervisor first ran) and hands straight over to it. Any failure before
+the supervisor takes over runs `finish.py --abort` (a stop without a sync; a full box without a run dir yet is
+destroyed instead), unless `KITSUNE_NO_SELF_STOP=1`. Bootstrap and the supervisor hold `$KITSUNE_STATE/supervise.lock`,
+so running the script again by hand during a run starts nothing new.
+
+Re-arm a halted box for a fresh run: `bash vast/onstart.sh --rearm` moves the halt marker, the deadline, the
+supervisor/finish history and the heartbeats (`label_hb`, `train_hb`, `hb/`), a full box's `resume_plan.json`,
+`download_gate.json`, `watchdog_alerts.jsonl` and `smoke_verdict.json` to `$KITSUNE_STATE/rearm-<stamp>/`, then boots
+as if for the first time (a new cap: export `KITSUNE_MAX_HOURS` first). It refuses while a watchdog or supervisor of
+this container still runs (stop/start the instance first).
+
+Instance env (set by launch.py): `KITSUNE_SHA KITSUNE_CONFIG KITSUNE_DATA_REPO KITSUNE_OUT_REPO TZ`, optional
+`KITSUNE_DATA_REVISION KITSUNE_MAX_HOURS`; the label job has `KITSUNE_JOB=label` and no `KITSUNE_OUT_REPO`; the study
+and full jobs add `KITSUNE_BOX` and `KITSUNE_N_GPUS` (the full job's table is under "Full-data runs"). HF_TOKEN comes
+from the vast account env and is never printed.
 
 ## The label run (one RTX 5090 labels the full download)
 
@@ -690,3 +745,128 @@ before its max_steps, which the pre-registration counts as an invalid run.
 
 The CTC trainer's keys (`family`, `parakeet_root`, `loss.w_ctc`) come with the CTC trainer (WP4b); box B needs it, and
 its store builder, before it can run.
+
+## Full-data runs (the full boxes)
+
+Plan v3 trains the full students on the whole label set: P-0.1B alone on **box 1** (`p01`, 1x RTX 5090, Parakeet labels
+only), then T-0.6B, P-0.3B and P-0.05B on **box 2** (`full`, 2x RTX 5090, one shared GPU queue), after two short
+smokes (`full-smoke` = smoke A, `smoke-b`). Each is one `launch.py --job full --box <box>` call; on the box
+`vast/supervise.py` runs `kitsune/full_queue.py` for that box. The box registry `configs/full/boxes.json`
+(`kitsune/fullrun.py`) is the one source of each box's GPU count, data config, hours (`est_hours` planned, `max_hours`
+the watchdog cap), price cap (`max_dph`), extra disk, watchdog and items; launch reads it at the commit the box runs
+and keeps no table of its own (`python -m kitsune.fullrun show --box <box>` prints a box's spec and env).
+
+### Before a full box (the owner's steps)
+
+1. **The scratch repo** (the trainers' timed full states; each run keeps exactly one there and replaces it every
+   cycle): create it once as a PRIVATE model repo, `hf repos create Multy123/kitsune-scratch --private`, and give the
+   vast `HF_TOKEN` (fine-grained) read and write access to it, as to `Multy123/kitsune-runs`. The code never creates
+   it: launch refuses a missing or public one (with the laptop login), and the box's plan refuses a token that cannot
+   read and write it (exit 3, before anything is pulled). Never pass the runs or the data repo as `--scratch-repo`
+   (the trainers delete and squash the scratch repo's history); launch refuses that too.
+2. The full selection and its sidecar are uploaded (`labels/full/selections/full_study/`), and the configs and the
+   registry are committed (`python tools/make_full_configs.py --check` says "up to date").
+3. The image is built for the commit (`--image-tag main` after a merge; launch checks the build commit's pins).
+
+### Commands (PowerShell, from the launch clone at origin/main)
+
+```powershell
+Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/main
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-smoke --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --machine <smoke A's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box smoke-b --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full --machine <id> --max-hours <re-projected> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+```
+Each line first as it is (look-only: the preflight, the offer table, the create command and the cost line), then the
+same line with `--yes` to rent. Without `--machine` the offers are ranked by the estimated total (the planned hours at
+the offer's $/h with the disk, plus the traffic at its $/GB); `--offer-id` picks another row.
+
+What launch checks and decides, before anything is rented:
+- **Offers:** `--tier 5090` (default) or `a100` (option C, default cap $2.60/h). Per GPU: `cpu_cores_effective >= 16`,
+  `cpu_ram >= 60` in the query and 64,000 MB on the client, `inet_up >= 100`; reliability >= 0.98, driver CUDA >= 13.0,
+  disk_bw and inet_down >= 500, a direct port, the disk from the extent's sizing plus the registry's `extra_gb`.
+  `verified=any` in the query, then the client keeps verified and deverified hosts only (never unverified), and only a
+  host whose max rental outlasts the box by `MIN_RENTAL_DAYS` (4). The registry's `max_dph` drops dearer offers before
+  the ranking. `--gpus` may only repeat the registry's count; `--config` only its data config.
+- **Avoided machines:** `vast/blocklist.json` (every job; 151760, study box A #1's 2.9 MB/s host, for good), the
+  label runs' failed hosts, and a machine whose full box's download gate said slow in the last 30 days
+  (`full/box-*/infra/*/download_gate.json` in the runs repo). A `--machine` on that list is refused.
+- **full_preflight:** every config the box reads committed at the commit; every tool its items run there (the queue,
+  the trainer, 05, speed_probe with the items' `--kind`s and every `--flag` in their `args`, each eval item's `-m`
+  module or script: a box whose items need a CLI or a flag not merged yet is refused here, not by argparse on the
+  rented box); its students present and the registered builds
+  (`kitsune.prereg.student_problems`); its extra files and dirs; the scratch repo private; the full selection's sidecar
+  (`kitsune.devslice.sidecar_problems`) against the Hub's selection and frozen manifest; plus the selection and extent
+  checks every extent config gets. `--no-hf-check` is refused.
+- **Env** (all from the registry and the checks): `KITSUNE_JOB=full`, `KITSUNE_BOX`, `KITSUNE_CONFIG` (the data
+  config), `KITSUNE_N_GPUS`, `KITSUNE_WATCHDOG_HB_FILE=train_hb`, `KITSUNE_WATCHDOG_ORPHAN_S` and `_ORPHAN_ACTION`,
+  `KITSUNE_MAX_HOURS` (the registry's cap, no rebuild add-on), `KITSUNE_SCRATCH_REPO` (boxes with timed states),
+  `KITSUNE_MACHINE_ID`, the gate's `KITSUNE_GATE_BYTES` (max(the extent's upstream bytes, 571.2 GB)),
+  `KITSUNE_GATE_MAX_H` (`--gate-hours`, 5; 0 turns the gate off, and a box whose registry says `gate: false`, smoke-b,
+  has none), `KITSUNE_REBUILD_BYTES`, `KITSUNE_PULL_BYTES`, and with `--resume` the `KITSUNE_RESUME*` values below.
+
+### On the box
+
+bootstrap.sh (job full) runs, in order: **download_gate** (`python -m kitsune.netgate`: three pinned upstream files,
+~2.5 GB, downloaded as 01 downloads them; a host that could not pull 571.2 GB in `KITSUNE_GATE_MAX_H` hours, 31.7 MB/s at
+5 h, is refused with exit 3 after at most ~3 minutes, and a pass sets the label pull's and the rebuild's per-attempt
+timeouts from the measured rate, the rebuild's never below launch's 40 MB/s sizing; hf_xet's chunk cache is off and
+its cache dir the gate's own, so a retried gate times the link again, never the disk), **plan** (also the scratch repo's
+token check), **pull_derived** (everything but the labels: the meta files, the selection, the registry's students,
+extra files and dirs), **resume_pull** (`--resume` only), **check_students** (`python -m kitsune.fullrun
+check-students`), **pull_labels** in the background while **rebuild_audio** (01 `--extent-config`) runs, then
+**pull_labels_wait** (a failed label pull fails here) and **coverage**. On box 1 (CTC, no `pull_parakeet`) the train
+stems have Parakeet labels only: the extent and coverage checks read their ids from `parakeet_out`
+(`kitsune.extent.label_root_for`, fix 9). Every phase keeps `$KITSUNE_STATE/train_hb` fresh while it runs, for at
+most its own worst case: the label pull, pull_labels_wait and the rebuild for their three attempts' timeouts (with the
+gate's floor rate the full extent's rebuild may take ~24 h), every other phase for `KITSUNE_PHASE_HB_MAX_S` (12 h),
+and no toucher outlives bootstrap: a bootstrap that fails during the rebuild also stops the background label pull
+(its timeout and python) and its toucher.
+
+The watchdog reads `train_hb` (bootstrap's phases, the queue's poll and the supervisor's bounded finish calls touch
+it; each trainer, 05 and the store builds beat their own `hb/<item>`, which the queue's stall check reads). On boxes p01
+and full (`action: stop`) a heartbeat stale for `orphan_s` means a dead controller: the watchdog syncs and stops the box
+(`watchdog: box controller heartbeat stale`). The smoke box (`action: alert`) freezes it on purpose in its fault test:
+there the watchdog only appends `{"wall", "kind": "orphan_alert", "hb", "age_s", "limit_s"}` to
+`$KITSUNE_STATE/watchdog_alerts.jsonl` and re-arms once the file is fresh again.
+
+### Watching it
+
+| what | where |
+|---|---|
+| the box's state | runs repo `full/box-<box>/queue_summary.json` (put as each item starts and ends, and as a run dir appears: the source of truth of a resume); the smokes' `full/box-<box>/smoke_verdict.json` |
+| the download gate | `/workspace/kitsune_state/download_gate.json` (verdict, the three samples' MB/s, the timeouts), later in the infra folder |
+| logs | on the box `tail -f /workspace/kitsune.log` and `/workspace/kitsune_state/logs/<item>.log`; at the end in the runs repo `full/box-<box>/infra/<container>/` (queue.json, events.jsonl, the per-item logs, the gate, the resume plan, the watchdog's alerts) |
+| the runs | runs repo `runs/<run_id>/` (lean: logs, weights, the uploaded pre_cooldown state); the timed states in the scratch repo `runs/<run_id>/checkpoints/full_step_<N>/` with `runs/<run_id>/timed_state.json` |
+
+### How it ends
+
+| outcome | instance |
+|---|---|
+| the queue exits 0 (every non-droppable training item done, everything verified) | **destroyed** after finish.py's lean verification |
+| a training item failed for good (queue exit 4) | **stopped**, disk kept: the owner decides |
+| the download gate refuses the host, or any other bootstrap failure before a run dir exists | `finish.py --abort`: the infra goes up, then the box is **destroyed** (nothing on its disk is unique); a slow gate names the reason, and launch avoids the machine for 30 days |
+| a bootstrap failure after resume_pull pulled run dirs | **stopped** (`--abort` with a run dir) |
+| `train_hb` stale (boxes p01 and full) | synced and **stopped** by the watchdog |
+| the cap (`max_hours`) | **stopped** by the watchdog |
+
+finish.py for a full box is lean (as the study box's): the logs, every weights dir and the full states the config
+uploads, never the timed states (their `.scratch_pending` marker is never uploaded nor expected).
+
+### Resume on a new host
+
+A dead or stopped box continues elsewhere from what the Hub has:
+```powershell
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box <box> --resume [--resume-reset <run_id>] [--resume-set <run_id>:schedule.epochs=<E>] --machine <new id> --max-hours <left + setup> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+```
+- `--resume` (`KITSUNE_RESUME=1`): bootstrap's resume_pull (`python -m kitsune.full_queue resume-pull`) reads the
+  box's Hub queue summary, pulls every started run with its newest full state (the scratch pointer's or the runs
+  repo's) and marks the finished ones done; the queue adopts that plan.
+- `--resume-reset <run_id>` (repeatable; `KITSUNE_RESUME_RESET`): continue an early-stopped run from its pre_cooldown
+  state. `--resume-set <run_id>:schedule.epochs=<E>` (repeatable; `KITSUNE_RESUME_SETS`): resume with another epoch
+  count (the only key allowed). Both imply `--resume`.
+- launch refuses a box whose Hub summary is missing and a reset/set id that no train item of the box ran, prints what
+  will resume with the newest state step it can see (scratch and runs repo), and warns about a live instance with
+  the box's own label prefix `kitsune-full-<box>-<data config stem>-` (not `kitsune-full-<box>*`, which for box `full`
+  would also match the smoke box's `kitsune-full-full-smoke-...`): destroy the old box first, two boxes must never
+  write the same run dirs.

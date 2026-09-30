@@ -481,6 +481,20 @@ RULES = {
         r"speed_kind parakeet-tdt times the Parakeet teacher"),
     "whisper speed item on student weights": (lambda r: _item(r, "full-smoke", "speed-study-p01").update(
         speed_kind="whisper"), r"speed_kind whisper times a Whisper model"),
+    # no model source and no --model <key> in args: the queue's argv has no --model and speed_probe exits 2 on the box
+    "whisper speed item without a model": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
+        speed_kind="whisper", system="whisper-small"), r"speed_kind whisper needs --model <key> in args \(or model\)"),
+    "whisper speed item with only --hf-cache": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
+        speed_kind="whisper", system="whisper-small", args=["--hf-cache", "{hf_cache}"]),
+        r"speed_kind whisper needs --model"),
+    "whisper speed item with --model last": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
+        speed_kind="whisper", system="whisper-small", args=["--hf-cache", "{hf_cache}", "--model"]),
+        r"speed_kind whisper needs --model"),
+    "whisper speed item with --model before an option": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
+        speed_kind="whisper", system="whisper-small", args=["--model", "--hf-cache", "{hf_cache}"]),
+        r"speed_kind whisper needs --model"),
+    "whisper speed item with an empty --model=": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
+        speed_kind="whisper", system="whisper-small", args=["--model="]), r"speed_kind whisper needs --model"),
     "unknown speed kind": (lambda r: _item(r, "full", "speed-study-t06").update(speed_kind="tdt"),
                            r"speed_kind 'tdt'"),
     "only_if_new_machine unknown": (lambda r: _item(r, "smoke-b", "speed-study-p03").update(
@@ -611,6 +625,9 @@ def test_speed_sources_that_pass(tmp_path, reg):
     items.append({"name": "speed-whisper-small", "kind": "speed", "system": "whisper-small", "speed_kind": "whisper",
                   "args": ["--model", "whisper-small", "--hf-cache", "{hf_cache}"], "stall_min": None,
                   "max_hours": 0.3})
+    items.append({"name": "speed-whisper-turbo", "kind": "speed", "system": "whisper-large-v3-turbo",
+                  "speed_kind": "whisper", "args": ["--hf-cache", "{hf_cache}", "--model=whisper-large-v3-turbo"],
+                  "stall_min": None, "max_hours": 0.3})
     items.append({"name": "speed-whisper-dir", "kind": "speed", "system": "whisper-dir", "speed_kind": "whisper",
                   "model": "models/parakeet-tdt_ctc-0.6b-ja-hf", "stall_min": None, "max_hours": 0.3})
     items.append({"name": "speed-student-dir", "kind": "speed", "system": "student-dir", "speed_kind": "ctc",

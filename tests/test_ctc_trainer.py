@@ -910,3 +910,73 @@ def test_the_padded_row_gate_fails_the_ctc_smoke(env):
         m.main(["--config", write_config(env, "ctc-padgate", merged(REF_OVER, {"smoke": {"pad_max_mean_kl": -1}}))])
     pad = events(one_run(env["root"], "ctc-padgate"), "smoke_padded_row")[0]
     assert pad["ok"] is False and pad["unit"] == "frames" and pad["n_tok"] > pad["n_utts"] and pad["kl_mean"] < 1e-5
+
+
+# ------------------------------------------------------------------------------------------ the full runs' dev split
+
+
+def test_frame_preflight_holds_the_dev_split_to_the_train_rule_on_its_own():
+    """The dev split (the full runs' early-stop rows, cut from train shards) is dropped-and-counted like train, each
+    split against the 0.1 % on its own - never pooled with the other, so a dev share above it fails even when the two
+    together stay below; an eval row still fails at once."""
+    from kitsune import trainset as T
+
+    n = 1000
+    samples = [3200 + 7 * i for i in range(2 * n)]
+    stored = [T.ctc_frames(s) for s in samples]
+
+    def run(splits, bad_rows):
+        m = len(splits)
+        st = [t + (1 if i in bad_rows else 0) for i, t in enumerate(stored[:m])]
+        return T.frame_preflight([f"r{i}" for i in range(m)], ["src"] * m, splits, [0.2] * m, st, samples[:m])
+
+    one = run(["dev"] * n, {5})
+    assert one["ok"] and one["dev_mismatch_frac"] == 0.001 and one["train_mismatch_frac"] == 0.0 and one["_rows"] == [5]
+    assert one["by_split"] == {"dev": dict(rows=1000, mismatch=1, undecodable=0)}
+    assert one["lenient_splits"] == ["train", "dev"]
+    assert not run(["dev"] * n, {5, 6})["ok"]  # 0.2 % of the dev rows
+    both = run(["train"] * n + ["dev"] * n, {5, 1005})  # 0.1 % of each
+    assert both["ok"] and both["train_mismatch_frac"] == both["dev_mismatch_frac"] == 0.001
+    pooled = run(["train"] * n + ["dev"] * n, {1005, 1006})  # 0.1 % of all 2000 rows, but 0.2 % of the dev rows
+    assert not pooled["ok"] and pooled["train_mismatch_frac"] == 0.0
+    assert not run(["dev"] * (n - 1) + ["eval"], {n - 1})["ok"]
+    assert run(["train"] * n, {5})["dev_mismatch_frac"] == 0.0  # no dev rows: 0, as train's
+
+
+def test_the_dev_split_frame_store_reads_its_rows_train_shards(big, monkeypatch):
+    """build_frame_stores for split "dev" packs the kept dev rows from exactly the shards their teacher_file names (and
+    their parakeet_out targets from the same stems), and runs the frame preflight on them as split dev: two planted
+    mismatches fail the build, and its message names the dev share."""
+    from kitsune import trainset
+
+    fc = big["fc"]
+    df = pd.read_parquet(big["sel"])
+    dev = df["teacher_file"].eq("src_big/train-00003") & df["keep"]
+    df.loc[dev, "split"] = "dev"
+    df.loc[dev, ["in_probe", "in_greedy_subset"]] = False
+    sel = big["root"] / "sel_dev.parquet"
+    df.to_parquet(sel, index=False)
+    po = make_fake_parakeet_out(fc, big["root"] / "po_dev", seed=7)
+    read = []
+    orig = trainset._pack_audio
+
+    def pack(rows, shard_files, *a, **kw):
+        read.append([p.relative_to(fc.data).as_posix() for p in shard_files])
+        return orig(rows, shard_files, *a, **kw)
+
+    monkeypatch.setattr(trainset, "_pack_audio", pack)
+    st = trainset.build_frame_stores(sel, fc.data, po.root, big["root"] / "cache" / "dev", ["src_big"], ["dev"],
+                                     log=lambda s: None)
+    assert read == [["shards/src_big/train-00003.parquet"]]
+    assert sorted(u.id for u in st.utts) == sorted(df["id"][dev]) and {u.split for u in st.utts} == {"dev"}
+    rep = st.info["frame_preflight"]
+    assert rep["ok"] and rep["by_split"] == {"dev": dict(rows=int(dev.sum()), mismatch=0, undecodable=0)}
+    for i in range(0, len(st), 37):  # its targets are the stored ones of that shard
+        assert st.targets(i).n_frames == trainset.ctc_frames(n_samples(fc.utts[st.utts[i].id].audio))
+    two = planted_parakeet_out(fc, big["root"] / "po_dev_two", unique_length(fc, df["id"][dev].tolist())[:2],
+                               monkeypatch)
+    with pytest.raises(trainset.FramePreflightFailed, match=r"dev 2/\d+; train share 0\.000 %, dev share ") as e:
+        trainset.build_frame_stores(sel, fc.data, two.root, big["root"] / "cache" / "dev_two", ["src_big"], ["dev"],
+                                    log=lambda s: None)
+    frac = e.value.report["dev_mismatch_frac"]
+    assert frac == 2 / int(dev.sum()) > 0.001 and f"dev share {100 * frac:.3f} %, limit 0.1 % each" in str(e.value)
