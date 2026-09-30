@@ -1,34 +1,12 @@
 #!/bin/bash
-# vast.ai on-start script for the Kitsune-Transcribe viability run (SSH launch mode; runs as root at EVERY container
-# start). vast/launch.py passes the small vast/onstart_stub.sh with `vastai create instance --onstart` (the API may cap
-# that field near 4 KB); the stub clones the repo at $KITSUNE_SHA and execs this file from the clone. It still clones
-# by itself if run on a box without the stub (clone_repo is a no-op when the checkout is already at $KITSUNE_SHA).
-#
-# Steps: sync the env to /etc/environment (SSH/tmux sessions do not inherit the container env), raise the nofile limit,
-# check /dev/shm and the pids budget, start TensorBoard and the vast portal, clone the repo at $KITSUNE_SHA, start
-# vast/watchdog.sh (hard cost cap), then detached: vast/bootstrap.sh (data) and vast/supervise.py (training +
-# stop/destroy), all logging to /workspace/kitsune.log. With KITSUNE_JOB=label (the label box, launch.py --job label)
-# the detached part is vast/label.py alone: it holds supervise.lock, runs its own idempotent steps and resumes from
-# $KITSUNE_STATE/label.json, so bootstrap.sh and supervise.py are not run. With KITSUNE_JOB=study (a size-study box,
-# launch.py --job study --box A|B|replicate|shakedown) the path is the train job's - bootstrap.sh (the extent, both
-# label roots, the box's students) then supervise.py, which runs the box's queue (kitsune/study_queue.py) instead of
-# one trainer; KITSUNE_BOX names the box. --rearm leaves $KITSUNE_STATE/queue.json in place: the queue resumes where it
-# stopped (its PREREG numbers are written once; deleting the file by hand starts the box's study over).
-#
-# Restarts: the watchdog deadline is fixed at first boot; a `halt` marker (written by finish.py or by a failure here)
-# means the run is over, so a restarted container only brings up the env and the portal for inspection. An interrupted
-# run is handled by supervise.py's own history: a restart that finds $KITSUNE_STATE/supervise.json skips bootstrap (the
-# data passed its coverage check before the supervisor first ran) and hands straight over to it. Any failure before
-# the supervisor takes over stops the instance (not destroy), unless KITSUNE_NO_SELF_STOP=1. Bootstrap + supervisor
-# hold $KITSUNE_STATE/supervise.lock, so running this script again by hand during a run starts nothing new.
-#
-# Re-arm a halted box for a fresh run: `bash vast/onstart.sh --rearm` moves the halt marker, the deadline and the
-# supervisor/finish history to $KITSUNE_STATE/rearm-<stamp>/, then boots as if for the first time (new 5.5 h cap). It
-# refuses while a watchdog or supervisor of this container still runs (stop/start the instance first).
-#
-# Instance env (set by launch.py): KITSUNE_SHA KITSUNE_CONFIG KITSUNE_DATA_REPO KITSUNE_OUT_REPO TZ, optional
-# KITSUNE_DATA_REVISION KITSUNE_MAX_HOURS; the label job has KITSUNE_JOB=label and no KITSUNE_OUT_REPO. HF_TOKEN comes
-# from the vast account env and is never printed.
+# vast.ai on-start script (SSH launch mode; runs as root at EVERY container start), exec'd from the clone by the small
+# vast/onstart_stub.sh that launch.py passes with --onstart. It syncs the env to /etc/environment, raises nofile, sizes
+# the CPU thread pools per GPU, starts TensorBoard, the vast portal and vast/watchdog.sh (the hard cost cap), then,
+# detached: vast/label.py (KITSUNE_JOB=label), or vast/bootstrap.sh and vast/supervise.py (train, study and full jobs),
+# all logging to /workspace/kitsune.log. A halt marker means the run is over; a restart with a supervisor history skips
+# bootstrap; a failure before the supervisor takes over stops the box (finish.py --abort, which destroys a full box
+# that has no run dir yet), unless KITSUNE_NO_SELF_STOP=1. `--rearm` archives a halted run's lifecycle state and boots
+# afresh. The whole story (jobs, restarts, re-arm, the instance env): vast/README.md, "onstart.sh".
 set -euo pipefail
 set -o errtrace
 
@@ -56,7 +34,7 @@ stop_instance() {  # $1 = reason
         return 0
     fi
     if [ -f "$KITSUNE_DIR/vast/finish.py" ] \
-        && "$PY" "$KITSUNE_DIR/vast/finish.py" --stop --no-sync --reason "$1"; then
+        && "$PY" "$KITSUNE_DIR/vast/finish.py" --abort --reason "$1"; then
         return 0
     fi
     if [ -n "${CONTAINER_API_KEY:-}" ] && [ -n "${CONTAINER_ID:-}" ]; then
@@ -195,7 +173,7 @@ rearm() {  # --rearm: archive the previous run's lifecycle state (see the header
     d="$KITSUNE_STATE/rearm-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$d"
     for f in halt deadline first_boot supervise.json events.jsonl bootstrap_timings.jsonl bootstrap_coverage.json \
-        label.json label_hb; do
+        label.json label_hb train_hb hb resume_plan.json watchdog_alerts.jsonl smoke_verdict.json download_gate.json; do
         if [ -e "$KITSUNE_STATE/$f" ]; then
             mv "$KITSUNE_STATE/$f" "$d/"
         fi
@@ -237,19 +215,32 @@ if [ "$shm_kb" -lt $(( 2 * 1024 * 1024 )) ]; then
 else
     log "/dev/shm is $(( shm_kb / 1024 )) MB"
 fi
-# the base image's 12-cpu-thread-limits.sh caps the CPU thread pools on a host whose pids budget is below 16 per
-# visible CPU (else pools sized to nproc hit EAGAIN), but only in the portal's shell, not in ours (bootstrap's hf_xet
-# downloads, the trainer and its DataLoader workers): same trigger here, before sync_env so SSH sessions get it too.
-# Every read is guarded: with errtrace a failing $(cat ...) would fire the ERR trap and stop the box
-pids_max=$(cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo unknown)
+# CPU thread pools, before sync_env so SSH sessions get them too. A vast container's nproc is the host's, so the pools
+# (fix 2) are the cgroup's cpu.max quota q (else nproc) over the GPUs: t = max(1, q / KITSUNE_N_GPUS), and at most 16
+# on a pids budget below 16 per visible CPU (the base image's 12-cpu-thread-limits.sh trigger, in the portal's shell
+# only: pools sized to nproc hit EAGAIN). The label job keeps its rule: 16 on a low pids budget only. A pool already
+# set wins. Every read is guarded: with errtrace a failing $(cat ...) would fire the ERR trap and stop the box
+pids_max=$(cat "${KITSUNE_CGROUP:-/sys/fs/cgroup}/pids.max" 2>/dev/null || cat "${KITSUNE_CGROUP:-/sys/fs/cgroup}/pids/pids.max" 2>/dev/null || echo unknown)
 ncpu=$(nproc 2>/dev/null || echo 0)
-log "pids.max $pids_max, nproc $ncpu, cpu.max $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo n/a)"
-if [[ "$pids_max" =~ ^[0-9]+$ && "$ncpu" =~ ^[0-9]+$ ]] && (( pids_max < ncpu * 16 )); then
+q=$(awk '$1 != "max" && $2 > 0 { printf "%d", $1 / $2 }' "${KITSUNE_CGROUP:-/sys/fs/cgroup}/cpu.max" 2>/dev/null || true)
+log "pids.max $pids_max, nproc $ncpu, cpu.max $(cat "${KITSUNE_CGROUP:-/sys/fs/cgroup}/cpu.max" 2>/dev/null || echo n/a)"
+[[ "$q" =~ ^[0-9]+$ ]] && (( q > 0 && q < ncpu )) || q=$ncpu
+g=${KITSUNE_N_GPUS:-1}
+[[ "$g" =~ ^[1-9][0-9]*$ ]] || g=1
+t=$(( q / g > 1 ? q / g : 1 ))
+low=0
+[[ "$pids_max" =~ ^[0-9]+$ && "$ncpu" =~ ^[0-9]+$ ]] && (( pids_max < ncpu * 16 )) && low=1
+[ "${KITSUNE_JOB:-train}" != label ] || t=16
+(( ! low || t <= 16 )) || t=16
+if [ "${KITSUNE_JOB:-train}" != label ] || [ "$low" = 1 ]; then
     for v in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS RAYON_NUM_THREADS \
         TOKIO_WORKER_THREADS; do
-        export "$v=${!v:-16}"  # a value already set wins
+        export "$v=${!v:-$t}"  # a value already set wins
     done
-    log "low pids budget: CPU thread pools capped to 16"
+    log "CPU thread pools $t (quota $q CPUs / $g GPU(s), low pids budget $low)"
+fi
+if [ "${KITSUNE_JOB:-train}" != label ]; then
+    export KITSUNE_CPU_QUOTA="$q" KITSUNE_THREADS_PER_GPU="$t"
 fi
 sync_env
 
@@ -262,7 +253,7 @@ if [ -f "$KITSUNE_STATE/halt" ]; then
 fi
 
 required="KITSUNE_SHA KITSUNE_DATA_REPO"
-[ "${KITSUNE_JOB:-train}" != study ] || required="$required KITSUNE_BOX KITSUNE_OUT_REPO"
+case "${KITSUNE_JOB:-train}" in study|full) required="$required KITSUNE_BOX KITSUNE_OUT_REPO" ;; esac
 for var in $required; do
     if [ -z "${!var:-}" ]; then
         log "$var is not set (vast/launch.py passes it)"
@@ -288,6 +279,7 @@ log "watchdog started (deadline $(date -u -d "@$(cat "$KITSUNE_STATE/deadline")"
         exec 7>&-  # label.py takes supervise.lock itself for its lifetime (--rearm checks it)
         exec "$PY" "$KITSUNE_DIR/vast/label.py"
     fi
+    [ "${KITSUNE_JOB:-train}" != full ] || touch "$KITSUNE_STATE/train_hb"  # its watchdog's heartbeat, fresh now
     if [ -s "$KITSUNE_STATE/supervise.json" ]; then
         # a restart of this run: the supervisor starts only after a bootstrap that passed its coverage check and
         # records its history before the first attempt (--rearm moves it aside), so the data is on disk; bootstrap's

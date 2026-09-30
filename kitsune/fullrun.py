@@ -46,8 +46,8 @@ Per kind:
   readout  of (an earlier train item of the box)
   speed    system, speed_kind (tools/speed_probe.py --kind), args ([]), only_if_new_machine (another registry box, or
            null), and the model source speed_probe needs: aed / ctc exactly one (of, one weights entry or model);
-           parakeet-ctc / parakeet-tdt `model` (the teacher's data-repo dir); cohere none; whisper none (the key goes
-           in args, --model <key>) or `model`
+           parakeet-ctc / parakeet-tdt `model` (the teacher's data-repo dir); cohere none; whisper `model`, or none
+           with the key in args (["--model", "<key>", "--hf-cache", "{hf_cache}"]; refused without either)
   eval     argv (a template), model sources
 
 Model sources: `of` (an earlier train item of this box: its run dir's config and final checkpoint), `of_box` + `of` (a
@@ -479,6 +479,22 @@ def _str_list(where: str, v, p: list[str]) -> list:
     return v
 
 
+def _gives_option(args, opt: str) -> bool:
+    """args (a command-line list) gives the option opt a value the way argparse reads it: `opt value` (a value that
+    is not itself an option) or `opt=value`. False for anything that is not a list (a problem already)."""
+    if not isinstance(args, list):
+        return False
+    for j, a in enumerate(args):
+        if not isinstance(a, str):
+            continue
+        if a == opt and j + 1 < len(args) and isinstance(args[j + 1], str) and args[j + 1] \
+                and not args[j + 1].startswith("-"):
+            return True
+        if a.startswith(opt + "=") and len(a) > len(opt) + 1:
+            return True
+    return False
+
+
 def _placeholders(where: str, s, item: dict, earlier: list[str], p: list[str]) -> list[str]:
     """Check one template string's placeholders against the item; returns the items it names as {out:<item>}."""
     if not isinstance(s, str):
@@ -640,8 +656,8 @@ def _check_item(where: str, it: dict, bname: str, box: dict, earlier: list[str],
             _word(f"{where}.system", g("system"), p)
         if "speed_kind" in out and g("speed_kind") not in SPEED_KINDS:
             p.append(f"{where}.speed_kind {g('speed_kind')!r} is not one of {SPEED_KINDS}")
-        # the model source speed_probe needs per --kind (it refuses aed, ctc and the Parakeet kinds without --model at
-        # once): a registry typo here would otherwise surface only on the rented box, as a failed speed item
+        # the model source speed_probe needs per --kind (it refuses every kind but cohere without --model at once): a
+        # registry typo here would otherwise surface only on the rented box, as a failed speed item
         sk, n_ckpt = g("speed_kind"), (g("of") is not None) + (
             len(g("weights")) if isinstance(g("weights"), list) else 0)
         n_src = n_ckpt + (g("model") is not None)
@@ -657,6 +673,9 @@ def _check_item(where: str, it: dict, bname: str, box: dict, earlier: list[str],
         elif sk == "whisper" and n_ckpt:
             p.append(f"{where}: speed_kind whisper times a Whisper model: give none (--model <key> in args) or "
                      f"model, not of or weights")
+        elif sk == "whisper" and g("model") is None and not _gives_option(g("args"), "--model"):
+            # without a model source the queue's argv has no --model, so the Whisper key must come from args
+            p.append(f"{where}: speed_kind whisper needs --model <key> in args (or model)")
         for j, a in enumerate(_str_list(f"{where}.args", g("args"), p)):
             implicit += _placeholders(f"{where}.args[{j}]", a, out, earlier, p)
         o = g("only_if_new_machine")

@@ -298,7 +298,11 @@ def combined_loss_ctc(tf: dict | None, w_kl: float, w_ctc: float) -> dict | None
 
 
 def load_parakeet_rows(parakeet_root, sets: Iterable[str], split: str = "eval") -> dict[str, list[dict]]:
-    """set -> its parakeet_out/<set>/<split>-*.jsonl rows (id, hyp (TDT), ctc_hyp, ref, cer, ctc_cer, ...)."""
+    """set -> its parakeet_out/<set>/<split>-*.jsonl rows (id, hyp (TDT), ctc_hyp, ref, cer, ctc_cer, ...). Split
+    "dev" is refused: the dev slice has no files of its own, and the trainer's dev eval reads its rows' text from the
+    dev store (scripts/04_distill.py run_dev_eval)."""
+    if split == "dev":
+        raise ValueError("dev rows are read from the dev store")
     out = {}
     for s in sets:
         rows = []

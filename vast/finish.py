@@ -47,6 +47,16 @@ uploads (ckpt.upload_full_at "frac:<f>" / "end", uploaded_fulls; plus a marked o
 its own sake: the box keeps its resume states on its disk and the runs repo gets what the study reports (STUDY.md 5.5).
 The infra logs and the queue's state go to study/box-<KITSUNE_BOX>/infra/<container>/, with the queue's per-item logs
 ($KITSUNE_STATE/logs/) and each re-armed state (rearm-<stamp>/) under it (infra_files deep).
+
+Full-data box (--job full, the default when KITSUNE_JOB=full; kitsune/full_queue.py runs the box): lean like the study
+box, the infra (queue.json, events.jsonl, the per-item logs, download_gate.json, resume_plan.json, the watchdog's
+alerts) under full/box-<KITSUNE_BOX>/infra/<container>/ (deep). A trainer's timed full states go to the scratch repo,
+never to the runs repo: their marker (SCRATCH_MARK) is never uploaded nor expected, and a lean verification never
+expects the state it marks. `--abort --reason R` is what onstart runs when the box fails before its supervisor takes
+over (a slow download gate, a refused plan): the infra goes up (bounded), then the box is destroyed while it has no run
+dir (nothing on its disk is unique yet: a failed bootstrap, the gate's refusal) and stopped once it has one (a resume
+pulled run dirs, or training began); a slow download_gate.json gives the reason. For every other job --abort is
+--stop --no-sync, resolved before the label dispatch.
 """
 import argparse
 import hashlib
@@ -92,6 +102,11 @@ FULL_RE = re.compile(r"^full[_-]?(?:step[_-]?)?(\d+)(?:\.(?!tmp$|partial$)[A-Za-
 # scripts/04_distill.py's marker in a full state meant for the Hub (ckpt.upload_full_at), removed once its upload
 # succeeded
 UPLOAD_MARK = ".upload_pending"
+# its marker in a timed full state bound for the scratch repo (kitsune.fullrun.SCRATCH_MARK; finish stays stdlib-only,
+# a test asserts they are equal): never uploaded, never expected in the runs repo
+SCRATCH_MARK = ".scratch_pending"
+MARKERS = (UPLOAD_MARK, SCRATCH_MARK)
+GATE_FILE = "download_gate.json"  # kitsune.fullrun.GATE_FILE: the full box's download gate record in STATE_DIR
 HASH_CHUNK = 8 << 20
 EXIT_INTEGRITY = 65  # label mode: a write-once conflict or a sealed root (vast/label.py ends such a box with a stop)
 SYNC_LOCK_WAIT_S = 1500  # label mode: sync.lock is polled up to 25 min, then the sync is skipped
@@ -167,7 +182,7 @@ def expected_files(run_dir: Path, expect_full: bool = True, lean: bool = False) 
     out = {}
     for f in files_under(run_dir):
         rel = f.relative_to(run_dir).as_posix()
-        if rel.split("/", 1)[0] in ("checkpoints", "infra") or rel.endswith((".tmp", ".lock")):
+        if rel.split("/", 1)[0] in ("checkpoints", "infra") or rel.endswith((".tmp", ".lock")) or f.name in MARKERS:
             continue
         out[f"{prefix}/{rel}"] = f
     ckpt = run_dir / "checkpoints"
@@ -182,7 +197,7 @@ def expected_files(run_dir: Path, expect_full: bool = True, lean: bool = False) 
         if pick is None:
             continue
         for f in files_under(pick):
-            if f.name != UPLOAD_MARK:
+            if f.name not in MARKERS:
                 out[f"{prefix}/checkpoints/{f.relative_to(ckpt).as_posix()}"] = f
     return out
 
@@ -519,6 +534,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--stop", action="store_true", help="upload best-effort, then stop")
     mode.add_argument("--sync-only", action="store_true", help="upload only, no instance action")
     mode.add_argument("--verify-only", action="store_true", help="compare only, no upload and no instance action")
+    mode.add_argument("--abort", action="store_true",
+                      help="a failed boot (onstart): full job: infra up, then destroy while there is no run dir, else "
+                           "stop; any other job: --stop --no-sync")
     ap.add_argument("--reason", default="", help="recorded in the halt marker and events")
     ap.add_argument("--repo", default=os.environ.get("KITSUNE_OUT_REPO") or None, help="HF output repo (env KITSUNE_OUT_REPO)")
     ap.add_argument("--repo-type", default=os.environ.get("KITSUNE_OUT_REPO_TYPE", "model"))
@@ -530,21 +548,25 @@ def main(argv: list[str] | None = None) -> int:
                     help="do not require the full training states in the repo (the newest, and any whose trainer "
                          "upload failed)")
     ap.add_argument("--dry-run", action="store_true", help="print the actions; no upload, stop or destroy")
-    ap.add_argument("--job", choices=("train", "label", "study"), default=os.environ.get("KITSUNE_JOB") or "train",
-                    help="train: runs/ in the output repo; label: the label root in the data repo; study: runs/ in the "
-                         "output repo, lean (env KITSUNE_JOB)")
+    ap.add_argument("--job", choices=("train", "label", "study", "full"),
+                    default=os.environ.get("KITSUNE_JOB") or "train",
+                    help="train: runs/ in the output repo; label: the label root in the data repo; study and full: "
+                         "runs/ in the output repo, lean (env KITSUNE_JOB)")
     ap.add_argument("--lean", action="store_true",
-                    help="the study box's uploads (the default for --job study): logs, every weights dir and only the "
-                         "full states the run's config uploads (expected_files lean), not the newest one")
+                    help="the study and full boxes' uploads (the default for --job study and full): logs, every weights "
+                         "dir and only the full states the run's config uploads (expected_files lean), not the newest "
+                         "one")
     ap.add_argument("--no-infra", action="store_true", help="label: skip the infra log upload")
     ap.add_argument("--allow-empty", action="store_true",
                     help="label: --destroy with no finished label file (nothing unique on the disk yet)")
     args = ap.parse_args(argv)
+    if args.abort and args.job != "full":  # a failed boot of any other box: what onstart ran before --abort existed
+        args.stop, args.no_sync, args.abort = True, True, False
     if args.job == "label":
         return label_main(args)
 
     dirs = [Path(d) for d in args.run_dir] if args.run_dir else run_dirs(Path(args.runs_root))
-    lean = args.lean or args.job == "study"
+    lean = args.lean or args.job in ("study", "full")
     expect_full = not args.no_full and not lean
     api = None
     if args.repo:
@@ -552,10 +574,11 @@ def main(argv: list[str] | None = None) -> int:
             api = hf_api()
         except Exception as e:
             log(f"huggingface_hub unavailable: {e}")
-    log(f"mode={'destroy' if args.destroy else 'stop' if args.stop else 'sync-only' if args.sync_only else 'verify-only'} "
-        f"repo={args.repo} run_dirs={[d.name for d in dirs]} dry_run={args.dry_run}")
+    mode = ("destroy" if args.destroy else "stop" if args.stop else "sync-only" if args.sync_only
+            else "abort" if args.abort else "verify-only")
+    log(f"mode={mode} repo={args.repo} run_dirs={[d.name for d in dirs]} dry_run={args.dry_run}")
 
-    if api is not None and not args.no_sync and not args.verify_only:
+    if api is not None and not args.no_sync and not args.verify_only and not args.abort:
         for d in dirs:
             try:
                 sync(api, args.repo, args.repo_type, d, expect_full, args.dry_run, lean)
@@ -565,17 +588,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.job == "study":  # one box, many run dirs: its logs and queue state under the box's own folder
         infra_dest = f"study/box-{os.environ.get('KITSUNE_BOX') or 'unknown'}/infra/" \
                      f"{os.environ.get('CONTAINER_ID', 'local')}"
+    elif args.job == "full":  # kitsune.fullrun.box_infra_dir
+        infra_dest = f"full/box-{os.environ.get('KITSUNE_BOX') or 'unknown'}/infra/" \
+                     f"{os.environ.get('CONTAINER_ID', 'local')}"
     else:
         infra_dest = f"runs/{dirs[-1].name}/infra" if dirs else f"infra/{os.environ.get('CONTAINER_ID', 'local')}"
 
     def push_infra():  # best effort and bounded; --no-sync too (a failed bootstrap's reason is in these files)
         if api is not None and not args.verify_only:
             best_effort(lambda: upload_infra(api, args.repo, args.repo_type, infra_dest, args.dry_run,
-                                             deep=args.job == "study"), "infra upload")
+                                             deep=args.job in ("study", "full")), "infra upload")
 
     if args.sync_only:
         push_infra()
         return 0
+    if args.abort:  # job full (every other job became --stop --no-sync above)
+        return abort(dirs, args.reason, args.dry_run, push_infra)
     if args.stop:
         return 0 if instance_action("stop", args.reason or "requested", args.dry_run, push_infra) else 1
 
@@ -597,6 +625,32 @@ def main(argv: list[str] | None = None) -> int:
         why = f"verification failed ({len(problems)} problems); {args.reason}".rstrip("; ")
         return 2 if instance_action("stop", why, args.dry_run, push_infra) else 1
     return 0 if instance_action("destroy", args.reason or "run verified on the hub", args.dry_run, push_infra) else 1
+
+
+def gate_reason() -> str | None:
+    """A slow download gate's reason from STATE_DIR/download_gate.json (kitsune.netgate), or None: no file, another
+    verdict, or unreadable."""
+    try:
+        gate = json.loads((STATE_DIR / GATE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(gate, dict) or gate.get("verdict") != "slow":
+        return None
+    return f"download gate: {gate.get('reason') or 'slow'}"
+
+
+def abort(dirs: list[Path], reason: str, dry_run: bool, push_infra) -> int:
+    """--abort on a full box (onstart's failure path, before the supervisor): destroy while there is no run dir (a
+    failed bootstrap or gate: nothing on the disk is unique, and a stopped box would bill its ~1-2 TB disk), stop once
+    there is one (a resume pulled run dirs, or training began: the owner decides). The infra goes up first, bounded,
+    inside instance_action; a slow download gate names the reason (launch.py then avoids the machine). Event abort
+    {destroyed, reason, machine_id}."""
+    why = "; ".join(x for x in (gate_reason(), reason) if x) or "requested"
+    destroy = not dirs
+    event("abort", destroyed=destroy, reason=why, machine_id=os.environ.get("KITSUNE_MACHINE_ID") or None,
+          run_dirs=[d.name for d in dirs])
+    log(f"abort: {len(dirs)} run dir(s) on the box: {'destroy' if destroy else 'stop'} ({why})")
+    return 0 if instance_action("destroy" if destroy else "stop", why, dry_run, push_infra) else 1
 
 
 # ---------------------------------------------------------------------------------------------------------- label

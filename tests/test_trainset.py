@@ -758,3 +758,66 @@ def test_loader_close_still_raises_other_shutdown_errors(monkeypatch):
     next(loader)
     with pytest.raises(RuntimeError, match="something else broke"):
         loader.close()
+
+
+# ------------------------------------------------------------------------------------------ the full runs' dev split
+
+
+def with_dev_split(sel: Path, stems: dict[str, list[str]], out: Path) -> Path:
+    """A copy of a selection whose kept rows of the named shards ({source: [stem]}) are the dev slice, as
+    make_selection.py's full mode marks it: split "dev", keep true, teacher_file their train shard."""
+    df = pd.read_parquet(sel)
+    files = {f"{s}/{st}" for s, v in stems.items() for st in v}
+    dev = df["teacher_file"].isin(files) & df["keep"]
+    df.loc[dev, "split"] = "dev"
+    df.loc[dev, ["in_probe", "in_greedy_subset"]] = False
+    df.to_parquet(out, index=False)
+    return out
+
+
+def test_the_dev_split_reads_its_rows_train_shards(corpus, selection, tmp_path, monkeypatch):
+    """A dev row's audio and labels live in its train shard: build_stores for split "dev" packs exactly the kept dev
+    rows, reading only the shards their teacher_file names (not every train shard: the full data's id columns alone
+    would be a scan of every row group), with the targets and audio the fixture wrote; the train store of the same
+    selection holds none of them. read_selection refuses a split that is not a selection split."""
+    import kitsune.trainset as T
+    from kitsune.trainset import read_selection
+
+    dev_sel = with_dev_split(selection, {"src_a": ["train-00001"]}, tmp_path / "dev.parquet")
+    read = []
+    orig = T._pack_audio
+
+    def pack(sel, shard_files, *a, **kw):
+        read.append([p.relative_to(corpus.data).as_posix() for p in shard_files])
+        return orig(sel, shard_files, *a, **kw)
+
+    monkeypatch.setattr(T, "_pack_audio", pack)
+    dev = build_stores(dev_sel, corpus.data, corpus.teacher_out, tmp_path / "dev", TRAIN, ["dev"])
+    rows = pd.read_parquet(dev_sel)
+    want = rows[(rows["split"] == "dev") & rows["keep"]]
+    has_audio = [i for i in want["id"] if corpus.utts[i].has_audio]
+    assert read == [["shards/src_a/train-00001.parquet"]]
+    assert sorted(u.id for u in dev.utts) == sorted(has_audio) and {u.split for u in dev.utts} == {"dev"}
+    assert dev.info["splits"] == ["dev"] and list(dev.info["shards"]) == ["shards/src_a/train-00001.parquet"]
+    check_alignment(corpus, dev, list(range(len(dev))))
+    train = build_stores(dev_sel, corpus.data, corpus.teacher_out, tmp_path / "train", TRAIN, ["train"])
+    assert not {u.id for u in train.utts} & set(want["id"])
+    assert len(train) + len(dev) == len(build_stores(selection, corpus.data, corpus.teacher_out, tmp_path / "all",
+                                                     TRAIN, ["train"]))
+    # a rebuild with the same rows reuses the cache (the shards' sizes are its audio check), and says so in memory
+    # (info["reused"], as a frame store: the trainer's data event), never in the cache's stores.json
+    read.clear()
+    again = build_stores(dev_sel, corpus.data, corpus.teacher_out, tmp_path / "dev", TRAIN, ["dev"])
+    assert len(again) == len(dev) and read == []
+    assert again.info["reused"] is True and "reused" not in dev.info
+    assert "reused" not in json.loads((tmp_path / "dev" / "stores.json").read_text(encoding="utf-8"))
+
+    for bad in (["test"], ["train", "Dev"]):
+        with pytest.raises(ValueError, match="not selection splits"):
+            read_selection(dev_sel, TRAIN, bad)
+    assert len(read_selection(dev_sel, TRAIN, ["dev"])) == len(want)
+    broken = pd.read_parquet(dev_sel)
+    broken.loc[broken["split"] == "dev", "teacher_file"] = "src_a/eval-00000"  # a dev row must name a train shard
+    broken.to_parquet(tmp_path / "broken.parquet", index=False)
+    with pytest.raises(ValueError, match="train shard"):
+        build_stores(tmp_path / "broken.parquet", corpus.data, corpus.teacher_out, tmp_path / "broken", TRAIN, ["dev"])
