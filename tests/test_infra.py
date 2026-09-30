@@ -2084,6 +2084,96 @@ def test_smoke_tiny_forward_backward():
     assert out["params_with_grad"] > 0 and out["loss"] > 0
 
 
+# ------------------------------------------------------------------------------------------ full-data boxes (WP3)
+
+
+def test_bootstrap_pulls_the_labels_within_the_gates_timeout():
+    """The label pull runs in the background during the rebuild, per attempt within the download gate's measured
+    timeout (KITSUNE_PULL_TIMEOUT_MIN, 30 min without a gate); the derived pull keeps its 30 min."""
+    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if ln.lstrip().startswith("phase pull_labels retry"))
+    assert re.fullmatch(r'phase pull_labels retry \d+ timeout -k \d+ "\$\{KITSUNE_PULL_TIMEOUT_MIN:-30\}m" "\$PY" '
+                        r'"\$HELPER" pull_labels &', line.strip()), line
+    assert "export KITSUNE_PULL_TIMEOUT_MIN KITSUNE_REBUILD_TIMEOUT_MIN" in text
+
+
+def onstart_threads(tmp_path, *, cpu_max: str | None, pids_max: str, ncpu: int, gpus=None, job=None, **preset):
+    """Run onstart.sh's thread block (from the pids.max read to sync_env) under its set -e / errtrace / ERR trap with
+    a fake cgroup dir (KITSUNE_CGROUP) and nproc; returns the env it leaves."""
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    text = (VAST / "onstart.sh").read_text(encoding="utf-8")
+    block = re.search(r"^pids_max=\$\(.*?(?=^sync_env$)", text, re.M | re.S).group(0)
+    cg = tmp_path / f"cg-{len(list(tmp_path.iterdir()))}"
+    cg.mkdir()
+    (cg / "pids.max").write_text(pids_max + "\n", encoding="utf-8")
+    if cpu_max is not None:
+        (cg / "cpu.max").write_text(cpu_max + "\n", encoding="utf-8")
+    pools = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "RAYON_NUM_THREADS",
+             "TOKIO_WORKER_THREADS")
+    script = tmp_path / "threads.sh"
+    script.write_text("\n".join([
+        "set -euo pipefail", "set -o errtrace", "trap 'echo \"ERR trap at $LINENO\"; exit 99' ERR",
+        "log() { printf 'LOG %s\\n' \"$*\"; }", f"nproc() {{ echo {ncpu}; }}", block,
+        f"for v in {' '.join(pools)} KITSUNE_CPU_QUOTA KITSUNE_THREADS_PER_GPU; do echo \"$v=${{!v:-unset}}\"; done",
+        ""]), encoding="utf-8", newline="\n")
+    env = {k: v for k, v in os.environ.items() if k not in pools and not k.startswith("KITSUNE_")}
+    env.update(KITSUNE_CGROUP=cg.as_posix(), **preset)
+    if gpus is not None:
+        env["KITSUNE_N_GPUS"] = str(gpus)
+    if job is not None:
+        env["KITSUNE_JOB"] = job
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0 and "ERR trap" not in r.stdout, r.stdout + r.stderr
+    got = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln and not ln.startswith("LOG"))
+    return {k: got[k] for k in pools}, got["KITSUNE_CPU_QUOTA"], got["KITSUNE_THREADS_PER_GPU"], r.stdout
+
+
+def test_onstart_sizes_the_thread_pools_per_gpu_from_the_cgroup_quota(tmp_path):
+    """Fix 2: a vast container's nproc is the host's (box A: 128, a 61.44-CPU quota, 4 GPUs): the six pools get
+    floor(quota) / KITSUNE_N_GPUS each (the owner set 15 by hand on box A), nproc / GPUs without a quota, at most 16 on a
+    low pids budget; a pool set already wins; KITSUNE_CPU_QUOTA and KITSUNE_THREADS_PER_GPU go to every child."""
+    pools, q, t, out = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="max", ncpu=128, gpus=4,
+                                       job="study")
+    assert set(pools.values()) == {"15"} and (q, t) == ("61", "15"), out
+    pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="max", ncpu=128, gpus=2, job="full")
+    assert set(pools.values()) == {"30"} and t == "30"
+    pools, q, t, _ = onstart_threads(tmp_path, cpu_max="max 100000", pids_max="max", ncpu=64, gpus=2, job="full")
+    assert set(pools.values()) == {"32"} and q == "64"
+    pools, q, t, _ = onstart_threads(tmp_path, cpu_max=None, pids_max="max", ncpu=24, job="full")  # no cpu.max: nproc
+    assert set(pools.values()) == {"24"} and (q, t) == ("24", "24")
+    pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="1000", ncpu=128, job="train")
+    assert set(pools.values()) == {"16"} and t == "16", "a low pids budget caps at 16"
+    pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="max", ncpu=128, gpus=4,
+                                     job="full", OMP_NUM_THREADS="7")
+    assert pools["OMP_NUM_THREADS"] == "7" and pools["MKL_NUM_THREADS"] == "15"
+    pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="max", ncpu=128, gpus="x",
+                                     job="full")
+    assert t == "61", "a GPU count that is not a number counts as 1"
+
+
+def test_onstart_keeps_the_label_boxs_thread_rule(tmp_path):
+    """KITSUNE_JOB=label as before fix 2: the pools untouched on a normal pids budget, 16 on a low one, and no quota
+    variables."""
+    pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="max", ncpu=128, job="label")
+    assert set(pools.values()) == {"unset"} and (q, t) == ("unset", "unset")
+    pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="1000", ncpu=128, job="label")
+    assert set(pools.values()) == {"16"} and (q, t) == ("unset", "unset")
+
+
+def test_onstart_full_job_needs_its_box_and_out_repo_and_aborts_through_finish():
+    """A full box's on-start refuses without KITSUNE_BOX and KITSUNE_OUT_REPO (as a study box), and a failure before
+    the supervisor runs finish.py --abort (a full box without a run dir is destroyed; any other job: --stop
+    --no-sync)."""
+    text = (VAST / "onstart.sh").read_text(encoding="utf-8")
+    assert 'case "${KITSUNE_JOB:-train}" in study|full) required="$required KITSUNE_BOX KITSUNE_OUT_REPO" ;; esac' \
+        in text
+    body = re.search(r"^stop_instance\(\) \{[^\n]*\n.*?^\}\n", text, re.M | re.S).group(0)
+    assert '"$PY" "$KITSUNE_DIR/vast/finish.py" --abort --reason "$1"' in body
+    assert "vast/README.md" in text.split("set -euo pipefail", 1)[0], "the header points to the moved prose"
+
+
 # ------------------------------------------------------------------------------------------ the quant pin and image step
 # (the full runs' quantised variants, kitsune/quant.py: contract 0.5 and 8)
 

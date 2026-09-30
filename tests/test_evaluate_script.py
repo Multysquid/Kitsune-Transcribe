@@ -758,3 +758,57 @@ def test_a_generated_study_config_with_max_steps_unset_loads(env, tmp_path):
     got, path = m05.load_cfg(m05.load_trainer(), args)
     assert got["schedule"]["max_steps"] is None and got["schedule"]["clock"] == "steps" and path == p
     assert got["pull_parakeet"] is True and got["family"] == "aed" and got["loss"]["w_ctc"] == 0.8
+
+
+def test_05_beats_its_heartbeat_once_per_batch(env, tmp_path, monkeypatch):
+    """Under a full box's queue (KITSUNE_HEARTBEAT set; the readout's stall check reads the file) 05 beats once per
+    batch: its featuriser is wrapped in kitsune.heartbeat.Beating, which the evaluators call once per batch, right after
+    the thermal guard. A featuriser the trainer's setup_processing wrapped already is not wrapped twice; without the
+    env nothing beats."""
+    from kitsune import heartbeat
+
+    m05 = load_script("05_evaluate")
+    beats = []
+    monkeypatch.setattr(heartbeat, "beat", lambda path=None, *, force=False: beats.append(path))
+
+    class CountingGuard:
+        max_seen, checks = None, 0
+
+        def check(self):
+            self.checks += 1
+
+        def record(self):
+            return dict(checks=self.checks)
+
+    guard = CountingGuard()
+    monkeypatch.setattr(m05, "make_guard", lambda device, args, log: guard)
+    argv = ["--config", str(env["run"] / "config.json"), "--ckpt", str(env["ckpt"]), "--sets", "eval_jsut"]
+    monkeypatch.setenv(heartbeat.ENV, str(tmp_path / "hb" / "m4-tiny"))
+    assert m05.main([*argv, "--out", str(tmp_path / "a")]) == 0
+    assert guard.checks > 0 and len(beats) == guard.checks, (len(beats), guard.checks)
+
+    real_load = m05.load_trainer
+
+    def load_trainer():  # the trainer's own wrap (scripts/04_distill.py setup_processing under a queue item)
+        D = real_load()
+        setup = D.setup_processing
+
+        def setup_processing(R, *a, **k):
+            out = setup(R, *a, **k)
+            if not isinstance(R.feat_eval, heartbeat.Beating):
+                R.feat_eval = heartbeat.Beating(R.feat_eval)
+            return out
+
+        D.setup_processing = setup_processing
+        return D
+
+    monkeypatch.setattr(m05, "load_trainer", load_trainer)
+    beats.clear()
+    guard.checks = 0
+    assert m05.main([*argv, "--out", str(tmp_path / "b")]) == 0
+    assert guard.checks > 0 and len(beats) == guard.checks, "wrapped once, not twice"
+    monkeypatch.setattr(m05, "load_trainer", real_load)
+    monkeypatch.delenv(heartbeat.ENV)
+    beats.clear()
+    assert m05.main([*argv, "--out", str(tmp_path / "c")]) == 0
+    assert beats == []

@@ -792,3 +792,88 @@ def test_export_hf_fails_when_the_hub_cannot_be_reached(run, tmp_path, monkeypat
     monkeypatch.setattr(FakeHubRepo, "sha", "b" * 40)  # the Hub back, at a newer commit: a fresh folder of its own
     exp.main(["hf://me/kitsune-runs/runs/tiny-run", "--out", str(out)])
     assert calls[-1]["revision"] == "b" * 40 and Path(calls[-1]["local_dir"]) == out / "_download" / ("b" * 12)
+
+
+# ------------------------------------------------------------------------------------- 4e: scalars.parquet at close
+
+
+def test_scalars_parquet_close_writes_it_at_close_only(tmp_path):
+    """scalars_parquet="close" (the full runs' log.scalars_parquet): no metrics/scalars.parquet at a periodic sync,
+    which still writes steps.parquet and uploads; close()'s final sync writes it with every row of the jsonl, as
+    "sync" (the default, unchanged) does at every sync. A value other than the two is refused."""
+    api = FakeApi()
+    run = tmp_path / "close-run"
+    log = RunLogger(run, CFG, hf_repo="me/kitsune-runs", sync_every_min=10, api=api, capture=False, tee=False,
+                    scalars_parquet="close")
+    fill(log, steps=range(1, 4))
+    assert log.sync(force=True) is True
+    assert not (run / "metrics" / "scalars.parquet").exists() and (run / "metrics" / "steps.parquet").exists()
+    assert "metrics/scalars.jsonl" in api.calls[-1]["files"] and "metrics/scalars.parquet" not in api.calls[-1]["files"]
+    fill(log, steps=range(4, 6))
+    log.close(summary={"verdict": "GO"})
+    got = pd.read_parquet(run / "metrics" / "scalars.parquet")
+    assert got.equals(read_scalars_jsonl(run / "metrics" / "scalars.jsonl").to_pandas())
+    assert sorted(set(got["step"])) == [1, 2, 3, 4, 5] and "metrics/scalars.parquet" in api.calls[-1]["files"]
+
+    plain = tmp_path / "sync-run"
+    log = RunLogger(plain, CFG, sync_every_min=10, capture=False, tee=False)  # the default
+    fill(log, steps=range(1, 3))
+    log.sync(force=True)
+    assert log.scalars_parquet == "sync" and (plain / "metrics" / "scalars.parquet").exists()
+    log.close()
+    with pytest.raises(ValueError, match="scalars_parquet"):
+        RunLogger(tmp_path / "bad-run", CFG, capture=False, tee=False, scalars_parquet="never")
+    assert not (tmp_path / "bad-run").exists()
+
+
+def test_scalars_parquet_close_on_the_failure_path_and_behind_a_stalled_sync(tmp_path):
+    """The trainer's failure path closes the logger too (_close_failed): the parquet is written there. When an earlier
+    sync hangs, close() runs no final sync (it would queue behind it) but still writes the parquet locally, for
+    vast/finish.py's upload."""
+    run = tmp_path / "fail-run"
+    log = RunLogger(run, CFG, sync_every_min=10, capture=False, tee=False, scalars_parquet="close")
+    fill(log, steps=range(1, 3))
+    try:
+        raise RuntimeError("CUDA error")
+    except RuntimeError as e:
+        log.exception(e)
+    log.close(summary={"status": "failed"})
+    assert pd.read_parquet(run / "metrics" / "scalars.parquet").equals(
+        read_scalars_jsonl(run / "metrics" / "scalars.jsonl").to_pandas())
+
+    release = threading.Event()
+
+    class StalledApi(FakeApi):
+        def upload_folder(self, **kw):
+            self.calls.append(kw)
+            release.wait(30)
+
+    run = tmp_path / "stalled-run"
+    log = RunLogger(run, CFG, hf_repo="me/kitsune-runs", sync_every_min=10, api=StalledApi(), capture=False,
+                    tee=False, upload_retries=(), close_join_s=0.3, scalars_parquet="close")
+    try:
+        log.step_row({"loss": 1.0}, 1)
+        log.sync(force=True, wait=False)
+        log.step_row({"loss": 0.5}, 2)
+        log.close()
+        assert [e["kind"] for e in events(run)][-2:] == ["logger_close", "sync_abandoned"]
+        got = pd.read_parquet(run / "metrics" / "scalars.parquet")
+        assert sorted(set(got["step"])) == [1, 2] and got.equals(
+            read_scalars_jsonl(run / "metrics" / "scalars.jsonl").to_pandas())
+    finally:
+        release.set()
+    log._sync_thread.join(5)
+
+
+def test_an_event_may_name_its_own_step(tmp_path):
+    """An event's row carries the logger's current step, unless the event names its own (a timed state's upload that
+    its thread reports steps later: scripts/04_distill.py ScratchUploader)."""
+    run = tmp_path / "ev-run"
+    log = RunLogger(run, CFG, capture=False, tee=False)
+    log.step_row({"loss": 1.0}, 7)
+    log.event("plain", x=1)
+    log.event("timed_state_upload_ok", name="full_step_3", step=3)
+    log.close()
+    rows = {e["kind"]: e for e in events(run)}
+    assert rows["plain"]["step"] == 7 and rows["plain"]["x"] == 1
+    assert rows["timed_state_upload_ok"]["step"] == 3 and rows["timed_state_upload_ok"]["name"] == "full_step_3"

@@ -95,7 +95,11 @@ def corpus_cer(hyps: Sequence[str], refs: Sequence[str]) -> dict:
 
 
 def load_teacher_rows(teacher_root, sources: Iterable[str], split: str | None = None) -> dict[str, dict]:
-    """id -> teacher_out jsonl row (hyp, ref, cer, duration, n_tok, truncated) plus its source."""
+    """id -> teacher_out jsonl row (hyp, ref, cer, duration, n_tok, truncated) plus its source. Split "dev" is refused:
+    the dev slice has no files of its own (its rows sit in train shards), and the trainer's dev eval reads their text
+    from the dev store (scripts/04_distill.py run_dev_eval)."""
+    if split == "dev":
+        raise ValueError("dev rows are read from the dev store")
     rows = {}
     for src in sources:
         for f in sorted((Path(teacher_root) / src).glob(f"{split}-*.jsonl" if split else "*.jsonl")):

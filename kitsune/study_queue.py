@@ -74,6 +74,11 @@ loader-bound, an LR edge after its extension, a refused numbers file), EXIT_THRO
 EXIT_FAIL anything else; $KITSUNE_STATE/queue_summary.json says what happened (finish.py uploads it with the infra
 logs; the queue also puts it at study/box-<box>/queue_summary.json in the runs repo).
 
+The full-data runs' queue (kitsune/full_queue.py) subclasses Queue through a few hooks that leave the study box as it
+was: Queue(box, settings, plan=...) takes a registry-driven plan instead of box_plan (a shared_queue plan trains more
+runs than it has GPUs), self.max_attempts (MAX_ATTEMPTS here), argv_for (an item's command line, as start built it)
+and child_env (extra env per child; none here); kill_orphans also knows the full queue's children (ORPHAN_CMDS).
+
 Usage (the box runs it through vast/supervise.py; KITSUNE_BOX, KITSUNE_OUT_REPO and KITSUNE_STATE from the env):
   python -m kitsune.study_queue run --box A
   python -m kitsune.study_queue plan --box B              # the items it would run, nothing started
@@ -131,6 +136,11 @@ DEADLINE_FILE = "deadline"  # vast/onstart.sh: the watchdog's stop time (epoch s
 CALIB_GROUP_TIMEOUT_S = 5400  # a group whose windows are not all in by then is stopped and counts as failed
 STOP_GRACE_S = 1800  # how long a stopped run may take to leave (its end phase)
 MAX_ATTEMPTS = 2  # per item: a run resumes (or a branch restarts) once; a second failure is final
+# the command lines of the processes a queue starts (kill_orphans): the trainer, the evaluator and, for the full-run
+# queue (kitsune/full_queue.py), its store build and resume check, the speed probe, the Whisper eval and the quant CLI.
+# Never the bare "kitsune.full_queue": that is the queue itself (its run command)
+ORPHAN_CMDS = ("04_distill", "05_evaluate", "kitsune.full_queue build-stores", "kitsune.full_queue check-resume",
+               "speed_probe", "whisper_eval", "kitsune.quant")
 STAMP_RE = r"-\d{8}T\d{6}Z(?:-\d+)?"
 DIVERGED = ("FloatingPointError",)  # a probe whose trainer stopped on non-finite gradients: its objective is non-finite
 DETERMINISTIC = ("SmokeFailed",)  # a trainer's smoke checks: a second try from the same start fails the same way
@@ -279,8 +289,11 @@ def shm_fit(workers: int, prefetch: int, micro_audio_s: float, budget: float) ->
 
 
 def auto_workers() -> int:
-    """perf.num_workers "auto" on the box, as kitsune.trainset.default_num_workers resolves it on Linux."""
-    return max(1, min(8, (os.cpu_count() or 2) // 2))
+    """perf.num_workers "auto" on the box, as kitsune.trainset.default_num_workers resolves it on Linux: half of one
+    GPU's share of the usable CPUs (kitsune.ctc_preflight.per_gpu_cpus), at most 8."""
+    from kitsune.ctc_preflight import per_gpu_cpus
+
+    return max(1, min(8, per_gpu_cpus() // 2))
 
 
 # ============================================================================================================ plans
@@ -582,19 +595,24 @@ def _pdeathsig():  # pragma: no cover - Linux only: a trainer dies with the queu
 
 
 class Queue:
-    def __init__(self, box: str, settings: Settings | None = None):
+    def __init__(self, box: str, settings: Settings | None = None, plan: dict | None = None):
+        """plan: the box plan to run instead of box_plan(box, rules) (kitsune/full_queue.py passes its registry-driven
+        one); a plan with shared_queue set trains more runs than it has GPUs, one after the other on a shared queue,
+        so the one-GPU-per-run check is not its rule."""
         self.box = box
         self.s = settings or Settings()
         self.root = Path(self.s.root)
         self.rules = self.s.rules if self.s.rules is not None else prereg.rules()
-        self.plan = box_plan(box, self.rules)
+        self.plan = plan if plan is not None else box_plan(box, self.rules)
+        self.max_attempts = MAX_ATTEMPTS  # per item (finished); the full-run queue takes its box's from the registry
         self.gpus = list(self.s.gpus or detect_gpus())
         if not self.gpus:
             raise QueueError("no GPU found: nvidia-smi listed none and KITSUNE_GPUS is not set")
         if self.s.n_gpus is not None and len(self.gpus) != int(self.s.n_gpus):
             raise QueueError(f"box {box} was rented with {self.s.n_gpus} GPU(s) (KITSUNE_N_GPUS), the queue found "
                              f"{len(self.gpus)}: {self.gpus}")
-        if not self.plan.get("shakedown") and len(self.gpus) < len(self.plan["runs"]):
+        if not self.plan.get("shakedown") and not self.plan.get("shared_queue") and \
+                len(self.gpus) < len(self.plan["runs"]):
             raise QueueError(f"box {box} trains its {len(self.plan['runs'])} runs in one wave, one per GPU, and "
                              f"calibrates them concurrently: {len(self.gpus)} GPU(s) found ({self.gpus})")
         self.state_path = Path(self.s.state_dir) / STATE_FILE
@@ -740,10 +758,10 @@ class Queue:
     def _rel(self, p: Path) -> str:
         return Path(p).resolve().relative_to(self.root.resolve()).as_posix()
 
-    def start(self, name: str, gpu: str, resume: Path | None = None):
-        it = self.item(name)
+    def argv_for(self, name: str, it: dict, resume: Path | None) -> list[str]:
+        """The item's command line (start): a store build, the anchor, a speed probe, or a trainer (fresh, or --resume
+        from its local full state), with its --set values and the runs repo."""
         kind = it["kind"]
-        env = dict(os.environ, **self.s.env, **it["env"], CUDA_VISIBLE_DEVICES=str(gpu), KITSUNE_QUEUE_ITEM=name)
         if kind in ("stores",):
             argv = self._cmd("stores") + ["--config", it["config"], *sum((["--set", s] for s in it["sets"]), [])]
         elif kind == "anchor":
@@ -757,6 +775,19 @@ class Queue:
             argv += sum((["--set", s] for s in it["sets"]), [])
             if self.s.out_repo:
                 argv += ["--set", f"hf.output_repo={self.s.out_repo}"]
+        return argv
+
+    def child_env(self, name: str, it: dict, gpu: str) -> dict:
+        """Extra env for the item's process, merged last (start). The study box has none; kitsune/full_queue.py gives
+        each child its heartbeat file and deadline."""
+        return {}
+
+    def start(self, name: str, gpu: str, resume: Path | None = None):
+        it = self.item(name)
+        kind = it["kind"]
+        env = dict(os.environ, **self.s.env, **it["env"], CUDA_VISIBLE_DEVICES=str(gpu), KITSUNE_QUEUE_ITEM=name)
+        env.update(self.child_env(name, it, gpu))
+        argv = self.argv_for(name, it, resume)
         attempt = dict(t0=time.time(), gpu=str(gpu), resume=self._rel(resume) if resume is not None else None,
                        argv=argv)
         if len(it["attempts"]) >= 1 and it["env"].get("KITSUNE_CRASH_AT_STEP"):
@@ -807,19 +838,21 @@ class Queue:
 
     def kill_orphans(self):
         """A restart: the trainers the previous queue process left running (a crash of the queue itself, not of the
-        container) are killed before anything starts, so no GPU runs two jobs; their items resume below."""
+        container) are killed before anything starts, so no GPU runs two jobs; their items resume below. A pid is
+        killed only when its command line is one the queues start (ORPHAN_CMDS: never the bare kitsune.full_queue,
+        which is the queue itself) and never when it is this process or its parent (a recycled pid)."""
         for name, it in self.state["items"].items():
             if it["status"] != "running" or not it["attempts"]:
                 continue
             pid = it["attempts"][-1].get("pid")
             it["status"] = "interrupted"
-            if os.name != "posix" or not pid:
+            if os.name != "posix" or not pid or pid in (os.getpid(), os.getppid()):
                 continue
             try:
                 cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
             except OSError:
                 continue
-            if name in cmdline or "04_distill" in cmdline or "05_evaluate" in cmdline:
+            if name in cmdline or any(c in cmdline for c in ORPHAN_CMDS):
                 log(f"killing {name}'s orphaned process group {pid}")
                 try:
                     os.killpg(pid, signal.SIGKILL)
@@ -964,7 +997,7 @@ class Queue:
         elif str((summary or {}).get("error", "")).startswith(DETERMINISTIC):
             it["status"] = "failed"  # the smoke checks fail the same way from the same start: no second try
             self.event("item_failed", item=name, rc=rc, error=str(summary.get("error"))[:600], retried=False)
-        elif sum(1 for a in it["attempts"] if a.get("rc") not in (None, 0)) < MAX_ATTEMPTS and kind != "stores":
+        elif sum(1 for a in it["attempts"] if a.get("rc") not in (None, 0)) < self.max_attempts and kind != "stores":
             # failures only: an attempt a queue restart interrupted (no rc) is no failure of the item
             it["status"] = "retry"
             todo.append(name) if name not in todo else None

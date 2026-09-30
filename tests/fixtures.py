@@ -156,7 +156,9 @@ def make_fake_corpus(root, sources: dict | None = None, *, rows_per_shard: int =
                      token_range: tuple[int, int] | None = None, truncated: dict[str, int] | None = None,
                      high_agree_frac: float = 0.15, null_agree: dict[str, int] | None = None, no_second=(),
                      missing_audio: dict[str, int] | None = None, teacher_skipped: dict[str, int] | None = None,
-                     extra_shard_rows: dict[str, int] | None = None) -> FakeCorpus:
+                     extra_shard_rows: dict[str, int] | None = None, id_fn=None) -> FakeCorpus:
+    """id_fn(source, split, i) -> an id, or None for the default <source>/<hash>.flac (e.g. Emilia-style
+    <source>/JA_<video>_W<nnnnnn> ids for the full selection's dev videos); ids must stay unique."""
     root = Path(root)
     sources = sources or {"src_a": (48, "train"), "eval_x": (16, "eval")}
     lo, hi = token_range or (256, vocab_size)
@@ -170,6 +172,8 @@ def make_fake_corpus(root, sources: dict | None = None, *, rows_per_shard: int =
     rng = np.random.default_rng(seed)
 
     def make_id(source: str, split: str, i: int) -> str:
+        if id_fn is not None and (got := id_fn(source, split, i)) is not None:
+            return got
         h = hashlib.sha1(f"{seed}/{source}/{split}/{i}".encode()).hexdigest()[:13]
         return f"{source}/{h[:3]}/{h}.flac"
 
