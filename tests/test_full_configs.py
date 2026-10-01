@@ -641,10 +641,16 @@ def test_smoke_b(reg):
                                  "{out}/tables", "--manifest", "{manifest}", "--cache-dir", "{cache_dir}",
                                  "--max-temp", "0"]
         assert specs(n) == [{"check": "13", "json": "{out}/study.json", "path": "quant.nonfinite.rows", "equals": 0}]
-    for f in ("int8-w8a8", "nvfp4-w4a4", "mxfp4-w4a4"):
+    # F2 / F4: the selftest carries the compile, zero-row, parity and padded sub-checks (0.5 h); fp8-w8a8's trio
+    # (F1's bf16 weight scales, file against memory, padded batches through torchao) joined the other three, and every
+    # trio's quant-* and mem-* readout must show no non-finite row (check 13: where pre-F1 fp8 made NaN)
+    assert it["selftest"]["max_hours"] == 0.5
+    nonfinite = [{"check": "13", "json": "{out}/study.json", "path": "quant.nonfinite.rows", "equals": 0}]
+    for f in ("int8-w8a8", "nvfp4-w4a4", "mxfp4-w4a4", "fp8-w8a8"):
         q, m, c = f"quant-{f}-study-p03", f"mem-{f}-study-p03", f"cmp-{f}-study-p03"
         assert it[q]["argv"] == quant_argv(f, "{config:study-p03}", "{ckpt:study-p03}")
         assert "--quant" in it[m]["argv"] and it[m]["argv"][it[m]["argv"].index("--quant") + 1] == f
+        assert specs(q) == specs(m) == nonfinite, f
         assert it[c]["argv"] == ["{python}", "-m", "kitsune.quant", "compare", f"{{out:{q}}}", f"{{out:{m}}}",
                                  "--exact", "--json-out", "{out}/compare.json"]
         assert set(it[c]["needs"]) == {q, m}  # the {out:<item>} placeholders' implicit needs
