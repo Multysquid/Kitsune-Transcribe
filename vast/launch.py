@@ -204,6 +204,12 @@ MIN_RENTAL_DAYS = 4  # the host's max rental must outlast the box (decision 12; 
 # vast converts the query's cpu_ram GB to MB itself, loosely (m54650's 1x lists 64,439 MB), so the query asks for 60 GB
 # a GPU and the client filter for 64,000 MB a GPU (m140586's 2x at 126,367 MB fails, as planned)
 FULL_RAM_MB_PER_GPU = 64_000
+# full_filter's disk_bw floor in MB/s (plan v3 section 3), and the lowest value --min-disk-bw takes. A full box writes
+# ~1 TB once (the rebuilt shards and the store) at the rebuild's ~40 MB/s and then reads its stores at ~120 MB/s (box 1
+# measured as P-0.1B's 1,539 audio-s step every ~0.4 s); the floor keeps headroom over that, and the smoke's data_wait
+# check (verdict check 5) catches a disk that starves the loader before box 1 trains
+FULL_MIN_DISK_BW = 500
+MIN_DISK_BW_FLOOR = 150
 FULL_UP_GB_PER_GPU_HOUR = 3.0  # the cost line's upload: lean syncs plus the timed states, ~250 GB for box 2
 GATE_BLOCK_DAYS = 30  # a machine whose download gate said slow is avoided this long (vast/blocklist.json: for good)
 BLOCKLIST = Path(__file__).resolve().parent / "blocklist.json"
@@ -213,11 +219,12 @@ FULL_TOOLS = {"stores": "kitsune/full_queue.py", "train": "scripts/04_distill.py
               "speed": "tools/speed_probe.py"}
 
 
-def full_filter(n_gpus: int, disk_gb: int = DISK_GB) -> list[str]:
-    """The full box's host filter for n GPUs (plan v3 section 3); the client filter (offer_problems) does the rest."""
+def full_filter(n_gpus: int, disk_gb: int = DISK_GB, min_disk_bw: int = FULL_MIN_DISK_BW) -> list[str]:
+    """The full box's host filter for n GPUs (plan v3 section 3); the client filter (offer_problems) does the rest.
+    min_disk_bw: the disk_bw floor in MB/s (--min-disk-bw; default FULL_MIN_DISK_BW)."""
     return [f"num_gpus={n_gpus}", "verified=any", "rentable=true", "reliability>=0.98", "cuda_vers>=13.0",
-            f"cpu_cores_effective>={16 * n_gpus}", f"cpu_ram>={60 * n_gpus}", "disk_bw>=500", "inet_down>=500",
-            f"inet_up>={100 * n_gpus}", "direct_port_count>=1", f"disk_space>={disk_gb}"]
+            f"cpu_cores_effective>={16 * n_gpus}", f"cpu_ram>={60 * n_gpus}", f"disk_bw>={int(min_disk_bw)}",
+            "inet_down>=500", f"inet_up>={100 * n_gpus}", "direct_port_count>=1", f"disk_space>={disk_gb}"]
 
 
 def study_filter(n_gpus: int, disk_gb: int = DISK_GB) -> list[str]:
@@ -261,12 +268,13 @@ def study_job(box: str) -> JobSpec:
                    "dph", f"kitsune-study-{box}")
 
 
-def full_job(box: str, spec: dict, tier: str, plan_hours: float, max_hours: float, max_dph: float) -> JobSpec:
+def full_job(box: str, spec: dict, tier: str, plan_hours: float, max_hours: float, max_dph: float,
+             min_disk_bw: int = FULL_MIN_DISK_BW) -> JobSpec:
     """The JobSpec of a full box from its registry spec: its GPU count in full_filter, the tier's GPUs, the planned and
     capped hours, uploads at FULL_UP_GB_PER_GPU_HOUR, ranked by the estimated total, and the client filter. The
     download (est_down_gb) comes from the extent's sizing later."""
     n = spec["gpus"]
-    return JobSpec(FULL_TIERS[tier], full_filter(n), DISK_GB, 0.0, FULL_UP_GB_PER_GPU_HOUR * n * plan_hours,
+    return JobSpec(FULL_TIERS[tier], full_filter(n, min_disk_bw=min_disk_bw), DISK_GB, 0.0, FULL_UP_GB_PER_GPU_HOUR * n * plan_hours,
                    plan_hours, max_hours, max_dph, "est_total", f"kitsune-full-{box}", n_gpus=n,
                    accept_verification=FULL_VERIFICATION, min_rental_days=MIN_RENTAL_DAYS,
                    ram_mb_per_gpu=FULL_RAM_MB_PER_GPU)
@@ -1609,6 +1617,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gate-hours", type=float, default=None,
                     help="full: the download gate's ceiling: the host must pull the reference 571.2 GB in this many "
                          "hours (default 5; 0 turns the gate off; a box whose registry says gate false has none)")
+    ap.add_argument("--min-disk-bw", type=int, default=None, metavar="MB_S",
+                    help=f"full: the offers' disk_bw floor in MB/s (default {FULL_MIN_DISK_BW}; at least "
+                         f"{MIN_DISK_BW_FLOOR}). Lower it to take a host whose only miss is disk bandwidth; the smoke's "
+                         f"data_wait check guards the loader")
     ap.add_argument("--no-self-stop", action="store_true",
                     help="debugging: the box does not stop itself when its on-start or bootstrap fails "
                          "(KITSUNE_NO_SELF_STOP=1); the watchdog still stops it once onstart.sh has started it")
@@ -1629,11 +1641,14 @@ def main(argv: list[str] | None = None) -> int:
     full_only = [f for f, v in (("--gpus", args.gpus is not None), ("--scratch-repo", args.scratch_repo),
                                 ("--resume", args.resume), ("--resume-reset", args.resume_reset),
                                 ("--resume-set", args.resume_set), ("--tier", args.tier),
-                                ("--gate-hours", args.gate_hours is not None)) if v]
+                                ("--gate-hours", args.gate_hours is not None),
+                                ("--min-disk-bw", args.min_disk_bw is not None)) if v]
     if full_only and not full:
         ap.error(f"{', '.join(full_only)}: for --job full only")
     if args.machine is not None and not re.fullmatch(r"\d+", args.machine):
         ap.error(f"--machine takes a vast machine_id (digits), not {args.machine!r}")
+    if args.min_disk_bw is not None and args.min_disk_bw < MIN_DISK_BW_FLOOR:
+        ap.error(f"--min-disk-bw must be >= {MIN_DISK_BW_FLOOR} MB/s, not {args.min_disk_bw}")
     if args.gate_hours is not None and args.gate_hours < 0:
         ap.error("--gate-hours must be >= 0 (0 turns the gate off)")
     try:
@@ -1697,7 +1712,11 @@ def main(argv: list[str] | None = None) -> int:
         max_hours = args.max_hours if args.max_hours is not None else float(spec["max_hours"])
         plan_hours = max_hours / 1.1 if args.max_hours is not None else float(spec["est_hours"])
         max_dph = args.max_dph if args.max_dph is not None else A100_MAX_DPH if tier == "a100" else spec["max_dph"]
-        job = full_job(args.box, spec, tier, plan_hours, max_hours, max_dph)
+        min_disk_bw = args.min_disk_bw if args.min_disk_bw is not None else FULL_MIN_DISK_BW
+        if min_disk_bw < FULL_MIN_DISK_BW:
+            notes.append(f"--min-disk-bw {min_disk_bw}: offers with disk_bw >= {min_disk_bw} MB/s are taken (the "
+                         f"default floor is {FULL_MIN_DISK_BW}); the smoke's data_wait check guards the loader")
+        job = full_job(args.box, spec, tier, plan_hours, max_hours, max_dph, min_disk_bw=min_disk_bw)
         config = spec["data_config"]
         if chain is not None:
             # the boot bootstrap rebuilds stage 1's extent; the disk, the gate and the cap are the whole chain's. The

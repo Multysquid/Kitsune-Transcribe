@@ -188,6 +188,25 @@ def test_box_p01_rents_one_5090_with_the_registrys_numbers(full_launch, capsys):
     assert "avoiding machine 151760: vast/blocklist.json" in out  # every job avoids the blocklist
 
 
+def test_min_disk_bw_lowers_only_the_disk_floor(full_launch, capsys):
+    rc, fake = full_launch([[offer(1, 139369, 0.70)]], "--box", "p01", "--scratch-repo", SCRATCH, "--min-disk-bw",
+                           "250", "--dry-run")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    q = search_query(fake).split(" ")
+    assert "disk_bw>=250" in q and "disk_bw>=500" not in q
+    assert {"inet_down>=500", "inet_up>=100", "cpu_cores_effective>=16", "reliability>=0.98"} <= set(q)
+    assert "--min-disk-bw 250" in out  # the note says the floor was lowered
+    assert "disk_bw>=500" in launch.full_filter(1)  # the default floor is kept
+    two = launch.full_filter(2, min_disk_bw=300)
+    assert "disk_bw>=300" in two and not any(t.startswith("disk_bw") and t != "disk_bw>=300" for t in two)
+    for bad in ("100", "149"):
+        with pytest.raises(SystemExit):
+            launch.main(["--job", "full", "--box", "p01", "--min-disk-bw", bad, "--dry-run"])
+    with pytest.raises(SystemExit):  # a full-only flag
+        launch.main(["--job", "train", "--min-disk-bw", "300", "--dry-run"])
+
+
 def test_box_full_rents_two_gpus_under_its_cap_and_ranks_by_the_total(full_launch, capsys):
     two = [offer(1, 11, 1.60, num_gpus=2, cpu_ram=130000, inet_down_cost=0.05, inet_up_cost=0.05),  # cheap $/h, dear GB
            offer(2, 12, 1.65, num_gpus=2, cpu_ram=130000),
