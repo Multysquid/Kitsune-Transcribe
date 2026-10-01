@@ -617,15 +617,27 @@ def _register_row_major():
     so x.transpose(1, 2).contiguous() of the (B, C, T) depthwise-conv output reached torchao's int8 GEMM column-major:
     box 53693389's smoke B, speed-study-p03-int8-w8a8-compile, CUBLAS_STATUS_NOT_SUPPORTED at M = 4959 (7 mod 8: the
     case torchao's eager safe_int_mm copies to contiguous for, and its compile branch skips). A custom op's output has
-    the layout its fake declares. Registered once per process (a reload of this module finds it registered)."""
-    try:
-        op = torch.library.custom_op("kitsune::row_major", mutates_args=())(_row_major_impl)
-        op.register_fake(_row_major_fake)
-        return op
-    except (RuntimeError, ValueError):  # already registered (importlib.reload)
+    the layout its fake declares.
+
+    Registered once per process, and torch.library.custom_op is never called a second time: a second call raises, and
+    the half-built Library it leaves behind deregisters the op's schema when it is collected - measured on CPU (torch
+    2.14): after one such call every later torch.compile through the op failed with "Tried to access the schema for
+    which doesn't have a schema registered yet" (PR #35's own reload test did that to the tests after it). So the
+    first CustomOpDef is kept for the process in _ROW_MAJOR (importlib.reload keeps a module's dict, so a reload finds
+    it), and an op some other copy of this module registered (a file loaded under another module name) is looked up,
+    not defined again."""
+    global _ROW_MAJOR
+    if _ROW_MAJOR is not None:
+        return _ROW_MAJOR
+    if hasattr(torch.ops.kitsune, "row_major"):  # registered by another copy of this module, which keeps it alive
         return torch.ops.kitsune.row_major
+    op = torch.library.custom_op("kitsune::row_major", mutates_args=())(_row_major_impl)
+    op.register_fake(_row_major_fake)
+    _ROW_MAJOR = op
+    return op
 
 
+_ROW_MAJOR = globals().get("_ROW_MAJOR")  # survives importlib.reload: the op registered by the first import
 row_major = _register_row_major()
 
 

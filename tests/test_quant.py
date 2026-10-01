@@ -315,15 +315,24 @@ def test_pointwise_conv_hands_its_linear_a_row_major_input():
 
 def test_the_row_major_op():
     """kitsune::row_major: a registered custom op whose output is a row-major copy (its fake says so, which is what
-    torch.compile keeps), passing torch.library.opcheck; registering it again (a reload of the module) gives an op
-    that still works."""
+    torch.compile keeps), passing torch.library.opcheck; registering it again (a reload of the module) is the same op,
+    and torch.compile still traces it afterwards: PR #35's version called torch.library.custom_op a second time here,
+    whose half-built Library deregistered the op's schema, and every later compile through it failed."""
     x = torch.randn(2, 8, 5).transpose(1, 2)
     y = Q.row_major(x)
     assert y.is_contiguous() and torch.equal(y, x) and y.data_ptr() != x.data_ptr()
     res = torch.library.opcheck(Q.row_major, (x,))
     assert all(v == "SUCCESS" for v in res.values()), res
     again = Q._register_row_major()
-    assert again(x).is_contiguous() and torch.equal(again(x), x)
+    assert again is Q.row_major and again(x).is_contiguous() and torch.equal(again(x), x)
+    import gc
+
+    gc.collect()  # what deregistered the schema was the collection of the failed second registration
+    conv, ad = _pointwise_with_assert(1)
+    torch.compiler.reset()
+    x = torch.randn(2, 64, 9)
+    with torch.no_grad():
+        assert torch.allclose(torch.compile(ad, backend="aot_eager", dynamic=True)(x), conv(x), atol=1e-5, rtol=0)
 
 
 def test_the_selftest_names_the_int8_kernel_and_tells_mxfp4s_refusal_from_another_error(monkeypatch):
