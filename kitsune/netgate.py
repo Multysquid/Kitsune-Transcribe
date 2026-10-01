@@ -3,15 +3,25 @@
 Why: the audio rebuild (scripts/01_prepare_data.py --extent-config) downloads the extent's upstream audio from the Hub,
 ~571 GB for the full extent. Study box A #1 (machine 151760) had a ~2.9 MB/s Hub link: three 67-minute rebuild attempts
 failed before anyone noticed, all of it billed. So a full box times the same download path first, on three pinned
-upstream files (~2.5 GB, the three biggest upstreams, exactly as 01 fetches them: hf_hub_download of the pinned
-revision into a cache dir, one file at a time, with the bootstrap's HF_XET_HIGH_PERFORMANCE), and refuses a host that
-could not pull the reference 571.2 GB within the gate's ceiling (5 h by default): 31.7 MB/s. The refusal exits 3, which
+upstream files (~2.5 GB, the three biggest upstreams, with 01's own call: hf_hub_download of the pinned revision into a
+cache dir, with the bootstrap's HF_XET_HIGH_PERFORMANCE; one file at a time, where 01 now runs several, see "One
+stream" below), and refuses a host that could not pull the reference 571.2 GB within the gate's ceiling (5 h by
+default): 31.7 MB/s. The refusal exits 3, which
 bootstrap's retry() does not repeat; onstart then runs `finish.py --abort`, which destroys a box that has no run dir yet
 (nothing on its disk is unique) and records the slow gate, so vast/launch.py avoids that machine for GATE_BLOCK_DAYS.
 
 The measured rate also sizes the bootstrap's timeouts (timeouts): the per-attempt rebuild timeout never below launch's
-40 MB/s sizing (kitsune.extent: 01 is CPU-bound near that rate even on a fast link), the background label pull's never
-below 30 min.
+40 MB/s sizing (kitsune.extent REBUILD_BYTES_PER_S), the background label pull's never below 30 min.
+
+One stream on purpose (decision F3). Since F3, 01 downloads up to KITSUNE_DOWNLOAD_AHEAD (default 6) upstream files at
+once while its single-threaded ingest reads them in order (kitsune/fetchahead.py); the gate still times one file at a
+time. That is the conservative floor decision 11 judges: a host that passes on one stream passes on several, and
+judging aggregate throughput would change which hosts count as slow (an owner decision, not taken). So projected_h is
+the download alone at ONE stream, not a rebuild forecast. Before F3 the rebuild took ~2.5x it (box 1, 2026-10-01: gate
+128.9 MB/s, 571 GB projected ~1.2 h, rebuild 3.1 h = ~51 MB/s, the link idle during every ingest); with the downloads
+overlapping the ingest, the rebuild should take max(the single-threaded ingest, ~0.9-1 h on the full extent; the
+download at the aggregate rate of K streams), i.e. about the projection or less on a host whose streams add up. The
+timeouts above were sized for the slower sequential rebuild and are only more conservative now.
 
   python -m kitsune.netgate --out $STATE/download_gate.json --dir $STATE/netgate    # exit 0 pass, 3 slow, 1 error
   python -m kitsune.netgate --timeouts $STATE/download_gate.json                    # prints "PULL_MIN REBUILD_MIN"
@@ -57,7 +67,8 @@ class Sample:
 
 
 # the first input of the three biggest upstreams, at 01's pinned revisions (scripts/01_prepare_data.py REVISIONS; a
-# test asserts they are equal) and with the sizes the label box recorded (labels/full/extent.json input bytes)
+# test asserts they are equal) and with the sizes the label box recorded (labels/full/extent.json input bytes). Timed
+# one after the other: the single-stream floor, while the rebuild fetches several at once (F3, module docstring)
 SAMPLES = (
     Sample("japanese-asr/whisper_transcriptions.reazonspeech.large", "4ad8d64a13594f0ce1f0622627a18ef99b42b5e8",
            "large/train-00000-of-00705.parquet", 493_409_818),

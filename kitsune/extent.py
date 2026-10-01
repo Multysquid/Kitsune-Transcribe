@@ -87,6 +87,10 @@ DISK_BASE_GB = 127
 DISK_MARGIN, DISK_STEP_GB = 1.1, 50
 LABEL_GB_PER_HOUR = 0.0016
 PARAKEET_GB_PER_HOUR = 0.00134  # parakeet_out npz + jsonl per audio hour (STUDY.md 3.4, K9)
+# 40 MB/s stays after F3, where 01 downloads up to KITSUNE_DOWNLOAD_AHEAD (6) inputs ahead of its ingest (box 1 rebuilt
+# one at a time at ~51 MB/s): it sizes launch's rebuild timeout, the floor of the gate's and the rebuild's train_hb
+# budget, which may be generous but must never cut a healthy rebuild short. The files fetched ahead (<= 7 x 2.5 GB on
+# disk at once) fit in DISK_MARGIN, and 01's disk guard reserves RESERVE_GB per download in flight
 REBUILD_BYTES_PER_S, REBUILD_SLACK, REBUILD_BASE_MIN = 40e6, 1.5, 30
 
 
