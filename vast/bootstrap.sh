@@ -61,6 +61,12 @@
 # controller on the full extent with the same data root (01 skips stage 1's finished inputs; coverage checks every
 # stem), without the gate (its record stays) and with the controller's timeouts and a 3 h KITSUNE_PHASE_HB_MAX_S.
 set -euo pipefail
+# fd 7 is onstart's supervise.lock (flock), which its subshell holds while bootstrap runs and closes right before it
+# execs vast/supervise.py, which takes the lock itself. Nothing of bootstrap's may hold it: on 2026-10-01 (box
+# p01-chain) the train_hb touchers' `sleep 60`s, inherited fd 7 and all, outlived bootstrap, supervise.py found the lock
+# held and exited, and the box idled with no supervisor. onstart runs bootstrap with fd 7 closed; this closes it for
+# a bootstrap started any other way, so no phase, toucher or label pull (nor what they start) ever has it
+exec 7>&-
 
 KITSUNE_DIR="${KITSUNE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE="${KITSUNE_STATE:-/workspace/kitsune_state}"
@@ -96,10 +102,10 @@ TIMINGS="$STATE/bootstrap_timings.jsonl"
 HELPER="$STATE/bootstrap_helper.py"
 
 stop_label_pull() {  # job full, at exit: the background label pull and everything it started. Killing its subshell
-    # alone leaves its children running, holding onstart's supervise.lock (fd 7): the pull's timeout (SIGTERM reaches
-    # its python through timeout) and the phase's train_hb toucher (which also ends by itself once bootstrap is gone).
-    # The children are listed first: once the subshell is dead they belong to init. ps -ef has PID in column 2 and
-    # PPID in column 3, with procps and Git Bash alike
+    # alone leaves its children running: the pull's timeout (SIGTERM reaches its python through timeout) and the
+    # phase's train_hb toucher (which also ends by itself once bootstrap is gone). The children are listed first: once
+    # the subshell is dead they belong to init. ps -ef has PID in column 2 and PPID in column 3, with procps and Git
+    # Bash alike
     [ -n "${LABELS_PID:-}" ] || return 0
     local kids
     kids=$(ps -ef 2>/dev/null | awk -v p="$LABELS_PID" '$3 == p { print $2 }') || true
@@ -124,11 +130,17 @@ trap on_exit EXIT
 
 beat_train_hb() {  # beat_train_hb <max_s>: touch $STATE/train_hb (the watchdog's heartbeat on a full box) every 60 s
     # for at most max_s, and only while this bootstrap runs ($$ is its pid in every subshell): a toucher left behind
-    # by a killed bootstrap would keep an orphaned box looking alive
-    local end=$(( $(date +%s) + $1 ))
+    # by a killed bootstrap would keep an orphaned box looking alive. Its sleep runs in the background and goes with
+    # the toucher (phase kills the toucher, not its child): a `sleep 60` left behind held onstart's supervise.lock (fd
+    # 7, then inherited) up to a minute after bootstrap (see the exec 7>&- above)
+    local end=$(( $(date +%s) + $1 )) s=""
+    trap '[ -z "${s:-}" ] || kill "$s" 2>/dev/null; exit 0' TERM
     while [ "$(date +%s)" -lt "$end" ] && kill -0 "$$" 2>/dev/null; do
         touch "$STATE/train_hb" 2>/dev/null || true
-        sleep 60
+        sleep 60 &
+        s=$!
+        wait "$s" || true
+        s=""
     done
 }
 

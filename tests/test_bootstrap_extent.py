@@ -1004,6 +1004,52 @@ def test_the_exit_trap_acts_in_bootstraps_own_process_only(tmp_path):
     assert not alive, "bootstrap's own exit stops the label pull"
 
 
+def toucher_script(tmp_path: Path, func: str) -> Path:
+    """beat_train_hb started and killed as phase does, with a `sleep` on PATH that notes its pid when the toucher calls
+    it (`sleep 60`) and then sleeps 30 s in place (exec): the script says whether that sleep outlived its toucher."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    bash_script(fake / "sleep", "#!/bin/bash", '[ "$1" != 60 ] || { echo $$ >> "$SLEEP_PIDS"; set -- 30; }',
+                'exec "$REAL_SLEEP" "$@"')
+    pids = tmp_path / "sleep_pids"
+    return bash_script(
+        tmp_path / "toucher.sh", "set -euo pipefail", 'export REAL_SLEEP="$(command -v sleep)"',
+        f'fake="$(cd "{fake.as_posix()}" && pwd)"  # /d/... under Git Bash: PATH splits at the colon of D:/',
+        f'export SLEEP_PIDS="{pids.as_posix()}" PATH="$fake:$PATH"', 'chmod +x "$fake/sleep"',
+        f'STATE="{tmp_path.as_posix()}"', func,
+        "beat_train_hb 100 &", "hb=$!",
+        'for i in $(seq 200); do [ -s "$SLEEP_PIDS" ] && break; "$REAL_SLEEP" 0.05; done',
+        'kill "$hb"; wait "$hb" || true', 'p=$(head -1 "$SLEEP_PIDS")',
+        'for i in $(seq 60); do kill -0 "$p" 2>/dev/null || { echo "sleep gone"; exit 0; }; "$REAL_SLEEP" 0.05; done',
+        'kill "$p"; echo "sleep outlived its toucher"')
+
+
+def test_a_toucher_takes_its_sleep_with_it(tmp_path):
+    """phase kills its train_hb toucher, not the toucher's child: a `sleep 60` left behind kept onstart's supervise.lock
+    (fd 7) up to a minute after bootstrap, and supervise.py, started right then, refused to run. The toucher now sleeps
+    in the background and kills that sleep when it is killed (the old toucher fails this under Git Bash and Linux)."""
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    script = toucher_script(tmp_path, bootstrap_funcs("beat_train_hb"))
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "sleep gone" in r.stdout, r.stdout + r.stderr
+
+
+def test_nothing_of_bootstraps_holds_onstarts_supervise_lock():
+    """onstart's detached subshell holds supervise.lock (fd 7) while bootstrap runs and closes it right before it execs
+    supervise.py: bootstrap runs with fd 7 closed, and bootstrap closes it itself before its first command (for a
+    bootstrap started some other way), so no phase, toucher or label pull ever has it. supervise.py's bounded wait for
+    the lock: test_infra."""
+    text = BOOTSTRAP.read_text(encoding="utf-8")
+    code = [ln for ln in text.split("<<'PYEOF'")[0].splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    assert code[:2] == ["set -euo pipefail", "exec 7>&-"], code[:3]
+    onstart = (BOOTSTRAP.parent / "onstart.sh").read_text(encoding="utf-8")
+    body = re.search(r"^\(\n(.*?)^\) < /dev/null &$", onstart, re.M | re.S).group(1)
+    assert body.index('exec 7>"$KITSUNE_STATE/supervise.lock"') < body.index(
+        'bash "$KITSUNE_DIR/vast/bootstrap.sh" 7>&-\n') < body.index("exec 7>&-  # handed over")
+
+
 # Linux-only behaviour: the EXIT trap race needs Linux bash (Git Bash's slower fork does not show it). Run on Linux, or
 # under WSL from Windows (KITSUNE_LINUX_BASH, e.g. "wsl.exe -e bash", or wsl.exe when it answers); skipped otherwise.
 
@@ -1065,6 +1111,61 @@ def test_linux_a_child_killed_at_once_never_runs_bootstraps_exit_trap(tmp_path):
     assert got["new"] == 0, got
     if got["old"] == 0:
         pytest.skip(f"the old EXIT trap showed no race on this machine ({got}); on_exit was checked")
+
+
+def test_linux_onstarts_handover_finds_the_lock_free_and_the_helper_intact(tmp_path):
+    """The whole job-full bootstrap (the fake interpreter above, the labels down before the rebuild ends, real 60 s
+    toucher sleeps) under Linux bash in an onstart-like wrapper that holds supervise.lock on fd 7 and passes it to
+    bootstrap (onstart itself no longer does): right after bootstrap the lock is free, and only bootstrap's own process
+    removed the helper, never before the coverage check. Before the fix the touchers' sleeps held the lock on every
+    run, and about half the runs lost the helper. Then supervise.wait_for_lock gets a lock that a leftover holds for
+    3 s, with real flock."""
+    rounds = 3
+    py = tmp_path / "fakepy"
+    py.write_text(FAKE_PY, encoding="utf-8", newline="\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    bash_script(bin_dir / "rm", "#!/bin/bash", 'echo "$PPID $*" >> "$RM_LOG"', 'exec /bin/rm "$@"')
+    env = dict(KITSUNE_CONFIG="configs/c.json", KITSUNE_PY=linux_path(py), KITSUNE_DATA_REPO="u/data",
+               KITSUNE_OUT_REPO="u/runs", HF_TOKEN="hf_fake", REAL_PY="python3", KITSUNE_JOB="full", KITSUNE_BOX="p01",
+               KITSUNE_GATE_BYTES="571200000000", FAKE_LABELS_S="1", FAKE_REBUILD_S="2")
+    lock = tmp_path / "held.lock"
+    probe = ("import sys, time, supervise; from pathlib import Path; supervise.LOCK_POLL_S = 0.25; t0 = time.time(); "
+             "lock = supervise.wait_for_lock(Path(sys.argv[1])); "
+             "print('wait_for_lock:', 'got' if lock else 'none', f'after {time.time() - t0:.1f} s')")
+    script = bash_script(
+        tmp_path / "handover.sh", "set -uo pipefail", f'chmod +x "{linux_path(py)}" "{linux_path(bin_dir)}/rm"',
+        f'export PATH="{linux_path(bin_dir)}:$PATH"', *(f"export {k}={shlex.quote(v)}" for k, v in env.items()),
+        f"for i in $(seq {rounds}); do",
+        f'    D="{linux_path(tmp_path)}/round$i"', '    mkdir -p "$D/box/configs" "$D/state" "$D/tmp"',
+        """    echo '{}' > "$D/box/configs/c.json\"""",
+        '    export KITSUNE_DIR="$D/box" KITSUNE_STATE="$D/state" TMPDIR="$D/tmp" FAKE_CALLS="$D/calls.txt" '
+        'RM_LOG="$D/rm.log"',
+        "    (",
+        '        exec 7>"$KITSUNE_STATE/supervise.lock"',
+        '        flock -n 7 || { echo "round $i: lock busy"; exit 1; }',
+        f'        bash "{linux_path(BOOTSTRAP)}" > "$D/boot.log" 2>&1 &',
+        '        b=$!', '        echo "$b" > "$D/boot.pid"', '        wait "$b"', '        rc=$?',
+        '        exec 7>&-',
+        '        if flock -n "$KITSUNE_STATE/supervise.lock" true; then l=free; else l=held; fi',
+        '        echo "round $i: bootstrap exit $rc, lock $l"',
+        "    )",
+        "done",
+        f'flock "{linux_path(lock)}" sleep 3 &', "command sleep 0.5",
+        f'cd "{linux_path(BOOTSTRAP.parent)}"', f'python3 -c {shlex.quote(probe)} "{linux_path(lock)}"')
+    r = run_linux(script, timeout=600)
+    out = r.stdout + r.stderr
+    for i in range(1, rounds + 1):
+        d = tmp_path / f"round{i}"
+        assert f"round {i}: bootstrap exit 0, lock free" in r.stdout, out
+        boot = (d / "boot.log").read_text(encoding="utf-8")
+        assert "bootstrap complete" in boot and "was missing" not in boot, boot
+        pid = (d / "boot.pid").read_text().strip()
+        rms = (d / "rm.log").read_text().splitlines()
+        assert [ln.split()[0] for ln in rms if "bootstrap_helper.py" in ln] == [pid], (rms, pid)
+    m = re.search(r"wait_for_lock: got after ([\d.]+) s", r.stdout)
+    assert m and 1.5 < float(m.group(1)) < 30, out
+    assert "is held by another process; waiting up to 180 s" in r.stdout, out
 
 
 def test_linux_onstarts_exit_trap_unlocks_in_onstart_only(tmp_path):

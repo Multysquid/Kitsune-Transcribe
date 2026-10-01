@@ -302,8 +302,10 @@ means the run is over, so a restarted container only brings up the env and the p
 run is handled by supervise.py's own history: a restart that finds `$KITSUNE_STATE/supervise.json` skips bootstrap
 (the data passed its coverage check before the supervisor first ran) and hands straight over to it. Any failure before
 the supervisor takes over runs `finish.py --abort` (a stop without a sync; a full box without a run dir yet is
-destroyed instead), unless `KITSUNE_NO_SELF_STOP=1`. Bootstrap and the supervisor hold `$KITSUNE_STATE/supervise.lock`,
-so running the script again by hand during a run starts nothing new.
+destroyed instead), unless `KITSUNE_NO_SELF_STOP=1`. The detached subshell holds `$KITSUNE_STATE/supervise.lock` while
+bootstrap runs (bootstrap and its children never get the lock's fd), then the supervisor holds it, so running the
+script again by hand during a run starts nothing new; the supervisor waits up to 3 minutes for a lock still held when
+it starts before it steps aside.
 
 Re-arm a halted box for a fresh run: `bash vast/onstart.sh --rearm` moves the halt marker, the deadline, the
 supervisor/finish history and the heartbeats (`label_hb`, `train_hb`, `hb/`), a full box's `resume_plan.json`,
@@ -821,7 +823,12 @@ stems have Parakeet labels only: the extent and coverage checks read their ids f
 most its own worst case: the label pull, pull_labels_wait and the rebuild for their three attempts' timeouts (with the
 gate's floor rate the full extent's rebuild may take ~24 h), every other phase for `KITSUNE_PHASE_HB_MAX_S` (12 h),
 and no toucher outlives bootstrap: a bootstrap that fails during the rebuild also stops the background label pull
-(its timeout and python) and its toucher.
+(its timeout and python) and its toucher, and a killed toucher takes its `sleep 60` with it. Bootstrap closes fd 7
+(onstart's `supervise.lock`) before anything else and its EXIT trap acts in bootstrap's own process only: on
+2026-10-01 a toucher's leftover sleep kept the lock past bootstrap (supervise.py refused to start and the box idled),
+and a toucher killed right after its fork ran the inherited EXIT trap and deleted the helper before the coverage check
+(Linux bash runs a parent's EXIT trap in a child that SIGTERM reaches before it has reset its traps). supervise.py
+also waits up to 3 minutes for a held lock before it steps aside.
 
 The watchdog reads `train_hb` (bootstrap's phases, the queue's poll and the supervisor's bounded finish calls touch
 it; each trainer, 05 and the store builds beat their own `hb/<item>`, which the queue's stall check reads). On boxes p01
