@@ -210,6 +210,12 @@ FULL_RAM_MB_PER_GPU = 64_000
 # check (verdict check 5) catches a disk that starves the loader before box 1 trains
 FULL_MIN_DISK_BW = 500
 MIN_DISK_BW_FLOOR = 150
+# cost guards of a full box (launch --max-gb-cost / --max-total). 2026-10-01: with the cheap offers gone, the ranking's
+# winner under the $/h cap was a host charging $0.039/GB both ways, ~$53 expected for a ~$26 run. Usual hosts charge
+# $0-0.003/GB; the total cap defaults to FULL_TOTAL_FACTOR x the $/h cap x the planned hours, plus the run's traffic
+# at the $/GB cap (traffic dominates a short box's cost)
+FULL_MAX_GB_COST = 0.01
+FULL_TOTAL_FACTOR = 1.25
 FULL_UP_GB_PER_GPU_HOUR = 3.0  # the cost line's upload: lean syncs plus the timed states, ~250 GB for box 2
 GATE_BLOCK_DAYS = 30  # a machine whose download gate said slow is avoided this long (vast/blocklist.json: for good)
 BLOCKLIST = Path(__file__).resolve().parent / "blocklist.json"
@@ -252,6 +258,8 @@ class JobSpec:
     accept_verification: tuple | None = None  # the offer's "verification" must be one of these (None: any)
     min_rental_days: float = 0.0  # the host's max rental ("duration") at least this long
     ram_mb_per_gpu: int = 0  # cpu_ram (MB) at least this x n_gpus
+    max_gb_cost: float | None = None  # the host's inet_down_cost and inet_up_cost at most this ($/GB; None: any)
+    max_total: float | None = None  # an est_total ranking keeps only offers whose est_total is at most this ($)
 
 
 JOBS = {
@@ -277,7 +285,7 @@ def full_job(box: str, spec: dict, tier: str, plan_hours: float, max_hours: floa
     return JobSpec(FULL_TIERS[tier], full_filter(n, min_disk_bw=min_disk_bw), DISK_GB, 0.0, FULL_UP_GB_PER_GPU_HOUR * n * plan_hours,
                    plan_hours, max_hours, max_dph, "est_total", f"kitsune-full-{box}", n_gpus=n,
                    accept_verification=FULL_VERIFICATION, min_rental_days=MIN_RENTAL_DAYS,
-                   ram_mb_per_gpu=FULL_RAM_MB_PER_GPU)
+                   ram_mb_per_gpu=FULL_RAM_MB_PER_GPU, max_gb_cost=FULL_MAX_GB_COST)
 
 
 class LaunchError(RuntimeError):
@@ -391,6 +399,10 @@ def offer_problems(offer: dict, job: JobSpec, now: float | None = None) -> list[
         ram = offer.get("cpu_ram")
         if not isinstance(ram, (int, float)) or ram < job.ram_mb_per_gpu * job.n_gpus:
             out.append(f"cpu_ram {ram} MB < {job.ram_mb_per_gpu * job.n_gpus} MB")
+    if job.max_gb_cost is not None:
+        for key in ("inet_down_cost", "inet_up_cost"):
+            if _gb_cost(offer, key) > job.max_gb_cost:
+                out.append(f"{key} ${_gb_cost(offer, key):.4f}/GB > ${job.max_gb_cost:g}/GB")
     return out
 
 
@@ -407,6 +419,8 @@ def rank_offers(offers: list[dict], job: JobSpec, avoid=frozenset(), max_dph: fl
     if job.sort == "est_total":
         if max_dph is not None:
             kept = [o for o in kept if isinstance(o.get("dph_total"), (int, float)) and o["dph_total"] <= max_dph]
+        if job.max_total is not None:
+            kept = [o for o in kept if est_total(o, job) <= job.max_total]
         return sorted(kept, key=lambda o: est_total(o, job))
     return sorted(kept, key=lambda o: o.get("dph_total", 1e9))
 
@@ -431,7 +445,7 @@ def search_offers(exe: str, job: JobSpec | None = None, disk_gb: int | None = No
             avoided = sum(str(o.get("machine_id")) in {str(m) for m in avoid} for o in offers)
             why = (f" (all {len(offers)} on avoided machines)" if avoided == len(offers) else
                    f" ({avoided} of {len(offers)} on avoided machines, the others dropped by the client filter, "
-                   f"--machine or the price cap)")
+                   f"--machine, the price cap or the cost guards)")
         print(f"no offers for {name}{why}: {query}")
     if job.sort == "est_total":  # --ssh --direct needs a direct port: show whether that is what empties the search
         hint = " ".join(t for t in job_query(job, job.tiers[-1][1], disk_gb).split(" ")
@@ -1621,6 +1635,12 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"full: the offers' disk_bw floor in MB/s (default {FULL_MIN_DISK_BW}; at least "
                          f"{MIN_DISK_BW_FLOOR}). Lower it to take a host whose only miss is disk bandwidth; the smoke's "
                          f"data_wait check guards the loader")
+    ap.add_argument("--max-gb-cost", type=float, default=None, metavar="USD_PER_GB",
+                    help=f"full: drop offers whose download or upload traffic costs more than this per GB (default "
+                         f"{FULL_MAX_GB_COST:g})")
+    ap.add_argument("--max-total", type=float, default=None, metavar="USD",
+                    help=f"full: drop offers whose expected total (rent for the planned hours + traffic) is above this "
+                         f"(default {FULL_TOTAL_FACTOR:g} x the $/h cap x the planned hours + the traffic at the $/GB cap)")
     ap.add_argument("--no-self-stop", action="store_true",
                     help="debugging: the box does not stop itself when its on-start or bootstrap fails "
                          "(KITSUNE_NO_SELF_STOP=1); the watchdog still stops it once onstart.sh has started it")
@@ -1642,11 +1662,16 @@ def main(argv: list[str] | None = None) -> int:
                                 ("--resume", args.resume), ("--resume-reset", args.resume_reset),
                                 ("--resume-set", args.resume_set), ("--tier", args.tier),
                                 ("--gate-hours", args.gate_hours is not None),
-                                ("--min-disk-bw", args.min_disk_bw is not None)) if v]
+                                ("--min-disk-bw", args.min_disk_bw is not None),
+                                ("--max-gb-cost", args.max_gb_cost is not None),
+                                ("--max-total", args.max_total is not None)) if v]
     if full_only and not full:
         ap.error(f"{', '.join(full_only)}: for --job full only")
     if args.machine is not None and not re.fullmatch(r"\d+", args.machine):
         ap.error(f"--machine takes a vast machine_id (digits), not {args.machine!r}")
+    for flag, v in (("--max-gb-cost", args.max_gb_cost), ("--max-total", args.max_total)):
+        if v is not None and not v > 0:
+            ap.error(f"{flag} must be > 0, not {v}")
     if args.min_disk_bw is not None and args.min_disk_bw < MIN_DISK_BW_FLOOR:
         ap.error(f"--min-disk-bw must be >= {MIN_DISK_BW_FLOOR} MB/s, not {args.min_disk_bw}")
     if args.gate_hours is not None and args.gate_hours < 0:
@@ -1907,6 +1932,13 @@ def main(argv: list[str] | None = None) -> int:
     if full:  # the registry's cap is the whole box's: no rebuild add-on
         if sizing:
             job = replace(job, est_down_gb=sizing["down_gb"] + sizing["labels_gb"])
+        gb_cap = args.max_gb_cost if args.max_gb_cost is not None else FULL_MAX_GB_COST
+        total_cap = (args.max_total if args.max_total is not None  # rent at the $/h cap + traffic at the $/GB cap
+                     else round(FULL_TOTAL_FACTOR * float(job.max_dph) * float(job.est_hours or 0)
+                                + (job.est_down_gb + job.est_up_gb) * gb_cap, 2))
+        job = replace(job, max_gb_cost=gb_cap, max_total=total_cap)
+        notes.append(f"cost guards: traffic <= ${gb_cap:g}/GB each way; expected total <= ${total_cap:.2f} "
+                     f"(--max-gb-cost / --max-total)")
     else:
         max_hours = args.max_hours if args.max_hours is not None else \
             job.max_hours + (sizing["rebuild_timeout_min"] / 60 if sizing else 0)
