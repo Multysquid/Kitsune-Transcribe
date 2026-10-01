@@ -47,7 +47,10 @@ machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it neve
              wipe_run_dir after an event (the run dir moved to runs/_wiped/, its logs synced, the retry pulled back
              from the Hub as a new host would, then check-resume), deadline (the item's KITSUNE_DEADLINE = start +
              seconds), freeze_controller_hb (no train_hb beats for `seconds`). A fault-ended attempt never counts as a
-             failure. Then smoke_verdict.json (build contract 5: the built-in checks 1-11 on a box with train items,
+             failure. A part never ends while a fired freeze window is open (hold_freeze, box 53693389): it holds,
+             running no items and not beating, until the watchdog's alert is recorded or the window ends, bounded by
+             its stop_at and the box deadline less deadline_reserve_min; a queue restart inside the window keeps it
+             (register). Then smoke_verdict.json (build contract 5: the built-in checks 1-11 on a box with train items,
              plus the registry's verdict specs), put at full/box-<box>/smoke_verdict.json
 Exit of `run` (vast/supervise.py decide_queue): 0 when no train or stores item failed and every non-droppable train
 item is done and verified (-> destroy); EXIT_STOP 4 when a train or stores item failed for good or a non-droppable
@@ -161,6 +164,7 @@ STARTUP_WAIT_MAX_S = 120.0
 FORCED_MIN_DELTA_ABS = 1e8  # check 10: a config whose early_stop.min_delta_abs is this large forces the trigger
 SCRATCH_COMMITS_MAX = 2  # check 7: the scratch repo's history after its squashes
 ALERT_SLACK_S = 300  # check 7: an alert counts for the freeze when it falls in its window + this
+FREEZE = "freeze_controller_hb"
 # the no-start rule of a readout (start_deadline): it must end this long before the watchdog's log sync, which runs
 # KITSUNE_WATCHDOG_SYNC_LEAD_S (vast/watchdog.sh, default 600) before the box deadline
 READOUT_SYNC_MARGIN_S = 600
@@ -606,6 +610,12 @@ class FullQueue(Q.Queue):
         for f in self.spec["faults"]:
             self.state["faults"].setdefault(f["id"], dict(id=f["id"], action=f["action"], item=f["item"],
                                                           fired_at=None, outcome=None))
+        now = time.time()
+        for f, fs in self._open_freezes():  # a restart inside a fired freeze window keeps it (_freeze_until is not
+            if float(fs["window_end"]) > now:  # in queue.json): the rest of the window, then hold_freeze, as before
+                self._freeze_until = max(self._freeze_until, float(fs["window_end"]))
+                self.event("freeze_restored", id=f["id"], window_end=fs["window_end"],
+                           left_s=round(float(fs["window_end"]) - now, 1))
         self.machine_checks()
         self.save()
 
@@ -720,6 +730,7 @@ class FullQueue(Q.Queue):
             self.put_summary(force=True)
             self.execute(list(self.order), monitor=self.monitor)
             self.drain_uploads()
+            self.hold_freeze()
             self.end_faults()
             rc, status, reason = self.outcome()
         except Q.Halt as e:
@@ -1547,7 +1558,7 @@ class FullQueue(Q.Queue):
                     e.get("kind") == "checkpoint" and e.get("ckpt") == "full" for e in self._attempt_events(name)):
                 continue  # only once this attempt has a full state to resume from
             self._fire(f, name, step=step)
-            if f["action"] == "freeze_controller_hb":
+            if f["action"] == FREEZE:
                 fs["window_end"] = now + float(f["seconds"])
                 self._freeze_until = fs["window_end"]
                 continue
@@ -1560,12 +1571,90 @@ class FullQueue(Q.Queue):
                 if not self._killpg(proc, getattr(signal, "SIGKILL", None)):
                     proc.kill()
 
-    def _freeze_windows(self, now: float):
+    def _open_freezes(self) -> list[tuple[dict, dict]]:
+        """(fault, its state) of every freeze_controller_hb fault that fired and has no outcome yet."""
+        out = []
         for f in self.spec["faults"]:
-            fs = self.state["faults"][f["id"]]
-            if f["action"] == "freeze_controller_hb" and fs.get("window_end") and fs["outcome"] is None and \
-                    now >= fs["window_end"]:
-                self._outcome(f, "recovered")
+            fs = self.state["faults"].get(f["id"]) or {}
+            if f["action"] == FREEZE and fs.get("fired_at") is not None and fs.get("window_end") and \
+                    fs.get("outcome") is None:
+                out.append((f, fs))
+        return out
+
+    def _freeze_windows(self, now: float):
+        """Every poll (and in hold_freeze): a freeze window that has run its `seconds` closes (released at its
+        window_end, release "window")."""
+        for f, fs in self._open_freezes():
+            if now >= float(fs["window_end"]):
+                self._release(f, float(fs["window_end"]), "window")
+
+    def _release(self, f: dict, at: float, why: str):
+        """A freeze ends: released (wall), release (alert: the watchdog's alert was recorded during the hold; window:
+        its seconds ran out; deadline: the hold reached the box deadline less deadline_reserve_min; cut: end_faults found
+        it open, which hold_freeze should make unreachable), outcome recovered; the controller beats again unless
+        another freeze still holds."""
+        fs = self.state["faults"][f["id"]]
+        fs.update(released=at, release=why)
+        self._outcome(f, "recovered")
+        self._freeze_until = max([float(x["window_end"]) for _, x in self._open_freezes()], default=0.0)
+
+    def watchdog_alerts(self) -> list[dict]:
+        """The box watchdog's alert records ($KITSUNE_STATE/watchdog_alerts.jsonl; a chain part: the box's state dir)."""
+        p = self.box_state / fullrun.ALERTS_FILE
+        out = []
+        if p.is_file():
+            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+        return out
+
+    def freeze_alerts(self, fs: dict) -> list[dict]:
+        """The watchdog alerts that count for a fired freeze (check 7, and hold_freeze's early release): wall in
+        [its fire, its end + ALERT_SLACK_S], its end being its release, or while it is open its planned window_end."""
+        t0 = (fs.get("fired_at") or {}).get("wall")
+        if t0 is None:
+            return []
+        end = float(fs.get("released") or fs.get("window_end") or t0)
+        return [a for a in self.watchdog_alerts() if float(t0) <= float(a.get("wall") or 0) <= end + ALERT_SLACK_S]
+
+    def hold_freeze(self):
+        """Hold the part while a fired freeze window is open (run(): after the last item and the upload drain, before
+        end_faults). Box 53693389 (2026-10-01): F5 fired on smoke-p005, the item ended ~50 s later, the rest of the part
+        took ~7 min, and end_faults cut the window after 480 s - below the watchdog's orphan_s 600 plus its 60 s poll, so
+        no alert could come and check 7 failed (alerts_during 0). Here the part runs no item and never beats (the window
+        holds ctl_beat_path at None) until the watchdog's alert is recorded (freeze_alerts: release "alert", at once), the
+        window ends (release "window"), or the box deadline less deadline_reserve_min comes (release "deadline"); a
+        chain part's stop_at halts it (stage_deadline_check: run()'s Halt, the verdict written, the window left open as
+        any Halt leaves it). Expected idle ~orphan_s + the watchdog's poll - what was left of the window at the part's
+        end; with no watchdog, the rest of `seconds`. The chain's set_mode comes after the part returns, so the watchdog
+        stays in its alert mode for the whole hold."""
+        for f, fs in self._open_freezes():
+            t_in = time.time()
+            dl = self.box_deadline()
+            cap = None if dl is None else dl - float(self.spec["deadline_reserve_min"]) * 60
+            end = float(fs["window_end"])
+            self.event("freeze_hold", id=f["id"], window_end=end, left_s=round(end - t_in, 1),
+                       alerts=len(self.freeze_alerts(fs)))
+            log(f"{f['id']}: the freeze window is open for {max(0.0, end - t_in):.0f} s more: holding the part (no "
+                f"items, no beats) until the watchdog's alert or the window's end")
+            self.save()
+            try:
+                while fs.get("outcome") is None:
+                    now = time.time()
+                    if self.freeze_alerts(fs):
+                        self._release(f, now, "alert")
+                    elif now >= end:
+                        self._freeze_windows(now)
+                    elif cap is not None and now >= cap:
+                        self._release(f, now, "deadline")
+                    else:
+                        self.stage_deadline_check()
+                        time.sleep(max(0.0, min(self.s.poll_s, end - now, (cap - now) if cap is not None else end)))
+            finally:
+                fs["held_s"] = round(time.time() - t_in, 2)
+                self.save()
 
     def _outcome(self, f: dict, outcome: str):
         fs = self.state["faults"][f["id"]]
@@ -1590,7 +1679,7 @@ class FullQueue(Q.Queue):
             if fs["fired_at"] is None:
                 fs["outcome"] = "missed"
                 self.event("fault_missed", id=f["id"], action=f["action"], item=name)
-            elif f["action"] != "freeze_controller_hb":
+            elif f["action"] != FREEZE:
                 ok = self.item(name)["status"] == "done" and (f["action"] != "wipe_run_dir"
                                                                or self.item(name).get("check_resume") == "ok")
                 self._outcome(f, "recovered" if ok else "failed")
@@ -1603,8 +1692,8 @@ class FullQueue(Q.Queue):
             if fs["fired_at"] is None:
                 fs["outcome"] = "missed"
                 self.event("fault_missed", id=f["id"], action=f["action"], item=f["item"])
-            elif f["action"] == "freeze_controller_hb":
-                self._outcome(f, "recovered")
+            elif f["action"] == FREEZE:  # hold_freeze closed it unless the part ended in a way that skipped the hold
+                self._release(f, time.time(), "cut")
             else:
                 self._fault_outcomes(f["item"])
         self._freeze_until = 0.0
@@ -1664,7 +1753,8 @@ class FullQueue(Q.Queue):
 
     def faults_list(self) -> list[dict]:
         return [dict(id=fs["id"], action=fs["action"], item=fs["item"], fired_at=fs.get("fired_at"),
-                     outcome=fs.get("outcome")) for fs in self.state["faults"].values()]
+                     outcome=fs.get("outcome"), **{k: fs[k] for k in ("window_end", "released", "release", "held_s")
+                                                   if k in fs}) for fs in self.state["faults"].values()]
 
     def write_summary(self, status: str, reason: str | None, rc: int | None):
         path = Path(self.s.state_dir) / fullrun.SUMMARY_FILE
@@ -1799,15 +1889,7 @@ class SmokeVerdict:
                     faults=self.q.faults_list(), hb_max_gap_s=hb, alerts=self.alerts())
 
     def alerts(self) -> list[dict]:
-        p = self.q.box_state / fullrun.ALERTS_FILE  # the box watchdog's file (a chain part: the box's state dir)
-        out = []
-        if p.is_file():
-            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-                try:
-                    out.append(json.loads(line))
-                except ValueError:
-                    continue
-        return out
+        return self.q.watchdog_alerts()
 
     def check1(self):
         names = [n for n in self.trains() if n != SMOKE_NOSTART]
@@ -1967,13 +2049,13 @@ class SmokeVerdict:
                 good = good and self.items[f["item"]].get("check_resume") == "ok"
             ev[f["id"]] = dict(outcome=fs.get("outcome"), ok=good)
             ok = ok and good
-        f, fs = self.fault("freeze_controller_hb")
-        if f is not None:
+        f, fs = self.fault(FREEZE)
+        if f is not None:  # the window as it was held: from the fire to its release (hold_freeze), not the plan
             t0 = (fs.get("fired_at") or {}).get("wall")
-            end = fs.get("window_end") or (t0 or 0) + float(f["seconds"])
-            during = [a for a in self.alerts() if t0 is not None and t0 <= float(a.get("wall") or 0) <=
-                      end + ALERT_SLACK_S]
-            ev[f["id"]] = dict(alerts_during=len(during), window=[t0, end])
+            end = fs.get("released") or fs.get("window_end") or (t0 or 0) + float(f["seconds"])
+            during = self.q.freeze_alerts(fs)
+            ev[f["id"]] = dict(alerts_during=len(during), window=[t0, end], held_s=fs.get("held_s"),
+                               release=fs.get("release"), orphan_s=(self.q.spec.get("watchdog") or {}).get("orphan_s"))
             ok = ok and bool(during)
         scratch = self.q.scratch_hub()
         timed = [n for n in self.ran() if self.kinds(n, "timed_state_upload_ok")]
@@ -2206,7 +2288,9 @@ class ChainController:
     verified, else ignored, and started again); the chain summary ($KITSUNE_STATE/queue_summary.json, put at
     full/box-<chain>/queue_summary.json) on every step change and at the end. The controller beats train_hb only between
     steps: never while a part runs (the part's queue beats, and a smoke's freeze fault must hold) nor while the stage-2
-    bootstrap runs (its phases' bounded touchers keep it fresh, so a hung phase still goes stale)."""
+    bootstrap runs (its phases' bounded touchers keep it fresh, so a hung phase still goes stale). A part never returns
+    while its fired freeze window is open (FullQueue.hold_freeze), so neither the controller's beat at the part's end
+    nor set_mode's stop mode can cut a freeze short of the alert check 7 needs."""
 
     def __init__(self, box: str, settings: FullSettings | None = None, registry: dict | None = None, *,
                  bootstrap_cmd: list[str] | None = None, boot_poll_s: float = BOOT2_POLL_S,

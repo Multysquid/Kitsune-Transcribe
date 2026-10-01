@@ -540,7 +540,8 @@ def test_summary_puts_are_coalesced_but_never_lost(fq):
 
 
 def smoke_registry(reg: dict, *, sigstop: bool, stall_min: float | None = None) -> dict:
-    """box full-smoke of tiny_registry, sized for the fakes: the freeze fault 30 s on a watchdog of 0 s; without SIGSTOP
+    """box full-smoke of tiny_registry, sized for the fakes: the freeze fault 60 s (orphan_s + fullrun.WATCHDOG_POLL_S)
+    on a watchdog of 0 s, released at the stand-in watchdog's alert if the part ends first (hold_freeze); without SIGSTOP
     (Windows) F1 is dropped and the wipe fires on the first attempt. stall_min: the smoke trainers' stall limit (the
     registry's 10 min otherwise; the SIGSTOP run needs seconds, as its stopped trainer is recovered by the stall
     check)."""
@@ -551,7 +552,7 @@ def smoke_registry(reg: dict, *, sigstop: bool, stall_min: float | None = None) 
                 it["stall_min"] = stall_min
     for f in reg["boxes"]["full-smoke"]["faults"]:
         if f["action"] == "freeze_controller_hb":
-            f["seconds"] = 30.0  # longer than the rest of smoke-p005: its end falls inside, whatever the load
+            f["seconds"] = 60.0  # longer than the rest of smoke-p005: its end falls inside, whatever the load
         if f["action"] == "wipe_run_dir" and not sigstop:
             f["min_attempt"] = 1
     if not sigstop:
@@ -647,15 +648,19 @@ def check_smoke(fq, rc, runs_hub, scratch_hub, seen):
     # F4 deadline: KITSUNE_DEADLINE = its start + 600 s
     p005_rec = next(x for x in fq.records("train") if x["item"] == "smoke-p005")
     assert float(p005_rec["deadline"]) == pytest.approx(p005_rec["t0"] + 600, abs=5)
-    # F5 freeze: train_hb unchanged from the fault until it ended (its window, or the run's end: end_faults), across
-    # an item end and its summary put
-    fired = st["faults"]["F5"]["fired_at"]["wall"]
-    until = min(st["faults"]["F5"]["window_end"],
-                next(e["wall"] for e in fq.events("fault_outcome") if e["id"] == "F5"))
+    # F5 freeze: train_hb unchanged from the fault until its release (its window's end, or the watchdog's alert while
+    # the part held it open: hold_freeze, never end_faults' cut), across an item end and its summary put
+    f5 = st["faults"]["F5"]
+    fired, until = f5["fired_at"]["wall"], f5["released"]
+    assert f5["release"] in ("alert", "window") and until <= f5["window_end"]
     window = [m for t, m in seen if fired + 0.05 < t < until - 0.05]
     assert window and len(set(window)) == 1
     ends = [e for e in fq.events("item_end") if fired < e["wall"] < until]
     assert any(e["item"] == "smoke-p005" for e in ends), "smoke-p005 did not end inside the freeze"
+    alerts = [json.loads(x) for x in (fq.state / fullrun.ALERTS_FILE).read_text(encoding="utf-8").splitlines()]
+    first = min(a["wall"] for a in alerts if a["wall"] >= fired)
+    assert fq.events("queue_end")[0]["wall"] >= first  # the part did not end before the freeze's alert
+    assert v["checks"]["7"]["evidence"]["F5"]["window"] == [fired, until]
     # smoke-nostart: skipped by the no-start rule; check 3's math on the fakes' step times
     assert st["items"]["smoke-nostart"]["status"] == "skipped" and "smoke-nostart" in st["no_start"]
     c3 = v["checks"]["3"]["evidence"]
@@ -689,6 +694,156 @@ def test_smoke_a_faults_and_verdict(fq, monkeypatch):
     every built-in check passes."""
     rc, q, runs_hub, scratch_hub, seen = run_smoke(fq, monkeypatch, sigstop=False)
     check_smoke(fq, rc, runs_hub, scratch_hub, seen)
+
+
+
+# the end-of-part freeze hold (box 53693389: F5's window cut at 480 s by end_faults, before the watchdog's 600 s
+# orphan_s and its poll, so check 7 had no alert)
+
+
+FREEZE_ENV = dict(FAKE_EPOCH_STEPS="100", FAKE_STEP_S="0.01")  # smoke-p005: ~1 s, F5 fires at its step 5
+
+
+def freeze_box(fq, monkeypatch, seconds: float, orphan_s: int = 1, **changes):
+    """box full-smoke reduced to stores-ctc and smoke-p005 with F4 dropped and F5 at step 5 for `seconds` on an
+    alert watchdog of orphan_s (fullrun.WATCHDOG_POLL_S 0, so seconds > orphan_s validates): under FREEZE_ENV,
+    smoke-p005 ends ~1 s after the fire, so the part's work is over long before the window."""
+    monkeypatch.setattr(fullrun, "WATCHDOG_POLL_S", 0)
+    reg = box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p005"],
+                   watchdog={"orphan_s": orphan_s, "action": "alert"}, **changes)
+    reg["boxes"]["full-smoke"]["faults"] = [dict(f, at_step=5, seconds=seconds)
+                                            for f in reg["boxes"]["full-smoke"]["faults"]
+                                            if f["action"] == "freeze_controller_hb"]
+    return reg
+
+
+def stand_in_watchdog(hb: Path, alerts: Path, stale_s: float):
+    """The alert-mode watchdog in miniature: one orphan_alert per stale spell of train_hb (> stale_s); returns its stop
+    event and a list of (time, mtime) samples."""
+    stop, seen = threading.Event(), []
+
+    def run():
+        armed = True
+        while not stop.is_set():
+            try:
+                m = hb.stat().st_mtime
+            except OSError:
+                m = None
+            seen.append((time.time(), m))
+            if m is not None and time.time() - m > stale_s and armed:
+                with open(alerts, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"wall": time.time(), "kind": "orphan_alert", "hb": hb.name,
+                                        "age_s": time.time() - m, "limit_s": stale_s}) + "\n")
+                armed = False
+            elif m is not None and time.time() - m < 0.1:
+                armed = True
+            time.sleep(0.01)
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return stop, th, seen
+
+
+def test_the_part_holds_an_open_freeze_until_the_watchdog_alerts(fq, monkeypatch):
+    """The regression test of box 53693389: the freeze's item ends long before its window, nothing else is left, and
+    the part holds - no items, no beats - until the watchdog's alert is recorded, then releases at once; check 7
+    passes. Before the fix, end_faults cut the window as the part ended and the alert never came."""
+    reg = freeze_box(fq, monkeypatch, seconds=60.0, orphan_s=3)
+    hb, alerts = fq.state / fullrun.TRAIN_HB, fq.state / fullrun.ALERTS_FILE
+    fq.state.mkdir(parents=True, exist_ok=True)
+    stop, th, seen = stand_in_watchdog(hb, alerts, stale_s=3.0)
+    try:
+        q = fq.make("full-smoke", registry=reg, env=FREEZE_ENV)
+        t0 = time.time()
+        assert q.run() == F.EXIT_OK
+    finally:
+        stop.set()
+        th.join(5)
+    assert time.time() - t0 < 30  # released at the alert, not at the window's 60 s
+    st = fq.st()
+    f5 = st["faults"]["F5"]
+    (hold,) = fq.events("freeze_hold")
+    fired = f5["fired_at"]["wall"]
+    alert_wall = min(w for w in (json.loads(x)["wall"] for x in alerts.read_text(encoding="utf-8").splitlines())
+                     if w >= fired)
+    assert f5["release"] == "alert" and f5["outcome"] == "recovered" and f5["released"] >= alert_wall
+    assert f5["held_s"] >= 0 and hold["id"] == "F5" and hold["left_s"] > 30
+    assert fq.events("queue_end")[0]["wall"] >= alert_wall
+    # train_hb never moved from the fire to the release
+    window = [m for t, m in seen if fired + 0.05 < t < f5["released"] - 0.05]
+    assert window and len(set(window)) == 1
+    item_end = next(e["wall"] for e in fq.events("item_end") if e["item"] == "smoke-p005")
+    assert fired < item_end < hold["wall"] < alert_wall  # the item ended inside the window, then the part held
+    c7 = json.loads((fq.state / fullrun.VERDICT_FILE).read_text(encoding="utf-8"))["checks"]["7"]
+    assert c7["pass"] is True and c7["evidence"]["F5"]["alerts_during"] == 1, c7
+    assert c7["evidence"]["F5"]["release"] == "alert" and c7["evidence"]["F5"]["window"] == [fired, f5["released"]]
+    assert c7["evidence"]["F5"]["orphan_s"] == 3 and c7["evidence"]["F5"]["held_s"] == f5["held_s"]
+
+
+def test_a_freeze_hold_without_a_watchdog_ends_with_its_window(fq, monkeypatch):
+    """No alert ever comes: the part holds to the window's end (release "window"), and check 7 fails honestly."""
+    q = fq.make("full-smoke", registry=freeze_box(fq, monkeypatch, seconds=3.0), env=FREEZE_ENV)
+    assert q.run() == F.EXIT_OK
+    f5 = fq.st()["faults"]["F5"]
+    assert f5["release"] == "window" and f5["released"] == f5["window_end"] and f5["outcome"] == "recovered"
+    assert fq.events("queue_end")[0]["wall"] >= f5["window_end"]
+    c7 = json.loads((fq.state / fullrun.VERDICT_FILE).read_text(encoding="utf-8"))["checks"]["7"]
+    assert c7["pass"] is False and c7["evidence"]["F5"]["alerts_during"] == 0
+
+
+def test_a_freeze_hold_stops_at_the_box_deadline_reserve_and_halts_at_a_parts_stop_at(fq, monkeypatch):
+    """The hold never outlasts the box deadline less deadline_reserve_min (release "deadline"), and a chain part's
+    stop_at halts it (rc 4, the verdict written, no hang)."""
+    reg = freeze_box(fq, monkeypatch, seconds=600.0, deadline_reserve_min=0)
+    fq.state.mkdir(parents=True, exist_ok=True)
+    (fq.state / "deadline").write_text(f"{time.time() + 8}\n")
+    q = fq.make("full-smoke", registry=reg, env=FREEZE_ENV)
+    assert q.run() == F.EXIT_OK
+    f5 = fq.st()["faults"]["F5"]
+    assert f5["release"] == "deadline" and f5["released"] < f5["window_end"] and f5["held_s"] < 30
+    fq.reset()
+    q = fq.make("full-smoke", registry=freeze_box(fq, monkeypatch, seconds=600.0), env=FREEZE_ENV,
+                stop_at=time.time() + 8)
+    t0 = time.time()
+    assert q.run() == F.EXIT_STOP
+    assert time.time() - t0 < 60
+    st = fq.st()
+    assert st["final"]["status"] == "halted" and "stage deadline" in st["final"]["reason"]
+    assert fq.events("stage_deadline") and fq.events("freeze_hold")
+    assert (fq.state / fullrun.VERDICT_FILE).is_file()
+
+
+def test_a_queue_restart_inside_a_freeze_keeps_it(fq, monkeypatch):
+    """_freeze_until is not in queue.json: a new queue's register() restores a fired, open window (freeze_restored),
+    so the controller does not beat for the rest of it; after its end it beats again."""
+    reg = freeze_box(fq, monkeypatch, seconds=60.0)
+    q = fq.make("full-smoke", registry=reg)
+    q.register()
+    end = time.time() + 0.6
+    q.state["faults"]["F5"].update(fired_at=dict(wall=time.time(), attempt=1, step=5), window_end=end)
+    q.save()
+    q2 = fq.make("full-smoke", registry=reg)
+    q2.register()
+    assert q2.ctl_beat_path() is None and q2._freeze_until == end
+    (ev,) = fq.events("freeze_restored")
+    assert ev["id"] == "F5" and ev["window_end"] == end
+    time.sleep(max(0.0, end - time.time()) + 0.05)
+    assert q2.ctl_beat_path() == fq.state / fullrun.TRAIN_HB
+    # an ended window is not restored
+    q3 = fq.make("full-smoke", registry=reg)
+    q3.register()
+    assert q3._freeze_until == 0.0 and len(fq.events("freeze_restored")) == 1
+
+
+def test_end_faults_records_a_cut_freeze(fq, monkeypatch):
+    """A freeze still open when end_faults runs (hold_freeze skipped) is recorded as cut, so a regression shows."""
+    q = fq.make("full-smoke", registry=freeze_box(fq, monkeypatch, seconds=60.0))
+    q.register()
+    q.state["faults"]["F5"].update(fired_at=dict(wall=time.time(), attempt=1, step=5), window_end=time.time() + 60)
+    q._freeze_until = q.state["faults"]["F5"]["window_end"]
+    q.end_faults()
+    f5 = q.state["faults"]["F5"]
+    assert f5["release"] == "cut" and f5["outcome"] == "recovered" and q.ctl_beat_path() is not None
 
 
 def test_a_fault_fires_only_after_a_full_state_and_is_missed_when_the_run_ends_first(fq):
