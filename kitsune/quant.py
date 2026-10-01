@@ -265,6 +265,17 @@ CKPT_AED_LENGTHS = (300, 287, 251, 200, 173, 120, 64, 31)
 # is the order that recompiled there (dynamo specialises a batch of 1)
 COMPILE_FORMATS = ("int8-w8a8", "nvfp4-w4a4", "fp8-w8a8")
 COMPILE_BLOCK = dict(channels=1024, kernel=9, frames=333, batches=(3, 1))
+# The compiled block is judged by its quantisation error, not by its distance to the eager block. inductor elides the
+# bf16 downcast-upcast pairs inside a fused kernel (torch._inductor.config.emulate_precision_casts, off by default;
+# Triton's fp fusion on): torchao's bf16 activation scale (fp8: amax / 448 in bf16, F1; int8: amax / 127.5) becomes
+# fp32 there, and so do the bf16 roundings between the block's pointwise ops ahead of each quantiser - so a share of
+# the activation codes differ from eager's, and SELFTEST_TOL (real against emulate on the same codes) cannot bound
+# compiled against eager. A CPU simulation at COMPILE_BLOCK (the emulation with fp32 activation scales, and with the
+# whole block in fp32 as the upper bound; 2026-10-02) put compiled against eager at 0.46-0.56 % for int8 (tol 0.5 %),
+# up to 3.8 % for nvfp4 (2 %) and 1.5 % for fp8 (1 %), while the error against the unquantised bf16 block stayed
+# where eager's is: their ratio 0.97-1.00 in every format. Hard check: that ratio within COMPILE_NOISE_RATIO (a wrong
+# kernel, layout or scale gives several times eager's error; a silent eager fallback is the graph counter's to catch)
+COMPILE_NOISE_RATIO = 1.25
 TIMED_FORMATS = tuple(f for f in QUANT_FORMATS if f != "fp16" and FORMAT_INFO[f]["timed"])
 BEAT_MAX_S = 1800  # the heartbeat bound of export / compare / selftest (contract 8)
 LOAD_WITH = ("kitsune.quant.load_quantized (transformers from_pretrained would re-initialise the missing .weight "
@@ -2215,7 +2226,8 @@ def selftest(device, *, ckpt=None, rows=(1, 7, 17, 128, 1000), shape=(2560, 1024
                        low-precision GEMM runs (W*A* formats, by op evidence: low_gemm_evidence)
       mxfp4            MXFP4 through torchao's AUTO kernel must raise (a warning, "re-evaluate decision 20", when not)
       compile          (F4, _selftest_compile) a conformer-convolution-like block of quantised Linears, torch.compile'd
-                       (dynamic, inductor) at B = 3 then B = 1, against the eager block, per COMPILE_FORMATS
+                       (dynamic, inductor) at B = 3 then B = 1, its error against the unquantised block within
+                       COMPILE_NOISE_RATIO of the eager block's, per COMPILE_FORMATS
       ckpt             with ckpt dirs: the same comparison on the student (a CTC encoder batch; an AED
                        greedy_generate(pin_new=8) at batch 1 and 8), then padded batches (F4: CKPT_CTC_LENGTHS,
                        CKPT_AED_LENGTHS) with the real model under NonFiniteMonitor: no non-finite row
@@ -2513,9 +2525,10 @@ class _ConvBlock(nn.Module):
         return self.pointwise_conv2(h).transpose(1, 2)
 
 
-def _conv_block(fmt: str, impl: str, dev, c: int, k: int, seed: int = 0) -> _ConvBlock:
+def _conv_block(fmt: str | None, impl: str, dev, c: int, k: int, seed: int = 0) -> _ConvBlock:
     """A seeded _ConvBlock in bf16 on dev (the speed probe's whole-model cast), its pointwise convs adapted and its
-    three Linears quantised (quantize_linear) for impl, with the counters off (as speed_probe --compile)."""
+    three Linears quantised (quantize_linear) for impl, with the counters off (as speed_probe --compile); fmt None:
+    the same block unquantised (the compile sub-check's reference)."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     blk = _ConvBlock(c, k)
     with torch.no_grad():
@@ -2528,10 +2541,20 @@ def _conv_block(fmt: str, impl: str, dev, c: int, k: int, seed: int = 0) -> _Con
     blk.pointwise_conv1 = PointwiseConv1dAsLinear(blk.pointwise_conv1)
     blk.pointwise_conv2 = PointwiseConv1dAsLinear(blk.pointwise_conv2)
     blk = blk.to(dev, torch.bfloat16).eval()
-    for lin in (blk.ff, blk.pointwise_conv1.linear, blk.pointwise_conv2.linear):
+    for lin in (blk.ff, blk.pointwise_conv1.linear, blk.pointwise_conv2.linear) if fmt else ():
         quantize_linear(lin, fmt, impl)
         lin.kq.count = False
     return blk
+
+
+def _compile_compare(yc: torch.Tensor, ye: torch.Tensor, yref: torch.Tensor) -> dict:
+    """The compile sub-check's numbers (COMPILE_NOISE_RATIO): rel_err compiled against eager (a record),
+    err_eager / err_compiled against the unquantised block's output yref, and noise_ratio = err_compiled / err_eager,
+    which the check bounds. A ratio of 1 when both are 0 (the CPU test's aot_eager on emulate gives eager's bits)."""
+    e_eager, e_comp = _rel_frob(ye, yref), _rel_frob(yc, yref)
+    ratio = e_comp / e_eager if e_eager else (1.0 if e_comp == 0 else math.inf)
+    return dict(rel_err=_rel_frob(yc, ye), err_eager=e_eager, err_compiled=e_comp, noise_ratio=ratio,
+                max_noise_ratio=COMPILE_NOISE_RATIO)
 
 
 def _dynamo_graphs() -> int:
@@ -2548,14 +2571,22 @@ def _selftest_compile(rec, check, dev, *, impl: str = "torchao", backend: str = 
     kitsune::row_major, is verified only here and on smoke B's +compile speed items). Per COMPILE_FORMATS: a
     _conv_block (COMPILE_BLOCK, or `block` overriding it), torch.compiler.reset(), torch.compile(dynamic=True,
     backend), then a batch of B = batches[0] (frames T; the second element's last third masked) and one of B =
-    batches[1], under bf16 autocast, each against the eager block. Hard check "compile <fmt> B=<b>": no exception, a
-    finite output within SELFTEST_TOL[fmt] of the eager one, and dynamo compiled a graph for the format (its
-    unique_graphs counter grew: a silent eager fallback must not pass). The error text is recorded."""
+    batches[1], under bf16 autocast, each against the eager block and the unquantised one. Hard check "compile <fmt>
+    B=<b>": no exception, a finite output whose error against the unquantised block is within COMPILE_NOISE_RATIO of
+    the eager block's (_compile_compare; not SELFTEST_TOL against eager: inductor drops bf16 roundings the eager
+    quantisers make, see COMPILE_NOISE_RATIO), and dynamo compiled a graph for the format (its unique_graphs counter
+    grew: a silent eager fallback must not pass). The error text is recorded."""
     cfg = dict(COMPILE_BLOCK, **(block or {}))
     c, k, T = int(cfg["channels"]), int(cfg["kernel"]), int(cfg["frames"])
-    out = dict(backend=backend, impl=impl, block=cfg, formats={})
+    out = dict(backend=backend, impl=impl, block=cfg, max_noise_ratio=COMPILE_NOISE_RATIO, formats={})
     rec["compile"] = out
     g = torch.Generator(device="cpu").manual_seed(3)
+    try:
+        ref = _conv_block(None, impl, dev, c, k)
+    except Exception as e:  # noqa: BLE001 - recorded: without the reference no format can be judged
+        out["error"] = f"{type(e).__name__}: {e}"[:600]
+        check("compile reference block", False, out["error"])
+        return
     for fmt in COMPILE_FORMATS:
         f = dict(calls={})
         out["formats"][fmt] = f
@@ -2580,13 +2611,14 @@ def _selftest_compile(rec, check, dev, *, impl: str = "torchao", backend: str = 
                 before = _dynamo_graphs()
                 with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16):
                     ye = blk(x, mask)
+                    yref = ref(x, mask)
                     t0 = time.perf_counter()
                     yc = comp(x, mask)
                     _sync(dev)
                     r["wall_s"] = time.perf_counter() - t0
                 r.update(graphs_new=_dynamo_graphs() - before, graphs_format=_dynamo_graphs() - start,
-                         finite=bool(torch.isfinite(yc).all()), rel_err=_rel_frob(yc, ye), tol=SELFTEST_TOL[fmt])
-                ok = r["finite"] and r["rel_err"] <= SELFTEST_TOL[fmt] and r["graphs_format"] > 0
+                         finite=bool(torch.isfinite(yc).all()), **_compile_compare(yc, ye, yref))
+                ok = r["finite"] and r["noise_ratio"] <= COMPILE_NOISE_RATIO and r["graphs_format"] > 0
             except Exception as e:  # noqa: BLE001 - recorded: the assert / cuBLAS error text is the evidence
                 r["error"] = f"{type(e).__name__}: {e}"[:600]
                 ok = False

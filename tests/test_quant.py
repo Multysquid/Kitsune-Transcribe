@@ -1190,6 +1190,45 @@ def test_selftest_compile_block_on_cpu():
         calls = rec["compile"]["formats"][f]["calls"]
         assert calls["B=3"]["graphs_new"] >= 1 and calls["B=1"]["graphs_new"] >= 1 and calls["B=1"]["rel_err"] == 0.0
         assert calls["B=3"]["rows"] == 87 and rec["compile"]["block"]["kernel"] == 9
+        for r in calls.values():  # aot_eager on emulate: eager's bits, so its quantisation error exactly
+            assert r["noise_ratio"] == 1.0 and r["err_compiled"] == r["err_eager"] > 0
+
+
+def test_compile_check_judges_the_quantisation_error_not_the_distance_to_eager(monkeypatch):
+    """COMPILE_NOISE_RATIO: inductor drops the bf16 roundings of eager's quantisers (the fp8 and int8 activation scales
+    become fp32, and the pointwise chain before each quantiser runs in fp32), which moves compiled outputs further from
+    eager than SELFTEST_TOL in some format (COMPILE_BLOCK's width, 3 x 64 frames here), but leaves their error against
+    the unquantised block where eager's is. Simulated with the emulation itself (fp32 activation scales; the whole block
+    in fp32): every format passes the ratio check; a wrong output (a scale off by 1.5 on every row, or the output's
+    channels shuffled) fails it by far."""
+    dev = torch.device("cpu")
+    c, k, T = 1024, 9, 64
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(3, T, c, generator=g).to(torch.bfloat16)
+    mask = torch.ones(3, T, dtype=torch.bool)
+    mask[1, (2 * T) // 3:] = False
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        yref = Q._conv_block(None, "emulate", dev, c, k)(x, mask)
+    over = {}
+    for fmt in Q.COMPILE_FORMATS:
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            ye = Q._conv_block(fmt, "emulate", dev, c, k)(x, mask)
+        with monkeypatch.context() as m:  # the fused scale math: no bf16 rounding of the activation scale
+            m.setattr(Q, "FP8_SCALE_DTYPE", torch.float32)
+            m.setattr(Q, "INT8_ACT_SCALE_DTYPE", torch.float32)
+            with torch.no_grad():
+                with torch.autocast("cpu", dtype=torch.bfloat16):
+                    ya = Q._conv_block(fmt, "emulate", dev, c, k)(x, mask)
+                yb = Q._conv_block(fmt, "emulate", dev, c, k).float()(x.float(), mask)
+        for y in (ya, yb):
+            r = Q._compile_compare(y, ye, yref)
+            assert 0.9 < r["noise_ratio"] <= Q.COMPILE_NOISE_RATIO, (fmt, r)
+        over[fmt] = max(Q._compile_compare(y, ye, yref)["rel_err"] for y in (ya, yb)) / Q.SELFTEST_TOL[fmt]
+        for wrong in (ye.float() * 1.5, ye[..., torch.randperm(c, generator=g)]):
+            assert Q._compile_compare(wrong, ye, yref)["noise_ratio"] > 3 * Q.COMPILE_NOISE_RATIO, fmt
+    assert max(over.values()) > 1, over  # why compiled is not held to SELFTEST_TOL against eager
+    r = Q._compile_compare(yref, yref, yref)
+    assert r["noise_ratio"] == 1.0 and r["err_eager"] == 0.0
 
 
 def test_old_recipe_variants_are_refused(dirs, tmp_path):

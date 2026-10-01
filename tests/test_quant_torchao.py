@@ -21,7 +21,8 @@ constants, never by widening a tolerance here.
                        ops) give kitsune's fp8 activation grid and weight pack bit for bit
   CUDA (smoke B, a     every timed format's to_torchao dequantises to its pack; torchao's fp8 PerRow quantize_ of a
   5090)                weight is kitsune's pack (F1); every W*A* format gives exactly the bias on an all-zero row (F4);
-                       the compiled conformer-convolution block matches eager (F4); kitsune.quant.selftest passes with
+                       the compiled conformer-convolution block is as good a quantisation as eager (F4,
+                       COMPILE_NOISE_RATIO); kitsune.quant.selftest passes with
                        every sub-check (real kernels within SELFTEST_TOL of the emulation at every M, no int8 fp32
                        fallback after padding, weights quantised under autocast, torchao parity, zero rows, compile, and
                        a tiny CTC and AED student unpadded and padded); a pack computed on CUDA equals the CPU one bit
@@ -366,7 +367,8 @@ def test_w_a_formats_zero_rows_finite_on_cuda(fmt):
 @needs_cuda
 def test_compiled_conv_block_on_cuda():
     """F4: the conformer-convolution-like block of torchao Linears, torch.compile'd with inductor at B = 3 then B = 1
-    (box 53693389's nvfp4 contiguity assert and int8 CUBLAS_STATUS_NOT_SUPPORTED), matches eager per format."""
+    (box 53693389's nvfp4 contiguity assert and int8 CUBLAS_STATUS_NOT_SUPPORTED): per format its error against the
+    unquantised block is within COMPILE_NOISE_RATIO of the eager block's."""
     rec, checks = dict(warnings=[]), []
     Q._selftest_compile(rec, lambda name, ok, detail=None: checks.append((name, ok, detail)), torch.device("cuda"))
     assert [c[0] for c in checks] == [f"compile {f} B={b}" for f in Q.COMPILE_FORMATS for b in (3, 1)]
