@@ -49,9 +49,12 @@ full_plan.py --json on full.parquet and on smoke.parquet, --import-plan with bot
 changed in), then those numbers into boxes.json by hand, then --check and the tests.
 
 configs/full/boxes.json, the box registry (kitsune/fullrun.py), is hand-written; --check validates it with
-fullrun.registry_problems (every data and item config present, its data keys equal to its box's data config's), checks
-that every readout of a full box fits in its run's end reserve (readout_reserve_problems) and that the numbers bound to
-the plan record equal it (registry_drift: smoke A's plan_total_steps / plan_hours, F4's seconds, box 1's train hours).
+fullrun.registry_problems (every data and item config present, its data keys equal to its box's data config's; the
+chained box p01-chain's rules of contract addendum E.1.4: its parts, hours and watchdogs, each part's extent within its
+stage's rebuild config and stage 1's within stage 2's), checks that every readout of a full box fits in its run's end
+reserve (readout_reserve_problems; a chain has no items, its parts are checked) and that the numbers bound to the plan
+record equal it (registry_drift: smoke A's plan_total_steps / plan_hours, F4's seconds, box 1's train hours; the
+chain's own hours are addendum E.6's and tests/test_full_configs.py checks them against its parts).
 
 Usage:
   python tools/make_full_configs.py                  # write configs/full/*.json (and remove stale generated ones)
