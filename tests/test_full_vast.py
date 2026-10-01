@@ -15,6 +15,7 @@ import copy
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -205,6 +206,42 @@ def test_min_disk_bw_lowers_only_the_disk_floor(full_launch, capsys):
             launch.main(["--job", "full", "--box", "p01", "--min-disk-bw", bad, "--dry-run"])
     with pytest.raises(SystemExit):  # a full-only flag
         launch.main(["--job", "train", "--min-disk-bw", "300", "--dry-run"])
+
+
+def test_cost_guards_drop_dear_traffic_and_totals_over_the_cap():
+    """2026-10-01: with the cheap offers gone, the ranking's winner under the $/h cap charged $0.039/GB both ways (~$53
+    expected for a ~$26 run). A full job now drops traffic over FULL_MAX_GB_COST and totals over max_total."""
+    from dataclasses import replace
+    job = replace(launch.full_job("p01", {"gpus": 1}, "5090", 20.0, 22.0, 1.0), est_down_gb=600.0, est_up_gb=50.0)
+    assert job.max_gb_cost == launch.FULL_MAX_GB_COST == 0.01
+    dear = offer(1, 11, 0.80, inet_down_cost=0.039, inet_up_cost=0.039)
+    fair = offer(2, 12, 0.95)
+    assert any("inet_down_cost" in p for p in launch.offer_problems(dear, job))
+    assert any("inet_up_cost" in p for p in launch.offer_problems(dear, job))
+    assert launch.offer_problems(fair, job) == []
+    assert [o["id"] for o in launch.rank_offers([dear, fair], job, max_dph=1.0)] == [2]
+    loose = replace(job, max_gb_cost=0.05)  # traffic allowed: ranked by the total, the dear one last
+    assert [o["id"] for o in launch.rank_offers([dear, fair], loose, max_dph=1.0)] == [2, 1]
+    capped = replace(loose, max_total=25.0)  # fair: 0.95 x 20 + 650 x 0.002 = 20.3; dear: 16 + 650 x 0.039 = 41.4
+    assert [o["id"] for o in launch.rank_offers([dear, fair], capped, max_dph=1.0)] == [2]
+    assert launch.rank_offers([dear, fair], replace(capped, max_total=10.0), max_dph=1.0) == []
+
+
+def test_cost_guard_flags_are_full_only_and_positive(full_launch, capsys):
+    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    m = re.search(r"cost guards: traffic <= \$0\.01/GB each way; expected total <= \$([0-9.]+)", out)
+    assert m and 24.0 < float(m.group(1)) < 40.0, out  # 1.25 x $1.00 x 19.5 h + ~620 GB x $0.01
+    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--max-total", "5",
+                           "--dry-run")
+    out = capsys.readouterr().out
+    assert rc != 0 and "cost guards" in out and created(fake) is None
+    for args in (["--max-total", "0"], ["--max-gb-cost", "-1"]):
+        with pytest.raises(SystemExit):
+            launch.main(["--job", "full", "--box", "p01", *args, "--dry-run"])
+    with pytest.raises(SystemExit):
+        launch.main(["--job", "train", "--max-total", "30", "--dry-run"])
 
 
 def test_box_full_rents_two_gpus_under_its_cap_and_ranks_by_the_total(full_launch, capsys):
