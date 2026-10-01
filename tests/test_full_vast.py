@@ -823,3 +823,456 @@ def test_watchdog_dry_run_names_the_file_and_the_action(tmp_path):
                        timeout=60)
     assert r.returncode == 0 and "train_hb is stale by 600 s" in r.stdout and "orphan_alert" in r.stdout, r.stdout
     assert "then stop the instance" not in r.stdout and "no sync, no stop" in r.stdout
+
+
+# ================================================================================ the chained box (addendum E)
+
+from fixtures_chain import CHAIN_BOX, with_chain  # noqa: E402
+
+SMOKE_SIZING = dict(down_gb=59.2, shard_gb=100.0, sel_gb=12.0, stores=2, labels_gb=5.5, hours=1000.0, extra_gb=0.0,
+                    disk_gb=400, rebuild_timeout_min=120)
+
+
+@pytest.fixture
+def chain_launch(repo, monkeypatch):
+    """launch.main for --job full --box p01-chain on the tiny registry + the E.1.7 entry, the Hub side recorded: every
+    hf_preflight / extent_preflight / full_preflight call (a part's problems from .seen["part_problems"]), and
+    chain_preflight's."""
+    write_reg(repo.root, with_chain(repo.reg))
+    seen = {"hf": [], "extent": [], "preflight": [], "chain": [], "part_problems": {}}
+
+    def hf_preflight(data, out, cfg):
+        seen["hf"].append(cfg["selection"])
+        return "d" * 40, []
+
+    def extent_preflight(data, rev, cfg, extra_gb=0.0):
+        seen["extent"].append((cfg["selection"], extra_gb))
+        full = not (cfg.get("extent") or {}).get("inputs")  # box 1's uncapped extent, else stage 1's
+        return [], dict(SIZING if full else SMOKE_SIZING, extra_gb=extra_gb)
+
+    def full_preflight(*a, **kw):
+        seen["preflight"].append((a, kw))
+        return list(seen["part_problems"].get(a[5], [])), [f"{a[5]} preflight ok"]
+
+    monkeypatch.setattr(launch, "hf_preflight", hf_preflight)
+    monkeypatch.setattr(launch, "extent_preflight", extent_preflight)
+    monkeypatch.setattr(launch, "full_preflight", full_preflight)
+    monkeypatch.setattr(launch, "chain_preflight",
+                        lambda *a, **kw: seen["chain"].append((a, kw)) or ([], ["chain preflight ok"]))
+    monkeypatch.setattr(launch, "avoided_machines", lambda data, rev: (set(), []))
+    monkeypatch.setattr(launch, "gate_refusals", lambda out: ({}, []))
+
+    def go(searches, *args, box=CHAIN_BOX, instances=()):
+        fake = FakeVastai(searches, instances)
+        monkeypatch.setattr(launch.shutil, "which", lambda name: "/fake/vastai" if name == "vastai" else None)
+        monkeypatch.setattr(launch.subprocess, "run", fake)
+        rc = launch.main(["--job", "full", "--box", box, "--data-repo", DATA, "--out-repo", RUNS, "--sha", SHA,
+                          "--image", DIGEST_IMAGE, "--skip-git-checks", *args])
+        return rc, fake
+    go.seen = seen
+    return go
+
+
+def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
+    """E.1.8: KITSUNE_CONFIG is stage 1's rebuild, the watchdog's stage-1 env with its hand-over bound, the disk and
+    the gate on box 1's extent (+ the chain's extra_gb), the boot's rebuild bytes and timeout on stage 1's; every part
+    preflighted as a box, each distinct data config's selection checked, the chain's own files; 35 h, 25.2 h, $1.00."""
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    create = created(fake)
+    env = env_of(create)
+    assert env == {
+        "KITSUNE_JOB": "full", "KITSUNE_BOX": CHAIN_BOX, "KITSUNE_SHA": SHA,
+        "KITSUNE_CONFIG": "configs/full/data-smoke.json", "KITSUNE_DATA_REPO": DATA, "KITSUNE_OUT_REPO": RUNS,
+        "KITSUNE_N_GPUS": "1", "KITSUNE_WATCHDOG_HB_FILE": "train_hb", "KITSUNE_WATCHDOG_ORPHAN_S": "600",
+        "KITSUNE_WATCHDOG_ORPHAN_ACTION": "alert", "KITSUNE_CHAIN_STAGE": "1", "KITSUNE_WATCHDOG_HANDOVER_S": "34200",
+        "KITSUNE_SCRATCH_REPO": SCRATCH, "KITSUNE_GATE_BYTES": str(int(571.3e9)), "KITSUNE_GATE_MAX_H": "5",
+        "KITSUNE_REBUILD_BYTES": str(int(59.2e9)), "KITSUNE_PULL_BYTES": str(int(1e9 * (5.5 + 2))),
+        "KITSUNE_MAX_HOURS": "35", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
+        "KITSUNE_REBUILD_TIMEOUT_MIN": "120", "KITSUNE_DPH": "0.8100", "KITSUNE_MACHINE_ID": "54650"}
+    assert create[create.index("--disk") + 1] == "1400" and create[create.index("--label") + 1].startswith(
+        "kitsune-full-p01-chain-data-smoke-")
+    s = chain_launch.seen
+    assert sorted(s["extent"]) == sorted([(fullrun.FULL_SELECTION, 120.0), (fullrun.SMOKE_SELECTION, 0.0)])
+    assert s["hf"] == [fullrun.SMOKE_SELECTION, "labels/full/selections/study_1000h.parquet", fullrun.FULL_SELECTION]
+    parts = {a[5]: (a, kw) for a, kw in s["preflight"]}
+    assert list(parts) == ["full-smoke", "smoke-b", "p01"]
+    assert parts["smoke-b"][0][3] is None and parts["p01"][0][3] == SCRATCH, "the scratch repo only for timed parts"
+    assert parts["smoke-b"][0][7]["selection"] == "labels/full/selections/study_1000h.parquet"
+    assert all(not kw.get("resume") for _, kw in parts.values())
+    assert len(s["chain"]) == 1 and "chain preflight ok" in out and "part p01: p01 preflight ok" in out
+    assert "x ~25.2 h (box p01-chain; watchdog cap 35 h)" in out
+    assert "chain p01-chain: the gate part must end by first boot + 9 h" in out and "+ 9.5 h" in out
+    assert "free disk was re-checked just now: the offer search keeps only offers with disk_space >= 1400 GB" in out
+    assert "disk_space>=1400" in search_query(fake).split(" "), "the offer search itself filters on the chain's disk"
+    assert "chain stage 1 (configs/full/data-smoke.json): ~59 GB upstream down" in out
+
+
+@pytest.mark.parametrize("args, err", [
+    (["--config", "configs/full/data-smoke.json"], "--config is refused for chain box p01-chain"),
+    (["--gate-hours", "0"], "--gate-hours 0 is refused for chain box p01-chain"),
+    (["--max-hours", "29"], "--max-hours 29 is below chain p01-chain's floor 30"),
+], ids=["config", "gate-off", "max-hours"])
+def test_launch_chain_refusals(chain_launch, capsys, args, err):
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, *args, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and err in out and created(fake) is None, out
+
+
+def test_launch_chain_warns_below_its_cap_and_a_parts_problem_refuses(chain_launch, capsys):
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--max-hours", "32", "--dry-run")
+    out = capsys.readouterr().out
+    assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 35 h" in out
+    assert env_of(created_or_printed(out))["KITSUNE_MAX_HOURS"] == "32"
+    chain_launch.seen["part_problems"]["smoke-b"] = ["tools/whisper_eval.py (item whisper-large-v3) does not exist"]
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and "part smoke-b: tools/whisper_eval.py (item whisper-large-v3) does not exist" in out
+    assert created(fake) is None
+
+
+@pytest.mark.parametrize("flag", [["--resume"], ["--resume-reset", "full-p01-20260927T120000Z"],
+                                  ["--resume-set", "full-p01-20260927T120000Z:schedule.epochs=5"]])
+def test_a_chain_is_never_resumed_as_a_chain(chain_launch, capsys, flag):
+    """E.8: launch --box p01-chain --resume exits 1 with what to run instead; nothing is searched or rented."""
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, *flag, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and "is not resumed as a chain" in out and "--box p01 --resume" in out and fake.calls == []
+
+
+def test_a_resume_of_box_1_checks_the_chains_summary_and_its_live_instances(chain_launch, monkeypatch, capsys):
+    """--box p01 --resume with p01-chain in the registry: E.8's summary check runs (its refusal refuses), and a live
+    p01-chain instance is warned about as a live p01 one is."""
+    got = []
+    monkeypatch.setattr(launch, "chain_resume_checks", lambda out, box, chain: got.append((box, chain)) or (
+        ["the newest p01 summary on the Hub is from another rental (container X)"], []))
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--yes", box="p01",
+                            instances=[{"id": 9, "label": "kitsune-full-p01-chain-data-smoke-abc",
+                                        "actual_status": "running"}])
+    out = capsys.readouterr().out
+    assert rc == 1 and got == [("p01", CHAIN_BOX)] and "from another rental (container X)" in out
+    assert "WARNING: a live instance of box p01: kitsune-full-p01-chain-data-smoke-abc (instance 9" in out
+    monkeypatch.setattr(launch, "chain_resume_checks", lambda out, box, chain: ([], ["continues stage 2 of chain"]))
+    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--dry-run", box="p01")
+    assert rc == 0 and "continues stage 2 of chain" in capsys.readouterr().out
+
+
+def chain_summaries(container="C1", started=100.0, queue_started=150.0, status="running", p01_container="C1",
+                    p01_started=150.0) -> dict:
+    return {fullrun.box_summary_path(CHAIN_BOX): {"kind": "chain", "box": CHAIN_BOX, "container_id": container,
+                                                  "started": started, "gate": {"result": "pass", "time_utc": "T"},
+                                                  "parts": {"p01": {"status": status,
+                                                                    "queue_started": queue_started}}},
+            fullrun.box_summary_path("p01"): {"kind": "full", "box": "p01", "container_id": p01_container,
+                                              "started": p01_started, "items": {}}}
+
+
+@pytest.mark.parametrize("case, problem, note", [
+    ("match", None, "--box p01 --resume continues stage 2 of chain p01-chain (gate passed T); the chain's container "
+                    "C1"),
+    ("other-rental", "the newest p01 summary on the Hub is from another rental (container C0); chain p01-chain on "
+                     "container C1 died before box 1 started: launch --box p01 fresh or the chain", None),
+    ("p01-newer", None, None),
+    ("no-chain", None, None),
+])
+def test_chain_resume_checks(monkeypatch, case, problem, note):
+    runs = {"match": chain_summaries(),
+            "other-rental": chain_summaries(status="pending", queue_started=None, p01_container="C0", p01_started=50.0),
+            "p01-newer": chain_summaries(status="pending", p01_container="C9", p01_started=500.0),
+            "no-chain": {k: v for k, v in chain_summaries().items() if "chain" not in k}}[case]
+    hub = FullHub({}, runs)
+    monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+    problems, notes = launch.chain_resume_checks(RUNS, "p01", CHAIN_BOX)
+    if problem is None:
+        assert problems == [], problems
+    else:
+        assert len(problems) == 1 and problem in problems[0], problems
+    assert notes == ([note] if note else []), notes
+
+
+def test_chain_preflight_checks_the_chains_configs_and_stage_files(repo, monkeypatch):
+    write_reg(repo.root, with_chain(repo.reg))
+    reg, reader, _, _ = launch.full_registry(SHA)
+    have = {f: b"x" for f in fullrun.box_extra_files(CHAIN_BOX, reg, read_json=reader)}
+    have["models/parakeet-tdt_ctc-0.6b-ja-hf/config.json"] = b"x"
+    hub = FullHub(have)
+    monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+    problems, notes = launch.chain_preflight(DATA, "d" * 40, SHA, CHAIN_BOX, reg)
+    assert problems == [], problems
+    assert any(n.startswith("chain p01-chain stage 1: parts full-smoke, smoke-b; rebuilds configs/full/data-smoke.json"
+                            "; gate part full-smoke gates stage 2 (checks 1-11) by first boot + 9 h") for n in notes)
+    del hub.data["labels/full/selections/study_1000h.parquet"]  # smoke-b's frozen selection, stage 1 pulls it
+    problems, _ = launch.chain_preflight(DATA, "d" * 40, SHA, CHAIN_BOX, reg)
+    assert problems == [f"{DATA}: no labels/full/selections/study_1000h.parquet (chain p01-chain pulls it in a stage)"]
+    (repo.root / "configs/full/data-smoke-b.json").rename(repo.root / "moved.json")  # not committed at the sha
+    problems, _ = launch.chain_preflight(DATA, "d" * 40, SHA, CHAIN_BOX, reg)
+    assert any("configs/full/data-smoke-b.json does not exist at 0123456789ab" in p for p in problems), problems
+    assert any("cannot check chain p01-chain's stage files" in p for p in problems), problems
+    (repo.root / "moved.json").rename(repo.root / "configs/full/data-smoke-b.json")
+
+
+def test_a_smoke_b_item_whose_cli_the_sha_lacks_is_refused_by_its_part_preflight(repo, monkeypatch, devslice):
+    reg = launch.full_registry(SHA)[0]
+    data = box_data("smoke-b", reg, repo.root)
+    assert preflight(monkeypatch, FullHub(data), box="smoke-b", scratch=None)[0] == []
+    (repo.root / "tools/whisper_eval.py").unlink()
+    problems, _ = preflight(monkeypatch, FullHub(data), box="smoke-b", scratch=None)
+    assert any("tools/whisper_eval.py (item whisper-large-v3) does not exist" in p for p in problems), problems
+
+
+# --------------------------------------------------------------------------------------------------- finish
+
+
+class ChainHub(FinishHub):
+    """FinishHub (the run dir's verification passes) plus what a chain's --destroy reads: the infra commits kept by
+    path (their listing), files downloaded and put by path. keep_old: a put that never takes (a Hub that keeps the
+    old copy); slow_infra_s: every infra commit takes that long."""
+
+    def __init__(self, run, remote=None, keep_old=False, slow_infra_s=0.0):
+        super().__init__(run)
+        self.remote, self.keep_old, self.slow = dict(remote or {}), keep_old, slow_infra_s
+        self.order, self.files_put = [], []
+
+    def create_commit(self, **kw):
+        time.sleep(self.slow)
+        super().create_commit(**kw)
+        self.order.append("infra")
+        for op in kw["operations"]:
+            self.remote[op.path_in_repo] = op.path_or_fileobj
+
+    def list_repo_tree(self, repo, path_in_repo=None, recursive=False, repo_type=None):
+        if path_in_repo and "/infra/" in path_in_repo:
+            self.order.append("listing")
+            return [SimpleNamespace(path=p, size=len(v)) for p, v in self.remote.items()
+                    if p.startswith(path_in_repo + "/")]
+        return super().list_repo_tree(repo, path_in_repo, recursive, repo_type)
+
+    def hf_hub_download(self, repo_id, filename, repo_type=None, local_dir=None):
+        if filename not in self.remote:
+            e = FileNotFoundError(f"404: {filename}")
+            e.response = SimpleNamespace(status_code=404)  # huggingface_hub's EntryNotFoundError: not retried
+            raise e
+        p = Path(local_dir) / filename
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(self.remote[filename])
+        return str(p)
+
+    def upload_file(self, path_or_fileobj=None, path_in_repo=None, repo_id=None, repo_type=None, commit_message=None):
+        self.files_put.append(path_in_repo)
+        self.order.append(f"put {path_in_repo}")
+        if not self.keep_old:
+            self.remote[path_in_repo] = Path(path_or_fileobj).read_bytes()
+
+
+def chain_state_dir(state: Path) -> dict:
+    """A chain box's state dir after its controller: chain.json, each part's records, the chain summary; returns the
+    Hub copies the controller put (repo path -> bytes)."""
+    files = {"chain/chain.json": {"box": CHAIN_BOX, "gate_box": "full-smoke", "gate": {"part": "full-smoke"}},
+             "chain/full-smoke/queue.json": {"box": "full-smoke"}, "chain/full-smoke/events.jsonl": None,
+             "chain/full-smoke/queue_summary.json": {"box": "full-smoke", "status": "complete"},
+             "chain/full-smoke/smoke_verdict.json": {"box": "full-smoke", "overall": "pass"},
+             "chain/full-smoke/logs/smoke-p03.log": None, "chain/smoke-b/queue_summary.json": {"box": "smoke-b"},
+             "chain/smoke-b/smoke_verdict.json": {"box": "smoke-b"}, "chain/p01/queue_summary.json": {"box": "p01"},
+             "chain/stage1/bootstrap_plan.json": {"record": "x"}, "queue_summary.json": {"kind": "chain"},
+             "download_gate.json": {"verdict": "pass"}, "watchdog_alerts.jsonl": None, "events.jsonl": None}
+    hub = {}
+    for rel, doc in files.items():
+        p = state / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps(doc).encode() if doc is not None else b'{"kind": "x"}\n'
+        p.write_bytes(data)
+        if rel == "queue_summary.json":
+            hub[fullrun.box_summary_path(CHAIN_BOX)] = data
+        elif rel.startswith("chain/") and rel.endswith(("queue_summary.json", "smoke_verdict.json")):
+            hub[f"full/box-{rel.split('/')[1]}/{Path(rel).name}"] = data
+    return hub
+
+
+@pytest.fixture
+def chain_finish(full_finish, monkeypatch):
+    monkeypatch.setenv("KITSUNE_BOX", CHAIN_BOX)
+    monkeypatch.setenv("KITSUNE_CHAIN_STAGE", "2")
+    monkeypatch.setattr(finish, "HUB_RETRY_WAITS", (0.01,))
+    hub_copies = chain_state_dir(full_finish.state)
+
+    def go(*args, **hub_kw):
+        hub = ChainHub(full_run(full_finish.state.parent), dict(hub_copies), **hub_kw)
+        monkeypatch.setattr(finish, "hf_api", lambda: hub)
+        rc = finish.main([*args, "--repo", RUNS, "--runs-root", str(full_finish.state.parent / "runs")])
+        return rc, hub
+    go.hub_copies, go.state = hub_copies, full_finish.state
+    return go
+
+
+def test_a_chains_destroy_verifies_its_records_after_a_synchronous_infra_upload(chain_finish, monkeypatch):
+    """E.7.2: the deep infra (chain/** included) goes up first, then every summary and verdict is compared with the
+    Hub's (a differing one put once and compared again), then the infra listing: destroy."""
+    actions = []
+    monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
+    chain_finish.hub_copies["full/box-smoke-b/queue_summary.json"] = b'{"box": "smoke-b", "old": true}'
+    rc, hub = chain_finish("--destroy")
+    assert rc == 0 and actions == ["destroy"]
+    assert hub.files_put == ["full/box-smoke-b/queue_summary.json"]
+    put = hub.order.index("put full/box-smoke-b/queue_summary.json")
+    assert hub.order.index("infra") < put < hub.order.index("listing") and hub.order[-1] == "infra", hub.order
+    infra = set(hub.commits[0])
+    dest = f"full/box-{CHAIN_BOX}/infra/C77"
+    for rel in ("chain/chain.json", "chain/full-smoke/events.jsonl", "chain/full-smoke/queue.json",
+                "chain/full-smoke/logs/smoke-p03.log", "chain/stage1/bootstrap_plan.json", "events.jsonl",
+                "download_gate.json", "watchdog_alerts.jsonl", "queue_summary.json"):
+        assert f"{dest}/{rel}" in infra, rel
+    ev = [json.loads(x) for x in (chain_finish.state / "events.jsonl").read_text().splitlines() if x.startswith("{")]
+    assert [e["problems"] for e in ev if e.get("kind") == "chain_verify"] == [[]]
+
+
+@pytest.mark.parametrize("hub_kw, why", [
+    (dict(keep_old=True), "the Hub's copy still differs"),
+    (dict(slow_infra_s=0.5), "did not finish within"),
+], ids=["put-does-not-take", "slow-infra"])
+def test_a_chain_whose_records_do_not_verify_is_stopped(chain_finish, monkeypatch, hub_kw, why):
+    actions = []
+    monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
+    monkeypatch.setattr(finish, "CHAIN_INFRA_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(finish, "INFRA_TIMEOUT_S", 0.2)
+    chain_finish.hub_copies["full/box-p01/queue_summary.json"] = b'{"box": "p01", "old": true}'
+    rc, hub = chain_finish("--destroy", **hub_kw)
+    assert rc == 2 and actions == ["stop"]
+    halt = json.loads((chain_finish.state / "halt").read_text(encoding="utf-8"))
+    assert halt["action"] == "stop" and halt["reason"].startswith("chain verification failed") and why in halt["reason"]
+
+
+def test_a_plain_full_box_and_a_chains_other_modes_are_unchanged(chain_finish, monkeypatch):
+    actions = []
+    monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
+    rc, hub = chain_finish("--stop", "--reason", "x")
+    assert rc == 0 and actions == ["stop"] and hub.files_put == [] and "listing" not in hub.order
+    monkeypatch.delenv("KITSUNE_CHAIN_STAGE")
+    rc, hub = chain_finish("--destroy")
+    assert rc == 0 and actions[-1] == "destroy" and hub.files_put == [] and "listing" not in hub.order
+
+
+# ------------------------------------------------------------------------------------------------- watchdog
+
+
+def later(seconds: float, fn):
+    import threading
+
+    th = threading.Timer(seconds, fn)
+    th.start()
+    return th
+
+
+def test_the_mode_file_switches_the_watchdog_from_alert_to_stop(tmp_path):
+    """Stage 1 alerts on a stale heartbeat; once the controller writes "stop 1" the same stale heartbeat syncs and
+    stops the box."""
+    bash = need_bash()
+    env, state, record = box_watchdog(tmp_path, "1", "alert", FAKE_SLEEP_MAX="20")
+    hb = state / "train_hb"
+    hb.write_text("", encoding="utf-8")
+    t0 = int(time.time())
+    os.utime(hb, (t0 + 1, t0 + 1))
+
+    def write_mode():
+        (state / "watchdog_mode.tmp").write_bytes(b"stop 1\n")  # as the controller writes it: LF
+        (state / "watchdog_mode.tmp").replace(state / "watchdog_mode")
+
+    th = later(4.5, write_mode)
+    try:
+        r = subprocess.run([bash, str(VAST / "watchdog.sh")], capture_output=True, text=True, env=env, timeout=90)
+    finally:
+        th.cancel()
+    assert r.returncode == 0, r.stdout + r.stderr
+    alerts = (state / "watchdog_alerts.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(alerts) == 1, "alert mode before the mode file"
+    got = calls(record)
+    assert [a for _, a in got] == ["--sync-only", "--stop --no-sync --reason watchdog: box controller heartbeat stale"]
+    assert "mode file: stop 1 (was alert 1)" in r.stdout and got[0][0] >= t0 + 4
+
+
+@pytest.mark.parametrize("content", [b"", b"banana x\n", b"stop\n", b"alert -3\n", b"\x00\x01garbage"],
+                         ids=["empty", "garbage", "no-limit", "negative", "binary"])
+def test_an_empty_or_malformed_mode_file_is_ignored(tmp_path, content):
+    bash = need_bash()
+    env, state, record = box_watchdog(tmp_path, "1", "alert", FAKE_SLEEP_MAX="5")
+    (state / "watchdog_mode").write_bytes(content)
+    hb = state / "train_hb"
+    hb.write_text("", encoding="utf-8")
+    t0 = int(time.time())
+    os.utime(hb, (t0 + 1, t0 + 1))
+    r = subprocess.run([bash, str(VAST / "watchdog.sh")], capture_output=True, text=True, env=env, timeout=90)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert calls(record) == [] and (state / "watchdog_alerts.jsonl").is_file(), "still in its env's alert mode"
+    assert r.stdout.count("ignoring malformed") == (1 if content.strip() else 0), r.stdout
+
+
+def test_a_stage_1_that_does_not_hand_over_is_stopped_whatever_its_heartbeat(tmp_path):
+    """KITSUNE_WATCHDOG_HANDOVER_S: no mode file by first boot + that -> sync, then stop, with a fresh heartbeat (a
+    hung controller or a stage-1 bootstrap's toucher can no longer hold the box); a mode file disarms it."""
+    bash = need_bash()
+    for moded in (False, True):
+        d = tmp_path / str(moded)
+        env, state, record = box_watchdog(d, "600", "alert", KITSUNE_WATCHDOG_HANDOVER_S="2", FAKE_SLEEP_MAX="8")
+        (state / "first_boot").write_text(f"{int(time.time())}\n")
+        if moded:
+            (state / "watchdog_mode").write_bytes(b"stop 600\r\n")  # a CRLF line is read too
+        hb = state / "train_hb"
+        hb.write_text("", encoding="utf-8")
+        toucher = subprocess.Popen([sys.executable, "-c", "import os, sys, time\nfor _ in range(60):\n"
+                                    "    os.utime(sys.argv[1], None); time.sleep(0.2)", str(hb)])
+        try:
+            r = subprocess.run([bash, str(VAST / "watchdog.sh")], capture_output=True, text=True, env=env,
+                               timeout=90)
+        finally:
+            toucher.kill()
+        assert r.returncode == 0, r.stdout + r.stderr
+        got = [a for _, a in calls(record)]
+        if moded:
+            assert got == [] and "did not hand over" not in r.stdout
+        else:
+            assert got == ["--sync-only", "--stop --no-sync --reason watchdog: chain stage 1 over its sub-deadline"]
+            assert "chain stage 1 did not hand over by first boot + 2 s" in r.stdout
+
+
+@pytest.mark.parametrize("case", ["fires", "no-self-stop", "old-halt", "not-full"])
+def test_the_halt_retry(tmp_path, case):
+    """A halt marker written during this container's life and older than HALT_RETRY_S (1 s here) with the instance
+    still up: the stop is requested again (job full only; never with KITSUNE_NO_SELF_STOP=1, nor for a marker older
+    than the watchdog)."""
+    bash = need_bash()
+    extra = dict(KITSUNE_JOB="full" if case != "not-full" else "study", KITSUNE_WATCHDOG_HALT_RETRY_S="1",
+                 FAKE_SLEEP_MAX="6")
+    env, state, record = box_watchdog(tmp_path, "0", "stop", **extra)
+    if case == "no-self-stop":
+        env["KITSUNE_NO_SELF_STOP"] = "1"  # after watchdog_env, which clears it
+    halt = state / "halt"
+    th = None
+    if case == "old-halt":
+        halt.write_text('{"action": "destroy"}\n')
+        os.utime(halt, (time.time() - 3600, time.time() - 3600))
+    else:
+        th = later(1.0, lambda: halt.write_text('{"action": "destroy"}\n'))
+    try:
+        r = subprocess.run([bash, str(VAST / "watchdog.sh")], capture_output=True, text=True, env=env, timeout=90)
+    finally:
+        if th is not None:
+            th.cancel()
+    assert r.returncode == 0, r.stdout + r.stderr
+    got = [a for _, a in calls(record)]
+    if case == "fires":
+        assert len(got) == 1 and got[0].startswith("--stop --no-sync --reason watchdog: halt marker ") and \
+            got[0].endswith(" s old, instance still up"), got
+    else:
+        assert got == [], got
+
+
+def test_the_watchdogs_dry_run_prints_the_chain_rules(tmp_path):
+    bash = need_bash()
+    env, state, _ = box_watchdog(tmp_path, "600", "alert", KITSUNE_WATCHDOG_HANDOVER_S="34200", KITSUNE_JOB="full")
+    (state / "first_boot").write_text("1000000000\n")
+    r = subprocess.run([bash, str(VAST / "watchdog.sh"), "--dry-run"], capture_output=True, text=True, env=env,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "chain stage 1: with no mode file by first boot + 34200 s (2001-09-09T11:16:40Z)" in r.stdout
+    assert "halt retry: a halt marker written after this start and older than 1200 s" in r.stdout
+    assert "mode file" in r.stdout and not (state / "deadline").exists()

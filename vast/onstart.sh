@@ -173,7 +173,8 @@ rearm() {  # --rearm: archive the previous run's lifecycle state (see the header
     d="$KITSUNE_STATE/rearm-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$d"
     for f in halt deadline first_boot supervise.json events.jsonl bootstrap_timings.jsonl bootstrap_coverage.json \
-        label.json label_hb train_hb hb resume_plan.json watchdog_alerts.jsonl smoke_verdict.json download_gate.json; do
+        label.json label_hb train_hb hb resume_plan.json watchdog_alerts.jsonl smoke_verdict.json download_gate.json \
+        watchdog_mode chain; do
         if [ -e "$KITSUNE_STATE/$f" ]; then
             mv "$KITSUNE_STATE/$f" "$d/"
         fi

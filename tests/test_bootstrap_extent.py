@@ -839,3 +839,100 @@ def test_other_jobs_run_no_full_phase(tmp_path):
     assert [c.split(" ")[0] + " " + c.split(" ")[1] for c in calls] == [
         "HELPER plan", "HELPER pull", "scripts/01_prepare_data.py --data", "HELPER coverage"], calls
     assert not (state / "train_hb").exists()
+
+
+# ------------------------------------------------------------------------------------- a chain box (addendum E)
+
+P03_STUDENT = "students/study/p03"
+SB_SELECTION = f"{LR}/selections/sb.parquet"  # smoke-b's own (study) selection, next to stage 1's rebuild
+
+
+def chain_box(box) -> dict:
+    """A chain p01-chain on the toy extent, written into the box's checkout: stage 1 = full-smoke (a CTC train item,
+    student p03; its data config the capped extent, both label roots: the rebuild) + smoke-b (its own study selection
+    on the same extent: its selection files join stage 1's pull); stage 2 = p01 (student p01) on the uncapped extent.
+    The remote gains every student, extra file and dir."""
+    from kitsune import fullrun
+
+    stub = box.root.parent / "stub" / "huggingface_hub" / "__init__.py"
+    stub.write_text(FULL_STUB, encoding="utf-8")
+    folder = box.root / "configs" / "full"
+    folder.mkdir(parents=True, exist_ok=True)
+    base = {k: v for k, v in make_cfg().items() if k not in ("student", "run_name")}
+    s1 = dict(base, pull_parakeet=True)
+    sb = dict(s1, selection=SB_SELECTION, selection_recipe=dict(base["selection_recipe"], study={"draw_audio_s": 1}))
+    s2 = dict({k: v for k, v in make_cfg(inputs={}).items() if k not in ("student", "run_name")}, family="ctc",
+              selection=f"{LR}/selections/full.parquet")
+    configs = {"data-s1": s1, "data-sb": sb, "data-s2": s2,
+               "smoke-p03": dict(s1, run_name="smoke-p03", family="ctc", student=P03_STUDENT),
+               "sb-eval": dict(sb, run_name="sb-eval", student=P03_STUDENT),
+               "full-p01": dict(s2, run_name="full-p01", student=P01_STUDENT)}
+    for name, cfg in configs.items():
+        (folder / f"{name}.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    def box_of(dc, items, **kw):
+        return dict({"gpus": 1, "data_config": f"configs/full/{dc}.json", "est_hours": 1.0, "max_hours": 9,
+                     "max_dph": 1.0, "deadline_reserve_min": 20, "watchdog": {"orphan_s": 3600, "action": "stop"},
+                     "timed_states": False, "items": items}, **kw)
+
+    reg = {"version": 1, "boxes": {
+        "full-smoke": box_of("data-s1", [{"name": "smoke-p03", "kind": "train", "config": "configs/full/smoke-p03.json",
+                                          "study_run": "study-p03", "family": "ctc", "max_hours": 0.75}],
+                             smoke=True, watchdog={"orphan_s": 600, "action": "alert"},
+                             extra_files=[SIDECAR, MANIFEST]),
+        "smoke-b": box_of("data-sb", [{"name": "stores-eval", "kind": "stores", "config": "configs/full/sb-eval.json",
+                                       "eval_only": True}], smoke=True, gate=False, max_hours=3,
+                          extra_dirs=[PARAKEET_MODEL]),
+        "p01": box_of("data-s2", [{"name": "full-p01", "kind": "train", "config": "configs/full/full-p01.json",
+                                   "study_run": "study-p01", "family": "ctc", "max_hours": 13.56}],
+                      est_hours=19.5, max_hours=22, extra_files=[MANIFEST]),
+        "p01-chain": {"est_hours": 25.2, "max_hours": 35, "max_dph": 1.0, "extra_gb": 120, "chain": [
+            {"parts": ["full-smoke", "smoke-b"], "gate_box": "full-smoke", "max_hours": 10.5},
+            {"parts": ["p01"]}]}}}
+    (folder / "boxes.json").write_text(json.dumps(reg), encoding="utf-8")
+    fullrun.load_registry(reg, root=box.root)  # a valid chain (the file rules included)
+    for f in [*(f"{s}/{n}" for s in (P01_STUDENT, P03_STUDENT) for n in (*STUDENT_FILES, "MODEL_CARD.md")), SIDECAR,
+              MANIFEST, SB_SELECTION, f"{LR}/selections/sb.json", f"{PARAKEET_MODEL}/config.json"]:
+        (box.remote_dir / f).parent.mkdir(parents=True, exist_ok=True)
+        (box.remote_dir / f).write_bytes(b"x")
+    return dict(KITSUNE_JOB="full", KITSUNE_BOX="p01-chain", KITSUNE_FULL_REGISTRY="", KITSUNE_SCRATCH_REPO="")
+
+
+def test_a_chains_plan_serves_its_stage(box):
+    """KITSUNE_BOX=p01-chain: stage 1 pulls both selections (its rebuild's and smoke-b's study selection with its
+    sidecar and manifest) and stage 1's students only; stage 2 box 1's student and the uncapped extent's labels; a
+    KITSUNE_CONFIG that is not the stage's rebuild is refused (exit 3, not retried)."""
+    env = chain_box(box)
+    r = box.helper("plan", **env, KITSUNE_CHAIN_STAGE="1", CONFIG="configs/full/data-s1.json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
+    files = set(plan["files"])
+    assert {f"{LR}/selections/sub.parquet", SB_SELECTION, f"{LR}/selections/sb.json", SIDECAR, MANIFEST} <= files
+    assert {f"{P03_STUDENT}/{n}" for n in (*STUDENT_FILES, "MODEL_CARD.md")} <= files
+    assert not any(f.startswith(P01_STUDENT) for f in files), "box 1's student is stage 2's"
+    assert f"{PARAKEET_MODEL}/config.json" in files and plan["rebuild"] == ["galgame", "eval_jsut"]
+    stage1_labels = set(plan["labels"]["files"])
+    assert f"{LR}/parakeet_out/galgame/train-00001.npz" not in stage1_labels, "stage 1: the capped extent"
+    r = box.helper("plan", **env, KITSUNE_CHAIN_STAGE="2", CONFIG="configs/full/data-s2.json")
+    assert r.returncode == 0, r.stdout + r.stderr
+    plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
+    files = set(plan["files"])
+    assert {f"{P01_STUDENT}/{n}" for n in (*STUDENT_FILES, "MODEL_CARD.md")} <= files
+    assert not any(f.startswith(P03_STUDENT) for f in files) and SB_SELECTION not in files
+    assert f"{LR}/parakeet_out/galgame/train-00001.npz" in plan["labels"]["files"], "stage 2: the uncapped extent"
+    for stage, config in (("2", "configs/full/data-s1.json"), ("1", "configs/full/data-s2.json")):
+        r = box.helper("plan", **env, KITSUNE_CHAIN_STAGE=stage, CONFIG=config)
+        assert r.returncode == 3 and f"chain stage {stage} rebuilds" in r.stderr and "(not retried)" in r.stderr, (
+            stage, r.stdout + r.stderr)
+
+
+def test_a_chains_phase_timings_carry_its_stage(tmp_path):
+    """bootstrap_timings.jsonl: every phase of a chain stage carries "stage" (the controller's stage-2 bootstrap
+    appends to the boot's file); no other box's records change."""
+    r, calls, state = run_bootstrap(tmp_path, KITSUNE_CHAIN_STAGE="2")
+    assert r.returncode == 0, r.stdout + r.stderr
+    recs = [json.loads(ln) for ln in (state / "bootstrap_timings.jsonl").read_text().splitlines()]
+    assert recs and all(x["stage"] == 2 and set(x) == {"phase", "seconds", "end", "stage"} for x in recs), recs
+    r, calls, state = run_bootstrap(tmp_path / "plain")
+    recs = [json.loads(ln) for ln in (state / "bootstrap_timings.jsonl").read_text().splitlines()]
+    assert recs and all(set(x) == {"phase", "seconds", "end"} for x in recs), recs

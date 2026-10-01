@@ -62,6 +62,13 @@ supervisor beats it, bounded (kitsune.heartbeat.beating, max_s = the call's time
 calls - the --sync-only after a queue failure and the final --stop/--destroy - so a slow but live upload is not taken
 for a dead controller, while a hung one still goes stale.
 
+A chain box (KITSUNE_BOX=p01-chain; contract addendum E) runs its controller through the same command. Its exit 5 with
+its chain summary in $KITSUNE_STATE/queue_summary.json (kind chain, status gate_failed or failed: it ended before box 1
+trained) destroys - finish.py --destroy verifies the chain's summaries, verdicts and infra on the Hub first - with no
+--sync-only before it; any other exit 5 is an ordinary failure. Each attempt records the chain stage its summary names,
+and the restart budget (MAX_QUEUE_RESTARTS) counts the failures of the last attempt's stage only, so the restarts of
+stage 1 never use up box 1's; every other box's attempts have stage None and share one budget, as before.
+
 Usage (started by vast/onstart.sh; KITSUNE_CONFIG / KITSUNE_OUT_REPO come from the instance env):
   python vast/supervise.py
   python vast/supervise.py --dry-run --train-cmd "python -c 'import sys; sys.exit(3)'"   # exercise the policy locally
@@ -86,7 +93,14 @@ if str(ROOT) not in sys.path:  # kitsune.heartbeat (a full box's bounded beats a
 from finish import FULL_RE, newest_checkpoint  # noqa: E402
 
 EXIT_OK, EXIT_THROUGHPUT, EXIT_HALT = 0, 3, 4  # EXIT_HALT: the queue's halt (study: a rule; full: an item failed)
+# a chain box's controller (kitsune/full_queue.py ChainController): it ended before its last stage trained - a failed
+# gate, a failed stage-2 bootstrap, box 1 no longer fits - and nothing unique is on the disk: destroy (finish.py
+# verifies the chain's Hub records first). Only with its chain summary; any other exit 5 is an ordinary failure
+EXIT_CHAIN_DESTROY = 5
+CHAIN_NAMES = ("p01-chain",)  # kitsune.fullrun.CHAIN_NAMES (this script stays stdlib-only at import)
+CHAIN_DESTROY_STATUSES = ("gate_failed", "failed")
 MAX_QUEUE_RESTARTS = 2  # a queue (study or full): restarted after a crash at most this often, then the box stops
+# (a chain box: per stage, so a restart spent in stage 1 never takes one from box 1's training)
 QUEUE_JOBS = ("study", "full")  # KITSUNE_JOB values whose box runs a queue (--queue by default)
 FINISH_BEAT_EVERY_S = 30.0  # a full box: train_hb beats while a finish.py call runs (kitsune.heartbeat.beating)
 MIN_RESUME_STEP = 100
@@ -123,9 +137,18 @@ def decide(rc: int | None, step: int, n_failures: int, full_state: Path | None,
     return "resume", f"first failure ({what}) at step {step}; resuming from {full_state.name}"
 
 
-def decide_queue(rc: int | None, n_failures: int, reason: str | None = None) -> tuple[str, str]:
+def is_chain_summary(summary) -> bool:
+    return isinstance(summary, dict) and summary.get("kind") == "chain" and summary.get("box") in CHAIN_NAMES
+
+
+def decide_queue(rc: int | None, n_failures: int, reason: str | None = None,
+                 summary: dict | None = None) -> tuple[str, str]:
     """The study queue's policy -> (action, reason), action in {"destroy", "stop", "restart"}. rc None = the queue was
-    interrupted by a container restart; reason = its queue_summary.json's (a halt says why)."""
+    interrupted by a container restart; reason = its queue_summary.json's (a halt says why). A chain box's exit 5 with
+    its chain summary (kind chain, a CHAIN_NAMES box, status gate_failed or failed) destroys: it ended before its last
+    stage trained, and finish.py verifies its records on the Hub before the destroy."""
+    if rc == EXIT_CHAIN_DESTROY and is_chain_summary(summary) and summary.get("status") in CHAIN_DESTROY_STATUSES:
+        return "destroy", f"chain ended before box 1 trained: {reason or summary.get('reason') or 'see its summary'}"
     if rc == EXIT_OK:
         return "destroy", "study queue finished (exit 0)"
     if rc == EXIT_HALT:
@@ -143,6 +166,22 @@ def queue_reason(state_dir: Path) -> str | None:
         return json.loads((state_dir / "queue_summary.json").read_text(encoding="utf-8")).get("reason")
     except (OSError, ValueError, AttributeError):
         return None
+
+
+def queue_summary(state_dir: Path) -> dict | None:
+    """$KITSUNE_STATE/queue_summary.json (the queue's, or a chain's controller summary), or None."""
+    try:
+        doc = json.loads((state_dir / "queue_summary.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def attempt_stage(state_dir: Path):
+    """The chain stage the controller was in (its summary's stage), or None (not a chain: every attempt shares the one
+    restart budget, as before)."""
+    summ = queue_summary(state_dir)
+    return summ.get("stage") if is_chain_summary(summ) else None
 
 
 def beating(hb: Path | None, timeout: float):
@@ -183,12 +222,14 @@ def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = Fals
         return 0
     for a in state["attempts"]:
         if "rc" not in a:  # the container died while the queue ran
-            a.update(rc=None, interrupted=True)
+            a.update(rc=None, interrupted=True, stage=attempt_stage(state_path.parent))
     while True:
         if state["attempts"]:
             last = state["attempts"][-1]
-            failures = sum(1 for a in state["attempts"] if a["rc"] != EXIT_OK)
-            action, reason = decide_queue(last["rc"], failures, queue_reason(state_path.parent))
+            # a chain's restart budget is per stage (the attempt's stage from the chain summary; None elsewhere)
+            failures = sum(1 for a in state["attempts"] if a["rc"] != EXIT_OK and a.get("stage") == last.get("stage"))
+            action, reason = decide_queue(last["rc"], failures, queue_reason(state_path.parent),
+                                          queue_summary(state_path.parent))
             log(f"decision after queue attempt {len(state['attempts'])}: {action} ({reason})")
             if action != "restart":
                 state["final"] = {"action": action, "reason": reason, "wall": time.time()}
@@ -202,11 +243,12 @@ def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = Fals
         oom0 = oom_kills()
         rc = run_trainer(queue_cmd, env)
         oom1 = oom_kills()
-        attempt.update(rc=rc, t1=time.time(),
+        attempt.update(rc=rc, t1=time.time(), stage=attempt_stage(state_path.parent),
                        oom_kills=oom1 - oom0 if oom0 is not None and oom1 is not None else None)
         save_state(state_path, state)
         log(f"queue attempt {len(state['attempts'])} exited {rc} after {(attempt['t1'] - attempt['t0']) / 60:.1f} min")
-        if rc not in (EXIT_OK, EXIT_HALT, EXIT_THROUGHPUT):  # the stop path syncs everything anyway
+        # the stop and destroy paths sync everything anyway (a chain's exit 5: its destroy)
+        if rc not in (EXIT_OK, EXIT_HALT, EXIT_THROUGHPUT, EXIT_CHAIN_DESTROY):
             with beating(hb, SYNC_TIMEOUT_S):
                 call_finish(["--sync-only", *dry], timeout=SYNC_TIMEOUT_S)
 
