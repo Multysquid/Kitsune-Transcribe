@@ -145,7 +145,19 @@ SMOKE_NOSTART = "smoke-nostart"  # the item the no-start rule must skip
 SMOKE_VRAM_GB = 28.0  # check 2: every memory number of every smoke run
 SMOKE_MIN_STEPS = 300  # check 2: a VRAM window long enough (the deadline-fault item is exempt)
 BOX1_H_MAX, BOX2_H_MAX, FACTOR_MIN = 17.0, 45.0, 0.6  # check 3: the projected box hours and plan factors
-DATA_WAIT_MAX = 0.02  # check 5
+# check 5's loader rule: the steady-state share of the steps' time spent waiting on the loader, below DATA_WAIT_MAX
+# (the build contract's 0.02, kept: the owner may move it to prereg.DATA_WAIT_MAX, the study's 0.05). Box 53693389
+# (2026-10-01) failed check 5 on the whole-run summary.throughput.data_wait_frac (smoke-p005 0.234): every launch builds
+# a new loader whose 8 spawned workers take ~6-7 s to start, its first step waits for them, and a short smoke that the
+# faults restarted (smoke-p01 3 launches, smoke-p03 2) is dominated by those start-ups. Its steady state was 0.0007 to
+# 0.0023 (the smoke profiler's own data_wait_share agrees). So the first LAUNCH_SKIP_STEPS steps after every launch's
+# phase{name: "train"} and the smoke profiler's steps are left out (steady_wait); at least WAIT_MIN_STEPS steps must
+# remain, and no launch's first step may wait STARTUP_WAIT_MAX_S or more (a loader that only starts slowly, as on a
+# disk that cannot open its stores, still fails)
+DATA_WAIT_MAX = 0.02
+LAUNCH_SKIP_STEPS = 10
+WAIT_MIN_STEPS = 50
+STARTUP_WAIT_MAX_S = 120.0
 FORCED_MIN_DELTA_ABS = 1e8  # check 10: a config whose early_stop.min_delta_abs is this large forces the trigger
 SCRATCH_COMMITS_MAX = 2  # check 7: the scratch repo's history after its squashes
 ALERT_SLACK_S = 300  # check 7: an alert counts for the freeze when it falls in its window + this
@@ -1686,6 +1698,28 @@ class FullQueue(Q.Queue):
 # ========================================================================================================= verdict
 
 
+def _int_in(v, lo: int, hi: int) -> bool:
+    """v (an env value: a string) is an integer in [lo, hi]."""
+    try:
+        return lo <= int(str(v).strip()) <= hi
+    except (TypeError, ValueError):
+        return False
+
+
+def steady_wait(wait: dict[int, float], step_s: dict[int, float], launches: list[int], exclude=()) -> dict:
+    """Check 5's loader share of one run: sum(time/data_wait_s) / sum(time/step_s) over the steps logged with both,
+    leaving out the first LAUNCH_SKIP_STEPS steps after every launch (at_step a of a phase{name: "train"} event: steps
+    a+1 ...; its spawned workers start inside them) and the steps in `exclude` (the smoke profiler's). No launch known
+    (an event lost): the first logged step's launch. data_wait_frac None when no step remains; startup_wait_s is each
+    launch's first-step wait (None when that step was not logged)."""
+    launches = sorted(set(launches)) or ([min(step_s) - 1] if step_s else [])
+    drop = {s for a in launches for s in range(a + 1, a + 1 + LAUNCH_SKIP_STEPS)} | set(exclude)
+    steps = [s for s in sorted(step_s) if s in wait and s not in drop]
+    tot = sum(step_s[s] for s in steps)
+    return dict(data_wait_frac=sum(wait[s] for s in steps) / tot if tot > 0 else None, steps_measured=len(steps),
+                startup_wait_s={a + 1: wait.get(a + 1) for a in launches})
+
+
 class SmokeVerdict:
     """smoke_verdict.json (build contract 5): the built-in checks 1-11 on a smoke box with train items (smoke A), then
     the registry's verdict specs (checks 12-16; smoke B has only these). A check is {pass: true | false | null,
@@ -1832,16 +1866,59 @@ class SmokeVerdict:
         return (g or {}).get("verdict") == "pass", dict(gate=g)
 
     def check5(self):
+        """The thread pools and the loader's wait, per train item that ran (build contract 5, check 5, as fixed after
+        box 53693389).
+
+        Threads: every launch's `threads` event (not only the last) has KITSUNE_THREADS_PER_GPU == t (the queue's), each
+        of the six pools (fullrun.ENV_THREAD_POOLS, onstart's fix 2) an integer in [1, t], and torch_threads in
+        [max(1, t // 2), t]. Not == t: torch starts its intra-op pool at mkl_get_max_threads(), which MKL_DYNAMIC (MKL's
+        default, TRUE) caps at the physical cores, so a whole-machine quota on an SMT host gives min(t, cores): 16 of
+        t = 32 on the 9950X (16 cores / 32 threads) of box 53693389, reproduced with the same torch 2.14 on the laptop
+        (env 32 -> 24 of its 24 cores, env 20 -> 20, MKL_DYNAMIC=FALSE -> 32). The upper bound is the oversubscription
+        fix 2 prevents; the lower one holds on hosts with at most 2 hardware threads a core (cores >= logical / 2 >=
+        q / 2 >= t / 2), so a stray set_num_threads(1) still fails. interop_threads is evidence only (no env sets it).
+
+        Loader: steady_wait over the merged time/data_wait_s and time/step_s rows (the trainer logs both every step,
+        CORE_STEP_TAGS), the launches from the phase{name: "train", at_step} events and the smoke profiler's steps
+        (smoke_profile_start: its warm-up step and the recorded_steps after it) left out; pass iff at least
+        WAIT_MIN_STEPS steps remain, their fraction is < DATA_WAIT_MAX and no launch's first step waited
+        STARTUP_WAIT_MAX_S or more. summary.throughput.data_wait_frac (the whole run, start-ups included) stays in the
+        evidence as data_wait_frac_run."""
         want = os.environ.get(fullrun.ENV_THREADS_PER_GPU)
-        got, wait = {}, {}
+        try:
+            t = int(want) if want is not None else None
+        except ValueError:
+            t = None
+        rng = [max(1, t // 2), t] if t is not None and t >= 1 else None
+        threads, wait, ok = {}, {}, rng is not None and bool(self.ran())
         for n in self.ran():
-            th = self.kinds(n, "threads")
-            got[n] = th[-1].get("torch_threads") if th else None
-            wait[n] = (self.summary(n).get("throughput") or {}).get("data_wait_frac")
-        ok = want is not None and all(v == int(want) for v in got.values()) and bool(got) and \
-            all(w is not None and w < DATA_WAIT_MAX for w in wait.values())
-        return ok, dict(threads_per_gpu=want, cpu_quota=os.environ.get(fullrun.ENV_CPU_QUOTA), torch_threads=got,
-                        data_wait_frac=wait, data_wait_max=DATA_WAIT_MAX,
+            rows = []
+            for e in self.kinds(n, "threads"):
+                env = e.get("env") or {}
+                pools = {k: env.get(k) for k in fullrun.ENV_THREAD_POOLS}
+                tt = e.get("torch_threads")
+                good = rng is not None and env.get(fullrun.ENV_THREADS_PER_GPU) == str(t) and \
+                    all(_int_in(v, 1, t) for v in pools.values()) and \
+                    isinstance(tt, int) and not isinstance(tt, bool) and rng[0] <= tt <= rng[1]
+                rows.append(dict(torch_threads=tt, interop_threads=e.get("interop_threads"), pools_env=pools, ok=good))
+            threads[n] = rows
+            launches = [int(e["at_step"]) for e in self.kinds(n, "phase")
+                        if e.get("name") == "train" and isinstance(e.get("at_step"), int)]
+            exclude = {s for e in self.kinds(n, "smoke_profile_start") if isinstance(e.get("at_step"), int)
+                       for s in range(e["at_step"], e["at_step"] + int(e.get("recorded_steps") or 0) + 1)}
+            w = steady_wait(self.scalars(n, "time/data_wait_s"), self.scalars(n, "time/step_s"), launches, exclude)
+            w["data_wait_frac_run"] = (self.summary(n).get("throughput") or {}).get("data_wait_frac")
+            starts = [v for v in w["startup_wait_s"].values() if v is not None]
+            w["ok"] = w["data_wait_frac"] is not None and w["steps_measured"] >= WAIT_MIN_STEPS and \
+                w["data_wait_frac"] < DATA_WAIT_MAX and all(v < STARTUP_WAIT_MAX_S for v in starts)
+            wait[n] = w
+            ok = ok and bool(rows) and all(r["ok"] for r in rows) and w["ok"]
+        return ok, dict(threads_per_gpu=want, cpu_quota=os.environ.get(fullrun.ENV_CPU_QUOTA),
+                        torch_threads_range=rng, threads=threads,
+                        torch_threads={n: [r["torch_threads"] for r in rows] for n, rows in threads.items()},
+                        data_wait=wait, data_wait_frac={n: w["data_wait_frac"] for n, w in wait.items()},
+                        data_wait_max=DATA_WAIT_MAX, launch_skip_steps=LAUNCH_SKIP_STEPS,
+                        wait_min_steps=WAIT_MIN_STEPS, startup_wait_max_s=STARTUP_WAIT_MAX_S,
                         peak_rss_gb={n: self.items[n].get("peak_rss_gb") for n in self.ran()},
                         host_mem_peak_gb=self.q.state.get("host_mem_peak_gb"))
 

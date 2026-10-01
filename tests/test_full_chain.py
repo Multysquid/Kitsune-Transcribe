@@ -498,6 +498,8 @@ def test_the_chain_end_to_end_on_real_part_queues(ch, monkeypatch):
     monkeypatch.setattr(huggingface_hub, "snapshot_download", snap)
     monkeypatch.setattr(finish, "HUB_RETRY_WAITS", (0.05, 0.1))
     monkeypatch.setenv(fullrun.ENV_THREADS_PER_GPU, "8")
+    for k in fullrun.ENV_THREAD_POOLS:  # onstart's six pools (fix 2): check 5 wants each in [1, t]
+        monkeypatch.setenv(k, "8")
     up = Q.HubUploader("u/kitsune-runs")
     up._api = FakeApi(runs_hub, "chain")
     train_configs(ch.root, **{n: {"early_stop": {"min_delta_abs": 1e9}} for n in ("smoke-t06", "smoke-p03")})

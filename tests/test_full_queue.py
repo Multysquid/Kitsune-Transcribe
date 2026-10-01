@@ -575,6 +575,8 @@ def run_smoke(fq, monkeypatch, *, sigstop: bool, stall_min: float | None = None)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", snap)
     monkeypatch.setattr(finish, "HUB_RETRY_WAITS", (0.05, 0.1))
     monkeypatch.setenv(fullrun.ENV_THREADS_PER_GPU, "8")
+    for k in fullrun.ENV_THREAD_POOLS:  # onstart's six pools (fix 2): check 5 wants each in [1, t]
+        monkeypatch.setenv(k, "8")
     up = Q.HubUploader("u/kitsune-runs")
     up._api = FakeApi(runs_hub, "full-smoke")
     train_configs(fq.root, **{n: {"early_stop": {"min_delta_abs": 1e9}} for n in ("smoke-t06", "smoke-p03")})
@@ -780,6 +782,131 @@ def test_check_8_takes_a_non_forced_run_on_the_epochs_clock_even_when_it_stopped
     ran("smoke-p01", 0.0, clock="steps")  # the cooldown must come on the epochs clock
     ok, ev = F.SmokeVerdict(q).check8()
     assert not ok and ev["scheduled_cooldown"] == []
+
+
+# check 5 as fixed after box 53693389 (2026-10-01): torch_threads 16 of t = 32 on a 16-core / 32-thread host, and
+# whole-run data_wait_frac up to 0.234 from the loader start-ups of short, fault-restarted smoke runs
+
+
+def test_steady_wait_leaves_out_every_launchs_start_up_and_the_profiled_steps():
+    """smoke-p01 of box 53693389: launches after steps 0, 100 and 487, each first step waiting ~6-7 s for the loader's
+    spawned workers, 0.2 ms on a 0.272 s step after that, the smoke profiler on steps 21-41."""
+    step = {s: 0.272 for s in range(1, 936)}
+    wait = {s: 0.0002 for s in step}
+    for a, w0 in ((0, 6.59), (100, 6.09), (487, 6.79)):
+        wait[a + 1] = w0
+    prof = set(range(21, 42))
+    assert sum(wait.values()) / sum(step.values()) > 0.05  # the whole-run number check 5 used to fail on
+    w = F.steady_wait(wait, step, [0, 100, 487], prof)
+    assert w["data_wait_frac"] == pytest.approx(0.0002 / 0.272) and w["data_wait_frac"] < F.DATA_WAIT_MAX
+    assert w["startup_wait_s"] == {1: 6.59, 101: 6.09, 488: 6.79}
+    assert w["steps_measured"] == 935 - 3 * F.LAUNCH_SKIP_STEPS - len(prof)
+    slow_prof = {**wait, **{s: 0.2 for s in prof}}  # the profiler's steps are left out
+    assert F.steady_wait(slow_prof, step, [0, 100, 487], prof) == w
+    # a loader that starves the steps in steady state still shows
+    assert F.steady_wait({s: 0.03 for s in step}, step, [0, 100, 487], prof)["data_wait_frac"] == \
+        pytest.approx(0.03 / 0.272)
+    # no launch event: the first logged step's launch; nothing logged: None
+    assert F.steady_wait(wait, step, [])["startup_wait_s"] == {1: 6.59}
+    assert F.steady_wait({}, {}, []) == dict(data_wait_frac=None, steps_measured=0, startup_wait_s={})
+    # smoke-p005: one launch, 120 steps of 0.18 s, a 6.6 s first wait (whole run 0.234 on the box)
+    step = {s: 0.18 for s in range(1, 121)}
+    wait = {**{s: 0.0004 for s in step}, 1: 6.6}
+    w = F.steady_wait(wait, step, [0], range(21, 42))
+    assert w["data_wait_frac"] == pytest.approx(0.0004 / 0.18) and w["steps_measured"] == 120 - 10 - 21
+
+
+def check5_of(fq, monkeypatch, threads, *, t="32", n_steps=200, launches=(0,), steady=0.0002, startup=6.6):
+    """SmokeVerdict.check5 on one synthetic smoke-p03 run dir: `threads` the threads events, one per launch, each
+    torch_threads or (torch_threads, {pool or KITSUNE_THREADS_PER_GPU: value}); the queue's KITSUNE_THREADS_PER_GPU t;
+    time/data_wait_s `steady` on 0.4 s steps, `startup` on each launch's first step."""
+    monkeypatch.setenv(fullrun.ENV_THREADS_PER_GPU, t)
+    q = fq.make("full-smoke", registry=box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p03"]))
+    q.register()
+    rd = fq.root / "runs" / "smoke-p03-20261001T131206Z"
+    (rd / "metrics").mkdir(parents=True, exist_ok=True)
+    with open(rd / "events.jsonl", "w", encoding="utf-8") as f:
+        for a, th in zip(launches, threads):
+            tt, changes = th if isinstance(th, tuple) else (th, {})
+            env = {**{k: t for k in fullrun.ENV_THREAD_POOLS}, fullrun.ENV_CPU_QUOTA: t,
+                   fullrun.ENV_THREADS_PER_GPU: t, **changes}
+            f.write(json.dumps({"kind": "threads", "torch_threads": tt, "interop_threads": 32, "env": env}) + "\n")
+            f.write(json.dumps({"kind": "phase", "name": "train", "at_step": a}) + "\n")
+    with open(rd / "metrics" / "scalars.jsonl", "w", encoding="utf-8") as f:
+        for a in launches:
+            for s in range(a + 1, n_steps + 1):
+                f.write(json.dumps({"step": s, "tag": "time/step_s", "value": 0.4}) + "\n")
+                f.write(json.dumps({"step": s, "tag": "time/data_wait_s",
+                                    "value": startup if s == a + 1 else steady}) + "\n")
+    (rd / "summary.json").write_text(json.dumps({"throughput": {"data_wait_frac": 0.0957}}), encoding="utf-8")
+    q.item("smoke-p03").update(status="done", run_dir=f"runs/{rd.name}", attempts=[dict(t0=1.0, gpu="0", rc=0)])
+    return F.SmokeVerdict(q).check5()
+
+
+@pytest.mark.parametrize("threads,t,ok", [
+    ([16], "32", True),  # the 9950X: torch's pool capped at the 16 physical cores (MKL_DYNAMIC)
+    ([32], "32", True),
+    ([33], "32", False),  # oversubscribed past the quota (what fix 2 prevents)
+    ([15], "32", False),  # below t // 2: something set the pool down
+    ([(16, {fullrun.ENV_OMP_NUM_THREADS: "64"})], "32", False),  # a pool past t
+    ([(16, {fullrun.ENV_RAYON_NUM_THREADS: None})], "32", False),  # a pool onstart did not set
+    ([(16, {fullrun.ENV_THREADS_PER_GPU: "16"})], "32", False),  # the trainer saw another t than the queue
+    ([16, 64], "32", False),  # every launch is checked, not only the last
+    ([16, 32], "32", True),
+    ([1], "1", True),
+    (["16"], "32", False),  # not an integer count
+])
+def test_check_5_bounds_every_launchs_torch_threads_by_the_quota(fq, monkeypatch, threads, t, ok):
+    launches = (0, 100)[:len(threads)]
+    got, ev = check5_of(fq, monkeypatch, threads, t=t, launches=launches)
+    assert got is ok, ev
+    assert ev["torch_threads_range"] == [max(1, int(t) // 2), int(t)] and ev["threads_per_gpu"] == t
+    assert ev["torch_threads"]["smoke-p03"] == [x[0] if isinstance(x, tuple) else x for x in threads]
+    assert ev["data_wait"]["smoke-p03"]["ok"] is True  # the wait half passes throughout
+
+
+def test_check_5_measures_the_loaders_steady_wait(fq, monkeypatch):
+    ok, ev = check5_of(fq, monkeypatch, [16, 16], launches=(0, 100))
+    w = ev["data_wait"]["smoke-p03"]
+    assert ok and w["data_wait_frac"] == pytest.approx(0.0002 / 0.4) and w["data_wait_frac_run"] == 0.0957
+    assert w["startup_wait_s"] == {1: 6.6, 101: 6.6} and w["steps_measured"] == 200 - 2 * F.LAUNCH_SKIP_STEPS
+    assert ev["data_wait_frac"] == {"smoke-p03": w["data_wait_frac"]} and ev["data_wait_max"] == F.DATA_WAIT_MAX
+    # a steady wait at the limit fails; so does a loader that only starts slowly; so do too few steps to measure
+    ok, ev = check5_of(fq, monkeypatch, [16], steady=F.DATA_WAIT_MAX * 0.4)
+    assert not ok and ev["data_wait"]["smoke-p03"]["data_wait_frac"] == pytest.approx(F.DATA_WAIT_MAX)
+    ok, ev = check5_of(fq, monkeypatch, [16], startup=F.STARTUP_WAIT_MAX_S)
+    assert not ok and ev["data_wait"]["smoke-p03"]["startup_wait_s"] == {1: F.STARTUP_WAIT_MAX_S}
+    ok, ev = check5_of(fq, monkeypatch, [16], n_steps=F.LAUNCH_SKIP_STEPS + F.WAIT_MIN_STEPS - 1)
+    assert not ok and ev["data_wait"]["smoke-p03"]["steps_measured"] == F.WAIT_MIN_STEPS - 1
+    # no quota from the queue's env: fail
+    monkeypatch.delenv(fullrun.ENV_THREADS_PER_GPU)
+    q = fq.make("full-smoke", registry=box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p03"]))
+    q.register()
+    q.item("smoke-p03").update(status="done", run_dir="runs/smoke-p03-20261001T131206Z",
+                               attempts=[dict(t0=1.0, gpu="0", rc=0)])
+    ok, ev = F.SmokeVerdict(q).check5()
+    assert not ok and ev["torch_threads_range"] is None
+
+
+def test_check_5_on_the_fake_trainer_takes_the_steady_state_not_the_start_ups(fq, monkeypatch):
+    """The trainer's records as the fake writes them (threads, phase train per launch, time/data_wait_s per step): a
+    start-up that puts the whole run past the limit passes; a loader that starves every step fails."""
+    for k in fullrun.ENV_THREAD_POOLS:
+        monkeypatch.setenv(k, "8")
+    monkeypatch.setenv(fullrun.ENV_THREADS_PER_GPU, "8")
+    reg = box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p03"])
+    for sd, env, ok in (("s1", dict(FAKE_STARTUP_WAIT_S="20"), True), ("s2", dict(FAKE_WAIT_FRAC="0.06"), False)):
+        q = fq.make("full-smoke", registry=reg, state_dir=fq.tmp / sd, env=dict(FAKE_EPOCH_STEPS="100", **env))
+        assert q.run() == F.EXIT_OK
+        c5 = json.loads((fq.tmp / sd / fullrun.VERDICT_FILE).read_text(encoding="utf-8"))["checks"]["5"]
+        assert c5["pass"] is ok, c5
+        w = c5["evidence"]["data_wait"]["smoke-p03"]
+        if ok:
+            assert w["data_wait_frac_run"] > F.DATA_WAIT_MAX and w["data_wait_frac"] == pytest.approx(0.01)
+            assert list(w["startup_wait_s"].values()) == [pytest.approx(20.01)]
+        else:
+            assert w["data_wait_frac"] == pytest.approx(0.06)
+        assert c5["evidence"]["torch_threads"] == {"smoke-p03": [8]}
 
 
 def test_only_if_new_machine_skips_a_re_time_on_the_same_machine(fq):
