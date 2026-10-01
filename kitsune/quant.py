@@ -42,6 +42,11 @@ Principles:
                     activation quantiser asserts a contiguous input, and its int8 GEMM fails on a column-major one
   imports           torch and the stdlib only at import: torchao, transformers and safetensors are imported where
                     they are used, so the report can import this module on the laptop
+  recipe version    every record of a quantised model carries RECIPE_VERSION (2 since F1; absent = 1, every recipe up
+                    to 8ff3bd5) and recipe_sha256 (its constants): a variant file's quantization.json, 05's quant
+                    block and --out identity, speed_probe's quant_recipe, the selftest. A number of older quant code is
+                    never used (F4): load_quantized refuses such a variant, the readout exports it again, and
+                    tools/full_report.py leaves its readouts and speed records out
 
 Numerics (the exact recipes; the constants are the torchao parity test's to pin):
   every scale is computed in fp32 from the bf16-rounded weight, on the CPU wherever the weight lives (pack_weight):
@@ -65,7 +70,11 @@ Numerics (the exact recipes; the constants are the torchao parity test's to pin)
   mxfp4         per 32 along K, b the block amax: rceil e = ceil(log2(b / 6)) exactly through frexp; floor e =
                 floor(log2 b) - 2; b == 0: e = -127; e clamped to [-127, 127] and stored as uint8 e + 127 (E8M0); codes
                 of clamp(w * 2^-e, +-6) (e == -127 scales by 1, as torchao); dequant E2M1[c] * 2^e
-  fp8           per row s = amax / 448 (0 -> 1), q = e4m3(clamp(w / s, +-448)); activations per token the same way
+  fp8           torchao 0.18's float8 per row (F1, DECISIONS F): s = fp32(bf16(amax / 448)) (FP8_SCALE_DTYPE: the same
+                bits from the CPU's division and CUDA's reciprocal multiply), q = e4m3(clamp(x / s, +-448)); weights: an
+                all-zero row s = 1 (torchao: NaN); activations per token, the amax first clamped up to FP8_ACT_LB = 2^-40
+                (torchao's activation_value_lb, set in torchao_config): a padded frame's zero row quantises to zeros,
+                not NaN
   bias          added outside the quantised GEMM, in every format and impl (cuBLASLt's FP4 GEMM failed at M=1 with a
                 bias, pytorch #157054; and emulate and torchao then agree)
   emulate GEMM  the input is rounded to the autocast dtype when autocast is on (the real path sees autocast's bf16),
@@ -93,7 +102,8 @@ Variant dir (export; load_quantized reads it back, verify_export checks it):
                       float8_e8m0fnu nor float4_e2m1fn_x2), <name>.qtensor_scale (fp32, nvfp4) and <name>.bias. fp16:
                       the HF keys and shapes, loadable with from_pretrained. The header's metadata holds no time, so
                       the bytes are deterministic and the two variants of one format are the same file
-  quantization.json   the recipe (schema 1): format, weights, activations, scope, recipe constants, source (dir,
+  quantization.json   the recipe (schema 1): format, weights, activations, scope, recipe_version, recipe_sha256, recipe
+                      constants, source (dir,
                       weights_sha256, family, architecture), layers {name: kind, shape, orig_shape, bias}, kept,
                       skipped, tied, fp16_tensors, counts, bytes, file_bytes, copied files with their sha256, the tensor
                       index digest, versions, load_with
@@ -109,10 +119,13 @@ CLI (python -m kitsune.quant; exit codes of contract 1.5):
   inspect DIR                                                                                          0 ok / 1
   compare A B [--exact | --tol-cer x] [--json-out FILE]   two 05 --out dirs, over the sets both hold: {same, sets}
                                                                                                 0 same / 1 differ
-  selftest --device cuda:0 --out FILE [--ckpt DIR ...] [--rows 1,7,17,128,1000]   smoke B check 12: real torchao
-          kernels against emulate per format and M, the kernel census (every int8 GEMM returned after padding: no
-          fp32 fallback), weights quantised and the low-precision GEMM run under autocast, MXFP4 refused by
-          torchao's AUTO kernel. {ok, ...}                                                                  0 / 1
+  selftest --device cuda:0 --out FILE [--ckpt DIR ...] [--rows 1,7,17,128,1000]   smoke B check 12: the pack's device
+          parity, torchao's own quantize_ against the pack (fp8, int8), real torchao kernels against emulate per
+          format and M, the kernel census (every int8 GEMM returned after padding: no fp32 fallback), all-zero
+          activation rows (exactly the bias, never NaN), weights quantised and the low-precision GEMM run under
+          autocast, MXFP4 refused by torchao's AUTO kernel, a compiled conformer-convolution block per W*A* format
+          (B = 3 then 1, against eager), and per --ckpt the student unpadded and on padded batches (no non-finite
+          row). {ok, recipe_version, ...}                                                                   0 / 1
 export, compare and selftest beat the item's heartbeat (kitsune.heartbeat.beating, max 1800 s; a no-op without
 KITSUNE_HEARTBEAT); readout's 05 part beats through 05's featuriser.
 """
@@ -200,12 +213,52 @@ INT8_ACT_DIV = 127.5
 INT8_ACT_QMIN = -127
 INT8_ACT_EPS = 1e-5
 INT8_ACT_SCALE_DTYPE = torch.bfloat16
+# torchao 0.18's float8 per row (_choose_scale_float8, then _quantize_affine_float8): the scale amax / 448 is computed
+# in the input's dtype and only then cast to fp32. Every input kitsune hands it is bf16 (QuantLinear casts to the
+# weight's dtype, and the template Linear is bf16), so the scale is bf16-rounded: FP8_SCALE_DTYPE. The fp32 scale this
+# module used before (box 53693389's smoke B, 14bfcad) put the selftest's fp8 real-vs-emulate error at 1.08-1.82 %
+# against a 1 % tolerance (a CPU simulation of only this difference gives 1.00-1.18 %). DECISIONS F1 (2026-10-01):
+# the activation's AND the weight's row scale are rounded so ("torchao decides": the pack then equals torchao's own
+# quantize_ of the same bf16 weight). bf16(a / 448) is the same bits from the CPU's true division and from CUDA's
+# multiply by the fp32 reciprocal, for every positive finite bf16 amax (tests/test_quant.py, exhaustively): the pack is
+# device-independent as before
+FP8_SCALE_DTYPE = torch.bfloat16
+# torchao's activation_value_lb (Float8DynamicActivationFloat8WeightConfig; hp_value_lb of _choose_scale_float8): the
+# activation row amax is clamped up to it before the division. torchao's default (None) leaves an all-zero row with
+# scale 0 and codes 0 / 0 = NaN, and the students hand an fp8 Linear exactly such rows - every padded frame at
+# subsampling.linear (Parakeet masks the subsampled features) and at every o_proj (sdpa returns 0 for a fully masked
+# query row): box 53693389's fp8 speed records decoded garbage (cer_ref_corpus 0.939-0.945, every format else 0.19-0.27),
+# the NaN spreading from the padded rows through attention to all but each batch's longest utterance. F1 sets it to
+# 2^-40, a power of two (exact in bf16): a zero row gets the scale bf16(2^-40) / 448 ~ 2e-15 and quantises to zeros.
+# Weights get no lb in torchao (an all-zero weight row would be NaN there); this module keeps scale 1 for one, a
+# documented deviation that no student weight reaches
+FP8_ACT_LB = 2.0 ** -40
+# The recipe version every variant file, 05 quant block, speed record and selftest carries (F4: readers never use a
+# number the quant code before a fix produced):
+#   1 (or the field absent)  every recipe up to 8ff3bd5, 14bfcad's included: fp32 fp8 scales, an fp8 activation row of
+#                            zeros 0 / 0 = NaN (box 53693389's smoke B #1)
+#   2                        F1 (DECISIONS F, 2026-10-01): FP8_SCALE_DTYPE for the fp8 activation and weight row scales,
+#                            FP8_ACT_LB on the activations
+# load_quantized refuses a variant below it, 05 refuses one as --ckpt, the readout re-exports one, and
+# tools/full_report.py leaves out every quant readout and speed record below it (QUANT_RECIPE_MIN)
+RECIPE_VERSION = 2
 NVFP4_SCALE_MIN = float(torch.finfo(torch.float8_e4m3fn).tiny)  # torchao nvfp4_quantize clamps the block scale here
 NVFP4_BLOCK, MXFP4_BLOCK = 16, 32
 E8M0_BIAS = 127
 PAD_ROWS = 17  # torch._int_mm refuses M <= 16 on CUDA: an int8-activation torchao call is padded to this many rows
 # smoke B's selftest: the relative Frobenius error of a real torchao Linear against its emulation
 SELFTEST_TOL = {"int8-w8a16": 5e-3, "int8-w8a8": 5e-3, "nvfp4-w4a16": 1e-2, "nvfp4-w4a4": 2e-2, "fp8-w8a8": 1e-2}
+# F4's selftest sub-checks (check 12). The padded checkpoint batches: CTC 4 x 500 frames with these valid lengths (the
+# longest unpadded, the rest padded by 14-76 %: zero rows at subsampling.linear and at every o_proj, where the pre-F1
+# fp8 recipe made NaN); AED 8 x 300 with these lengths (as varied as an eval batch of short clips)
+CKPT_CTC_LENGTHS = (500, 431, 257, 120)
+CKPT_AED_LENGTHS = (300, 287, 251, 200, 173, 120, 64, 31)
+# the compiled conformer-convolution-like block: the W*A* formats with a real kernel (mxfp4 has none, decision 20), at
+# a ParakeetEncoderConvolutionModule's width and kernel; M = 3 x 333 = 999 rows is 7 mod 8 like box 53693389's M = 4959
+# (the case torchao's eager safe_int_mm copies to contiguous for and its compile branch skips), and B = 3 then B = 1
+# is the order that recompiled there (dynamo specialises a batch of 1)
+COMPILE_FORMATS = ("int8-w8a8", "nvfp4-w4a4", "fp8-w8a8")
+COMPILE_BLOCK = dict(channels=1024, kernel=9, frames=333, batches=(3, 1))
 TIMED_FORMATS = tuple(f for f in QUANT_FORMATS if f != "fp16" and FORMAT_INFO[f]["timed"])
 BEAT_MAX_S = 1800  # the heartbeat bound of export / compare / selftest (contract 8)
 LOAD_WITH = ("kitsune.quant.load_quantized (transformers from_pretrained would re-initialise the missing .weight "
@@ -299,8 +352,10 @@ def resolve_impl(fmt: str, impl: str, device) -> str:
 
 
 def identity(fmt: str, impl: str, scope: str, mx_rounding: str) -> dict:
-    """The block a 05 --out identity gains for a quantised eval (only then: existing --out dirs keep theirs)."""
-    rec = dict(fmt=fmt, impl=impl, scope=scope, mx_rounding=mx_rounding, schema=SCHEMA)
+    """The block a 05 --out identity gains for a quantised eval (only then: existing --out dirs keep theirs). It holds
+    RECIPE_VERSION: a quantised --out that older quant code started (no recipe_version) refuses to resume (05's
+    check_identity), so no set scored by a pre-F1 recipe is completed by a fixed one or the other way round."""
+    rec = dict(fmt=fmt, impl=impl, scope=scope, mx_rounding=mx_rounding, schema=SCHEMA, recipe_version=RECIPE_VERSION)
     if impl == "torchao":
         rec["torchao"] = torchao_version()
     return rec
@@ -402,9 +457,17 @@ def _int8_rows(x: torch.Tensor, div: float, eps: float, qmin: int, scale_dtype=t
     return q, s
 
 
-def _fp8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _fp8_rows(x: torch.Tensor, *, lb: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row float8 e4m3 (torchao 0.18's _choose_scale_float8 + _quantize_affine_float8 on a bf16 input, F1): the
+    row amax (of bf16 values, so exact), clamped up to lb when given (torchao's hp_value_lb: FP8_ACT_LB for
+    activations), divided by 448 in FP8_SCALE_DTYPE and then made fp32; the codes e4m3(clamp(x / s, +-448)) in fp32.
+    Without lb (weights) an all-zero row gets the scale 1 and zero codes, where torchao would divide 0 by 0."""
     amax = x.abs().amax(dim=1)
-    s = torch.where(amax > 0, amax / F8_MAX, torch.ones_like(amax))
+    if lb is not None:
+        amax = amax.clamp(min=lb)
+    s = (amax.to(FP8_SCALE_DTYPE) / F8_MAX).float()
+    if lb is None:
+        s = torch.where(amax > 0, s, torch.ones_like(s))
     q = (x / s[:, None]).clamp(-F8_MAX, F8_MAX).to(torch.float8_e4m3fn)
     return q, s
 
@@ -475,7 +538,7 @@ def pack_weight(w: torch.Tensor, wfmt: str, *, mx_rounding: str = "rceil") -> Qu
     if wfmt == "int8":
         q, s = _int8_rows(wb, INT8_DIV, INT8_EPS, -128, scale_dtype=INT8_SCALE_DTYPE)
         return QuantPack("int8", (n, k), q.to(torch.int8), scale=s.float())
-    if wfmt == "fp8":
+    if wfmt == "fp8":  # the bf16-rounded row scale of F1, no lb (torchao's weight has none): a zero row keeps scale 1
         q, s = _fp8_rows(wb)
         return QuantPack("fp8", (n, k), q, scale=s.float())
     if wfmt == "nvfp4":
@@ -510,7 +573,7 @@ def fake_quant_act(x: torch.Tensor, act: str, *, mx_rounding: str = "rceil") -> 
         q, s = _int8_rows(x2, INT8_ACT_DIV, INT8_ACT_EPS, INT8_ACT_QMIN, scale_dtype=INT8_ACT_SCALE_DTYPE)
         y = q * s[:, None]
     elif act == "fp8":
-        q, s = _fp8_rows(x2)
+        q, s = _fp8_rows(x2, lb=FP8_ACT_LB)  # a padded frame's zero row: zeros, never 0 / 0 (F1)
         y = q.float() * s[:, None]
     elif act == "nvfp4":
         codes, bs, t = _nvfp4(x2)
@@ -858,7 +921,8 @@ def _recipe_consts(fmt: str, mx_rounding: str) -> dict:
         rec.update(int8_div=INT8_DIV, int8_eps=INT8_EPS, int8_range=[-128, 127],
                    int8_scale_dtype=str(INT8_SCALE_DTYPE).replace("torch.", ""))
     if wfmt == "fp8":
-        rec.update(fp8_scale="amax/448 per row (0 -> 1)")
+        rec.update(fp8_scale="bf16(amax / 448) per row, then fp32 (an all-zero weight row: 1)",
+                   fp8_scale_dtype=str(FP8_SCALE_DTYPE).replace("torch.", ""))
     if wfmt == "nvfp4":
         rec.update(tensor_scale="amax/(448*6)", block_scale_min=NVFP4_SCALE_MIN,
                    code_scaling="x * ((1 / tensor_scale) / block_scale) (torchao 0.18's reciprocal form)")
@@ -871,7 +935,16 @@ def _recipe_consts(fmt: str, mx_rounding: str) -> dict:
         rec.update(act_tensor_scale="whole call input")
     if act in ("fp8", "mxfp4"):
         rec.update(act_block="per token" if act == "fp8" else MXFP4_BLOCK)
+    if act == "fp8":
+        rec.update(act_scale_dtype=str(FP8_SCALE_DTYPE).replace("torch.", ""), act_value_lb=FP8_ACT_LB)
     return rec
+
+
+def recipe_sha256(fmt: str, mx_rounding: str = "rceil") -> str:
+    """The sha256 of a format's recipe constants (_recipe_consts as sorted, compact JSON): two records with the same
+    RECIPE_VERSION and another hash were made by quant code whose constants differ (a reader can tell them apart)."""
+    return hashlib.sha256(json.dumps(_recipe_consts(fmt, mx_rounding), sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
 
 
 def _versions() -> dict:
@@ -931,8 +1004,11 @@ def apply(model: nn.Module, fmt: str, *, impl: str = "auto", scope: str = "linea
     if family == "aed" and model.config.tie_word_embeddings:
         tied["proj_out.weight"] = "model.decoder.embed_tokens.weight"
     wfmt = _SPLIT[fmt][0] if fmt != "fp16" else "fp16"
+    # recipe_version / recipe_sha256 (F4): additive, so the schema stays 1; a variant file carries them in its
+    # quantization.json, and every reader refuses or leaves out a record below RECIPE_VERSION
     recipe = dict(
         schema=SCHEMA, format=fmt, weights=wfmt, activations=ACTIVATIONS[fmt], scope=scope if fmt != "fp16" else None,
+        recipe_version=RECIPE_VERSION, recipe_sha256=recipe_sha256(fmt, mx_rounding),
         recipe=_recipe_consts(fmt, mx_rounding), family=family, architecture=type(model).__name__,
         layers=layers, kept=kept, skipped=skipped, tied=tied, fp16_tensors=fp16,
         counts=dict(params_total=params_total, params_quantized=params_q,
@@ -1145,7 +1221,12 @@ def torchao_config(fmt: str):
         return _ao("NVFP4DynamicActivationNVFP4WeightConfig")(use_dynamic_per_tensor_scale=True,
                                                                use_triton_kernel=False)
     if fmt == "fp8-w8a8":
-        return _ao("Float8DynamicActivationFloat8WeightConfig")(granularity=_ao("PerRow")())
+        # activation_value_lb (F1): torchao passes it to its activation quantiser as hp_value_lb, so a padded frame's
+        # all-zero row quantises to zeros, not 0 / 0 = NaN (FP8_ACT_LB). It travels in the weight subclass's
+        # act_quant_kwargs, which to_torchao keeps (it rebuilds from the template's flatten context). It also keeps
+        # torchao on its torch quantiser: an MSLK one requires hp_value_lb None
+        return _ao("Float8DynamicActivationFloat8WeightConfig")(granularity=_ao("PerRow")(),
+                                                                activation_value_lb=FP8_ACT_LB)
     raise QuantError(f"{fmt}: no torchao config (mxfp4 is emulated, fp16 is plain fp16)")
 
 
@@ -1307,6 +1388,17 @@ def read_recipe(path) -> dict:
     if not isinstance(rec, dict) or rec.get("schema") != SCHEMA or rec.get("format") not in QUANT_FORMATS:
         raise QuantError(f"{p}: not a schema-{SCHEMA} recipe of a known format")
     return rec
+
+
+def recipe_version_problem(rec: dict) -> str | None:
+    """Why a variant's recipe may not be used (F4), or None: one exported by quant code older than RECIPE_VERSION (no
+    recipe_version: version 1, every export up to 8ff3bd5) holds the pre-F1 numbers, so it is never loaded, scored or
+    reused - it is exported again from its bf16 checkpoint (about a minute)."""
+    v = rec.get("recipe_version") or 1
+    if v != RECIPE_VERSION:
+        return (f"this {rec.get('format')} variant was exported by quant recipe version {v}, not {RECIPE_VERSION} (the "
+                "pre-F1 fp8 scales, DECISIONS F): export it again from its bf16 checkpoint")
+    return None
 
 
 def _family_of_dir(path: Path) -> tuple[str, str]:
@@ -1631,6 +1723,8 @@ def load_quantized(path, device, *, impl: str = "auto", dtype=torch.float32) -> 
     if problems := verify_export(path):
         raise QuantError(f"{path}: not a valid variant dir: " + "; ".join(problems[:10]))
     rec = read_recipe(path)
+    if (why := recipe_version_problem(rec)) is not None:
+        raise QuantError(f"{path}: {why}")
     fmt = rec["format"]
     dev = torch.device(device)
     impl_r = resolve_impl(fmt, impl, dev)
@@ -2090,17 +2184,28 @@ def quantize_linear(lin: nn.Linear, fmt: str, impl: str, *, mx_rounding: str = "
 
 
 def selftest(device, *, ckpt=None, rows=(1, 7, 17, 128, 1000), shape=(2560, 1024)) -> dict:
-    """Smoke B check 12 (module docstring). Per timed format on an (N, K) Linear: torchao against emulate at every M
-    (relative Frobenius error within SELFTEST_TOL), the kernel census and the wall time; int8 W8A8: no fp32 fallback
-    after padding (every call's torch._int_mm returned: fallback_mm 0, kernel_census) and, unpadded at M=1, whether
-    the trap shows (torch._int_mm raising; a warning when it returned); under torch.autocast(bf16) with an fp32 input
-    the weight stays torchao's and the low-precision GEMM runs (W*A* formats, by op evidence: low_gemm_evidence);
-    MXFP4 through torchao's AUTO kernel must raise (a warning, "re-evaluate decision 20", when it does not). With ckpt
-    dirs: the same comparison on the student (a CTC encoder batch; an AED greedy_generate(pin_new=8) at batch 1 and
-    8). ok = every hard check passed."""
+    """Smoke B check 12 (module docstring), in this order:
+      pack_device      a weight on the GPU packs to the CPU's bits in every weight format (hard), device_arith a record
+      torchao_parity   torchao's own quantize_ of a bf16 weight on the GPU, read back, equals pack_weight's (hard for
+                       fp8, F1's "torchao decides", and int8; nvfp4 a record: its tensor scale uses CUDA's reciprocal)
+      layers           per timed format on an (N, K) Linear: torchao against emulate at every M (relative Frobenius
+                       error within SELFTEST_TOL), the kernel census and the wall time; int8 W8A8: no fp32 fallback
+                       after padding (every call's torch._int_mm returned: fallback_mm 0, kernel_census) and, unpadded
+                       at M=1, whether the trap shows (torch._int_mm raising; a warning when it returned); zero rows
+                       (F4, _selftest_zero_rows: a padded frame's all-zero activation row gives exactly the bias, never
+                       NaN); under torch.autocast(bf16) with an fp32 input the weight stays torchao's and the
+                       low-precision GEMM runs (W*A* formats, by op evidence: low_gemm_evidence)
+      mxfp4            MXFP4 through torchao's AUTO kernel must raise (a warning, "re-evaluate decision 20", when not)
+      compile          (F4, _selftest_compile) a conformer-convolution-like block of quantised Linears, torch.compile'd
+                       (dynamic, inductor) at B = 3 then B = 1, against the eager block, per COMPILE_FORMATS
+      ckpt             with ckpt dirs: the same comparison on the student (a CTC encoder batch; an AED
+                       greedy_generate(pin_new=8) at batch 1 and 8), then padded batches (F4: CKPT_CTC_LENGTHS,
+                       CKPT_AED_LENGTHS) with the real model under NonFiniteMonitor: no non-finite row
+    ok = every hard check passed; recipe_version is RECIPE_VERSION (a selftest of older quant code has none)."""
     dev = torch.device(device)
-    rec = dict(schema=SCHEMA, device=str(dev), versions=_versions(), rows=[int(r) for r in rows], shape=list(shape),
-               formats={}, checks=[], warnings=[], ckpt={}, ok=False, time_utc=_now())
+    rec = dict(schema=SCHEMA, recipe_version=RECIPE_VERSION, device=str(dev), versions=_versions(),
+               rows=[int(r) for r in rows], shape=list(shape), formats={}, checks=[], warnings=[], ckpt={}, ok=False,
+               time_utc=_now())
 
     def check(name, ok, detail=None):
         rec["checks"].append(dict(name=name, ok=bool(ok), detail=detail))
@@ -2114,12 +2219,19 @@ def selftest(device, *, ckpt=None, rows=(1, 7, 17, 128, 1000), shape=(2560, 1024
         rec["capability"] = list(torch.cuda.get_device_capability(dev))
         check("environment", True, rec["gpu"])
         _selftest_pack_device(rec, check, dev, shape)
+        _selftest_torchao_parity(rec, check, dev, shape)
         _selftest_layers(rec, check, dev, rows, shape)
         _selftest_mxfp4(rec, dev, shape)
+        _selftest_compile(rec, check, dev)
         for d in ckpt or []:
             _selftest_ckpt(rec, check, dev, Path(d))
     rec["ok"] = all(c["ok"] for c in rec["checks"])
     return rec
+
+
+def _sync(dev: torch.device):
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
 
 
 def _packs_equal(a: QuantPack, b: QuantPack) -> bool:
@@ -2138,8 +2250,10 @@ def _selftest_pack_device(rec, check, dev, shape):
     """Hard check pack_device_parity: a weight on the GPU packs to the CPU's bits in every weight format (pack_weight
     computes on the CPU), so an in-memory quantised model (05 --quant, speed_probe) is the exported file. device_arith
     (a record, no check): what computing the scales on the GPU itself gives - the rows whose nvfp4-style tensor scale
-    amax / (448 * 6) and whose fp8 scale amax / 448 differ from the CPU's, the mechanism box 53693389's cmp-nvfp4
-    failure points to (CUDA divides by a Python scalar as a multiply by its reciprocal)."""
+    amax / (448 * 6), whose pre-F1 fp32 fp8 scale amax / 448 and whose F1 fp8 scale bf16(amax) / 448 in bf16 differ
+    from the CPU's, the mechanism box 53693389's cmp-nvfp4 failure points to (CUDA divides by a Python scalar as a
+    multiply by its reciprocal). fp8_bf16_scale_rows_differ is 0 by the exhaustive bf16 argument (FP8_SCALE_DTYPE):
+    the F1 scale is device-independent."""
     n, k = shape
     g = torch.Generator(device="cpu").manual_seed(1)
     w = torch.randn(n, k, generator=g) * 0.02
@@ -2147,10 +2261,58 @@ def _selftest_pack_device(rec, check, dev, shape):
     check("pack_device_parity", not bad, f"differs from the CPU's pack: {bad}" if bad else f"{list(WFMTS)}")
     amax = w.to(torch.bfloat16).float().abs().amax(dim=1)
     amax_d = amax.to(dev)
+    a16, a16_d = amax.to(FP8_SCALE_DTYPE), amax_d.to(FP8_SCALE_DTYPE)
     rec["device_arith"] = dict(
         rows=int(n), nvfp4_tensor_scale_rows_differ=int(((amax_d / (F8_MAX * F4_MAX)).cpu()
                                                          != amax / (F8_MAX * F4_MAX)).sum()),
-        fp8_scale_rows_differ=int(((amax_d / F8_MAX).cpu() != amax / F8_MAX).sum()))
+        fp8_fp32_scale_rows_differ=int(((amax_d / F8_MAX).cpu() != amax / F8_MAX).sum()),
+        fp8_bf16_scale_rows_differ=int(((a16_d / F8_MAX).cpu() != a16 / F8_MAX).sum()))
+
+
+def _n_diff(a: torch.Tensor, b: torch.Tensor) -> int | None:
+    """The elements of two tensors of one shape and element size whose bits differ (None when they cannot be
+    compared)."""
+    a, b = a.detach().cpu().contiguous(), b.detach().cpu().contiguous()
+    if a.shape != b.shape or a.element_size() != b.element_size():
+        return None
+    es = a.element_size()
+    return int((a.reshape(-1).view(torch.uint8).reshape(-1, es) != b.reshape(-1).view(torch.uint8).reshape(-1, es))
+               .any(dim=1).sum())
+
+
+TORCHAO_PARITY_HARD = ("int8-w8a8", "fp8-w8a8")  # F1: "torchao decides"; nvfp4 is a record (its fp32 tensor scale)
+
+
+def _selftest_torchao_parity(rec, check, dev, shape):
+    """torchao's own quantize_ of an (N, K) bf16 weight (no all-zero row) on the GPU, read back with from_torchao,
+    against pack_weight of the same weight on the CPU: the bits of every part (parts_differ: the elements that
+    differ). A hard check for fp8 (F1: the bf16-rounded row scale is torchao's) and int8 (its bf16 scale is
+    device-independent too); nvfp4 a record and a warning (its fp32 tensor scale is CUDA's reciprocal there, module
+    docstring) - and torchao may keep its block scales swizzled, which from_torchao cannot read."""
+    n, k = shape
+    g = torch.Generator(device="cpu").manual_seed(2)
+    w = (torch.randn(n, k, generator=g) * 0.02).to(torch.bfloat16)
+    out = {}
+    rec["torchao_parity"] = out
+    for fmt in (*TORCHAO_PARITY_HARD, "nvfp4-w4a4"):
+        r = dict(same=False)
+        out[fmt] = r
+        try:
+            lin = nn.Linear(k, n, bias=False, device=dev, dtype=torch.bfloat16)
+            with torch.no_grad():
+                lin.weight.copy_(w.to(dev))
+            _ao("quantize_")(lin, torchao_config(fmt))
+            r["weight_type"] = type(lin.weight).__name__
+            theirs, ours = from_torchao(lin.weight, fmt), pack_weight(w, _SPLIT[fmt][0])
+            pt, po = theirs.parts(), ours.parts()
+            r["parts_differ"] = {p: _n_diff(pt[p], po[p]) for p in po}
+            r["same"] = _packs_equal(theirs, ours)
+        except Exception as e:  # noqa: BLE001 - recorded: an API change fails the hard check with its error
+            r["error"] = f"{type(e).__name__}: {e}"[:400]
+        if fmt in TORCHAO_PARITY_HARD:
+            check(f"torchao parity {fmt}", r["same"], r)
+        elif not r["same"]:
+            rec["warnings"].append(f"torchao parity {fmt} (a record): {r.get('error') or r.get('parts_differ')}")
 
 
 def _selftest_layers(rec, check, dev, rows, shape):
@@ -2192,6 +2354,7 @@ def _selftest_layers(rec, check, dev, rows, shape):
                           census.get("fallback_mm") == 0 and bool(census.get("int8_act_calls")),
                           f"fallback_mm {census.get('fallback_mm')}, int8_act_calls {census.get('int8_act_calls')}, "
                           f"torch._int_mm {census.get('int8_mm')}")
+            _selftest_zero_rows(rec, check, dev, fmt, emu, real, bias, k, g)
             # fp32 input under bf16 autocast: the weight stays torchao's, the low-precision GEMM runs (W*A*: by op
             # evidence, low_gemm_evidence; a kernel name is recorded, not required)
             before = type(real.weight)
@@ -2223,6 +2386,38 @@ def _selftest_layers(rec, check, dev, rows, shape):
         except Exception as e:  # noqa: BLE001 - recorded: the selftest reports every format
             frec["error"] = f"{type(e).__name__}: {e}"[:600]
             check(f"{fmt} builds and runs", False, frec["error"])
+
+
+ZERO_ROWS = (0, 5)  # the all-zero rows of the zero-row check's M = 17 input (int8's padding to 17 rows not involved)
+
+
+def _selftest_zero_rows(rec, check, dev, fmt, emu, real, bias, k, g):
+    """F4: a padded frame's all-zero activation row. An M = 17 bf16 input with rows ZERO_ROWS all zero, under bf16
+    autocast: hard check "<fmt> zero rows" - the real output finite, its zero rows exactly the bias in bf16 (the GEMM
+    of zero codes is 0, the bias added outside it), and within SELFTEST_TOL of emulate. Pre-F1 fp8 (torchao's default:
+    no activation_value_lb) divides 0 by 0 there: NaN (box 53693389). Recorded only (a warning when not finite): an
+    all-zero 17-row input, where nvfp4's per-tensor amax is 0 too (no real call hands it one). The fp8 record shows
+    the weight's act_quant_kwargs (hp_value_lb). Every timed format (the weight-only ones trivially)."""
+    x = torch.randn(17, k, generator=g).to(torch.bfloat16)
+    x[list(ZERO_ROWS)] = 0.0
+    x = x.to(dev)
+    with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16):
+        ye, yr = emu(x), real(x)
+        yz = real(torch.zeros(17, k, device=dev, dtype=torch.bfloat16))
+    _sync(dev)
+    finite = bool(torch.isfinite(yr).all())
+    want = bias.detach().to(dev, yr.dtype)[None, :].expand(len(ZERO_ROWS), -1)
+    rows_bias = finite and bool(torch.equal(yr[list(ZERO_ROWS)], want))
+    err = _rel_frob(yr, ye)
+    zr = dict(finite=finite, zero_rows_equal_bias=rows_bias, rel_err=err, tol=SELFTEST_TOL[fmt],
+              all_zero_finite=bool(torch.isfinite(yz).all()))
+    if _SPLIT[fmt][1] == "fp8":
+        zr["act_quant_kwargs"] = repr(getattr(real.weight, "act_quant_kwargs", None))[:400]
+    rec["formats"].setdefault(fmt, {})["zero_rows"] = zr
+    check(f"{fmt} zero rows", finite and rows_bias and err <= SELFTEST_TOL[fmt], zr)
+    if not zr["all_zero_finite"]:
+        rec["warnings"].append(f"{fmt}: an all-zero input (every row zero) gives a non-finite output (a record only: "
+                               "no real call hands a layer an all-zero input)")
 
 
 MXFP4_REFUSAL_MARKERS = ("B200", "B300", "only supported")  # torchao 0.18's MXFP4 refusal on a GPU without kernels
@@ -2268,7 +2463,119 @@ def mxfp4_auto_config():
                                                      kernel_preference=_ao("KernelPreference").AUTO)
 
 
-def _selftest_ckpt(rec, check, dev, d: Path):
+class _ConvBlock(nn.Module):
+    """The compile sub-check's block: a ParakeetEncoderConvolutionModule's shape behind a feed-forward Linear. ff ->
+    the padded frames masked to exact zero rows (what pointwise_conv1 then sees, as at a student's padded frames) ->
+    (B, C, T) -> pointwise Conv1d(C, 2C) -> GLU -> depthwise Conv1d(k, groups C) -> BatchNorm (eval) -> SiLU ->
+    pointwise Conv1d(C, C) -> (B, T, C). The pointwise convs become PointwiseConv1dAsLinear (_conv_block), so
+    pointwise_conv2 reads the depthwise output T-fastest: box 53693389's nvfp4 contiguity assert and int8 + compile
+    cuBLAS error came from exactly that input."""
+
+    def __init__(self, c: int, k: int):
+        super().__init__()
+        self.ff = nn.Linear(c, c)
+        self.pointwise_conv1 = nn.Conv1d(c, 2 * c, 1)
+        self.depthwise_conv = nn.Conv1d(c, c, k, padding=k // 2, groups=c)
+        self.norm = nn.BatchNorm1d(c)
+        self.pointwise_conv2 = nn.Conv1d(c, c, 1)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        h = self.ff(x).masked_fill(~mask[..., None], 0.0)
+        h = F.glu(self.pointwise_conv1(h.transpose(1, 2)), dim=1)
+        h = F.silu(self.norm(self.depthwise_conv(h)))
+        return self.pointwise_conv2(h).transpose(1, 2)
+
+
+def _conv_block(fmt: str, impl: str, dev, c: int, k: int, seed: int = 0) -> _ConvBlock:
+    """A seeded _ConvBlock in bf16 on dev (the speed probe's whole-model cast), its pointwise convs adapted and its
+    three Linears quantised (quantize_linear) for impl, with the counters off (as speed_probe --compile)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    blk = _ConvBlock(c, k)
+    with torch.no_grad():
+        for name, p in blk.named_parameters():
+            p.copy_(1.0 + 0.1 * torch.randn(p.shape, generator=g) if name == "norm.weight"
+                    else 0.02 * torch.randn(p.shape, generator=g) if p.dim() > 1 else 0.05 * torch.randn(p.shape,
+                                                                                                         generator=g))
+        blk.norm.running_mean.copy_(0.1 * torch.randn(c, generator=g))
+        blk.norm.running_var.copy_(0.5 + torch.rand(c, generator=g))
+    blk.pointwise_conv1 = PointwiseConv1dAsLinear(blk.pointwise_conv1)
+    blk.pointwise_conv2 = PointwiseConv1dAsLinear(blk.pointwise_conv2)
+    blk = blk.to(dev, torch.bfloat16).eval()
+    for lin in (blk.ff, blk.pointwise_conv1.linear, blk.pointwise_conv2.linear):
+        quantize_linear(lin, fmt, impl)
+        lin.kq.count = False
+    return blk
+
+
+def _dynamo_graphs() -> int:
+    """Graphs dynamo has compiled in this process (torch._dynamo.utils.counters, a private API: used only to tell a
+    compiled call from a silent eager fallback)."""
+    from torch._dynamo.utils import counters
+
+    return int(counters["stats"]["unique_graphs"])
+
+
+def _selftest_compile(rec, check, dev, *, impl: str = "torchao", backend: str = "inductor", block: dict | None = None):
+    """F4: the compiled path of the quantised W*A* formats (box 53693389's smoke B: nvfp4-w4a4 + compile asserted on a
+    non-contiguous input, int8-w8a8 + compile hit CUBLAS_STATUS_NOT_SUPPORTED on a column-major one; the fix,
+    kitsune::row_major, is verified only here and on smoke B's +compile speed items). Per COMPILE_FORMATS: a
+    _conv_block (COMPILE_BLOCK, or `block` overriding it), torch.compiler.reset(), torch.compile(dynamic=True,
+    backend), then a batch of B = batches[0] (frames T; the second element's last third masked) and one of B =
+    batches[1], under bf16 autocast, each against the eager block. Hard check "compile <fmt> B=<b>": no exception, a
+    finite output within SELFTEST_TOL[fmt] of the eager one, and dynamo compiled a graph for the format (its
+    unique_graphs counter grew: a silent eager fallback must not pass). The error text is recorded."""
+    cfg = dict(COMPILE_BLOCK, **(block or {}))
+    c, k, T = int(cfg["channels"]), int(cfg["kernel"]), int(cfg["frames"])
+    out = dict(backend=backend, impl=impl, block=cfg, formats={})
+    rec["compile"] = out
+    g = torch.Generator(device="cpu").manual_seed(3)
+    for fmt in COMPILE_FORMATS:
+        f = dict(calls={})
+        out["formats"][fmt] = f
+        try:
+            blk = _conv_block(fmt, impl, dev, c, k)
+            torch.compiler.reset()
+            comp = torch.compile(blk, dynamic=True, backend=backend)
+            start = _dynamo_graphs()
+        except Exception as e:  # noqa: BLE001
+            f["error"] = f"{type(e).__name__}: {e}"[:600]
+            check(f"compile {fmt} builds", False, f["error"])
+            continue
+        for b in cfg["batches"]:
+            r = dict(rows=int(b) * T)
+            f["calls"][f"B={b}"] = r
+            try:
+                x = torch.randn(int(b), T, c, generator=g).to(dev, torch.bfloat16)
+                mask = torch.ones(int(b), T, dtype=torch.bool)
+                if b > 1:
+                    mask[1, (2 * T) // 3:] = False
+                mask = mask.to(dev)
+                before = _dynamo_graphs()
+                with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16):
+                    ye = blk(x, mask)
+                    t0 = time.perf_counter()
+                    yc = comp(x, mask)
+                    _sync(dev)
+                    r["wall_s"] = time.perf_counter() - t0
+                r.update(graphs_new=_dynamo_graphs() - before, graphs_format=_dynamo_graphs() - start,
+                         finite=bool(torch.isfinite(yc).all()), rel_err=_rel_frob(yc, ye), tol=SELFTEST_TOL[fmt])
+                ok = r["finite"] and r["rel_err"] <= SELFTEST_TOL[fmt] and r["graphs_format"] > 0
+            except Exception as e:  # noqa: BLE001 - recorded: the assert / cuBLAS error text is the evidence
+                r["error"] = f"{type(e).__name__}: {e}"[:600]
+                ok = False
+            check(f"compile {fmt} B={b}", ok, r)
+        del blk, comp
+    torch.compiler.reset()
+
+
+def _selftest_ckpt(rec, check, dev, d: Path, *, impl: str = "torchao"):
+    """The checkpoint comparison (selftest's docstring): emulate against impl (torchao; emulate in the CPU tests) on
+    the student, unpadded, then padded (F4): CTC 4 x 500 frames with CKPT_CTC_LENGTHS - hard check "ckpt <dir> <fmt>
+    padded finite": the real model's NonFiniteMonitor saw no non-finite row and its log-probs are finite on every
+    valid frame (rel_err and argmax_agree on the valid frames recorded); AED 8 x 300 with CKPT_AED_LENGTHS through
+    greedy_generate(pin_new=8) - hard check: no non-finite row (token_rows_equal_b8_padded recorded). Both models'
+    monitor records are kept (a non-finite row of the emulation as well would point at the student, not the
+    kernels)."""
     import copy
 
     out = {}
@@ -2285,7 +2592,7 @@ def _selftest_ckpt(rec, check, dev, d: Path):
             try:
                 emu, real = copy.deepcopy(base), copy.deepcopy(base)
                 apply(emu, fmt, impl="emulate")
-                apply(real, fmt, impl="torchao")
+                apply(real, fmt, impl=impl)
                 for m in (emu, real):
                     patch_relpos_once_per_batch(m)
                 if family == "ctc":
@@ -2293,15 +2600,33 @@ def _selftest_ckpt(rec, check, dev, d: Path):
 
                     feats = torch.randn(4, 500, 80, generator=g).to(dev)
                     mask = torch.ones(4, 500, dtype=torch.bool, device=dev)
-                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16):
                         le, _ = CS.ctc_log_probs(emu, feats, mask)
                         t0 = time.perf_counter()
                         lr, _ = CS.ctc_log_probs(real, feats, mask)
-                        torch.cuda.synchronize(dev)
+                        _sync(dev)
                         r["wall_s"] = time.perf_counter() - t0
                     r["rel_err"] = _rel_frob(lr, le)
                     r["argmax_agree"] = float((lr.argmax(-1) == le.argmax(-1)).float().mean())
                     check(f"ckpt {d.name} {fmt} finite", bool(torch.isfinite(lr).all()), r)
+                    pmask = CS.lengths_to_mask(torch.tensor(CKPT_CTC_LENGTHS), 500).to(dev)
+                    mons = {tag: NonFiniteMonitor(m).attach() for tag, m in (("emulate", emu), ("torchao", real))}
+                    try:
+                        with torch.no_grad(), torch.autocast(dev.type, dtype=torch.bfloat16):
+                            pe, _ = CS.ctc_log_probs(emu, feats, pmask)
+                            pr, n_r = CS.ctc_log_probs(real, feats, pmask)
+                            _sync(dev)
+                    finally:
+                        nf = {tag: mon.record() for tag, mon in mons.items()}
+                        for mon in mons.values():
+                            mon.detach()
+                    valid = CS.lengths_to_mask(n_r, pr.shape[1])
+                    p = dict(lengths=list(CKPT_CTC_LENGTHS), nonfinite=nf["torchao"], nonfinite_emulate=nf["emulate"],
+                             valid_finite=bool(torch.isfinite(pr[valid]).all()),
+                             rel_err=_rel_frob(pr[valid], pe[valid]),
+                             argmax_agree=float((pr[valid].argmax(-1) == pe[valid].argmax(-1)).float().mean()))
+                    r["padded"] = p
+                    check(f"ckpt {d.name} {fmt} padded finite", nf["torchao"]["rows"] == 0 and p["valid_finite"], p)
                 else:
                     from kitsune import evaluate as ev
                     from kitsune import trainset
@@ -2315,11 +2640,30 @@ def _selftest_ckpt(rec, check, dev, d: Path):
                                 t0 = time.perf_counter()
                                 res[tag] = ev.greedy_generate(mdl, feats, fmask, 3.0, prompt_ids=trainset.PROMPT,
                                                               eos=trainset.EOS, pad=trainset.PAD, amp=True, pin_new=8)
-                                torch.cuda.synchronize(dev)
+                                _sync(dev)
                                 r[f"wall_s_b{bsz}_{tag}"] = time.perf_counter() - t0
                         same = sum(a[0] == b[0] for a, b in zip(res["emulate"], res["torchao"]))
                         r[f"token_rows_equal_b{bsz}"] = f"{same}/{bsz}"
                     check(f"ckpt {d.name} {fmt} decodes", True, r)
+                    n = len(CKPT_AED_LENGTHS)
+                    feats = torch.randn(n, 300, 128, generator=g).to(dev)
+                    fmask = (torch.arange(300)[None, :] < torch.tensor(CKPT_AED_LENGTHS)[:, None]).long().to(dev)
+                    res, nf = {}, {}
+                    for tag, mdl in (("emulate", emu), ("torchao", real)):
+                        mon = NonFiniteMonitor(mdl).attach()
+                        try:
+                            with ev._eval_mode(mdl), ev._fp32_head(mdl):
+                                res[tag] = ev.greedy_generate(mdl, feats, fmask, 3.0, prompt_ids=trainset.PROMPT,
+                                                              eos=trainset.EOS, pad=trainset.PAD, amp=True, pin_new=8)
+                                _sync(dev)
+                        finally:
+                            nf[tag] = mon.record()
+                            mon.detach()
+                    same = sum(a[0] == b[0] for a, b in zip(res["emulate"], res["torchao"]))
+                    p = dict(lengths=list(CKPT_AED_LENGTHS), nonfinite=nf["torchao"], nonfinite_emulate=nf["emulate"],
+                             token_rows_equal_b8_padded=f"{same}/{n}")
+                    r["padded"] = p
+                    check(f"ckpt {d.name} {fmt} padded finite", nf["torchao"]["rows"] == 0, p)
                 del emu, real
             except Exception as e:  # noqa: BLE001
                 r["error"] = f"{type(e).__name__}: {e}"[:600]
@@ -2358,8 +2702,9 @@ def readout(args) -> int:
     reuse = False
     if variant.exists() and not verify_export(variant):
         rec = read_recipe(variant)
-        reuse = rec["format"] == args.fmt and (rec.get("source") or {}).get("weights_sha256") == weights_sha256(
-            _weight_files(Path(args.ckpt)))
+        # a variant of older quant code (recipe_version below RECIPE_VERSION) is exported again, never reused (F4)
+        reuse = rec["format"] == args.fmt and recipe_version_problem(rec) is None and (
+            rec.get("source") or {}).get("weights_sha256") == weights_sha256(_weight_files(Path(args.ckpt)))
     if reuse:
         print(f"{variant}: the verified {args.fmt} variant of this checkpoint is reused", flush=True)
     else:

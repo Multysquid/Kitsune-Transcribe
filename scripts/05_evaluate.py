@@ -146,7 +146,9 @@ quantised layers' call counters under .parts/quant/ (flushed every 30 s, so a ki
 quant block of study.json, summary.json and evaluator.json totals them: format, impl, scope, mx_rounding, source
 (memory | file), simulated, base_system, file_bytes / export_dir (a variant), share_quantized, counters {calls, padded,
 fallback_risk}, nonfinite {batches, rows, by_module, first}, fp32_fallbacks (the in-scope layers left 16-bit, with
-why), torchao, weights_bytes (the deployable bytes) and bytes {deployable, quantized, kept}. A quantised layer that no
+why), torchao, weights_bytes (the deployable bytes), bytes {deployable, quantized, kept}, recipe_version and
+recipe_sha256 (the quant code's recipe: kitsune.quant.RECIPE_VERSION, 2 since F1; a variant --ckpt of an older version
+is refused, exit 2, export it again; the --out identity holds the version too). A quantised layer that no
 batch called fails the run. Every --ckpt eval's study.json also records weights {path, file_bytes}, and every
 system's metrics gain m4_nostyle, m4_all (M4 with Galgame's whole set, kitsune.evaluate.M4_ALL_STRATA), m4_all_nostyle
 and m3 (the gate sets; with _teacher / _ratio for the raw ones).
@@ -1149,6 +1151,8 @@ def quant_request(args, ckpt: Path) -> dict:
         except Q.QuantError as e:
             raise SystemExit(f"REFUSED: {e}") from e
         fmt = rec["format"]
+        if (why := Q.recipe_version_problem(rec)) is not None:  # F4: a pre-F1 variant is never scored
+            raise SystemExit(f"REFUSED: {ckpt}: {why}")
         if args.quant not in (None, fmt):
             raise SystemExit(f"REFUSED: {ckpt} is a {fmt} variant: --quant {args.quant} does not match it (omit "
                              "--quant: the format is the variant's)")
@@ -1179,7 +1183,12 @@ def quant_base(q: dict, impl: str, system: str, ckpt: Path, recipe: dict | None 
     from kitsune import quant as Q
 
     rec = recipe or q.get("recipe") or {}
+    # recipe_version / recipe_sha256 (F4): the quant code that made the numbers; tools/full_report.py leaves a readout
+    # below kitsune.quant.RECIPE_VERSION out. An in-memory eval's are the running code's (its apply writes the same)
     return dict(format=q["fmt"], impl=impl, scope=q["scope"], mx_rounding=q["mx_rounding"],
+                recipe_version=rec.get("recipe_version") or (None if q["variant"] else Q.RECIPE_VERSION),
+                recipe_sha256=rec.get("recipe_sha256") or (None if q["variant"] else Q.recipe_sha256(
+                    q["fmt"], q["mx_rounding"])),
                 source="file" if q["variant"] else "memory", simulated=impl == "emulate",
                 base_system=Q.split_system(system)[0],
                 file_bytes=(rec.get("file_bytes") or {}).get(Q.WEIGHTS_FILE) if q["variant"] else None,

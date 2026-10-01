@@ -9,6 +9,9 @@ the in-memory outputs to the bit, its bytes are deterministic, w8a16 and w8a8 ar
 loads with from_pretrained), the non-finite monitor, the byte formulas, the kernel census (int8 GEMMs counted when they
 return, not when attempted; nothing counted with the counters off), the selftest's autocast evidence (ops, not kernel
 names) and MXFP4 canary, compare, the selftest's refusal off CUDA, the CLI's exit codes and the heartbeat of an export.
+F1 / F4 (DECISIONS F): the fp8 recipe is torchao's arithmetic (bf16 row scales, activation_value_lb), the bf16 scales
+are device-independent (exhaustively), a variant of older quant code is refused, and the selftest's zero-row, padded
+checkpoint and compiled-block sub-checks pass on CPU (emulate) and catch the pre-F1 fp8 NaN.
 
 CPU only, tiny random models built in the test; nothing needs the network or torchao."""
 import json
@@ -154,8 +157,12 @@ def test_scales():
     assert pi.scale[0].item() == s0 == 0.0157470703125 and pi.qweight[0, :3].tolist() == [64, -127, 32]
     assert pi.scale[1].item() == Q.INT8_EPS and (pi.qweight[1] == 0).all()  # an all-zero row: the eps clamp
     pf = Q.pack_weight(wi, "fp8")
-    assert pf.qweight.dtype == torch.float8_e4m3fn and pf.scale[0].item() == pytest.approx(2.0 / 448)
-    assert pf.scale[1].item() == 1.0 and torch.equal(Q.unpack_weight(pf)[0, :3], wi[0, :3])
+    # F1: s = bf16(2 / 448) = 0.00445556640625 (torchao's scale dtype), a little under 2 / 448: 1 / s = 224.4 -> 224,
+    # -2 / s = -448.9 clamps to -448, 0.5 / s = 112.2 -> 112; the dequantisation is no longer exact
+    s8 = (torch.tensor(2.0, dtype=torch.bfloat16) / 448).float().item()
+    assert pf.qweight.dtype == torch.float8_e4m3fn and pf.scale[0].item() == s8 == 0.00445556640625
+    assert pf.scale[1].item() == 1.0 and (pf.qweight[1].float() == 0).all()  # an all-zero weight row: scale 1
+    assert torch.equal(Q.unpack_weight(pf)[0, :3], torch.tensor([224.0, -448.0, 112.0]) * s8)
 
 
 def _torchao_nvfp4_codes(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -189,6 +196,63 @@ def test_nvfp4_codes_use_torchaos_reciprocal_scaling():
     xc, xbs = _torchao_nvfp4_codes(x)
     kc, kbs, _ = Q._nvfp4(x.float())
     assert torch.equal(kc, xc) and torch.equal(kbs.view(torch.uint8), xbs.view(torch.uint8))
+
+
+def _torchao_fp8_rows(x: torch.Tensor, lb: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """torchao 0.18's float8 per row on a bf16 tensor, its arithmetic verbatim: _choose_scale_float8 (block [1, K]) -
+    the row amax in the tensor's dtype, clamped up to hp_value_lb when set (Float8DynamicActivationFloat8WeightConfig's
+    activation_value_lb), divided by 448 in that dtype, then fp32 - and _quantize_affine_float8: fp32(x) / s clamped to
+    +-448, cast to e4m3. No guard for a zero row. Returns (codes (N, K), scales (N,))."""
+    xb = x.to(torch.bfloat16)
+    amax = xb.abs().amax(dim=1, keepdim=True)
+    if lb is not None:
+        amax = torch.clamp(amax, min=lb)
+    s = (amax / 448.0).to(torch.float32)
+    return (xb.to(torch.float32) / s).clamp(-448.0, 448.0).to(torch.float8_e4m3fn), s.reshape(-1)
+
+
+def test_fp8_recipe_is_torchaos_arithmetic():
+    """F1 (DECISIONS F; box 53693389's smoke B): the fp8 activation grid and the fp8 weight pack are torchao 0.18's
+    recipe bit for bit, on rows of every magnitude: the row scale bf16(amax / 448) (FP8_SCALE_DTYPE), the activation's
+    amax clamped up to FP8_ACT_LB first. An all-zero activation row (a padded frame) gets the scale bf16(2^-40) / 448
+    and exact zeros, where torchao's default (no lb) divides 0 by 0; an all-zero weight row keeps scale 1 and zero codes
+    (the documented deviation: torchao has no weight lb). The pre-F1 fp32 scale differs from it in most rows, so this
+    test tells the two forms apart."""
+    g = torch.Generator().manual_seed(4)
+    x = (torch.randn(400, 1024, generator=g) * torch.logspace(-6, 3, 400)[:, None]).to(torch.bfloat16)
+    zero = [7, 123]
+    x[zero] = 0.0
+    nz = [i for i in range(400) if i not in zero]
+    tq, ts = _torchao_fp8_rows(x, lb=Q.FP8_ACT_LB)
+    q, s = Q._fp8_rows(x.float(), lb=Q.FP8_ACT_LB)
+    assert torch.equal(s, ts) and torch.equal(q.view(torch.uint8), tq.view(torch.uint8))
+    y = Q.fake_quant_act(x.float(), "fp8")
+    assert torch.equal(y, tq.float() * ts[:, None]) and torch.isfinite(y).all()
+    assert Q.FP8_ACT_LB == 2.0 ** -40 and float(torch.tensor(Q.FP8_ACT_LB, dtype=torch.bfloat16)) == Q.FP8_ACT_LB
+    lb_scale = (torch.tensor(Q.FP8_ACT_LB, dtype=torch.bfloat16) / 448).float().item()
+    assert all(s[i].item() == lb_scale for i in zero) and (q[zero].float() == 0).all() and (y[zero] == 0).all()
+    dq, ds = _torchao_fp8_rows(x)  # torchao's default config: no lb, a zero row is 0 / 0
+    assert (ds[zero] == 0).all() and torch.isnan(dq[zero].float()).all()
+    p = Q.pack_weight(x, "fp8")
+    assert torch.equal(p.scale[nz], ts[nz]) and torch.equal(p.qweight[nz].view(torch.uint8),
+                                                            tq[nz].view(torch.uint8))
+    assert (p.scale[zero] == 1.0).all() and (p.qweight[zero].float() == 0).all()
+    old = x.float().abs().amax(dim=1) / 448  # the pre-F1 fp32 scale (14bfcad)
+    assert float((old[nz] != ts[nz]).float().mean()) > 0.5
+
+
+def test_fp8_and_int8_bf16_scales_are_the_same_from_cpu_division_and_cudas_reciprocal():
+    """Why the bf16-rounded fp8 (F1) and int8 scales are device-independent: for every positive finite bf16 amax,
+    bf16(a / d) - the CPU's true division - equals bf16(fp32(a) * fp32(1 / d)) - CUDA's kernel for a tensor divided by
+    a Python scalar - for d = 448 (fp8) and 127.5 (int8). The pack is computed on the CPU anyway (pack_weight); this
+    is what lets torchao's own quantize_ on the GPU give the same scales (the selftest's torchao parity)."""
+    a = torch.arange(2 ** 16, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    a = a[torch.isfinite(a) & (a > 0)]
+    assert a.numel() == 32639  # 0x7F7F: every positive finite bf16, its 127 subnormals included
+    for d in (Q.F8_MAX, Q.INT8_DIV):
+        cpu = a / d
+        recip = (a.float() * torch.tensor(1.0 / d, dtype=torch.float32)).to(torch.bfloat16)
+        assert int((cpu.view(torch.int16) != recip.view(torch.int16)).sum()) == 0, d
 
 
 @pytest.mark.parametrize("wfmt", Q.WFMTS)
@@ -568,9 +632,14 @@ def test_export_load_roundtrip_bitwise(dirs, tmp_path, fam, fmt):
     assert Q.is_quantized_dir(out) and not Q.verify_export(out)
     disk = json.loads((out / Q.QUANT_FILE).read_text(encoding="utf-8"))
     for k in ("schema", "format", "weights", "activations", "scope", "recipe", "source", "layers", "kept", "skipped",
-              "tied", "fp16_tensors", "counts", "bytes", "file_bytes", "versions", "load_with", "time_utc", "copied"):
+              "tied", "fp16_tensors", "counts", "bytes", "file_bytes", "versions", "load_with", "time_utc", "copied",
+              "recipe_version", "recipe_sha256"):
         assert k in disk, k
     assert disk == json.loads(json.dumps(rec)) and "impl" not in disk
+    assert disk["recipe_version"] == Q.RECIPE_VERSION == 2 and disk["recipe_sha256"] == Q.recipe_sha256(fmt)
+    if fmt == "fp8-w8a8":  # F1's constants in the record
+        assert disk["recipe"]["act_value_lb"] == 2.0 ** -40 and disk["recipe"]["act_scale_dtype"] == "bfloat16"
+        assert disk["recipe"]["fp8_scale_dtype"] == "bfloat16"
     assert disk["source"]["family"] == fam and len(disk["source"]["weights_sha256"]) == 64
     assert disk["file_bytes"][Q.WEIGHTS_FILE] == (out / Q.WEIGHTS_FILE).stat().st_size
     for name in disk["copied"]:
@@ -742,7 +811,7 @@ def test_system_names_formats_and_impls(monkeypatch):
     assert Q.resolve_impl("fp8-w8a8", "auto", cuda) == "torchao"
     assert Q.identity("fp8-w8a8", "emulate", "linear+pw", "rceil") == dict(fmt="fp8-w8a8", impl="emulate",
                                                                             scope="linear+pw", mx_rounding="rceil",
-                                                                            schema=1)
+                                                                            schema=1, recipe_version=Q.RECIPE_VERSION)
     assert "torchao" in Q.identity("fp8-w8a8", "torchao", "linear+pw", "rceil")
 
 
@@ -970,7 +1039,124 @@ def test_the_selftests_pack_device_check_is_skipped_off_cuda():
     checks, rec = [], dict(warnings=[])
     Q._selftest_pack_device(rec, lambda name, ok, detail=None: checks.append((name, ok)), torch.device("cpu"), (16, 64))
     assert checks == [("pack_device_parity", True)]
-    assert rec["device_arith"] == dict(rows=16, nvfp4_tensor_scale_rows_differ=0, fp8_scale_rows_differ=0)
+    assert rec["device_arith"] == dict(rows=16, nvfp4_tensor_scale_rows_differ=0, fp8_fp32_scale_rows_differ=0,
+                                       fp8_bf16_scale_rows_differ=0)
+
+
+class _TorchaoDefaultFp8(nn.Module):
+    """A stand-in for a real fp8-w8a8 Linear under torchao's DEFAULT config (no activation_value_lb): the activation's
+    row scale bf16(amax / 448) with no clamp, so a zero row is 0 / 0 (_torchao_fp8_rows), the bias added outside."""
+
+    def __init__(self, emu: nn.Linear):
+        super().__init__()
+        self.w, self.b = emu.weight.detach().float(), emu.bias.detach()
+        self.weight = emu.weight
+
+    def forward(self, x):
+        q, s = _torchao_fp8_rows(x.reshape(-1, x.shape[-1]))
+        y = torch.nn.functional.linear(q.float() * s[:, None], self.w).to(torch.bfloat16)
+        return y + self.b.to(torch.bfloat16)
+
+
+def test_selftest_zero_rows_catch_a_nan_real_path():
+    """F4's zero-row sub-check (_selftest_zero_rows): an M = 17 input with two all-zero rows. Emulate against emulate
+    passes for every timed format, its zero rows exactly the bias; a real fp8 layer with torchao's default recipe (no
+    activation_value_lb: 0 / 0 on a zero row, box 53693389's NaN) fails "fp8-w8a8 zero rows"."""
+    g = torch.Generator().manual_seed(9)
+    k, n = 64, 48
+    w, b = torch.randn(n, k, generator=g) * 0.02, torch.randn(n, generator=g) * 0.01
+
+    def make(fmt):
+        lin = nn.Linear(k, n)
+        with torch.no_grad():
+            lin.weight.copy_(w)
+            lin.bias.copy_(b)
+        return Q.quantize_linear(lin, fmt, "emulate")
+
+    def run(fmt, real):
+        rec, checks = dict(formats={}, warnings=[]), []
+        Q._selftest_zero_rows(rec, lambda name, ok, detail=None: checks.append((name, ok)), torch.device("cpu"), fmt,
+                              make(fmt), real, b, k, g)
+        return rec, checks
+
+    for fmt in Q.TIMED_FORMATS:
+        rec, checks = run(fmt, make(fmt))
+        zr = rec["formats"][fmt]["zero_rows"]
+        assert checks == [(f"{fmt} zero rows", True)] and zr["zero_rows_equal_bias"] and zr["rel_err"] == 0.0
+        assert zr["all_zero_finite"] and not rec["warnings"]
+    rec, checks = run("fp8-w8a8", _TorchaoDefaultFp8(make("fp8-w8a8")))
+    zr = rec["formats"]["fp8-w8a8"]["zero_rows"]
+    assert checks == [("fp8-w8a8 zero rows", False)] and zr["finite"] is False and not zr["all_zero_finite"]
+    assert "act_quant_kwargs" in zr and rec["warnings"]
+
+
+_FP8_ROWS = Q._fp8_rows
+
+
+def _pre_f1_act_fp8_rows(x, *, lb=None):
+    """Q._fp8_rows with the activations (the calls with an lb) quantised by torchao's default config: no lb."""
+    return _FP8_ROWS(x) if lb is None else _torchao_fp8_rows(x)
+
+
+def test_selftest_padded_ckpt_on_cpu(dirs, monkeypatch):
+    """F4's padded checkpoint sub-check (_selftest_ckpt, emulate in place of torchao on CPU), on a tiny CTC and AED
+    student: every format's unpadded and padded checks pass, with both models' NonFiniteMonitor records. With the
+    pre-F1 fp8 activation recipe (torchao's default: no lb, so a padded frame's zero row is 0 / 0) the padded fp8
+    check fails as box 53693389's fp8 records did: every row but the batch's longest is non-finite."""
+    for fam, rows in (("ctc", len(Q.CKPT_CTC_LENGTHS)), ("aed", len(Q.CKPT_AED_LENGTHS))):
+        rec, checks = dict(ckpt={}, warnings=[]), []
+        Q._selftest_ckpt(rec, lambda name, ok, detail=None: checks.append((name, ok)), torch.device("cpu"), dirs[fam],
+                         impl="emulate")
+        first = "finite" if fam == "ctc" else "decodes"
+        assert checks == [(f"ckpt {fam} {f} {c}", True) for f in Q.TIMED_FORMATS for c in (first, "padded finite")]
+        for f in Q.TIMED_FORMATS:
+            p = rec["ckpt"][str(dirs[fam])][f]["padded"]
+            assert p["nonfinite"]["rows"] == p["nonfinite_emulate"]["rows"] == 0 and p["nonfinite"]["forwards"] >= 1
+        monkeypatch.setattr(Q, "TIMED_FORMATS", ("fp8-w8a8",))
+        monkeypatch.setattr(Q, "_fp8_rows", _pre_f1_act_fp8_rows)
+        rec, checks = dict(ckpt={}, warnings=[]), []
+        Q._selftest_ckpt(rec, lambda name, ok, detail=None: checks.append((name, ok)), torch.device("cpu"), dirs[fam],
+                         impl="emulate")
+        assert checks[-1] == (f"ckpt {fam} fp8-w8a8 padded finite", False)
+        assert rec["ckpt"][str(dirs[fam])]["fp8-w8a8"]["padded"]["nonfinite"]["rows"] == rows - 1
+        monkeypatch.undo()
+
+
+def test_selftest_compile_block_on_cpu():
+    """F4's compile sub-check (_selftest_compile) on CPU: the conformer-convolution-like block of quantised Linears
+    (emulate), torch.compile'd with aot_eager (dynamic) at B = 3 then B = 1, equals the eager block for every
+    COMPILE_FORMATS entry, and dynamo compiled a graph for each (the B = 1 call recompiles: a new graph). This drives
+    kitsune::row_major and the quantised Linears under tracing; inductor and torchao's kernels are smoke B's."""
+    rec, checks = dict(warnings=[]), []
+    Q._selftest_compile(rec, lambda name, ok, detail=None: checks.append((name, ok)), torch.device("cpu"),
+                        impl="emulate", backend="aot_eager", block=dict(channels=64, frames=29))
+    assert checks == [(f"compile {f} B={b}", True) for f in Q.COMPILE_FORMATS for b in (3, 1)]
+    assert Q.COMPILE_FORMATS == ("int8-w8a8", "nvfp4-w4a4", "fp8-w8a8") and Q.COMPILE_BLOCK["batches"] == (3, 1)
+    assert 3 * Q.COMPILE_BLOCK["frames"] % 8 == 7  # M = 999: 7 mod 8, box 53693389's int8 + compile case
+    for f in Q.COMPILE_FORMATS:
+        calls = rec["compile"]["formats"][f]["calls"]
+        assert calls["B=3"]["graphs_new"] >= 1 and calls["B=1"]["graphs_new"] >= 1 and calls["B=1"]["rel_err"] == 0.0
+        assert calls["B=3"]["rows"] == 87 and rec["compile"]["block"]["kernel"] == 9
+
+
+def test_old_recipe_variants_are_refused(dirs, tmp_path):
+    """F4: a variant exported by quant code older than RECIPE_VERSION (no recipe_version in its quantization.json:
+    version 1, every export up to 8ff3bd5, smoke B #1's included) is never loaded: load_quantized raises with "export
+    it again"; the current one loads."""
+    out = tmp_path / "v"
+    Q.export(dirs["ctc"], out, "fp8-w8a8")
+    Q.load_quantized(out, "cpu")
+    rec = json.loads((out / Q.QUANT_FILE).read_text(encoding="utf-8"))
+    for old in (None, 1):
+        r = dict(rec)
+        if old is None:
+            del r["recipe_version"]
+        else:
+            r["recipe_version"] = old
+        (out / Q.QUANT_FILE).write_text(json.dumps(r), encoding="utf-8")
+        assert Q.verify_export(out) == []  # the file is intact: only its recipe is old
+        with pytest.raises(Q.QuantError, match="recipe version 1, not 2.*export it again"):
+            Q.load_quantized(out, "cpu")
 
 
 def test_selftest_off_cuda_is_not_ok(tmp_path, capsys):

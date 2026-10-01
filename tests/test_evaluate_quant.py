@@ -126,7 +126,9 @@ def test_05_quant_in_memory_end_to_end(ctc_env, prereg, m05, mem_run):
     assert qe["fmt"] == "nvfp4-w4a4" and qe["source"] == "memory" and qe["layers"] > 0
     assert events(out, "quant_counters")[-1]["uncalled"] == [] and events(out, "nonfinite")[-1]["rows"] == 0
     ident = load(out / ".parts" / "identity.json")
-    assert ident["quant"] == dict(fmt="nvfp4-w4a4", impl="emulate", scope="linear+pw", mx_rounding="rceil", schema=1)
+    assert ident["quant"] == dict(fmt="nvfp4-w4a4", impl="emulate", scope="linear+pw", mx_rounding="rceil", schema=1,
+                                  recipe_version=Q.RECIPE_VERSION)
+    assert qb["recipe_version"] == Q.RECIPE_VERSION and qb["recipe_sha256"] == Q.recipe_sha256("nvfp4-w4a4")
     # a rerun: nothing left to evaluate, the quant block stays (from .parts/quant)
     assert run05(m05, ctc_env, prereg, out, "--quant", "nvfp4-w4a4", "--quant-impl", "emulate", "--tables",
                  str(tables)) == 0
@@ -189,6 +191,21 @@ def test_export_then_eval_equals_in_memory(ctc_env, prereg, m05, variants, tmp_p
             run05(m05, ctc_env, prereg, tmp_path / "y", "--quant-scope", "linear", ckpt=variants[fmt])
 
 
+def test_a_variant_of_older_quant_code_is_refused(ctc_env, prereg, m05, variants, tmp_path):
+    """F4: a variant dir without recipe_version (quant code before F1: smoke B #1's exports) is refused as --ckpt
+    (exit 2, "export it again") before anything is evaluated."""
+    import shutil
+
+    old = tmp_path / "old"
+    shutil.copytree(variants["int8-w8a8"], old)
+    rec = load(old / Q.QUANT_FILE)
+    del rec["recipe_version"]
+    (old / Q.QUANT_FILE).write_text(json.dumps(rec), encoding="utf-8")
+    with pytest.raises(SystemExit, match="REFUSED: .*recipe version 1, not 2.*export it again"):
+        run05(m05, ctc_env, prereg, tmp_path / "x", ckpt=old)
+    assert not (tmp_path / "x" / "study.json").exists()
+
+
 def test_the_readout_cli(ctc_env, prereg, tmp_path, monkeypatch, capsys):
     """python -m kitsune.quant readout: exports <out>/variant, then 05 on it into <out> with <out>/tables; a retry
     reuses the verified variant of the same checkpoint; the system is <run_name>@<fmt>."""
@@ -213,6 +230,14 @@ def test_the_readout_cli(ctc_env, prereg, tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     assert Q.main(argv) == 0
     assert "is reused" in capsys.readouterr().out and (out / "variant" / Q.QUANT_FILE).stat().st_mtime_ns == before
+    # F4: a variant of older quant code (no recipe_version) is exported again, never reused; its 05 --out identity
+    # (recipe_version) then still matches the fresh variant's
+    rec = load(out / "variant" / Q.QUANT_FILE)
+    del rec["recipe_version"]
+    (out / "variant" / Q.QUANT_FILE).write_text(json.dumps(rec), encoding="utf-8")
+    assert Q.main(argv) == 0
+    assert "is reused" not in capsys.readouterr().out
+    assert load(out / "variant" / Q.QUANT_FILE)["recipe_version"] == Q.RECIPE_VERSION
 
 
 def test_aed_variant_equals_in_memory_and_fp16(aed_env, prereg, m05, tmp_path):
