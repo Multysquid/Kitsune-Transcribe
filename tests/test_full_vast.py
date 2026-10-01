@@ -1198,6 +1198,69 @@ def test_a_chain_whose_records_do_not_verify_is_stopped(chain_finish, monkeypatc
     assert halt["action"] == "stop" and halt["reason"].startswith("chain verification failed") and why in halt["reason"]
 
 
+def seed_hub_reads(state: Path):
+    """The hub_reads layout box 53693389 left (hf_hub_download(local_dir=...) of check 7's scratch pointer and of
+    smoke-b's machine check), plus a re-armed copy; returns the JSON copies the infra must carry (E.7.2 item 1)."""
+    rid = "smoke-p01-20261001T131836Z"
+    keep = {f"chain/full-smoke/hub_reads/verdict/runs/{rid}/timed_state.json": b'{"step": 50}',
+            "chain/smoke-b/hub_reads/full/box-full-smoke/queue_summary.json": b'{"machine_id": "m1"}'}
+    cache = [f"chain/full-smoke/hub_reads/verdict/.cache/huggingface/{n}" for n in (
+        ".gitignore", "CACHEDIR.TAG", f"download/runs/{rid}/timed_state.json.metadata",
+        f"download/runs/{rid}/timed_state.json.lock")]
+    cache += [f"chain/smoke-b/hub_reads/.cache/huggingface/{n}" for n in (
+        ".gitignore", "CACHEDIR.TAG", "download/full/box-full-smoke/queue_summary.json.metadata")]
+    cache += ["rearm-20261001T000000Z/chain/full-smoke/hub_reads/.cache/huggingface/.gitignore", ".cache/x/.gitignore"]
+    for rel in [*keep, *cache]:
+        (state / rel).parent.mkdir(parents=True, exist_ok=True)
+        (state / rel).write_bytes(keep.get(rel, b"*\n"))
+    return keep
+
+
+@pytest.mark.parametrize("mode", ["--destroy", "--sync-only", "--stop", "--abort"])
+def test_a_chains_infra_leaves_out_the_hub_download_caches(chain_finish, monkeypatch, mode):
+    """Box 53693389 (2026-10-01): chain/<part>/hub_reads/ held huggingface_hub's .cache/huggingface/ bookkeeping, the
+    first such path made CommitOperationAdd raise, the whole deep infra commit was lost, and --destroy stopped the box
+    (the stop's own infra push failed the same way). The infra now leaves out only the .cache/.git paths: every mode
+    commits the rest, the hub_reads JSON copies included, and --destroy verifies and destroys."""
+    actions = []
+    monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
+    keep = seed_hub_reads(chain_finish.state)
+    rc, hub = chain_finish(mode, *(["--reason", "x"] if mode in ("--stop", "--abort") else []))
+    want_rc, want_actions = {"--destroy": (0, ["destroy"]), "--sync-only": (0, []), "--stop": (0, ["stop"]),
+                             "--abort": (0, ["stop"])}[mode]  # --abort with a run dir on the disk: stop
+    assert (rc, actions) == (want_rc, want_actions)
+    sent = [p for c in hub.commits for p in c]
+    assert sent and all(finish.hub_path_ok(p) for p in sent), [p for p in sent if not finish.hub_path_ok(p)]
+    dest = f"full/box-{CHAIN_BOX}/infra/C77"
+    for rel, data in keep.items():
+        assert hub.sent[f"{dest}/{rel}"] == data, rel
+    if mode == "--destroy":
+        ev = [json.loads(x) for x in (chain_finish.state / "events.jsonl").read_text().splitlines()
+              if x.startswith("{")]
+        assert [e["problems"] for e in ev if e.get("kind") == "chain_verify"] == [[]]
+
+
+def test_a_chain_infra_upload_that_raises_names_its_error(chain_finish, monkeypatch):
+    """An infra commit that fails at once (a 4xx no retry fixes) stops the box with that error in the reason, not as a
+    timeout ("did not finish within" stays the slow upload's wording)."""
+    actions = []
+    monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
+
+    class Refused(ChainHub):
+        def create_commit(self, **kw):
+            e = RuntimeError("400 Bad Request: refused")
+            e.response = SimpleNamespace(status_code=400)
+            raise e
+
+    hub = Refused(full_run(chain_finish.state.parent), dict(chain_finish.hub_copies))
+    monkeypatch.setattr(finish, "hf_api", lambda: hub)
+    rc = finish.main(["--destroy", "--repo", RUNS, "--runs-root", str(chain_finish.state.parent / "runs")])
+    assert rc == 2 and actions == ["stop"]
+    halt = json.loads((chain_finish.state / "halt").read_text(encoding="utf-8"))
+    assert "the infra upload to full/box-p01-chain/infra/C77 failed (RuntimeError: 400 Bad Request" in halt["reason"]
+    assert "did not finish within" not in halt["reason"]
+
+
 def test_a_plain_full_box_and_a_chains_other_modes_are_unchanged(chain_finish, monkeypatch):
     actions = []
     monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
