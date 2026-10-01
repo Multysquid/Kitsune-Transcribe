@@ -1,0 +1,16 @@
+{
+ "_comment": "Box full's measured speeds (tools/make_full_configs.py --import-speed; never edited by hand): smoke: smoke A's verdict check 3 (median steady s/step per student at the full configs' batches); box1: box 1's measurement from tools/box1_go.py --json (null until box 1 ended: the hours are then provisional). make_full_configs.box2_hours projects box full's train items' max_hours and its est_hours / max_hours from it, and --check holds boxes.json to them.",
+ "smoke": {
+  "source": "full/box-full-smoke/smoke_verdict.json",
+  "sha": "14bfcadbc660394955d290ed5256d49398882d4a",
+  "machine_id": "19048",
+  "time_utc": "2026-10-01T13:47:02+00:00",
+  "sec_per_step": {
+   "t06": 1.0429505235515535,
+   "p03": 0.39240704476833344,
+   "p01": 0.2715486469678581,
+   "p005": 0.1792971519753337
+  }
+ },
+ "box1": null
+}
