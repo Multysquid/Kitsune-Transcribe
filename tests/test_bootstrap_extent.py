@@ -1006,10 +1006,11 @@ def test_the_exit_trap_acts_in_bootstraps_own_process_only(tmp_path):
 
 def toucher_script(tmp_path: Path, func: str) -> Path:
     """beat_train_hb started and killed as phase does, with a `sleep` on PATH that notes its pid when the toucher calls
-    it (`sleep 60`) and then sleeps 30 s in place (exec): the script says whether that sleep outlived its toucher."""
+    it (`sleep 60`) and then sleeps 60 s in place (exec): the script says whether that sleep outlived its toucher. The
+    killed sleep gets 20 s to go (a busy Git Bash took over 3 s), well short of the old toucher's 60 s sleep."""
     fake = tmp_path / "bin"
     fake.mkdir()
-    bash_script(fake / "sleep", "#!/bin/bash", '[ "$1" != 60 ] || { echo $$ >> "$SLEEP_PIDS"; set -- 30; }',
+    bash_script(fake / "sleep", "#!/bin/bash", '[ "$1" != 60 ] || { echo $$ >> "$SLEEP_PIDS"; set -- 60; }',
                 'exec "$REAL_SLEEP" "$@"')
     pids = tmp_path / "sleep_pids"
     return bash_script(
@@ -1020,7 +1021,7 @@ def toucher_script(tmp_path: Path, func: str) -> Path:
         "beat_train_hb 100 &", "hb=$!",
         'for i in $(seq 200); do [ -s "$SLEEP_PIDS" ] && break; "$REAL_SLEEP" 0.05; done',
         'kill "$hb"; wait "$hb" || true', 'p=$(head -1 "$SLEEP_PIDS")',
-        'for i in $(seq 60); do kill -0 "$p" 2>/dev/null || { echo "sleep gone"; exit 0; }; "$REAL_SLEEP" 0.05; done',
+        'for i in $(seq 400); do kill -0 "$p" 2>/dev/null || { echo "sleep gone"; exit 0; }; "$REAL_SLEEP" 0.05; done',
         'kill "$p"; echo "sleep outlived its toucher"')
 
 
@@ -1032,8 +1033,35 @@ def test_a_toucher_takes_its_sleep_with_it(tmp_path):
     if bash is None:
         pytest.skip("bash not available")
     script = toucher_script(tmp_path, bootstrap_funcs("beat_train_hb"))
-    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=60)
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "sleep gone" in r.stdout, r.stdout + r.stderr
+
+
+def test_a_toucher_killed_before_it_noted_its_sleep_still_kills_it(tmp_path):
+    """Bash may run the toucher's TERM trap after `sleep 60 &` forked and before `s=$!` is set: the trap kills the
+    toucher's own jobs, not a remembered pid, so that sleep goes too; with no job left it still exits 0 (set -e would
+    end it at the failing kill). The trap line of beat_train_hb, verbatim, in a background subshell under set -e."""
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    trap = re.search(r"^ *(trap '.*' TERM)$", bootstrap_funcs("beat_train_hb"), re.M).group(1)
+    script = bash_script(
+        tmp_path / "trap_term.sh", "set -euo pipefail",
+        "command sleep 300 & pull=$!  # bootstrap's own job (the label pull): not the toucher's",
+        "toucher() {", f"    {trap}", '    command sleep 300 & echo "$!" > "$1"',
+        '    [ "$2" = with-sleep ] || { kill "$(cat "$1")"; wait || true; }', "    kill -TERM $BASHPID",
+        "    command sleep 300  # never reached", "}",
+        f'for m in with-sleep none; do f="{tmp_path.as_posix()}/$m"',
+        '    toucher "$f" "$m" & t=$!; wait "$t" && echo "$m: toucher exit 0" || echo "$m: toucher exit $?"',
+        '    for i in $(seq 200); do kill -0 "$(cat "$f")" 2>/dev/null || break; command sleep 0.05; done',
+        '    if kill -0 "$(cat "$f")" 2>/dev/null; then echo "$m: sleep left"; kill "$(cat "$f")"',
+        '    else echo "$m: sleep gone"; fi',
+        "done", 'kill -0 "$pull" && echo "pull alive"; kill "$pull"')
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=180)
+    out = r.stdout + r.stderr
+    for line in ("with-sleep: toucher exit 0", "with-sleep: sleep gone", "none: toucher exit 0", "none: sleep gone",
+                 "pull alive"):
+        assert line in r.stdout, out
 
 
 def test_nothing_of_bootstraps_holds_onstarts_supervise_lock():
@@ -1119,7 +1147,8 @@ def test_linux_onstarts_handover_finds_the_lock_free_and_the_helper_intact(tmp_p
     bootstrap (onstart itself no longer does): right after bootstrap the lock is free, and only bootstrap's own process
     removed the helper, never before the coverage check. Before the fix the touchers' sleeps held the lock on every
     run, and about half the runs lost the helper. Then supervise.wait_for_lock gets a lock that a leftover holds for
-    3 s, with real flock."""
+    8 s, with real flock (8 s: python3 under WSL may take seconds to start and import supervise from /mnt/d, and the
+    probe must find the lock still held)."""
     rounds = 3
     py = tmp_path / "fakepy"
     py.write_text(FAKE_PY, encoding="utf-8", newline="\n")
@@ -1151,7 +1180,7 @@ def test_linux_onstarts_handover_finds_the_lock_free_and_the_helper_intact(tmp_p
         '        echo "round $i: bootstrap exit $rc, lock $l"',
         "    )",
         "done",
-        f'flock "{linux_path(lock)}" sleep 3 &', "command sleep 0.5",
+        f'flock "{linux_path(lock)}" sleep 8 &', "command sleep 0.5",
         f'cd "{linux_path(BOOTSTRAP.parent)}"', f'python3 -c {shlex.quote(probe)} "{linux_path(lock)}"')
     r = run_linux(script, timeout=600)
     out = r.stdout + r.stderr
@@ -1164,7 +1193,7 @@ def test_linux_onstarts_handover_finds_the_lock_free_and_the_helper_intact(tmp_p
         rms = (d / "rm.log").read_text().splitlines()
         assert [ln.split()[0] for ln in rms if "bootstrap_helper.py" in ln] == [pid], (rms, pid)
     m = re.search(r"wait_for_lock: got after ([\d.]+) s", r.stdout)
-    assert m and 1.5 < float(m.group(1)) < 30, out
+    assert m and 1.5 < float(m.group(1)) < 60, out
     assert "is held by another process; waiting up to 180 s" in r.stdout, out
 
 

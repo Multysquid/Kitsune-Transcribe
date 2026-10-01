@@ -132,15 +132,17 @@ beat_train_hb() {  # beat_train_hb <max_s>: touch $STATE/train_hb (the watchdog'
     # for at most max_s, and only while this bootstrap runs ($$ is its pid in every subshell): a toucher left behind
     # by a killed bootstrap would keep an orphaned box looking alive. Its sleep runs in the background and goes with
     # the toucher (phase kills the toucher, not its child): a `sleep 60` left behind held onstart's supervise.lock (fd
-    # 7, then inherited) up to a minute after bootstrap (see the exec 7>&- above)
-    local end=$(( $(date +%s) + $1 )) s=""
-    trap '[ -z "${s:-}" ] || kill "$s" 2>/dev/null; exit 0' TERM
+    # 7, then inherited) up to a minute after bootstrap (see the exec 7>&- above). The TERM trap kills the toucher's
+    # own jobs (`jobs -p` in a background subshell lists only its own), not a remembered $!: bash may run the trap
+    # after `sleep 60 &` forked and before `s=$!` is set. `|| true`: with no job left, kill fails and set -e would end
+    # the trap before its exit 0
+    local end=$(( $(date +%s) + $1 )) s
+    trap 'kill $(jobs -p) 2>/dev/null || true; exit 0' TERM
     while [ "$(date +%s)" -lt "$end" ] && kill -0 "$$" 2>/dev/null; do
         touch "$STATE/train_hb" 2>/dev/null || true
         sleep 60 &
         s=$!
         wait "$s" || true
-        s=""
     done
 }
 
