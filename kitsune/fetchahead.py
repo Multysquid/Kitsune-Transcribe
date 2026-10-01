@@ -171,6 +171,11 @@ class FetchAhead:
         self._stop = threading.Event()
         self._next = 0  # index of the next key a worker claims
         self._taken = 0  # keys handed to the consumer
+        # the index of the key the consumer's latest take asked for (-1: none yet). The disk guard asks again for a
+        # refused key i only once this reaches i: 01 calls take(i) after finish_input and free_download of key i-1,
+        # so that is the moment the one-at-a-time path checks the free space. _taken reaches i inside take(i-1),
+        # while file i-1 is still on disk (the ingest has not read it yet), which is too early to judge key i.
+        self._wanted = -1
         self._state: dict[str, tuple[str, object]] = {}  # key -> (running|ready|failed, path|error)
         self._sizes: dict[str, int] = {}
         self._attempted: dict[str, float] = {}  # key -> clock() at its latest attempt (a retry is no stall)
@@ -230,9 +235,11 @@ class FetchAhead:
                             on_retry=counted)
 
     def _guard(self, i: int, key) -> str | None:
-        """The guard's verdict for key i. A refusal of a key the ingest has not reached yet waits for the ingest to
-        get there (earlier files are freed on the way) and asks again: the one-at-a-time path refuses only the
-        next download, on the free space of that moment."""
+        """The guard's verdict for key i. A refusal of a key the consumer has not asked for yet waits until its take
+        asks for it (every earlier file was ingested and freed by then) and asks again: the one-at-a-time path
+        refuses only the next download, on the free space of that moment, and a refusal then surfaces at once, in
+        the take that is waiting for it. (Waiting only for _taken >= i asked again inside take(i-1), with file i-1
+        still on disk: a spurious final refusal, and one that reported out-of-date free space at take(i).)"""
         while True:
             with self._cv:
                 others = self._in_flight() - 1
@@ -240,9 +247,10 @@ class FetchAhead:
             if not problem:
                 return None
             with self._cv:
-                if self._taken >= i or self._stop.is_set():
+                if self._wanted >= i or self._stop.is_set():
                     return problem
-                self._cv.wait()
+                while self._wanted < i and not self._stop.is_set():
+                    self._cv.wait()
 
     # ---------------------------------------------------------------------------------------------- the consumer
     def next_key(self):
@@ -257,6 +265,9 @@ class FetchAhead:
         with self._cv:
             if self._closed or self._taken >= len(self.keys) or self.keys[self._taken] != key:
                 raise KeyError(key)
+            if self._wanted < self._taken:  # the consumer asks for key _taken now: a refused key's guard asks again
+                self._wanted = self._taken
+                self._cv.notify_all()
         t0 = last_growth = last_log = self.clock()
         last_bytes = -1
         try:

@@ -196,15 +196,29 @@ def test_retries_exhausted_raise_the_last_error(tmp_path, fast_backoff):
 
 def test_guard_waits_for_the_ingest_then_fails_the_item_as_SystemExit_in_order(tmp_path):
     """The disk guard refuses k2 while the ingest has not reached it (space frees as earlier files go) and asks again
-    once k2 is next; it refuses k3 for good, which surfaces as SystemExit at k3's take, after k0..k2. It sees the
-    other downloads in flight."""
-    files = Files(tmp_path / "dl", lambda k: 0.01)
+    once k2's take asks for it, i.e. after the ingest read and freed k1; it refuses k3 for good, which surfaces as
+    SystemExit at k3's take, after k0..k2. It sees the other downloads in flight.
+
+    Deterministic: k0's download waits until the guard was asked about k2 once (so that first ask is a refusal), and
+    the pause between take("k1") and reached.add("k1") stands for 01's ingest of k1 (finish_input, free_download).
+    Asking again as soon as take("k1") had handed k1 over (the old wait for _taken >= 2) refused k2 for good inside
+    that pause: "SystemExit: k2: not yet" in about 9 % of runs, and every run with the pause."""
+    asked_k2 = threading.Event()
+
+    def latency(key):
+        if key == "k0":
+            assert asked_k2.wait(10)
+        return 0.01
+
+    files = Files(tmp_path / "dl", latency)
     reached, seen = set(), []
 
     def guard(key, in_flight):
         seen.append((key, in_flight))
-        if key == "k2" and "k1" not in reached:
-            return "k2: not yet"
+        if key == "k2":
+            asked_k2.set()
+            if "k1" not in reached:
+                return "k2: not yet"
         if key == "k3":
             return "only 3 GB free on the data disk; stopping before k3"
         return None
@@ -212,11 +226,13 @@ def test_guard_waits_for_the_ingest_then_fails_the_item_as_SystemExit_in_order(t
     with FetchAhead([f"k{i}" for i in range(4)], files, ahead=4, guard=guard, poll_s=0.01, log=lambda m: None) as fa:
         assert fa.take("k0").name == "k0"
         assert fa.take("k1").name == "k1"
+        time.sleep(0.2)  # the ingest reads k1 and frees it; the guard must not be asked about k2 again meanwhile
+        assert [k for k, _ in seen].count("k2") == 1
         reached.add("k1")
         assert fa.take("k2").name == "k2"
         with pytest.raises(SystemExit, match="GB free.*stopping before k3"):
             fa.take("k3")
-    assert [k for k, _ in seen].count("k2") >= 2 and "k2" in files.calls and "k3" not in files.calls
+    assert [k for k, _ in seen].count("k2") == 2 and "k2" in files.calls and "k3" not in files.calls
     assert all(0 <= n <= 3 for _, n in seen)
 
 
