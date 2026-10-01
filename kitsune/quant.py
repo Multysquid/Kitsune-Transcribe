@@ -58,9 +58,11 @@ Numerics (the exact recipes; the constants are the torchao parity test's to pin)
   E2M1          codes 0-7 = {0, .5, 1, 1.5, 2, 3, 4, 6}, bit 3 the sign (torch.signbit: -0.2 is code 8, as torchao);
                 round to nearest, ties to the even code; two codes per byte, element 2i in the low nibble
   int8 weights  s = max(bf16(amax_row / INT8_DIV), INT8_EPS) (torchao keeps the weight's dtype for the scale:
-                INT8_SCALE_DTYPE), q = clamp(round(w / s), -128, 127); dequant q * s
-  int8 acts     per token: s = max(bf16(amax_row / INT8_ACT_DIV), INT8_ACT_EPS), q = clamp(round(x / s),
-                INT8_ACT_QMIN, 127)
+                INT8_SCALE_DTYPE), q = clamp(round(w * (1 / s)), -128, 127): torchao 0.18's quantize_affine multiplies
+                by the fp32 reciprocal, which rounds differently from w / s on a tie (w / s = k + 0.5 exactly, common
+                with a short-mantissa bf16 s: about 13 codes of a 2560 x 1024 N(0, 0.02) weight); dequant q * s
+  int8 acts     per token: s = max(bf16(amax_row / INT8_ACT_DIV), INT8_ACT_EPS), q = clamp(round(x * (1 / s)),
+                INT8_ACT_QMIN, 127) (torchao's Int8Tensor.from_hp, as the weight's)
   nvfp4         t = amax(|w|) / (448 * 6) (an all-zero tensor: 1); per 16 along K bs = e4m3(clamp((b / 6) / t,
                 NVFP4_SCALE_MIN, 448)); codes of clamp(w * ((1 / t) / bs), +-6): torchao 0.18's nvfp4_quantize
                 multiplies by that reciprocal (to match its triton kernel), which rounds differently from w / (bs * t)
@@ -206,12 +208,15 @@ INT8_EPS = float(torch.finfo(torch.float32).eps)
 # before the codes are computed, and the file's F32 holds it exactly. Measured by the parity test in the image (CI of
 # 4278cea: torchao 0.18's int8 weight scales were bf16(amax / 127.5) on every row, fp32 ones differed)
 INT8_SCALE_DTYPE = torch.bfloat16
-# torchao 0.18's int8 activation (Int8Tensor, per token): the scale bf16(amax / 127.5) like the weight's, the codes
-# clamped to [-127, 127]. Measured in the image (CI of 772e3b7): this emulation gives torchao's CPU W8A8 outputs bit
-# for bit, where / 127 matched none and [-128, 127] three in four
+# torchao 0.18's int8 activation (Int8Tensor.from_hp per token, the same call as the weight's): the scale
+# bf16(amax / 127.5), clamped to float32 eps, the codes round(x * (1 / s)) clamped to [-128, 127] (its
+# _DTYPE_TO_QVALUE_BOUNDS; reduce_range is off). The image CI of 772e3b7 matched its CPU W8A8 outputs with / 127.5 and
+# the bf16 scale; its 32 x 128 input could not tell -127 from -128 or 1e-5 from eps (both 1.0, and the sort picked
+# -127 and 1e-5): torchao's source decides. A -128 code occurs in about 0.2 % of the rows of an N(0, 1) 4096 x 1024
+# input (tests/test_quant_torchao.py)
 INT8_ACT_DIV = 127.5
-INT8_ACT_QMIN = -127
-INT8_ACT_EPS = 1e-5
+INT8_ACT_QMIN = -128
+INT8_ACT_EPS = INT8_EPS
 INT8_ACT_SCALE_DTYPE = torch.bfloat16
 # torchao 0.18's float8 per row (_choose_scale_float8, then _quantize_affine_float8): the scale amax / 448 is computed
 # in the input's dtype and only then cast to fp32. Every input kitsune hands it is bf16 (QuantLinear casts to the
@@ -238,7 +243,8 @@ FP8_ACT_LB = 2.0 ** -40
 #   1 (or the field absent)  every recipe up to 8ff3bd5, 14bfcad's included: fp32 fp8 scales, an fp8 activation row of
 #                            zeros 0 / 0 = NaN (box 53693389's smoke B #1)
 #   2                        F1 (DECISIONS F, 2026-10-01): FP8_SCALE_DTYPE for the fp8 activation and weight row scales,
-#                            FP8_ACT_LB on the activations
+#                            FP8_ACT_LB on the activations; int8 codes round(x * (1 / s)) as torchao (weights and
+#                            activations), the activation codes in [-128, 127] with the float32 eps
 # load_quantized refuses a variant below it, 05 refuses one as --ckpt, the readout re-exports one, and
 # tools/full_report.py leaves out every quant readout and speed record below it (QUANT_RECIPE_MIN)
 RECIPE_VERSION = 2
@@ -449,11 +455,13 @@ class QuantPack:
 
 def _int8_rows(x: torch.Tensor, div: float, eps: float, qmin: int, scale_dtype=torch.float32
                ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Symmetric per-row int8 (torchao's choose_qparams_affine order): the scale amax / div rounded to scale_dtype,
-    then clamped to eps (an all-zero row gets eps), the codes round(x / s) in fp32, clamped to [qmin, 127]."""
+    """Symmetric per-row int8 (torchao 0.18's choose_qparams_affine, then quantize_affine): the scale amax / div
+    rounded to scale_dtype, then clamped to eps (an all-zero row gets eps), the codes round(x * (1 / s)) in fp32 -
+    torchao's expression: the fp32 reciprocal, then the product, both correctly rounded on the CPU and on CUDA, so a
+    tie (x / s = k + 0.5) rounds as torchao's does, which x / s would not - clamped to [qmin, 127]."""
     amax = x.abs().amax(dim=1)
     s = torch.clamp((amax / div).to(scale_dtype), min=eps).float()
-    q = torch.clamp(torch.round(x / s[:, None]), qmin, 127)
+    q = torch.clamp(torch.round(x * (1.0 / s[:, None])), qmin, 127)
     return q, s
 
 
@@ -919,7 +927,8 @@ def _recipe_consts(fmt: str, mx_rounding: str) -> dict:
     rec = dict(base, block=FORMAT_INFO[fmt]["block"])
     if wfmt == "int8":
         rec.update(int8_div=INT8_DIV, int8_eps=INT8_EPS, int8_range=[-128, 127],
-                   int8_scale_dtype=str(INT8_SCALE_DTYPE).replace("torch.", ""))
+                   int8_scale_dtype=str(INT8_SCALE_DTYPE).replace("torch.", ""),
+                   int8_code_scaling="x * (1 / s) (torchao 0.18's quantize_affine)")
     if wfmt == "fp8":
         rec.update(fp8_scale="bf16(amax / 448) per row, then fp32 (an all-zero weight row: 1)",
                    fp8_scale_dtype=str(FP8_SCALE_DTYPE).replace("torch.", ""))
@@ -2195,7 +2204,8 @@ def selftest(device, *, ckpt=None, rows=(1, 7, 17, 128, 1000), shape=(2560, 1024
     """Smoke B check 12 (module docstring), in this order:
       pack_device      a weight on the GPU packs to the CPU's bits in every weight format (hard), device_arith a record
       torchao_parity   torchao's own quantize_ of a bf16 weight on the GPU, read back, equals pack_weight's (hard for
-                       fp8, F1's "torchao decides", and int8; nvfp4 a record: its tensor scale uses CUDA's reciprocal)
+                       fp8, F1's "torchao decides", and int8; nvfp4 a record: its scales divide by Python scalars,
+                       which CUDA does as reciprocal multiplies)
       layers           per timed format on an (N, K) Linear: torchao against emulate at every M (relative Frobenius
                        error within SELFTEST_TOL), the kernel census and the wall time; int8 W8A8: no fp32 fallback
                        after padding (every call's torch._int_mm returned: fallback_mm 0, kernel_census) and, unpadded
@@ -2294,9 +2304,18 @@ TORCHAO_PARITY_HARD = ("int8-w8a8", "fp8-w8a8")  # F1: "torchao decides"; nvfp4 
 def _selftest_torchao_parity(rec, check, dev, shape):
     """torchao's own quantize_ of an (N, K) bf16 weight (no all-zero row) on the GPU, read back with from_torchao,
     against pack_weight of the same weight on the CPU: the bits of every part (parts_differ: the elements that
-    differ). A hard check for fp8 (F1: the bf16-rounded row scale is torchao's) and int8 (its bf16 scale is
-    device-independent too); nvfp4 a record and a warning (its fp32 tensor scale is CUDA's reciprocal there, module
-    docstring) - and torchao may keep its block scales swizzled, which from_torchao cannot read."""
+    differ). Code level, torchao 0.18 (the wheel's source, 2026-10-02):
+      fp8    _choose_scale_float8: bf16 amax / 448 (a scalar division: CUDA's reciprocal multiply, the same bf16 bits
+             for every amax, tests/test_quant.py), then _quantize_affine_float8: fp32 x / s, a tensor division,
+             correctly rounded on both devices - pack_weight's arithmetic
+      int8   choose_qparams_affine: bf16 amax / 127.5 (as fp8's), then quantize_affine: round(x * (1.0 / s)), an fp32
+             reciprocal and a product, both correctly rounded on both devices - pack_weight's since its reciprocal
+             form (before it, x / s gave another code on about 13 ties of this weight)
+      nvfp4  per_tensor_amax_to_scale and the block amax / 6 divide fp32 by Python scalars: CUDA's reciprocal
+             multiply, which differs from the CPU's division for about 1 fp32 value in 3-5
+    So hard checks for fp8 and int8 (an exact equality is right: no step of either differs between the devices), a
+    record and a warning for nvfp4 - and torchao may keep its block scales swizzled, which from_torchao cannot
+    read."""
     n, k = shape
     g = torch.Generator(device="cpu").manual_seed(2)
     w = (torch.randn(n, k, generator=g) * 0.02).to(torch.bfloat16)

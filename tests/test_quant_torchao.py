@@ -7,7 +7,9 @@ constants, never by widening a tolerance here.
 
   CPU (the image CI)   every torchao name kitsune uses resolves and every format's config builds (the MXFP4 AUTO
                        config of the selftest's decision-20 canary too); the int8 packs (weight-only and W8A8) equal
-                       torchao's quantize_ of the same weight; the NVFP4 pack (on a real-sized weight, where the
+                       torchao's quantize_ of the same weight (on real-sized weights too, where the reciprocal form
+                       round(w * (1 / s)) decides the ties), and the W8A8 activation grid equals torchao's
+                       Int8Tensor.from_hp; the NVFP4 pack (on a real-sized weight, where the
                        reciprocal scaling decides codes) and the W4A4 activation grid, and the MXFP4 (RCEIL) pack,
                        equal torchao's own quantisers (they run on CPU in the image: an API error there fails, it is
                        drift; only a CPU-kernel refusal skips); the FP8 per-row pack where torchao runs it on CPU (it
@@ -120,6 +122,44 @@ def test_fp8_scale_equals_torchaos_primitives_on_cpu():
     nz = [i for i in range(96) if i != 3]
     assert torch.equal(p.scale[nz], ws[nz]) and same_bits(p.qweight[nz], wq.reshape(p.qweight.shape)[nz])
     assert ws[3].item() == 0.0 and p.scale[3].item() == 1.0 and (p.qweight[3].float() == 0).all()
+
+
+@pytest.mark.parametrize("seed", [0, 2])
+def test_int8_pack_equals_torchaos_on_a_real_sized_weight(seed):
+    """torchao's quantize_ of a 2560 x 1024 N(0, 0.02) bf16 weight (seed 2: the selftest's torchao parity weight, its
+    hard check on the GPU) is kitsune's int8 pack bit for bit: quantize_affine's round(w * (1.0 / s)) decides about a
+    dozen ties there, which w / s rounds the other way (the 96 x 128 weight() has none). The GPU runs the same fp32
+    reciprocal and product, both correctly rounded (_selftest_torchao_parity)."""
+    w = real_weight(seed)
+    theirs = Q.from_torchao(torchao_linear(w, "int8-w8a8").weight, "int8-w8a8")
+    ours = Q.pack_weight(w, "int8")
+    assert torch.equal(theirs.scale.float(), ours.scale), "int8 scales differ from torchao's"
+    assert _n_codes_differ(theirs.qweight, ours.qweight) == 0, "int8 codes differ from torchao's"
+    divided = torch.clamp(torch.round(w.float() / ours.scale[:, None]), -128, 127).to(torch.int8)
+    assert _n_codes_differ(theirs.qweight, divided) > 0  # the test tells the two forms apart
+
+
+def _n_codes_differ(a: torch.Tensor, b: torch.Tensor) -> int:
+    return int((a.detach().cpu().reshape(-1) != b.detach().cpu().reshape(-1)).sum())
+
+
+def test_int8_activation_grid_equals_torchaos():
+    """torchao's activation quantiser of the W8A8 path (Int8Tensor.from_hp per row, called as the int8 linear calls it
+    with the weight's act_quant_kwargs) on an N(0, 1) 4096 x 1024 bf16 input with an all-zero row and a tiny one gives
+    kitsune's activation scales and codes bit for bit (INT8_ACT_DIV, INT8_ACT_QMIN = -128, INT8_ACT_EPS = float32
+    eps, round(x * (1 / s))); some rows hold a -128 code, so the range is pinned."""
+    from torchao.quantization.quantize_.common.quantize_tensor_kwargs import _choose_quant_func_and_quantize_tensor
+
+    lin = torchao_linear(weight(), "int8-w8a8")
+    g = torch.Generator().manual_seed(6)
+    x = torch.randn(4096, 1024, generator=g).to(torch.bfloat16)
+    x[5] = 0.0
+    x[9] *= 1e-6
+    a = _choose_quant_func_and_quantize_tensor(x, lin.weight.act_quant_kwargs, scale=None, zero_point=None)
+    q, s = Q._int8_rows(x.float(), Q.INT8_ACT_DIV, Q.INT8_ACT_EPS, Q.INT8_ACT_QMIN, scale_dtype=Q.INT8_ACT_SCALE_DTYPE)
+    assert torch.equal(a.scale.float().reshape(-1), s), "int8 activation scales differ from torchao's"
+    assert torch.equal(a.qdata.float().reshape(q.shape), q), "int8 activation codes differ from torchao's"
+    assert bool((a.qdata == -128).any()) and Q.INT8_ACT_QMIN == -128
 
 
 @pytest.mark.parametrize("fmt", ["int8-w8a16", "int8-w8a8"])
@@ -240,7 +280,7 @@ def _int8_act_candidates(x: torch.Tensor, pw: Q.QuantPack, yr: torch.Tensor) -> 
                                                    "int_to_bf16_first")):
         xf = x.float()
         sx = torch.clamp((xf.abs().amax(1) / div).to(sdt), min=Q.INT8_ACT_EPS).float()
-        qx = torch.clamp(torch.round(xf / sx[:, None]), qmin, 127)
+        qx = torch.clamp(torch.round(xf * (1.0 / sx[:, None])), qmin, 127)
         yint = (qx.double() @ qw.T).float()
         sw = pw.scale[None, :]
         if form == "dequant_fp32":

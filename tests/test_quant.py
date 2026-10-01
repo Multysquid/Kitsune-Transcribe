@@ -241,6 +241,48 @@ def test_fp8_recipe_is_torchaos_arithmetic():
     assert float((old[nz] != ts[nz]).float().mean()) > 0.5
 
 
+def _torchao_int8_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """torchao 0.18's symmetric int8 per row on a bf16 tensor (Int8Tensor.from_hp, the weight's and the activation's
+    call alike), its arithmetic verbatim: choose_qparams_affine - max(-min(amin, 0), max(amax, 0)) / ((127 - -128) /
+    2) in the tensor's dtype, clamped to float32 eps, then fp32 - and quantize_affine: clamp(round(x * (1.0 / s)) + 0,
+    -128, 127). Returns (codes (N, K) fp32, scales (N,))."""
+    xb = x.to(torch.bfloat16)
+    mn = torch.min(xb.amin(dim=1, keepdim=True), torch.zeros(1, dtype=xb.dtype))
+    mx = torch.max(xb.amax(dim=1, keepdim=True), torch.zeros(1, dtype=xb.dtype))
+    s = torch.clamp(torch.max(-mn, mx) / (float(127 - -128) / 2), min=torch.finfo(torch.float32).eps).to(torch.float32)
+    return torch.clamp(torch.round(xb * (1.0 / s)) + 0, -128, 127), s.reshape(-1)
+
+
+def test_int8_recipe_is_torchaos_arithmetic():
+    """The int8 weight pack and the W8A8 activation grid are torchao 0.18's recipe bit for bit on real-sized tensors:
+    the codes round(x * (1 / s)), torchao's reciprocal form. On a 2560 x 1024 N(0, 0.02) weight - the selftest's torchao
+    parity weight (seed 2) among them - the division x / s gives another code on a tie (x / s = k + 0.5 exactly), so
+    this test tells the two forms apart (the 96 x 128 weights of the parity tests had no such tie). The activations:
+    an N(0, 1) 4096 x 1024 input (with an all-zero row and a tiny one) has rows with a -128 code and the eps clamp
+    applies, where the pre-fix recipe ([-127, 127], eps 1e-5) differed. tests/test_quant_torchao.py checks the same
+    against torchao itself in the image."""
+    for seed in (0, 2):
+        g = torch.Generator().manual_seed(seed)
+        w = (torch.randn(2560, 1024, generator=g) * 0.02).to(torch.bfloat16)
+        tq, ts = _torchao_int8_rows(w)
+        p = Q.pack_weight(w, "int8")
+        assert torch.equal(p.scale, ts) and torch.equal(p.qweight.float(), tq), seed
+        divided = torch.clamp(torch.round(w.float() / ts[:, None]), -128, 127)
+        assert int((divided != tq).sum()) > 0, seed  # the ties: 12 codes at seed 0, 13 at seed 2
+    g = torch.Generator().manual_seed(6)
+    x = torch.randn(4096, 1024, generator=g).to(torch.bfloat16)
+    x[5] = 0.0
+    x[9] *= 1e-6
+    tq, ts = _torchao_int8_rows(x)
+    q, s = Q._int8_rows(x.float(), Q.INT8_ACT_DIV, Q.INT8_ACT_EPS, Q.INT8_ACT_QMIN, scale_dtype=Q.INT8_ACT_SCALE_DTYPE)
+    assert torch.equal(s, ts) and torch.equal(q, tq)
+    assert torch.equal(Q.fake_quant_act(x.float(), "int8"), tq * ts[:, None])
+    assert (tq == -128).any(dim=1).sum() > 0 and (tq[5] == 0).all() and ts[5].item() == Q.INT8_EPS
+    old_s = torch.clamp((x.float().abs().amax(1) / 127.5).to(torch.bfloat16), min=1e-5).float()
+    old_q = torch.clamp(torch.round(x.float() / old_s[:, None]), -127, 127)
+    assert not torch.equal(old_s, ts) and not torch.equal(old_q, tq)
+
+
 def test_fp8_and_int8_bf16_scales_are_the_same_from_cpu_division_and_cudas_reciprocal():
     """Why the bf16-rounded fp8 (F1) and int8 scales are device-independent: for every positive finite bf16 amax,
     bf16(a / d) - the CPU's true division - equals bf16(fp32(a) * fp32(1 / d)) - CUDA's kernel for a tensor divided by
