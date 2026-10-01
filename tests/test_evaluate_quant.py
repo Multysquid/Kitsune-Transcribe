@@ -129,11 +129,29 @@ def test_05_quant_in_memory_end_to_end(ctc_env, prereg, m05, mem_run):
     assert ident["quant"] == dict(fmt="nvfp4-w4a4", impl="emulate", scope="linear+pw", mx_rounding="rceil", schema=1,
                                   recipe_version=Q.RECIPE_VERSION)
     assert qb["recipe_version"] == Q.RECIPE_VERSION and qb["recipe_sha256"] == Q.recipe_sha256("nvfp4-w4a4")
+    for s in ctc_env["manifest"]["sets"]:  # the batching guard's digest of the pass plan (kitsune.quant.compare)
+        assert len(load(out / ".parts" / f"{s}.json")["batches_sha256"]) == 64
     # a rerun: nothing left to evaluate, the quant block stays (from .parts/quant)
     assert run05(m05, ctc_env, prereg, out, "--quant", "nvfp4-w4a4", "--quant-impl", "emulate", "--tables",
                  str(tables)) == 0
     assert events(out, "todo")[-1]["sets"] == [] and load(out / "study.json")["quant"]["counters"] == qb["counters"]
     assert load(out / "summary.json")["quant"]["format"] == "nvfp4-w4a4"
+
+
+def test_chunks_follow_chunk_s_not_the_batches(ctc_env, prereg, m05, mem_run, tmp_path):
+    """The PR #35 review: 05's chunks are runs of whole batches, so another --chunk-s cuts the same batches into
+    other chunks. The set records' chunks differ, their batches_sha256 is equal, and the exact compare (check 14) is
+    the same: the number of chunks is not a batching key."""
+    out = tmp_path / "chunky"
+    assert run05(m05, ctc_env, prereg, out, "--quant", "nvfp4-w4a4", "--quant-impl", "emulate", "--chunk-s",
+                 "1000") == 0
+    for s in ctc_env["manifest"]["sets"]:
+        a, b = load(mem_run["out"] / ".parts" / f"{s}.json"), load(out / ".parts" / f"{s}.json")
+        assert a["batches_sha256"] == b["batches_sha256"] and a["pass_sets"] == b["pass_sets"]
+    assert any(load(mem_run["out"] / ".parts" / f"{s}.json")["chunks"] != load(out / ".parts" / f"{s}.json")["chunks"]
+               for s in ctc_env["manifest"]["sets"])
+    res = Q.compare_eval_dirs(mem_run["out"], out, exact=True)
+    assert res["same"] and all(v["batches_equal"] for v in res["sets"].values()), res
 
 
 def test_05_quant_refusals(ctc_env, prereg, m05, mem_run, tmp_path, monkeypatch):

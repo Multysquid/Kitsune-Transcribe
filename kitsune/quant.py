@@ -2051,10 +2051,15 @@ def _greedy_sets(d: Path) -> dict[str, Path]:
 
 
 # the 05 --out identity (.parts/identity.json) and per-set record (.parts/<set>.json) fields that fix an eval's batches:
-# the exact compare's batching guard (weights and step differ between a variant file and its in-memory source)
+# the exact compare's batching guard (weights and step differ between a variant file and its in-memory source).
+# batches_sha256 is the pass plan itself (05: the sha256 of its batches' ids). The number of chunks is NOT a batching
+# key: 05's chunks are runs of whole batches of the plan (chunk_plan), and eval_batches re-cuts exactly those batches
+# from a chunk, so the chunk count follows --chunk-s (or the pass's audio total), not the batches - two dirs on the
+# same batches with another --chunk-s are the same eval (the PR #35 review). A set record of older 05 code has no
+# batches_sha256: compared without it when either side lacks it (the other keys still guard)
 BATCH_IDENTITY_KEYS = ("store", "batch_s", "device", "autocast", "tf32", "relpos_patch", "family", "eval_sets",
                        "sources", "subset", "quant")
-BATCH_SET_KEYS = ("pass_sets", "batch_s", "chunks")
+BATCH_SET_KEYS = ("pass_sets", "batch_s", "batches_sha256")
 
 
 def _batching(d: Path, s: str) -> dict | None:
@@ -2137,6 +2142,9 @@ def compare_eval_dirs(a, b, *, exact: bool = True, tol_cer: float = 0.0) -> dict
                 tf_diff = _tf_diff(fa, fb[list(fa.columns)])
                 tf_equal = not tf_diff
         ba, bb = _batching(a, s), _batching(b, s)
+        if ba is not None and bb is not None and (ba.get("set.batches_sha256") is None
+                                                  or bb.get("set.batches_sha256") is None):
+            ba, bb = ({k: v for k, v in x.items() if k != "set.batches_sha256"} for x in (ba, bb))  # older 05 code
         batches_equal = None if ba is None or bb is None else ba == bb
         delta = None if cer_a is None or cer_b is None else abs(float(cer_a) - float(cer_b))
         if exact:

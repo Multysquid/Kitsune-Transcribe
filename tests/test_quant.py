@@ -965,7 +965,7 @@ def test_compare_eval_dirs_and_the_cli(tmp_path, capsys):
 
 def _parts(d: Path, identity: dict | None = None, **sets):
     """A 05 --out dir's .parts records: identity.json and one <set>.json per keyword (its pass_sets, batch_s,
-    chunks)."""
+    chunks, batches_sha256)."""
     (d / ".parts").mkdir(parents=True, exist_ok=True)
     ident = dict(weights="w1", step=10, store="fp-store", batch_s=400.0, device="cuda", autocast="bf16", tf32=False,
                  relpos_patch=True, family="ctc", eval_sets=["eval_jsut"], sources=["eval_jsut"], subset=None,
@@ -973,7 +973,8 @@ def _parts(d: Path, identity: dict | None = None, **sets):
     ident.update(identity or {})
     (d / ".parts" / "identity.json").write_text(json.dumps(ident), encoding="utf-8")
     for s, rec in sets.items():
-        (d / ".parts" / f"{s}.json").write_text(json.dumps(dict(dict(pass_sets=[s], batch_s=400.0, chunks=3), **rec)),
+        (d / ".parts" / f"{s}.json").write_text(json.dumps(dict(dict(pass_sets=[s], batch_s=400.0, chunks=3,
+                                                                     batches_sha256="b" * 64), **rec)),
                                                 encoding="utf-8")
 
 
@@ -981,7 +982,9 @@ def test_compare_names_the_tf_columns_that_differ_and_guards_the_batches(tmp_pat
     """Box 53693389's check 14: every hypothesis equal, the tf tables 3e-7 apart in their KL sums. Exact stays
     bitwise; tf_diff names the column with its n_diff and max_rel (ulp noise at a glance); equal tables on equal
     batches are the same; the same tables on other batches are not (batches_equal, a reason), a variant file's own
-    weights and its quant source excepted."""
+    weights and its quant source excepted. The number of chunks is not a batching key (the PR #35 review: 05's chunks
+    are runs of whole batches, so they follow --chunk-s): the pass plan's batches_sha256 is, compared only when both
+    set records have it (older 05 code wrote none)."""
     import numpy as np
     import pandas as pd
 
@@ -1002,13 +1005,21 @@ def test_compare_names_the_tf_columns_that_differ_and_guards_the_batches(tmp_pat
                                                        source="memory")), eval_jsut={})
     r = Q.compare_eval_dirs(one, two)["sets"]["eval_jsut"]
     assert r["same"] and r["tf_equal"] and r["tf_diff"] == {} and r["batches_equal"] is True
+    _parts(two, eval_jsut=dict(chunks=11))  # the same batches cut into other chunks (another --chunk-s)
+    r = Q.compare_eval_dirs(one, two)["sets"]["eval_jsut"]
+    assert r["same"] and r["batches_equal"] is True, r
+    for old_side in (one, two):  # a set record of older 05 code (no batches_sha256): compared without it
+        _parts(old_side, eval_jsut=dict(batches_sha256=None))
+        assert Q.compare_eval_dirs(one, two)["sets"]["eval_jsut"]["batches_equal"] is True
+        _parts(old_side, eval_jsut={})
     for ident, rec, key in ((dict(batch_s=300.0), {}, "batch_s"), (dict(store="other"), {}, "store"),
-                            ({}, dict(chunks=4), "set.chunks"),
+                            ({}, dict(batches_sha256="c" * 64), "set.batches_sha256"),
                             ({}, dict(pass_sets=["eval_jsut", "x"]), "set.pass_sets")):
         _parts(two, ident, eval_jsut=rec)
         r = Q.compare_eval_dirs(one, two)
         s = r["sets"]["eval_jsut"]
         assert not r["same"] and s["batches_equal"] is False and key in s["reason"], (key, s)
+        assert "set.chunks" not in s["reason"]
         assert Q.compare_eval_dirs(one, two, exact=False, tol_cer=0.0)["same"]  # the CER mode does not ask
     js = tmp_path / "cmp.json"
     assert Q.main(["compare", str(one), str(two), "--exact", "--json-out", str(js)]) == 1

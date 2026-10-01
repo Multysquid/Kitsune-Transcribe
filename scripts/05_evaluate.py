@@ -801,7 +801,7 @@ def sweep_work(ctx: Ctx):
         elif all(chunk_meta(work, k) is not None for k in range(n)):
             ctx.log.event("pass_finish", sets=sets, chunks=n, work=str(work),
                           note="its chunks were all done: the sets' outputs are written from them")
-            finish_pass(ctx, sets, n, work)
+            finish_pass(ctx, sets, n, work, batches_sha256=man.get("batches_sha256"))
             ctx.passes.append(dict(sets=sets, chunks=n, chunks_resumed=n, finished_from_chunks=True))
         elif any(set_done(ctx.out, s) for s in sets):
             ctx.log.event("pass_dropped", sets=sets, work=str(work), note="it holds a set done since")
@@ -840,10 +840,13 @@ def run_pass(ctx: Ctx, sets: list[str]):
     plan = trainset.eval_batches(store.utts, ctx.bs, idx)
     chunks = chunk_plan(plan, dur, float(ctx.args.chunk_s))
     ids_of = [[store.utts[i].id for b in ch for i in b] for ch in chunks]
+    # the pass's batches themselves (their ids, in plan order): kitsune.quant.compare_eval_dirs' batching guard. Not
+    # the chunks, which only group whole batches and follow --chunk-s (the PR #35 review)
+    plan_sha = hashlib.sha256(json.dumps([[store.utts[i].id for i in b] for b in plan]).encode()).hexdigest()
     fp = hashlib.sha256(json.dumps(dict(identity=ctx.identity_key, sets=sets, chunks=ids_of)).encode()).hexdigest()
     work = ctx.out / WORK / f"pass-{fp[:16]}"
     work.mkdir(parents=True, exist_ok=True)
-    manifest = dict(sets=sets, chunks=len(chunks), identity=ctx.identity_key)
+    manifest = dict(sets=sets, chunks=len(chunks), identity=ctx.identity_key, batches_sha256=plan_sha)
     if _load_json(work / MANIFEST) != manifest:
         _write_json(work / MANIFEST, manifest)
     total_s = float(dur[idx].sum())
@@ -901,16 +904,17 @@ def run_pass(ctx: Ctx, sets: list[str]):
                       tf_s=round(t1 - t0, 1), greedy_s=round(t2 - t1, 1), dropped=len(dropped_g),
                       eta_min=round(eta / 60, 1) if eta is not None else None,
                       **({"temp_max_c": ctx.guard.max_seen} if ctx.guard else {}))
-    finish_pass(ctx, sets, len(chunks), work)
+    finish_pass(ctx, sets, len(chunks), work, batches_sha256=plan_sha)
     ctx.passes.append(dict(sets=sets, utts=len(idx), batches=len(plan), chunks=len(chunks), chunks_resumed=len(done),
                            wall_s=round(time.time() - t_start, 1)))
 
 
-def finish_pass(ctx: Ctx, sets: list[str], n_chunks: int, work: Path):
+def finish_pass(ctx: Ctx, sets: list[str], n_chunks: int, work: Path, batches_sha256: str | None = None):
     """The pass's per-set outputs from its chunks, in plan order: the raw teacher-forced rows (.parts, for the
     summary), tf_<set> and greedy_<set> tables as the trainer writes them, and the set's record (dropped rows, its
-    share of the wall time) last. Then the pass's chunks go (the work dir is kept until every set is written, so a stop
-    in here is finished by the next run: sweep_work)."""
+    share of the wall time, batches_sha256: the pass plan's digest, None from a work dir of older code) last. Then
+    the pass's chunks go (the work dir is kept until every set is written, so a stop in here is finished by the next
+    run: sweep_work)."""
     ev, out = ctx.ev, ctx.out
     metas = [chunk_meta(work, k) for k in range(n_chunks)]
     if any(m is None for m in metas):
@@ -943,7 +947,7 @@ def finish_pass(ctx: Ctx, sets: list[str], n_chunks: int, work: Path):
         _write_json(out / PARTS / f"{s}.json", dict(
             set=s, n_tf=len(raw_s), n_greedy=len(g_s), dropped_tf=d_tf, dropped_greedy=d_gr,
             tf_wall_s=share("tf_wall_s"), greedy_wall_s=share("greedy_wall_s"), pass_sets=sets,
-            batch_s=ctx.bs, chunks=n_chunks, time_utc=_now(), **ctc_extra))
+            batch_s=ctx.bs, chunks=n_chunks, batches_sha256=batches_sha256, time_utc=_now(), **ctc_extra))
         ctx.log.event("set_done", set=s, utts=len(g_s), undecodable=len(d_gr))
     shutil.rmtree(work, ignore_errors=True)
     _rmdir_if_empty(out / WORK)
