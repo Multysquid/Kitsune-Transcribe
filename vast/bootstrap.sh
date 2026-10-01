@@ -90,9 +90,9 @@ fi
 cd "$KITSUNE_DIR"
 mkdir -p "$STATE"
 TIMINGS="$STATE/bootstrap_timings.jsonl"
-# the helper lives in the box state on /workspace, not in /tmp: on 2026-10-01 a box lost its /tmp copy between the
-# label pull and the coverage check (cause unknown) and destroyed itself. ensure_helper (in every phase) writes it
-# again from HELPER_SRC if it is gone, and says so
+# the helper lives in the box state on /workspace, not in /tmp (ensure_helper, in every phase, writes it again from
+# HELPER_SRC if it is gone, and says so). On 2026-10-01 two boxes lost it between the label pull and the coverage check
+# (one destroyed itself): the EXIT trap below ran in a phase's train_hb toucher (see on_exit)
 HELPER="$STATE/bootstrap_helper.py"
 
 stop_label_pull() {  # job full, at exit: the background label pull and everything it started. Killing its subshell
@@ -107,7 +107,20 @@ stop_label_pull() {  # job full, at exit: the background label pull and everythi
     [ -z "$kids" ] || kill $kids 2>/dev/null || true
     LABELS_PID=""
 }
-trap 'rm -f "$HELPER"; stop_label_pull' EXIT
+
+on_exit() {  # the EXIT trap, in bootstrap's own process only ($BASHPID is the running process, $$ bootstrap's). Bash
+    # resets the traps of a background subshell only some way into its start: a SIGTERM that arrives before that runs
+    # bash's fatal-signal handler with the parent's EXIT trap still armed, and the child runs it. The pull_labels_wait
+    # phase did exactly that on 2026-10-01: its `wait` on a pull long done returned at once, so `kill "$hb"` hit the
+    # toucher it had just forked, which deleted the helper (and would kill a label pull pid that may be recycled).
+    # Linux bash 5.2 runs it in most children killed at once; Git Bash's slower fork does not show it. Tests:
+    # test_bootstrap_extent.py *exit_trap*. A test that fails in that state only returns (a trap's leading
+    # `[ ... ] || cmd` was seen to run cmd there although the test held)
+    [ "$BASHPID" = "$$" ] || return 0
+    rm -f "$HELPER"
+    stop_label_pull
+}
+trap on_exit EXIT
 
 beat_train_hb() {  # beat_train_hb <max_s>: touch $STATE/train_hb (the watchdog's heartbeat on a full box) every 60 s
     # for at most max_s, and only while this bootstrap runs ($$ is its pid in every subshell): a toucher left behind
