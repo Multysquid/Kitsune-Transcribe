@@ -799,6 +799,8 @@ def test_emilia_budget_cut_discards_fetched_ahead_tars(tmp_path, fake_hub, monke
         assert sorted(downloads)[:2] == read and len(downloads) == len(set(downloads))
         if ahead and hint is None:
             assert 2 <= len(downloads) <= 2 + ahead
+        elif ahead:  # both tars come down at once: their start order is the threads' (progress.json's is checked above)
+            assert sorted(downloads) == read
         else:
             assert downloads == read
         assert sorted(freed) == sorted(f.replace("/", "_") for f in downloads)  # every one freed, read or not
