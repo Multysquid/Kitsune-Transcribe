@@ -90,7 +90,10 @@ fi
 cd "$KITSUNE_DIR"
 mkdir -p "$STATE"
 TIMINGS="$STATE/bootstrap_timings.jsonl"
-HELPER="$(mktemp --suffix=.py)"
+# the helper lives in the box state on /workspace, not in /tmp: on 2026-10-01 a box lost its /tmp copy between the
+# label pull and the coverage check (cause unknown) and destroyed itself. ensure_helper (in every phase) writes it
+# again from HELPER_SRC if it is gone, and says so
+HELPER="$STATE/bootstrap_helper.py"
 
 stop_label_pull() {  # job full, at exit: the background label pull and everything it started. Killing its subshell
     # alone leaves its children running, holding onstart's supervise.lock (fd 7): the pull's timeout (SIGTERM reaches
@@ -121,9 +124,16 @@ phase_budget_s() {  # phase_budget_s <tries> <minutes>: the longest `retry <trie
     echo $(( $1 * ($2 * 60 + 60) + 30 * $1 * ($1 - 1) + 600 ))
 }
 
+ensure_helper() {  # the helper must exist when a phase may run it (HELPER_SRC is read right after it is written)
+    [ -n "${HELPER_SRC:-}" ] && [ ! -s "$HELPER" ] || return 0
+    log "helper $HELPER was missing; writing it again"
+    printf '%s\n' "$HELPER_SRC" > "$HELPER.tmp" && mv -f "$HELPER.tmp" "$HELPER"
+}
+
 phase() {  # phase <name> <command...>: run it and append its wall time
     local name=$1 t0 t1 hb max_s rc=0
     shift
+    ensure_helper
     t0=$(date +%s.%N)
     log "phase $name ..."
     if [ "${KITSUNE_JOB:-}" = full ]; then
@@ -580,6 +590,7 @@ def coverage():
 
 {"plan": plan, "pull": pull, "pull_labels": pull_labels, "coverage": coverage}[sys.argv[1]]()
 PYEOF
+HELPER_SRC=$(<"$HELPER")  # the source ensure_helper writes again
 
 log "repo $KITSUNE_DIR at $(git -C "$KITSUNE_DIR" rev-parse --short HEAD 2>/dev/null || echo '?'), config $CONFIG, data $KITSUNE_DATA_REPO@$KITSUNE_DATA_REVISION"
 log "disk free before: $(df -h --output=avail "$KITSUNE_DIR" | tail -1 | tr -d ' ')"
