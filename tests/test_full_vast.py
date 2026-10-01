@@ -86,6 +86,9 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.setattr(launch, "git", git)
     monkeypatch.setattr(launch, "config_at", lambda sha, c: json.loads(at(sha, c)))
     monkeypatch.setattr(launch, "worktree_file", lambda rel: None)
+    # the quant go signal's git reads: a verdict's commit is an ancestor of SHA with the same quant code
+    monkeypatch.setattr(launch, "git_ancestry", lambda old, new: "ancestor")
+    monkeypatch.setattr(launch, "git_blob", lambda sha, p: f"blob:{p}")
     return SimpleNamespace(root=root, reg=reg)
 
 
@@ -537,8 +540,8 @@ def test_full_preflight_passes_a_ready_box(repo, monkeypatch, devslice):
     import hashlib
     assert side == {"kind": "full_study"} and sel_sha == "5e" * 32
     assert man_sha == hashlib.sha256(b'{"manifest": 1}').hexdigest(), "a small file in git: hashed"
-    for box in ("full", "full-smoke"):  # the other training boxes of the registry pass too
-        problems, _ = preflight(monkeypatch, FullHub(box_data(box, reg, repo.root)), box=box)
+    for box in ("full", "full-smoke"):  # the other training boxes of the registry pass too (box full: verified quant)
+        problems, _ = preflight(monkeypatch, FullHub(box_data(box, reg, repo.root), runs=go_runs()), box=box)
         assert problems == [], (box, problems)
 
 
@@ -570,9 +573,9 @@ def test_full_preflight_refuses_a_box_whose_tools_the_sha_lacks(repo, monkeypatc
     kitsune.quant, WP6's whisper kind of speed_probe) is refused before renting."""
     reg = launch.full_registry(SHA)[0]
     data = box_data("full", reg, repo.root)
-    assert preflight(monkeypatch, FullHub(data), box="full")[0] == []
+    assert preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")[0] == []
     (repo.root / "kitsune/quant.py").unlink()
-    problems, _ = preflight(monkeypatch, FullHub(data), box="full")
+    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")
     assert any("kitsune/quant.py (item quant-int8-w8a8-full-p03) does not exist" in p for p in problems), problems
     (repo.root / "kitsune/full_queue.py").unlink()
     problems, _ = preflight(monkeypatch, FullHub(data), box="p01", reg=reg)
@@ -599,7 +602,7 @@ def test_full_preflight_refuses_speed_args_the_sha_lacks(repo, monkeypatch, devs
     data = box_data("full", reg, repo.root)
     probe = repo.root / "tools/speed_probe.py"
     base = probe.read_text(encoding="utf-8")  # the kinds only: no flag of the args
-    problems, _ = preflight(monkeypatch, FullHub(data), box="full", reg=reg)
+    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full", reg=reg)
     want = {"--quant": "speed-full-t06", "--profile-kernels": "speed-full-t06", "--threads": "speed-full-t06",
             "--hf-cache": "speed-study-t06", "--compile": "speed-study-t06"}
     for flag, item in want.items():
@@ -609,11 +612,11 @@ def test_full_preflight_refuses_speed_args_the_sha_lacks(repo, monkeypatch, devs
     # a sha with every flag but --compile (WP5's, say, before its compile commit): only that one is refused
     flags = [f for f in want if f != "--compile"]
     probe.write_text(base + "".join(f'ap.add_argument("{f}")\n' for f in flags), encoding="utf-8")
-    problems, _ = preflight(monkeypatch, FullHub(data), box="full", reg=reg)
+    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full", reg=reg)
     assert [p for p in problems if "speed_probe" in p] == [
         "tools/speed_probe.py at 0123456789ab has no --compile (in the args of speed item speed-study-t06 of box full)"]
     probe.write_text(base + "".join(f'ap.add_argument("{f}")\n' for f in want), encoding="utf-8")
-    assert preflight(monkeypatch, FullHub(data), box="full", reg=reg)[0] == []
+    assert preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full", reg=reg)[0] == []
 
 
 def test_full_preflight_without_devslice_refuses_the_sidecar(repo, monkeypatch):
@@ -648,6 +651,182 @@ def test_resume_preflight_needs_the_hub_summary_and_known_run_ids(repo, monkeypa
 
 
 # ========================================================================================= blocklist and gates
+
+
+# ======================================================================================== the quant go signal (F2)
+
+
+GO_SHA = "fedcba9876543210fedcba9876543210fedcba98"
+
+
+def go_verdict(**kw) -> dict:
+    """A passing smoke-b verdict (checks 12-16; smoke B has no built-in checks) at GO_SHA."""
+    checks = {n: {"pass": True, "evidence": []} for n in launch.QUANT_GO_CHECKS}
+    return dict({"format": 1, "box": "smoke-b", "sha": GO_SHA, "machine_id": "149252",
+                 "time_utc": "2026-10-01T23:10:00+00:00", "overall": "pass", "checks": checks}, **kw)
+
+
+def go_runs(verdict=None) -> dict:
+    """The runs repo's files of a passing smoke-b (its verdict at full/box-smoke-b/smoke_verdict.json)."""
+    return {fullrun.box_verdict_path("smoke-b"): go_verdict() if verdict is None else verdict}
+
+
+@pytest.fixture
+def quant_go(repo, monkeypatch):
+    """quant_go_problems of box full at SHA against a hub with the given verdict (None: none on the Hub); the verdict's
+    commit an ancestor with the same quant code unless .ancestry / .blobs say otherwise."""
+    st = SimpleNamespace(ancestry="ancestor", blobs={}, asked=[])
+    monkeypatch.setattr(launch, "git_ancestry", lambda old, new: st.asked.append((old, new)) or st.ancestry)
+    monkeypatch.setattr(launch, "git_blob", lambda sha, p: st.blobs.get((sha, p), f"blob:{p}"))
+
+    def go(verdict="pass", box="full", allow=False, spec=None):
+        runs = {} if verdict is None else go_runs(None if verdict == "pass" else verdict)
+        hub = FullHub({}, runs=runs)
+        monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+        spec = spec if spec is not None else fullrun.box_spec(box, repo.reg)
+        return launch.quant_go_problems(RUNS, SHA, box, spec, allow_unverified_quant=allow)
+    go.st = st
+    return go
+
+
+def test_the_quant_go_signal_passes_a_verified_box(quant_go):
+    problems, notes = quant_go()
+    assert problems == [], problems
+    assert notes[0] == ("smoke-b verdict: sha fedcba987654, machine 149252, 2026-10-01T23:10:00+00:00, overall pass, "
+                        "check 12 True, check 13 True, check 14 True, check 15 True, check 16 True")
+    assert notes[1].startswith("quant go signal: the smoke-b verdict at fedcba987654 passed checks 12-16, and "
+                               "kitsune/quant.py, tools/speed_probe.py")
+    assert quant_go.st.asked == [(GO_SHA, SHA)]
+
+
+@pytest.mark.parametrize("case, want", [
+    ("missing", "no readable full/box-smoke-b/smoke_verdict.json in Multy123/kitsune-runs (FileNotFoundError"),
+    ("overall", "its overall is 'fail'"),
+    ("check16", "check(s) 16 False (each of 12-16 must pass)"),
+    ("absent", "check(s) 14 absent (each of 12-16 must pass)"),
+    ("null", "check(s) 13 None (each of 12-16 must pass)"),
+    ("nosha", "it names no commit (sha None)"),
+    ("unknown", "its commit fedcba987654 is not in this clone (git fetch origin)"),
+    ("not_ancestor", "its commit fedcba987654 is not an ancestor of 0123456789ab"),
+    ("quant", "kitsune/quant.py differs between fedcba987654 (verified) and 0123456789ab"),
+    ("pins", "requirements-train.txt, docker/Dockerfile differ between fedcba987654"),
+])
+def test_the_quant_go_signal_refusals(quant_go, case, want):
+    """Box full is refused without a verdict, with a failed one or a check of 12-16 not passed, or when the verified
+    commit is unknown, not an ancestor of the one the box runs, or ran other quant code (QUANT_CODE: the quant path,
+    its CLIs and the image's pins)."""
+    v = go_verdict()
+    if case == "overall":
+        v["overall"] = "fail"
+    elif case == "check16":
+        v["checks"]["16"]["pass"] = False
+    elif case == "absent":
+        del v["checks"]["14"]
+    elif case == "null":
+        v["checks"]["13"]["pass"] = None
+    elif case == "nosha":
+        del v["sha"]
+    elif case in ("unknown", "not_ancestor"):
+        quant_go.st.ancestry = case
+    elif case == "quant":
+        quant_go.st.blobs[(SHA, "kitsune/quant.py")] = "changed"
+    elif case == "pins":
+        quant_go.st.blobs.update({(GO_SHA, "requirements-train.txt"): "old", (GO_SHA, "docker/Dockerfile"): "old"})
+    problems, notes = quant_go(None if case == "missing" else v)
+    assert len(problems) == 1 and want in problems[0], problems
+    assert problems[0].startswith("box full's 2 quantised item(s) (e.g. quant-int8-w8a8-full-p03) need a passing "
+                                  "smoke-b verdict (checks 12-16) at this quant code (DECISIONS F2): ")
+    assert problems[0].endswith("rent the standalone smoke-B first (launch --job full --box smoke-b) or pass "
+                                "--allow-unverified-quant")
+    # --allow-unverified-quant: the same text as a warning, nothing refused
+    problems, notes = quant_go(None if case == "missing" else v, allow=True)
+    assert problems == [] and any(n.startswith("WARNING: box full's 2 quantised item(s)") and want in n
+                                  and n.endswith("(--allow-unverified-quant: not refused)") for n in notes), notes
+
+
+def test_the_quant_go_signal_only_concerns_boxes_with_quantised_items(quant_go, repo, monkeypatch):
+    """smoke-b (the verifier) and the boxes without a quantised item never read the verdict; a box whose only
+    quantised item is a speed probe with --quant needs it."""
+    class Unreadable(FullHub):
+        def download(self, *a, **kw):
+            raise AssertionError("the verdict must not be read")
+
+    hub = Unreadable({})
+    for box in ("p01", "full-smoke", "smoke-b"):
+        monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+        assert launch.quant_go_problems(RUNS, SHA, box, fullrun.box_spec(box, repo.reg)) == ([], []), box
+    assert launch.quant_items(fullrun.box_spec("full", repo.reg)) == ["quant-int8-w8a8-full-p03",
+                                                                     "quant-int8-w8a8-full-p01"]
+    speed_only = {"items": [{"name": "speed-x", "kind": "speed", "args": ["--quant", "int8-w8a8"]},
+                            {"name": "speed-y", "kind": "speed", "args": ["--compile"]},
+                            {"name": "fp16-x", "kind": "eval", "argv": ["{python}", "scripts/05_evaluate.py", "--quant",
+                                                                        "fp16"]},
+                            {"name": "whisper", "kind": "eval", "argv": ["{python}", "tools/whisper_eval.py"]}]}
+    assert launch.quant_items(speed_only) == ["speed-x", "fp16-x"]
+    problems, _ = quant_go(None, box="p01", spec=speed_only)
+    assert problems and "box p01's 2 quantised item(s) (e.g. speed-x)" in problems[0]
+
+
+def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, monkeypatch, devslice):
+    """full_preflight ends with the quant go signal (allow_unverified_quant passed through) and, for box full, a warning
+    while its speed record has no box-1 part (never a refusal)."""
+    monkeypatch.setattr(launch, "git_ancestry", lambda old, new: "ancestor")
+    monkeypatch.setattr(launch, "git_blob", lambda sha, p: f"blob:{p}")
+    reg = launch.full_registry(SHA)[0]
+    data = box_data("full", reg, repo.root)
+    problems, notes = preflight(monkeypatch, FullHub(data), box="full")
+    assert len(problems) == 1 and "need a passing smoke-b verdict" in problems[0], problems
+    assert f"WARNING: no {launch.SPEED_RECORD} at 0123456789ab: box full's hours are not held to measured speeds" in notes
+    problems, notes = preflight(monkeypatch, FullHub(data), box="full", allow_unverified_quant=True)
+    assert problems == [] and any(n.startswith("WARNING: box full's 2 quantised item(s)") for n in notes)
+    rec = repo.root / launch.SPEED_RECORD
+    rec.parent.mkdir(parents=True, exist_ok=True)
+    rec.write_text(json.dumps({"smoke": {}, "box1": None}), encoding="utf-8")
+    problems, notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")
+    assert problems == [] and any(n.startswith("quant go signal: ") for n in notes)
+    assert any(n.startswith("WARNING: box full's hours are smoke-only") for n in notes), notes
+    rec.write_text(json.dumps({"smoke": {}, "box1": {"sha": "ab" * 20, "sec_per_step": 0.29}}), encoding="utf-8")
+    notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")[1]
+    assert not any("smoke-only" in n for n in notes) and any("box 1 at abababababab, 0.29 s/step" in n for n in notes)
+    assert launch.speed_record_notes(SHA, "p01") == []
+
+
+def test_allow_unverified_quant_reaches_the_preflight_and_is_full_only(full_launch, capsys):
+    rc, fake = full_launch([[offer(1, 10, 1.40, num_gpus=2, cpu_ram=130000)]], "--box", "full", "--scratch-repo",
+                           SCRATCH, "--allow-unverified-quant")
+    assert rc == 0, capsys.readouterr().out
+    assert full_launch.seen["preflight"][1]["allow_unverified_quant"] is True
+    rc, _ = full_launch([[offer(1, 10, 1.40, num_gpus=2, cpu_ram=130000)]], "--box", "full", "--scratch-repo",
+                        SCRATCH)
+    assert rc == 0 and full_launch.seen["preflight"][1]["allow_unverified_quant"] is False
+    with pytest.raises(SystemExit):
+        launch.main(["--job", "study", "--box", "A", "--data-repo", DATA, "--out-repo", RUNS,
+                     "--allow-unverified-quant"])
+    assert "--allow-unverified-quant: for --job full only" in capsys.readouterr().err
+
+
+def test_offers_in_a_country_without_hub_access_are_dropped():
+    job = launch.full_job("smoke-b", {"gpus": 1}, "5090", 1.75, 3, 1.0)
+    assert job.avoid_countries == ("CN",)
+    for geo, bad in ((", CN", True), ("Beijing, CN", True), ("Tokyo, JP", False), ("Hong Kong, HK", False),
+                     (None, False)):
+        o = offer(1, 58555, 0.5, cpu_ram=64439, **({"geolocation": geo} if geo is not None else {}))
+        problems = launch.offer_problems(o, job)
+        assert bool(problems) == bad, (geo, problems)
+        if bad:
+            assert problems == [f"geolocation {geo!r}: the Hugging Face Hub is not reachable from there"]
+    cn = offer(1, 58555, 0.5, cpu_ram=64439, geolocation=", CN")
+    assert launch.offer_problems(cn, launch.JOBS["train"]) == []  # the other jobs keep their filters
+    assert [o["id"] for o in launch.rank_offers([cn, offer(2, 149252, 0.72, cpu_ram=64439, geolocation="Japan, JP")],
+                                                job)] == [2]
+
+
+def test_the_quant_code_and_the_speed_record_exist_in_this_checkout():
+    for rel in launch.QUANT_CODE:
+        assert (ROOT / rel).is_file(), rel
+    rec = json.loads((ROOT / launch.SPEED_RECORD).read_text(encoding="utf-8"))
+    assert set(rec) >= {"smoke", "box1"}
+    assert launch.SPEED_RECORD_BOXES == ("full",) and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
 
 
 def test_the_blocklist_holds_151760_and_refuses_a_broken_file(tmp_path):

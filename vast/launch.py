@@ -55,8 +55,11 @@ deverified hosts only, a rental that runs >= MIN_RENTAL_DAYS, >= 64 GB RAM per G
 total. Refused before renting (full_preflight): a box config not committed at the commit, a student not the
 registered build, an extra file or dir the data repo lacks, an eval/speed tool the commit does not have, a scratch
 repo (--scratch-repo, required for a box with timed states) that is not private, a selection sidecar that is not the
-selection's, and with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no
-train item of it ran. Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate
+selection's, with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no
+train item of it ran, and a box with quantised items (box full) without the quant go signal: smoke-b's verdict on the
+Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE; DECISIONS F2), which
+--allow-unverified-quant turns into a warning. Box full's hours warn while its speed record has no box-1 part. Offers
+listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped. Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate
 said slow in the last GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The
 box times its Hub link first (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
   python vast/launch.py --job full --box p01 --machine 54650 --image-tag main --data-repo Multy123/kitsune-data \\
@@ -224,6 +227,26 @@ GATE_RE = re.compile(r"full/box-[^/]+/infra/[^/]+/download_gate\.json")
 # the tools a registry item runs besides its argv template (kitsune/full_queue.py builds these argvs)
 FULL_TOOLS = {"stores": "kitsune/full_queue.py", "train": "scripts/04_distill.py", "readout": "scripts/05_evaluate.py",
               "speed": "tools/speed_probe.py"}
+# THE QUANT GO SIGNAL (DECISIONS F2, 2026-10-01: "the quant/compile fixes are verified on a GPU by a standalone smoke-B
+# box before box 2 launches"). A box with quantised items (box full: 28 quantised readouts) is refused unless the runs
+# repo's smoke-b verdict (full/box-smoke-b/smoke_verdict.json) passed overall and every one of checks 12-16 (12 the
+# torchao selftest and the emulate-vs-real NVFP4 compare, 13 fp16 without non-finite rows, 14 export = in-memory, 15
+# Whisper, 16 every speed probe), at a commit that is an ancestor of the one the box runs with QUANT_CODE (the quant
+# path, its CLIs and the image's pins) byte-identical: a later change to any of them is unverified until smoke-B runs
+# again. smoke-b itself (the verifier) and the boxes without quantised items never read it. --allow-unverified-quant
+# turns the refusal into a warning (the owner's call). Smoke-B #1 (instance 53693389, 14bfcad) failed 12, 14 and 16.
+QUANT_GO_BOX = "smoke-b"
+QUANT_GO_CHECKS = ("12", "13", "14", "15", "16")
+QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.py", "kitsune/whisper.py",
+              "tools/whisper_eval.py", "requirements-train.txt", "docker/Dockerfile")
+# box full's hours come from make_full_configs' speed record (its SPEED_FILE under configs/full): smoke A's measured
+# s/step and, after box 1, box 1's; without box 1's part they are provisional (contract 7), and launch says so
+SPEED_RECORD = "configs/full/plan/box2_hours.json"
+SPEED_RECORD_BOXES = ("full",)
+# offers in a country whose hosts cannot reach the Hugging Face Hub: a full box downloads everything from it, and with
+# no download gate (smoke-b) such a host burns its rebuild attempts up to the cap (2026-10-01: the cheapest 1x 5090,
+# m58555, was listed in CN)
+FULL_AVOID_COUNTRIES = ("CN",)
 
 
 def full_filter(n_gpus: int, disk_gb: int = DISK_GB, min_disk_bw: int = FULL_MIN_DISK_BW) -> list[str]:
@@ -261,6 +284,7 @@ class JobSpec:
     ram_mb_per_gpu: int = 0  # cpu_ram (MB) at least this x n_gpus
     max_gb_cost: float | None = None  # the host's inet_down_cost and inet_up_cost at most this ($/GB; None: any)
     max_total: float | None = None  # an est_total ranking keeps only offers whose est_total is at most this ($)
+    avoid_countries: tuple = ()  # the country codes (geolocation's last part) whose offers are dropped
 
 
 JOBS = {
@@ -286,7 +310,8 @@ def full_job(box: str, spec: dict, tier: str, plan_hours: float, max_hours: floa
     return JobSpec(FULL_TIERS[tier], full_filter(n, min_disk_bw=min_disk_bw), DISK_GB, 0.0, FULL_UP_GB_PER_GPU_HOUR * n * plan_hours,
                    plan_hours, max_hours, max_dph, "est_total", f"kitsune-full-{box}", n_gpus=n,
                    accept_verification=FULL_VERIFICATION, min_rental_days=MIN_RENTAL_DAYS,
-                   ram_mb_per_gpu=FULL_RAM_MB_PER_GPU, max_gb_cost=FULL_MAX_GB_COST)
+                   ram_mb_per_gpu=FULL_RAM_MB_PER_GPU, max_gb_cost=FULL_MAX_GB_COST,
+                   avoid_countries=FULL_AVOID_COUNTRIES)
 
 
 class LaunchError(RuntimeError):
@@ -387,7 +412,8 @@ def _duration_s(offer: dict, now: float) -> float | None:
 
 def offer_problems(offer: dict, job: JobSpec, now: float | None = None) -> list[str]:
     """Why an offer fails the job's client-side filter (what vast's query cannot say exactly): its verification, its
-    max rental, its RAM per GPU. Empty for every offer under the train, label and study jobs (JobSpec defaults)."""
+    max rental, its RAM per GPU, its traffic prices, its country. Empty for every offer under the train, label and
+    study jobs (JobSpec defaults)."""
     now = time.time() if now is None else now
     out = []
     if job.accept_verification is not None and offer.get("verification") not in job.accept_verification:
@@ -404,6 +430,10 @@ def offer_problems(offer: dict, job: JobSpec, now: float | None = None) -> list[
         for key in ("inet_down_cost", "inet_up_cost"):
             if _gb_cost(offer, key) > job.max_gb_cost:
                 out.append(f"{key} ${_gb_cost(offer, key):.4f}/GB > ${job.max_gb_cost:g}/GB")
+    if job.avoid_countries:
+        geo = str(offer.get("geolocation") or "")
+        if geo.rsplit(",", 1)[-1].strip().upper() in job.avoid_countries:
+            out.append(f"geolocation {geo!r}: the Hugging Face Hub is not reachable from there")
     return out
 
 
@@ -1301,9 +1331,113 @@ def _at_sha(sha: str, path: str) -> bool:
         return False
 
 
+def git_blob(sha: str, path: str) -> str | None:
+    """The blob id of path at sha (None: not there, or the commit is not local); a seam for the tests."""
+    try:
+        return git("rev-parse", "--verify", "--quiet", f"{sha}:{path}") or None
+    except (subprocess.CalledProcessError, OSError):
+        return None
+
+
+def git_ancestry(old: str, new: str) -> str:
+    """"ancestor" (old is new or one of its ancestors), "not_ancestor", or "unknown" (old is not a commit of this
+    clone: git fetch origin); a seam for the tests."""
+    try:
+        git("cat-file", "-e", f"{old}^{{commit}}")
+    except (subprocess.CalledProcessError, OSError):
+        return "unknown"
+    try:
+        git("merge-base", "--is-ancestor", old, new)
+        return "ancestor"
+    except (subprocess.CalledProcessError, OSError):
+        return "not_ancestor"
+
+
+def quant_items(spec: dict) -> list[str]:
+    """The items of a box spec that run the quantised path: an eval item whose argv runs kitsune.quant or passes
+    --quant, a speed item whose args pass --quant."""
+    out = []
+    for it in spec["items"]:
+        argv = [a for a in (it.get("argv") or []) if isinstance(a, str)]
+        args = [a for a in (it.get("args") or []) if isinstance(a, str)]
+        if (it["kind"] == "eval" and (argv_target(argv) == "kitsune/quant.py" or "--quant" in argv)) or (
+                it["kind"] == "speed" and "--quant" in args):
+            out.append(it["name"])
+    return out
+
+
+def quant_go_problems(out_repo: str, sha: str, box: str, spec: dict, *,
+                      allow_unverified_quant: bool = False) -> tuple[list[str], list[str]]:
+    """-> (problems, notes): the quant go signal (QUANT_GO_BOX's verdict; see QUANT_CODE) for a box with quantised
+    items; nothing for the verifier itself or a box without them. allow_unverified_quant: the refusal becomes a
+    WARNING note."""
+    import tempfile
+
+    names = quant_items(spec)
+    if box == QUANT_GO_BOX or not names:
+        return [], []
+    path, why, notes, vsha = fullrun.box_verdict_path(QUANT_GO_BOX), [], [], None
+    try:
+        api, download = _hub()
+        with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+            v = json.loads(Path(download(out_repo, path, local_dir=tmp)).read_text(encoding="utf-8"))
+        if not isinstance(v, dict):
+            raise ValueError(f"not an object: {type(v).__name__}")
+    except Exception as e:  # noqa: BLE001  no verdict, an unreadable Hub: no go signal
+        why.append(f"no readable {path} in {out_repo} ({type(e).__name__}: {e})")
+    else:
+        checks = v.get("checks") if isinstance(v.get("checks"), dict) else {}
+        vals = {n: (checks[n].get("pass") if isinstance(checks.get(n), dict) else "absent") for n in QUANT_GO_CHECKS}
+        vsha = v.get("sha") if isinstance(v.get("sha"), str) else None
+        notes.append(f"smoke-b verdict: sha {(vsha or '?')[:12]}, machine {v.get('machine_id')}, {v.get('time_utc')}, "
+                     f"overall {v.get('overall')}, " + ", ".join(f"check {n} {vals[n]}" for n in QUANT_GO_CHECKS))
+        if v.get("overall") != "pass":
+            why.append(f"its overall is {v.get('overall')!r}")
+        if bad := [n for n in QUANT_GO_CHECKS if vals[n] is not True]:
+            why.append("check(s) " + ", ".join(f"{n} {vals[n]}" for n in bad) + " (each of 12-16 must pass)")
+        if vsha is None or not re.fullmatch(r"[0-9a-f]{40}", vsha):
+            why.append(f"it names no commit (sha {v.get('sha')!r})")
+        else:
+            rel = git_ancestry(vsha, sha)
+            if rel == "unknown":
+                why.append(f"its commit {vsha[:12]} is not in this clone (git fetch origin)")
+            elif rel == "not_ancestor":
+                why.append(f"its commit {vsha[:12]} is not an ancestor of {sha[:12]}")
+            elif differ := [p for p in QUANT_CODE if git_blob(vsha, p) != git_blob(sha, p)]:
+                why.append(f"{', '.join(differ)} differ{'s' if len(differ) == 1 else ''} between {vsha[:12]} (verified) "
+                           f"and {sha[:12]}")
+    if not why:
+        notes.append(f"quant go signal: the smoke-b verdict at {vsha[:12]} passed checks 12-16, and "
+                     f"{', '.join(QUANT_CODE)} are unchanged at {sha[:12]}")
+        return [], notes
+    msg = (f"box {box}'s {len(names)} quantised item(s) (e.g. {names[0]}) need a passing smoke-b verdict (checks 12-16) "
+           f"at this quant code (DECISIONS F2): {'; '.join(why)}; rent the standalone smoke-B first (launch --job full "
+           f"--box smoke-b) or pass --allow-unverified-quant")
+    if allow_unverified_quant:
+        return [], notes + [f"WARNING: {msg} (--allow-unverified-quant: not refused)"]
+    return [msg], notes
+
+
+def speed_record_notes(sha: str, box: str) -> list[str]:
+    """A warning for a box whose hours come from the speed record (SPEED_RECORD_BOXES) while that record at sha has no
+    box-1 part (provisional, contract 7) or is missing; never a refusal."""
+    if box not in SPEED_RECORD_BOXES:
+        return []
+    try:
+        rec = json.loads(git_show(sha, SPEED_RECORD).decode("utf-8"))
+    except (subprocess.CalledProcessError, OSError, ValueError):
+        return [f"WARNING: no {SPEED_RECORD} at {sha[:12]}: box {box}'s hours are not held to measured speeds"]
+    if not isinstance(rec, dict) or rec.get("box1") is None:
+        return [f"WARNING: box {box}'s hours are smoke-only ({SPEED_RECORD} has no box-1 measurement): contract 7 "
+                f"refreshes them after box 1 (tools/box1_go.py, then make_full_configs --import-speed --box1-go)"]
+    b1 = rec["box1"]
+    return [f"box {box}'s hours: smoke A's s/step x box 1's ratio ({SPEED_RECORD}: box 1 at "
+            f"{str(b1.get('sha') or '?')[:12]}, {b1.get('sec_per_step')} s/step)"]
+
+
 def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_repo: str | None, sha: str, box: str,
                    reg: dict, cfg: dict, *, reader=None, resume: bool = False, resets=(),
-                   sets: dict | None = None) -> tuple[list[str], list[str]]:
+                   sets: dict | None = None, allow_unverified_quant: bool = False) -> tuple[list[str], list[str]]:
     """-> (problems, notes) for --job full, read-only (local git and the laptop's HF login), on top of hf_preflight and
     extent_preflight:
     - every config the box reads (fullrun.box_configs: its data config, its item configs, the registry) committed at
@@ -1317,7 +1451,10 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
     - a full selection's sidecar (<selection stem>.json) passing kitsune.devslice.sidecar_problems against the Hub's
       selection and frozen manifest;
     - with resume: the box's Hub queue summary, and every --resume-reset/--resume-set id the run dir of one of its train
-      items; the notes say what will resume, with the newest state step found in the scratch and runs repos."""
+      items; the notes say what will resume, with the newest state step found in the scratch and runs repos;
+    - a box with quantised items: the quant go signal (quant_go_problems: a passing smoke-b verdict at this quant code;
+      allow_unverified_quant makes it a warning); box full: a warning while its hours are provisional
+      (speed_record_notes)."""
     import hashlib
     import tempfile
 
@@ -1431,7 +1568,8 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
         problems_r, notes_r = resume_preflight(out_repo, scratch_repo, box, resets, sets or {})
         problems += problems_r
         notes += notes_r
-    return problems, notes
+    problems_q, notes_q = quant_go_problems(out_repo, sha, box, spec, allow_unverified_quant=allow_unverified_quant)
+    return problems + problems_q, notes + notes_q + speed_record_notes(sha, box)
 
 
 def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, sets: dict) -> tuple[list, list]:
@@ -1642,6 +1780,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-total", type=float, default=None, metavar="USD",
                     help=f"full: drop offers whose expected total (rent for the planned hours + traffic) is above this "
                          f"(default {FULL_TOTAL_FACTOR:g} x the $/h cap x the planned hours + the traffic at the $/GB cap)")
+    ap.add_argument("--allow-unverified-quant", action="store_true",
+                    help="full: rent a box with quantised items (box full) without a passing smoke-b verdict at its "
+                         "quant code (DECISIONS F2's go signal; the refusal becomes a warning)")
     ap.add_argument("--no-self-stop", action="store_true",
                     help="debugging: the box does not stop itself when its on-start or bootstrap fails "
                          "(KITSUNE_NO_SELF_STOP=1); the watchdog still stops it once onstart.sh has started it")
@@ -1665,7 +1806,8 @@ def main(argv: list[str] | None = None) -> int:
                                 ("--gate-hours", args.gate_hours is not None),
                                 ("--min-disk-bw", args.min_disk_bw is not None),
                                 ("--max-gb-cost", args.max_gb_cost is not None),
-                                ("--max-total", args.max_total is not None)) if v]
+                                ("--max-total", args.max_total is not None),
+                                ("--allow-unverified-quant", args.allow_unverified_quant)) if v]
     if full_only and not full:
         ap.error(f"{', '.join(full_only)}: for --job full only")
     if args.machine is not None and not re.fullmatch(r"\d+", args.machine):
@@ -1881,7 +2023,8 @@ def main(argv: list[str] | None = None) -> int:
                     problems, pre_notes = full_preflight(args.data_repo, data_rev, args.out_repo,
                                                          args.scratch_repo if spec["timed_states"] else None, sha,
                                                          args.box, reg, cfg, reader=reader, resume=resume,
-                                                         resets=resets, sets=sets)
+                                                         resets=resets, sets=sets,
+                                                         allow_unverified_quant=args.allow_unverified_quant)
                     errors += problems
                     notes += pre_notes
                     for c in (fullrun.CHAIN_NAMES if resume else ()):  # E.8: a resume of a chain's last part
