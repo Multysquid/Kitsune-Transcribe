@@ -90,9 +90,15 @@ def write_tables(root: Path, tables: dict) -> Path:
 def write_readout(root: Path, name: str, system: str, table: pd.DataFrame | None = None, *, greedy=None,
                   family=None, time_utc=T0, summary=None, whisper=None, **study_extra) -> Path:
     """A 05_evaluate --out dir: study.json, tables/<system>/<set>.parquet (when table), greedy_<set>.parquet (when
-    greedy: set -> frame), summary.json, whisper.json."""
+    greedy: set -> frame), summary.json, whisper.json. A quant block gets the recipe_version of the fixed quant code
+    (F4: 2) unless it names one (None: the field absent, as 05 before F4 wrote it)."""
     d = root / name
     d.mkdir(parents=True)
+    if isinstance(study_extra.get("quant"), dict):
+        q = dict(dict(recipe_version=FR.QUANT_RECIPE_MIN), **study_extra["quant"])
+        if q["recipe_version"] is None:
+            del q["recipe_version"]
+        study_extra["quant"] = q
     if table is not None:
         write_tables(d / "tables", {system: table})
     for s, g in (greedy or {}).items():
@@ -122,8 +128,13 @@ def greedy_frames(ids, refs, hyps, *, duration=5.0, n_tok=10, durations=None, tr
 def srec(rtf, *, machine="m54650", host="c0ffee", gpu="NVIDIA GeForce RTX 5090", p50_s=None, tokens=None, t=T0,
          kind="ctc", **kw) -> dict:
     """A tools/speed_probe.py record. machine=None: the wave-1 speed_probe's versions (the container host only; WP6
-    adds machine_id), as smoke A writes them."""
+    adds machine_id), as smoke A writes them. F4's quant_recipe (version 2) and a passing sanity by default: what a
+    quantised or compiled record of the fixed code carries (the report reads them only for those); pass them as None
+    for a record of older code."""
     p50 = rtf * 40 if p50_s is None else p50_s
+    kw.setdefault("quant_recipe", dict(version=FR.QUANT_RECIPE_MIN, sha256="0" * 64))
+    kw.setdefault("sanity", dict(ok=True, cer=0.2, cer_bf16=0.2, delta=0.0, max_delta=0.05, hyps_differ=3,
+                                 reference="study-p03", reason=None))
     versions = dict(host=host) if machine is None else dict(host=host, machine_id=machine)
     return dict(kind=kind, rtf=rtf, p50_s=p50, p95_s=1.2 * p50, vram_peak_reserved_bytes=3_000_000_000,
                 vram_peak_reserved_bytes_1=800_000_000, vram_gb=3.0, weights_bytes=600_000_000,
@@ -511,7 +522,8 @@ def test_chart_svg_points(world, tmp_path):
 def test_report_md_order_and_whisper_caveats(world, tmp_path):
     md = (world["out"] / "report.md").read_text(encoding="utf-8")
     heads = re.findall(r"^## (.+)$", md, re.M)
-    assert heads[:6] == ["Offer table", "Study -> full", "Quantisation", "Whisper", "Charts", "Hallucinations"]
+    assert heads[:7] == ["Offer table", "Study -> full", "Quantisation", "Speed probes not measured or left out",
+                         "Whisper", "Charts", "Hallucinations"]
     assert heads[-3:] == ["Flags", "Checks", "Inputs"]
     assert md.index("### Parakeet") < md.index("### Cohere") < md.index("### Whisper") < md.index("### The study")
     for c in FR.WHISPER_CAVEATS:
@@ -598,6 +610,118 @@ def test_duplicate_readouts_and_tables_precedence(world, tmp_path):
     f = rep["systems"]["study-p03@fp16"]
     assert f["file_bytes"] == 312_000_000 and f["file_bytes_from"] == "in-memory (quant.weights_bytes)"
     assert next(r for r in rep["offer"]["rows"] if r["system"] == "study-p03@fp16")["file_bytes"] == 312_000_000
+
+
+def test_old_and_insane_speed_records_are_left_out(world, tmp_path):
+    """F4: a smoke B #1 record (14bfcad's quant code: no quant_recipe, no sanity; its fp8 decoded garbage at CER 0.94)
+    is never used, nor a fixed-code record whose CER sanity failed (speed_probe's exit 4); a newer valid record of the
+    same format is. A compiled bf16 record needs a passing sanity too. Each left-out record is listed with its why."""
+    pull = tmp_path / "runs"
+    old = dict(quant_recipe=None, sanity=None)
+    write_speed(pull / "speed-smoke-b-20261001T140224Z" / "speed.json", world["sp_ids"], {
+        "study-p03": srec(0.0004),
+        "study-p03@fp8-w8a8": srec(0.0002, quant="fp8-w8a8", cer_ref_corpus=0.939, t="2026-10-01T15:00:00+00:00",
+                                   **old),
+        "study-p03@int8-w8a8": srec(0.0003, quant="int8-w8a8", t="2026-10-01T15:00:00+00:00", **old),
+        "study-p03+compile": srec(0.0002, compile=True, sanity=None, t="2026-10-01T15:00:00+00:00")})
+    insane = dict(ok=False, cer=0.94, cer_bf16=0.2, delta=0.74, reason="cer_ref_corpus 0.9400 is 74.00 pp above")
+    write_speed(pull / "speed-smoke-b-20261002T100000Z" / "speed.json", world["sp_ids"], {
+        "study-p03@fp8-w8a8": srec(0.00021, quant="fp8-w8a8", t="2026-10-02T11:00:00+00:00", sanity=insane),
+        "study-p03@int8-w8a8": srec(0.00031, quant="int8-w8a8", t="2026-10-02T11:00:00+00:00"),
+        "study-p03@nvfp4-w4a4": srec(0.00025, quant="nvfp4-w4a4", t="2026-10-02T11:00:00+00:00",
+                                     quant_recipe=dict(version=1))})
+    sp = FR.load_speed(sorted(pull.glob("speed-*/speed.json")))
+    used = {n for (_, n) in sp["records"]}
+    assert used == {"study-p03", "study-p03@int8-w8a8"}
+    assert sp["records"][(PRIMARY, "study-p03@int8-w8a8")]["rtf"] == 0.00031  # the fixed code's, not the newest-old
+    why = {(x["system"], Path(x["file"]).parent.name): x["why"] for x in sp["excluded"]}
+    assert set(why) == {("study-p03@fp8-w8a8", "speed-smoke-b-20261001T140224Z"),
+                        ("study-p03@int8-w8a8", "speed-smoke-b-20261001T140224Z"),
+                        ("study-p03+compile", "speed-smoke-b-20261001T140224Z"),
+                        ("study-p03@fp8-w8a8", "speed-smoke-b-20261002T100000Z"),
+                        ("study-p03@nvfp4-w4a4", "speed-smoke-b-20261002T100000Z")}
+    assert why[("study-p03@fp8-w8a8", "speed-smoke-b-20261001T140224Z")].startswith("quant recipe version 1")
+    assert why[("study-p03@fp8-w8a8", "speed-smoke-b-20261002T100000Z")].startswith("CER sanity failed: cer_ref")
+    assert why[("study-p03+compile", "speed-smoke-b-20261001T140224Z")].startswith("no CER sanity record")
+    assert FR.speed_excluded("study-p03", srec(0.1, quant_recipe=None, sanity=None)) is None  # bf16: nothing asked
+    assert FR.speed_excluded("x", srec(0.1, quant="fp16", quant_recipe=None)).startswith("quant recipe version 1")
+
+
+def test_failed_and_absent_probes_are_listed(world, tmp_path):
+    """F4: no speed row is silently empty. A speed file's failed block (speed_probe: a probe that raised) and the
+    speed dir's events.jsonl (the queue's line per speed item: exit 1, exit 4) give failed probes, a later good probe
+    of the system resolves an earlier failure; offered rows without any record are absent (S5); a queue summary's speed
+    item not done is listed. report.json's speed_probes, report.md's section, the compile line and the speed_probes
+    check say so."""
+    pull = tmp_path / "pull" / "runs"
+    d = pull / "speed-smoke-b-20261002T000000Z"
+    write_speed(d / "speed.json", world["sp_ids"], {
+        "study-p03": srec(0.0004), "parakeet-ctc": srec(0.0005), "study-p01": srec(0.0002),
+        "study-p03@int8-w8a8": srec(0.00045, quant="int8-w8a8", t="2026-10-02T06:00:00+00:00")})
+    doc = json.loads((d / "speed.json").read_text(encoding="utf-8"))
+    doc["failed"] = {"study-p03@nvfp4-w4a4": dict(error="AssertionError: Only support contiguous data for now",
+                                                  stage="probe", quant="nvfp4-w4a4", compile=False,
+                                                  time_utc="2026-10-02T05:00:00+00:00")}
+    (d / "speed.json").write_text(json.dumps(doc), encoding="utf-8")
+    lines = [dict(kind="speed", item="speed-study-p03-int8-w8a8-compile", system="study-p03@int8-w8a8+compile",
+                  status="failed", why="exit 1", rc=1, wall=1759380000.0),
+             dict(kind="speed", item="speed-study-p03-int8-w8a8", system="study-p03@int8-w8a8", status="failed",
+                  why="exit 4", rc=4, wall=1759370000.0),  # 2026-10-02T01:46Z: before the good record at 06:00
+             dict(kind="speed", item="speed-study-p03-nvfp4-w4a4", system="study-p03@nvfp4-w4a4", status="failed",
+                  why="exit 1", rc=1, wall=1759381200.0)]
+    (d / "events.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+    qs = queue_summary(tmp_path / "pull" / "full" / "box-smoke-b" / "queue_summary.json", "smoke-b", "m54650",
+                       "2026-10-01T23:00:00+00:00", speed_dir=str(d))
+    q = json.loads(qs.read_text(encoding="utf-8"))
+    q["items"]["speed-study-p005-fp8-w8a8"] = dict(kind="speed", status="skipped", why="no-start: deadline",
+                                                    result=None)
+    qs.write_text(json.dumps(q), encoding="utf-8")
+    rc, rep = run(["--manifest", world["man"], "--prereg", "none", "--tables", world["tables"], "--speed",
+                   d / "speed.json", "--queue-summaries", qs, "--boot-b", 200], tmp_path / "out")
+    assert rc == 0
+    pr = rep["speed_probes"]
+    failed = {f["system"]: f for f in pr["failed"]}
+    assert set(failed) == {"study-p03@nvfp4-w4a4", "study-p03@int8-w8a8+compile"}
+    assert "contiguous" in failed["study-p03@nvfp4-w4a4"]["why"] and failed["study-p03@nvfp4-w4a4"]["rc"] == 1
+    assert failed["study-p03@nvfp4-w4a4"]["stage"] == "probe"
+    assert failed["study-p03@int8-w8a8+compile"]["why"] == "exit 1"
+    assert [f["system"] for f in pr["failures_resolved"]] == ["study-p03@int8-w8a8"]
+    assert "cohere" in pr["absent"] and "study-p03" not in pr["absent"]
+    assert [(x["item"], x["status"]) for x in pr["queue_not_done"]] == [("speed-study-p005-fp8-w8a8", "skipped")]
+    chk = next(c for c in rep["checks"] if c["rule"] == "speed_probes")
+    assert chk["status"] == "fail" and "2 failed probe(s)" in chk["detail"] and "cohere" in chk["detail"]
+    md = (tmp_path / "out" / "report.md").read_text(encoding="utf-8")
+    sec = md.split("## Speed probes not measured or left out")[1].split("\n## ")[0]
+    assert "study-p03@nvfp4-w4a4" in sec and "Only support contiguous data" in sec and "queue: skipped" in sec
+    assert "no speed record (S5)" in sec and "superseded" in sec
+    # nothing failed, nothing absent: the check passes and the section says so
+    empty = FR.speed_probes_md(dict(failed=[], excluded=[], absent=[], queue_not_done=[], failures_resolved=[]))
+    assert empty[-2] == "Every speed probe given was measured and used."
+
+
+def test_pre_fix_quant_readouts_are_ignored(world, tmp_path):
+    """F4: a quant readout whose study.json quant block has no recipe_version (05 before F1: smoke B #1's fp16-study-*,
+    quant-* and mem-* readouts) is ignored, with its why, even when it is the newer one; the fixed code's readout of
+    the same system is read."""
+    t, ids, refs = world["T"], world["ids"], world["refs"]
+    pull = tmp_path / "runs"
+    q = dict(format="int8-w8a8", base_system="study-p03", impl="torchao", simulated=False, source="file",
+             file_bytes=320_000_000)
+    write_readout(pull, "quant-new", "study-p03@int8-w8a8", text_table(ids, refs, noisy(refs, 0.1, 50)),
+                  time_utc="2026-10-01T00:00:00+00:00", quant=q)
+    write_readout(pull, "quant-old", "study-p03@int8-w8a8", text_table(ids, refs, noisy(refs, 0.3, 51)),
+                  time_utc="2026-10-05T00:00:00+00:00", quant=dict(q, recipe_version=None))
+    write_readout(pull, "fp16-old", "study-p03@fp16", text_table(ids, refs, noisy(refs, 0.1, 52)),
+                  quant=dict(q, format="fp16", recipe_version=1))
+    write_tables(tmp_path / "tables", {"study-p03": world["T"]["study-p03"], "parakeet-ctc": t["parakeet-ctc"]})
+    rc, rep = run(["--manifest", world["man"], "--prereg", "none", "--tables", tmp_path / "tables",
+                   "--readouts", pull, "--boot-b", 200], tmp_path / "out")
+    assert rc == 0
+    inp = rep["inputs"]
+    assert Path(inp["readouts_read"]["study-p03@int8-w8a8"]).name == "quant-new"
+    ign = {Path(i["path"]).parent.name: i["why"] for i in inp["readouts_ignored"]}
+    assert set(ign) == {"quant-old", "fp16-old"} and all(w.startswith("quant recipe version 1") for w in ign.values())
+    assert "study-p03@fp16" not in rep["systems"]
 
 
 SMOKE_A = "speed-full-smoke-20261001T000000Z"
@@ -881,6 +1005,7 @@ def test_vocabulary_matches_the_quant_and_whisper_modules():
     if quant is not None:
         assert tuple(quant.QUANT_FORMATS) == FR.QUANT_FORMATS
         assert set(FR.FORMAT_LABEL) == set(quant.QUANT_FORMATS)
+        assert FR.QUANT_RECIPE_MIN == quant.RECIPE_VERSION == 2  # F4: the report uses no number of older quant code
     if whisper is not None:
         assert set(whisper.WHISPER_MODELS) == set(FR.WHISPER_SYSTEMS)
     assert set(FR.FULL_RUNS) == {"full-t06", "full-p03", "full-p01", "full-p005"}
