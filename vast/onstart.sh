@@ -191,8 +191,10 @@ if command -v flock >/dev/null && ! flock -n 8; then
     log "another onstart is running; exiting"
     exit 0
 fi
-# background children inherit fd 8; unlock explicitly so a manual re-run after this one is not locked out
-trap 'flock -u 8 2>/dev/null || true' EXIT
+# background children inherit fd 8; unlock explicitly so a manual re-run after this one is not locked out. In this
+# process only: a child SIGTERM reaches before it reset its traps runs this trap (bootstrap.sh on_exit), and there a
+# leading `[ ... ] ||` ran its right side anyway (Linux bash 5.2); a test that fails there only skips the unlock
+trap 'if [ "$BASHPID" = "$$" ]; then flock -u 8 2>/dev/null || true; fi' EXIT
 if [ "${1:-}" = "--rearm" ]; then
     rearm
 fi
@@ -291,7 +293,8 @@ log "watchdog started (deadline $(date -u -d "@$(cat "$KITSUNE_STATE/deadline")"
         log "supervisor history present: bootstrap already done for this run; handing over to the supervisor"
     else
         log "bootstrap start"
-        bash "$KITSUNE_DIR/vast/bootstrap.sh"
+        # 7>&-: the lock is this subshell's; a bootstrap leftover holding it locked supervise.py out (2026-10-01)
+        bash "$KITSUNE_DIR/vast/bootstrap.sh" 7>&-
         log "bootstrap done; starting the supervisor"
     fi
     exec 7>&-  # handed over: supervise.py takes the same lock itself for its lifetime

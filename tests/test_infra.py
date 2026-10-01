@@ -1382,11 +1382,50 @@ def test_supervise_restart_during_the_resumed_attempt_stops(tmp_path, monkeypatc
     assert state["attempts"][1]["step"] == 420 and "second failure" in state["final"]["reason"]
 
 
-def test_supervise_steps_aside_when_another_supervisor_runs(tmp_path, monkeypatch):
+def test_supervise_steps_aside_when_another_supervisor_runs(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(supervise, "acquire_lock", lambda path: None)
+    monkeypatch.setattr(supervise, "LOCK_WAIT_S", 0.2)  # a live supervisor still holds it after the bounded wait
+    monkeypatch.setattr(supervise, "LOCK_POLL_S", 0.05)
     state = {"attempts": [{"t0": 0.0, "resume": None}], "final": None}  # the live attempt of the other supervisor
     rc, trainer, finishes, after = run_supervise(tmp_path, monkeypatch, [(0, 10, False)], state=state)
     assert rc == 0 and trainer.argvs == [] and finishes == [] and after == state  # untouched
+    out = capsys.readouterr().out
+    assert out.count("waiting up to 0 s") == 1 and "not starting a second one" in out, out
+
+
+def test_supervise_waits_for_a_lock_a_bootstrap_leftover_still_holds(tmp_path, monkeypatch, capsys):
+    """Box p01-chain, 2026-10-01: a train_hb toucher's `sleep 60` that outlived bootstrap still held onstart's
+    supervise.lock when onstart exec'd the supervisor, which refused at once and left the box idle. The supervisor now
+    polls the lock (every LOCK_POLL_S, up to LOCK_WAIT_S, logged once) and runs once the leftover is gone."""
+    calls = []
+    monkeypatch.setattr(supervise, "acquire_lock", lambda path: calls.append(path) or (object() if len(calls) > 3
+                                                                                         else None))
+    monkeypatch.setattr(supervise, "LOCK_POLL_S", 0.01)
+    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(0, 500, True)])
+    assert rc == 0 and len(trainer.argvs) == 1 and [f[0] for f in finishes] == ["--destroy"]
+    assert len(calls) == 4 and calls[0] == tmp_path / "state" / "supervise.lock"
+    out = capsys.readouterr().out
+    assert out.count("is held by another process; waiting up to 180 s") == 1 and "got " in out, out
+    assert "not starting a second one" not in out
+
+
+def test_wait_for_lock_is_bounded(tmp_path, monkeypatch):
+    """wait_for_lock: a free lock at once, without a wait or a log line; a lock held throughout: polled every 2 s for
+    180 s (one log line), then None. Both supervisor paths (the trainer's and the queues') take the lock through it."""
+    held = []
+    assert supervise.wait_for_lock(tmp_path / "free.lock", sleep=held.append) is not None and held == []
+    now = [0.0]
+    sleeps = []
+
+    def sleep(s):
+        sleeps.append(s)
+        now[0] += s
+
+    monkeypatch.setattr(supervise, "acquire_lock", lambda path: None)
+    assert supervise.wait_for_lock(tmp_path / "held.lock", sleep=sleep, clock=lambda: now[0]) is None
+    assert sleeps == [2.0] * 90 and now[0] == 180.0
+    src = (VAST / "supervise.py").read_text(encoding="utf-8")
+    assert src.count('wait_for_lock(state_path.with_suffix(".lock"))') == 2 and "acquire_lock(state_path" not in src
 
 
 def test_supervise_destroys_a_run_that_died_after_its_complete_summary(tmp_path, monkeypatch, capsys):

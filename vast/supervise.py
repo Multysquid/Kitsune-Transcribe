@@ -33,7 +33,10 @@ reboot during the minutes-long upload) leaves a recorded decision and no marker;
 again, which runs that finish once more (it is idempotent: the Hub skips what it already has, then verify and act)
 instead of idling until the watchdog's deadline, which only stops the box. An exclusive lock
 ($KITSUNE_STATE/supervise.lock, flock) keeps a second supervisor (vast/onstart.sh run again by hand during a healthy
-run) from treating the live attempt as interrupted.
+run) from treating the live attempt as interrupted. onstart's detached subshell holds the same lock while bootstrap runs
+and closes it right before it execs the supervisor, so the supervisor waits for it (wait_for_lock, up to LOCK_WAIT_S)
+before it steps aside: a process left over from bootstrap that still held it (a train_hb toucher's `sleep 60`, box
+p01-chain on 2026-10-01) made the supervisor exit at once, and the box idled with no supervisor.
 
 The final finish.py call is bounded too (FINISH_TIMEOUT_S): its sync and --destroy's verification talk to the Hub (the
 repo listing has no timeout, and a crawling link has none overall), and a hang there would keep the GPU billing until the
@@ -110,6 +113,10 @@ SYNC_TIMEOUT_S = 1800
 FINISH_TIMEOUT_S = {"stop": 1800, "destroy": 3600}
 FALLBACK_TIMEOUT_S = 900  # finish.py --stop --no-sync: infra upload capped at 180 s, then vast REST (3 tries) and CLI
 TAIL_BYTES = 256 << 10
+# supervise.lock: a lock still held when the supervisor starts is polled every LOCK_POLL_S for up to LOCK_WAIT_S before
+# it steps aside (wait_for_lock). Another live supervisor only delays its refusal by that long
+LOCK_WAIT_S = 180.0
+LOCK_POLL_S = 2.0
 CGROUP = Path("/sys/fs/cgroup")
 
 
@@ -199,7 +206,7 @@ def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = Fals
     final finish.py call. The history (attempts with rc, the final decision) and its crash handling are the trainer
     path's (supervise). hb: the controllers' heartbeat file a full box's watchdog reads, beaten around the finish.py
     calls (none for the study box)."""
-    lock = acquire_lock(state_path.with_suffix(".lock"))
+    lock = wait_for_lock(state_path.with_suffix(".lock"))
     if lock is None:
         log(f"another supervisor holds {state_path.with_suffix('.lock')}; not starting a second one")
         return 0
@@ -430,6 +437,27 @@ def acquire_lock(path: Path):
     return f
 
 
+def wait_for_lock(path: Path, wait_s: float | None = None, poll_s: float | None = None, *, sleep=time.sleep,
+                  clock=time.monotonic):
+    """acquire_lock, polled every poll_s (LOCK_POLL_S) for up to wait_s (LOCK_WAIT_S) while another process holds the
+    lock; the wait is logged once. A short-lived holder (a process of the bootstrap that handed over, which inherited
+    onstart's lock fd) must never stop the box; a second live supervisor still holds it after the wait, and this one
+    then steps aside as before. None if it is still held."""
+    wait_s = LOCK_WAIT_S if wait_s is None else wait_s
+    poll_s = LOCK_POLL_S if poll_s is None else poll_s
+    lock = acquire_lock(path)
+    if lock is not None:
+        return lock
+    t0 = clock()
+    log(f"{path} is held by another process; waiting up to {wait_s:.0f} s for it (polling every {poll_s:.0f} s)")
+    while lock is None and clock() - t0 < wait_s:
+        sleep(poll_s)
+        lock = acquire_lock(path)
+    if lock is not None:
+        log(f"got {path} after {clock() - t0:.0f} s")
+    return lock
+
+
 def attempt_run_dir(a: dict, runs_root: Path) -> Path | None:
     """The run dir of a recorded attempt: stored when it ended; for one interrupted by a restart, the --resume path's
     run dir, else the run dir created or touched since the attempt started."""
@@ -442,7 +470,7 @@ def attempt_run_dir(a: dict, runs_root: Path) -> Path | None:
 
 def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: list[str], state_path: Path,
               dry_run: bool = False) -> int:
-    lock = acquire_lock(state_path.with_suffix(".lock"))  # held until this function returns
+    lock = wait_for_lock(state_path.with_suffix(".lock"))  # held until this function returns
     if lock is None:
         log(f"another supervisor holds {state_path.with_suffix('.lock')}; not starting a second one")
         return 0
