@@ -20,8 +20,10 @@ headline numbers and combined loss, and the verdict. This script runs that eval 
            gate_verdict over kitsune.evaluate.verdict with the config's verdict_options (eval.verdict_version) and
            reference model (eval.reference; its file is read before the eval, relative to this repo)
 On the same hardware, weights and settings the per-utterance results and summary.json are the trainer's to the bit
-(tests/test_evaluate_script.py, on CPU). A real run's numbers are close to its evals/step_<N>, not equal: its
-checkpoints hold bf16 weights where the trainer evaluated its fp32 masters, and another GPU runs other kernels.
+(tests/test_evaluate_script.py, on CPU; on CUDA only since the per-utterance sums use no atomics, kitsune.ctc_kd's
+_per_row, and for the same batches: a sum depends on its batch's padded width). A real run's numbers are close to its
+evals/step_<N>, not equal: its checkpoints hold bf16 weights where the trainer evaluated its fp32 masters, and another
+GPU runs other kernels.
 
 Output (--out; the layout of runs/<run_id>/evals/step_<N>/):
   tf_<set>.parquet, greedy_<set>.parquet  per utterance, as the trainer writes them (greedy with in_greedy_subset)

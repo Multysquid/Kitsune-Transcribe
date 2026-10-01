@@ -44,8 +44,12 @@ Principles:
                     they are used, so the report can import this module on the laptop
 
 Numerics (the exact recipes; the constants are the torchao parity test's to pin):
-  every scale is computed in fp32 from the bf16-rounded weight, so the pack is the same bits on CPU and CUDA (the
-  export runs on CPU); torch.round is round half to even; values are clamped to +-448 before any cast to e4m3
+  every scale is computed in fp32 from the bf16-rounded weight, on the CPU wherever the weight lives (pack_weight):
+  CUDA divides by a Python scalar as a multiply by its fp32 reciprocal, so a pack computed there differs from the
+  export's (the nvfp4 tensor scale in ~1 layer in 5, the fp8 row scales in about half the rows; int8 and mxfp4 by
+  construction never), and an in-memory quantised model on the GPU would not be the shipped file (box 53693389's
+  smoke B: cmp-nvfp4-w4a4 hyps differed in 316-1995 utterances a set); torch.round is round half to even; values are
+  clamped to +-448 before any cast to e4m3
   E2M1          codes 0-7 = {0, .5, 1, 1.5, 2, 3, 4, 6}, bit 3 the sign (torch.signbit: -0.2 is code 8, as torchao);
                 round to nearest, ties to the even code; two codes per byte, element 2i in the low nibble
   int8 weights  s = max(bf16(amax_row / INT8_DIV), INT8_EPS) (torchao keeps the weight's dtype for the scale:
@@ -456,7 +460,8 @@ def align_problem(wfmt: str, n: int, k: int) -> str | None:
 
 def pack_weight(w: torch.Tensor, wfmt: str, *, mx_rounding: str = "rceil") -> QuantPack:
     """The canonical pack of a 2-D weight, from the weight rounded to bf16 (a bf16 and an fp32 copy of the same bf16
-    values give the same bits). Non-finite weights raise QuantError."""
+    values give the same bits), computed on the CPU and returned there whatever the weight's device (module docstring,
+    Numerics; _install moves it to its module's device). Non-finite weights raise QuantError."""
     if wfmt not in WFMTS:
         raise QuantRefused(f"unknown weight format {wfmt!r}: one of {WFMTS}")
     if w.dim() != 2:
@@ -464,7 +469,7 @@ def pack_weight(w: torch.Tensor, wfmt: str, *, mx_rounding: str = "rceil") -> Qu
     n, k = (int(x) for x in w.shape)
     if wfmt in ("nvfp4", "mxfp4") and (why := align_problem(wfmt, n, k)):
         raise QuantError(why)  # the blocks need it; the int8 / fp8 kernels' N, K % 8 is select_layers' to apply
-    wb = w.detach().to(torch.bfloat16).float()
+    wb = w.detach().to("cpu", torch.bfloat16).float()
     if not bool(torch.isfinite(wb).all()):
         raise QuantError(f"a weight of shape {(n, k)} holds non-finite values: it cannot be quantised")
     if wfmt == "int8":
@@ -1939,11 +1944,65 @@ def _greedy_sets(d: Path) -> dict[str, Path]:
     return {p.name[len("greedy_"):-len(".parquet")]: p for p in sorted(d.glob("greedy_*.parquet"))}
 
 
+# the 05 --out identity (.parts/identity.json) and per-set record (.parts/<set>.json) fields that fix an eval's batches:
+# the exact compare's batching guard (weights and step differ between a variant file and its in-memory source)
+BATCH_IDENTITY_KEYS = ("store", "batch_s", "device", "autocast", "tf32", "relpos_patch", "family", "eval_sets",
+                       "sources", "subset", "quant")
+BATCH_SET_KEYS = ("pass_sets", "batch_s", "chunks")
+
+
+def _batching(d: Path, s: str) -> dict | None:
+    """What fixed the batches of set s in a 05 --out dir (BATCH_IDENTITY_KEYS, the quant block without its source,
+    and BATCH_SET_KEYS of the set's record), or None without its .parts records."""
+    try:
+        ident = json.loads((d / ".parts" / "identity.json").read_text(encoding="utf-8"))
+        rec = json.loads((d / ".parts" / f"{s}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(ident, dict) or not isinstance(rec, dict):
+        return None
+    out = {k: ident.get(k) for k in BATCH_IDENTITY_KEYS}
+    if isinstance(out["quant"], dict):
+        out["quant"] = {k: v for k, v in out["quant"].items() if k != "source"}
+    return dict(out, **{f"set.{k}": rec.get(k) for k in BATCH_SET_KEYS})
+
+
+def _tf_diff(fa, fb) -> dict:
+    """{column: {n_diff, max_abs, max_rel}} of the columns two tf tables (the same ids, sorted) differ in, bitwise
+    (NaN equals NaN): ulp noise (max_rel ~1e-7) tells itself from a real difference at a glance."""
+    import numpy as np
+
+    out = {}
+    for c in fa.columns:
+        if c == "id":
+            continue
+        a, b = fa[c].to_numpy(), fb[c].to_numpy()
+        if a.dtype.kind in "fc" and b.dtype.kind in "fc":
+            a, b = a.astype(np.float64), b.astype(np.float64)
+            diff = ~((a == b) | (np.isnan(a) & np.isnan(b)))
+            if diff.any():
+                d = np.abs(a[diff] - b[diff])
+                rel = d / np.maximum(np.abs(a[diff]), np.abs(b[diff]))
+                out[c] = dict(n_diff=int(diff.sum()), max_abs=float(np.nanmax(d)) if np.isfinite(d).any() else None,
+                              max_rel=float(np.nanmax(rel)) if np.isfinite(rel).any() else None)
+        else:
+            diff = np.asarray([x != y for x, y in zip(a, b)], dtype=bool)
+            if diff.any():
+                out[c] = dict(n_diff=int(diff.sum()), max_abs=None, max_rel=None)
+    return out
+
+
 def compare_eval_dirs(a, b, *, exact: bool = True, tol_cer: float = 0.0) -> dict:
-    """Two 05 --out dirs over the sets both hold: exact (every greedy hypothesis equal by id, and the teacher-forced
-    per-utterance tables tf_<set> equal) or each set's corpus CER within tol_cer. {same, mode, tol_cer, sets: {set:
-    {n_a, n_b, n_diff, hyps_equal, tf_equal, cer_a, cer_b, delta}}, only_a, only_b}; same is false when no set is
-    shared."""
+    """Two 05 --out dirs over the sets both hold: exact (every greedy hypothesis equal by id, the corpus CERs equal, and
+    the teacher-forced per-utterance tables tf_<set> equal, bitwise, by id) or each set's corpus CER within tol_cer.
+    {same, mode, tol_cer, sets: {set: {n_a, n_b, n_diff, hyps_equal, tf_equal, tf_diff, batches_equal, cer_a, cer_b,
+    delta, same, reason}}, only_a, only_b}; same is false when no set is shared.
+
+    tf_diff names each column the tf tables differ in with its n_diff, max_abs and max_rel. batches_equal: whether
+    both dirs evaluated the set in the same batches (_batching: their .parts records; None when either has none), which
+    an exact tf comparison needs - a per-utterance sum depends on its batch's padded width - so exact mode fails a set
+    evaluated on different batches with that reason. Box 53693389's check 14 failed on tf tables 3e-7 apart (the
+    per-utterance sums' CUDA atomics, since removed: kitsune.ctc_kd._per_row) with every hypothesis equal."""
     import pandas as pd
 
     from kitsune.evaluate import corpus_cer
@@ -1960,16 +2019,30 @@ def compare_eval_dirs(a, b, *, exact: bool = True, tol_cer: float = 0.0) -> dict
         n_diff = sum(ha.get(i) != hb.get(i) for i in ids)
         cer_a = corpus_cer(ga["hyp"].astype(str).tolist(), ga["ref"].astype(str).tolist())["cer"]
         cer_b = corpus_cer(gb["hyp"].astype(str).tolist(), gb["ref"].astype(str).tolist())["cer"]
-        tf_equal = None
+        tf_equal, tf_diff, reason = None, None, None
         ta, tb = a / f"tf_{s}.parquet", b / f"tf_{s}.parquet"
         if ta.is_file() and tb.is_file():
             fa = pd.read_parquet(ta).sort_values("id").reset_index(drop=True)
             fb = pd.read_parquet(tb).sort_values("id").reset_index(drop=True)
-            tf_equal = bool(list(fa.columns) == list(fb.columns) and fa.equals(fb))
+            if sorted(fa.columns) != sorted(fb.columns) or fa["id"].astype(str).tolist() != \
+                    fb["id"].astype(str).tolist():
+                tf_equal, reason = False, "the tf tables hold other ids or columns"
+            else:
+                tf_diff = _tf_diff(fa, fb[list(fa.columns)])
+                tf_equal = not tf_diff
+        ba, bb = _batching(a, s), _batching(b, s)
+        batches_equal = None if ba is None or bb is None else ba == bb
         delta = None if cer_a is None or cer_b is None else abs(float(cer_a) - float(cer_b))
-        ok = (n_diff == 0 and tf_equal is not False) if exact else (delta is not None and delta <= tol_cer)
+        if exact:
+            ok = n_diff == 0 and cer_a == cer_b and tf_equal is not False and batches_equal is not False
+            if batches_equal is False:
+                reason = "evaluated on different batches: " + ", ".join(
+                    sorted(k for k in set(ba) | set(bb) if ba.get(k) != bb.get(k)))
+        else:
+            ok = delta is not None and delta <= tol_cer
         sets[s] = dict(n_a=len(ha), n_b=len(hb), n_diff=int(n_diff), hyps_equal=n_diff == 0, tf_equal=tf_equal,
-                       cer_a=cer_a, cer_b=cer_b, delta=delta, same=bool(ok))
+                       tf_diff=tf_diff, batches_equal=batches_equal, cer_a=cer_a, cer_b=cer_b, delta=delta,
+                       same=bool(ok), reason=reason)
     return dict(same=bool(both) and all(v["same"] for v in sets.values()), mode="exact" if exact else "tol_cer",
                 tol_cer=None if exact else float(tol_cer), a=str(a), b=str(b), sets=sets,
                 only_a=sorted(set(sa) - set(sb)), only_b=sorted(set(sb) - set(sa)), time_utc=_now())
@@ -2028,12 +2101,44 @@ def selftest(device, *, ckpt=None, rows=(1, 7, 17, 128, 1000), shape=(2560, 1024
         rec["gpu"] = torch.cuda.get_device_name(dev)
         rec["capability"] = list(torch.cuda.get_device_capability(dev))
         check("environment", True, rec["gpu"])
+        _selftest_pack_device(rec, check, dev, shape)
         _selftest_layers(rec, check, dev, rows, shape)
         _selftest_mxfp4(rec, dev, shape)
         for d in ckpt or []:
             _selftest_ckpt(rec, check, dev, Path(d))
     rec["ok"] = all(c["ok"] for c in rec["checks"])
     return rec
+
+
+def _packs_equal(a: QuantPack, b: QuantPack) -> bool:
+    """Two packs with the same bits in every part (and the same format, shape and rounding)."""
+    pa, pb = a.parts(), b.parts()
+
+    def raw(t: torch.Tensor) -> torch.Tensor:  # the bytes (an fp8 or a 0-dim fp32 tensor scale too)
+        return t.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+
+    return (a.wfmt, tuple(a.shape), a.mx_rounding) == (b.wfmt, tuple(b.shape), b.mx_rounding) and \
+        pa.keys() == pb.keys() and all(pa[k].dtype == pb[k].dtype and pa[k].shape == pb[k].shape
+                                       and torch.equal(raw(pa[k]), raw(pb[k])) for k in pa)
+
+
+def _selftest_pack_device(rec, check, dev, shape):
+    """Hard check pack_device_parity: a weight on the GPU packs to the CPU's bits in every weight format (pack_weight
+    computes on the CPU), so an in-memory quantised model (05 --quant, speed_probe) is the exported file. device_arith
+    (a record, no check): what computing the scales on the GPU itself gives - the rows whose nvfp4-style tensor scale
+    amax / (448 * 6) and whose fp8 scale amax / 448 differ from the CPU's, the mechanism box 53693389's cmp-nvfp4
+    failure points to (CUDA divides by a Python scalar as a multiply by its reciprocal)."""
+    n, k = shape
+    g = torch.Generator(device="cpu").manual_seed(1)
+    w = torch.randn(n, k, generator=g) * 0.02
+    bad = [wf for wf in WFMTS if not _packs_equal(pack_weight(w, wf), pack_weight(w.to(dev), wf))]
+    check("pack_device_parity", not bad, f"differs from the CPU's pack: {bad}" if bad else f"{list(WFMTS)}")
+    amax = w.to(torch.bfloat16).float().abs().amax(dim=1)
+    amax_d = amax.to(dev)
+    rec["device_arith"] = dict(
+        rows=int(n), nvfp4_tensor_scale_rows_differ=int(((amax_d / (F8_MAX * F4_MAX)).cpu()
+                                                         != amax / (F8_MAX * F4_MAX)).sum()),
+        fp8_scale_rows_differ=int(((amax_d / F8_MAX).cpu() != amax / F8_MAX).sum()))
 
 
 def _selftest_layers(rec, check, dev, rows, shape):

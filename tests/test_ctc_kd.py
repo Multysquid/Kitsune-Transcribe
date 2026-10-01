@@ -216,6 +216,56 @@ def test_per_utterance_values_sum_to_the_totals():
     assert per["n_frames"].tolist() == [40, 25, 7]
 
 
+def _old_per_row(values, mask):
+    """The per-row sums as they were before box 53693389's check 14: index_add_ over the rows of mask.nonzero() (CUDA
+    adds them with atomics, in no fixed order)."""
+    rows = mask.nonzero()[:, 0]
+    return torch.zeros(mask.shape[0], dtype=values.dtype).index_add_(0, rows, values)
+
+
+def test_per_utt_sums_use_no_atomics(monkeypatch):
+    """ctc_kd_losses(per_utt=True) never calls index_add_ (nondeterministic on CUDA), and its per-utterance sums are
+    the old ones up to the summation order."""
+    teacher, tg = real_vocab_batch(seed=2)
+    student = torch.log_softmax(teacher + torch.randn(teacher.shape, generator=torch.Generator().manual_seed(9)), -1)
+    batch = collate_frame_targets(tg)
+    want = K.ctc_kd_losses(student, batch, per_utt=True)
+
+    def no_index_add(*a, **k):
+        raise AssertionError("index_add_ called")
+
+    monkeypatch.setattr(torch.Tensor, "index_add_", no_index_add)
+    per = K.ctc_kd_losses(student, batch, per_utt=True)
+    for key in want:
+        assert torch.equal(per[key], want[key]), key
+    monkeypatch.undo()
+    b = K._fit(batch, student.shape[1], student.device)
+    dm = b["dense_mask"] & b["frame_mask"]
+    v = torch.randn(int(dm.sum()), generator=torch.Generator().manual_seed(1))
+    assert torch.allclose(K._per_row(v, dm), _old_per_row(v, dm), rtol=1e-6, atol=1e-6)
+
+
+def test_the_objectives_gradient_is_unchanged_to_the_bit():
+    """The trainer's loss (ctc_kd_objective over per_utt=True, as 04_distill's ctc_step_loss) gives the same gradient
+    w.r.t. the student's log-probs, bit for bit, as with the old index_add_ sums: each KL value gets its row's upstream
+    gradient either way, so the change moves no training step (only the logged per-utterance values, by an ulp)."""
+    teacher, tg = real_vocab_batch(seed=3)
+    batch = collate_frame_targets(tg)
+    base = torch.log_softmax(teacher + torch.randn(teacher.shape, generator=torch.Generator().manual_seed(5)), -1)
+    grads = []
+    for per_row in (K._per_row, _old_per_row):
+        lp = base.clone().requires_grad_(True)
+        orig = K._per_row
+        K._per_row = per_row
+        try:
+            losses = K.ctc_kd_losses(lp, batch, per_utt=True)
+        finally:
+            K._per_row = orig
+        K.ctc_kd_objective(losses, losses["n_tokens"].sum()).backward()
+        grads.append(lp.grad)
+    assert torch.equal(grads[0], grads[1])
+
+
 def test_frame_metrics_count_valid_frames_only():
     teacher, tg = real_vocab_batch(seed=4)
     batch = collate_frame_targets(tg, t_max=50)

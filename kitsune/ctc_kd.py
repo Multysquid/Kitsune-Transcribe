@@ -19,7 +19,8 @@ CTC_utt is `F.ctc_loss(log_probs, the teacher's greedy CTC path, reduction="sum"
 (HF's "mean" divides by target length per utterance; NeMo's default mean_volume is yet another normalisation).
 
 `ctc_kd_losses` returns SUMS (or per-utterance vectors with per_utt=True) so the trainer aggregates micro-batches and
-logs per source; `ctc_kd_objective` divides by the step's N_u. The frame metrics (argmax agreement with the teacher,
+logs per source; `ctc_kd_objective` divides by the step's N_u. The per-utterance sums use no atomics (_per_row), so the
+same batch gives the same bits on CUDA too. The frame metrics (argmax agreement with the teacher,
 student / teacher argmax = blank) are counts over valid frames: the argmax-blank share is the blank-collapse watch.
 """
 from __future__ import annotations
@@ -45,8 +46,14 @@ def _fit(batch: dict, T: int, device) -> dict:
     return out
 
 
-def _per_row(values: Tensor, rows: Tensor, B: int) -> Tensor:
-    return torch.zeros(B, dtype=values.dtype, device=values.device).index_add_(0, rows, values)
+def _per_row(values: Tensor, mask: Tensor) -> Tensor:
+    """The per-row sums of values = x[mask] (row-major order) as a (B,) vector: values scattered back into a zero (B, T)
+    in the mask's places (masked_scatter fills in the row-major order lp[mask] read them in), summed over T. Not
+    index_add_: on CUDA it adds with atomics, so the order and the last bits of a row's sum changed from run to run
+    (torch.use_deterministic_algorithms lists it) - smoke B's check 14 (box 53693389) compared a readout's and an
+    in-memory eval's tf_<set> tables bitwise and found sum_kl_dense / sum_kl_blank 3e-7 apart on bit-identical model
+    outputs. The gradient is unchanged to the bit: each value gets its row's upstream gradient either way."""
+    return values.new_zeros(mask.shape).masked_scatter(mask, values).sum(dim=1)
 
 
 def ctc_kd_losses(log_probs: Tensor, batch: dict, blank: int = CTC_BLANK, per_utt: bool = False) -> dict[str, Tensor]:
@@ -70,7 +77,6 @@ def ctc_kd_losses(log_probs: Tensor, batch: dict, blank: int = CTC_BLANK, per_ut
 
     with torch.autocast(device_type=lp.device.type, enabled=False):
         # dense frames: stored top-k U {blank} + rest (boolean indexing: padded frames never enter any sum)
-        rows_d = dm.nonzero()[:, 0]
         lpd = lp[dm]  # (Nd, V)
         idx = b["topk_idx"][dm]  # (Nd, k)
         blank_in = (idx == blank).any(dim=-1)
@@ -85,7 +91,6 @@ def ctc_kd_losses(log_probs: Tensor, batch: dict, blank: int = CTC_BLANK, per_ut
         kl_d = negent - (p * logq).sum(dim=-1) - p_r * logq_r
 
         # blank-only frames: 2-bin KL
-        rows_b = bm.nonzero()[:, 0]
         lpb = lp[bm]  # (Nb, V)
         p_b = b["blank_lp"][bm].to(lp.dtype).exp().clamp(max=1.0)
         p_nb = (1.0 - p_b).clamp_min(0.0)
@@ -108,7 +113,7 @@ def ctc_kd_losses(log_probs: Tensor, batch: dict, blank: int = CTC_BLANK, per_ut
         t_blank = (t_col0 == blank) & fm
 
     if per_utt:
-        return dict(kl_dense=_per_row(kl_d, rows_d, B), kl_blank=_per_row(kl_b, rows_b, B), ctc=ctc,
+        return dict(kl_dense=_per_row(kl_d, dm), kl_blank=_per_row(kl_b, bm), ctc=ctc,
                     n_dense=dm.sum(dim=1), n_blank_frames=bm.sum(dim=1), n_frames=fm.sum(dim=1),
                     n_tokens=b["ctc_target_lengths"], argmax_agree=agree.sum(dim=1), argmax_blank=s_blank.sum(dim=1),
                     teacher_blank=t_blank.sum(dim=1))
