@@ -24,6 +24,9 @@ PY=/venv/main/bin/python
 export KITSUNE_PY="$PY"
 
 mkdir -p "$KITSUNE_STATE" "$(dirname "$KITSUNE_LOG")"
+# temp files on /workspace, not /tmp (a box lost a /tmp file mid-bootstrap on 2026-10-01): mktemp, tempfile, caches
+export TMPDIR="${KITSUNE_TMPDIR:-/workspace/tmp}"
+mkdir -p "$TMPDIR"
 exec >>"$KITSUNE_LOG" 2>&1
 
 log() { printf '%s [onstart] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }

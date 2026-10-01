@@ -664,7 +664,8 @@ case "$*" in
     "-m kitsune.netgate --timeouts"*) echo "${FAKE_TIMEOUTS:-41 400}"; exit 0 ;;
     "-m kitsune.full_queue resume-pull"*) exit "${FAKE_RESUME_RC:-0}" ;;
     "-m kitsune.fullrun check-students"*) exit 0 ;;
-    scripts/01_prepare_data.py*) exit "${FAKE_REBUILD_RC:-0}" ;;
+    scripts/01_prepare_data.py*) [ -z "${FAKE_RM_HELPER:-}" ] || rm -f "$STATE/bootstrap_helper.py"
+                                 exit "${FAKE_REBUILD_RC:-0}" ;;
 esac
 case "${2:-}" in
     plan) printf '{"data_root": "data", "rebuild": ["galgame"], "extent": %s}\n' "${FAKE_EXTENT:-true}" \
@@ -735,6 +736,21 @@ def test_a_full_bootstrap_runs_its_phases_in_order(tmp_path):
     assert (state / "train_hb").exists()
     r, calls, _ = run_bootstrap(tmp_path / "fresh")  # a fresh box: no resume_pull
     assert r.returncode == 0 and not any("resume-pull" in c for c in calls), calls
+
+
+def test_a_helper_lost_during_the_rebuild_is_written_again(tmp_path):
+    """2026-10-01: a box lost its /tmp helper between the label pull and the coverage check and destroyed itself. The
+    helper now lives in the box state, and every phase writes it again (and says so) when it is gone: here the rebuild
+    deletes it, and the coverage check still runs it."""
+    r, calls, state = run_bootstrap(tmp_path, FAKE_RM_HELPER="1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "bootstrap_helper.py was missing; writing it again" in r.stdout
+    assert calls[-1].startswith("HELPER coverage"), calls
+    assert not list((tmp_path / "tmp").iterdir()), "nothing of the bootstrap's goes to TMPDIR"
+    text = BOOTSTRAP.read_text(encoding="utf-8")
+    assert 'HELPER="$STATE/bootstrap_helper.py"' in text and "mktemp" not in text.split("PYEOF")[0]
+    onstart = (BOOTSTRAP.parent / "onstart.sh").read_text(encoding="utf-8")
+    assert 'export TMPDIR="${KITSUNE_TMPDIR:-/workspace/tmp}"' in onstart and 'mkdir -p "$TMPDIR"' in onstart
 
 
 @pytest.mark.parametrize("what", ["gate", "resume"])
