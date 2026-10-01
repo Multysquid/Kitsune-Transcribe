@@ -253,9 +253,73 @@ def test_an_unreadable_hub_is_not_decidable(tmp_path, capsys, monkeypatch):
 
     monkeypatch.setattr(G, "HubReader", Broken)
     rc = G.main(["--json", str(tmp_path / "go.json")])
-    assert rc == G.EXIT_WAIT and "not decidable: the runs repo is not readable" in capsys.readouterr().out
-    assert json.loads((tmp_path / "go.json").read_text(encoding="utf-8")) == {"go": None, "exit": 2, "lines": [],
+    assert rc == G.EXIT_HUB == 3 and "NOT DECIDABLE (Hub unreachable)" in capsys.readouterr().out
+    assert json.loads((tmp_path / "go.json").read_text(encoding="utf-8")) == {"go": None, "exit": 3, "lines": [],
                                                                                "box1": None}
     # nothing of box 1 on the Hub yet: not decidable either
     (tmp_path / "empty").mkdir()
     assert G.main(["--hub-dir", str(tmp_path / "empty")]) == G.EXIT_WAIT
+
+
+class FakeHfHub:
+    """huggingface_hub's HfApi.repo_info and hf_hub_download over a local folder at one head commit: a missing file is
+    the Hub's 404 (RemoteEntryNotFoundError); `down` makes every download fail as a dropped network does (no cached
+    copy: LocalEntryNotFoundError, an EntryNotFoundError too); `head_down` makes repo_info fail."""
+
+    def __init__(self, root: Path, sha: str = "c0ffee" * 6 + "abcd"):
+        self.root, self.sha, self.down, self.head_down, self.calls = root, sha, set(), False, []
+
+    def install(self, monkeypatch):
+        import huggingface_hub
+
+        fake = self
+
+        class Api:
+            def repo_info(self, repo):
+                fake.calls.append(("repo_info", repo))
+                if fake.head_down:
+                    raise ConnectionError("Hub unreachable")
+                return SimpleNamespace(sha=fake.sha)
+
+        monkeypatch.setattr(huggingface_hub, "HfApi", Api)
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", self.download)
+
+    def download(self, repo, path, revision=None, cache_dir=None):
+        import httpx
+        from huggingface_hub.errors import LocalEntryNotFoundError, RemoteEntryNotFoundError
+
+        self.calls.append(("download", path, revision))
+        if path in self.down or "*" in self.down:
+            raise LocalEntryNotFoundError("cannot reach the Hub and the file is not in the cache")
+        p = self.root / path
+        if not p.is_file():
+            raise RemoteEntryNotFoundError(f"404: {path}", response=httpx.Response(
+                404, request=httpx.Request("GET", f"https://huggingface.co/{repo}/resolve/{revision}/{path}")))
+        return str(p)
+
+
+def test_the_hub_reader_tells_a_missing_file_from_an_unreachable_hub(tmp_path, capsys, monkeypatch):
+    """A file the Hub says is not there is None (G5: run smoke-B, a NO-GO); a download that could not ask the Hub
+    (LocalEntryNotFoundError, which huggingface_hub 1.x derives from EntryNotFoundError) or a head commit it could not
+    resolve is HubUnreadable: exit EXIT_HUB, never a false NO-GO. Every file is read at the head commit."""
+    hub = go_hub(tmp_path / "hub")
+    fake = FakeHfHub(hub)
+    fake.install(monkeypatch)
+    r = G.HubReader()
+    assert r.get(fullrun.box_summary_path("p01")) is not None and r.get("full/box-p01/nothing.json") is None
+    assert [c for c in fake.calls if c[0] == "repo_info"] == [("repo_info", G.RUNS_REPO)]  # resolved once
+    assert {c[2] for c in fake.calls if c[0] == "download"} == {fake.sha}
+    assert G.main(["--json", str(tmp_path / "go.json")]) == G.EXIT_GO
+    capsys.readouterr()
+    fake.down = {fullrun.box_verdict_path("smoke-b")}  # G1-G4 read fine, smoke-B's verdict cannot be fetched
+    rc = G.main(["--json", str(tmp_path / "go.json")])
+    out = capsys.readouterr().out
+    assert rc == G.EXIT_HUB and "NOT DECIDABLE (Hub unreachable)" in out and "NO-GO" not in out.replace(
+        "nothing here is a NO-GO", "")
+    assert json.loads((tmp_path / "go.json").read_text(encoding="utf-8"))["go"] is None
+    fake.down = set()
+    (hub / fullrun.box_verdict_path("smoke-b")).unlink()  # the Hub's own answer: no verdict, a NO-GO (G5)
+    assert G.main([]) == G.EXIT_NOGO
+    capsys.readouterr()
+    fake.head_down = True
+    assert G.main([]) == G.EXIT_HUB and "Hub unreachable" in capsys.readouterr().out

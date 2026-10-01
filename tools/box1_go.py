@@ -22,7 +22,10 @@ repo's layout instead, for the tests or an offline copy):
   G5 smoke-B    full/box-smoke-b/smoke_verdict.json passed overall and every one of checks 12-16 (DECISIONS F2; launch
                 checks that its commit ran the quant code box full will run).
 GO when G1, G2, G3, G5 pass and G4 measured; exit 0 GO, 1 NO-GO, 2 not decidable yet (box 1 still running, a file not
-on the Hub yet, the Hub unreadable). While box 1 trains, its scalars so far give a partial projection of its run.
+on the Hub yet), 3 not decidable: the Hub unreachable (any read that did not get the Hub's answer - a network error,
+auth, a missing repo - never reads as a missing file, which could print a false NO-GO). The reader pins the runs
+repo's head commit first, so a cached copy is used only when it is that commit's file, never a stale one. While box 1
+trains, its scalars so far give a partial projection of its run.
 
 It then projects box 2's hours with box 1's measurement (tools/make_full_configs.py box2_hours on this checkout's plan
 and speed record) and lists what boxes.json would change; --json OUT writes {go, exit, lines, box1}, whose box1 object
@@ -54,12 +57,12 @@ GO_M4 = 0.1382  # P-0.1B's study M4 (contract 5); box 1 must beat it
 MIN_DEV_EVALS = 9  # early_stop.min_evals 5 smoothed values over smooth 5 checks
 SMOKE_STEPS_DEFAULT = 100  # the trainer's smoke.steps when the run config does not say
 STUDENT = "p01"
-EXIT_GO, EXIT_NOGO, EXIT_WAIT = 0, 1, 2
+EXIT_GO, EXIT_NOGO, EXIT_WAIT, EXIT_HUB = 0, 1, 2, 3
 PASS, FAIL, WAIT, INFO = "PASS", "FAIL", "WAIT", "INFO"
 
 
 class HubUnreadable(RuntimeError):
-    """The runs repo could not be read (not a missing file: those are None)."""
+    """The runs repo could not be read (not a missing file: those are None): exit EXIT_HUB."""
 
 
 class DirReader:
@@ -74,20 +77,33 @@ class DirReader:
 
 
 class HubReader:
-    """The runs repo through huggingface_hub (read-only downloads into cache_dir); a missing file is None."""
+    """The runs repo through huggingface_hub (read-only downloads into cache_dir) at its head commit, resolved once
+    (HfApi.repo_info): every file is read at that revision, so the cache serves only that commit's copy - without the
+    pin, hf_hub_download whose HEAD request fails returns whatever main's cached copy is, silently. A file is None only
+    when the Hub answered that it is not there (RemoteEntryNotFoundError); huggingface_hub 1.x's
+    LocalEntryNotFoundError is an EntryNotFoundError too, but it means the Hub could not be asked: HubUnreadable."""
 
     def __init__(self, repo: str = RUNS_REPO, cache_dir=None):
         self.repo, self.cache_dir = repo, cache_dir
+        self.revision: str | None = None
 
     def get(self, path: str) -> Path | None:
         try:
-            from huggingface_hub import hf_hub_download
-            from huggingface_hub.utils import EntryNotFoundError
+            from huggingface_hub import HfApi, hf_hub_download
+            from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
         except ImportError as e:
             raise HubUnreadable(f"huggingface_hub is not installed ({e})") from None
         try:
-            return Path(hf_hub_download(self.repo, path, cache_dir=self.cache_dir))
-        except EntryNotFoundError:
+            if self.revision is None:
+                self.revision = HfApi().repo_info(self.repo).sha
+                if not self.revision:
+                    raise HubUnreadable(f"{self.repo}: the Hub gave no head commit")
+            return Path(hf_hub_download(self.repo, path, revision=self.revision, cache_dir=self.cache_dir))
+        except HubUnreadable:
+            raise
+        except EntryNotFoundError as e:
+            if isinstance(e, LocalEntryNotFoundError):  # not the Hub's answer: it could not be reached
+                raise HubUnreadable(f"{self.repo}/{path}: {type(e).__name__}: {e}") from None
             return None
         except Exception as e:  # noqa: BLE001  network, auth, a missing repo: not decidable
             raise HubUnreadable(f"{self.repo}/{path}: {type(e).__name__}: {e}") from None
@@ -416,8 +432,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         rep = analyse(reader)
     except HubUnreadable as e:
-        print(f"not decidable: the runs repo is not readable ({e})")
-        rep, rc = None, EXIT_WAIT
+        print(f"NOT DECIDABLE (Hub unreachable): the runs repo could not be read ({e}); nothing here is a NO-GO, run "
+              f"again")
+        rep, rc = None, EXIT_HUB
     else:
         rc = rep.rc
         for gid, st, text in rep.lines:
@@ -430,7 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             for line in box2_projection(rep.box1):
                 print(line)
     if args.json:
-        out = {"go": None if rc == EXIT_WAIT else rc == EXIT_GO, "exit": rc,
+        out = {"go": None if rc in (EXIT_WAIT, EXIT_HUB) else rc == EXIT_GO, "exit": rc,
                "lines": [dict(id=g, status=s, text=t) for g, s, t in (rep.lines if rep else [])],
                "box1": rep.box1 if rep else None}
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
