@@ -4,7 +4,10 @@ record tools/study_report.py's Pareto view reads, merges systems into one file a
 draw is reproducible; --require-idle refuses a busy GPU. The decode it times is the evaluator's: the CTC student's
 CER on the list equals kitsune.evaluate.ctc_eval's, a trained-length AED decode greedy_eval's. An untrained Transcribe
 init dir is timed at the teacher's token counts (decode_len); the warm-ups and the allocator's cache never fall inside
-a clock (the order of the passes, on a recording runner); the study box queue's command lines parse.
+a clock (the order of the passes, on a recording runner); the study box queue's command lines parse. F4: a
+--quant / --compile record carries its quant recipe and a CER sanity against the same weights' unquantised decode,
+loaded only after the clocks; an insane one is written and exits 4; a probe that raises is recorded in the file's
+failed block until the system's next good probe.
 
 CPU only, tiny random models, a synthetic corpus in the real formats; the Transcribe kinds need the gated teacher
 processor in the local HF cache (skipped without it, as tests/test_evaluate_script.py)."""
@@ -357,6 +360,85 @@ def test_quant_records(env, tmp_path):
     assert list(h.columns) == ["id", "ref", "hyp", "hyp_1", "duration"] and h["id"].tolist() == doc["ids"]
     assert h["hyp_1"].notna().sum() == 4 and (h["hyp_1"].iloc[:4] != h["hyp"].iloc[:4]).sum() == q["hyp_diff_1"]
     assert "torchao" in q["versions"]
+    # F4: the quant code's recipe, and the CER sanity against the same weights' unquantised decode (here fp32, the
+    # CPU dtype; bf16 on CUDA) of the same ids in the same batches
+    from kitsune import quant as Q
+
+    assert base["quant_recipe"] is None and base["reference"] is None and base["sanity"] is None
+    for r in (q, f16):
+        assert r["quant_recipe"]["version"] == Q.RECIPE_VERSION == 2 and len(r["quant_recipe"]["sha256"]) == 64
+        ref, s = r["reference"], r["sanity"]
+        assert ref["system"] == "study-p01" and ref["dtype"] == "fp32" and ref["batches"] == r["batches"]
+        assert ref["cer_ref_corpus"] == base["cer_ref_corpus"]  # the reference IS the bf16 / fp32 system's decode
+        assert s["ok"] and s["reference"] == "study-p01" and abs(s["delta"]) <= sp.SANITY_MAX_DELTA == 0.05
+        assert s["cer"] == r["cer_ref_corpus"] and s["cer_bf16"] == ref["cer_ref_corpus"] and s["reason"] is None
+    assert q["quant_recipe"]["sha256"] == Q.recipe_sha256("int8-w8a8")
+
+
+def test_the_reference_loads_after_the_clocks_unquantised(env, tmp_path, monkeypatch):
+    """The sanity's reference is loaded only after the timed probe (it never shares the clocks or the VRAM peaks),
+    with quant None and compile False, the same rel-pos patch and decode length; a bf16 probe loads nothing more."""
+    calls, real_load, real_probe = [], sp.load_runner, sp.probe
+    monkeypatch.setattr(sp, "load_runner", lambda *a, **k: calls.append(("load", k.get("quant"), k.get("compile"),
+                                                                         k.get("relpos_patch")))
+                        or real_load(*a, **k))
+    monkeypatch.setattr(sp, "probe", lambda *a, **k: calls.append(("probe",)) or real_probe(*a, **k))
+    out = tmp_path / "speed.json"
+    assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "s@nvfp4-w4a4", "--quant",
+               "nvfp4-w4a4", "--quant-impl", "emulate", "--per-set", "2") == 0
+    assert [c[0] for c in calls] == ["load", "probe", "load"]
+    assert calls[0][1]["fmt"] == "nvfp4-w4a4" and calls[2][1:] == (None, False, True)
+    calls.clear()
+    assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "s") == 0
+    assert [c[0] for c in calls] == ["load", "probe"]
+
+
+def test_an_insane_record_is_written_and_exits_4(env, tmp_path, monkeypatch, capsys):
+    """F4 / check 16: a quantised model that decodes garbage (box 53693389's fp8: CER 0.94) is still recorded, with
+    sanity.ok false and its reason, and the probe exits 4 (the queue fails the speed item, no retry)."""
+    real_load = sp.load_runner
+
+    def garbage(*a, **k):
+        runner, desc = real_load(*a, **k)
+        if k.get("quant"):
+            runner.decode = lambda waves, durations, n_tok: ["ン" * 200 for _ in waves]
+        return runner, desc
+
+    monkeypatch.setattr(sp, "load_runner", garbage)
+    out = tmp_path / "speed.json"
+    assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "study-p01@fp8-w8a8", "--quant",
+               "fp8-w8a8", "--quant-impl", "emulate", "--per-set", "2") == sp.EXIT_INSANE == 4
+    r = json.loads(out.read_text(encoding="utf-8"))["systems"]["study-p01@fp8-w8a8"]
+    s = r["sanity"]
+    assert s["ok"] is False and s["delta"] > sp.SANITY_MAX_DELTA and "above the bf16 reference" in s["reason"]
+    assert s["hyps_differ"] == r["n_utts"] and r["rtf"] > 0
+    assert "INSANE" in capsys.readouterr().err
+    assert not sp.cer_sanity(float("nan"), 0.2)["ok"] and not sp.cer_sanity(None, 0.2)["ok"]
+    assert sp.cer_sanity(0.2, 0.3)["ok"] and sp.cer_sanity(0.25, 0.2)["ok"] and not sp.cer_sanity(0.2501, 0.2)["ok"]
+
+
+def test_a_failed_probe_is_recorded_and_cleared(env, tmp_path, monkeypatch):
+    """A probe that raises leaves failed[system] in the speed file (error, stage, quant, compile) and still raises
+    (exit 1 in the queue); the system's next good probe removes it. tools/full_report.py lists such probes."""
+    out = tmp_path / "speed.json"
+    argv = ["--kind", "ctc", "--model", str(env["ctc"]), "--system", "s@int8-w8a8", "--quant", "int8-w8a8",
+            "--quant-impl", "emulate", "--per-set", "2"]
+    assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "s", "--per-set", "2") == 0
+
+    def boom(*a, **k):
+        raise RuntimeError("CUBLAS_STATUS_NOT_SUPPORTED when calling cublasLtMatmul")
+
+    monkeypatch.setattr(sp, "probe", boom)
+    with pytest.raises(RuntimeError, match="CUBLAS"):
+        run(env, out, *argv)
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    f = doc["failed"]["s@int8-w8a8"]
+    assert f["stage"] == "probe" and "CUBLAS_STATUS_NOT_SUPPORTED" in f["error"] and f["quant"] == "int8-w8a8"
+    assert f["compile"] is False and "s@int8-w8a8" not in doc["systems"] and "s" in doc["systems"]
+    monkeypatch.undo()
+    assert run(env, out, *argv) == 0
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert doc["failed"] == {} and doc["systems"]["s@int8-w8a8"]["sanity"]["ok"]
 
 
 def test_quant_refusals(env, tmp_path, capsys):

@@ -66,7 +66,8 @@ Idle host: before loading, nvidia-smi lists the GPU's compute processes (and uti
 (exit 3) while another process is there. What was seen is recorded either way.
 
 Output (--out, JSON, merged, written atomically): {"schema": 1, "ids": [...], "ids_sha256": ..., "systems": {name:
-record}}. A record: kind, model, device, gpu, dtype, batch_s, n_utts, audio_s, batches, rtf, wall_s, the batch-1
+record}, "failed": {name: why}}. A record: kind, model, device, gpu, dtype, batch_s, n_utts, audio_s, batches, rtf,
+wall_s, the batch-1
 fields (n_latency, p50_s, p95_s, mean_s, rtf_1_p50), vram_peak_allocated_bytes / _reserved_bytes for each pass,
 vram_gb, params_total, weights_bytes, relpos_patch, decode_len, trained, tokens_per_utt, cer_ref_corpus, max_rows (the
 batched pass's row cap, null without one), n_truncated / n_timestamp_tokens (whisper's batched pass: rows the stop or
@@ -85,12 +86,34 @@ batch-1 decode under kitsune.quant.kernel_census (kernels: the matmul ops and GE
 the int8 calls whose torch._int_mm did not return); --threads sets torch's threads before loading; --hyps-out writes
 the list's hypotheses (id, ref, hyp, hyp_1, duration). With --compile the layers' counters are off, so quant_counters
 and the census's int8 counts are null (not counted, rather than zeros that would read as a measurement).
-Every record gains quant, quant_impl, quant_scope, mx_rounding, emulated, compile, threads, autocast_dtype,
-quant_counters, kernels, weights_bytes_resident and hyp_diff_1 (the latency ids whose batch-1 hypothesis differs from
-the batched one: NVFP4 W4A4's whole-call activation scale makes a row depend on its batch-mates); weights_bytes is the
-deployable packed bytes for a format. The idle check counts only the processes on the probe's own GPU (by PCI bus
-id), so --require-idle works while the box's other GPU trains. The probe beats $KITSUNE_HEARTBEAT once per timed
-repeat, and under kitsune.heartbeat.beating (max 1800 s) through the model load and the warm-ups (torch.compile's).
+Every record gains quant_recipe ({version, sha256}: kitsune.quant's RECIPE_VERSION and recipe_sha256 of the timed
+format; null without --quant), reference ({system, dtype, cer_ref_corpus, tokens_per_utt, batches, wall_s}: the bf16
+decode below; null without --quant / --compile) and sanity ({ok, cer, cer_bf16, delta, max_delta, hyps_differ,
+reference, reason}; null likewise), quant, quant_impl, quant_scope, mx_rounding, emulated, compile, threads,
+autocast_dtype, quant_counters, kernels, weights_bytes_resident and hyp_diff_1 (the latency ids whose batch-1
+hypothesis differs from the batched one: NVFP4 W4A4's whole-call activation scale makes a row depend on its
+batch-mates); weights_bytes is the deployable packed bytes for a format. The idle check counts only the processes
+on the probe's own GPU (by PCI bus id), so --require-idle works while the box's other GPU trains. The probe beats
+$KITSUNE_HEARTBEAT once per timed repeat, and under kitsune.heartbeat.beating (max 1800 s) through the model load
+and the warm-ups (torch.compile's).
+
+Sanity (F4, DECISIONS F; smoke B check 16): a timed number of a model that decodes garbage is not a speed. Box
+53693389's fp8-w8a8 records decoded NaN-filled garbage (cer_ref_corpus 0.939-0.945 against 0.19-0.27 for every other
+format) and passed check 16 as "done". So every --quant or --compile probe, after both clocks and the census (nothing
+it does can touch the timings or the VRAM peaks), frees the timed model and loads the same weights once more in the
+probe's dtype, eager, unquantised, with the rel-pos patch and decode length as timed (reference_pass), and decodes the
+same ids in the very batches of the batched pass. The record's sanity: ok when both corpus CERs are finite and the
+timed model's is at most SANITY_MAX_DELTA (5 pp) above the reference's. The bound: on the study's 200 speed ids every
+format that worked on box 53693389's smoke B stayed within 0.8 pp of its student's bf16 CER (int8 W8A16 / W8A8, NVFP4
+W4A16 and fp16: -0.16 to +0.79 pp, bf16 itself at 0.187-0.270); on the full manifest NVFP4 W4A4 cost P-0.3B +0.35 pp
+M4 and MXFP4 +0.70 pp; the broken fp8 was +67 to +71 pp. 5 pp is about 6x the largest genuine cost and 13x below that
+failure (about 20-25 % relative): it catches gross breakage (NaN, garbage, a wrong scale) and is not a measurement -
+the readouts measure a format's cost with CIs. A record that fails it is still written, with its numbers, and the
+probe exits EXIT_INSANE (4): the queue fails a speed item on any non-zero exit with no retry, so check 16 ("item done")
+fails and the speed dir's events.jsonl says "exit 4". A load, probe or reference that raises is recorded too, in the
+file's top-level failed {system: {error, stage, quant, compile, time_utc, versions}} (a later successful probe of the
+system removes it), and the exit stays 1: tools/full_report.py lists failed and left-out probes instead of leaving a
+row silently empty.
 
 Usage (on the box, at its end, one call per system; kitsune/study_queue.py phase_speed passes these):
   python tools/speed_probe.py --kind aed --model students/study/t03 --system study-t03 \
@@ -131,6 +154,12 @@ TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 TEACHER_REVISION = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"  # == scripts/03_build_student.TEACHER_REVISION (tested)
 MAX_SYMBOLS = 10  # the label pass's TDT guard (kitsune.parakeet; vast/label.py)
 EXIT_REFUSED, EXIT_BUSY = 2, 3
+EXIT_INSANE = 4  # a --quant / --compile record whose CER is not sane against its bf16 reference (written, then 4)
+# The CER sanity bound (module docstring, "Sanity"; F4): the timed model's corpus CER on the id list may be at most this
+# far above the same weights' bf16 eager decode of the same ids in the same batches. Working formats cost <= 0.8 pp on
+# the study's 200 ids (box 53693389's smoke B) and <= 0.70 pp M4 on the full manifest; the broken fp8 cost 67-71 pp.
+# A gross-breakage alarm, never a measurement; changing it is an owner call
+SANITY_MAX_DELTA = 0.05
 
 
 def _now() -> str:
@@ -521,6 +550,16 @@ def free_cache(device: torch.device):
         torch.cuda.empty_cache()
 
 
+def batch_plan(dur: np.ndarray, batch_s: float, max_rows: int | None) -> list[list[int]]:
+    """The batched pass's batches (indices into the id list): the eval's own (pack_micro_batches over the ids sorted by
+    duration, longest first, at most batch_s padded seconds), cut at max_rows rows when given. probe and
+    reference_pass both use it, so the bf16 reference decodes the very batches the timed model did."""
+    dur = np.asarray(dur, dtype=np.float64)
+    order = np.argsort(-dur, kind="stable")
+    return trainset.pack_micro_batches(order, dur, float(batch_s), dec_len=np.ones(len(dur)) if max_rows else None,
+                                       cap_tokens=int(max_rows) if max_rows else None)
+
+
 def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[str], device: torch.device, *,
           batch_s: float, warmup: int, warmup_1: int, latency_n: int | None, n_tok: list[int] | None = None,
           profile_kernels: bool = False, batch_rows: int | None = None) -> dict:
@@ -537,10 +576,8 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
 
     dur = np.asarray(durations, dtype=np.float64)
     tok = [1] * len(waves) if n_tok is None else [int(x) for x in n_tok]
-    order = np.argsort(-dur, kind="stable")
     max_rows = getattr(runner, "max_rows", None) or batch_rows
-    plan = trainset.pack_micro_batches(order, dur, float(batch_s), dec_len=np.ones(len(dur)) if max_rows else None,
-                                       cap_tokens=int(max_rows) if max_rows else None)
+    plan = batch_plan(dur, batch_s, max_rows)
     counted = [k for k in ("n_truncated", "n_timestamp_tokens") if hasattr(runner, k)]  # whisper's per-pass counts
     n1 = len(waves) if latency_n is None else min(int(latency_n), len(waves))
 
@@ -612,6 +649,58 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
                 n_timestamp_tokens=counts_b.get("n_timestamp_tokens"), _hyps=(hyps, hyps_1))
 
 
+def reference_pass(kind: str, model: str | None, device: torch.device, dtype: str, store, revision: str,
+                   waves: list[np.ndarray], durations: list[float], refs: list[str], n_tok: list[int] | None, *,
+                   relpos_patch: bool, decode_len: str | None, batch_s: float, batch_rows: int | None,
+                   hf_cache: str | None = None, fp32_head: bool = True) -> dict:
+    """The sanity's bf16 reference (module docstring, "Sanity"): the same weights loaded once more in the probe's
+    dtype (bf16 on CUDA), eager and unquantised (load_runner with quant None, compile False), with the rel-pos patch
+    and decode length the timed probe ran, decoding the id list in the batched pass's batches (batch_plan), untimed.
+    Called after both clocks, with the timed model freed. Returns {dtype, cer_ref_corpus, tokens_per_utt, batches,
+    wall_s, _hyps}."""
+    from kitsune import heartbeat
+    from kitsune.evaluate import corpus_cer
+
+    t0 = time.time()
+    with heartbeat.beating(max_s=1800):
+        runner, _ = load_runner(kind, model, device, dtype, store, revision, relpos_patch=relpos_patch,
+                                decode_len=decode_len, quant=None, compile=False, hf_cache=hf_cache,
+                                max_rows=batch_rows, fp32_head=fp32_head)
+        dur = np.asarray(durations, dtype=np.float64)
+        tok = [1] * len(waves) if n_tok is None else [int(x) for x in n_tok]
+        plan = batch_plan(dur, batch_s, getattr(runner, "max_rows", None) or batch_rows)
+        hyps: list[str | None] = [None] * len(waves)
+        runner.tokens = 0
+        with runner.context():
+            for b in plan:
+                out = runner.decode([waves[i] for i in b], [float(dur[i]) for i in b], [tok[i] for i in b])
+                for i, h in zip(b, out):
+                    hyps[i] = h
+                heartbeat.beat()
+        sync(device)
+    tokens = int(runner.tokens)
+    del runner
+    return dict(dtype=dtype, cer_ref_corpus=corpus_cer([h or "" for h in hyps], refs)["cer"],
+                tokens_per_utt=tokens / len(waves) if waves else None, batches=len(plan),
+                wall_s=round(time.time() - t0, 2), _hyps=hyps)
+
+
+def cer_sanity(cer, cer_bf16, *, hyps_differ: int | None = None, reference: str | None = None) -> dict:
+    """The record's sanity (module docstring): ok when both corpus CERs are finite numbers and cer - cer_bf16 <=
+    SANITY_MAX_DELTA (a quantised model better than its bf16 weights by any margin passes); reason says why not."""
+    import math
+
+    finite = all(isinstance(x, (int, float)) and math.isfinite(x) for x in (cer, cer_bf16))
+    delta = float(cer) - float(cer_bf16) if finite else None
+    ok = finite and delta <= SANITY_MAX_DELTA
+    reason = None if ok else (f"a corpus CER is not a finite number (cer {cer}, bf16 reference {cer_bf16})"
+                              if not finite else
+                              f"cer_ref_corpus {cer:.4f} is {100 * delta:.2f} pp above the bf16 reference's "
+                              f"{cer_bf16:.4f} (bound {100 * SANITY_MAX_DELTA:g} pp)")
+    return dict(ok=bool(ok), cer=cer, cer_bf16=cer_bf16, delta=delta, max_delta=SANITY_MAX_DELTA,
+                hyps_differ=hyps_differ, reference=reference, reason=reason)
+
+
 def quant_counters(model) -> dict | None:
     """The record's quant_counters: the quantised layers' {calls, padded, fallback_risk}; None when they were not
     counted (--compile turns the counters off, and zeros would then read as a measurement)."""
@@ -634,9 +723,9 @@ def write_hyps(path: Path, ids: list[str], refs: list[str], hyps: list, hyps_1: 
     os.replace(tmp, path)
 
 
-def merge_out(path: Path, ids: list[str], system: str, record: dict) -> dict:
-    """The output file with this system's record (replacing an older one of the same name). Refuses (SystemExit 2) a
-    file whose systems were timed on another id list."""
+def _merge(path: Path, ids: list[str], edit) -> dict:
+    """The output file read (or a new one), edit(doc) applied, written atomically. Refuses (SystemExit 2) a file
+    whose systems were timed on another id list."""
     sha = ids_sha256(ids)
     doc = dict(schema=SCHEMA, ids=ids, ids_sha256=sha, systems={})
     if path.is_file():
@@ -646,11 +735,35 @@ def merge_out(path: Path, ids: list[str], system: str, record: dict) -> dict:
                   f"one {sha[:12]}): use its list (--ids) or another --out", file=sys.stderr)
             raise SystemExit(EXIT_REFUSED)
         doc = dict(old, schema=SCHEMA)
-    doc.setdefault("systems", {})[system] = record
+    edit(doc)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(doc, indent=1, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
     return doc
+
+
+def merge_out(path: Path, ids: list[str], system: str, record: dict) -> dict:
+    """The output file with this system's record (replacing an older one of the same name), and the system's entry
+    in the top-level failed block gone (a probe that ran supersedes an earlier failure). Refuses (SystemExit 2) a
+    file whose systems were timed on another id list."""
+    def edit(doc):
+        doc.setdefault("systems", {})[system] = record
+        failed = doc.get("failed")
+        if isinstance(failed, dict):
+            failed.pop(system, None)
+
+    return _merge(path, ids, edit)
+
+
+def merge_failure(path: Path, ids: list[str], system: str, info: dict) -> dict:
+    """A probe that raised (module docstring, "Sanity"): failed[system] = info ({error, stage: load | probe |
+    reference, quant, compile, time_utc, versions}); the system's last good record, if any, stays as it was."""
+    def edit(doc):
+        failed = doc.get("failed")
+        doc["failed"] = failed = failed if isinstance(failed, dict) else {}
+        failed[system] = info
+
+    return _merge(path, ids, edit)
 
 
 def _cpu_model() -> str | None:
@@ -778,7 +891,6 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    from kitsune import heartbeat
     from kitsune import quant as Q
 
     if args.threads:
@@ -835,6 +947,44 @@ def main(argv=None) -> int:
     durations = [float(store.utts[pos[i]].duration) for i in ids]
     n_tok = [int(store.utts[pos[i]].n_tok) for i in ids]  # the teacher's tokens with EOS (a token store's)
     refs = store.frame().set_index("id").loc[ids, "ref"].tolist()
+    stages: list[str] = []
+    try:
+        rec = _timed_record(args, device, dtype, store, quant, decode_len, trained, waves, durations, n_tok, refs, ids,
+                            stages)
+    except Exception as e:  # noqa: BLE001 - recorded in the file's failed block, then re-raised: the exit stays 1
+        try:
+            merge_failure(out, ids, system, dict(error=f"{type(e).__name__}: {e}"[:1000],
+                                                 stage=stages[-1] if stages else "load",
+                                                 quant=quant["fmt"] if quant else None, compile=bool(args.compile),
+                                                 time_utc=_now(), versions=_versions()))
+        except BaseException as w:  # noqa: BLE001 - the record of a failure must never hide the failure itself
+            print(f"speed_probe: could not record the failure in {out}: {type(w).__name__}: {w}", file=sys.stderr)
+        raise
+    rec.update(idle=idle, gpu_state=gpu, versions=_versions(), store=str(args.store), time_utc=_now())
+    merge_out(out, ids, system, rec)
+    print(f"{system}: RTF {rec['rtf']:.5f} batched ({rec['n_utts']} utts, {rec['audio_s']:.0f} s), batch-1 p50 "
+          f"{rec['p50_s']:.3f} s p95 {rec['p95_s']:.3f} s, VRAM "
+          + ("n/a" if rec["vram_gb"] is None else f"{rec['vram_gb']:.2f} GB") + f", CER {rec['cer_ref_corpus']:.4f}"
+          f" -> {out}", flush=True)
+    s = rec.get("sanity")
+    if s is not None and not s["ok"]:
+        print(f"INSANE: {system}: {s['reason']} ({s['hyps_differ']} of {rec['n_utts']} hypotheses differ from the bf16 "
+              f"reference {s['reference']}): the record is written, but its timings are not a speed (exit "
+              f"{EXIT_INSANE})", file=sys.stderr, flush=True)
+        return EXIT_INSANE
+    return 0
+
+
+def _timed_record(args, device, dtype, store, quant, decode_len, trained, waves, durations, n_tok, refs, ids,
+                  stages: list) -> dict:
+    """main's load, probe and (for --quant / --compile) the bf16 reference with the sanity, as one record; the stage
+    it is in is appended to stages (main's failure record names it)."""
+    import gc
+
+    from kitsune import heartbeat
+    from kitsune.quant import split_system
+
+    stages.append("load")
     t0 = time.time()
     with heartbeat.beating(max_s=1800):
         runner, desc = load_runner(args.kind, args.model, device, dtype, store, args.revision,
@@ -843,6 +993,7 @@ def main(argv=None) -> int:
                                    fp32_head=not args.no_fp32_head)
     load_s = time.time() - t0
     amp = getattr(runner, "amp", None)
+    qrec = getattr(runner, "quant", None) or {}
     rec = dict(kind=args.kind, model=desc, device=str(device),
                gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
                dtype="fp16" if quant and quant["fmt"] == "fp16" else dtype,
@@ -851,9 +1002,12 @@ def main(argv=None) -> int:
                trained=trained, fp32_head=getattr(runner, "fp32_head", None),
                quant=quant["fmt"] if quant else None, quant_impl=quant["resolved"] if quant else None,
                quant_scope=quant["scope"] if quant else None, mx_rounding=quant["mx_rounding"] if quant else None,
+               quant_recipe=dict(version=qrec.get("recipe_version"), sha256=qrec.get("recipe_sha256")) if quant
+               else None,
                emulated=bool(quant) and quant["resolved"] == "emulate", compile=bool(args.compile),
                threads=torch.get_num_threads(), autocast_dtype=str(amp).replace("torch.", "") if amp else None,
                weights_bytes_resident=int(getattr(runner, "weights_bytes_resident", runner.weights_bytes)))
+    stages.append("probe")
     res = probe(runner, waves, durations, refs, device, batch_s=args.batch_s, warmup=args.warmup,
                 warmup_1=args.warmup_1, latency_n=args.latency_n, n_tok=n_tok, profile_kernels=args.profile_kernels,
                 batch_rows=args.batch_rows)
@@ -862,13 +1016,23 @@ def main(argv=None) -> int:
     rec["quant_counters"] = quant_counters(runner.model) if quant else None
     if args.hyps_out:
         write_hyps(Path(args.hyps_out), ids, refs, hyps, hyps_1, durations)
-    rec.update(idle=idle, gpu_state=gpu, versions=_versions(), store=str(args.store), time_utc=_now())
-    merge_out(out, ids, system, rec)
-    print(f"{system}: RTF {rec['rtf']:.5f} batched ({rec['n_utts']} utts, {rec['audio_s']:.0f} s), batch-1 p50 "
-          f"{rec['p50_s']:.3f} s p95 {rec['p95_s']:.3f} s, VRAM "
-          + ("n/a" if rec["vram_gb"] is None else f"{rec['vram_gb']:.2f} GB") + f", CER {rec['cer_ref_corpus']:.4f}"
-          f" -> {out}", flush=True)
-    return 0
+    rec.update(reference=None, sanity=None)
+    if quant or args.compile:  # the sanity (module docstring): after both clocks, with the timed model freed
+        stages.append("reference")
+        del runner, res
+        gc.collect()
+        if args.compile:
+            torch.compiler.reset()
+        free_cache(device)
+        base = split_system(args.system or args.kind)[0]
+        ref = reference_pass(args.kind, args.model, device, dtype, store, args.revision, waves, durations, refs, n_tok,
+                             relpos_patch=not args.no_relpos_patch, decode_len=decode_len, batch_s=args.batch_s,
+                             batch_rows=args.batch_rows, hf_cache=args.hf_cache, fp32_head=not args.no_fp32_head)
+        ref_hyps = ref.pop("_hyps")
+        rec["reference"] = dict(ref, system=base)
+        rec["sanity"] = cer_sanity(rec["cer_ref_corpus"], ref["cer_ref_corpus"], reference=base,
+                                   hyps_differ=sum((a or "") != (b or "") for a, b in zip(hyps, ref_hyps)))
+    return rec
 
 
 if __name__ == "__main__":
