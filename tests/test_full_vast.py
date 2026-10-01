@@ -776,7 +776,8 @@ def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, 
     data = box_data("full", reg, repo.root)
     problems, notes = preflight(monkeypatch, FullHub(data), box="full")
     assert len(problems) == 1 and "need a passing smoke-b verdict" in problems[0], problems
-    assert f"WARNING: no {launch.SPEED_RECORD} at 0123456789ab: box full's hours are not held to measured speeds" in notes
+    want = f"WARNING: no {launch.SPEED_RECORD} at 0123456789ab: box full's hours are not held to measured speeds"
+    assert want in notes
     problems, notes = preflight(monkeypatch, FullHub(data), box="full", allow_unverified_quant=True)
     assert problems == [] and any(n.startswith("WARNING: box full's 2 quantised item(s)") for n in notes)
     rec = repo.root / launch.SPEED_RECORD

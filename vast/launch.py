@@ -59,9 +59,10 @@ selection's, with --resume a box whose Hub queue summary is missing or a --resum
 train item of it ran, and a box with quantised items (box full) without the quant go signal: smoke-b's verdict on the
 Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE; DECISIONS F2), which
 --allow-unverified-quant turns into a warning. Box full's hours warn while its speed record has no box-1 part. Offers
-listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped. Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate
-said slow in the last GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The
-box times its Hub link first (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
+listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped. Every job avoids the machines of
+vast/blocklist.json; a full box also those whose download gate said slow in the last GATE_BLOCK_DAYS
+(full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link first
+(kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
   python vast/launch.py --job full --box p01 --machine 54650 --image-tag main --data-repo Multy123/kitsune-data \\
       --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch                  # look only
 --job full --box p01-chain rents a chain box (contract addendum E; kitsune/full_queue.py ChainController): smoke A and
@@ -1404,15 +1405,15 @@ def quant_go_problems(out_repo: str, sha: str, box: str, spec: dict, *,
             elif rel == "not_ancestor":
                 why.append(f"its commit {vsha[:12]} is not an ancestor of {sha[:12]}")
             elif differ := [p for p in QUANT_CODE if git_blob(vsha, p) != git_blob(sha, p)]:
-                why.append(f"{', '.join(differ)} differ{'s' if len(differ) == 1 else ''} between {vsha[:12]} (verified) "
-                           f"and {sha[:12]}")
+                why.append(f"{', '.join(differ)} differ{'s' if len(differ) == 1 else ''} between {vsha[:12]} "
+                           f"(verified) and {sha[:12]}")
     if not why:
         notes.append(f"quant go signal: the smoke-b verdict at {vsha[:12]} passed checks 12-16, and "
                      f"{', '.join(QUANT_CODE)} are unchanged at {sha[:12]}")
         return [], notes
-    msg = (f"box {box}'s {len(names)} quantised item(s) (e.g. {names[0]}) need a passing smoke-b verdict (checks 12-16) "
-           f"at this quant code (DECISIONS F2): {'; '.join(why)}; rent the standalone smoke-B first (launch --job full "
-           f"--box smoke-b) or pass --allow-unverified-quant")
+    msg = (f"box {box}'s {len(names)} quantised item(s) (e.g. {names[0]}) need a passing smoke-b verdict (checks "
+           f"12-16) at this quant code (DECISIONS F2): {'; '.join(why)}; rent the standalone smoke-B first (launch "
+           f"--job full --box smoke-b) or pass --allow-unverified-quant")
     if allow_unverified_quant:
         return [], notes + [f"WARNING: {msg} (--allow-unverified-quant: not refused)"]
     return [msg], notes
