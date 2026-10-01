@@ -12,12 +12,17 @@ Guarantees:
 - order: take(key) only ever returns keys[taken], whatever order the downloads finish in; an error surfaces at the
   take of the key that failed, i.e. where the one-at-a-time path would have met it.
 - disk: a worker claims the next key only while fewer than `ahead` keys are claimed and not yet taken, so at most
-  `ahead` files are downloading or waiting on disk, plus the one the ingest is reading.
+  `ahead` files are downloading or waiting on disk, plus the one the ingest is reading. The disk guard is asked in
+  plan order (a key never starts ahead of an earlier one it refused) and told the downloads actually in flight, so
+  it refuses a key for good only on what the one-at-a-time path sees at that point: every earlier file ingested and
+  freed, no later one started.
 - retries: each download is tried TRIES times. A transient error (HF 429 and 5xx, a dead or reset connection, a
   read timeout, a size-consistency failure, hf_xet errors) waits BACKOFF_S (+-20 % jitter; a 429's Retry-After is
   honoured), both capped at BACKOFF_MAX_S. A permanent one (a missing repo, revision or file, 401/403/404/410, a full
   disk, a programming error) is raised at once: no retry can fix it.
-- a hung download: the take that waits for it raises DownloadStalled once the file has not grown for stall_s. The
+- a hung download: the take that waits for it raises DownloadStalled once the file has not grown for stall_s, growth
+  counted per attempt (huggingface_hub writes each attempt to a fresh .incomplete file and deletes a failed one, so a
+  retry starts again from zero bytes: its growth below the first attempt's peak is still growth). The
   stuck thread cannot be killed from Python, and a second attempt into the same cache dir would wait on the first
   one's hf file lock, so the process exits instead; bootstrap's `retry 3 timeout` re-runs 01, which resumes (finished
   inputs are skipped, files completed ahead are cache hits).
@@ -179,6 +184,8 @@ class FetchAhead:
         self._state: dict[str, tuple[str, object]] = {}  # key -> (running|ready|failed, path|error)
         self._sizes: dict[str, int] = {}
         self._attempted: dict[str, float] = {}  # key -> clock() at its latest attempt (a retry is no stall)
+        self._downloading = 0  # attempts past the guard and inside fetch: the guard's "other downloads in flight"
+        self._guard_next = 0  # keys below it passed the guard; key i asks it first only once this reaches i
         self._closed = False
         self.stats = dict(planned=len(self.keys), taken=0, bytes=0, retries=0, discarded=0, waited_s=0.0,
                           alive_after_close=0)
@@ -222,7 +229,13 @@ class FetchAhead:
                 problem = self._guard(i, key)
                 if problem:
                     raise SystemExit(problem)
-            return self.fetch(key)
+            with self._cv:
+                self._downloading += 1
+            try:
+                return self.fetch(key)
+            finally:
+                with self._cv:
+                    self._downloading -= 1
 
         def wait(s):
             return self._stop.wait(s)
@@ -239,12 +252,27 @@ class FetchAhead:
         asks for it (every earlier file was ingested and freed by then) and asks again: the one-at-a-time path
         refuses only the next download, on the free space of that moment, and a refusal then surfaces at once, in
         the take that is waiting for it. (Waiting only for _taken >= i asked again inside take(i-1), with file i-1
-        still on disk: a spurious final refusal, and one that reported out-of-date free space at take(i).)"""
+        still on disk: a spurious final refusal, and one that reported out-of-date free space at take(i).)
+        The keys ask in plan order (_guard_next), and the other downloads in flight the guard is told about are the
+        attempts inside fetch (_downloading). So when a refused key i asks again at its take, no later key has
+        started (they wait behind i) and every earlier one was taken: 0 others, the one-at-a-time path's view.
+        Counting every "running" key instead counted the workers parked here, which have started nothing (the
+        refused keys counted each other: a final refusal at 30-45 GB free that the one-at-a-time path downloads
+        through), and later keys passing a parked one held its space at its take."""
+        with self._cv:
+            while self._guard_next < i and not self._stop.is_set():
+                self._cv.wait()
         while True:
             with self._cv:
-                others = self._in_flight() - 1
-            problem = self.guard(key, max(others, 0))
+                if self._stop.is_set():
+                    return f"{self.name}: closed before {key}'s download"
+                others = self._downloading
+            problem = self.guard(key, others)
             if not problem:
+                with self._cv:
+                    if self._guard_next <= i:
+                        self._guard_next = i + 1
+                        self._cv.notify_all()
                 return None
             with self._cv:
                 if self._wanted >= i or self._stop.is_set():
@@ -269,7 +297,7 @@ class FetchAhead:
                 self._wanted = self._taken
                 self._cv.notify_all()
         t0 = last_growth = last_log = self.clock()
-        last_bytes = -1
+        last_bytes, attempt = -1, None
         try:
             while True:
                 with self._cv:
@@ -287,6 +315,10 @@ class FetchAhead:
                     if state in ("ready", "failed"):
                         continue
                 now = self.clock()
+                with self._cv:
+                    started = self._attempted.get(key)
+                if started != attempt:  # a new attempt writes a new file from zero bytes: count its growth from there
+                    attempt, last_bytes = started, -1
                 b = self.progress(key) if self.progress is not None else 0
                 if b > last_bytes:
                     if last_bytes >= 0 and beat is not None:

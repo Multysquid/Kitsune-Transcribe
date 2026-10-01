@@ -294,6 +294,68 @@ def test_a_retry_restarts_the_stall_clock(tmp_path, monkeypatch):
     assert n[0] == 9 and fa.stats["retries"] == 8
 
 
+def test_a_retry_that_restarts_from_zero_bytes_is_not_a_stall(tmp_path, fast_backoff):
+    """huggingface_hub writes each attempt to a new .incomplete file and deletes a failed attempt's: attempt 2 starts
+    again from 0 bytes. Its growth counts from there (per attempt), not only once it passes attempt 1's peak: here
+    attempt 1 reached 1000 bytes and failed, attempt 2 grows to 600 over ~1.5 s with stall_s 1.0 (the old high-water
+    mark raised DownloadStalled about 1 s into attempt 2, while it was still growing)."""
+    size, n = [0], [0]
+
+    def fetch(key):
+        n[0] += 1
+        size[0] = 0
+        if n[0] == 1:
+            for _ in range(10):
+                size[0] += 100
+                time.sleep(0.01)
+            raise http_error(503)
+        for _ in range(30):
+            time.sleep(0.05)
+            size[0] += 20
+        (tmp_path / key).write_text("x", encoding="utf-8")
+        return tmp_path / key
+
+    beats = []
+    with FetchAhead(["big"], fetch, ahead=1, progress=lambda k: size[0], stall_s=1.0, poll_s=0.01,
+                    log=lambda m: None) as fa:
+        assert fa.take("big", beat=lambda: beats.append(size[0])).name == "big"
+    assert n[0] == 2 and fa.stats["retries"] == 1
+    assert any(b < 1000 for b in beats[-20:])  # attempt 2's growth below attempt 1's peak beat the heartbeat
+
+
+def test_the_guard_counts_started_downloads_and_never_lets_a_later_key_pass_a_refused_one(tmp_path):
+    """01's disk guard (MIN_FREE_GB 30, RESERVE_GB 3 for each other download in flight) with 40 GB free throughout and
+    downloads slower than the ingest: the one-at-a-time path downloads every file (40 >= 30). Fetch-ahead with 6
+    ahead refuses the keys that would start with 4 others downloading, and each must pass once its take asks for it:
+    workers parked in the guard are not downloads (counting them made the refused keys count each other, a final
+    refusal at 40 GB free), and no later key starts ahead of a refused one (it would hold that key's reserve at its
+    take). The guard is asked in plan order."""
+    free_gb, min_free, reserve = 40.0, 30.0, 3.0
+    lock, asked, refused = threading.Lock(), [], []
+
+    def guard(key, in_flight):
+        with lock:
+            asked.append((key, in_flight))
+            if free_gb - reserve * in_flight >= min_free:
+                return None
+            refused.append(key)
+        return f"only {free_gb:.0f} GB free (< {min_free:.0f} GB + {reserve:g} GB for each of {in_flight} others)"
+
+    keys = [f"k{i:02d}" for i in range(14)]
+    files = Files(tmp_path / "dl", latency=lambda k: 0.15)
+    with FetchAhead(keys, files, ahead=6, guard=guard, poll_s=0.01, log=lambda m: None) as fa:
+        for k in keys:
+            assert fa.take(k).name == k  # never SystemExit
+            (files.d / k).unlink()  # the ingest frees it
+    assert refused, "the scenario must make the guard refuse (more than 3 others in flight)"
+    assert all(n <= 4 for _, n in asked) and files.max_running <= 4
+    first = []
+    for k, _ in asked:
+        if k not in first:
+            first.append(k)
+    assert first == keys  # each key's first question comes in plan order
+
+
 def test_close_joins_threads_and_discards_unconsumed(tmp_path):
     keys = [f"k{i}" for i in range(6)]
     for abort in (False, True):
