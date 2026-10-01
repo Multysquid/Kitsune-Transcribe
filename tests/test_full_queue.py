@@ -540,7 +540,8 @@ def test_summary_puts_are_coalesced_but_never_lost(fq):
 
 
 def smoke_registry(reg: dict, *, sigstop: bool, stall_min: float | None = None) -> dict:
-    """box full-smoke of tiny_registry, sized for the fakes: the freeze fault 30 s on a watchdog of 0 s; without SIGSTOP
+    """box full-smoke of tiny_registry, sized for the fakes: the freeze fault 60 s (orphan_s + fullrun.WATCHDOG_POLL_S)
+    on a watchdog of 0 s, released at the stand-in watchdog's alert if the part ends first (hold_freeze); without SIGSTOP
     (Windows) F1 is dropped and the wipe fires on the first attempt. stall_min: the smoke trainers' stall limit (the
     registry's 10 min otherwise; the SIGSTOP run needs seconds, as its stopped trainer is recovered by the stall
     check)."""
@@ -551,7 +552,7 @@ def smoke_registry(reg: dict, *, sigstop: bool, stall_min: float | None = None) 
                 it["stall_min"] = stall_min
     for f in reg["boxes"]["full-smoke"]["faults"]:
         if f["action"] == "freeze_controller_hb":
-            f["seconds"] = 30.0  # longer than the rest of smoke-p005: its end falls inside, whatever the load
+            f["seconds"] = 60.0  # longer than the rest of smoke-p005: its end falls inside, whatever the load
         if f["action"] == "wipe_run_dir" and not sigstop:
             f["min_attempt"] = 1
     if not sigstop:
@@ -575,6 +576,8 @@ def run_smoke(fq, monkeypatch, *, sigstop: bool, stall_min: float | None = None)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", snap)
     monkeypatch.setattr(finish, "HUB_RETRY_WAITS", (0.05, 0.1))
     monkeypatch.setenv(fullrun.ENV_THREADS_PER_GPU, "8")
+    for k in fullrun.ENV_THREAD_POOLS:  # onstart's six pools (fix 2): check 5 wants each in [1, t]
+        monkeypatch.setenv(k, "8")
     up = Q.HubUploader("u/kitsune-runs")
     up._api = FakeApi(runs_hub, "full-smoke")
     train_configs(fq.root, **{n: {"early_stop": {"min_delta_abs": 1e9}} for n in ("smoke-t06", "smoke-p03")})
@@ -645,15 +648,19 @@ def check_smoke(fq, rc, runs_hub, scratch_hub, seen):
     # F4 deadline: KITSUNE_DEADLINE = its start + 600 s
     p005_rec = next(x for x in fq.records("train") if x["item"] == "smoke-p005")
     assert float(p005_rec["deadline"]) == pytest.approx(p005_rec["t0"] + 600, abs=5)
-    # F5 freeze: train_hb unchanged from the fault until it ended (its window, or the run's end: end_faults), across
-    # an item end and its summary put
-    fired = st["faults"]["F5"]["fired_at"]["wall"]
-    until = min(st["faults"]["F5"]["window_end"],
-                next(e["wall"] for e in fq.events("fault_outcome") if e["id"] == "F5"))
+    # F5 freeze: train_hb unchanged from the fault until its release (its window's end, or the watchdog's alert while
+    # the part held it open: hold_freeze, never end_faults' cut), across an item end and its summary put
+    f5 = st["faults"]["F5"]
+    fired, until = f5["fired_at"]["wall"], f5["released"]
+    assert f5["release"] in ("alert", "window") and until <= f5["window_end"]
     window = [m for t, m in seen if fired + 0.05 < t < until - 0.05]
     assert window and len(set(window)) == 1
     ends = [e for e in fq.events("item_end") if fired < e["wall"] < until]
     assert any(e["item"] == "smoke-p005" for e in ends), "smoke-p005 did not end inside the freeze"
+    alerts = [json.loads(x) for x in (fq.state / fullrun.ALERTS_FILE).read_text(encoding="utf-8").splitlines()]
+    first = min(a["wall"] for a in alerts if a["wall"] >= fired)
+    assert fq.events("queue_end")[0]["wall"] >= first  # the part did not end before the freeze's alert
+    assert v["checks"]["7"]["evidence"]["F5"]["window"] == [fired, until]
     # smoke-nostart: skipped by the no-start rule; check 3's math on the fakes' step times
     assert st["items"]["smoke-nostart"]["status"] == "skipped" and "smoke-nostart" in st["no_start"]
     c3 = v["checks"]["3"]["evidence"]
@@ -687,6 +694,156 @@ def test_smoke_a_faults_and_verdict(fq, monkeypatch):
     every built-in check passes."""
     rc, q, runs_hub, scratch_hub, seen = run_smoke(fq, monkeypatch, sigstop=False)
     check_smoke(fq, rc, runs_hub, scratch_hub, seen)
+
+
+
+# the end-of-part freeze hold (box 53693389: F5's window cut at 480 s by end_faults, before the watchdog's 600 s
+# orphan_s and its poll, so check 7 had no alert)
+
+
+FREEZE_ENV = dict(FAKE_EPOCH_STEPS="100", FAKE_STEP_S="0.01")  # smoke-p005: ~1 s, F5 fires at its step 5
+
+
+def freeze_box(fq, monkeypatch, seconds: float, orphan_s: int = 1, **changes):
+    """box full-smoke reduced to stores-ctc and smoke-p005 with F4 dropped and F5 at step 5 for `seconds` on an
+    alert watchdog of orphan_s (fullrun.WATCHDOG_POLL_S 0, so seconds > orphan_s validates): under FREEZE_ENV,
+    smoke-p005 ends ~1 s after the fire, so the part's work is over long before the window."""
+    monkeypatch.setattr(fullrun, "WATCHDOG_POLL_S", 0)
+    reg = box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p005"],
+                   watchdog={"orphan_s": orphan_s, "action": "alert"}, **changes)
+    reg["boxes"]["full-smoke"]["faults"] = [dict(f, at_step=5, seconds=seconds)
+                                            for f in reg["boxes"]["full-smoke"]["faults"]
+                                            if f["action"] == "freeze_controller_hb"]
+    return reg
+
+
+def stand_in_watchdog(hb: Path, alerts: Path, stale_s: float):
+    """The alert-mode watchdog in miniature: one orphan_alert per stale spell of train_hb (> stale_s); returns its stop
+    event and a list of (time, mtime) samples."""
+    stop, seen = threading.Event(), []
+
+    def run():
+        armed = True
+        while not stop.is_set():
+            try:
+                m = hb.stat().st_mtime
+            except OSError:
+                m = None
+            seen.append((time.time(), m))
+            if m is not None and time.time() - m > stale_s and armed:
+                with open(alerts, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"wall": time.time(), "kind": "orphan_alert", "hb": hb.name,
+                                        "age_s": time.time() - m, "limit_s": stale_s}) + "\n")
+                armed = False
+            elif m is not None and time.time() - m < 0.1:
+                armed = True
+            time.sleep(0.01)
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return stop, th, seen
+
+
+def test_the_part_holds_an_open_freeze_until_the_watchdog_alerts(fq, monkeypatch):
+    """The regression test of box 53693389: the freeze's item ends long before its window, nothing else is left, and
+    the part holds - no items, no beats - until the watchdog's alert is recorded, then releases at once; check 7
+    passes. Before the fix, end_faults cut the window as the part ended and the alert never came."""
+    reg = freeze_box(fq, monkeypatch, seconds=60.0, orphan_s=3)
+    hb, alerts = fq.state / fullrun.TRAIN_HB, fq.state / fullrun.ALERTS_FILE
+    fq.state.mkdir(parents=True, exist_ok=True)
+    stop, th, seen = stand_in_watchdog(hb, alerts, stale_s=3.0)
+    try:
+        q = fq.make("full-smoke", registry=reg, env=FREEZE_ENV)
+        t0 = time.time()
+        assert q.run() == F.EXIT_OK
+    finally:
+        stop.set()
+        th.join(5)
+    assert time.time() - t0 < 30  # released at the alert, not at the window's 60 s
+    st = fq.st()
+    f5 = st["faults"]["F5"]
+    (hold,) = fq.events("freeze_hold")
+    fired = f5["fired_at"]["wall"]
+    alert_wall = min(w for w in (json.loads(x)["wall"] for x in alerts.read_text(encoding="utf-8").splitlines())
+                     if w >= fired)
+    assert f5["release"] == "alert" and f5["outcome"] == "recovered" and f5["released"] >= alert_wall
+    assert f5["held_s"] >= 0 and hold["id"] == "F5" and hold["left_s"] > 30
+    assert fq.events("queue_end")[0]["wall"] >= alert_wall
+    # train_hb never moved from the fire to the release
+    window = [m for t, m in seen if fired + 0.05 < t < f5["released"] - 0.05]
+    assert window and len(set(window)) == 1
+    item_end = next(e["wall"] for e in fq.events("item_end") if e["item"] == "smoke-p005")
+    assert fired < item_end < hold["wall"] < alert_wall  # the item ended inside the window, then the part held
+    c7 = json.loads((fq.state / fullrun.VERDICT_FILE).read_text(encoding="utf-8"))["checks"]["7"]
+    assert c7["pass"] is True and c7["evidence"]["F5"]["alerts_during"] == 1, c7
+    assert c7["evidence"]["F5"]["release"] == "alert" and c7["evidence"]["F5"]["window"] == [fired, f5["released"]]
+    assert c7["evidence"]["F5"]["orphan_s"] == 3 and c7["evidence"]["F5"]["held_s"] == f5["held_s"]
+
+
+def test_a_freeze_hold_without_a_watchdog_ends_with_its_window(fq, monkeypatch):
+    """No alert ever comes: the part holds to the window's end (release "window"), and check 7 fails honestly."""
+    q = fq.make("full-smoke", registry=freeze_box(fq, monkeypatch, seconds=3.0), env=FREEZE_ENV)
+    assert q.run() == F.EXIT_OK
+    f5 = fq.st()["faults"]["F5"]
+    assert f5["release"] == "window" and f5["released"] == f5["window_end"] and f5["outcome"] == "recovered"
+    assert fq.events("queue_end")[0]["wall"] >= f5["window_end"]
+    c7 = json.loads((fq.state / fullrun.VERDICT_FILE).read_text(encoding="utf-8"))["checks"]["7"]
+    assert c7["pass"] is False and c7["evidence"]["F5"]["alerts_during"] == 0
+
+
+def test_a_freeze_hold_stops_at_the_box_deadline_reserve_and_halts_at_a_parts_stop_at(fq, monkeypatch):
+    """The hold never outlasts the box deadline less deadline_reserve_min (release "deadline"), and a chain part's
+    stop_at halts it (rc 4, the verdict written, no hang)."""
+    reg = freeze_box(fq, monkeypatch, seconds=600.0, deadline_reserve_min=0)
+    fq.state.mkdir(parents=True, exist_ok=True)
+    (fq.state / "deadline").write_text(f"{time.time() + 8}\n")
+    q = fq.make("full-smoke", registry=reg, env=FREEZE_ENV)
+    assert q.run() == F.EXIT_OK
+    f5 = fq.st()["faults"]["F5"]
+    assert f5["release"] == "deadline" and f5["released"] < f5["window_end"] and f5["held_s"] < 30
+    fq.reset()
+    q = fq.make("full-smoke", registry=freeze_box(fq, monkeypatch, seconds=600.0), env=FREEZE_ENV,
+                stop_at=time.time() + 8)
+    t0 = time.time()
+    assert q.run() == F.EXIT_STOP
+    assert time.time() - t0 < 60
+    st = fq.st()
+    assert st["final"]["status"] == "halted" and "stage deadline" in st["final"]["reason"]
+    assert fq.events("stage_deadline") and fq.events("freeze_hold")
+    assert (fq.state / fullrun.VERDICT_FILE).is_file()
+
+
+def test_a_queue_restart_inside_a_freeze_keeps_it(fq, monkeypatch):
+    """_freeze_until is not in queue.json: a new queue's register() restores a fired, open window (freeze_restored),
+    so the controller does not beat for the rest of it; after its end it beats again."""
+    reg = freeze_box(fq, monkeypatch, seconds=60.0)
+    q = fq.make("full-smoke", registry=reg)
+    q.register()
+    end = time.time() + 0.6
+    q.state["faults"]["F5"].update(fired_at=dict(wall=time.time(), attempt=1, step=5), window_end=end)
+    q.save()
+    q2 = fq.make("full-smoke", registry=reg)
+    q2.register()
+    assert q2.ctl_beat_path() is None and q2._freeze_until == end
+    (ev,) = fq.events("freeze_restored")
+    assert ev["id"] == "F5" and ev["window_end"] == end
+    time.sleep(max(0.0, end - time.time()) + 0.05)
+    assert q2.ctl_beat_path() == fq.state / fullrun.TRAIN_HB
+    # an ended window is not restored
+    q3 = fq.make("full-smoke", registry=reg)
+    q3.register()
+    assert q3._freeze_until == 0.0 and len(fq.events("freeze_restored")) == 1
+
+
+def test_end_faults_records_a_cut_freeze(fq, monkeypatch):
+    """A freeze still open when end_faults runs (hold_freeze skipped) is recorded as cut, so a regression shows."""
+    q = fq.make("full-smoke", registry=freeze_box(fq, monkeypatch, seconds=60.0))
+    q.register()
+    q.state["faults"]["F5"].update(fired_at=dict(wall=time.time(), attempt=1, step=5), window_end=time.time() + 60)
+    q._freeze_until = q.state["faults"]["F5"]["window_end"]
+    q.end_faults()
+    f5 = q.state["faults"]["F5"]
+    assert f5["release"] == "cut" and f5["outcome"] == "recovered" and q.ctl_beat_path() is not None
 
 
 def test_a_fault_fires_only_after_a_full_state_and_is_missed_when_the_run_ends_first(fq):
@@ -780,6 +937,131 @@ def test_check_8_takes_a_non_forced_run_on_the_epochs_clock_even_when_it_stopped
     ran("smoke-p01", 0.0, clock="steps")  # the cooldown must come on the epochs clock
     ok, ev = F.SmokeVerdict(q).check8()
     assert not ok and ev["scheduled_cooldown"] == []
+
+
+# check 5 as fixed after box 53693389 (2026-10-01): torch_threads 16 of t = 32 on a 16-core / 32-thread host, and
+# whole-run data_wait_frac up to 0.234 from the loader start-ups of short, fault-restarted smoke runs
+
+
+def test_steady_wait_leaves_out_every_launchs_start_up_and_the_profiled_steps():
+    """smoke-p01 of box 53693389: launches after steps 0, 100 and 487, each first step waiting ~6-7 s for the loader's
+    spawned workers, 0.2 ms on a 0.272 s step after that, the smoke profiler on steps 21-41."""
+    step = {s: 0.272 for s in range(1, 936)}
+    wait = {s: 0.0002 for s in step}
+    for a, w0 in ((0, 6.59), (100, 6.09), (487, 6.79)):
+        wait[a + 1] = w0
+    prof = set(range(21, 42))
+    assert sum(wait.values()) / sum(step.values()) > 0.05  # the whole-run number check 5 used to fail on
+    w = F.steady_wait(wait, step, [0, 100, 487], prof)
+    assert w["data_wait_frac"] == pytest.approx(0.0002 / 0.272) and w["data_wait_frac"] < F.DATA_WAIT_MAX
+    assert w["startup_wait_s"] == {1: 6.59, 101: 6.09, 488: 6.79}
+    assert w["steps_measured"] == 935 - 3 * F.LAUNCH_SKIP_STEPS - len(prof)
+    slow_prof = {**wait, **{s: 0.2 for s in prof}}  # the profiler's steps are left out
+    assert F.steady_wait(slow_prof, step, [0, 100, 487], prof) == w
+    # a loader that starves the steps in steady state still shows
+    assert F.steady_wait({s: 0.03 for s in step}, step, [0, 100, 487], prof)["data_wait_frac"] == \
+        pytest.approx(0.03 / 0.272)
+    # no launch event: the first logged step's launch; nothing logged: None
+    assert F.steady_wait(wait, step, [])["startup_wait_s"] == {1: 6.59}
+    assert F.steady_wait({}, {}, []) == dict(data_wait_frac=None, steps_measured=0, startup_wait_s={})
+    # smoke-p005: one launch, 120 steps of 0.18 s, a 6.6 s first wait (whole run 0.234 on the box)
+    step = {s: 0.18 for s in range(1, 121)}
+    wait = {**{s: 0.0004 for s in step}, 1: 6.6}
+    w = F.steady_wait(wait, step, [0], range(21, 42))
+    assert w["data_wait_frac"] == pytest.approx(0.0004 / 0.18) and w["steps_measured"] == 120 - 10 - 21
+
+
+def check5_of(fq, monkeypatch, threads, *, t="32", n_steps=200, launches=(0,), steady=0.0002, startup=6.6):
+    """SmokeVerdict.check5 on one synthetic smoke-p03 run dir: `threads` the threads events, one per launch, each
+    torch_threads or (torch_threads, {pool or KITSUNE_THREADS_PER_GPU: value}); the queue's KITSUNE_THREADS_PER_GPU t;
+    time/data_wait_s `steady` on 0.4 s steps, `startup` on each launch's first step."""
+    monkeypatch.setenv(fullrun.ENV_THREADS_PER_GPU, t)
+    q = fq.make("full-smoke", registry=box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p03"]))
+    q.register()
+    rd = fq.root / "runs" / "smoke-p03-20261001T131206Z"
+    (rd / "metrics").mkdir(parents=True, exist_ok=True)
+    with open(rd / "events.jsonl", "w", encoding="utf-8") as f:
+        for a, th in zip(launches, threads):
+            tt, changes = th if isinstance(th, tuple) else (th, {})
+            env = {**{k: t for k in fullrun.ENV_THREAD_POOLS}, fullrun.ENV_CPU_QUOTA: t,
+                   fullrun.ENV_THREADS_PER_GPU: t, **changes}
+            f.write(json.dumps({"kind": "threads", "torch_threads": tt, "interop_threads": 32, "env": env}) + "\n")
+            f.write(json.dumps({"kind": "phase", "name": "train", "at_step": a}) + "\n")
+    with open(rd / "metrics" / "scalars.jsonl", "w", encoding="utf-8") as f:
+        for a in launches:
+            for s in range(a + 1, n_steps + 1):
+                f.write(json.dumps({"step": s, "tag": "time/step_s", "value": 0.4}) + "\n")
+                f.write(json.dumps({"step": s, "tag": "time/data_wait_s",
+                                    "value": startup if s == a + 1 else steady}) + "\n")
+    (rd / "summary.json").write_text(json.dumps({"throughput": {"data_wait_frac": 0.0957}}), encoding="utf-8")
+    q.item("smoke-p03").update(status="done", run_dir=f"runs/{rd.name}", attempts=[dict(t0=1.0, gpu="0", rc=0)])
+    return F.SmokeVerdict(q).check5()
+
+
+@pytest.mark.parametrize("threads,t,ok", [
+    ([16], "32", True),  # the 9950X: torch's pool capped at the 16 physical cores (MKL_DYNAMIC)
+    ([32], "32", True),
+    ([33], "32", False),  # oversubscribed past the quota (what fix 2 prevents)
+    ([15], "32", False),  # below t // 2: something set the pool down
+    ([(16, {fullrun.ENV_OMP_NUM_THREADS: "64"})], "32", False),  # a pool past t
+    ([(16, {fullrun.ENV_RAYON_NUM_THREADS: None})], "32", False),  # a pool onstart did not set
+    ([(16, {fullrun.ENV_THREADS_PER_GPU: "16"})], "32", False),  # the trainer saw another t than the queue
+    ([16, 64], "32", False),  # every launch is checked, not only the last
+    ([16, 32], "32", True),
+    ([1], "1", True),
+    (["16"], "32", False),  # not an integer count
+])
+def test_check_5_bounds_every_launchs_torch_threads_by_the_quota(fq, monkeypatch, threads, t, ok):
+    launches = (0, 100)[:len(threads)]
+    got, ev = check5_of(fq, monkeypatch, threads, t=t, launches=launches)
+    assert got is ok, ev
+    assert ev["torch_threads_range"] == [max(1, int(t) // 2), int(t)] and ev["threads_per_gpu"] == t
+    assert ev["torch_threads"]["smoke-p03"] == [x[0] if isinstance(x, tuple) else x for x in threads]
+    assert ev["data_wait"]["smoke-p03"]["ok"] is True  # the wait half passes throughout
+
+
+def test_check_5_measures_the_loaders_steady_wait(fq, monkeypatch):
+    ok, ev = check5_of(fq, monkeypatch, [16, 16], launches=(0, 100))
+    w = ev["data_wait"]["smoke-p03"]
+    assert ok and w["data_wait_frac"] == pytest.approx(0.0002 / 0.4) and w["data_wait_frac_run"] == 0.0957
+    assert w["startup_wait_s"] == {1: 6.6, 101: 6.6} and w["steps_measured"] == 200 - 2 * F.LAUNCH_SKIP_STEPS
+    assert ev["data_wait_frac"] == {"smoke-p03": w["data_wait_frac"]} and ev["data_wait_max"] == F.DATA_WAIT_MAX
+    # a steady wait at the limit fails; so does a loader that only starts slowly; so do too few steps to measure
+    ok, ev = check5_of(fq, monkeypatch, [16], steady=F.DATA_WAIT_MAX * 0.4)
+    assert not ok and ev["data_wait"]["smoke-p03"]["data_wait_frac"] == pytest.approx(F.DATA_WAIT_MAX)
+    ok, ev = check5_of(fq, monkeypatch, [16], startup=F.STARTUP_WAIT_MAX_S)
+    assert not ok and ev["data_wait"]["smoke-p03"]["startup_wait_s"] == {1: F.STARTUP_WAIT_MAX_S}
+    ok, ev = check5_of(fq, monkeypatch, [16], n_steps=F.LAUNCH_SKIP_STEPS + F.WAIT_MIN_STEPS - 1)
+    assert not ok and ev["data_wait"]["smoke-p03"]["steps_measured"] == F.WAIT_MIN_STEPS - 1
+    # no quota from the queue's env: fail
+    monkeypatch.delenv(fullrun.ENV_THREADS_PER_GPU)
+    q = fq.make("full-smoke", registry=box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p03"]))
+    q.register()
+    q.item("smoke-p03").update(status="done", run_dir="runs/smoke-p03-20261001T131206Z",
+                               attempts=[dict(t0=1.0, gpu="0", rc=0)])
+    ok, ev = F.SmokeVerdict(q).check5()
+    assert not ok and ev["torch_threads_range"] is None
+
+
+def test_check_5_on_the_fake_trainer_takes_the_steady_state_not_the_start_ups(fq, monkeypatch):
+    """The trainer's records as the fake writes them (threads, phase train per launch, time/data_wait_s per step): a
+    start-up that puts the whole run past the limit passes; a loader that starves every step fails."""
+    for k in fullrun.ENV_THREAD_POOLS:
+        monkeypatch.setenv(k, "8")
+    monkeypatch.setenv(fullrun.ENV_THREADS_PER_GPU, "8")
+    reg = box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p03"])
+    for sd, env, ok in (("s1", dict(FAKE_STARTUP_WAIT_S="20"), True), ("s2", dict(FAKE_WAIT_FRAC="0.06"), False)):
+        q = fq.make("full-smoke", registry=reg, state_dir=fq.tmp / sd, env=dict(FAKE_EPOCH_STEPS="100", **env))
+        assert q.run() == F.EXIT_OK
+        c5 = json.loads((fq.tmp / sd / fullrun.VERDICT_FILE).read_text(encoding="utf-8"))["checks"]["5"]
+        assert c5["pass"] is ok, c5
+        w = c5["evidence"]["data_wait"]["smoke-p03"]
+        if ok:
+            assert w["data_wait_frac_run"] > F.DATA_WAIT_MAX and w["data_wait_frac"] == pytest.approx(0.01)
+            assert list(w["startup_wait_s"].values()) == [pytest.approx(20.01)]
+        else:
+            assert w["data_wait_frac"] == pytest.approx(0.06)
+        assert c5["evidence"]["torch_threads"] == {"smoke-p03": [8]}
 
 
 def test_only_if_new_machine_skips_a_re_time_on_the_same_machine(fq):

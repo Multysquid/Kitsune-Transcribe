@@ -1807,6 +1807,62 @@ def test_finish_infra_upload_redacts_the_portal_secrets(tmp_path, monkeypatch):
     assert b"[train] step 1 loss 2.5" in sent["runs/r/infra/kitsune.log"]
 
 
+def test_hub_forbidden_dirs_mirror_huggingface_hub():
+    """finish stays stdlib-only, so HUB_FORBIDDEN_DIRS mirrors the pinned huggingface_hub's FORBIDDEN_FOLDERS; a bump
+    that adds a rule fails here, not on a box (box 53693389 lost its chain infra commit to a .cache/ path)."""
+    from huggingface_hub import CommitOperationAdd
+    from huggingface_hub.utils import _paths
+
+    assert set(finish.HUB_FORBIDDEN_DIRS) == set(_paths.FORBIDDEN_FOLDERS)
+    for n in finish.HUB_FORBIDDEN_DIRS:
+        with pytest.raises(ValueError):
+            CommitOperationAdd(path_in_repo=f"a/{n}/b", path_or_fileobj=b"")
+        assert not finish.hub_path_ok(f"a/{n}/b") and not finish.hub_path_ok(f"{n}/b")
+    for ok in ("a/.cachex/b", "a/x.git/b", "a/b.cache", "hub_reads/runs/r/timed_state.json"):
+        CommitOperationAdd(path_in_repo=ok, path_or_fileobj=b"")
+        assert finish.hub_path_ok(ok), ok
+
+
+def test_an_infra_file_the_hub_refuses_or_that_vanished_costs_only_itself(tmp_path, monkeypatch):
+    """upload_infra builds its operations file by file: a path the Hub refuses (a rule hub_path_ok does not know yet)
+    or a file that went away between the listing and its read is left out alone (event infra_skipped); the rest of the
+    infra still goes up in one commit."""
+    state = tmp_path / "state"
+    (state / "logs").mkdir(parents=True)
+    (state / "logs" / "item.log").write_text("step 1\n", encoding="utf-8")
+    (state / "logs" / "x" / ".cache").mkdir(parents=True)
+    (state / "logs" / "x" / ".cache" / "y").write_text("{}", encoding="utf-8")
+    (state / "queue.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(finish, "INFRA_LOGS", [])
+    monkeypatch.setattr(finish, "STATE_DIR", state)
+    monkeypatch.setattr(finish, "hub_path_ok", lambda path: True)  # as if the mirror lagged the library
+    real = finish.infra_files
+    monkeypatch.setattr(finish, "infra_files", lambda deep=False: [*real(deep), ("gone.json", state / "gone.json")])
+    hub = FakeHub({})
+    finish.upload_infra(hub, "Multy123/kitsune-runs", "model", "full/box-x/infra/c", dry_run=False, deep=True)
+    (commit,) = hub.commits
+    assert {op.path_in_repo for op in commit["operations"]} == {"full/box-x/infra/c/logs/item.log",
+                                                                "full/box-x/infra/c/queue.json"}
+    ev = [json.loads(x) for x in (state / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    (skip,) = [e for e in ev if e["kind"] == "infra_skipped"]
+    assert skip["files"] == ["logs/x/.cache/y", "gone.json"] and skip["n"] == 2
+
+
+def test_expected_files_leave_out_paths_the_hub_cannot_take(tmp_path):
+    """A run dir path with a .git or .cache folder is never expected: upload_folder drops .git/** and
+    .cache/huggingface/** (DEFAULT_IGNORE_PATTERNS) and the Hub refuses the rest, so expecting one would fail verify
+    on every try and stop the box for good."""
+    run = make_run(tmp_path)
+    for rel in (".cache/huggingface/x.metadata", ".git/HEAD", "evals/.cache/z.json",
+                "checkpoints/step_200/.cache/huggingface/y.metadata"):
+        (run / rel).parent.mkdir(parents=True, exist_ok=True)
+        (run / rel).write_text("{}", encoding="utf-8")
+    for kw in (dict(), dict(expect_full=False, lean=True)):
+        exp = finish.expected_files(run, **kw)
+        assert exp and all(finish.hub_path_ok(p) for p in exp), sorted(exp)
+        assert f"runs/{run.name}/checkpoints/step_200/model.safetensors" in exp
+
+
 def test_finish_sync_uploads_the_logs_before_the_checkpoints(finish_env, tmp_path):
     """The watchdog's --sync-only gets 10 minutes before the stop: the ~9 GB of a full state not yet on the hub came
     first and could take all of them, and a checkpoint commit that raised skipped the run's logs altogether (rc 0). The

@@ -60,7 +60,8 @@ item's own weights; {config}, {ckpt}, {run_id} and {run_name} need `of`. The que
 full_queue.py). Verdict spec {check "1".."16", json, path "a.b.c", min, max, equals}: json and path go together, a
 condition needs a path. Fault {id, action (FAULT_ACTIONS), item (a train item of the box), at_step, after_event,
 min_attempt (1), seconds}: only on smoke boxes; sigstop/kill need at_step, wipe_run_dir after_event, deadline seconds,
-freeze_controller_hb at_step and seconds > watchdog.orphan_s on a box whose watchdog only alerts. Item configs must
+freeze_controller_hb at_step and seconds >= watchdog.orphan_s + WATCHDOG_POLL_S on a box whose watchdog only alerts
+(on a chain: under the last stage's stop orphan_s). Item configs must
 exist (check_files) and carry the box data config's DATA_KEYS values (a missing pull_parakeet counts as false); a train
 item's family is its config's (default aed). Without pull_parakeet, every stores and train item config has the data
 config's family (default aed): bootstrap pulls the labels the data config's pull plan names (kitsune/extent.py
@@ -461,6 +462,10 @@ _FAULT_FIELDS = {"id": _REQ, "action": _REQ, "item": _REQ, "at_step": None, "aft
                  "seconds": None}
 _VERDICT_KEYS = ("check", "json", "path", "min", "max", "equals")
 _WATCHDOG_ACTIONS = ("stop", "alert")
+# vast/watchdog.sh's poll (KITSUNE_WATCHDOG_POLL_S, default 60): a stale heartbeat is seen at the first poll past
+# orphan_s, so a freeze_controller_hb window must last orphan_s + this for its alert to fall inside it (box 53693389:
+# the queue cut F5's window at 480 s of its 900; the full window, held by the queue's hold_freeze, covers 600 + 60)
+WATCHDOG_POLL_S = 60
 # a chain box (addendum E.1.2-E.1.3): its own fields, and each stage's (the gated first stage, then the last one); a
 # stage's rebuild and the first stage's gate_by_hours are filled (a stored filled chain validates again unchanged)
 _CHAIN_FIELDS = {"chain": _REQ, "est_hours": _REQ, "max_hours": _REQ, "max_dph": _REQ, "extra_gb": 0, "gate": True}
@@ -782,6 +787,9 @@ def _check_faults(where: str, faults, box: dict, train_names: list[str], p: list
                          f"would stop the box; only an alert box may freeze its controller heartbeat")
             if _num(sec) and _int(wd.get("orphan_s")) and not sec > wd["orphan_s"]:
                 p.append(f"{w}: seconds {sec} must exceed watchdog.orphan_s {wd['orphan_s']} (the alert must fire)")
+            elif _num(sec) and _int(wd.get("orphan_s")) and not sec >= wd["orphan_s"] + WATCHDOG_POLL_S:
+                p.append(f"{w}: seconds {sec} must be >= watchdog.orphan_s {wd['orphan_s']} + the watchdog's poll "
+                         f"{WATCHDOG_POLL_S} s (WATCHDOG_POLL_S): the alert comes at its first poll past orphan_s")
     return out
 
 
@@ -988,6 +996,15 @@ def _check_chain(cname: str, raw: dict, plain: dict, p: list[str]) -> dict:
                 p.append(f"{w}: part {x!r}'s watchdog action is {action!r}: every part but the gate part runs with "
                          f"the watchdog in stop mode")
         filled.append(fs)
+    gb, last_parts = (filled[0].get("gate_box"), filled[1].get("parts") or []) if len(filled) == 2 else (None, [])
+    stop_s = [plain[x]["watchdog"].get("orphan_s") for x in last_parts if x in plain
+              and isinstance(plain[x].get("watchdog"), dict)]
+    if gb in plain and stop_s and all(_int(x) for x in stop_s):  # the mode set_mode switches to once the gate part
+        for f in plain[gb].get("faults") or []:  # has returned: never one in which a freeze could stop the box
+            if isinstance(f, dict) and f.get("action") == "freeze_controller_hb" and _num(f.get("seconds")) and \
+                    not f["seconds"] < max(stop_s):
+                p.append(f"{where}: the gate part's freeze {f.get('id')!r} ({f['seconds']} s) must be shorter than the "
+                         f"last stage's stop orphan_s {max(stop_s)}: stop mode must never fire on a freeze")
     if len(gpus) > 1:
         p.append(f"{where}: its parts have different gpus {sorted(gpus, key=str)}: one rental has one GPU count")
     last = [plain[x] for x in filled[1].get("parts") or [] if x in plain]

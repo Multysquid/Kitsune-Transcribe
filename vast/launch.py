@@ -206,8 +206,9 @@ MIN_RENTAL_DAYS = 4  # the host's max rental must outlast the box (decision 12; 
 FULL_RAM_MB_PER_GPU = 64_000
 # full_filter's disk_bw floor in MB/s (plan v3 section 3), and the lowest value --min-disk-bw takes. A full box writes
 # ~1 TB once (the rebuilt shards and the store) at the rebuild's ~40 MB/s and then reads its stores at ~120 MB/s (box 1
-# measured as P-0.1B's 1,539 audio-s step every ~0.4 s); the floor keeps headroom over that, and the smoke's data_wait
-# check (verdict check 5) catches a disk that starves the loader before box 1 trains
+# measured as P-0.1B's 1,539 audio-s step every ~0.4 s); the floor keeps headroom over that, and the smoke's
+# steady-state data_wait check (verdict check 5, with its cap on a launch's start-up wait) catches a disk that starves
+# the loader before box 1 trains
 FULL_MIN_DISK_BW = 500
 MIN_DISK_BW_FLOOR = 150
 # cost guards of a full box (launch --max-gb-cost / --max-total). 2026-10-01: with the cheap offers gone, the ranking's

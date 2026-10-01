@@ -824,7 +824,13 @@ def test_heartbeats_threads_event_and_a_run_without_timed_states(env, monkeypatc
     summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
     assert "timed_states" not in summary and summary["status"] == "complete"
     assert 0.0 <= summary["throughput"]["data_wait_frac"] < 1.0  # the loader's share of the steps' time
-    ups = [c for c in hub.commits if "/checkpoints/" in c.get("folder", "")]
+    # what smoke check 5's steady-state wait reads (full_queue.steady_wait): the launch's phase train and every step's
+    # time/data_wait_s and time/step_s, the lean steps included
+    assert [e["at_step"] for e in events(run, "phase") if e.get("name") == "train"] == [0]
+    rows = [json.loads(x) for x in (run / "metrics" / "scalars.jsonl").read_text(encoding="utf-8").splitlines()]
+    for tag in ("time/data_wait_s", "time/step_s"):
+        assert {r["step"] for r in rows if r["tag"] == tag} == set(range(1, 11)), tag
+    ups =[c for c in hub.commits if "/checkpoints/" in c.get("folder", "")]
     assert ups and all(c["ignore"] == [m.UPLOAD_MARK] for c in ups)
     steps = steps_of(run)
     assert steps["step"].tolist() == list(range(1, 11))

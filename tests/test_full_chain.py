@@ -227,6 +227,9 @@ RULES = {
                                    r"\['gate_box'\] belong to the gated first stage only"),
     "an unknown stage key": (lambda r, root: stage(r, 0).update(gpus=1), r"chain\[0\]: unknown key\(s\) \['gpus'\]"),
     "no parts": (lambda r, root: stage(r, 1).update(parts=[]), r"parts \[\] is not a non-empty list"),
+    "a gate freeze not under the stop orphan_s": (
+        lambda r, root: r["boxes"]["p01"].update(watchdog={"orphan_s": 900, "action": "stop"}),
+        r"the gate part's freeze 'F5' \(900 s\) must be shorter than the last stage's stop orphan_s 900"),
 }
 
 
@@ -487,7 +490,7 @@ def test_the_chain_end_to_end_on_real_part_queues(ch, monkeypatch):
     fs["faults"] = [f for f in fs["faults"] if f["action"] != "sigstop"]  # posix only; the queue's tests cover it
     for f in fs["faults"]:
         if f["action"] == "freeze_controller_hb":
-            f["seconds"] = 30.0
+            f["seconds"] = 60.0  # orphan_s 0 + fullrun.WATCHDOG_POLL_S; the stand-in's alert releases the hold at once
         if f["action"] == "wipe_run_dir":
             f["min_attempt"] = 1
     runs_hub = DirHub.create(ch.tmp / "runs-hub", limit=100000, window_s=1.0)
@@ -498,6 +501,8 @@ def test_the_chain_end_to_end_on_real_part_queues(ch, monkeypatch):
     monkeypatch.setattr(huggingface_hub, "snapshot_download", snap)
     monkeypatch.setattr(finish, "HUB_RETRY_WAITS", (0.05, 0.1))
     monkeypatch.setenv(fullrun.ENV_THREADS_PER_GPU, "8")
+    for k in fullrun.ENV_THREAD_POOLS:  # onstart's six pools (fix 2): check 5 wants each in [1, t]
+        monkeypatch.setenv(k, "8")
     up = Q.HubUploader("u/kitsune-runs")
     up._api = FakeApi(runs_hub, "chain")
     train_configs(ch.root, **{n: {"early_stop": {"min_delta_abs": 1e9}} for n in ("smoke-t06", "smoke-p03")})
@@ -587,6 +592,9 @@ def test_the_chain_end_to_end_on_real_part_queues(ch, monkeypatch):
     until = min(fz["window_end"], next(e["wall"] for e in fsev if e["kind"] == "fault_outcome" and e["id"] == "F5"))
     window = [m for t, m in seen if fz["fired_at"]["wall"] + 0.05 < t < until - 0.05]
     assert window and len(set(window)) == 1
+    # the part returned only once its freeze was released (hold_freeze), so set_mode's stop mode came after it
+    assert fz["release"] in ("alert", "window") and fz["released"] <= until
+    assert next(e["wall"] for e in ch.events("watchdog_mode")) >= fz["released"]
     # a restart of an ended chain does nothing
     assert ch.make(registry=reg, uploader=up).run() == 0 and len(ch.boots()) == 1
 

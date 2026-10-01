@@ -402,6 +402,9 @@ RULES = {
                                    r"freeze_controller_hb on a box whose watchdog action is 'stop'"),
     "freeze shorter than orphan_s": (lambda r: _box(r, "full-smoke")["faults"][4].update(seconds=600),
                                      r"must exceed watchdog.orphan_s"),
+    # box 53693389: the alert comes at the watchdog's first poll past orphan_s, which a 650 s window can miss
+    "freeze inside one watchdog poll": (lambda r: _box(r, "full-smoke")["faults"][4].update(seconds=650),
+                                        r"must be >= watchdog.orphan_s 600 \+ the watchdog's poll 60 s"),
     "kill without at_step": (lambda r: _box(r, "full-smoke")["faults"][1].pop("at_step"), r"kill needs at_step"),
     "wipe without after_event": (lambda r: _box(r, "full-smoke")["faults"][2].pop("after_event"),
                                  r"wipe_run_dir needs after_event"),

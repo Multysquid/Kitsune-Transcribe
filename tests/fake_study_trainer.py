@@ -25,9 +25,9 @@ log syncs there, FAKE_SYNCS of them, FAKE_BOX its box, retried on a 429 after FA
 
 The full runs (kitsune/full_queue.py; a config on the epochs clock, as configs/full/*.json): train_full writes what the
 queue, its stall check and its smoke verdict read (build contract 4.4) - per step metrics/scalars.jsonl rows
-(sched/train_s, time/step_s, mem/step_peak_reserved_gb) and a beat of $KITSUNE_HEARTBEAT; the setup events (threads,
-smoke_sdpa, memory_probe, dev_store, data.stores_reused, frame_preflight for family ctc); periodic full states
-(full_step_<N>/ with model.pt, optimizer.pt, l2sp.pt, trainer.pt, trainer.json and a `checkpoint` event); the WSD
+(sched/train_s, time/step_s, mem/step_peak_reserved_gb, time/data_wait_s) and a beat of $KITSUNE_HEARTBEAT; the setup
+events (threads, smoke_sdpa, memory_probe, dev_store, data.stores_reused, frame_preflight for family ctc); periodic full
+states (full_step_<N>/ with model.pt, optimizer.pt, l2sp.pt, trainer.pt, trainer.json and a `checkpoint` event); the WSD
 cooldown at 0.8 of the steps (phase cooldown, the pre_cooldown full state, ckpt_upload_ok); the export step_<S>/ and
 summary.json (steps, epochs, stopped_early, end_reason, resume_resets, checkpoints.weights, throughput). Knobs (env,
 JSON; {prefix: value} tables keyed by run name unless said otherwise): FAKE_EPOCH_STEPS (steps per epoch, 20; or a
@@ -39,11 +39,14 @@ at step 1 with that summary error, e.g. "SmokeFailed: ..."), FAKE_ERROR_RESUME (
 "ResumeMismatch: ..."), FAKE_EARLY {name: frac} (an early stop at that fraction: early_stop with action cooldown, the
 cooldown over 0.2 of the steps so far, summary stopped_early), FAKE_TIMED {name: every N steps} (timed full states into
 the scratch DirHub FAKE_SCRATCH: one commit of the state and its runs/<id>/timed_state.json pointer that deletes the
-previous state, a squash, a timed_state_upload_ok event), FAKE_DEADLINE_S (a KITSUNE_DEADLINE nearer than this, 3600:
-a deadline_cooldown event with action start), FAKE_THREADS (torch_threads, default KITSUNE_THREADS_PER_GPU or 8),
-FAKE_WAIT_FRAC (throughput.data_wait_frac, 0.01). --set schedule.resume_reset=true on a resumed launch: a resume_reset
-event and summary resume_resets + 1 (the next full state follows it). One FAKE_LOG record per launch as above, plus
-launch, resumed_from, deadline (KITSUNE_DEADLINE) and heartbeat (KITSUNE_HEARTBEAT).
+previous state, a squash, a timed_state_upload_ok event), FAKE_DEADLINE_S (a KITSUNE_DEADLINE nearer than this, 3600: a
+deadline_cooldown event with action start), FAKE_THREADS (torch_threads, default KITSUNE_THREADS_PER_GPU or 8),
+FAKE_WAIT_FRAC (the loader's share: every step's time/data_wait_s = it x the step's time/step_s, 0.01; the summary's
+throughput.data_wait_frac is the whole run's, start-ups included), FAKE_STARTUP_WAIT_S (added to the time/data_wait_s of
+each launch's first step, as a real loader's spawned workers start: 0; each launch logs phase {name: "train", at_step}
+before its first step, as the trainer does). --set schedule.resume_reset=true on a resumed launch: a resume_reset event
+and summary resume_resets + 1 (the next full state follows it). One FAKE_LOG record per launch as above, plus launch,
+resumed_from, deadline (KITSUNE_DEADLINE) and heartbeat (KITSUNE_HEARTBEAT).
 More modes: readout (scripts/05_evaluate.py: --out DIR --ckpt DIR --system S: study.json with metrics m4 FAKE_M4 {system
 prefix: value}, 0.12, m4_teacher, m4_ratio, jg, jg_nostyle, gate_pooled and strata.eval_jsut.cer_nostyle; exit 2 when
 --ckpt is missing), eval (a registry eval item: --out DIR; FAKE_WRITES {item: {path under --out: JSON}}), check-resume
@@ -403,6 +406,18 @@ def fail(run: Path, error: str, rc: int = 1) -> int:
     return rc
 
 
+def run_wait_frac(run: Path) -> float:
+    """summary.throughput.data_wait_frac as the trainer reports it: the whole run's sum(time/data_wait_s) /
+    sum(time/step_s), every launch's start-up included (the merged rows: a resumed launch's step replaces the old)."""
+    rows: dict[tuple[str, int], float] = {}
+    for line in (run / "metrics" / "scalars.jsonl").read_text(encoding="utf-8").splitlines():
+        r = json.loads(line)
+        rows[(r["tag"], r["step"])] = r["value"]
+    wait = sum(v for (t, _), v in rows.items() if t == "time/data_wait_s")
+    tot = sum(v for (t, _), v in rows.items() if t == "time/step_s")
+    return wait / tot if tot > 0 else 0.0
+
+
 def train_full(run: Path, cfg: dict, name: str, resumed: bool, record: dict, sets: list[str]) -> int:
     """A full run on the epochs clock (the module docstring): the steps, events, states and summary the full-run queue
     reads, fast."""
@@ -465,7 +480,9 @@ def train_full(run: Path, cfg: dict, name: str, resumed: bool, record: dict, set
     every = int(os.environ.get("FAKE_FULL_EVERY", "5"))
     timed = by_prefix(env_json("FAKE_TIMED", {}), name)
     sv = float(per_name("FAKE_STEP_VALUE", name, 1.0))
+    wf, w0 = float(os.environ.get("FAKE_WAIT_FRAC", "0.01")), float(os.environ.get("FAKE_STARTUP_WAIT_S", "0"))
     (run / "metrics").mkdir(parents=True, exist_ok=True)
+    event(run, "phase", name="train", at_step=start)
     s = start
     with open(run / "metrics" / "scalars.jsonl", "a", encoding="utf-8") as f:
         while s < st["total_steps"]:
@@ -480,7 +497,8 @@ def train_full(run: Path, cfg: dict, name: str, resumed: bool, record: dict, set
                     time.sleep(0.05)
             time.sleep(step_s)
             wall = time.time()
-            for tag, v in (("sched/train_s", s * sv), ("time/step_s", sv), ("mem/step_peak_reserved_gb", mem)):
+            for tag, v in (("sched/train_s", s * sv), ("time/step_s", sv), ("mem/step_peak_reserved_gb", mem),
+                           ("time/data_wait_s", wf * sv + (w0 if s == start + 1 else 0.0))):
                 f.write(json.dumps({"step": s, "wall": wall, "tag": tag, "value": v}) + "\n")
             f.flush()
             if hb:
@@ -514,7 +532,7 @@ def train_full(run: Path, cfg: dict, name: str, resumed: bool, record: dict, set
         "status": "complete", "run_id": run.name, "family": fam, "steps": T, "epochs": round(T / eps, 4),
         "stopped_early": trig, "early_stop_trigger": trig, "end_reason": st["end_reason"],
         "resume_resets": st["resume_resets"], "checkpoints": {"weights": [T], "full": fulls},
-        "throughput": {"data_wait_frac": float(os.environ.get("FAKE_WAIT_FRAC", "0.01"))}, "dev_history": []})
+        "throughput": {"data_wait_frac": run_wait_frac(run)}, "dev_history": []})
     return 0
 
 

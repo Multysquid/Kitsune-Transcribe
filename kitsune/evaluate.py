@@ -374,8 +374,11 @@ def teacher_forced_records(model, store, featurizer, device, batch_s: float = 40
             terms = {k: v.detach().float() for k, v in losses_fn(logits, item["top_idx"].to(device), top_lp).items()}
             terms.setdefault("teacher_p1", top_lp[:, 0].exp())  # teacher confidence for the p1 buckets
 
-            def per_row(v):
-                return torch.zeros(n, device=device).index_add_(0, rows, v).cpu().numpy()
+            tmask = item["tgt_mask"].to(device)
+
+            def per_row(v):  # h[tgt_mask] has h[tgt_row, tgt_pos]'s order (trainset collate): no atomics, so the same
+                # batch gives the same bits on CUDA (index_add_'s atomic order did not; kitsune.ctc_kd._per_row)
+                return torch.zeros(tmask.shape, device=device).masked_scatter(tmask, v.float()).sum(dim=1).cpu().numpy()
 
             sums = {k: per_row(v) for k, v in terms.items()}
             buckets = {}

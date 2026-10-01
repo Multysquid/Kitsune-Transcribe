@@ -685,6 +685,21 @@ def test_teacher_forced_self_consistency(self_store, featurizer):
     assert sorted(sub_utt["id"]) == sorted(ids)
 
 
+def test_teacher_forced_sums_use_no_atomics(self_store, featurizer, monkeypatch):
+    """The AED teacher-forced per-utterance sums scatter each token's term back into its (row, position) by the
+    collate's tgt_mask and sum the rows: no index_add_, whose CUDA atomics made the sums' last bits differ from run to
+    run (box 53693389's check 14). Student == teacher: every token's top-1 matches, so each row's sum of top1_match is
+    its token count exactly, and the bucket counts are whole numbers."""
+    def no_index_add(*a, **k):
+        raise AssertionError("index_add_ called")
+
+    monkeypatch.setattr(torch.Tensor, "index_add_", no_index_add)
+    raw, dropped = ev.teacher_forced_records(tiny_model(0), self_store, featurizer, "cpu", batch_s=3.0)
+    assert len(raw) == len(self_store.utts) and not dropped
+    assert (raw["sum_top1_match"] == raw["n_tok"]).all()
+    assert ((raw["_n_hi"] + raw["_n_lo"]) <= raw["n_tok"]).all() and (raw["_n_hi"] % 1 == 0).all()
+
+
 def test_evals_count_undecodable_rows_per_set(self_store, featurizer, tokenizer, monkeypatch):
     """An eval row whose audio does not decode is dropped by the dataset; both evals count it per set
     (bad_audio_per_set, which the verdict reads for the gate sets) and score the rest."""

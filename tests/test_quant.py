@@ -278,6 +278,76 @@ def test_pointwise_adapter_exact():
         assert torch.allclose(ad(x), conv(x), atol=1e-5, rtol=0)
 
 
+class _AssertsRowMajor(nn.Linear):
+    """torchao 0.18's NVFP4 activation quantiser in miniature: `assert data_hp.is_contiguous()` on the 2-D input
+    QuantLinear hands its GEMM (x.reshape(-1, K))."""
+
+    def forward(self, x):
+        assert x.reshape(-1, self.in_features).is_contiguous(), "Only support contiguous data for now"
+        return super().forward(x)
+
+
+def _pointwise_with_assert(seed: int = 0) -> tuple[nn.Conv1d, Q.PointwiseConv1dAsLinear]:
+    torch.manual_seed(seed)
+    conv = nn.Conv1d(64, 64, 1)
+    ad = Q.PointwiseConv1dAsLinear(conv)
+    ad.linear.__class__ = _AssertsRowMajor
+    return conv, ad
+
+
+def test_pointwise_conv_hands_its_linear_a_row_major_input():
+    """Box 53693389's smoke B: every nvfp4-w4a4 probe failed at its batch-1 warm-up, eager and compiled. At B = 1 the
+    (B, C, T) depthwise output's transpose reshaped to a (T, C) view with strides (1, T), which torchao's NVFP4
+    quantiser refuses; B > 1 had copied already. The adapter now hands a row-major input in both modes, at both
+    batch sizes, with the conv's numbers."""
+    conv, ad = _pointwise_with_assert()
+    dw = nn.Conv1d(64, 64, 3, padding=1, groups=64)  # the depthwise conv before it: T fastest
+    for b in (1, 3):
+        x = dw(torch.randn(b, 64, 37))
+        with torch.no_grad():
+            assert torch.allclose(ad(x), conv(x), atol=1e-5, rtol=0), b
+    compiled = torch.compile(ad, backend="aot_eager", dynamic=True)
+    for b in (3, 1):  # batched first, then the B = 1 recompile (where dynamo traced a non-contiguous fake tensor)
+        x = dw(torch.randn(b, 64, 41))
+        with torch.no_grad():
+            assert torch.allclose(compiled(x), conv(x), atol=1e-5, rtol=0), b
+
+
+def test_the_row_major_op():
+    """kitsune::row_major: a registered custom op whose output is a row-major copy (its fake says so, which is what
+    torch.compile keeps), passing torch.library.opcheck; registering it again (a reload of the module) gives an op
+    that still works."""
+    x = torch.randn(2, 8, 5).transpose(1, 2)
+    y = Q.row_major(x)
+    assert y.is_contiguous() and torch.equal(y, x) and y.data_ptr() != x.data_ptr()
+    res = torch.library.opcheck(Q.row_major, (x,))
+    assert all(v == "SUCCESS" for v in res.values()), res
+    again = Q._register_row_major()
+    assert again(x).is_contiguous() and torch.equal(again(x), x)
+
+
+def test_the_selftest_names_the_int8_kernel_and_tells_mxfp4s_refusal_from_another_error(monkeypatch):
+    """sm_120's int8 GEMM (cutlass_80_wmma_tensorop_i161616gemm_s8_*) is int8, not other_gemm (box 53693389's
+    cosmetic int8 warning). Decision 20's canary counts only a refusal that names the hardware as the expected one;
+    any other error from torchao's AUTO kernel is a warning that decision 20 went unchecked."""
+    assert Q._kernel_class("cutlass_80_wmma_tensorop_i161616gemm_s8_128x128_128x2_tn_align16") == "int8"
+
+    class Lin(nn.Linear):
+        def forward(self, x):
+            raise self.err
+
+    for err, hw in ((NotImplementedError("MXFP4 scaling only supported in CUDA for B200/B300"), True),
+                    (RuntimeError("shape mismatch"), False), (AssertionError("B200"), False)):
+        monkeypatch.setattr(Q, "mxfp4_auto_config", lambda: object())
+        monkeypatch.setattr(Q, "_ao", lambda name: (lambda lin, cfg: setattr(lin, "__class__", Lin)
+                                                     or setattr(lin, "err", err)))
+        rec = dict(warnings=[])
+        Q._selftest_mxfp4(rec, torch.device("cpu"), (64, 64))
+        out = rec["mxfp4_auto"]
+        assert out["raised"] is True and out["refused_for_hardware"] is hw, err
+        assert bool(rec["warnings"]) is (not hw) and all("decision 20 unchecked" in w for w in rec["warnings"])
+
+
 # ---------------------------------------------------------------------------------------------- apply
 
 
@@ -813,6 +883,85 @@ def test_compare_eval_dirs_and_the_cli(tmp_path, capsys):
     assert Q.main(["compare", str(one), str(other), "--json-out", str(js)]) == 1
     assert Q.main(["compare", str(one), str(other), "--tol-cer", "0.2"]) == 0
     capsys.readouterr()
+
+
+def _parts(d: Path, identity: dict | None = None, **sets):
+    """A 05 --out dir's .parts records: identity.json and one <set>.json per keyword (its pass_sets, batch_s,
+    chunks)."""
+    (d / ".parts").mkdir(parents=True, exist_ok=True)
+    ident = dict(weights="w1", step=10, store="fp-store", batch_s=400.0, device="cuda", autocast="bf16", tf32=False,
+                 relpos_patch=True, family="ctc", eval_sets=["eval_jsut"], sources=["eval_jsut"], subset=None,
+                 quant=dict(fmt="int8-w8a8", impl="torchao", scope="linear+pw", source="file"))
+    ident.update(identity or {})
+    (d / ".parts" / "identity.json").write_text(json.dumps(ident), encoding="utf-8")
+    for s, rec in sets.items():
+        (d / ".parts" / f"{s}.json").write_text(json.dumps(dict(dict(pass_sets=[s], batch_s=400.0, chunks=3), **rec)),
+                                                encoding="utf-8")
+
+
+def test_compare_names_the_tf_columns_that_differ_and_guards_the_batches(tmp_path):
+    """Box 53693389's check 14: every hypothesis equal, the tf tables 3e-7 apart in their KL sums. Exact stays
+    bitwise; tf_diff names the column with its n_diff and max_rel (ulp noise at a glance); equal tables on equal
+    batches are the same; the same tables on other batches are not (batches_equal, a reason), a variant file's own
+    weights and its quant source excepted."""
+    import numpy as np
+    import pandas as pd
+
+    refs = {"a": "あいうえお", "b": "かきくけこ"}
+    hyps = {"eval_jsut": {"a": "あいうえお", "b": "かきくけ"}}
+    one, two = _eval_dir(tmp_path / "one", hyps, refs), _eval_dir(tmp_path / "two", hyps, refs)
+    tf = pd.DataFrame(dict(id=["a", "b"], kl=[0.25, 0.5], n_tok=[5, 4], top1=[float("nan"), 1.0]))
+    tf.to_parquet(one / "tf_eval_jsut.parquet")
+    tf2 = tf.copy()
+    tf2.loc[1, "kl"] = float(np.nextafter(np.float64(0.5), 1.0))  # one ulp in one row of one column
+    tf2.iloc[::-1].to_parquet(two / "tf_eval_jsut.parquet")  # another row order: compared by id
+    r = Q.compare_eval_dirs(one, two)["sets"]["eval_jsut"]
+    assert not r["same"] and r["hyps_equal"] and r["tf_equal"] is False and r["batches_equal"] is None
+    assert set(r["tf_diff"]) == {"kl"} and r["tf_diff"]["kl"]["n_diff"] == 1 and r["tf_diff"]["kl"]["max_rel"] < 1e-15
+    tf.iloc[::-1].to_parquet(two / "tf_eval_jsut.parquet")  # NaN equals NaN
+    _parts(one, eval_jsut={})
+    _parts(two, dict(weights="w2", step=0, quant=dict(fmt="int8-w8a8", impl="torchao", scope="linear+pw",
+                                                       source="memory")), eval_jsut={})
+    r = Q.compare_eval_dirs(one, two)["sets"]["eval_jsut"]
+    assert r["same"] and r["tf_equal"] and r["tf_diff"] == {} and r["batches_equal"] is True
+    for ident, rec, key in ((dict(batch_s=300.0), {}, "batch_s"), (dict(store="other"), {}, "store"),
+                            ({}, dict(chunks=4), "set.chunks"),
+                            ({}, dict(pass_sets=["eval_jsut", "x"]), "set.pass_sets")):
+        _parts(two, ident, eval_jsut=rec)
+        r = Q.compare_eval_dirs(one, two)
+        s = r["sets"]["eval_jsut"]
+        assert not r["same"] and s["batches_equal"] is False and key in s["reason"], (key, s)
+        assert Q.compare_eval_dirs(one, two, exact=False, tol_cer=0.0)["same"]  # the CER mode does not ask
+    js = tmp_path / "cmp.json"
+    assert Q.main(["compare", str(one), str(two), "--exact", "--json-out", str(js)]) == 1
+    got = json.loads(js.read_text(encoding="utf-8"))["sets"]["eval_jsut"]
+    assert got["batches_equal"] is False and got["tf_diff"] == {}
+
+
+def test_the_pack_is_computed_on_the_cpu_and_installed_on_the_modules_device(monkeypatch):
+    """pack_weight returns CPU tensors (CUDA's division by a Python scalar would round some nvfp4 / fp8 scales
+    otherwise than the export does), and _install moves the pack to its module's device."""
+    w = torch.randn(32, 64)
+    for wf in Q.WFMTS:
+        p = Q.pack_weight(w, wf)
+        assert all(t.device.type == "cpu" for t in p.parts().values()), wf
+        assert Q._packs_equal(p, Q.pack_weight(w.to(torch.bfloat16), wf)), wf
+    seen = []
+    real_to = Q.QuantPack.to
+    monkeypatch.setattr(Q.QuantPack, "to", lambda self, dev: seen.append(torch.device(dev)) or real_to(self, dev))
+    Q.quantize_linear(nn.Linear(64, 32), "nvfp4-w4a4", "emulate")
+    assert seen == [torch.device("cpu")]
+
+
+def test_the_selftests_pack_device_check_is_skipped_off_cuda():
+    """The pack's device parity is a hard check of the GPU selftest (smoke B); off CUDA the selftest stops at its
+    environment check, and the parity helper itself holds on the CPU."""
+    rec = Q.selftest("cpu")
+    assert [c["name"] for c in rec["checks"]] == ["environment"] and "device_arith" not in rec
+    checks, rec = [], dict(warnings=[])
+    Q._selftest_pack_device(rec, lambda name, ok, detail=None: checks.append((name, ok)), torch.device("cpu"), (16, 64))
+    assert checks == [("pack_device_parity", True)]
+    assert rec["device_arith"] == dict(rows=16, nvfp4_tensor_scale_rows_differ=0, fp8_scale_rows_differ=0)
 
 
 def test_selftest_off_cuda_is_not_ok(tmp_path, capsys):

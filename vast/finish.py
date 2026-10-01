@@ -59,13 +59,15 @@ pulled run dirs, or training began); a slow download_gate.json gives the reason.
 --stop --no-sync, resolved before the label dispatch.
 
 A chain box (KITSUNE_CHAIN_STAGE set; contract addendum E): the deep infra also holds $KITSUNE_STATE/chain/ (chain.json,
-stage 1's bootstrap records, every part's queue state, events, logs, summaries and verdicts; each file its last 32
-MB). Its --destroy - after p01 completed, or when the chain ended before box 1 trained (a failed gate, a failed
-stage-2 bootstrap) - does more after the lean sync and the run-dir verification: the deep infra upload synchronously
-(within CHAIN_INFRA_TIMEOUT_S), then the chain's summary and every part's summary and verdict compared byte for byte
-with the Hub's (a missing or different one is put once and compared again), then the infra listing (the chain's
-events, chain.json, the gate part's events and queue.json, the download gate, the watchdog's alerts). Any problem
-stops the box instead (exit 2), as a failed verification does.
+stage 1's bootstrap records, every part's queue state, events, logs, summaries and verdicts, the JSON copies in its
+hub_reads/; each file its last 32 MB), never a path with a .git or .cache folder (HUB_FORBIDDEN_DIRS: the Hub refuses
+them, and hf_hub_download(local_dir=...) leaves .cache/huggingface/ in every hub_reads dir). Its --destroy - after p01
+completed, or when the chain ended before box 1 trained (a failed gate, a failed stage-2 bootstrap) - does more after
+the lean sync and the run-dir verification: the deep infra upload synchronously (within CHAIN_INFRA_TIMEOUT_S), then the
+chain's summary and every part's summary and verdict compared byte for byte with the Hub's (a missing or different one
+is put once and compared again), then the infra listing (the chain's events, chain.json, the gate part's events and
+queue.json, the download gate, the watchdog's alerts). Any problem stops the box instead (exit 2), as a failed
+verification does.
 """
 import argparse
 import hashlib
@@ -115,6 +117,12 @@ UPLOAD_MARK = ".upload_pending"
 # a test asserts they are equal): never uploaded, never expected in the runs repo
 SCRATCH_MARK = ".scratch_pending"
 MARKERS = (UPLOAD_MARK, SCRATCH_MARK)
+# huggingface_hub's FORBIDDEN_FOLDERS (utils/_paths.py; finish stays stdlib-only, a test asserts they are equal):
+# CommitOperationAdd refuses a path_in_repo with such a component at any depth, and upload_folder drops .git/** and
+# .cache/huggingface/** silently. hf_hub_download / snapshot_download(local_dir=D) leave D/.cache/huggingface/ behind:
+# box 53693389 (2026-10-01) lost its whole chain infra commit to chain/full-smoke/hub_reads/verdict/.cache/huggingface/
+# .gitignore, so its --destroy stopped the box instead
+HUB_FORBIDDEN_DIRS = (".git", ".cache")
 GATE_FILE = "download_gate.json"  # kitsune.fullrun.GATE_FILE: the full box's download gate record in STATE_DIR
 # a chain box (contract addendum E; KITSUNE_CHAIN_STAGE set): kitsune.fullrun's CHAIN_DIR / CHAIN_STATE / ALERTS_FILE /
 # SUMMARY_FILE / VERDICT_FILE, and how long its --destroy waits for the synchronous deep infra upload it verifies
@@ -124,6 +132,11 @@ CHAIN_INFRA_TIMEOUT_S = 900
 HASH_CHUNK = 8 << 20
 EXIT_INTEGRITY = 65  # label mode: a write-once conflict or a sealed root (vast/label.py ends such a box with a stop)
 SYNC_LOCK_WAIT_S = 1500  # label mode: sync.lock is polled up to 25 min, then the sync is skipped
+
+
+def hub_path_ok(path: str) -> bool:
+    """A repo path the Hub takes: no HUB_FORBIDDEN_DIRS component (".cachex/" or "x.git/" are fine)."""
+    return not any(part in HUB_FORBIDDEN_DIRS for part in path.split("/"))
 
 
 def log(msg: str):
@@ -191,12 +204,14 @@ def uploaded_fulls(run_dir: Path) -> list[Path]:
 def expected_files(run_dir: Path, expect_full: bool = True, lean: bool = False) -> dict[str, Path]:
     """repo path -> local file, for one run dir (see the module docstring). lean (the study box, KITSUNE_JOB=study):
     the logs, every weights dir, the marked full states and the ones the config uploads (uploaded_fulls), never the
-    newest full state for its own sake."""
+    newest full state for its own sake. Never a path the Hub cannot hold (hub_path_ok): sync's allow_patterns would name
+    a file upload_folder drops, and verify would then miss it on every try (a stop instead of a destroy)."""
     prefix = f"runs/{run_dir.name}"
     out = {}
     for f in files_under(run_dir):
         rel = f.relative_to(run_dir).as_posix()
-        if rel.split("/", 1)[0] in ("checkpoints", "infra") or rel.endswith((".tmp", ".lock")) or f.name in MARKERS:
+        if rel.split("/", 1)[0] in ("checkpoints", "infra") or rel.endswith((".tmp", ".lock")) or f.name in MARKERS \
+                or not hub_path_ok(rel):  # upload_folder would drop it or the Hub refuse it: never expected
             continue
         out[f"{prefix}/{rel}"] = f
     ckpt = run_dir / "checkpoints"
@@ -211,8 +226,9 @@ def expected_files(run_dir: Path, expect_full: bool = True, lean: bool = False) 
         if pick is None:
             continue
         for f in files_under(pick):
-            if f.name not in MARKERS:
-                out[f"{prefix}/checkpoints/{f.relative_to(ckpt).as_posix()}"] = f
+            rel = f.relative_to(ckpt).as_posix()
+            if f.name not in MARKERS and hub_path_ok(rel):
+                out[f"{prefix}/checkpoints/{rel}"] = f
     return out
 
 
@@ -404,7 +420,9 @@ def infra_files(deep: bool = False) -> list[tuple[str, Path]]:
     """(name under the infra folder, local file) of the infra upload: INFRA_LOGS and the top level of STATE_DIR; deep
     (the study box) also its logs/ (the queue's per-item output: the store build, the anchor, every speed-probe call,
     a trainer that died before its own logger started) and each rearm-<stamp>/ (the lifecycle state a re-arm moved
-    aside: the queue's events.jsonl with its prereg_numbers record among it)."""
+    aside: the queue's events.jsonl with its prereg_numbers record among it). Never a path with a HUB_FORBIDDEN_DIRS
+    component: a part's hub_reads/ keeps its real files (the JSON copies the queue decided from: E.7.2 item 1, and the
+    only record of the scratch pointer check 7 read) but not the .cache/huggingface/ bookkeeping of the downloads."""
     out = [(Path(p).name, Path(p)) for p in INFRA_LOGS]
     if STATE_DIR.is_dir():
         out += [(f.name, f) for f in sorted(STATE_DIR.glob("*"))]
@@ -412,7 +430,7 @@ def infra_files(deep: bool = False) -> list[tuple[str, Path]]:
             for sub in [STATE_DIR / "logs", STATE_DIR / CHAIN_DIR, *sorted(STATE_DIR.glob("rearm-*"))]:
                 if sub.is_dir():
                     out += [(f.relative_to(STATE_DIR).as_posix(), f) for f in sorted(sub.rglob("*"))]
-    return [(n, f) for n, f in out if f.is_file() and not f.name.endswith(".lock")]
+    return [(n, f) for n, f in out if f.is_file() and not f.name.endswith(".lock") and hub_path_ok(n)]
 
 
 def _tail(f: Path, limit: int) -> bytes:
@@ -427,20 +445,33 @@ def upload_infra(api, repo: str, repo_type: str, dest: str, dry_run: bool, deep:
     """Best effort: supervisor/bootstrap/watchdog logs and state go next to the run for later extraction, scrubbed:
     portal.log (the base image's boot output: its CUDA selection is recorded nowhere else) holds the portal's password
     and tokens as soon as a PORTAL_CONFIG reaches the box, and the runs repo keeps every file in its git history.
-    deep: the study box's subfolders too (infra_files), each file at most INFRA_MAX_FILE_BYTES (its end)."""
+    deep: the study box's subfolders too (infra_files), each file at most INFRA_MAX_FILE_BYTES (its end). A file the
+    Hub refuses (a rule newer than HUB_FORBIDDEN_DIRS) or that went away between the listing and its read (a queue's
+    .tmp renamed into place) is left out alone, logged and recorded (event infra_skipped): one bad path used to cost
+    the whole commit."""
     from huggingface_hub import CommitOperationAdd
 
-    ops = [CommitOperationAdd(path_in_repo=f"{dest}/{name}",
-                              path_or_fileobj=scrub(_tail(f, INFRA_MAX_FILE_BYTES) if "/" in name else f.read_bytes()))
-           for name, f in infra_files(deep)]
+    ops, skipped = [], []
+    for name, f in infra_files(deep):
+        try:
+            if not hub_path_ok(f"{dest}/{name}"):
+                raise ValueError(f"a {'/'.join(HUB_FORBIDDEN_DIRS)} folder in its path")
+            data = scrub(_tail(f, INFRA_MAX_FILE_BYTES) if "/" in name else f.read_bytes())
+            ops.append(CommitOperationAdd(path_in_repo=f"{dest}/{name}", path_or_fileobj=data))
+        except (ValueError, OSError) as e:
+            skipped.append(name)
+            log(f"infra: {name} left out ({type(e).__name__}: {e})")
+    if skipped:
+        event("infra_skipped", files=skipped[:50], n=len(skipped))
     log(f"upload {len(ops)} infra files -> {repo}:{dest}")
     if ops and not dry_run:  # retried inside best_effort's INFRA_TIMEOUT_S, which bounds every try together
         hub_retry(lambda: api.create_commit(repo_id=repo, repo_type=repo_type, operations=ops,
                                            commit_message="finish: infra logs"), "infra commit")
 
 
-def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S) -> bool:
-    """Run fn in a daemon thread and wait at most `timeout` s; failures are logged, never raised."""
+def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S, *, errors: list | None = None) -> bool:
+    """Run fn in a daemon thread and wait at most `timeout` s; failures are logged, never raised (and appended to
+    `errors` as "<type>: <message>" when given)."""
     ok = []
 
     def target():
@@ -449,6 +480,8 @@ def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S) -> bool:
             ok.append(True)
         except Exception as e:
             log(f"{what} failed: {type(e).__name__}: {e}")
+            if errors is not None:
+                errors.append(f"{type(e).__name__}: {e}"[:300])
 
     th = threading.Thread(target=target, name=what, daemon=True)
     th.start()
@@ -716,15 +749,17 @@ def chain_checks(api, repo: str, repo_type: str, infra_dest: str, dry_run: bool)
     logs and events on the Hub, then destroy". The problems (empty: destroy)."""
     if api is None:
         return ["no HF output repo or huggingface_hub: the chain's records cannot be verified"]
-    problems = []
+    problems, errors = [], []
     if not best_effort(lambda: upload_infra(api, repo, repo_type, infra_dest, dry_run, deep=True),
-                       "infra upload (chain)", timeout=CHAIN_INFRA_TIMEOUT_S):
-        problems.append(f"the infra upload to {infra_dest} failed or did not finish within {CHAIN_INFRA_TIMEOUT_S} s")
+                       "infra upload (chain)", timeout=CHAIN_INFRA_TIMEOUT_S, errors=errors):
+        problems.append(f"the infra upload to {infra_dest} failed ({errors[0]})" if errors else
+                        f"the infra upload to {infra_dest} did not finish within {CHAIN_INFRA_TIMEOUT_S} s")
     if dry_run:
         log("dry run: would verify the chain's summaries and verdicts and list its infra")
         return problems
     problems += verify_chain(api, repo, repo_type)
     gate = chain_gate_box()
+    # fixed names, the gate part an ITEM_RE name: never a HUB_FORBIDDEN_DIRS path, so infra_files never leaves one out
     want = ["events.jsonl", f"{CHAIN_DIR}/{CHAIN_STATE}", GATE_FILE]
     want += [f"{CHAIN_DIR}/{gate}/events.jsonl", f"{CHAIN_DIR}/{gate}/queue.json"] if gate else []
     want += [ALERTS_FILE] if (STATE_DIR / ALERTS_FILE).is_file() else []
