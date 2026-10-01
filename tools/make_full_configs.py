@@ -194,7 +194,8 @@ POST_T06_H, POST_T06_MAX_H = 0.3, 1.2
 POOL_B_H = 1.2
 END_H = 0.35  # calc_v3 end: finish's uploads and the destroy
 # max_hours' host margin: smoke A ran on a Ryzen 9950X (calc_v3's "fast" CPU class); calc_v3's pessimistic T-0.6B
-# epoch is 13.635 / 10.846 = 1.26 x its fast one (box 2's only 2x offer today, m54650, is a Zen2 EPYC)
+# epoch is 13.635 / 10.846 = 1.26 x its fast one (box 2's only 2x offer on 2026-10-01, m54650, a Zen2 EPYC, is
+# blocklisted since: any slow-CPU host is what it stands for)
 HOST_PESS = 1.26
 STALL_RECOVERY_H = 1.25  # one stall of T-0.6B: stall_min 45 + up to 30 min of progress since its last full state
 

@@ -63,7 +63,7 @@ listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped. Every
 vast/blocklist.json; a full box also those whose download gate said slow in the last GATE_BLOCK_DAYS
 (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link first
 (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
-  python vast/launch.py --job full --box p01 --machine 54650 --image-tag main --data-repo Multy123/kitsune-data \\
+  python vast/launch.py --job full --box p01 --image-tag main --data-repo Multy123/kitsune-data \\
       --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch                  # look only
 --job full --box p01-chain rents a chain box (contract addendum E; kitsune/full_queue.py ChainController): smoke A and
 smoke B, an automatic gate, then box 1, on one 1x RTX 5090. Its disk and download gate are sized on the last stage's

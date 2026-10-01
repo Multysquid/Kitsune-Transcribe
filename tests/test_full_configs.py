@@ -1094,7 +1094,7 @@ def test_launch_resolves_the_chained_box(monkeypatch, capsys):
 
     def vastai(exe, args):
         assert args[:2] == ["search", "offers"], f"only the offer search runs look-only, not {args[:2]}"
-        return json.dumps([{"id": 1, "machine_id": 54650, "gpu_name": "RTX 5090", "gpu_ram": 32607, "num_gpus": 1,
+        return json.dumps([{"id": 1, "machine_id": 70001, "gpu_name": "RTX 5090", "gpu_ram": 32607, "num_gpus": 1,
                             "dph_total": 0.816, "reliability": 0.99, "verification": "verified",
                             "duration": 30 * 86400, "cpu_ram": 64439, "disk_space": 1568, "inet_down_cost": 0.00117,
                             "inet_up_cost": 0.001, "storage_cost": 0.1}])
@@ -1124,7 +1124,7 @@ def test_launch_resolves_the_chained_box(monkeypatch, capsys):
         "KITSUNE_REBUILD_BYTES": str(int(1e9 * smoke["down_gb"])),
         "KITSUNE_PULL_BYTES": str(int(1e9 * (smoke["labels_gb"] + 2))), "KITSUNE_MAX_HOURS": "35", "TZ": "UTC",
         "KITSUNE_DATA_REVISION": "d" * 40, "KITSUNE_REBUILD_TIMEOUT_MIN": str(smoke["rebuild_timeout_min"]),
-        "KITSUNE_DPH": "0.8160", "KITSUNE_MACHINE_ID": "54650"}
+        "KITSUNE_DPH": "0.8160", "KITSUNE_MACHINE_ID": "70001"}
     assert cargs[cargs.index("--disk") + 1] == "1500" and "HF_TOKEN" not in create
     assert "disk_space>=1500" in out, "the offer search filters on box 1's disk (the machine's free disk)"
     assert cargs[cargs.index("--label") + 1] == f"kitsune-full-{CHAIN}-data-smoke-{sha[:7]}"

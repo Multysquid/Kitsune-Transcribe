@@ -161,7 +161,7 @@ def search_query(fake, n: int = 0) -> str:
 
 
 def test_box_p01_rents_one_5090_with_the_registrys_numbers(full_launch, capsys):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--yes")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 0, out
     search = next(c for c in fake.calls if c[1:3] == ["search", "offers"])
@@ -181,7 +181,7 @@ def test_box_p01_rents_one_5090_with_the_registrys_numbers(full_launch, capsys):
         "KITSUNE_GATE_BYTES": str(int(571.3e9)), "KITSUNE_GATE_MAX_H": "5", "KITSUNE_REBUILD_BYTES": str(int(571.3e9)),
         "KITSUNE_PULL_BYTES": str(int(1e9 * (23.4 + 2))), "KITSUNE_MAX_HOURS": "22", "TZ": "UTC",
         "KITSUNE_DATA_REVISION": "d" * 40, "KITSUNE_REBUILD_TIMEOUT_MIN": "387", "KITSUNE_DPH": "0.8100",
-        "KITSUNE_MACHINE_ID": "54650"}
+        "KITSUNE_MACHINE_ID": "70001"}
     assert create[create.index("--label") + 1].startswith("kitsune-full-p01-data-p01-")
     assert create[create.index("--disk") + 1] == "1400" and "HF_TOKEN" not in " ".join(create)
     assert full_launch.seen["extra_gb"] == 25  # the registry's extra_gb goes into the sizing
@@ -231,12 +231,12 @@ def test_cost_guards_drop_dear_traffic_and_totals_over_the_cap():
 
 
 def test_cost_guard_flags_are_full_only_and_positive(full_launch, capsys):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
     out = capsys.readouterr().out
     assert rc == 0, out
     m = re.search(r"cost guards: traffic <= \$0\.01/GB each way; expected total <= \$([0-9.]+)", out)
     assert m and 24.0 < float(m.group(1)) < 40.0, out  # 1.25 x $1.00 x 19.5 h + ~620 GB x $0.01
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--max-total", "5",
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--max-total", "5",
                            "--dry-run")
     out = capsys.readouterr().out
     assert rc != 0 and "cost guards" in out and created(fake) is None
@@ -305,17 +305,19 @@ def created_or_printed(out: str) -> list[str]:
 
 
 def test_machine_picks_that_machine_or_refuses(full_launch, capsys):
-    offers = [offer(1, 1, 0.50), offer(2, 54650, 0.81)]
-    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "54650", "--yes")
+    offers = [offer(1, 1, 0.50), offer(2, 70001, 0.81)]
+    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "70001", "--yes")
     assert rc == 0, capsys.readouterr().out
-    assert env_of(created(fake))["KITSUNE_MACHINE_ID"] == "54650"
+    assert env_of(created(fake))["KITSUNE_MACHINE_ID"] == "70001"
     rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "999", "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and "machine 999 has no offer passing the filter now" in out and created(fake) is None
-    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "151760", "--yes")
-    out = capsys.readouterr().out
-    assert rc == 1 and "--machine 151760 is avoided (vast/blocklist.json" in out and created(fake) is None
-    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "54650", "--offer-id",
+    for dead in ("151760", "54650"):  # the blocklist: refused even with an offer listed for it
+        rc, fake = full_launch([offers + [offer(3, int(dead), 0.60)]], "--box", "p01", "--scratch-repo", SCRATCH,
+                               "--machine", dead, "--yes")
+        out = capsys.readouterr().out
+        assert rc == 1 and f"--machine {dead} is avoided (vast/blocklist.json" in out and created(fake) is None
+    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "70001", "--offer-id",
                            "1", "--yes")
     assert rc == 1 and "offer 1 is not in the results" in capsys.readouterr().out
 
@@ -331,7 +333,7 @@ def test_machine_picks_that_machine_or_refuses(full_launch, capsys):
     (["--box", "p01", "--scratch-repo", SCRATCH, "--max-dph", "0.5"], "no 1x RTX 5090 offer matches the full-box"),
 ], ids=["gpus", "no-scratch", "scratch-is-out", "disk", "config", "no-hf-check", "max-dph"])
 def test_launch_full_refusals(full_launch, capsys, args, err):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], *args, "--yes")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], *args, "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and err in out and created(fake) is None, out
 
@@ -343,7 +345,7 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "train", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
                        "only schedule.epochs may change"),
-                      (["--job", "full", "--box", "p01", "--machine", "m54650"], "machine_id (digits)")):
+                      (["--job", "full", "--box", "p01", "--machine", "m70001"], "machine_id (digits)")):
         with pytest.raises(SystemExit):
             launch.main([*args, "--data-repo", DATA, "--out-repo", RUNS, "--sha", SHA])
         assert err in capsys.readouterr().err, args
@@ -382,7 +384,7 @@ def test_the_registry_is_read_at_the_sha_and_a_dirty_copy_refuses(full_launch, r
 
 def test_resume_flags_go_to_the_box_env(full_launch, capsys):
     rid, rid2 = "full-p01-20260927T120000Z", "full-p01-20260928T010203Z-2"
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
                            rid, "--resume-set", f"{rid}:schedule.epochs=5", "--resume-set",
                            f"{rid2}:schedule.epochs=05", "--yes",
                            instances=[{"id": 5, "label": "kitsune-full-p01-data-p01-abc", "actual_status": "running"},
@@ -396,7 +398,7 @@ def test_resume_flags_go_to_the_box_env(full_launch, capsys):
     assert kw["resume"] is True and kw["resets"] == [rid] and set(kw["sets"]) == {rid, rid2}
     assert "WARNING: a live instance of box p01: kitsune-full-p01-data-p01-abc (instance 5, running)" in out
     assert "kitsune-full-full" not in out
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
     assert rc == 0 and "KITSUNE_RESUME" not in " ".join(created_or_printed(capsys.readouterr().out))
     assert not any(c[1:3] == ["show", "instances"] for c in fake.calls)
 
@@ -411,17 +413,17 @@ def test_live_instances_are_the_boxs_own(monkeypatch):
 
 
 def test_the_gate_follows_the_registry_and_the_flag(full_launch, repo, capsys):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--gate-hours",
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--gate-hours",
                            "8", "--dry-run")
     env = env_of(created_or_printed(capsys.readouterr().out))
     assert rc == 0 and env["KITSUNE_GATE_MAX_H"] == "8"
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--gate-hours",
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--gate-hours",
                            "0", "--dry-run")
     out = capsys.readouterr().out
     assert rc == 0 and "the download gate is OFF" in out
     assert not any(k.startswith("KITSUNE_GATE") for k in env_of(created_or_printed(out)))
     # smoke-b: gate false, no timed states: neither the gate nor the scratch repo
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "smoke-b", "--dry-run")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "smoke-b", "--dry-run")
     out = capsys.readouterr().out
     env = env_of(created_or_printed(out))
     assert rc == 0, out
@@ -430,7 +432,7 @@ def test_the_gate_follows_the_registry_and_the_flag(full_launch, repo, capsys):
 
 
 def test_the_smoke_box_alerts_and_its_gate_is_judged_on_the_reference(full_launch, capsys):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "full-smoke", "--scratch-repo", SCRATCH, "--dry-run")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "full-smoke", "--scratch-repo", SCRATCH, "--dry-run")
     env = env_of(created_or_printed(capsys.readouterr().out))
     assert rc == 0
     assert env["KITSUNE_WATCHDOG_ORPHAN_ACTION"] == "alert" and env["KITSUNE_WATCHDOG_ORPHAN_S"] == "600"
@@ -830,9 +832,10 @@ def test_the_quant_code_and_the_speed_record_exist_in_this_checkout():
     assert launch.SPEED_RECORD_BOXES == ("full",) and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
 
 
-def test_the_blocklist_holds_151760_and_refuses_a_broken_file(tmp_path):
+def test_the_blocklist_holds_151760_and_54650_and_refuses_a_broken_file(tmp_path):
     bl = launch.load_blocklist()
     assert "151760" in bl and "2.9 MB/s" in bl["151760"]
+    assert "54650" in bl and "2026-10-01" in bl["54650"] and "never started" in bl["54650"]  # box 2's dead m54650
     raw = json.loads(launch.BLOCKLIST.read_text(encoding="utf-8"))
     assert set(raw) == {"_comment", "machines"}
     for bad in ('{"machines": ["151760"]}', '{"machines": {"m1": "x"}}', '{"machines": {"1": ""}}',
@@ -943,7 +946,7 @@ def full_finish(tmp_path, monkeypatch):
     monkeypatch.setenv("KITSUNE_JOB", "full")
     monkeypatch.setenv("KITSUNE_BOX", "p01")
     monkeypatch.setenv("CONTAINER_ID", "C77")
-    monkeypatch.setenv("KITSUNE_MACHINE_ID", "54650")
+    monkeypatch.setenv("KITSUNE_MACHINE_ID", "70001")
 
     def go(*args, run=True):
         r = full_run(tmp_path) if run else None
@@ -974,7 +977,7 @@ def test_abort_destroys_a_box_without_a_run_dir_with_the_gates_reason(full_finis
     rc, hub, actions, events = full_finish("--abort", "--reason", "onstart failed at line 298 (exit 3)", run=False)
     assert rc == 0 and actions == ["destroy"], "no run dir: nothing on the disk is unique"
     (ab,) = [e for e in events if e["kind"] == "abort"]
-    assert ab["destroyed"] is True and ab["machine_id"] == "54650"
+    assert ab["destroyed"] is True and ab["machine_id"] == "70001"
     assert ab["reason"].startswith("download gate: 2.9 MB/s") and "onstart failed at line 298" in ab["reason"]
     assert hub.uploads == [], "no sync"
     assert "full/box-p01/infra/C77/download_gate.json" in [p for c in hub.commits for p in c]
@@ -1113,7 +1116,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     """E.1.8: KITSUNE_CONFIG is stage 1's rebuild, the watchdog's stage-1 env with its hand-over bound, the disk and
     the gate on box 1's extent (+ the chain's extra_gb), the boot's rebuild bytes and timeout on stage 1's; every part
     preflighted as a box, each distinct data config's selection checked, the chain's own files; 35 h, 25.2 h, $1.00."""
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 0, out
     create = created(fake)
@@ -1126,7 +1129,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
         "KITSUNE_SCRATCH_REPO": SCRATCH, "KITSUNE_GATE_BYTES": str(int(571.3e9)), "KITSUNE_GATE_MAX_H": "5",
         "KITSUNE_REBUILD_BYTES": str(int(59.2e9)), "KITSUNE_PULL_BYTES": str(int(1e9 * (5.5 + 2))),
         "KITSUNE_MAX_HOURS": "35", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
-        "KITSUNE_REBUILD_TIMEOUT_MIN": "120", "KITSUNE_DPH": "0.8100", "KITSUNE_MACHINE_ID": "54650"}
+        "KITSUNE_REBUILD_TIMEOUT_MIN": "120", "KITSUNE_DPH": "0.8100", "KITSUNE_MACHINE_ID": "70001"}
     assert create[create.index("--disk") + 1] == "1400" and create[create.index("--label") + 1].startswith(
         "kitsune-full-p01-chain-data-smoke-")
     s = chain_launch.seen
@@ -1151,18 +1154,18 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     (["--max-hours", "29"], "--max-hours 29 is below chain p01-chain's floor 30"),
 ], ids=["config", "gate-off", "max-hours"])
 def test_launch_chain_refusals(chain_launch, capsys, args, err):
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, *args, "--yes")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, *args, "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and err in out and created(fake) is None, out
 
 
 def test_launch_chain_warns_below_its_cap_and_a_parts_problem_refuses(chain_launch, capsys):
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--max-hours", "32", "--dry-run")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--max-hours", "32", "--dry-run")
     out = capsys.readouterr().out
     assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 35 h" in out
     assert env_of(created_or_printed(out))["KITSUNE_MAX_HOURS"] == "32"
     chain_launch.seen["part_problems"]["smoke-b"] = ["tools/whisper_eval.py (item whisper-large-v3) does not exist"]
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and "part smoke-b: tools/whisper_eval.py (item whisper-large-v3) does not exist" in out
     assert created(fake) is None
@@ -1172,7 +1175,7 @@ def test_launch_chain_warns_below_its_cap_and_a_parts_problem_refuses(chain_laun
                                   ["--resume-set", "full-p01-20260927T120000Z:schedule.epochs=5"]])
 def test_a_chain_is_never_resumed_as_a_chain(chain_launch, capsys, flag):
     """E.8: launch --box p01-chain --resume exits 1 with what to run instead; nothing is searched or rented."""
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, *flag, "--yes")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, *flag, "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and "is not resumed as a chain" in out and "--box p01 --resume" in out and fake.calls == []
 
@@ -1183,14 +1186,14 @@ def test_a_resume_of_box_1_checks_the_chains_summary_and_its_live_instances(chai
     got = []
     monkeypatch.setattr(launch, "chain_resume_checks", lambda out, box, chain: got.append((box, chain)) or (
         ["the newest p01 summary on the Hub is from another rental (container X)"], []))
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--yes", box="p01",
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--yes", box="p01",
                             instances=[{"id": 9, "label": "kitsune-full-p01-chain-data-smoke-abc",
                                         "actual_status": "running"}])
     out = capsys.readouterr().out
     assert rc == 1 and got == [("p01", CHAIN_BOX)] and "from another rental (container X)" in out
     assert "WARNING: a live instance of box p01: kitsune-full-p01-chain-data-smoke-abc (instance 9" in out
     monkeypatch.setattr(launch, "chain_resume_checks", lambda out, box, chain: ([], ["continues stage 2 of chain"]))
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--dry-run", box="p01")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--dry-run", box="p01")
     assert rc == 0 and "continues stage 2 of chain" in capsys.readouterr().out
 
 

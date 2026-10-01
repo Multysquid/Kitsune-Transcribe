@@ -804,7 +804,8 @@ What launch checks and decides, before anything is rented:
   `verified=any` in the query, then the client keeps verified and deverified hosts only (never unverified), and only a
   host whose max rental outlasts the box by `MIN_RENTAL_DAYS` (4). The registry's `max_dph` drops dearer offers before
   the ranking. `--gpus` may only repeat the registry's count; `--config` only its data config.
-- **Avoided machines:** `vast/blocklist.json` (every job; 151760, study box A #1's 2.9 MB/s host, for good), the
+- **Avoided machines:** `vast/blocklist.json` (every job, for good: 151760, study box A #1's 2.9 MB/s host;
+  54650, which never started p01-chain's instance on 2026-10-01), the
   label runs' failed hosts, and a machine whose full box's download gate said slow in the last 30 days
   (`full/box-*/infra/*/download_gate.json` in the runs repo). A `--machine` on that list is refused.
 - **full_preflight:** every config the box reads committed at the commit; every tool its items run there (the queue,
