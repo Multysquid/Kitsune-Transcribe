@@ -37,7 +37,9 @@ Principles:
                     torchao silently falls back to an fp32 matmul) is padded away to 17 rows and counted
   module identity   a selected nn.Linear is class-swapped in place to QuantLinear (names, state_dict keys and hooks
                     stay); a pointwise Conv1d(k=1) of a conformer convolution module is replaced by
-                    PointwiseConv1dAsLinear, whose inner `.linear` is then treated like every other Linear
+                    PointwiseConv1dAsLinear, whose inner `.linear` is then treated like every other Linear; it hands
+                    that Linear a row-major (B, T, C) input (kitsune::row_major under torch.compile): torchao's NVFP4
+                    activation quantiser asserts a contiguous input, and its int8 GEMM fails on a column-major one
   imports           torch and the stdlib only at import: torchao, transformers and safetensors are imported where
                     they are used, so the report can import this module on the laptop
 
@@ -582,7 +584,9 @@ class QuantLinear(nn.Linear):
         else:
             if kq.count and kq.act == "int8" and dev == "cuda" and x2.shape[0] <= 16:
                 kq.fallback_risk += 1
-            y = F.linear(x2.to(self.weight.dtype), self.weight)
+            # torchao's NVFP4 activation quantiser asserts a contiguous input and its int8 GEMM needs a row-major one;
+            # a no-op on the (B, T, C) inputs the model hands it (PointwiseConv1dAsLinear included)
+            y = F.linear(x2.to(self.weight.dtype).contiguous(), self.weight)
         # the GEMM's output in the output dtype first, then the bias in it: what the real path does (its GEMM returns
         # the autocast dtype), so emulate rounds where it rounds
         y = y[:m].to(out_dtype)
@@ -594,10 +598,43 @@ class QuantLinear(nn.Linear):
         return f"{super().extra_repr()}, fmt={self.kq.fmt}, impl={self.kq.impl}"
 
 
+def _row_major_impl(x: torch.Tensor) -> torch.Tensor:
+    return x.clone(memory_format=torch.contiguous_format)
+
+
+def _row_major_fake(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x, memory_format=torch.contiguous_format)
+
+
+def _register_row_major():
+    """kitsune::row_major: a row-major copy that torch.compile keeps row-major. Inductor drops clone's memory_format
+    (its clone lowering lets "the downstream op handle the input stride") and lays a fused buffer out after its reads,
+    so x.transpose(1, 2).contiguous() of the (B, C, T) depthwise-conv output reached torchao's int8 GEMM column-major:
+    box 53693389's smoke B, speed-study-p03-int8-w8a8-compile, CUBLAS_STATUS_NOT_SUPPORTED at M = 4959 (7 mod 8: the
+    case torchao's eager safe_int_mm copies to contiguous for, and its compile branch skips). A custom op's output has
+    the layout its fake declares. Registered once per process (a reload of this module finds it registered)."""
+    try:
+        op = torch.library.custom_op("kitsune::row_major", mutates_args=())(_row_major_impl)
+        op.register_fake(_row_major_fake)
+        return op
+    except (RuntimeError, ValueError):  # already registered (importlib.reload)
+        return torch.ops.kitsune.row_major
+
+
+row_major = _register_row_major()
+
+
 class PointwiseConv1dAsLinear(nn.Module):
     """A pointwise Conv1d(k=1) of a conformer convolution module as a Linear over the channels: .linear holds the
-    conv's weight[:, :, 0] (bitwise) and bias; forward (B, C, T) -> linear(x.transpose(1, 2)).transpose(1, 2), exact up
-    to the accumulation order. The layer's name becomes <conv>.linear."""
+    conv's weight[:, :, 0] (bitwise) and bias; forward (B, C, T) -> linear(row-major x.transpose(1, 2)).transpose(1, 2),
+    exact up to the accumulation order. The layer's name becomes <conv>.linear.
+
+    Row-major: x is the depthwise conv's output, (B, C, T) with T fastest, so x.transpose(1, 2) is column-major in its
+    last two dims. At B > 1 QuantLinear's reshape(-1, C) copied it anyway; at B = 1 it returned a (T, C) view with
+    strides (1, T), and torchao 0.18's NVFP4 activation quantiser asserts `data_hp.is_contiguous()` (box 53693389's
+    smoke B: every nvfp4-w4a4 speed probe at its batch-1 warm-up, eager and compiled, and the selftest's T-0.6B batch-1
+    check). Eager: .contiguous(), a copy at B = 1 only (T x C bf16, a few us a layer). Compiled: the row_major op (its
+    docstring), one copy kernel a call (~1 % of a compiled quantised p03 batch); the bf16 model never has this class."""
 
     def __init__(self, conv: nn.Conv1d):
         super().__init__()
@@ -610,7 +647,9 @@ class PointwiseConv1dAsLinear(nn.Module):
         self.in_channels, self.out_channels = k, n
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear(x.transpose(1, 2)).transpose(1, 2)
+        xt = x.transpose(1, 2)
+        xt = row_major(xt) if torch.compiler.is_compiling() else xt.contiguous()
+        return self.linear(xt).transpose(1, 2)
 
 
 def _is_pointwise(m: nn.Module, parent: nn.Module | None) -> bool:
@@ -1775,7 +1814,8 @@ def _kernel_class(name: str) -> str:
         return "fp4"
     if any(s in n for s in ("e4m3", "fp8", "f8f8", "_f8")):
         return "fp8"
-    if any(s in n for s in ("i8i8", "int8", "imma", "s8s8", "_i8", "igemm")):
+    # gemm_s8: the int8 GEMM torch._int_mm runs on sm_120, cutlass_80_wmma_tensorop_i161616gemm_s8_* (box 53693389)
+    if any(s in n for s in ("i8i8", "int8", "imma", "s8s8", "_i8", "igemm", "gemm_s8")):
         return "int8"
     if any(s in n for s in ("bf16", "bfloat16")):
         return "bf16"
@@ -2068,6 +2108,9 @@ def _selftest_layers(rec, check, dev, rows, shape):
             check(f"{fmt} builds and runs", False, frec["error"])
 
 
+MXFP4_REFUSAL_MARKERS = ("B200", "B300", "only supported")  # torchao 0.18's MXFP4 refusal on a GPU without kernels
+
+
 def _selftest_mxfp4(rec, dev, shape):
     """Decision 20: MXFP4 has no kernel on sm_120, so torchao's AUTO kernel preference must raise here."""
     n, k = shape
@@ -2089,6 +2132,13 @@ def _selftest_mxfp4(rec, dev, shape):
         out["raised"] = False
     except Exception as e:  # noqa: BLE001
         out.update(raised=True, error=f"{type(e).__name__}: {e}"[:400])
+        # the refusal decision 20 expects names the hardware ("MXFP4 scaling only supported in CUDA for B200/B300" on
+        # box 53693389's 5090); any other error (a shape, an API change) leaves decision 20 unchecked
+        out["refused_for_hardware"] = isinstance(e, (NotImplementedError, RuntimeError)) and any(
+            m in str(e) for m in MXFP4_REFUSAL_MARKERS)
+        if not out["refused_for_hardware"]:
+            rec["warnings"].append(f"decision 20 unchecked: torchao's KernelPreference.AUTO raised on MXFP4, but not "
+                                   f"as a hardware refusal ({out['error']})")
     if out["raised"] is False:
         rec["warnings"].append("MXFP4 through torchao's KernelPreference.AUTO ran on this GPU: re-evaluate decision 20")
 

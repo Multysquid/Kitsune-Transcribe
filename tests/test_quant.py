@@ -278,6 +278,76 @@ def test_pointwise_adapter_exact():
         assert torch.allclose(ad(x), conv(x), atol=1e-5, rtol=0)
 
 
+class _AssertsRowMajor(nn.Linear):
+    """torchao 0.18's NVFP4 activation quantiser in miniature: `assert data_hp.is_contiguous()` on the 2-D input
+    QuantLinear hands its GEMM (x.reshape(-1, K))."""
+
+    def forward(self, x):
+        assert x.reshape(-1, self.in_features).is_contiguous(), "Only support contiguous data for now"
+        return super().forward(x)
+
+
+def _pointwise_with_assert(seed: int = 0) -> tuple[nn.Conv1d, Q.PointwiseConv1dAsLinear]:
+    torch.manual_seed(seed)
+    conv = nn.Conv1d(64, 64, 1)
+    ad = Q.PointwiseConv1dAsLinear(conv)
+    ad.linear.__class__ = _AssertsRowMajor
+    return conv, ad
+
+
+def test_pointwise_conv_hands_its_linear_a_row_major_input():
+    """Box 53693389's smoke B: every nvfp4-w4a4 probe failed at its batch-1 warm-up, eager and compiled. At B = 1 the
+    (B, C, T) depthwise output's transpose reshaped to a (T, C) view with strides (1, T), which torchao's NVFP4
+    quantiser refuses; B > 1 had copied already. The adapter now hands a row-major input in both modes, at both
+    batch sizes, with the conv's numbers."""
+    conv, ad = _pointwise_with_assert()
+    dw = nn.Conv1d(64, 64, 3, padding=1, groups=64)  # the depthwise conv before it: T fastest
+    for b in (1, 3):
+        x = dw(torch.randn(b, 64, 37))
+        with torch.no_grad():
+            assert torch.allclose(ad(x), conv(x), atol=1e-5, rtol=0), b
+    compiled = torch.compile(ad, backend="aot_eager", dynamic=True)
+    for b in (3, 1):  # batched first, then the B = 1 recompile (where dynamo traced a non-contiguous fake tensor)
+        x = dw(torch.randn(b, 64, 41))
+        with torch.no_grad():
+            assert torch.allclose(compiled(x), conv(x), atol=1e-5, rtol=0), b
+
+
+def test_the_row_major_op():
+    """kitsune::row_major: a registered custom op whose output is a row-major copy (its fake says so, which is what
+    torch.compile keeps), passing torch.library.opcheck; registering it again (a reload of the module) gives an op
+    that still works."""
+    x = torch.randn(2, 8, 5).transpose(1, 2)
+    y = Q.row_major(x)
+    assert y.is_contiguous() and torch.equal(y, x) and y.data_ptr() != x.data_ptr()
+    res = torch.library.opcheck(Q.row_major, (x,))
+    assert all(v == "SUCCESS" for v in res.values()), res
+    again = Q._register_row_major()
+    assert again(x).is_contiguous() and torch.equal(again(x), x)
+
+
+def test_the_selftest_names_the_int8_kernel_and_tells_mxfp4s_refusal_from_another_error(monkeypatch):
+    """sm_120's int8 GEMM (cutlass_80_wmma_tensorop_i161616gemm_s8_*) is int8, not other_gemm (box 53693389's
+    cosmetic int8 warning). Decision 20's canary counts only a refusal that names the hardware as the expected one;
+    any other error from torchao's AUTO kernel is a warning that decision 20 went unchecked."""
+    assert Q._kernel_class("cutlass_80_wmma_tensorop_i161616gemm_s8_128x128_128x2_tn_align16") == "int8"
+
+    class Lin(nn.Linear):
+        def forward(self, x):
+            raise self.err
+
+    for err, hw in ((NotImplementedError("MXFP4 scaling only supported in CUDA for B200/B300"), True),
+                    (RuntimeError("shape mismatch"), False), (AssertionError("B200"), False)):
+        monkeypatch.setattr(Q, "mxfp4_auto_config", lambda: object())
+        monkeypatch.setattr(Q, "_ao", lambda name: (lambda lin, cfg: setattr(lin, "__class__", Lin)
+                                                     or setattr(lin, "err", err)))
+        rec = dict(warnings=[])
+        Q._selftest_mxfp4(rec, torch.device("cpu"), (64, 64))
+        out = rec["mxfp4_auto"]
+        assert out["raised"] is True and out["refused_for_hardware"] is hw, err
+        assert bool(rec["warnings"]) is (not hw) and all("decision 20 unchecked" in w for w in rec["warnings"])
+
+
 # ---------------------------------------------------------------------------------------------- apply
 
 
