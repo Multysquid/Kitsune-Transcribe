@@ -52,7 +52,8 @@ def test_constants_exact_values():
                             "sources", "eval_sets", "selection_recipe", "pull_parakeet")
     assert fr.RUN_ID_RE == r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"
     assert fr.ITEM_RE == r"^[a-z0-9][a-z0-9.-]*$"
-    assert fr.RESUME_SET_KEYS == ("schedule.epochs",)
+    assert fr.RESUME_SET_KEYS == ("schedule.epochs", "early_stop.patience")
+    assert fr.RESUME_SET_INT_MIN == {"schedule.epochs": 1, "early_stop.patience": 1}
     assert fr.STALL_MIN_DEFAULT == {"stores": 360, "train": 45, "readout": 30, "speed": 30, "eval": 60}
     assert fr.ITEM_KINDS == ("stores", "train", "readout", "speed", "eval")
     assert fr.FAULT_ACTIONS == ("sigstop", "kill", "wipe_run_dir", "deadline", "freeze_controller_hb")
@@ -215,6 +216,21 @@ def test_parse_resume_sets():
     two = "full-t06-20260927T120000Z-2:schedule.epochs=04,full-p005-20260928T000000Z:schedule.epochs=5"
     assert fr.parse_resume_sets(two) == {"full-t06-20260927T120000Z-2": ["schedule.epochs=4"],
                                          "full-p005-20260928T000000Z": ["schedule.epochs=5"]}
+    # DECISIONS G3: P-0.1B's continuation sets its epochs and its early-stop patience, in the order given
+    assert fr.parse_resume_sets(f"{RID}:early_stop.patience=12") == {RID: ["early_stop.patience=12"]}
+    assert fr.parse_resume_sets(f"{RID}:early_stop.patience=012") == {RID: ["early_stop.patience=12"]}
+    both = f"{RID}:schedule.epochs=8,{RID}:early_stop.patience=12"
+    assert fr.parse_resume_sets(both) == {RID: ["schedule.epochs=8", "early_stop.patience=12"]}
+    assert fr.parse_resume_sets(f"{RID}:early_stop.patience=12,{RID}:schedule.epochs=8") == {
+        RID: ["early_stop.patience=12", "schedule.epochs=8"]}
+    for bad in (f"{RID}:early_stop.patience=0", f"{RID}:early_stop.patience=-1", f"{RID}:early_stop.patience=1.5",
+                f"{RID}:early_stop.patience=x", f"{RID}:early_stop.patience=",
+                f"{RID}:early_stop.patience=12,{RID}:early_stop.patience=6",
+                f"{RID}:early_stop.enabled=false", f"{RID}:early_stop.min_delta_rel=0.01"):
+        with pytest.raises(ValueError, match="early_stop|only schedule.epochs, early_stop.patience may change"):
+            fr.parse_resume_sets(bad)
+    with pytest.raises(ValueError, match="only schedule.epochs, early_stop.patience may change on a resume"):
+        fr.parse_resume_sets(f"{RID}:optim.lr=0.001")
     for bad in (f"{RID}:optim.lr=0.001",  # outside the whitelist
                 f"{RID}:schedule.epochs=0", f"{RID}:schedule.epochs=x", f"{RID}:schedule.epochs=1.5",
                 f"{RID}:schedule.epochs=-2", f"{RID}:schedule.epochs=", f"{RID}:schedule.epochs",

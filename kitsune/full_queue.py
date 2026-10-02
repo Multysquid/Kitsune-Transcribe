@@ -70,15 +70,16 @@ synchronous child, bounded by its own budget and by box 1's fit, and box p01 run
 records every step, so a restart goes on where it stopped; the chain summary is at full/box-<chain>/queue_summary.json.
 `plan` prints the stages and their parts' items; `resume-pull` refuses a chain (exit 3; fullrun.chain_resume_hint).
 
-Resume on a new host (launch --resume / --resume-reset <run_id> / --resume-set <run_id>:schedule.epochs=<E>): bootstrap
-runs `resume-pull` before its paid rebuild. It reads the box's queue summary from the runs repo, pulls every started
-run's logs and its newest full state (the scratch repo's timed state or a runs-repo full state, whichever is newer,
-checked against the pointer's or the LFS sha256), and writes $KITSUNE_STATE/resume_plan.json. The queue adopts that
-plan only when it has no queue.json yet: done items stay done, started runs resume, the rest start fresh; a reset or
-set run gets `sets_once` (schedule.resume_reset=true and its sets), passed on every attempt until the run has logged
-its resume_reset and a full state after it. Its readout then writes runs/m4-<run_id>-r<N>, so the first one on the Hub
-stays. Exit 0 plan written, 3 refused (no summary, an unknown run id, a state that does not match its checksum, a
-set-only run that is past its cooldown: use --resume-reset), 1 anything transient (bootstrap retries it).
+Resume on a new host (launch --resume / --resume-reset <run_id> / --resume-set <run_id>:<key>=<int>, key schedule.epochs
+or early_stop.patience, fullrun.RESUME_SET_KEYS): bootstrap runs `resume-pull` before its paid rebuild. It reads the
+box's queue summary from the runs repo, pulls every started run's logs and its newest full state (the scratch repo's
+timed state or a runs-repo full state, whichever is newer, checked against the pointer's or the LFS sha256), and writes
+$KITSUNE_STATE/resume_plan.json. The queue adopts that plan only when it has no queue.json yet: done items stay done,
+started runs resume, the rest start fresh; a reset or set run gets `sets_once` (schedule.resume_reset=true and its
+sets), passed on every attempt until the run has logged its resume_reset and a full state after it. Its readout then
+writes runs/m4-<run_id>-r<N>, so the first one on the Hub stays. Exit 0 plan written, 3 refused (no summary, an unknown
+run id, a state that does not match its checksum, a set-only run that is past its cooldown: use --resume-reset), 1
+anything transient (bootstrap retries it).
   done       a train item is done when the box summary says so and its export checkpoints/step_<steps>/ is on the
              Hub; also when the run's own summary.json is complete with its export there (the box died between the
              trainer's end and the queue's item-end put), but only when that summary cannot be an earlier run's: no

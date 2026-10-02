@@ -767,6 +767,49 @@ def test_the_resume_reset(env, monkeypatch):
     assert [p.name for p in (run / "checkpoints").glob("abandoned-*/step_5")]  # the first end, set aside
 
 
+def test_the_resume_reset_takes_a_new_patience(env, monkeypatch):
+    """DECISIONS G3 (P-0.1B's continuation): --resume <pre_cooldown> --set schedule.resume_reset=true --set
+    schedule.epochs=E --set early_stop.patience=12 (what full_queue's argv_for passes from KITSUNE_RESUME_SETS) gives a
+    fresh early-stop state under the new patience; every state saved after it carries patience 12, so a later crash
+    resume WITHOUT the sets (sets_applied dropped them) keeps it, and the run ends on its new schedule."""
+    m = load_script("04_distill")
+    over = {"subset": {"train_audio_s": 24, "eval_audio_s": 4},
+            "schedule": {"clock": "epochs", "epochs": 2, "warmup_steps": 300, "cooldown_frac": 0.5, "max_steps": None},
+            "batch": {"step_audio_s": 4, "micro_audio_s": 3, "pool_micro": 4},
+            "eval": {"every_steps": None, "every_min": None, "probe_is_train": True,
+                     "dev": {"every_steps": 1, "per_source": 3}},
+            "early_stop": rule(patience=2, min_delta_abs=FLAT)}
+    path = write_config(env, "patience", over)
+    assert m.main(["--config", path]) == 0
+    run = one_run(env["root"], "patience")
+    assert summary(run)["end_reason"] == "early_stop"
+    pc = run / "checkpoints" / "full_step_3"
+    assert trainer_json(run, "full_step_3")["cfg"]["early_stop"]["patience"] == 2
+    sets = ["--set", "schedule.resume_reset=true", "--set", "schedule.epochs=3", "--set", "early_stop.patience=12",
+            "--set", "ckpt.full_every_steps=1"]
+    monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "7")
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        m.main(["--config", path, "--resume", str(pc), *sets])
+    monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
+    (r,) = events(run, "resume_reset")
+    assert (r["at_step"], r["epochs"], r["resume_resets"]) == (3, 3, 1)
+    assert r["early_stop_before"]["triggered"] is not None
+    newest = max((p for p in (run / "checkpoints").glob("full_step_*") if (p / "trainer.json").is_file()),
+                 key=lambda p: int(p.name.rsplit("_", 1)[1]))
+    assert int(newest.name.rsplit("_", 1)[1]) > 3
+    st = trainer_json(run, newest.name)
+    assert st["cfg"]["early_stop"]["patience"] == 12 and st["cfg"]["schedule"]["epochs"] == 3
+    assert st["cfg"]["schedule"]["resume_reset"] is False and st["st"]["early_stop"]["triggered"] is None
+
+    assert m.main(["--config", path, "--resume", str(newest)]) == 0  # no sets: the state's config holds
+    s = summary(run)
+    T_new = events(run, "schedule")[-1]["total_steps"]
+    assert s["status"] == "complete" and s["steps"] == T_new and s["resume_resets"] == 1
+    end = trainer_json(run, f"full_step_{T_new}")
+    assert end["cfg"]["early_stop"]["patience"] == 12 and end["cfg"]["schedule"]["epochs"] == 3
+    assert len(events(run, "resume_reset")) == 1
+
+
 def test_resume_reset_refusals_on_their_own(tmp_path):
     m = load_script("04_distill")
     R, evs, _ = _unit_run(m, tmp_path, ["schedule.clock=steps", "schedule.max_steps=10", "schedule.warmup_steps=2",

@@ -344,7 +344,12 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "study", "--box", "p01"], "--box p01 is not a box of --job study"),
                       (["--job", "train", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
-                       "only schedule.epochs may change"),
+                       "only schedule.epochs, early_stop.patience may change on a resume"),
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:early_stop.patience=0"], "early_stop.patience must be an int >= 1"),
+                      (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=8",
+                        "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=9"], "given twice"),
+                      (["--job", "train", "--allow-done-trains"], "--allow-done-trains: for --job full only"),
                       (["--job", "full", "--box", "p01", "--machine", "m70001"], "machine_id (digits)")):
         with pytest.raises(SystemExit):
             launch.main([*args, "--data-repo", DATA, "--out-repo", RUNS, "--sha", SHA])
@@ -401,6 +406,27 @@ def test_resume_flags_go_to_the_box_env(full_launch, capsys):
     rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
     assert rc == 0 and "KITSUNE_RESUME" not in " ".join(created_or_printed(capsys.readouterr().out))
     assert not any(c[1:3] == ["show", "instances"] for c in fake.calls)
+
+
+def test_the_continuation_flags_go_to_the_box_env(full_launch, capsys):
+    """DECISIONS G3: P-0.1B's continuation from its pre_cooldown state to 8 epochs with patience 12 - the reset and
+    both sets of one run reach the box as one KITSUNE_RESUME_RESET and one KITSUNE_RESUME_SETS word, in the order
+    given (fullrun.parse_resume_sets on the box gives the queue the same list)."""
+    rid = "full-p01-20261001T184145Z"
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
+                           rid, "--resume-set", f"{rid}:schedule.epochs=8", "--resume-set",
+                           f"{rid}:early_stop.patience=012", "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    env = env_of(created(fake))
+    assert env["KITSUNE_RESUME"] == "1" and env["KITSUNE_RESUME_RESET"] == rid
+    assert env["KITSUNE_RESUME_SETS"] == f"{rid}:schedule.epochs=8,{rid}:early_stop.patience=12"
+    assert re.fullmatch(fullrun._ENV_WORD, env["KITSUNE_RESUME_SETS"])
+    assert fullrun.parse_resume_sets(env["KITSUNE_RESUME_SETS"]) == {
+        rid: ["schedule.epochs=8", "early_stop.patience=12"]}
+    a, kw = full_launch.seen["preflight"]
+    assert kw["resets"] == [rid] and kw["sets"] == {rid: ["schedule.epochs=8", "early_stop.patience=12"]}
+    assert kw["allow_done_trains"] is False
 
 
 def test_live_instances_are_the_boxs_own(monkeypatch):
@@ -650,6 +676,42 @@ def test_resume_preflight_needs_the_hub_summary_and_known_run_ids(repo, monkeypa
     problems, _ = preflight(monkeypatch, FullHub(data, runs, scratch), resume=True, resets=[],
                             sets={"full-p01-20260101T000000Z": ["schedule.epochs=4"]})
     assert any("full-p01-20260101T000000Z: no train item of box p01 ran it" in p for p in problems), problems
+
+
+def test_resume_preflight_guards_a_done_box(repo, monkeypatch, devslice):
+    """DECISIONS G3's two launch guards. (a) A plain --resume of a box whose train items are all done is refused (box
+    p01 would adopt full-p01 as done and score its new items on the 4-epoch weights) unless --allow-done-trains (a box
+    lost in its eval pool); a reset of the run, or a continuation lost on its way (the summary shows the run running
+    with its continuation record), passes. (b) A set-only id of a done run is refused (resume-pull refuses a set-only
+    run past its cooldown)."""
+    rid = "full-p01-20261001T184145Z"
+    reg = launch.full_registry(SHA)[0]
+    data = box_data("p01", reg, repo.root)
+
+    def summary(status, **kw):
+        return {fullrun.box_summary_path("p01"): {"items": {
+            "full-p01": dict({"kind": "train", "status": status, "run_dir": f"runs/{rid}"}, **kw),
+            "m4-full-p01": {"kind": "readout", "status": "done", "verified": True}}}}
+
+    done = summary("done", result={"steps": 107910})
+    problems, _ = preflight(monkeypatch, FullHub(data, done), resume=True, resets=[], sets={})
+    assert any("a plain --resume of box p01: every train item of its Hub summary is done (full-p01)" in p
+               and "--resume-reset <run_id>" in p for p in problems), problems
+    problems, notes = preflight(monkeypatch, FullHub(data, done), resume=True, resets=[], sets={},
+                                allow_done_trains=True)
+    assert problems == [], problems
+    assert any("--allow-done-trains: not refused" in n for n in notes), notes
+    sets = {rid: ["schedule.epochs=8", "early_stop.patience=12"]}
+    problems, notes = preflight(monkeypatch, FullHub(data, done), resume=True, resets=[rid], sets=sets)
+    assert problems == [], problems
+    assert any(f"resume: full-p01: done, run {rid}, reset sets ['schedule.epochs=8', 'early_stop.patience=12']" in n
+               for n in notes), notes
+    problems, _ = preflight(monkeypatch, FullHub(data, done), resume=True, resets=[], sets=sets)
+    assert any(f"--resume-set {rid} without --resume-reset: full-p01 is done" in p for p in problems), problems
+    lost = summary("running", continuation={"run_id": rid, "reset": True, "sets": sets[rid],
+                                            "resume_resets_before": 0})
+    problems, _ = preflight(monkeypatch, FullHub(data, lost), resume=True, resets=[], sets={})
+    assert problems == [], "a continuation lost on its way resumes with a plain --resume"
 
 
 # ========================================================================================= blocklist and gates
