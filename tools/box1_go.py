@@ -33,9 +33,10 @@ the run's summary.json, config.json and evals/step_107910 at the head and append
 4-epoch read after it pins c4604304db76e068df7bbe39d00d006b74d6c134. G5 (smoke-B's verdict) always reads the head:
 pinning it would hide a newer smoke-B.
 
-It then projects box 2's hours with box 1's measurement (tools/make_full_configs.py box2_hours on this checkout's plan
-and speed record) and lists what boxes.json would change; --json OUT writes {go, exit, lines, box1}, whose box1 object
-`python tools/make_full_configs.py --import-speed --box1-go OUT` records (only for an ended box 1).
+It then projects the hours of the boxes after box 1 with its measurement (tools/make_full_configs.py box_hours of each
+HOURS_BOXES box - full-t, full-p and P-0.1B's continuation on p01 - on this checkout's plan and speed record) and lists
+what boxes.json would change; --json OUT writes {go, exit, lines, box1}, whose box1 object `python tools/
+make_full_configs.py --import-speed --box1-go OUT` records (only for an ended box 1).
 
 Usage:
   python tools/box1_go.py --cache-dir D:/kitsune-tmp/fullbuild/hubcache --json box1_go.json
@@ -409,9 +410,10 @@ def _smoke_b(reader, rep: Report):
                                         + ", ".join(f"check {n} {x}" for n, x in vals.items()))
 
 
-def box2_projection(box1: dict) -> list[str]:
-    """Box full's hours with this box-1 measurement (make_full_configs.box2_hours on this checkout's plan and speed
-    record) and what boxes.json would change."""
+def boxes_projection(box1: dict) -> list[str]:
+    """The HOURS_BOXES' hours with this box-1 measurement (make_full_configs.box_hours on this checkout's plan and
+    speed record), the model's P-0.1B at box 1's 4 epochs against box 1's measured wall, and what boxes.json would
+    change."""
     import make_full_configs as M
 
     plan, rec = M.load_plan(), M.load_speed()
@@ -419,15 +421,19 @@ def box2_projection(box1: dict) -> list[str]:
         return ["no speed record in this checkout: make_full_configs.py --import-speed --smoke-verdict ..."]
     rec = dict(rec, box1=box1)
     if problems := M.speed_problems(rec):
-        return [f"box 1's measurement cannot serve box2_hours: {'; '.join(problems)}"]
+        return [f"box 1's measurement cannot serve box_hours: {'; '.join(problems)}"]
     reg = json.loads((M.OUT_DIR / M.BOXES).read_text(encoding="utf-8"))
-    box = reg["boxes"][M.BOX2]
-    h = M.box2_hours(plan, rec, reserve_min=box.get("deadline_reserve_min") or 60)
-    out = [f"box 2 with box 1's speed (r {h['r']:g}, o {h['o']:g}): "
-           + ", ".join(f"{n} {v}" for n, v in h["items"].items())
-           + f"; est {h['est_hours']:g} h, max {h['max_hours']} h (lanes {h['lanes']['A']:g} / {h['lanes']['B']:g}; "
-           f"T-0.6B's pessimistic slack {h['t06_slack_h']:g} h); P-0.1B by the same model {h['run_h']['p01']:g} h vs "
-           f"measured {box1.get('train_wall_h')} h"]
+    out = []
+    for b in M.HOURS_BOXES:
+        h = M.box_hours(plan, rec, b, reserve_min=(reg["boxes"].get(b) or {}).get("deadline_reserve_min") or 60)
+        out.append(f"box {b} with box 1's speed (r {h['r']:g}, o {h['o']:g}): "
+                   + ", ".join(f"{n} {v}" for n, v in h["items"].items())
+                   + f"; est {h['est_hours']:g} h, max {h['max_hours']} h (pessimistic slack {h['slack_h']:g} h)")
+    sps = rec["smoke"]["sec_per_step"][STUDENT]
+    model = M._run_h(M.plan_total_steps(STUDENT, plan), sps, box1["sec_per_step"] / sps,
+                     box1["overhead"] if box1.get("overhead") is not None else M.OVERHEAD_PLAN, M.FIXED_S[STUDENT],
+                     M.SMOKE_EPOCHS[STUDENT] / M.COMMON["eval"]["dev"]["every_epochs"], M.DEV_CHECK_S[STUDENT])
+    out.append(f"P-0.1B's 4 epochs by the same model {model:g} h vs measured {box1.get('train_wall_h')} h")
     todo = M.registry_drift(fullrun.load_registry(reg, root=ROOT, check_files=False), plan, rec)
     out += [f"boxes.json would change: {p}" for p in todo] or ["boxes.json already carries these hours"]
     return out
@@ -469,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
                    EXIT_WAIT: "NOT DECIDABLE YET: run again when box 1 has ended and its records are on the Hub"}[rc]
         print(f"\n{verdict}")
         if rep.box1 is not None:
-            for line in box2_projection(rep.box1):
+            for line in boxes_projection(rep.box1):
                 print(line)
     if args.json:
         out = {"go": None if rc in (EXIT_WAIT, EXIT_HUB) else rc == EXIT_GO, "exit": rc,

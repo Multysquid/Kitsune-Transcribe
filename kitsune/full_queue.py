@@ -1,8 +1,9 @@
 """The full-data runs' box queue: one registry box (kitsune/fullrun.py, configs/full/boxes.json) from its store builds
 to its last verified upload, on a shared GPU queue; plus the resume of a box on a new host.
 
-A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1, full = box 2, smoke-b) is the list of registry items of
-its spec, in registry order. FullQueue(study_queue.Queue) runs them with the study queue's process, state and upload
+A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1 and P-0.1B's continuation, full-t and full-p = box 2's two
+1x boxes, smoke-b; full = the retired 2x box 2, test fixtures only) is the list of registry items of its spec, in
+registry order. FullQueue(study_queue.Queue) runs them with the study queue's process, state and upload
 machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it never reads prereg.rules()["boxes"].
 
   items      stores (python -m kitsune.full_queue build-stores: the trainer's own train, eval and dev store builds,
@@ -99,9 +100,9 @@ Usage (vast/supervise.py runs `run` for KITSUNE_JOB=full; KITSUNE_BOX, KITSUNE_O
 KITSUNE_STATE from the env):
   python -m kitsune.full_queue run --box p01 [--gpus 0,1]
   python -m kitsune.full_queue run --box p01-chain               # a chain box: its ChainController
-  python -m kitsune.full_queue plan --box full                   # the registry items, in order, nothing started
+  python -m kitsune.full_queue plan --box full-t                 # the registry items, in order, nothing started
   python -m kitsune.full_queue build-stores --config configs/full/full-p03.json [--eval-only] [--set k=v]
-  python -m kitsune.full_queue resume-pull --box full --root /workspace/Kitsune-Transcribe
+  python -m kitsune.full_queue resume-pull --box full-t --root /workspace/Kitsune-Transcribe
   python -m kitsune.full_queue check-resume --run-dir runs/full-p03-20260927T120000Z
 Pure Python at import (stdlib, kitsune.fullrun, kitsune.heartbeat, kitsune.study_queue); the trainer (torch) only in the
 build-stores and check-resume children, huggingface_hub only when the Hub is called.

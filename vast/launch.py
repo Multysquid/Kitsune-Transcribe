@@ -46,23 +46,25 @@ count goes along (KITSUNE_N_GPUS). Boxes A and B may be live at the same time: n
   python vast/launch.py --job study --box A --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs \\
       --image-tag main                                                                        # look only
 
---job full --box full-smoke|p01|full|smoke-b rents a full-data box (kitsune/full_queue.py runs it; vast/README.md
-"Full-data runs"). The box registry configs/full/boxes.json (kitsune/fullrun.py) is read at the commit the box runs
-and is the one source of its GPU count (--gpus may only repeat it), data config (--config), hours (--max-hours; planned
-hours est_hours), price cap (--max-dph), extra disk and watchdog (KITSUNE_N_GPUS, KITSUNE_WATCHDOG_*). The offers: RTX
-5090s (--tier a100: A100s, option C, cap A100_MAX_DPH), full_filter per GPU, then a client filter (verified or
-deverified hosts only, a rental that runs >= max(MIN_RENTAL_DAYS, the cap + RENTAL_MARGIN_DAYS), >= 64 GB RAM per GPU or
-the registry box's min_ram_gb (x RAM_CLIENT_FACTOR), --machine), ranked by the estimated total. Refused before renting (full_preflight): a box config not committed at the commit, a student not the
-registered build, an extra file or dir the data repo lacks, an eval/speed tool the commit does not have, a scratch
+--job full --box full-smoke|p01|full-t|full-p|smoke-b rents a full-data box (kitsune/full_queue.py runs it;
+vast/README.md "Full-data runs"). The box registry configs/full/boxes.json (kitsune/fullrun.py) is read at the commit
+the box runs and is the one source of its GPU count (--gpus may only repeat it), data config (--config), hours
+(--max-hours; planned hours est_hours), price cap (--max-dph), extra disk and watchdog (KITSUNE_N_GPUS,
+KITSUNE_WATCHDOG_*). The offers: RTX 5090s (--tier a100: A100s, option C, cap A100_MAX_DPH), full_filter per GPU, then a
+client filter (verified or deverified hosts only, a rental that runs >= max(MIN_RENTAL_DAYS, the cap +
+RENTAL_MARGIN_DAYS), >= 64 GB RAM per GPU or the registry box's min_ram_gb (x RAM_CLIENT_FACTOR), --machine), ranked by
+the estimated total. Refused before renting (full_preflight): a box config not committed at the commit, a student not
+the registered build, an extra file or dir the data repo lacks, an eval/speed tool the commit does not have, a scratch
 repo (--scratch-repo, required for a box with timed states) that is not private, a selection sidecar that is not the
-selection's, with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no
-train item of it ran, and a box with quantised items (box full) without the quant go signal: smoke-b's verdict on the
-Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE; DECISIONS F2), which
---allow-unverified-quant turns into a warning. Box full's hours warn while its speed record has no box-1 part. Offers
-listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped. Every job avoids the machines of
-vast/blocklist.json; a full box also those whose download gate said slow in the last GATE_BLOCK_DAYS
-(full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link first
-(kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
+selection's, with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no train
+item of it ran (a plain --resume of a box whose train items are all done needs --allow-done-trains; a --resume-set id of
+a done run without --resume-reset is refused), and a box with quantised items (full-t, full-p, p01) without the quant go
+signal: smoke-b's verdict on the Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE;
+DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of boxes p01, full-t and full-p warn while
+their speed record has no box-1 part. Offers listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped.
+Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate said slow in the last
+GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link
+first (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
   python vast/launch.py --job full --box p01 --image-tag main --data-repo Multy123/kitsune-data \\
       --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch                  # look only
 --job full --box p01-chain rents a chain box (contract addendum E; kitsune/full_queue.py ChainController): smoke A and
@@ -238,7 +240,8 @@ GATE_RE = re.compile(r"full/box-[^/]+/infra/[^/]+/download_gate\.json")
 FULL_TOOLS = {"stores": "kitsune/full_queue.py", "train": "scripts/04_distill.py", "readout": "scripts/05_evaluate.py",
               "speed": "tools/speed_probe.py"}
 # THE QUANT GO SIGNAL (DECISIONS F2, 2026-10-01: "the quant/compile fixes are verified on a GPU by a standalone smoke-B
-# box before box 2 launches"). A box with quantised items (box full: 28 quantised readouts) is refused unless the runs
+# box before box 2 launches"). A box with quantised items (box full-p: 14 quantised readouts, full-t 7, p01 7 - P-0.1B's
+# continuation scores its 8-epoch weights on its own box) is refused unless the runs
 # repo's smoke-b verdict (full/box-smoke-b/smoke_verdict.json) passed overall and every one of checks 12-16 (12 the
 # torchao selftest and the emulate-vs-real NVFP4 compare, 13 fp16 without non-finite rows, 14 export = in-memory, 15
 # Whisper, 16 every speed probe), at a commit that is an ancestor of the one the box runs with QUANT_CODE (the quant
@@ -249,10 +252,11 @@ QUANT_GO_BOX = "smoke-b"
 QUANT_GO_CHECKS = ("12", "13", "14", "15", "16")
 QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.py", "kitsune/whisper.py",
               "tools/whisper_eval.py", "requirements-train.txt", "docker/Dockerfile")
-# box full's hours come from make_full_configs' speed record (its SPEED_FILE under configs/full): smoke A's measured
-# s/step and, after box 1, box 1's; without box 1's part they are provisional (contract 7), and launch says so
+# the hours of boxes p01 (P-0.1B's continuation), full-t and full-p come from make_full_configs' speed record (its
+# SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's; without box 1's part they are
+# provisional (contract 7), and launch says so
 SPEED_RECORD = "configs/full/plan/box2_hours.json"
-SPEED_RECORD_BOXES = ("full",)
+SPEED_RECORD_BOXES = ("p01", "full-t", "full-p")
 # offers in a country whose hosts cannot reach the Hugging Face Hub: a full box downloads everything from it, and with
 # no download gate (smoke-b) such a host burns its rebuild attempts up to the cap (2026-10-01: the cheapest 1x 5090,
 # m58555, was listed in CN)
@@ -1478,7 +1482,7 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
       resume of a box whose train items are all done needs allow_done_trains, a set-only id of a done run is refused
       (resume_preflight);
     - a box with quantised items: the quant go signal (quant_go_problems: a passing smoke-b verdict at this quant code;
-      allow_unverified_quant makes it a warning); box full: a warning while its hours are provisional
+      allow_unverified_quant makes it a warning); boxes p01, full-t, full-p: a warning while their hours are provisional
       (speed_record_notes)."""
     import hashlib
     import tempfile
@@ -1768,7 +1772,8 @@ def main(argv: list[str] | None = None) -> int:
                          "kitsune/full_queue.py, the registry configs/full/boxes.json)")
     ap.add_argument("--box", choices=[*STUDY_BOXES, *fullrun.ALL_BOX_NAMES], default=None,
                     help="study: A (the Cohere runs, 4 GPUs), B (Parakeet + bridge, 4 GPUs), replicate (1 GPU, after "
-                         "A) or shakedown (1 GPU, first); full: full-smoke (smoke A), p01 (box 1), full (box 2), "
+                         "A) or shakedown (1 GPU, first); full: full-smoke (smoke A), p01 (box 1, then P-0.1B's "
+                         "continuation), full-t and full-p (box 2's two 1x boxes; full: the retired 2x box), "
                          "smoke-b, or the chain p01-chain (smoke A + smoke B, then box 1 on one rental)")
     ap.add_argument("--data-repo", required=True, help="private HF dataset with the derived data (KITSUNE_DATA_REPO)")
     ap.add_argument("--out-repo", default=None, help="private HF model repo for runs/ (KITSUNE_OUT_REPO; train only)")
@@ -1839,7 +1844,7 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"full: drop offers whose expected total (rent for the planned hours + traffic) is above this "
                          f"(default {FULL_TOTAL_FACTOR:g} x the $/h cap x the planned hours + the traffic at the $/GB cap)")
     ap.add_argument("--allow-unverified-quant", action="store_true",
-                    help="full: rent a box with quantised items (box full) without a passing smoke-b verdict at its "
+                    help="full: rent a box with quantised items (full-t, full-p, p01) without a passing smoke-b verdict at its "
                          "quant code (DECISIONS F2's go signal; the refusal becomes a warning)")
     ap.add_argument("--no-self-stop", action="store_true",
                     help="debugging: the box does not stop itself when its on-start or bootstrap fails "

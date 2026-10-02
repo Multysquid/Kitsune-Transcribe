@@ -28,7 +28,7 @@ RID = "full-p03-20260927T120000Z"
 def test_constants_exact_values():
     assert fr.JOB == "full"
     assert (fr.BOXES_FILE, fr.ENV_REGISTRY) == ("configs/full/boxes.json", "KITSUNE_FULL_REGISTRY")
-    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b")
+    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p")
     assert fr.HUB_DIR == "full" and fr.STATE_DEFAULT == "/workspace/kitsune_state"
     assert (fr.TRAIN_HB, fr.HB_DIR, fr.RESUME_PLAN, fr.VERDICT_FILE, fr.ALERTS_FILE, fr.GATE_FILE, fr.SUMMARY_FILE,
             fr.DEADLINE_FILE) == ("train_hb", "hb", "resume_plan.json", "smoke_verdict.json",
@@ -330,7 +330,7 @@ def test_tiny_registry_validates(tmp_path, reg):
     assert fr.registry_problems(reg, root=tmp_path) == []
     assert (tmp_path / "configs" / "full" / "data-p01.json").is_file()
     loaded = fr.load_registry(reg, root=tmp_path)
-    assert set(loaded["boxes"]) == set(fr.BOX_NAMES)
+    assert set(loaded["boxes"]) == {"full-smoke", "p01", "full", "smoke-b"} < set(fr.BOX_NAMES)  # the four of section 7
     assert fr.load_registry(loaded, root=tmp_path) == loaded  # filling the defaults again changes nothing
     # every value a box env or command line carries is one env-string word (launch.env_string's rule)
     for b in loaded["boxes"].values():

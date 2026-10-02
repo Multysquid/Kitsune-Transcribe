@@ -1,7 +1,10 @@
 """The full-data runs' shared core: names, paths, the box registry and the small helpers every full-run package uses.
 
-The full runs (plan v3) train P-0.1B alone on box `p01` (1x RTX 5090, Parakeet labels only), then T-0.6B, P-0.3B and
-P-0.05B on box `full` (2x RTX 5090, one shared GPU queue), after two short smokes (`full-smoke` = smoke A, `smoke-b`).
+The full runs (plan v3) trained P-0.1B alone on box `p01` (1x RTX 5090, Parakeet labels only; box 1), which now
+also runs its continuation to 8 epochs (DECISIONS G3: --resume-reset with --resume-set schedule.epochs /
+early_stop.patience), then T-0.6B on box `full-t` and P-0.3B and P-0.05B on box `full-p` (each 1x RTX 5090, one queue;
+DECISIONS G2: box 2's 2x box `full` is retired, its name kept for the tests' fixtures only), after two short smokes
+(`full-smoke` = smoke A, `smoke-b`).
 The selection (scripts/make_selection.py full mode, kitsune/devslice.py), the trainer (scripts/04_distill.py), the
 box queue (kitsune/full_queue.py), the vast scripts (vast/launch.py, bootstrap.sh, finish.py) and the evaluators all
 import their shared names from here, so a constant cannot drift between them. The binding definitions are the full-run
@@ -92,7 +95,7 @@ build):
   python -m kitsune.fullrun extra-files --box p01                 # the box's extra data-repo files, one per line
   python -m kitsune.fullrun extra-dirs --box full-smoke           # its extra data-repo dirs
   python -m kitsune.fullrun check-students --box p01 --root R     # every pulled student is the registered build
-  python -m kitsune.fullrun show --box full                       # the box spec with defaults, env and configs (JSON)
+  python -m kitsune.fullrun show --box full-t                     # the box spec with defaults, env and configs (JSON)
   python -m kitsune.fullrun check-students --box p01-chain --stage 2 --root R   # a chain: one stage's view
 A chain's --stage defaults to $KITSUNE_CHAIN_STAGE, else 1 (show adds both stage views).
 The registry is $KITSUNE_FULL_REGISTRY when set (tests), else <root>/configs/full/boxes.json.
@@ -115,7 +118,10 @@ REPO = Path(__file__).resolve().parents[1]
 
 JOB = "full"  # KITSUNE_JOB=full
 BOXES_FILE, ENV_REGISTRY = "configs/full/boxes.json", "KITSUNE_FULL_REGISTRY"
-BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b")  # smoke A, box 1, box 2, smoke B
+# smoke A, box p01 (box 1, then P-0.1B's continuation), "full" (the retired 2x box 2: no longer in the registry, kept
+# for tests/fixtures_full.py's 2-GPU box only), smoke B, and box 2 as two 1x boxes (DECISIONS G2): full-t (T-0.6B)
+# and full-p (P-0.3B, P-0.05B, the Whisper models and their quantised readouts)
+BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p")
 # chain boxes (contract addendum E, DECISIONS D): one rental that runs registry boxes one after the other, in two
 # stages with an automatic gate between them (kitsune/full_queue.py ChainController). p01-chain = smoke A and smoke B,
 # then box 1, on one 1x RTX 5090

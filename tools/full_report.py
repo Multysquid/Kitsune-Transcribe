@@ -87,9 +87,9 @@ output has none (flag K1 over 1 %).
 Speed, per system: its own record in the chart group; else a full-data row takes its study weights' record (flag S1:
 same shape, same code); else a record from another group (S3). A full-data AED row whose readout emits more than 5 %
 more or fewer tokens on the 200 speed ids than the timed study weights did gets S2, and then its speed is the chart
-group's study-t06 record times the full-t06 / study-t06 ratio of box full's re-time pair (the two timed in one speed
-file: one machine, one time; box full's group, or the chart group itself when box full rented the chart's machine and
-full-t06 has its own record there), labelled so. Its quantised variants, which decode the same tokens, take the same
+group's study-t06 record times the full-t06 / study-t06 ratio of box full-t's re-time pair (the two timed in one
+speed file: one machine, one time; box full-t's group, or the chart group itself when box full-t rented the chart's
+machine and full-t06 has its own record there), labelled so. Its quantised variants, which decode the same tokens, take the same
 bf16 ratio (the pair is bf16 only; labelled so), so a variant and its bf16 row stay on one basis: the chart's joins and
 the quantisation table's "x bf16 speed" compare like with like (speed.unscaled keeps the record's own numbers). MXFP4
 and emulated variants have no speed ("n/a (simulated)", S4). File size, in order: study.json quant.file_bytes,
@@ -219,7 +219,7 @@ FLAGS = {
     "R1": "Reazon is in-domain (Parakeet and the students were trained on ReazonSpeech).",
     "S1": "Speed of the study weights of the same shape and code (the full-data weights were not timed).",
     "S2": "Token drift over 5 % between the full-data weights and the timed study weights on the speed ids: re-timed "
-          "(the study row x the full/study ratio of box full's bf16 re-time pair; a variant x the same bf16 ratio) "
+          "(the study row x the full/study ratio of box full-t's bf16 re-time pair; a variant x the same bf16 ratio) "
           "where that pair exists.",
     "S3": "Speed from another machine or GPU than the chart group's: not comparable with the other rows.",
     "S4": "Simulated (MXFP4, or an emulated run): accuracy only, no speed.",
@@ -943,9 +943,9 @@ def speed_fields(rec: dict) -> dict:
 
 
 def retime_pair(sp: dict, full: str, study: str) -> tuple[str, dict, dict] | None:
-    """Box full's re-time pair (decision 22): the full-data and the study weights timed by one box launch, so in one
+    """Box full-t's re-time pair (decision 22): the full-data and the study weights timed by one box launch, so in one
     speed file (runs/speed-<box>-<stamp>: one machine, one time) and one group; the newest such pair, None without one.
-    Any group counts, the chart group too: when box full rented the chart's machine, full-t06 has its own record there
+    Any group counts, the chart group too: when box full-t rented the chart's machine, full-t06 has its own record there
     and only its variants, which fall back to their study variants, need the ratio."""
     best = None
     for g in sorted(sp["groups"]):
@@ -1011,7 +1011,7 @@ def resolve_speed(system: str, inf: dict, sp: dict, drift: dict | None) -> dict:
                                  note=f"{n}'s chart-group record x the {full}/{stu} ratio timed in {pg}"
                                       + (" (the bf16 pair's ratio, applied to the variant)" if full != system else ""))
         else:
-            out["retime"] = dict(group=None, note="no re-time pair (box full's speed-full-t06 and speed-study-t06 "
+            out["retime"] = dict(group=None, note="no re-time pair (box full-t's speed-full-t06 and speed-study-t06 "
                                                   "in one speed file): the study weights' speed is shown")
     return out
 
@@ -1392,7 +1392,7 @@ def checks(rep: dict, readouts: dict, sp: dict, man_sha: str) -> list[dict]:
                         detail=f"{len(sp['ids'])} ids, sha256 {str(sp['ids_sha256'])[:12]}"
                                + (": the study's 200-id list" if same else
                                   f", not the study's ({STUDY_SPEED_IDS_SHA256[:12]})")))
-        # another group is expected (box full's re-time pair feeds the S2 ratio); a ROW timed there is not comparable
+        # another group is expected (box full-t's re-time pair feeds the S2 ratio); a ROW timed there is not comparable
         s3 = sorted(s for s, v in rep["systems"].items() if "S3" in v["flags"])
         keyed = "; ".join(f"{g}: machine from {', '.join(e['machine_from'])}" for g, e in sp["groups"].items())
         by_host = len(sp["groups"]) > 1 and any("versions.host" in w for e in sp["groups"].values()

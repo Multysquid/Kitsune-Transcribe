@@ -867,8 +867,10 @@ def test_the_quant_go_signal_only_concerns_boxes_with_quantised_items(quant_go, 
 
 
 def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, monkeypatch, devslice):
-    """full_preflight ends with the quant go signal (allow_unverified_quant passed through) and, for box full, a warning
-    while its speed record has no box-1 part (never a refusal)."""
+    """full_preflight ends with the quant go signal (allow_unverified_quant passed through) and, for a box whose hours
+    come from the speed record (SPEED_RECORD_BOXES: p01, full-t, full-p; the tiny registry's 2-GPU box full stands in
+    for them here), a warning while that record has no box-1 part (never a refusal)."""
+    monkeypatch.setattr(launch, "SPEED_RECORD_BOXES", ("full",))
     monkeypatch.setattr(launch, "git_ancestry", lambda old, new: "ancestor")
     monkeypatch.setattr(launch, "git_blob", lambda sha, p: f"blob:{p}")
     reg = launch.full_registry(SHA)[0]
@@ -888,7 +890,9 @@ def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, 
     rec.write_text(json.dumps({"smoke": {}, "box1": {"sha": "ab" * 20, "sec_per_step": 0.29}}), encoding="utf-8")
     notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")[1]
     assert not any("smoke-only" in n for n in notes) and any("box 1 at abababababab, 0.29 s/step" in n for n in notes)
-    assert launch.speed_record_notes(SHA, "p01") == []
+    assert launch.speed_record_notes(SHA, "p01") == []  # not in the patched tuple
+    monkeypatch.setattr(launch, "SPEED_RECORD_BOXES", ("p01", "full-t", "full-p"))
+    assert launch.speed_record_notes(SHA, "full-smoke") == [] and launch.speed_record_notes(SHA, "full-t")
 
 
 def test_allow_unverified_quant_reaches_the_preflight_and_is_full_only(full_launch, capsys):
@@ -926,7 +930,8 @@ def test_the_quant_code_and_the_speed_record_exist_in_this_checkout():
         assert (ROOT / rel).is_file(), rel
     rec = json.loads((ROOT / launch.SPEED_RECORD).read_text(encoding="utf-8"))
     assert set(rec) >= {"smoke", "box1"}
-    assert launch.SPEED_RECORD_BOXES == ("full",) and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
+    assert launch.SPEED_RECORD_BOXES == ("p01", "full-t", "full-p") and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
+    assert set(launch.SPEED_RECORD_BOXES) <= set(fullrun.BOX_NAMES)
 
 
 def test_the_blocklist_holds_151760_and_54650_and_refuses_a_broken_file(tmp_path):

@@ -47,7 +47,7 @@
   "clock": "epochs",
   "max_steps": null,
   "end_reserve_min": 30,
-  "epochs": 3,
+  "epochs": 10,
   "deadline_cooldown": true
  },
  "batch": {
@@ -165,7 +165,6 @@
  "second_root": "labels/full/second_out",
  "parakeet_root": "labels/full/parakeet_out",
  "selection": "labels/full/selections/full_study/full.parquet",
- "pull_parakeet": true,
  "extent": {
   "name": "full",
   "root": "labels/full",
