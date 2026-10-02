@@ -29,10 +29,15 @@ decoder input is prompt + tokens[:-1]; see AudioBatchDataset for the exact batch
 The CTC family (the size study's Parakeet students) trains on the Parakeet teacher's per-frame targets instead: a FRAME
 store (build_frame_stores; layout and frame preflight in the "frame stores" section below) holds the same audio and,
 per utterance, kitsune.ctc_targets.FrameTargets; FrameBatchDataset collates it, and StepPlanner(max_dec_len=None) plans
-it without a decoder. dataset_for(stores) picks the dataset of a store.
+it without a decoder. dataset_for(stores) picks the dataset of a store. The CTC family's TRAIN loader may augment its
+micro-batches (dataset_for(stores, augment=Augment(...)); the "augmentation" section below; scripts/04_distill.py
+augment.*): rows cut before their final token, utterances joined into longer rows, another row's speech mixed in. A
+dataset built without it - every eval, dev, probe, smoke and memory-probe one - returns the stored rows as they are.
 """
+import copy
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -49,7 +54,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
-from kitsune.audio import decode_audio
+from kitsune.audio import TARGET_SR, decode_audio
 from kitsune.store import fsync_path
 
 PROMPT = [13764, 7, 4, 16, 98, 98, 5, 9, 11, 13]  # teacher decoder prompt (ja, pnc, noitn, ...); see teacher_out/meta.json
@@ -443,6 +448,7 @@ FRAME_FORMAT_VERSION = 1  # bump when the frame store layout changes
 FRAME_MISMATCH_MAX_FRAC = 0.001  # decision 15: above this share of the train rows the build fails
 HOP = 160  # the Parakeet extractor's hop (10 ms at 16 kHz): valid mel frames = samples // HOP
 CTC_SUBSAMPLING_CONVS = 3  # the encoder's three stride-2 convolutions (kernel 3, padding 1): 8x subsampling
+FRAME_SAMPLES = HOP * 2 ** CTC_SUBSAMPLING_CONVS  # 1280 samples = one encoder frame (80 ms): ctc_frames(1280 c) == c
 CTC_BLANK = 3072  # == kitsune.parakeet_targets.BLANK
 CTC_VOCAB = 3073  # == kitsune.parakeet_targets.VOCAB
 CTC_DENSE_THR = 0.95  # the label pass's dense-frame threshold (STUDY.md 2.1): below it p(blank) a frame keeps its top-k
@@ -476,9 +482,17 @@ def is_frame_store(stores: "Stores") -> bool:
     return (stores.info or {}).get("kind") == "frames"
 
 
-def dataset_for(stores: "Stores") -> "AudioBatchDataset | FrameBatchDataset":
-    """The micro-batch dataset of a store: FrameBatchDataset for a frame store, else AudioBatchDataset."""
-    return FrameBatchDataset(stores) if is_frame_store(stores) else AudioBatchDataset(stores)
+def dataset_for(stores: "Stores", augment: "Augment | None" = None) -> "AudioBatchDataset | FrameBatchDataset":
+    """The micro-batch dataset of a store: FrameBatchDataset for a frame store, else AudioBatchDataset. augment: the
+    TRAIN loader's augmentation (Augment; a frame store only - a token store's targets are per decoder position, and
+    no cut or join of the audio keeps them aligned). Every other dataset - the evals, the dev slice, the probe, the
+    smoke checks, the memory probe - is built without it and reads the stored rows as they are."""
+    if is_frame_store(stores):
+        return FrameBatchDataset(stores, augment=augment)
+    if augment is not None:
+        raise ValueError("augmentation needs a frame store (the CTC family's per-frame targets): a token store's "
+                         "targets are per decoder position and cannot follow a cut or joined row")
+    return AudioBatchDataset(stores)
 
 
 def _frame_cache_complete(cache_dir: Path) -> bool:
@@ -1100,11 +1114,18 @@ class FrameBatchDataset(torch.utils.data.Dataset):
     A row whose audio does not decode, or whose decoded length does not give its stored n_frames (ctc_frames), is
     dropped and named in `dropped`. The build's frame preflight removed every mismatched row, so the second case means
     the audio changed since the build (a message on stderr says which). B can be 0: skip such a micro-batch.
-    Picklable without the data; the memmaps open lazily in each process."""
+    Picklable without the data; the memmaps open lazily in each process.
+
+    augment (an Augment; the train loader's only, scripts/04_distill.py augment.*): each micro-batch is augmented after
+    decoding (_augmented; the "augmentation" section below) - its rows joined, cut and mixed - and collated as above,
+    plus `aug`, a dict of counts (utts, rows, concat_groups, concat_utts, truncated, mixed). A joined row holds several
+    utterances: its ids are theirs joined by "+", sources and index the first one's. None (the default) returns the
+    stored rows exactly as before the augmentation existed, without `aug`."""
 
     ARRAYS = ("frames_blank_lp", "dense_frame", "dense_topk_idx", "dense_topk_lp", "ctc_ids")
 
-    def __init__(self, stores: Stores):
+    def __init__(self, stores: Stores, augment: "Augment | None" = None):
+        self.augment = _augment_spec(augment)
         u = stores.utts
         d = Path(stores.cache_dir)
         self.cache_dir = str(d)
@@ -1128,6 +1149,15 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         state = self.__dict__.copy()
         state["_mm"] = None  # never pickle memmaps: each process maps the files itself
         return state
+
+    def with_augment(self, augment: "Augment | None") -> "FrameBatchDataset":
+        """This dataset with another augmentation (None: none), as a shallow copy: the per-utterance arrays (ids,
+        offsets, durations; on the full data ~10M rows, most of a GiB) are shared, not built or held a second time, so
+        the trainer keeps its plain dataset for the smoke checks and the memory probe next to the augmenting one its
+        train loader pickles into the workers."""
+        out = copy.copy(self)
+        out.augment, out._mm = _augment_spec(augment), None
+        return out
 
     def _open(self) -> dict:
         if self._mm is None:
@@ -1174,6 +1204,8 @@ class FrameBatchDataset(torch.utils.data.Dataset):
                 continue
             waves.append(w)
             keep.append(i)
+        if self.augment is not None:
+            return self._augmented(idx, keep, waves, dropped)
         B = len(keep)
         lengths = np.array([len(w) for w in waves], dtype=np.int64)
         wave = np.zeros((B, int(lengths.max()) if B else 0), dtype=np.float32)
@@ -1186,12 +1218,330 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         if B:
             out.update(collate_frame_targets([self.targets(i) for i in keep]))
         else:  # the empty batch's shapes (the trainer skips it)
-            out.update(frame_mask=torch.zeros(0, 0, dtype=torch.bool), dense_mask=torch.zeros(0, 0, dtype=torch.bool),
-                       blank_lp=torch.zeros(0, 0), topk_idx=torch.zeros(0, 0, 0, dtype=torch.long),
-                       topk_lp=torch.zeros(0, 0, 0), ctc_targets=torch.zeros(0, dtype=torch.long),
-                       ctc_target_lengths=torch.zeros(0, dtype=torch.long), n_frames=torch.zeros(0, dtype=torch.long))
+            out.update(_empty_frame_targets())
         out["n_tok"] = out["ctc_target_lengths"].clone()
         return out
+
+    def _augmented(self, idx: Sequence[int], keep: list[int], waves: list[np.ndarray], dropped: list[str]) -> dict:
+        """__getitem__ under self.augment: the decoded rows (store indices `keep`, audio `waves`) joined, cut and mixed
+        in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's own stream, a function of its
+        index list alone - then collated as the plain path collates. The order matters: a joined row can be cut (inside
+        any piece, never before truncate_min_s), and mix takes its interferers from the rows as they were before the cut
+        and before any mixing (clean speech, the length of the whole row). Metadata of a row: ids its pieces' joined by
+        "+" (a cut row only those that start before the cut), sources and index the first piece's (the trainer's
+        per-source sums count a joined row under its first piece's source), durations the pieces' stored durations
+        summed (a cut row: the seconds it keeps, c x 80 ms), agree the smallest known one (NaN if none is known)."""
+        from kitsune.ctc_targets import collate_frame_targets
+
+        a = self.augment
+        rng = augment_rng(a.seed, idx)
+        rows = [_AugRow(w, self.targets(i), [i], [0]) for w, i in zip(waves, keep)]
+        groups = 0
+        if a.concat_p > 0 and len(rows) >= 2 and rng.random() < a.concat_p:
+            k = concat_k(len(rows), max(r.ft.n_frames for r in rows), a, rng)
+            if k:
+                order = rng.permutation(len(rows))  # which utterances share a row, and in which order: random
+                rows = [_join_rows([rows[j] for j in order[g:g + k]], rng) for g in range(0, len(rows), k)]
+                groups = len(rows)
+        originals = [r.wave for r in rows]  # mix's interferers: the rows before any cut (a view) or mix (a copy)
+        n_cut = n_mixed = 0
+        if a.truncate_p > 0:
+            for r in rows:
+                if rng.random() < a.truncate_p:
+                    c = truncate_cut(r.ft, rng, a.truncate_min_frac, a.truncate_min_s)
+                    if c is not None:
+                        r.cut_at(c)
+                        n_cut += 1
+        if a.mix_p > 0 and len(rows) >= 2:
+            for p, r in enumerate(rows):
+                if rng.random() >= a.mix_p:
+                    continue
+                q = int(rng.integers(len(rows) - 1))
+                q += q >= p  # another row: a different utterance (every utterance is in exactly one row)
+                got = mix_into(r.wave, originals[q], rng, a.mix_snr_db)
+                if got is not None:
+                    r.wave = got[0]
+                    n_mixed += 1
+        B = len(rows)
+        lengths = np.array([len(r.wave) for r in rows], dtype=np.int64)
+        wave = np.zeros((B, int(lengths.max()) if B else 0), dtype=np.float32)
+        for b, r in enumerate(rows):
+            wave[b, :len(r.wave)] = r.wave
+        durations = np.array([r.cut * FRAME_SAMPLES / TARGET_SR if r.cut is not None
+                              else self.duration[r.pieces].sum(dtype=np.float32) for r in rows], dtype=np.float32)
+        agree = np.array([_nanmin(self.agree[r.pieces]) for r in rows], dtype=np.float32)
+        out = dict(wave=torch.from_numpy(wave), lengths=torch.from_numpy(lengths),
+                   durations=torch.from_numpy(durations), agree=torch.from_numpy(agree),
+                   index=torch.tensor([r.pieces[0] for r in rows], dtype=torch.int64),
+                   ids=["+".join(self.ids[i] for i in r.pieces) for r in rows],
+                   sources=[self.sources[r.pieces[0]] for r in rows], dropped=dropped)
+        out.update(collate_frame_targets([r.ft for r in rows]) if B else _empty_frame_targets())
+        out["n_tok"] = out["ctc_target_lengths"].clone()
+        out["aug"] = dict(utts=len(keep), rows=B, concat_groups=groups, concat_utts=len(keep) if groups else 0,
+                          truncated=n_cut, mixed=n_mixed)
+        return out
+
+
+def _empty_frame_targets() -> dict:
+    """collate_frame_targets' keys for a micro-batch that lost every row (the trainer skips it)."""
+    return dict(frame_mask=torch.zeros(0, 0, dtype=torch.bool), dense_mask=torch.zeros(0, 0, dtype=torch.bool),
+                blank_lp=torch.zeros(0, 0), topk_idx=torch.zeros(0, 0, 0, dtype=torch.long),
+                topk_lp=torch.zeros(0, 0, 0), ctc_targets=torch.zeros(0, dtype=torch.long),
+                ctc_target_lengths=torch.zeros(0, dtype=torch.long), n_frames=torch.zeros(0, dtype=torch.long))
+
+
+def _nanmin(x: np.ndarray) -> float:
+    v = x[~np.isnan(x)]
+    return float(v.min()) if len(v) else float("nan")
+
+
+# ---------------------------------------------------------------------------------------------------- augmentation
+#
+# The CTC family's train-time augmentation (scripts/04_distill.py augment.*, off by default; FrameBatchDataset(
+# augment=Augment(...)), in the loader's workers, after decoding). Why: trained on the stored rows alone, the student
+# learns two artefacts of its data rather than of speech (the owner's review of P-0.1B inside the app):
+#   - every row is ONE whole utterance that ends in a sentence mark, so "the input ends" becomes "emit 。": a decoded
+#     chunk gets 。/？/！ at its end whether the speaker stopped or not (moving the chunk's end 3 s later moves the mark
+#     with it, 30 of 30), and a real sentence end inside a long chunk gets none;
+#   - no row ever holds two utterances or a second voice: joined utterances (ReazonSpeech 11.9 % CER per utterance,
+#     33.7 % with 4 of them in one input; CV 10.3 -> 15.9 %) and conversational streams with crosstalk go badly.
+# Three fixes, each keeping the teacher's per-frame targets right for the input the student gets:
+#   concat    per micro-batch (concat_p): ALL its rows joined into groups of k, k drawn among the divisors of the row
+#             count in [2, concat_max_n] with k x the longest row <= concat_max_s (none: no join). Every piece but the
+#             last is padded (AUG_PAD_STD noise) or trimmed to exactly FRAME_SAMPLES x its stored n_frames, so each
+#             piece starts on an encoder frame boundary and its targets hold unchanged at its frame offset; the targets
+#             are concatenated and the greedy CTC path recomputed over the joined argmax. Real sentence marks then sit
+#             INSIDE long rows, and multi-utterance inputs of up to concat_max_s become ordinary. The joined micro-batch
+#             has rows / k rows of at most k x its longest row's frames: its padded frames (rows x longest, what the
+#             encoder's activations and the (frames x 3073) logits scale with) never exceed the planned micro-batch's,
+#             and the trainer clamps concat_max_s to the longest train utterance, so no joined row is longer than the
+#             one the memory probe's "longest" micro-batch already ran. The audio rectangle can grow by the pads alone
+#             (< 70 ms per join, read by the convolutional subsampling only)
+#   truncate  per row (truncate_p): cut at a frame c drawn in [max(truncate_min_frac x T, truncate_min_s), e), e = the
+#             first frame of the row's final emitted token (the teacher's argmax; for a whole utterance its final
+#             sentence mark), the audio at exactly FRAME_SAMPLES x c and the targets at frame c alike. The teacher made
+#             its targets from the WHOLE utterance, so the frames before c carry no final mark: the input ending is no
+#             longer a reason to emit one
+#   mix       per row (mix_p, micro-batches of 2+ rows): a random segment of another row's audio - as it was before any
+#             cut or mix: clean, whole - added at a random offset, scaled to an SNR drawn from mix_snr_db (dB of this
+#             row's power over the segment's, both over the span they share); the targets stay this row's (clean
+#             teacher, noisy student), so the student transcribes the dominant voice through crosstalk and background
+#             talk. The length never changes
+# No step changes a row's frame count other than as its targets change (concat sums whole frames, truncate cuts at a
+# frame boundary, mix keeps the length), so ctc_frames(samples) == n_frames holds for every row the loss reads.
+# Deterministic: each micro-batch draws from augment_rng(seed, its index list) alone, so a resumed or branched run -
+# which replays the same index lists - augments every micro-batch exactly as the original did, whichever worker decodes
+# it (a micro-batch whose index list recurs in a later epoch is augmented the same way again; with the planner's
+# reshuffled pools that needs the same utterances in the same order, which only a one-row micro-batch meets). Pure numpy
+# in the worker - a join, a slice, one copy per mixed row -: measured on the laptop, 0.05-0.35 s more per 1600 s
+# micro-batch with all three on (the most for 1 s rows, 1600 of them), next to the ~0.7-1.6 s its MP3/OGG decode takes
+# on one core (default_num_workers' rates).
+
+AUG_PAD_STD = 1e-5  # the noise between joined pieces (~-100 dBFS): never digital zeros, whose LogMel floor is a feature
+# no recording has, which the student would then see at every join and nowhere else
+MIX_SILENT_POWER = 1e-8  # a mean square below this (-80 dBFS) is silence: no level to scale an interferer to (or by)
+MIX_MIN_COVER = 0.5  # the interferer's segment covers a uniform share in [MIX_MIN_COVER, 1] of the shorter of the rows
+
+
+@dataclass(frozen=True)
+class Augment:
+    """What a train FrameBatchDataset does to each micro-batch (the section comment above). scripts/04_distill.py
+    builds it from augment.* (from_config) with seed = augment.seed or the run's seed and concat_max_s clamped to the
+    longest train utterance. concat_p: per micro-batch; truncate_p, mix_p: per row; truncate_min_frac / truncate_min_s:
+    the cut's lower bound (a share of the row's frames, seconds); concat_max_n / concat_max_s: the pieces and seconds of
+    a joined row; mix_snr_db: (low, high) dB of the row's power over the interferer's, drawn uniformly."""
+
+    seed: int
+    truncate_p: float = 0.0
+    truncate_min_frac: float = 0.3
+    truncate_min_s: float = 1.0
+    concat_p: float = 0.0
+    concat_max_s: float = 28.0
+    concat_max_n: int = 4
+    mix_p: float = 0.0
+    mix_snr_db: tuple = (5.0, 20.0)
+
+    def __post_init__(self):
+        snr = tuple(float(x) for x in self.mix_snr_db)
+        object.__setattr__(self, "mix_snr_db", snr)
+        probs = (self.truncate_p, self.concat_p, self.mix_p)
+        ok = (int(self.seed) >= 0 and all(0.0 <= float(p) <= 1.0 for p in probs)
+              and 0.0 <= float(self.truncate_min_frac) < 1.0 and float(self.truncate_min_s) >= 0.0
+              and float(self.concat_max_s) > 0.0 and int(self.concat_max_n) >= 2 and len(snr) == 2
+              and 0.0 <= snr[0] <= snr[1])
+        if not ok:
+            raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
+                             "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high)")
+
+    @classmethod
+    def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None) -> "Augment":
+        """From scripts/04_distill.py's augment block: `enabled` and `seed` are the caller's (seed: the resolved one),
+        concat_max_s (when given) replaces the block's - the trainer's clamp."""
+        kw = {f.name: block[f.name] for f in fields(cls) if f.name != "seed" and f.name in block}
+        if concat_max_s is not None:
+            kw["concat_max_s"] = float(concat_max_s)
+        return cls(seed=int(seed), **kw)
+
+
+def _augment_spec(augment) -> "Augment | None":
+    if augment is None or isinstance(augment, Augment):
+        return augment
+    raise TypeError(f"augment must be an Augment or None, got {type(augment).__name__}")
+
+
+def augment_rng(seed: int, idx: Sequence[int]) -> np.random.Generator:
+    """The generator of one micro-batch's augmentation: seeded with (seed, a 64-bit BLAKE2b digest of its index list
+    as int64), a pure function of the list - not of the worker, the process or anything drawn before it."""
+    h = hashlib.blake2b(np.asarray([int(i) for i in idx], dtype=np.int64).tobytes(), digest_size=8).digest()
+    return np.random.default_rng(np.random.SeedSequence([int(seed), int.from_bytes(h, "little")]))
+
+
+def greedy_ids(col0: np.ndarray) -> np.ndarray:
+    """kitsune.parakeet_targets.ctc_greedy without the Python loop (as build_frame_stores computes a store's ctc_ids):
+    the argmax per frame with repeats collapsed and blanks dropped, int32."""
+    col0 = np.asarray(col0, dtype=np.int64)
+    if not len(col0):
+        return np.zeros(0, np.int32)
+    prev = np.concatenate([[-1], col0[:-1]])
+    return col0[(col0 != prev) & (col0 != CTC_BLANK)].astype(np.int32)
+
+
+def join_frame_targets(parts: Sequence) -> "FrameTargets":
+    """One joined row's targets from its pieces' FrameTargets, in order: piece j's frames at offset sum(n_frames of the
+    pieces before it) - blank_lp and the top-k concatenated, the dense frames shifted by the offset - and the greedy CTC
+    path recomputed over the joined argmax (greedy_ids). That is the pieces' own paths one after another, except where a
+    piece ends and the next starts on the same token: the joined frames then hold one run of it, which CTC reads as one
+    token, so the target must too (the same token twice is two runs only with a blank between)."""
+    from kitsune.ctc_targets import FrameTargets
+
+    offs = np.cumsum([0] + [p.n_frames for p in parts[:-1]])
+    ft = FrameTargets(int(sum(p.n_frames for p in parts)), np.concatenate([p.blank_lp for p in parts]),
+                      np.concatenate([np.asarray(p.dense_frame, dtype=np.int32) + np.int32(o)
+                                      for p, o in zip(parts, offs)]),
+                      np.concatenate([p.topk_idx for p in parts]), np.concatenate([p.topk_lp for p in parts]),
+                      np.zeros(0, np.int32))
+    ft.ctc_ids = greedy_ids(ft.col0())
+    return ft
+
+
+def cut_frame_targets(ft: "FrameTargets", c: int) -> "FrameTargets":
+    """The first c frames of ft (a cut row's targets): blank_lp[:c], the dense frames below c with their top-k, and
+    the greedy CTC path of the argmax kept - a prefix of ft's path (a token whose run the cut splits is still emitted
+    once, as CTC reads those frames)."""
+    from kitsune.ctc_targets import FrameTargets
+
+    c = int(c)
+    nd = int(np.searchsorted(ft.dense_frame, c))  # the dense frames increase
+    out = FrameTargets(c, ft.blank_lp[:c].copy(), ft.dense_frame[:nd].copy(), ft.topk_idx[:nd].copy(),
+                       ft.topk_lp[:nd].copy(), np.zeros(0, np.int32))
+    out.ctc_ids = greedy_ids(out.col0())
+    return out
+
+
+def last_token_start(ft: "FrameTargets") -> int | None:
+    """The first frame of the row's final emitted token: the start of the last run of one non-blank class in the
+    teacher's argmax (CTC's peaky argmax mostly gives the token a single frame, sometimes a few). None: no token."""
+    col0 = ft.col0()
+    nz = np.flatnonzero(col0 != CTC_BLANK)
+    if not len(nz):
+        return None
+    e = int(nz[-1])
+    while e > 0 and col0[e - 1] == col0[nz[-1]]:
+        e -= 1
+    return e
+
+
+def truncate_cut(ft: "FrameTargets", rng: np.random.Generator, min_frac: float, min_s: float) -> int | None:
+    """truncate's cut frame c, uniform in [lo, e): lo = max(ceil(min_frac x T), the frames of min_s, 1), e =
+    last_token_start. Every frame from e on goes, so the final token does (and whatever else starts after c); the cut
+    never lands inside the final token's run, where the teacher's mark would survive on the frames before c. None when
+    the interval is empty: a row without a token, a short one, one whose final token starts before lo."""
+    e = last_token_start(ft)
+    if e is None:
+        return None
+    lo = max(math.ceil(float(min_frac) * ft.n_frames - 1e-9),
+             math.ceil(float(min_s) * TARGET_SR / FRAME_SAMPLES - 1e-9), 1)
+    return int(rng.integers(lo, e)) if lo < e else None
+
+
+def concat_k(n_rows: int, longest_frames: int, a: Augment, rng: np.random.Generator) -> int:
+    """concat's group size for a micro-batch of n_rows rows whose longest has longest_frames frames: drawn uniformly
+    among the k in [2, concat_max_n] that divide n_rows (every row joins a group of the same size, so the rows x
+    longest rectangle is at most the original's) and keep k x the longest row (in whole frames, the length a piece
+    takes in a joined row) within concat_max_s; 0 when none does - that micro-batch stays as it is."""
+    longest_s = int(longest_frames) * FRAME_SAMPLES / TARGET_SR
+    ks = [k for k in range(2, int(a.concat_max_n) + 1)
+          if n_rows % k == 0 and k * longest_s <= float(a.concat_max_s) + 1e-9]
+    return ks[int(rng.integers(len(ks)))] if ks else 0
+
+
+def join_waves(waves: Sequence[np.ndarray], n_frames: Sequence[int], rng: np.random.Generator) -> np.ndarray:
+    """A joined row's audio: every piece but the last padded with AUG_PAD_STD noise, or cut (by under HOP samples,
+    which the extractor's valid mel frames, samples // HOP, never read), to exactly FRAME_SAMPLES x its n_frames, so
+    piece j starts at sample FRAME_SAMPLES x its frame offset; the last piece as it is: after a whole number S of
+    frames its own length gives its own frames (ctc_frames(FRAME_SAMPLES x S + n) == S + ctc_frames(n)), and padding it
+    would only lengthen the row."""
+    out = []
+    for w, t in zip(waves[:-1], n_frames[:-1]):
+        n = FRAME_SAMPLES * int(t)
+        out.append(w[:n])
+        if len(w) < n:
+            out.append(np.float32(AUG_PAD_STD) * rng.standard_normal(n - len(w), dtype=np.float32))
+    out.append(waves[-1])
+    return np.concatenate(out).astype(np.float32, copy=False)
+
+
+def mix_into(dst: np.ndarray, src: np.ndarray, rng: np.random.Generator,
+             snr_db: Sequence[float]) -> tuple[np.ndarray, dict] | None:
+    """dst with a segment of src added: n samples (a uniform share in [MIX_MIN_COVER, 1] of the shorter of the two)
+    from a random start in src, at a random offset in dst, scaled so that 10 log10(power(dst over those n samples) /
+    power(the scaled segment)) is an SNR drawn uniformly from snr_db. Returns (the new array - dst itself is never
+    written: it may be another row's interferer -, {src_start, offset, n, snr_db, gain}), or None when there is
+    nothing to mix (a row under 2 samples; either span silent, below MIX_SILENT_POWER: no level to scale to, and
+    scaling a silent segment up would only turn its noise floor into a loud hiss)."""
+    L = min(len(dst), len(src))
+    if L < 2:
+        return None
+    n = int(rng.integers(math.ceil(MIX_MIN_COVER * L), L + 1))
+    s0 = int(rng.integers(0, len(src) - n + 1))
+    off = int(rng.integers(0, len(dst) - n + 1))
+    snr = float(rng.uniform(float(snr_db[0]), float(snr_db[1])))
+    seg = np.asarray(src[s0:s0 + n], dtype=np.float32)
+    span = np.asarray(dst[off:off + n], dtype=np.float32)
+    # the powers as float32 dot products (BLAS, no float64 copies of up to 30 s of audio per mixed row): ~1e-6 relative,
+    # 1e-5 dB of SNR
+    p_dst, p_seg = float(np.dot(span, span)) / n, float(np.dot(seg, seg)) / n
+    if p_dst < MIX_SILENT_POWER or p_seg < MIX_SILENT_POWER:
+        return None
+    gain = math.sqrt(p_dst / (p_seg * 10.0 ** (snr / 10.0)))
+    out = np.array(dst, dtype=np.float32, copy=True)
+    out[off:off + n] += np.float32(gain) * seg
+    return out, dict(src_start=s0, offset=off, n=n, snr_db=snr, gain=gain)
+
+
+class _AugRow:
+    """One row of an augmented micro-batch: its audio, targets, the store indices of its pieces and their first frames,
+    and the frame it was cut at (None: whole)."""
+
+    __slots__ = ("wave", "ft", "pieces", "offsets", "cut")
+
+    def __init__(self, wave: np.ndarray, ft, pieces: list[int], offsets: list[int]):
+        self.wave, self.ft, self.pieces, self.offsets, self.cut = wave, ft, pieces, offsets, None
+
+    def cut_at(self, c: int):
+        """Keep the first c frames: the audio at exactly FRAME_SAMPLES x c samples (ctc_frames of it is c; a row of
+        T > c frames always has that many), the targets cut_frame_targets', and only the pieces that start before c."""
+        self.wave = self.wave[:FRAME_SAMPLES * int(c)]
+        self.ft = cut_frame_targets(self.ft, c)
+        n = sum(1 for o in self.offsets if o < c)
+        self.pieces, self.offsets, self.cut = self.pieces[:n], self.offsets[:n], int(c)
+
+
+def _join_rows(parts: list[_AugRow], rng: np.random.Generator) -> _AugRow:
+    """concat's join of single-utterance rows, in the given order."""
+    t = [r.ft.n_frames for r in parts]
+    return _AugRow(join_waves([r.wave for r in parts], t, rng), join_frame_targets([r.ft for r in parts]),
+                   [r.pieces[0] for r in parts], np.cumsum([0] + t[:-1]).astype(int).tolist())
 
 
 # --------------------------------------------------------------------------------------------------------- loader
