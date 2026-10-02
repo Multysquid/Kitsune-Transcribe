@@ -205,5 +205,11 @@
  "bn": {
   "mode": "frozen"
  },
- "family": "ctc"
+ "family": "ctc",
+ "augment": {
+  "enabled": true,
+  "truncate_p": 0.3,
+  "concat_p": 0.5,
+  "mix_p": 0.2
+ }
 }

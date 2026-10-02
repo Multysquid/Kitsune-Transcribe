@@ -243,7 +243,7 @@ GATE_RE = re.compile(r"full/box-[^/]+/infra/[^/]+/download_gate\.json")
 FULL_TOOLS = {"stores": "kitsune/full_queue.py", "train": "scripts/04_distill.py", "readout": "scripts/05_evaluate.py",
               "speed": "tools/speed_probe.py"}
 # THE QUANT GO SIGNAL (DECISIONS F2, 2026-10-01: "the quant/compile fixes are verified on a GPU by a standalone smoke-B
-# box before box 2 launches"). A box with quantised items (box full-p: 14 quantised readouts, full-t 7, p01 7 - the
+# box before box 2 launches"). A box with quantised items (box full-p: 7 quantised readouts, full-t 7, p01 7 - the
 # recipe test scores its re-run's weights on its own box) is refused unless the runs
 # repo's smoke-b verdict (full/box-smoke-b/smoke_verdict.json) passed overall and every one of checks 12-16 (12 the
 # torchao selftest and the emulate-vs-real NVFP4 compare, 13 fp16 without non-finite rows, 14 export = in-memory, 15

@@ -753,9 +753,11 @@ its store builder, before it can run.
 Plan v3 trains the full students on the whole label set: P-0.1B alone on **box 1** (`p01`, 1x RTX 5090, Parakeet labels
 only; done 2026-10-02, 4 epochs, M4 11.45 %), after two short smokes (`full-smoke` = smoke A, `smoke-b`). Box 2 is now
 two 1x RTX 5090 boxes (DECISIONS G2): **box T** (`full-t`: T-0.6B, the Cohere labels only, `data-t`) and **box P**
-(`full-p`: P-0.3B then P-0.05B, the Parakeet labels, `data-p`, with the Whisper models and their quantised readouts);
-T-0.6B and P-0.3B train 3 epochs, P-0.05B 5 (DECISIONS G1, confirmed by the owner on 2026-10-02; the earlier 10-epoch
-request was withdrawn), each with the common early-stop patience 6. Box `p01` runs again as **the recipe test**
+(`full-p`: P-0.3B with the CTC train-data augmentation recipe, `full-p03.json`'s `augment` block, the Parakeet labels,
+`data-p`, with the Whisper models and the quantised readouts); T-0.6B and P-0.3B train 3 epochs (DECISIONS G1,
+confirmed by the owner on 2026-10-02; the earlier 10-epoch request was withdrawn), each with the common early-stop
+patience 6. DECISIONS H2 postpones box T (the AED family has no truncate or concat yet) and P-0.05B (its config
+`full-p005.json` stays, 5 epochs; its items left box P). Box `p01` runs again as **the recipe test**
 (DECISIONS H1, below): box 1's cooldown re-run from its pre_cooldown state to the same end with the CTC train-data
 augmentation on, then P-0.1B's 7 quantised readouts (G3's 8-epoch continuation is postponed, H2). The 2x box `full` is retired: its
 name stays in `fullrun.BOX_NAMES` for the tests' fixtures only, it is not in the registry, and launch refuses it. Each is one `launch.py --job full --box <box>` call; on the box
@@ -796,12 +798,13 @@ a standalone **smoke-B** (`--box smoke-b`, ~1.5 h on a 1x 5090, report only: it 
 checks say), its verdict `full/box-smoke-b/smoke_verdict.json` passing checks 12-16 (`python tools/box1_go.py
 --revision c4604304db76e068df7bbe39d00d006b74d6c134`: G5), this layout merged, then **box p01's recipe test** (DECISIONS
 H1 step 1, the `--resume-reset ... augment.*` line above: box 1's cooldown again with the train-data augmentation, a
-paired A/B against the 4-epoch record) and **boxes full-t and full-p** after it (they do not depend on its timing: box
-p01 scores its own quantised readouts). The hours of boxes p01, full-t and full-p (`est_hours`, `max_hours` and the train items' no-start needs)
+paired A/B against the 4-epoch record), then **box full-p** (P-0.3B with the recipe) only if the test shows that the
+recipe helps (H1 step 2: its readout `runs/m4-full-p01-20261001T184145Z-r1` against the record's at revision
+c4604304); box full-t waits (H2). The hours of boxes p01, full-t and full-p (`est_hours`, `max_hours` and the train items' no-start needs)
 come from the speed record `configs/full/plan/box2_hours.json` (smoke A's measured s/step and box 1's, `box1_go.py
 --revision <its 4-epoch record> --json` then `make_full_configs.py --import-speed --box1-go`) at the step counts of
 the plan record's launch part (`--import-launch-plan`), so their lines take no `--max-hours`; launch warns while the
-record has no box-1 part. launch refuses a box with quantised items (full-p 14, full-t 7, p01 7) without **the quant go
+record has no box-1 part. launch refuses a box with quantised items (full-p 7, full-t 7, p01 7) without **the quant go
 signal**: smoke-b's verdict on the Hub passed overall and every one of checks 12-16, at a commit that is an ancestor of
 the one the box runs, with `kitsune/quant.py`, `tools/speed_probe.py`, `scripts/05_evaluate.py`, `kitsune/whisper.py`,
 `tools/whisper_eval.py`, `requirements-train.txt` and `docker/Dockerfile` unchanged since (`QUANT_CODE`): a later

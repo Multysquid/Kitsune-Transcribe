@@ -3,9 +3,9 @@
 The full runs (plan v3) trained P-0.1B alone on box `p01` (1x RTX 5090, Parakeet labels only; box 1), which now
 re-runs that run's cooldown with the CTC train-data augmentation on, the recipe test (DECISIONS H1: --resume-reset with
 --resume-set schedule.epochs and augment.*; G3's 8-epoch continuation is postponed, H2), then T-0.6B on box `full-t`
-and P-0.3B and P-0.05B on box `full-p` (each 1x RTX 5090, one queue;
-DECISIONS G2: box 2's 2x box `full` is retired, its name kept for the tests' fixtures only), after two short smokes
-(`full-smoke` = smoke A, `smoke-b`).
+(postponed, H2) and P-0.3B with that recipe on box `full-p` if the test shows it helps (H1 step 2; P-0.05B postponed,
+H2), each 1x RTX 5090, one queue (DECISIONS G2: box 2's 2x box `full` is retired, its name kept for the tests'
+fixtures only), after two short smokes (`full-smoke` = smoke A, `smoke-b`).
 The selection (scripts/make_selection.py full mode, kitsune/devslice.py), the trainer (scripts/04_distill.py), the
 box queue (kitsune/full_queue.py), the vast scripts (vast/launch.py, bootstrap.sh, finish.py) and the evaluators all
 import their shared names from here, so a constant cannot drift between them. The binding definitions are the full-run
@@ -122,7 +122,8 @@ JOB = "full"  # KITSUNE_JOB=full
 BOXES_FILE, ENV_REGISTRY = "configs/full/boxes.json", "KITSUNE_FULL_REGISTRY"
 # smoke A, box p01 (box 1, then its recipe test: box 1's cooldown again), "full" (the retired 2x box 2: no longer in
 # the registry, kept for tests/fixtures_full.py's 2-GPU box only), smoke B, and box 2 as two 1x boxes (DECISIONS G2):
-# full-t (T-0.6B) and full-p (P-0.3B, P-0.05B, the Whisper models and their quantised readouts)
+# full-t (T-0.6B) and full-p (P-0.3B with the augmentation recipe, the Whisper models and the quantised readouts;
+# P-0.05B postponed, DECISIONS H2)
 BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p")
 # chain boxes (contract addendum E, DECISIONS D): one rental that runs registry boxes one after the other, in two
 # stages with an automatic gate between them (kitsune/full_queue.py ChainController). p01-chain = smoke A and smoke B,
