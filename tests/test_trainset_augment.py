@@ -177,14 +177,18 @@ def test_augment_spec_and_where_it_applies(env, tmp_path):
     store's per-position targets cannot follow a cut); with_augment shares the plain dataset's arrays."""
     for bad in (dict(truncate_p=1.5), dict(concat_p=-0.1), dict(mix_p=2), dict(truncate_min_frac=1.0),
                 dict(truncate_min_s=-1), dict(concat_max_s=0), dict(concat_max_n=1), dict(mix_snr_db=(10, 5)),
-                dict(mix_snr_db=(-3, 5)), dict(seed=-1)):
+                dict(mix_snr_db=(-3, 5)), dict(seed=-1), dict(truncate_pause_p=1.5),
+                dict(truncate_p=0.5),  # a cut needs the punctuation ids: without them a mark looks like a word
+                dict(truncate_p=0.5, punct_ids=(BLANK,))):
         with pytest.raises(ValueError, match="not an augmentation"):
             T.Augment(**{"seed": 1, **bad})
     with pytest.raises(TypeError):
         T.FrameBatchDataset(env["store"], augment={"truncate_p": 1.0})
     a = T.Augment.from_config(dict(enabled=True, seed=None, truncate_p=0.5, concat_max_s=28.0, mix_snr_db=[5, 20],
-                                   concat_max_n=3), seed=11, concat_max_s=2.5)
-    assert a == T.Augment(seed=11, truncate_p=0.5, concat_max_s=2.5, concat_max_n=3, mix_snr_db=(5.0, 20.0))
+                                   concat_max_n=3, truncate_pause_p=0.25), seed=11, concat_max_s=2.5,
+                              punct_ids=[8, MARK])
+    assert a == T.Augment(seed=11, truncate_p=0.5, concat_max_s=2.5, concat_max_n=3, mix_snr_db=(5.0, 20.0),
+                          truncate_pause_p=0.25, punct_ids=(MARK, 8))
     plain = T.dataset_for(env["store"])
     aug = plain.with_augment(a)
     assert aug.augment == a and plain.augment is None and aug.ids is plain.ids and aug.n_frames is plain.n_frames
@@ -232,28 +236,51 @@ def test_join_keeps_each_piece_at_its_offset():
 
 
 def test_cut_and_its_interval():
-    """cut_frame_targets keeps the first c frames (a prefix of the CTC path); truncate_cut draws c in
-    [max(ceil(min_frac x T), frames of min_s, 1), e) with e the first frame of the final token's run, so the final
-    token - the mark - always goes, also when its run spans several frames; None when that interval is empty."""
-    # 30 frames: tokens at 3, 8-9 (one run), 16, and the mark's run at 20-22
+    """cut_frame_targets keeps the first c frames (a prefix of the CTC path). truncate_frames allows exactly the c >=
+    max(ceil(min_frac x T), frames of min_s, 1) whose first removed token (the first one STARTING at or after c) is a
+    word: never the mark (a cut between a sentence's last word and its mark would keep a complete sentence without its
+    mark), never nothing; truncate_cut draws among them, pause_p of the time among those inside a >= 4-frame pause;
+    None when there are none."""
+    # 30 frames: tokens at 3, 8-9 (one run), 16, and the mark's run at 20-22; pauses (blank runs >= 4) at 4-7, 10-15,
+    # 23-29 - the one at 17-19, between the last word and the mark, is 3 frames and is excluded anyway
     col0 = [BLANK] * 3 + [40] + [BLANK] * 4 + [41, 41] + [BLANK] * 6 + [42] + [BLANK] * 3 + [MARK] * 3 + [BLANK] * 7
     t = ft(col0, seed=5)
-    assert t.n_frames == 30 and T.last_token_start(t) == 20 and T.last_token_start(ft([BLANK] * 9)) is None
+    assert t.n_frames == 30
+    nxt = T.next_token_start(t.col0())
+    assert nxt.tolist() == [40] * 4 + [41] * 5 + [42] * 8 + [MARK] * 4 + [BLANK] * 9  # frame 9: 41's run began at 8
+    assert np.flatnonzero(T.pause_frames(t.col0())).tolist() == [4, 5, 6, 7, *range(10, 16), *range(23, 30)]
     for c in (1, 4, 9, 17, 20, 23, 30):
         x = T.cut_frame_targets(t, c)
         assert x.n_frames == c and np.array_equal(x.col0(), t.col0()[:c]) and np.array_equal(x.blank_lp, t.blank_lp[:c])
         assert np.array_equal(x.dense_frame, t.dense_frame[t.dense_frame < c])
         assert np.array_equal(x.topk_idx, t.topk_idx[t.dense_frame < c]) and x.ctc_ids.tolist() == ctc_greedy(col0[:c])
         assert x.ctc_ids.tolist() == t.ctc_ids.tolist()[:len(x.ctc_ids)]
+    P = (MARK,)
+    assert T.truncate_frames(t, 0.3, 0.0, P).tolist() == list(range(9, 17))  # 17-20 would remove only the mark
+    assert T.truncate_frames(t, 0.0, 0.0, ()).tolist() == list(range(1, 21))  # without punct_ids the mark is a "word"
     rng = np.random.default_rng(0)
-    got = {T.truncate_cut(t, rng, 0.3, 0.0) for _ in range(400)}
-    assert got == set(range(9, 20))  # [ceil(0.3 x 30), 20): every value, never inside the mark's run
-    for c in got:
-        assert MARK not in T.cut_frame_targets(t, c).ctc_ids.tolist()
-    assert {T.truncate_cut(t, rng, 0.0, 1.0) for _ in range(200)} == set(range(13, 20))  # 1 s = 12.5 -> 13 frames
-    assert T.truncate_cut(t, rng, 0.9, 0.0) is None  # lo 27 >= e 20
-    assert T.truncate_cut(ft([BLANK] * 30), rng, 0.0, 0.0) is None
-    assert T.truncate_cut(ft([40] + [BLANK] * 20), rng, 0.0, 0.0) is None  # the final token starts at frame 0
+    got = {T.truncate_cut(t, rng, 0.3, 0.0, P) for _ in range(400)}
+    assert got == set(range(9, 17))
+    for c in got:  # the kept part is never a complete sentence: the last word (42) and the mark both go
+        ids = T.cut_frame_targets(t, c).ctc_ids.tolist()
+        assert MARK not in ids and 42 not in ids and ids == t.ctc_ids.tolist()[:len(ids)]
+    assert {T.truncate_cut(t, rng, 0.3, 0.0, P, pause_p=1.0) for _ in range(300)} == set(range(10, 16))
+    mixed = [T.truncate_cut(t, rng, 0.3, 0.0, P, pause_p=0.5) for _ in range(2000)]
+    # half from the pause frames, half uniform over all 8 (6 of them in a pause): 0.5 + 0.5 x 6/8 = 0.875
+    assert set(mixed) == set(range(9, 17)) and 0.83 < np.mean([c in range(10, 16) for c in mixed]) < 0.92
+    assert {T.truncate_cut(t, rng, 0.0, 1.0, P) for _ in range(200)} == set(range(13, 17))  # 1 s = 12.5 -> 13 frames
+    assert T.truncate_cut(t, rng, 0.9, 0.0, P) is None  # lo 27: no word starts that late
+    assert T.truncate_cut(ft([BLANK] * 30), rng, 0.0, 0.0, P) is None
+    assert T.truncate_cut(ft([40] + [BLANK] * 20), rng, 0.0, 0.0, P) is None  # the last word starts at frame 0
+    # a joined row of two sentences (the second piece at frame 10): never in the first one's pause before its mark
+    # (4-8: the first sentence would stay complete without its mark), but after its mark (9-11, the first sentence
+    # complete WITH its mark, the second one cut) and inside the second one, before its last word (12-14)
+    a = ft([BLANK, 50, BLANK, 51, BLANK, BLANK, BLANK, BLANK, MARK, BLANK], seed=6)
+    b = ft([BLANK, 52, BLANK, BLANK, 53, BLANK, MARK], seed=7)
+    j = T.join_frame_targets([a, b])
+    assert T.truncate_frames(j, 0.0, 0.0, P).tolist() == [1, 2, 3, 9, 10, 11, 12, 13, 14]
+    for c in (9, 10, 11):
+        assert T.cut_frame_targets(j, c).ctc_ids.tolist() == [50, 51, MARK]
 
 
 def test_concat_group_size():
@@ -339,7 +366,7 @@ def test_every_row_keeps_its_frames(env):
     store = env["store"]
     pos = {u.id: i for i, u in enumerate(store.utts)}
     ds = T.FrameBatchDataset(store, augment=T.Augment(seed=1, truncate_p=0.5, truncate_min_s=0.3, concat_p=0.7,
-                                                       concat_max_s=2.5, mix_p=0.5))
+                                                       concat_max_s=2.5, mix_p=0.5, punct_ids=(MARK,)))
     seen = dict(truncated=0, mixed=0, concat_groups=0, rows=0, utts=0, concat_utts=0)
     for idx in micro_batches(store, micro_s=4.0):
         mb = ds[idx]
@@ -364,11 +391,11 @@ def test_every_row_keeps_its_frames(env):
 
 def test_truncate_keeps_the_frames_before_its_cut(env):
     """truncate alone (p 1): a cut row's audio is the row's first 1280 x c samples and its targets the row's first c
-    frames, bit for bit; c lies before the start of the row's final token, so its CTC path is a strict prefix of the
-    row's, without the final token; a row too short to cut stays whole."""
+    frames, bit for bit; c is one of truncate_frames, so its CTC path is a strict prefix of the row's whose next token
+    (the first one the cut removed) is a word, never the mark; a row with nothing to cut stays whole."""
     store = env["store"]
     plain = T.dataset_for(store)
-    a = T.Augment(seed=2, truncate_p=1.0, truncate_min_frac=0.3, truncate_min_s=0.3)
+    a = T.Augment(seed=2, truncate_p=1.0, truncate_min_frac=0.3, truncate_min_s=0.3, punct_ids=(MARK,))
     ds = plain.with_augment(a)
     n_cut = 0
     for idx in micro_batches(store)[:20]:
@@ -377,22 +404,22 @@ def test_truncate_keeps_the_frames_before_its_cut(env):
         cut = 0
         for b, i in enumerate(idx):
             T0, c = int(p["n_frames"][b]), int(g["n_frames"][b])
-            e = T.last_token_start(store.targets(i))
-            lo = max(math.ceil(0.3 * T0 - 1e-9), math.ceil(0.3 * 12.5 - 1e-9), 1)
-            if c == T0:  # p 1: only a row with nothing to cut stays whole (no token, or its final one starts early)
-                assert e is None or lo >= e
+            cand = T.truncate_frames(store.targets(i), 0.3, 0.3, (MARK,))
+            if c == T0:  # p 1: only a row with nothing to cut stays whole (no word token starting late enough)
+                assert not len(cand)
                 n = int(p["lengths"][b])
                 assert int(g["lengths"][b]) == n and torch.equal(g["wave"][b, :n], p["wave"][b, :n])
                 assert row_ids(g, b) == row_ids(p, b) and float(g["durations"][b]) == float(p["durations"][b])
                 continue
             cut += 1
-            assert lo <= c < e and int(g["lengths"][b]) == FS * c
+            assert c in set(cand.tolist()) and int(g["lengths"][b]) == FS * c
             assert torch.equal(g["wave"][b, :FS * c], p["wave"][b, :FS * c]) and not g["wave"][b, FS * c:].any()
             for k in ("blank_lp", "dense_mask", "topk_idx", "topk_lp", "frame_mask"):
                 assert torch.equal(g[k][b, :c], p[k][b, :c]), k
             assert not g["frame_mask"][b, c:].any() and not g["dense_mask"][b, c:].any()
             ids, full_ids = row_ids(g, b), row_ids(p, b)
-            assert len(ids) < len(full_ids) and ids == full_ids[:len(ids)]  # the final token is gone
+            assert len(ids) < len(full_ids) and ids == full_ids[:len(ids)]  # a prefix: the final token is gone
+            assert full_ids[len(ids)] != MARK  # and the first token the cut removed is a word, not only the mark
             assert float(g["durations"][b]) == pytest.approx(c * 0.08)
         assert g["aug"]["truncated"] == cut
         n_cut += cut
@@ -481,7 +508,8 @@ def test_same_index_list_same_batch(env):
     """The augmentation of a micro-batch is a function of (seed, its index list): the same list gives the same batch
     from another dataset object (a worker's unpickled copy), another seed or another order of the list another."""
     store = env["store"]
-    a = T.Augment(seed=6, truncate_p=0.5, truncate_min_s=0.3, concat_p=0.5, concat_max_s=2.6, mix_p=0.5)
+    a = T.Augment(seed=6, truncate_p=0.5, truncate_min_s=0.3, concat_p=0.5, concat_max_s=2.6, mix_p=0.5,
+                  punct_ids=(MARK,))
     ds = T.dataset_for(store, augment=a)
     other = pickle.loads(pickle.dumps(ds))
     assert other.augment == a and other._mm is None
@@ -504,8 +532,8 @@ def test_validate_the_augment_block():
     RESUME_FIXED keys."""
     m = load_script("04_distill")
     assert m.DEFAULTS["augment"] == {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3,
-                                     "truncate_min_s": 1.0, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4,
-                                     "mix_p": 0.0, "mix_snr_db": [5.0, 20.0]}
+                                     "truncate_min_s": 1.0, "truncate_pause_p": 0.5, "concat_p": 0.0,
+                                     "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0, "mix_snr_db": [5.0, 20.0]}
     assert not m.augment_on(m.load_config(None, [])) and not m.augment_on({})
     ctc = ["family=ctc", "parakeet_root=po"]
     assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.mix_p=0.5"]))
@@ -514,6 +542,7 @@ def test_validate_the_augment_block():
                        (["augment.truncate_p=1.5"], "augment.truncate_p"),
                        (["augment.concat_p=-0.1"], "augment.concat_p"),
                        (["augment.mix_p=x"], "augment.mix_p"), (["augment.truncate_min_frac=1"], "truncate_min_frac"),
+                       (["augment.truncate_pause_p=2"], "augment.truncate_pause_p"),
                        (["augment.truncate_min_s=-1"], "truncate_min_s"), (["augment.concat_max_s=0"], "concat_max_s"),
                        (["augment.concat_max_n=1"], "concat_max_n"), (["augment.concat_max_n=2.0"], "concat_max_n"),
                        (["augment.mix_snr_db=[20, 5]"], "mix_snr_db"), (["augment.mix_snr_db=[-5, 5]"], "mix_snr_db"),
@@ -582,6 +611,7 @@ def test_a_ctc_run_with_every_augmentation(env, aug_run):
     assert aug["concat_max_s"] == pytest.approx(longest) and aug["concat_max_s_clamped"] is True
     assert aug["concat_max_s_config"] == 28.0 and aug["longest_train_s"] == pytest.approx(longest, abs=1e-3)
     assert aug["seed"] == 1234 and aug["concat_p"] == 1.0 and aug["mix_snr_db"] == [5.0, 20.0]
+    assert aug["punct_ids"] == {"1": "。"} and aug["truncate_pause_p"] == 0.5  # the tiny tokenizer's only mark
     smoke = {e["kind"]: e for e in evs if e["kind"].startswith("smoke_")}
     assert smoke["smoke_padded_row"]["ok"] and smoke["smoke_longest_fwd_bwd"]["ok"]
     assert smoke["smoke_steps"]["steps"] == 3 and smoke["smoke_steps"]["dropped"] == 0
@@ -593,7 +623,9 @@ def test_a_ctc_run_with_every_augmentation(env, aug_run):
     assert {"aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac", "aug/masked_frac"} <= tags
     utts = utts_of(run)
     joined = utts[utts["id"].str.contains("+", regex=False)]
-    assert len(joined) and (joined["n_tok"] > 0).all()
+    # a joined row's per-utterance record (none when every joined row of this tiny run - about one - was cut inside its
+    # first piece: a cut row keeps only the pieces that start before its cut; the dataset tests cover joined ids)
+    assert (joined["n_tok"] > 0).all()
     ids = {u.id for u in env["store"].utts}
     assert all(x in ids for r in utts["id"] for x in r.split("+"))
     assert json.loads((run / "summary.json").read_text(encoding="utf-8"))["status"] == "complete"

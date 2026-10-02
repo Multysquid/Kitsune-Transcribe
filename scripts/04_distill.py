@@ -331,9 +331,11 @@ utterance ending in a sentence mark, so the student puts 。 wherever its input 
 inside a long chunk), and it never saw two utterances or two voices in one input (ReazonSpeech 11.9 % CER per
 utterance, 33.7 % with 4 joined; crosstalk far below Whisper). The train loader's micro-batches (setup_augment: a copy
 of R.ds, R.train_ds, that make_loader pickles into its workers) are therefore joined (concat_p: all rows of a
-micro-batch into groups of k, the teacher frame targets concatenated, so real marks sit inside long rows), cut before
-their final token (truncate_p: audio and targets at the same frame - the targets came from the whole utterance, so the
-frames before the cut carry no final mark) and mixed with another row's speech 5-20 dB down (mix_p; the targets the
+micro-batch into groups of k, the teacher frame targets concatenated, so real marks sit inside long rows), cut inside
+a sentence (truncate_p: at a frame whose first removed token is a word - never a mark or comma, the student
+tokenizer's punct_token_ids -, half of them in a pause; audio and targets at the same frame - the targets came from the
+whole utterance, so the frames before the cut carry no final mark, and the kept part is never a complete sentence
+stripped of its mark) and mixed with another row's speech 5-20 dB down (mix_p; the targets the
 clean row's), in that order (kitsune.trainset's "augmentation" section). Memory: a joined micro-batch has rows / k rows
 of at most k x its longest row's frames, so its padded frames never exceed the planned micro-batch's, and setup_augment
 clamps concat_max_s to the longest train utterance (the `augment` event), so no joined row is longer than the one the
@@ -473,15 +475,19 @@ DEFAULTS = {
     # the CTC family's train-data augmentation (kitsune.trainset's "augmentation" section; the module docstring's
     # "Train-data augmentation"): the TRAIN loader's micro-batches only - never an eval, dev, probe, smoke check or the
     # memory probe. enabled false (the default) trains exactly as before. seed: null = the run's seed; every micro-batch
-    # draws from (seed, its index list) alone. truncate_p: per row, cut it before its final emitted token (the final
-    # sentence mark), at a frame >= truncate_min_frac of its frames and >= truncate_min_s seconds. concat_p: per
+    # draws from (seed, its index list) alone. truncate_p: per row, cut it at a frame >= truncate_min_frac of its
+    # frames and >= truncate_min_s seconds whose first removed token is a word (never a sentence mark or comma: the
+    # student tokenizer's, punct_token_ids), so the kept part ends inside a sentence and its targets carry no final mark;
+    # truncate_pause_p of the cuts land inside a pause (>= 320 ms of teacher blank), as a voice-detector chunk ends.
+    # concat_p: per
     # micro-batch, join all its rows into groups of k (a divisor of the row count, 2..concat_max_n, with k x the longest
     # row <= concat_max_s; the trainer clamps concat_max_s to the longest train utterance, an `augment` event). mix_p:
     # per row, add a segment of another row of the micro-batch at an SNR drawn from mix_snr_db ([low, high] dB below
     # the row, low >= 0), the targets the clean row's. A resume may change any of them (the step plan does not depend
     # on them; the change is in its `resume` event's overrides), a T/2 branch none (BRANCH_FREE)
     "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
-                "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0, "mix_snr_db": [5.0, 20.0]},
+                "truncate_pause_p": 0.5, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0,
+                "mix_snr_db": [5.0, 20.0]},
     # BatchNorm: mode "frozen" (eval mode, running stats fixed, affine trainable: the pruned students, whose BN holds
     # the teacher's statistics) or "train" (a student trained from scratch: BN trains, its running stats update, eval
     # and greedy decoding use them; gradient checkpointing is never turned on). momentum: null = the modules' own
@@ -948,7 +954,7 @@ def validate_augment(cfg: dict):
     seed = a["seed"]
     if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0):
         raise SystemExit(f"augment.seed must be null (the run's seed) or an int >= 0, got {seed!r}")
-    for key in ("truncate_p", "concat_p", "mix_p"):
+    for key in ("truncate_p", "truncate_pause_p", "concat_p", "mix_p"):
         if not (_number(a[key]) and 0 <= a[key] <= 1):
             raise SystemExit(f"augment.{key} must be a probability in [0, 1], got {a[key]!r}")
     if not (_number(a["truncate_min_frac"]) and 0 <= a["truncate_min_frac"] < 1):
@@ -2250,16 +2256,39 @@ def setup_augment(R: Run):
     seed = int(cfg["seed"]) if a["seed"] is None else int(a["seed"])
     longest = float(np.max(R.ds.duration)) if len(R.ds) else 0.0  # the stored durations, as the planner packs them
     used = min(float(a["concat_max_s"]), longest) if longest > 0 else float(a["concat_max_s"])
-    spec = trainset.Augment.from_config(a, seed=seed, concat_max_s=used)
+    punct = punct_token_ids(R.tokenizer)
+    if float(a["truncate_p"]) > 0 and not any(t in SENTENCE_MARKS for t in punct.values()):
+        raise SystemExit(f"augment.truncate_p {a['truncate_p']} needs the student tokenizer's sentence marks "
+                         f"({''.join(SENTENCE_MARKS)}) to keep every cut inside a sentence, and this tokenizer has none "
+                         f"(punctuation found: {punct})")
+    spec = trainset.Augment.from_config(a, seed=seed, concat_max_s=used, punct_ids=sorted(punct))
     R.log.event("augment", seed=seed, truncate_p=spec.truncate_p, truncate_min_frac=spec.truncate_min_frac,
-                truncate_min_s=spec.truncate_min_s, concat_p=spec.concat_p, concat_max_n=spec.concat_max_n,
-                concat_max_s=used, concat_max_s_config=float(a["concat_max_s"]), longest_train_s=round(longest, 3),
-                concat_max_s_clamped=used < float(a["concat_max_s"]), mix_p=spec.mix_p,
-                mix_snr_db=list(spec.mix_snr_db))
-    print(f"augment: truncate_p {spec.truncate_p:g}, concat_p {spec.concat_p:g} (k <= {spec.concat_max_n}, "
+                truncate_min_s=spec.truncate_min_s, truncate_pause_p=spec.truncate_pause_p,
+                punct_ids={str(i): t for i, t in sorted(punct.items())}, concat_p=spec.concat_p,
+                concat_max_n=spec.concat_max_n, concat_max_s=used, concat_max_s_config=float(a["concat_max_s"]),
+                longest_train_s=round(longest, 3), concat_max_s_clamped=used < float(a["concat_max_s"]),
+                mix_p=spec.mix_p, mix_snr_db=list(spec.mix_snr_db))
+    print(f"augment: truncate_p {spec.truncate_p:g} (pause cuts {spec.truncate_pause_p:g}, never removing only "
+          f"{''.join(punct.values()) or 'punctuation'}), concat_p {spec.concat_p:g} (k <= {spec.concat_max_n}, "
           f"<= {used:g} s{' = the longest train utterance' if used < float(a['concat_max_s']) else ''}), mix_p "
           f"{spec.mix_p:g} at {spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, seed {seed}", flush=True)
     return R.ds.with_augment(spec)
+
+
+# the text of the tokens truncate must never remove alone (punct_token_ids): sentence marks and commas, full- and
+# half-width (the Parakeet ja vocabulary has 。 ? ! and 、 - ids 1, 25, 27 and 8 in tokenizer.json f604c293...)
+SENTENCE_MARKS = ("。", "?", "!", "？", "！", ".", "．")
+PUNCT_TEXT = (*SENTENCE_MARKS, "、", ",", "，")
+
+
+def punct_token_ids(tokenizer) -> dict[int, str]:
+    """{token id: its text} of the vocabulary's punctuation tokens (PUNCT_TEXT, with the word-boundary marker "▁"
+    stripped): the tokens augment's truncate never removes alone, so that a cut never keeps a complete sentence without
+    its mark (kitsune.trainset.truncate_frames). Read from the student's own tokenizer, so a vocabulary with other ids
+    (the tests' tiny one has only 。, at id 1) gets its own; the `augment` event records them."""
+    vocab = tokenizer.get_vocab()
+    return {int(i): t.replace("▁", "") for t, i in vocab.items()
+            if t.replace("▁", "") and t.replace("▁", "") in PUNCT_TEXT}
 
 
 def batch_utts(mb: dict) -> int:
