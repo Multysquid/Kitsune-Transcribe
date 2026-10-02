@@ -1033,3 +1033,66 @@ def test_real_study_results(tmp_path):
             assert rep["systems"][s]["sets"][k]["cer"] == pytest.approx(v["sets"][k]["cer"], rel=1e-12)
     assert len(rep["speed_groups"]["groups"]) == 1
     assert next(c for c in rep["checks"] if c["rule"] == "speed_ids")["status"] == "pass"
+
+
+def test_earlier_keeps_the_4_epoch_p01_next_to_its_continuation(world, tmp_path, capsys):
+    """DECISIONS G4: P-0.1B's continuation writes runs/m4-<rid>-r1 next to box 1's runs/m4-<rid>; both are study.json
+    system full-p01. Without --earlier the -r1 readout supersedes the 4-epoch one (newest) and the report warns. With
+    --earlier full-p01-e4=<its dir>@<rev> both are rows: the earlier one role full_earlier (P-0.1B full, 4 epochs,
+    runs-repo <rev>), in vs_teacher and vs_study, compared with the final run (vs_final: final / earlier, paired,
+    k 0), its speed its study weights' (S1), never offered or charted, its dir left out of the --readouts dedupe, and
+    report.json's earlier block names it with its revision."""
+    t, ids, refs = world["T"], world["ids"], world["refs"]
+    rid, rev = "full-p01-20261001T184145Z", "c4604304db76e068df7bbe39d00d006b74d6c134"
+    pull = tmp_path / "runs"
+    e4 = text_table(ids, refs, noisy(refs, 0.11, 60))
+    e8 = text_table(ids, refs, noisy(refs, 0.10, 61))
+    write_readout(pull, f"m4-{rid}", "full-p01", e4, family="ctc", time_utc="2026-10-02T03:50:00+00:00")
+    write_readout(pull, f"m4-{rid}-r1", "full-p01", e8, family="ctc", time_utc="2026-10-04T01:00:00+00:00")
+    write_tables(tmp_path / "tables", {k: t[k] for k in ("study-p01", "parakeet-ctc", "cohere")})
+    sp = write_speed(tmp_path / "speed-smoke-b-20261003T000000Z" / "speed.json", world["sp_ids"],
+                     {"study-p01": srec(0.0002), "parakeet-ctc": srec(0.0005)})
+    base = ["--manifest", world["man"], "--prereg", "none", "--tables", tmp_path / "tables", "--readouts", pull,
+            "--speed", sp, "--boot-b", 200]
+    rc, rep = run(base, tmp_path / "out0")
+    err = capsys.readouterr().err
+    assert rc == 0 and Path(rep["inputs"]["readouts_read"]["full-p01"]).name == f"m4-{rid}-r1"
+    (w,) = rep["warnings"]
+    assert w.startswith(f"full-p01: the continuation's readout m4-{rid}-r1 superseded m4-{rid}") and "--earlier" in w
+    assert "WARNING: full-p01: the continuation's readout" in err and rep["earlier"] == {}
+
+    rc, rep = run([*base, "--earlier", f"full-p01-e4={pull / f'm4-{rid}'}@{rev}"], tmp_path / "out1")
+    assert rc == 0 and rep["warnings"] == []
+    sysd, comp = rep["systems"], rep["comparisons"]
+    assert Path(rep["inputs"]["readouts_read"]["full-p01"]).name == f"m4-{rid}-r1"
+    assert Path(rep["inputs"]["readouts_read"]["full-p01-e4"]).name == f"m4-{rid}"
+    assert not any(Path(x["dir"]).name == f"m4-{rid}" for x in rep["inputs"]["readouts_superseded"])
+    v = sysd["full-p01-e4"]
+    assert (v["role"], v["family"], v["teacher"], v["base"], v["display"]) == (
+        "full_earlier", "ctc", "parakeet-ctc", "full-p01", "P-0.1B full, 4 epochs (runs-repo c4604304)")
+
+    def m4(df):
+        return np.mean([hand_cer(df, s) for s in ("eval_jsut", "eval_cv8", "eval_reazon")]
+                       + [hand_cer(df, "galgame", world["manifest"]["galgame_views"]["neutral"])])
+
+    assert v["metrics"]["m4"] == pytest.approx(m4(e4)) and sysd["full-p01"]["metrics"]["m4"] == pytest.approx(m4(e8))
+    assert v["speed"]["source"] == "study-p01" and "S1" in v["flags"] and "R1" in v["flags"]
+    assert "full-p01-e4" in comp["vs_teacher"] and "full-p01-e4" in comp["vs_study"]
+    c = comp["vs_final"]["full-p01-e4"]["m4"]
+    assert (c["a"], c["b"], c["n_noisy"]) == ("full-p01", "full-p01-e4", 0)
+    assert c["ratio"] == pytest.approx(m4(e8) / m4(e4))
+    assert "full-p01-e4" not in {r["system"] for r in rep["offer"]["rows"]} and "full-p01" in {
+        r["system"] for r in rep["offer"]["rows"]}
+    assert "full-p01-e4" not in {p["system"] for p in rep["chart"]["points"]}
+    assert rep["earlier"] == {"full-p01-e4": {"run": "full-p01", "epochs": 4, "dir": str(pull / f"m4-{rid}"),
+                                             "revision": rev, "study_system": "full-p01",
+                                             "time_utc": "2026-10-02T03:50:00+00:00"}}
+    md = (tmp_path / "out1" / "report.md").read_text(encoding="utf-8")
+    assert "### Continued runs" in md and "P-0.1B full, 4 epochs (runs-repo c4604304)" in md
+    # refusals: a NAME that is not <full run>-e<N>, a missing dir, a bad revision, a dir holding another run
+    for bad, want in ((f"p01-e4={pull / f'm4-{rid}'}", "NAME=DIR[@REV]"),
+                      (f"full-p01-e4={tmp_path / 'nowhere'}", "is not a directory"),
+                      (f"full-p01-e4={pull / f'm4-{rid}'}@main", "not a runs-repo revision"),
+                      (f"full-p03-e3={pull / f'm4-{rid}'}", "not one readout of full-p03")):
+        rc, _ = run([*base, "--earlier", bad], tmp_path / "bad")
+        assert rc == 2 and want in capsys.readouterr().err, bad

@@ -51,6 +51,14 @@ Inputs (lean pulls of the runs repo; no weights are read)
   --machine-of NAME=ID ...  the machine of the records in the speed dir NAME (speed-<box>-<stamp>) or of the container
                          host NAME (versions.host), for a file no summary covers (a box launched again elsewhere
                          replaces its summary)
+  --earlier NAME=DIR[@REV] ...  an earlier readout of a full run that a continuation went on from (DECISIONS G4:
+                         P-0.1B's 4 epochs, runs-repo c4604304, before its continuation to 8): NAME = full-<x>-e<epochs>
+                         (full-p01-e4), DIR its 05 --out dir (runs/m4-<run_id>, pulled at REV), REV the runs-repo
+                         revision it is cited at. Its study.json is read as system NAME, role full_earlier: listed in
+                         study -> full and vs_teacher, compared with the final run (vs_final: final / earlier, the same
+                         run continued, k = 0), never offered or charted; its dir is left out of the --readouts search
+                         (no dedupe against the final readout). report.json's `earlier` block names it with REV. A full
+                         run whose -r<N> readout superseded an older one without --earlier gets a warning.
   --run-summaries DIR ... the trainer's runs roots (tools/study_report.load_summaries): steps, epochs, stopped_early,
                          early_stop_trigger, end_reason, resume_resets of the full and study runs
   --params FILE          {system: params_total} (the study's params.json); kitsune.study_stats.PARAMS_TOTAL, a
@@ -63,7 +71,8 @@ Inputs (lean pulls of the runs repo; no weights are read)
   --boot-b N, --seed N   the paired bootstrap (default 10,000 replicates, seed 1234: the study's)
 
 Systems and roles (never kitsune.study_stats.is_trained/family_of, which only know "study-" names): teacher (cohere,
-parakeet-ctc, parakeet-tdt: fixed models), full (FULL_RUNS), study (the study's students and controls), quant (a
+parakeet-ctc, parakeet-tdt: fixed models), full (FULL_RUNS), full_earlier (--earlier: <full run>-e<N>), study (the
+study's students and controls), quant (a
 study.json with a quant block; its base is quant.base_system and its format quant.format, never parsed from the
 name), whisper (family "whisper", or a WHISPER_SYSTEMS key), anchor / half / other (listed, never offered).
 
@@ -155,6 +164,10 @@ sr = _load_tool("study_report")
 FULL_RUNS = {"full-t06": ("study-t06", "aed", "T-0.6B"), "full-p03": ("study-p03", "ctc", "P-0.3B"),
              "full-p01": ("study-p01", "ctc", "P-0.1B"), "full-p005": ("study-p005", "ctc", "P-0.05B")}
 STUDY_TO_FULL = {v[0]: k for k, v in FULL_RUNS.items()}
+# --earlier's NAME: <full run>-e<epochs> (DECISIONS G4: full-p01-e4, P-0.1B's 4 epochs before its continuation)
+EARLIER_RE = re.compile(r"^(?P<run>full-[a-z0-9]+)-e(?P<epochs>[1-9][0-9]*)$")
+REV_RE = re.compile(r"^[0-9a-f]{7,40}$")
+RN_DIR_RE = re.compile(r"-r(?P<n>\d+)$")  # runs/m4-<run_id>-r<N>: a continuation's readout (kitsune.full_queue)
 # kitsune.quant.QUANT_FORMATS (CONTRACT.md 1.1; a test compares them when kitsune.quant is importable)
 QUANT_FORMATS = ("fp16", "int8-w8a16", "int8-w8a8", "nvfp4-w4a16", "nvfp4-w4a4", "mxfp4-w4a4", "fp8-w8a8")
 # kitsune.quant.RECIPE_VERSION (a test compares them): a quant readout or a quantised speed record below it was made by
@@ -401,15 +414,19 @@ def _old_quant_recipe(q) -> str | None:
     return None
 
 
-def load_readouts(dirs, man: ss.Manifest) -> tuple[dict, dict]:
-    """(system -> readout dict, notes) from every study.json under the --readouts dirs (module docstring)."""
+def load_readouts(dirs, man: ss.Manifest, exclude=()) -> tuple[dict, dict]:
+    """(system -> readout dict, notes) from every study.json under the --readouts dirs (module docstring), none under
+    an `exclude` dir (the --earlier dirs)."""
     found: dict[str, list[dict]] = {}
     notes = dict(read={}, superseded=[], ignored=[], refused_sets=[])
+    ex = [Path(x).resolve() for x in exclude]
     for d in dirs or []:
         d = Path(d)
         if not d.is_dir():
             raise InputError(f"--readouts {d}: not a directory")
         for f in sorted(d.rglob("study.json")):
+            if any(f.resolve().is_relative_to(x) for x in ex):
+                continue
             rec = read_json(f)
             system = rec.get("system") if isinstance(rec, dict) else None
             if not isinstance(system, str) or not system:
@@ -487,6 +504,10 @@ def classify(system: str, ro: dict | None) -> dict:
         _, fam, label = FULL_RUNS[system]
         return dict(role="full", family=fam, base=None, format="bf16", trained=True, teacher=TEACHER_OF[fam],
                     simulated=False, display=f"{label} full")
+    if (m := EARLIER_RE.match(system)) and m["run"] in FULL_RUNS:  # --earlier: base = the final run it went on to
+        _, fam, label = FULL_RUNS[m["run"]]
+        return dict(role="full_earlier", family=fam, base=m["run"], format="bf16", trained=True,
+                    teacher=TEACHER_OF[fam], simulated=False, display=f"{label} full, {m['epochs']} epochs")
     b = ss.base_run(system)
     role = ("half" if system.endswith(ss.HALF) else "study" if b in ss.RUNS else "anchor" if b == ss.ANCHOR
             else "other")
@@ -501,6 +522,8 @@ def study_of(system: str, inf: dict) -> str | None:
     full-x@fmt -> study-x@fmt; None for everything else."""
     if inf["role"] == "full":
         return FULL_RUNS[system][0]
+    if inf["role"] == "full_earlier":
+        return FULL_RUNS[inf["base"]][0]
     if inf["role"] == "quant" and inf["base"] in FULL_RUNS and inf["format"]:
         return f"{FULL_RUNS[inf['base']][0]}@{inf['format']}"
     return None
@@ -993,7 +1016,7 @@ def resolve_speed(system: str, inf: dict, sp: dict, drift: dict | None) -> dict:
         out["drift"] = drift
         # the re-time pair is bf16 only (decision 22): a variant of full-t06 decodes the full-data weights' tokens
         # too, so it takes the same bf16 ratio, and a variant and its bf16 row stay on one basis (x bf16 speed, joins)
-        full = system if inf["role"] == "full" else inf["base"]
+        full = system if inf["role"] == "full" else inf["base"]  # quant, full_earlier: the run they belong to
         stu = FULL_RUNS[full][0] if full in FULL_RUNS else None
         pair = retime_pair(sp, full, stu) if stu else None
         if pair and g == prim:
@@ -1061,6 +1084,8 @@ def _params(system: str, inf: dict, params: dict, ro: dict | None, speed: dict |
         return int(p[system])
     if inf["role"] == "full" and FULL_RUNS[system][0] in p:
         return int(p[FULL_RUNS[system][0]])
+    if inf["role"] == "full_earlier" and FULL_RUNS[inf["base"]][0] in p:
+        return int(p[FULL_RUNS[inf["base"]][0]])
     if inf["role"] == "quant" and isinstance(inf.get("base"), str):
         b = inf["base"]
         return _params(b, info.get(b) or classify(b, None), params, None, None, info)
@@ -1089,6 +1114,46 @@ def load_all_summaries(dirs) -> tuple[dict, dict]:
     return out, notes
 
 
+def parse_earlier(specs) -> dict[str, dict]:
+    """--earlier NAME=DIR[@REV] -> {NAME: {run, epochs, dir, revision}}. InputError on a NAME that is not
+    <full run>-e<epochs>, a missing DIR, a REV that is not 7-40 hex digits, or a NAME given twice."""
+    out = {}
+    for spec in specs or []:
+        name, eq, rest = str(spec).partition("=")
+        m = EARLIER_RE.match(name)
+        if not eq or not m or m["run"] not in FULL_RUNS:
+            raise InputError(f"--earlier {spec!r}: NAME=DIR[@REV] with NAME <full run>-e<epochs> (e.g. full-p01-e4; "
+                             f"runs {', '.join(FULL_RUNS)})")
+        d, rev = rest, None
+        if "@" in rest and REV_RE.match(rest.rsplit("@", 1)[1]):
+            d, rev = rest.rsplit("@", 1)
+        elif "@" in rest:
+            raise InputError(f"--earlier {spec!r}: @{rest.rsplit('@', 1)[1]} is not a runs-repo revision (hex)")
+        if not Path(d).is_dir():
+            raise InputError(f"--earlier {name}: {d} is not a directory")
+        if name in out:
+            raise InputError(f"--earlier {name} given twice")
+        out[name] = dict(run=m["run"], epochs=int(m["epochs"]), dir=str(Path(d)), revision=rev)
+    return out
+
+
+def superseded_warnings(ro_notes: dict, readouts: dict, earlier: dict) -> list[str]:
+    """A full run whose readout is a continuation's (runs/m4-<run_id>-r<N>) that superseded an older readout of it,
+    without an --earlier of that run: the earlier result drops out of the report silently otherwise."""
+    out = []
+    for x in ro_notes["superseded"]:
+        s = x.get("system")
+        kept = (readouts.get(s) or {}).get("dir")
+        if s not in FULL_RUNS or not kept or not RN_DIR_RE.search(Path(kept).name):
+            continue
+        if any(e["run"] == s for e in earlier.values()):
+            continue
+        out.append(f"{s}: the continuation's readout {Path(kept).name} superseded {Path(x['dir']).name}; to keep the "
+                   f"earlier run in the report, pass --earlier {s}-e<epochs>={x['dir']}@<runs-repo revision> "
+                   f"(DECISIONS G4: full-p01-e4 at c4604304)")
+    return out
+
+
 def build_report(args) -> dict:
     man_obj = read_json(args.manifest)
     man = ss.parse_manifest(man_obj)
@@ -1112,7 +1177,19 @@ def build_report(args) -> dict:
             if name in tables:
                 raise InputError(f"--tables: system {name} is in {tables_from[name]} and in {d}")
             tables[name], tables_from[name] = df, str(d)
-    readouts, ro_notes = load_readouts(args.readouts, man)
+    earlier = parse_earlier(getattr(args, "earlier", None))
+    readouts, ro_notes = load_readouts(args.readouts, man, exclude=[e["dir"] for e in earlier.values()])
+    warnings = superseded_warnings(ro_notes, readouts, earlier)
+    for name, e in earlier.items():
+        found, notes_e = load_readouts([e["dir"]], man)
+        hits = [r for r in found.values() if r["system"] == e["run"]]
+        if len(found) != 1 or not hits:
+            raise InputError(f"--earlier {name}={e['dir']}: holds {sorted(found) or 'no readout'}, not one readout "
+                             f"of {e['run']}")
+        ro = dict(hits[0], system=name)
+        e["study_system"], e["time_utc"] = ro["study"].get("system"), ro["time_utc"]
+        ro_notes["read"][name] = ro["dir"]
+        readouts[name] = ro
     for name in sorted(readouts):
         if name in tables:
             ro_notes["superseded"].append(dict(system=name, dir=readouts[name]["dir"],
@@ -1163,7 +1240,7 @@ def build_report(args) -> dict:
         flags = []
         if inf["role"] == "whisper":
             flags += ["W1", "W2", "W3", "W4", "W5", "W6"] if s == KOTOBA else ["W1", "W3", "W4", "W5", "W6"]
-        if inf["role"] in ("full", "study", "quant", "half", "anchor") or s.startswith("parakeet"):
+        if inf["role"] in ("full", "full_earlier", "study", "quant", "half", "anchor") or s.startswith("parakeet"):
             flags.append("R1")
         flags += [f for f in speed["flags"] if f not in flags]
         fb = (q or {}).get("fp32_fallbacks")
@@ -1174,6 +1251,8 @@ def build_report(args) -> dict:
             flags.append("K1")
         if summ and summ.get("stopped_early"):
             flags.append("E1")
+        if s in earlier and earlier[s]["revision"]:
+            inf = dict(inf, display=f"{inf['display']} (runs-repo {earlier[s]['revision'][:8]})")
         systems[s] = dict(
             display=inf["display"], role=inf["role"], family=inf["family"], teacher=inf["teacher"],
             trained=inf["trained"], base=inf["base"], format=inf["format"], simulated=inf["simulated"],
@@ -1186,13 +1265,17 @@ def build_report(args) -> dict:
                                                                "early_stop_trigger", "end_reason", "resume_resets")},
             flags=flags)
 
-    comparisons = dict(vs_teacher={}, vs_study={}, vs_bf16={})
+    comparisons = dict(vs_teacher={}, vs_study={}, vs_bf16={}, vs_final={})
     for s, v in systems.items():
         t = v["teacher"]
         if v["trained"] and t and t in systems:
             comparisons["vs_teacher"][s] = {m: st.compare(s, t, m, 1) for m in COMPARE_METRICS}
-        if v["role"] == "full" and FULL_RUNS[s][0] in systems:
-            comparisons["vs_study"][s] = {m: st.compare(s, FULL_RUNS[s][0], m, 2) for m in COMPARE_METRICS}
+        run = s if v["role"] == "full" else v["base"] if v["role"] == "full_earlier" else None
+        if run and FULL_RUNS[run][0] in systems:
+            comparisons["vs_study"][s] = {m: st.compare(s, FULL_RUNS[run][0], m, 2) for m in COMPARE_METRICS}
+        if v["role"] == "full_earlier" and v["base"] in systems:
+            # the final run / its earlier state, paired: the same run continued, so only the bootstrap (k = 0)
+            comparisons["vs_final"][s] = {m: st.compare(v["base"], s, m, 0) for m in COMPARE_METRICS}
         if v["role"] == "quant" and v["base"] in systems:
             c = {m: st.compare(s, v["base"], m, 0) for m in COMPARE_METRICS}
             kb, kv = systems[v["base"]]["kl"], v["kl"]
@@ -1220,6 +1303,9 @@ def build_report(args) -> dict:
                                                          "chart_points.json", "chart_points.csv"])
     rep["speed_probes"] = speed_probes(rep, sp, qs)
     rep["flags_legend"] = FLAGS
+    rep["earlier"] = {n: {k: e[k] for k in ("run", "epochs", "dir", "revision", "study_system", "time_utc")}
+                      for n, e in earlier.items()}
+    rep["warnings"] = warnings
     rep["checks"] = checks(rep, readouts, sp, man_sha)
     expected = [*FULL_RUNS, *ss.TEACHERS]
     rep["missing_systems"] = [s for s in expected if s not in systems]
@@ -1771,7 +1857,7 @@ def render_md(rep: dict) -> str:
         rows = []
         for s, c in vs.items():
             run = sysd[s]["run"] or {}
-            stu = FULL_RUNS[s][0]
+            stu = FULL_RUNS[s if sysd[s]["role"] == "full" else sysd[s]["base"]][0]
             rows.append([sysd[s]["display"], pct(sysd[stu]["metrics"]["m4"]), pct(sysd[s]["metrics"]["m4"]),
                          _mci(c["m4"], 3), (c["m4"] or {}).get("verdict", "n/a"), _mci(c["m4_all"], 3),
                          run.get("steps", "n/a"),
@@ -1780,6 +1866,22 @@ def render_md(rep: dict) -> str:
                          run.get("end_reason") or "n/a", run.get("resume_resets") or 0])
         L += sr.table(["model", "study M4", "full M4", "full / study M4 [CI]", "verdict", "M4-all ratio [CI]",
                        "steps", "epochs", "early stop (trigger)", "end reason", "resets"], rows) + [""]
+    vf = comp.get("vs_final") or {}
+    if vf:
+        L += ["### Continued runs", "",
+              "A full run continued past an earlier end (--earlier; DECISIONS G4): the final run / its earlier state "
+              "(k = 0: the same run continued, only the bootstrap). The earlier row is never offered or charted.", ""]
+        rows = []
+        for s, c in vf.items():
+            v = sysd[s]
+            e = (rep.get("earlier") or {}).get(s) or {}
+            rows.append([sysd[v["base"]]["display"], v["display"], pct(v["metrics"]["m4"]),
+                         pct(sysd[v["base"]]["metrics"]["m4"]), _mci(c["m4"], 3), (c["m4"] or {}).get("verdict", "n/a"),
+                         _mci(c["m4_all"], 3), e.get("revision") or "n/a"])
+        L += sr.table(["final run", "earlier", "earlier M4", "final M4", "final / earlier M4 [CI]", "verdict",
+                       "M4-all ratio [CI]", "earlier at runs-repo"], rows) + [""]
+    for w in rep.get("warnings") or []:
+        L += [f"WARNING: {w}", ""]
 
     vb = comp["vs_bf16"]
     if vb:
@@ -1956,6 +2058,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--machine-of", nargs="+", metavar="NAME=ID",
                     help="the machine of the records in speed dir NAME (speed-<box>-<stamp>) or of container host "
                          "NAME, where no queue summary says it")
+    ap.add_argument("--earlier", nargs="+", metavar="NAME=DIR[@REV]",
+                    help="an earlier readout of a full run a continuation went on from: NAME <full run>-e<epochs> "
+                         "(full-p01-e4), DIR its readout dir, REV the runs-repo revision it is cited at (repeatable)")
     ap.add_argument("--run-summaries", type=Path, nargs="+", help="the trainer's runs root(s)")
     ap.add_argument("--params", type=Path, help="{system: params_total} (the study's params.json)")
     ap.add_argument("--kotoba-jsonl", type=Path, help="Kotoba's stored Galgame judge file (decision 29; optional)")
@@ -1979,6 +2084,8 @@ def main(argv=None) -> int:
         print(f"REFUSED: {e}", file=sys.stderr)
         return 2
     write_outputs(rep, args.out)
+    for w in rep.get("warnings") or []:
+        print(f"WARNING: {w}", file=sys.stderr)
     n = sum(p["drawn"] for p in rep["chart"]["points"])
     print(f"{len(rep['systems'])} systems, {len(rep['offer']['rows'])} offer rows, {n} chart points; "
           f"wrote {args.out / 'report.md'} and report.json, offer.csv, the charts")
