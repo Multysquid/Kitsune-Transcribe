@@ -1,5 +1,5 @@
 {
- "_comment": "Box full's measured speeds (tools/make_full_configs.py --import-speed; never edited by hand): smoke: smoke A's verdict check 3 (median steady s/step per student at the full configs' batches); box1: box 1's measurement from tools/box1_go.py --json (null until box 1 ended: the hours are then provisional). make_full_configs.box2_hours projects box full's train items' max_hours and its est_hours / max_hours from it, and --check holds boxes.json to them.",
+ "_comment": "The full boxes' measured speeds (tools/make_full_configs.py --import-speed; never edited by hand): smoke: smoke A's verdict check 3 (median steady s/step per student at the full configs' batches); box1: box 1's measurement from tools/box1_go.py --json at the runs-repo revision of its 4-epoch record (null until box 1 ended: the hours are then provisional). make_full_configs.box_hours projects the HOURS_BOXES' train items' max_hours and their est_hours / max_hours from it, and --check holds boxes.json to them.",
  "smoke": {
   "source": "full/box-full-smoke/smoke_verdict.json",
   "sha": "14bfcadbc660394955d290ed5256d49398882d4a",
@@ -12,5 +12,28 @@
    "p005": 0.1792971519753337
   }
  },
- "box1": null
+ "box1": {
+  "source": "full/box-p01/queue_summary.json",
+  "sha": "7715f3f622096505d4d3cf9872c31f835edfa5d2",
+  "machine_id": "32513",
+  "container_id": "53711872",
+  "run_id": "full-p01-20261001T184145Z",
+  "steps": 107910,
+  "epochs": 4.0,
+  "sec_per_step": 0.281352277030237,
+  "smoke_sec_per_step": 0.2715486469678581,
+  "overhead": 0.0465,
+  "train_wall_h": 9.152,
+  "stores_ctc_h": 0.548,
+  "bootstrap_h": 3.09,
+  "rebuild_h": 3.072,
+  "host_mem_peak_gb": 28.819381713867188,
+  "peak_rss_gb": {
+   "full-p01": 164.342,
+   "m4-full-p01": 3.736,
+   "stores-ctc": 36.797
+  },
+  "m4": 0.11453038342858687,
+  "revision": "c4604304db76e068df7bbe39d00d006b74d6c134"
+ }
 }

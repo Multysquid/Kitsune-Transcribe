@@ -138,10 +138,12 @@ def test_go(tmp_path, capsys):
     assert (b["stores_ctc_h"], b["bootstrap_h"], b["rebuild_h"]) == (0.9, 3.0, 4.0)
     assert b["peak_rss_gb"] == {"stores-ctc": 36.8, "full-p01": 25.1, "m4-full-p01": 4.2}
     assert f"(smoke A {smoke}: r {b['sec_per_step'] / smoke:.3f})" in line(rec, "G4", "PASS")[0]
-    # the box-2 projection with box 1's measurement, and what boxes.json would change
+    # the projection of boxes full-t, full-p and p01 with box 1's measurement, and what boxes.json would change
     r = round(b["sec_per_step"] / smoke, 4)
-    assert f"box 2 with box 1's speed (r {r:g}, o {b['overhead']:g}): full-t06 " in printed
-    assert "boxes.json would change: boxes.full.items.full-t06: {'max_hours': 22.72}" in printed
+    for box, run_ in (("full-t", "full-t06"), ("full-p", "full-p03"), ("p01", "full-p01")):
+        assert f"box {box} with box 1's speed (r {r:g}, o {b['overhead']:g}): {run_} " in printed, box
+    assert "P-0.1B's 4 epochs by the same model " in printed and "vs measured" in printed
+    assert "boxes.json would change: boxes.full-t.items.full-t06: {'max_hours': 22.81}" in printed
 
 
 def test_the_json_round_trips_through_import_speed(tmp_path, capsys):
@@ -152,10 +154,11 @@ def test_the_json_round_trips_through_import_speed(tmp_path, capsys):
     M.import_speed(None, tmp_path / "go.json", out)
     speed = M.load_speed(out)
     assert speed["box1"] == rec["box1"] and speed["smoke"] == M.load_speed()["smoke"]
-    h = M.box2_hours(M.load_plan(), speed)
-    assert h["r"] == round(rec["box1"]["sec_per_step"] / speed["smoke"]["sec_per_step"]["p01"], 4)
-    assert h["o"] == rec["box1"]["overhead"]
-    assert h["stores_h"] == (1.35, round(1.35 * M.STORES_PESS, 2)) and h["setup_h"] == (1.6, 3.3)
+    for box in M.HOURS_BOXES:
+        h = M.box_hours(M.load_plan(), speed, box)
+        assert h["r"] == round(rec["box1"]["sec_per_step"] / speed["smoke"]["sec_per_step"]["p01"], 4)
+        assert h["o"] == rec["box1"]["overhead"]
+        assert h["store_h"] == (0.9, round(0.9 * M.STORES_PESS, 2)) and h["setup_h"] == (1.6, 3.3)
 
 
 @pytest.mark.parametrize("m4", [0.1390, 0.1382])
@@ -186,7 +189,7 @@ def test_a_running_box_is_not_decidable_and_projects_its_run(tmp_path, capsys):
     total = M.plan_total_steps("p01", M.load_plan())
     proj = (total * steady_median(600) * 1.08 + 837 + 40 * 8.5) / 3600
     assert partial.startswith(f"partial: step 600 of {total}; at this speed full-p01 runs ~{proj:.2f} h at o 0.08 "
-                              f"(its registry need 13.24 h)"), partial
+                              f"(its registry need 10.94 h)"), partial
 
 
 def test_too_few_dev_evals_are_no_go(tmp_path, capsys):
@@ -323,3 +326,30 @@ def test_the_hub_reader_tells_a_missing_file_from_an_unreachable_hub(tmp_path, c
     capsys.readouterr()
     fake.head_down = True
     assert G.main([]) == G.EXIT_HUB and "Hub unreachable" in capsys.readouterr().out
+
+
+def test_revision_pins_box_1s_reads_and_never_smoke_bs(tmp_path, capsys, monkeypatch):
+    """DECISIONS G4: --revision REV reads G1-G4 at that runs-repo commit (P-0.1B's continuation overwrites box p01's
+    records at the head) without resolving the head for them, and records it as box1.revision; G5, smoke-B's verdict,
+    still reads the head (a pinned G5 would hide a newer smoke-B)."""
+    rev = "c4604304db76e068df7bbe39d00d006b74d6c134"
+    hub = go_hub(tmp_path / "hub")
+    fake = FakeHfHub(hub)
+    fake.install(monkeypatch)
+    out = tmp_path / "go.json"
+    assert G.main(["--revision", rev, "--json", str(out)]) == G.EXIT_GO, capsys.readouterr().out
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert rec["box1"]["revision"] == rev
+    dl = [c for c in fake.calls if c[0] == "download"]
+    verdict = fullrun.box_verdict_path("smoke-b")
+    assert {c[2] for c in dl if c[1] != verdict} == {rev}
+    assert {c[2] for c in dl if c[1] == verdict} == {fake.sha}
+    assert fake.calls.count(("repo_info", G.RUNS_REPO)) == 1  # the head, for G5 only
+    # without --revision the head is recorded
+    fake.calls.clear()
+    assert G.main(["--json", str(out)]) == G.EXIT_GO
+    assert json.loads(out.read_text(encoding="utf-8"))["box1"]["revision"] == fake.sha
+    capsys.readouterr()
+    for bad in (["--revision", "c4604304"], ["--revision", rev, "--hub-dir", str(hub)]):
+        with pytest.raises(SystemExit):
+            G.main(bad)

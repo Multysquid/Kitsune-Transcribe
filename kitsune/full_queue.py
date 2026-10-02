@@ -1,8 +1,9 @@
 """The full-data runs' box queue: one registry box (kitsune/fullrun.py, configs/full/boxes.json) from its store builds
 to its last verified upload, on a shared GPU queue; plus the resume of a box on a new host.
 
-A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1, full = box 2, smoke-b) is the list of registry items of
-its spec, in registry order. FullQueue(study_queue.Queue) runs them with the study queue's process, state and upload
+A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1 and P-0.1B's continuation, full-t and full-p = box 2's two
+1x boxes, smoke-b; full = the retired 2x box 2, test fixtures only) is the list of registry items of its spec, in
+registry order. FullQueue(study_queue.Queue) runs them with the study queue's process, state and upload
 machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it never reads prereg.rules()["boxes"].
 
   items      stores (python -m kitsune.full_queue build-stores: the trainer's own train, eval and dev store builds,
@@ -70,15 +71,16 @@ synchronous child, bounded by its own budget and by box 1's fit, and box p01 run
 records every step, so a restart goes on where it stopped; the chain summary is at full/box-<chain>/queue_summary.json.
 `plan` prints the stages and their parts' items; `resume-pull` refuses a chain (exit 3; fullrun.chain_resume_hint).
 
-Resume on a new host (launch --resume / --resume-reset <run_id> / --resume-set <run_id>:schedule.epochs=<E>): bootstrap
-runs `resume-pull` before its paid rebuild. It reads the box's queue summary from the runs repo, pulls every started
-run's logs and its newest full state (the scratch repo's timed state or a runs-repo full state, whichever is newer,
-checked against the pointer's or the LFS sha256), and writes $KITSUNE_STATE/resume_plan.json. The queue adopts that
-plan only when it has no queue.json yet: done items stay done, started runs resume, the rest start fresh; a reset or
-set run gets `sets_once` (schedule.resume_reset=true and its sets), passed on every attempt until the run has logged
-its resume_reset and a full state after it. Its readout then writes runs/m4-<run_id>-r<N>, so the first one on the Hub
-stays. Exit 0 plan written, 3 refused (no summary, an unknown run id, a state that does not match its checksum, a
-set-only run that is past its cooldown: use --resume-reset), 1 anything transient (bootstrap retries it).
+Resume on a new host (launch --resume / --resume-reset <run_id> / --resume-set <run_id>:<key>=<int>, key schedule.epochs
+or early_stop.patience, fullrun.RESUME_SET_KEYS): bootstrap runs `resume-pull` before its paid rebuild. It reads the
+box's queue summary from the runs repo, pulls every started run's logs and its newest full state (the scratch repo's
+timed state or a runs-repo full state, whichever is newer, checked against the pointer's or the LFS sha256), and writes
+$KITSUNE_STATE/resume_plan.json. The queue adopts that plan only when it has no queue.json yet: done items stay done,
+started runs resume, the rest start fresh; a reset or set run gets `sets_once` (schedule.resume_reset=true and its
+sets), passed on every attempt until the run has logged its resume_reset and a full state after it. Its readout then
+writes runs/m4-<run_id>-r<N>, so the first one on the Hub stays. Exit 0 plan written, 3 refused (no summary, an unknown
+run id, a state that does not match its checksum, a set-only run that is past its cooldown: use --resume-reset), 1
+anything transient (bootstrap retries it).
   done       a train item is done when the box summary says so and its export checkpoints/step_<steps>/ is on the
              Hub; also when the run's own summary.json is complete with its export there (the box died between the
              trainer's end and the queue's item-end put), but only when that summary cannot be an earlier run's: no
@@ -98,9 +100,9 @@ Usage (vast/supervise.py runs `run` for KITSUNE_JOB=full; KITSUNE_BOX, KITSUNE_O
 KITSUNE_STATE from the env):
   python -m kitsune.full_queue run --box p01 [--gpus 0,1]
   python -m kitsune.full_queue run --box p01-chain               # a chain box: its ChainController
-  python -m kitsune.full_queue plan --box full                   # the registry items, in order, nothing started
+  python -m kitsune.full_queue plan --box full-t                 # the registry items, in order, nothing started
   python -m kitsune.full_queue build-stores --config configs/full/full-p03.json [--eval-only] [--set k=v]
-  python -m kitsune.full_queue resume-pull --box full --root /workspace/Kitsune-Transcribe
+  python -m kitsune.full_queue resume-pull --box full-t --root /workspace/Kitsune-Transcribe
   python -m kitsune.full_queue check-resume --run-dir runs/full-p03-20260927T120000Z
 Pure Python at import (stdlib, kitsune.fullrun, kitsune.heartbeat, kitsune.study_queue); the trainer (torch) only in the
 build-stores and check-resume children, huggingface_hub only when the Hub is called.

@@ -296,6 +296,42 @@ def test_the_client_filter_keeps_only_verified_long_rentals_with_the_ram(full_la
     assert launch.offer_problems(offer(1, 1, 0.5, verification="unverified", duration=0), launch.JOBS["label"]) == []
 
 
+def test_a_registry_min_ram_and_a_long_cap_tighten_the_filter(full_launch, repo, capsys):
+    """min_ram_gb (registry; RAM analysis 2026-10-02: box 1's real peaks were 33 GiB trainer, 37 GiB store build, the
+    164 GB peak_rss_gb is page cache counted per DataLoader worker): the query asks floor(0.94 x it) GB, the client
+    filter round(0.97 x it x 1000) MB, so vast's 96 GB machines listed at 95,758 MB stay; None keeps 64,000 MB a GPU
+    and the query's 60. A cap past MIN_RENTAL_DAYS raises the rental floor to cap / 24 + 0.5 d."""
+    now = time.time()
+    j = launch.full_job("full-t", {"gpus": 1, "min_ram_gb": 96}, "5090", 26.0, 37, 1.1)
+    assert "cpu_ram>=90" in j.base_filter and j.ram_mb_min == 93120 and j.min_rental_days == 4
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=95758), j, now) == []
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=64439), j, now) == ["cpu_ram 64439 MB < 93120 MB"]
+    j0 = launch.full_job("p01", {"gpus": 1, "min_ram_gb": None}, "5090", 19.5, 22, 1.0)
+    assert "cpu_ram>=60" in j0.base_filter and j0.ram_mb_min == 0
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=64439), j0, now) == []
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=63183), j0, now) == ["cpu_ram 63183 MB < 64000 MB"]
+    assert "cpu_ram>=120" in launch.full_filter(2, min_ram_gb=96)  # never below 60 a GPU
+    # a hypothetical long box (104 h, as a 10-epoch box T would have been): the floor rises past 4 d
+    long = launch.full_job("full-t", {"gpus": 1, "min_ram_gb": 96}, "5090", 78.9, 104, 1.1)
+    assert long.min_rental_days == launch.min_rental_days(104) == 4.83
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=96000, duration=4.2 * DAY), long, now) == [
+        "max rental 4.2 d < 4.83 d"]
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=96000, duration=4.9 * DAY), long, now) == []
+    assert launch.min_rental_days(37) == launch.min_rental_days(22) == launch.MIN_RENTAL_DAYS == 4
+    # the launch: the registry's min_ram_gb reaches the query and the look-only says so
+    reg = copy.deepcopy(dict(repo.reg))
+    reg["boxes"]["p01"]["min_ram_gb"] = 96
+    write_reg(repo.root, reg)
+    rc, fake = full_launch([[offer(1, 2, 0.50, cpu_ram=64439), offer(2, 3, 0.60, cpu_ram=95758)]], "--box", "p01",
+                           "--scratch-repo", SCRATCH, "--dry-run")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "cpu_ram>=90" in search_query(fake).split(" ") and "cpu_ram>=60" not in search_query(fake).split(" ")
+    assert "RAM >= 96 GB (registry min_ram_gb): the query asks cpu_ram >= 90 GB, the client filter >= 93120 MB" in out
+    assert "host max rental >= 4 d" in out
+    assert env_of(created_or_printed(out))["KITSUNE_MACHINE_ID"] == "3"
+
+
 def created_or_printed(out: str) -> list[str]:
     """The create command as printed (look-only runs print it with the offer they would rent)."""
     import shlex
@@ -344,7 +380,17 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "study", "--box", "p01"], "--box p01 is not a box of --job study"),
                       (["--job", "train", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
-                       "only schedule.epochs may change"),
+                       "only schedule.epochs, early_stop.patience may change on a resume"),
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:early_stop.patience=0"], "early_stop.patience must be an int >= 1"),
+                      (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=8",
+                        "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=9"], "given twice"),
+                      (["--job", "train", "--allow-done-trains"], "--allow-done-trains: for --job full only"),
+                      (["--job", "train", "--fresh-over-done"], "--fresh-over-done: for --job full only"),
+                      (["--job", "full", "--box", "p01", "--resume", "--fresh-over-done"],
+                       "--fresh-over-done is for a launch without --resume"),
+                      (["--job", "full", "--box", "p01", "--fresh-over-done", "--resume-reset",
+                        "full-p01-20261001T184145Z"], "--fresh-over-done is for a launch without --resume"),
                       (["--job", "full", "--box", "p01", "--machine", "m70001"], "machine_id (digits)")):
         with pytest.raises(SystemExit):
             launch.main([*args, "--data-repo", DATA, "--out-repo", RUNS, "--sha", SHA])
@@ -401,6 +447,42 @@ def test_resume_flags_go_to_the_box_env(full_launch, capsys):
     rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
     assert rc == 0 and "KITSUNE_RESUME" not in " ".join(created_or_printed(capsys.readouterr().out))
     assert not any(c[1:3] == ["show", "instances"] for c in fake.calls)
+
+
+def test_the_continuation_flags_go_to_the_box_env(full_launch, capsys):
+    """DECISIONS G3: P-0.1B's continuation from its pre_cooldown state to 8 epochs with patience 12 - the reset and
+    both sets of one run reach the box as one KITSUNE_RESUME_RESET and one KITSUNE_RESUME_SETS word, in the order
+    given (fullrun.parse_resume_sets on the box gives the queue the same list)."""
+    rid = "full-p01-20261001T184145Z"
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
+                           rid, "--resume-set", f"{rid}:schedule.epochs=8", "--resume-set",
+                           f"{rid}:early_stop.patience=012", "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    env = env_of(created(fake))
+    assert env["KITSUNE_RESUME"] == "1" and env["KITSUNE_RESUME_RESET"] == rid
+    assert env["KITSUNE_RESUME_SETS"] == f"{rid}:schedule.epochs=8,{rid}:early_stop.patience=12"
+    assert re.fullmatch(fullrun._ENV_WORD, env["KITSUNE_RESUME_SETS"])
+    assert fullrun.parse_resume_sets(env["KITSUNE_RESUME_SETS"]) == {
+        rid: ["schedule.epochs=8", "early_stop.patience=12"]}
+    a, kw = full_launch.seen["preflight"]
+    assert kw["resets"] == [rid] and kw["sets"] == {rid: ["schedule.epochs=8", "early_stop.patience=12"]}
+    assert kw["allow_done_trains"] is False and kw["allow_fresh_over_done"] is False
+
+
+def test_the_fresh_over_done_flag_goes_to_the_preflight(full_launch, capsys):
+    """--fresh-over-done reaches full_preflight (a fresh launch, resume False); a refusal of the preflight (a done
+    train item on the Hub) stops the launch, look-only or not."""
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "full-smoke", "--scratch-repo", SCRATCH,
+                           "--fresh-over-done", "--dry-run")
+    assert rc == 0, capsys.readouterr().out
+    a, kw = full_launch.seen["preflight"]
+    assert kw["resume"] is False and kw["allow_fresh_over_done"] is True
+    full_launch.seen["preflight_problems"] = ["a fresh launch of box p01 (no --resume): its Hub summary ..."]
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and "a fresh launch of box p01 (no --resume)" in out and created(fake) is None, out
+    assert full_launch.seen["preflight"][1]["allow_fresh_over_done"] is False
 
 
 def test_live_instances_are_the_boxs_own(monkeypatch):
@@ -652,6 +734,80 @@ def test_resume_preflight_needs_the_hub_summary_and_known_run_ids(repo, monkeypa
     assert any("full-p01-20260101T000000Z: no train item of box p01 ran it" in p for p in problems), problems
 
 
+def test_resume_preflight_guards_a_done_box(repo, monkeypatch, devslice):
+    """DECISIONS G3's two launch guards. (a) A plain --resume of a box whose train items are all done is refused (box
+    p01 would adopt full-p01 as done and score its new items on the 4-epoch weights) unless --allow-done-trains (a box
+    lost in its eval pool); a reset of the run, or a continuation lost on its way (the summary shows the run running
+    with its continuation record), passes. (b) A set-only id of a done run is refused (resume-pull refuses a set-only
+    run past its cooldown)."""
+    rid = "full-p01-20261001T184145Z"
+    reg = launch.full_registry(SHA)[0]
+    data = box_data("p01", reg, repo.root)
+
+    def summary(status, **kw):
+        return {fullrun.box_summary_path("p01"): {"items": {
+            "full-p01": dict({"kind": "train", "status": status, "run_dir": f"runs/{rid}"}, **kw),
+            "m4-full-p01": {"kind": "readout", "status": "done", "verified": True}}}}
+
+    done = summary("done", result={"steps": 107910})
+    problems, _ = preflight(monkeypatch, FullHub(data, done), resume=True, resets=[], sets={})
+    assert any("a plain --resume of box p01: every train item of its Hub summary is done (full-p01)" in p
+               and "--resume-reset <run_id>" in p for p in problems), problems
+    problems, notes = preflight(monkeypatch, FullHub(data, done), resume=True, resets=[], sets={},
+                                allow_done_trains=True)
+    assert problems == [], problems
+    assert any("--allow-done-trains: not refused" in n for n in notes), notes
+    sets = {rid: ["schedule.epochs=8", "early_stop.patience=12"]}
+    problems, notes = preflight(monkeypatch, FullHub(data, done), resume=True, resets=[rid], sets=sets)
+    assert problems == [], problems
+    assert any(f"resume: full-p01: done, run {rid}, reset sets ['schedule.epochs=8', 'early_stop.patience=12']" in n
+               for n in notes), notes
+    problems, _ = preflight(monkeypatch, FullHub(data, done), resume=True, resets=[], sets=sets)
+    assert any(f"--resume-set {rid} without --resume-reset: full-p01 is done" in p for p in problems), problems
+    lost = summary("running", continuation={"run_id": rid, "reset": True, "sets": sets[rid],
+                                            "resume_resets_before": 0})
+    problems, _ = preflight(monkeypatch, FullHub(data, lost), resume=True, resets=[], sets={})
+    assert problems == [], "a continuation lost on its way resumes with a plain --resume"
+
+
+def test_a_fresh_launch_over_a_done_box_is_refused(repo, monkeypatch, devslice):
+    """Box p01 after box 1: its Hub summary has full-p01 done. A launch without --resume would train a new 4-epoch
+    P-0.1B in a new run dir and overwrite that summary, after which the continuation (--resume-reset of box 1's run)
+    is refused ("no train item of box p01 ran it"). So a fresh launch over a done train item is refused unless
+    --fresh-over-done; no summary, or one whose train items are not done (a box that died in its first training: its
+    owner relaunches it fresh or resumes it), passes; the continuation itself passes."""
+    rid = "full-p01-20261001T184145Z"
+    reg = launch.full_registry(SHA)[0]
+    data = box_data("p01", reg, repo.root)
+
+    def summary(status):
+        return {fullrun.box_summary_path("p01"): {"items": {
+            "full-p01": {"kind": "train", "status": status, "run_dir": f"runs/{rid}", "result": {"steps": 107910}},
+            "m4-full-p01": {"kind": "readout", "status": "done", "verified": True}}}}
+
+    problems, _ = preflight(monkeypatch, FullHub(data, summary("done")))
+    (p,) = [p for p in problems if "a fresh launch" in p]
+    assert p.startswith(f"a fresh launch of box p01 (no --resume): its Hub summary full/box-p01/queue_summary.json has "
+                        f"train items done: full-p01 (run {rid})") and "--fresh-over-done" in p, p
+    problems, notes = preflight(monkeypatch, FullHub(data, summary("done")), allow_fresh_over_done=True)
+    assert problems == [], problems
+    assert any("--fresh-over-done: not refused" in n for n in notes), notes
+    for runs in ({}, summary("running"), summary("failed")):
+        problems, notes = preflight(monkeypatch, FullHub(data, runs))
+        assert problems == [] and not any("fresh launch" in n for n in notes), (runs, problems, notes)
+    sets = {rid: ["schedule.epochs=8", "early_stop.patience=12"]}
+    problems, _ = preflight(monkeypatch, FullHub(data, summary("done")), resume=True, resets=[rid], sets=sets)
+    assert problems == [], "the continuation is a resume: the fresh guard does not apply"
+
+    class Down(FullHub):
+        def file_exists(self, repo, path, repo_type=None):
+            raise ConnectionError("Hub down")
+
+    problems, _ = preflight(monkeypatch, Down(data))
+    assert any("cannot read full/box-p01/queue_summary.json" in p and "a fresh launch would overwrite it" in p
+               for p in problems), problems
+
+
 # ========================================================================================= blocklist and gates
 
 
@@ -770,8 +926,10 @@ def test_the_quant_go_signal_only_concerns_boxes_with_quantised_items(quant_go, 
 
 
 def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, monkeypatch, devslice):
-    """full_preflight ends with the quant go signal (allow_unverified_quant passed through) and, for box full, a warning
-    while its speed record has no box-1 part (never a refusal)."""
+    """full_preflight ends with the quant go signal (allow_unverified_quant passed through) and, for a box whose hours
+    come from the speed record (SPEED_RECORD_BOXES: p01, full-t, full-p; the tiny registry's 2-GPU box full stands in
+    for them here), a warning while that record has no box-1 part (never a refusal)."""
+    monkeypatch.setattr(launch, "SPEED_RECORD_BOXES", ("full",))
     monkeypatch.setattr(launch, "git_ancestry", lambda old, new: "ancestor")
     monkeypatch.setattr(launch, "git_blob", lambda sha, p: f"blob:{p}")
     reg = launch.full_registry(SHA)[0]
@@ -791,7 +949,9 @@ def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, 
     rec.write_text(json.dumps({"smoke": {}, "box1": {"sha": "ab" * 20, "sec_per_step": 0.29}}), encoding="utf-8")
     notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")[1]
     assert not any("smoke-only" in n for n in notes) and any("box 1 at abababababab, 0.29 s/step" in n for n in notes)
-    assert launch.speed_record_notes(SHA, "p01") == []
+    assert launch.speed_record_notes(SHA, "p01") == []  # not in the patched tuple
+    monkeypatch.setattr(launch, "SPEED_RECORD_BOXES", ("p01", "full-t", "full-p"))
+    assert launch.speed_record_notes(SHA, "full-smoke") == [] and launch.speed_record_notes(SHA, "full-t")
 
 
 def test_allow_unverified_quant_reaches_the_preflight_and_is_full_only(full_launch, capsys):
@@ -829,7 +989,8 @@ def test_the_quant_code_and_the_speed_record_exist_in_this_checkout():
         assert (ROOT / rel).is_file(), rel
     rec = json.loads((ROOT / launch.SPEED_RECORD).read_text(encoding="utf-8"))
     assert set(rec) >= {"smoke", "box1"}
-    assert launch.SPEED_RECORD_BOXES == ("full",) and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
+    assert launch.SPEED_RECORD_BOXES == ("p01", "full-t", "full-p") and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
+    assert set(launch.SPEED_RECORD_BOXES) <= set(fullrun.BOX_NAMES)
 
 
 def test_the_blocklist_holds_151760_and_54650_and_refuses_a_broken_file(tmp_path):
@@ -1137,6 +1298,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     assert s["hf"] == [fullrun.SMOKE_SELECTION, "labels/full/selections/study_1000h.parquet", fullrun.FULL_SELECTION]
     parts = {a[5]: (a, kw) for a, kw in s["preflight"]}
     assert list(parts) == ["full-smoke", "smoke-b", "p01"]
+    assert all(kw["allow_fresh_over_done"] is False for _, kw in parts.values()), "each part: a fresh launch's guard"
     assert parts["smoke-b"][0][3] is None and parts["p01"][0][3] == SCRATCH, "the scratch repo only for timed parts"
     assert parts["smoke-b"][0][7]["selection"] == "labels/full/selections/study_1000h.parquet"
     assert all(not kw.get("resume") for _, kw in parts.values())

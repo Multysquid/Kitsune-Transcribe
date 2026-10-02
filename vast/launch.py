@@ -46,24 +46,28 @@ count goes along (KITSUNE_N_GPUS). Boxes A and B may be live at the same time: n
   python vast/launch.py --job study --box A --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs \\
       --image-tag main                                                                        # look only
 
---job full --box full-smoke|p01|full|smoke-b rents a full-data box (kitsune/full_queue.py runs it; vast/README.md
-"Full-data runs"). The box registry configs/full/boxes.json (kitsune/fullrun.py) is read at the commit the box runs
-and is the one source of its GPU count (--gpus may only repeat it), data config (--config), hours (--max-hours; planned
-hours est_hours), price cap (--max-dph), extra disk and watchdog (KITSUNE_N_GPUS, KITSUNE_WATCHDOG_*). The offers: RTX
-5090s (--tier a100: A100s, option C, cap A100_MAX_DPH), full_filter per GPU, then a client filter (verified or
-deverified hosts only, a rental that runs >= MIN_RENTAL_DAYS, >= 64 GB RAM per GPU, --machine), ranked by the estimated
-total. Refused before renting (full_preflight): a box config not committed at the commit, a student not the
-registered build, an extra file or dir the data repo lacks, an eval/speed tool the commit does not have, a scratch
+--job full --box full-smoke|p01|full-t|full-p|smoke-b rents a full-data box (kitsune/full_queue.py runs it;
+vast/README.md "Full-data runs"). The box registry configs/full/boxes.json (kitsune/fullrun.py) is read at the commit
+the box runs and is the one source of its GPU count (--gpus may only repeat it), data config (--config), hours
+(--max-hours; planned hours est_hours), price cap (--max-dph), extra disk and watchdog (KITSUNE_N_GPUS,
+KITSUNE_WATCHDOG_*). The offers: RTX 5090s (--tier a100: A100s, option C, cap A100_MAX_DPH), full_filter per GPU, then a
+client filter (verified or deverified hosts only, a rental that runs >= max(MIN_RENTAL_DAYS, the cap +
+RENTAL_MARGIN_DAYS), >= 64 GB RAM per GPU or the registry box's min_ram_gb (x RAM_CLIENT_FACTOR), --machine), ranked by
+the estimated total. Refused before renting (full_preflight): a box config not committed at the commit, a student not
+the registered build, an extra file or dir the data repo lacks, an eval/speed tool the commit does not have, a scratch
 repo (--scratch-repo, required for a box with timed states) that is not private, a selection sidecar that is not the
-selection's, with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no
-train item of it ran, and a box with quantised items (box full) without the quant go signal: smoke-b's verdict on the
-Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE; DECISIONS F2), which
---allow-unverified-quant turns into a warning. Box full's hours warn while its speed record has no box-1 part. Offers
-listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped. Every job avoids the machines of
-vast/blocklist.json; a full box also those whose download gate said slow in the last GATE_BLOCK_DAYS
-(full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link first
-(kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
-  python vast/launch.py --job full --box p01 --image-tag main --data-repo Multy123/kitsune-data \\
+selection's, with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no train
+item of it ran (a plain --resume of a box whose train items are all done needs --allow-done-trains; a --resume-set id of
+a done run without --resume-reset is refused), without --resume a box whose Hub queue summary has a train item done
+(a fresh queue would overwrite that summary, and the run's continuation, --resume-reset, reads it; --fresh-over-done
+for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01) without the quant go
+signal: smoke-b's verdict on the Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE;
+DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of boxes p01, full-t and full-p warn while
+their speed record has no box-1 part. Offers listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped.
+Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate said slow in the last
+GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link
+first (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
+  python vast/launch.py --job full --box full-t --image-tag main --data-repo Multy123/kitsune-data \\
       --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch                  # look only
 --job full --box p01-chain rents a chain box (contract addendum E; kitsune/full_queue.py ChainController): smoke A and
 smoke B, an automatic gate, then box 1, on one 1x RTX 5090. Its disk and download gate are sized on the last stage's
@@ -205,9 +209,18 @@ FULL_TIERS = {
 A100_MAX_DPH = 2.60  # --tier a100's default price cap (option C: 2x A100 for box 2)
 FULL_VERIFICATION = ("verified", "deverified")  # never "unverified" (decision 1)
 MIN_RENTAL_DAYS = 4  # the host's max rental must outlast the box (decision 12; m52214 listed 0.4 d)
+# ... and its cap with a margin: a full box rents for at least max(MIN_RENTAL_DAYS, max_hours / 24 + this) days
+RENTAL_MARGIN_DAYS = 0.5
 # vast converts the query's cpu_ram GB to MB itself, loosely (m54650's 1x lists 64,439 MB), so the query asks for 60 GB
 # a GPU and the client filter for 64,000 MB a GPU (m140586's 2x at 126,367 MB fails, as planned)
 FULL_RAM_MB_PER_GPU = 64_000
+# a registry box's min_ram_gb (kitsune.fullrun; null keeps the per-GPU rule above): the query asks for
+# floor(RAM_QUERY_FACTOR x it) GB, the client filter for round(RAM_CLIENT_FACTOR x it x 1000) MB. The looser client
+# factor is load-bearing: vast lists 96 GB machines at 95,758-96,709 MB (2026-10-02), so a plain x 1000 rule would drop
+# every one of them. Box 1's real peak was 33 GiB for the trainer and 37 GiB for the CTC store build (cgroup anon, not
+# the queue summary's peak_rss_gb, which sums VmRSS over the item's processes and so counts the store's page cache once
+# per DataLoader worker: 164 GB on a 187 GB host)
+RAM_QUERY_FACTOR, RAM_CLIENT_FACTOR = 0.94, 0.97
 # full_filter's disk_bw floor in MB/s (plan v3 section 3), and the lowest value --min-disk-bw takes. A full box writes
 # ~1 TB once (the rebuilt shards and the store) at the rebuild's ~40 MB/s and then reads its stores at ~120 MB/s (box 1
 # measured as P-0.1B's 1,539 audio-s step every ~0.4 s); the floor keeps headroom over that, and the smoke's
@@ -229,7 +242,8 @@ GATE_RE = re.compile(r"full/box-[^/]+/infra/[^/]+/download_gate\.json")
 FULL_TOOLS = {"stores": "kitsune/full_queue.py", "train": "scripts/04_distill.py", "readout": "scripts/05_evaluate.py",
               "speed": "tools/speed_probe.py"}
 # THE QUANT GO SIGNAL (DECISIONS F2, 2026-10-01: "the quant/compile fixes are verified on a GPU by a standalone smoke-B
-# box before box 2 launches"). A box with quantised items (box full: 28 quantised readouts) is refused unless the runs
+# box before box 2 launches"). A box with quantised items (box full-p: 14 quantised readouts, full-t 7, p01 7 - P-0.1B's
+# continuation scores its 8-epoch weights on its own box) is refused unless the runs
 # repo's smoke-b verdict (full/box-smoke-b/smoke_verdict.json) passed overall and every one of checks 12-16 (12 the
 # torchao selftest and the emulate-vs-real NVFP4 compare, 13 fp16 without non-finite rows, 14 export = in-memory, 15
 # Whisper, 16 every speed probe), at a commit that is an ancestor of the one the box runs with QUANT_CODE (the quant
@@ -240,21 +254,25 @@ QUANT_GO_BOX = "smoke-b"
 QUANT_GO_CHECKS = ("12", "13", "14", "15", "16")
 QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.py", "kitsune/whisper.py",
               "tools/whisper_eval.py", "requirements-train.txt", "docker/Dockerfile")
-# box full's hours come from make_full_configs' speed record (its SPEED_FILE under configs/full): smoke A's measured
-# s/step and, after box 1, box 1's; without box 1's part they are provisional (contract 7), and launch says so
+# the hours of boxes p01 (P-0.1B's continuation), full-t and full-p come from make_full_configs' speed record (its
+# SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's; without box 1's part they are
+# provisional (contract 7), and launch says so
 SPEED_RECORD = "configs/full/plan/box2_hours.json"
-SPEED_RECORD_BOXES = ("full",)
+SPEED_RECORD_BOXES = ("p01", "full-t", "full-p")
 # offers in a country whose hosts cannot reach the Hugging Face Hub: a full box downloads everything from it, and with
 # no download gate (smoke-b) such a host burns its rebuild attempts up to the cap (2026-10-01: the cheapest 1x 5090,
 # m58555, was listed in CN)
 FULL_AVOID_COUNTRIES = ("CN",)
 
 
-def full_filter(n_gpus: int, disk_gb: int = DISK_GB, min_disk_bw: int = FULL_MIN_DISK_BW) -> list[str]:
+def full_filter(n_gpus: int, disk_gb: int = DISK_GB, min_disk_bw: int = FULL_MIN_DISK_BW,
+                min_ram_gb: float | None = None) -> list[str]:
     """The full box's host filter for n GPUs (plan v3 section 3); the client filter (offer_problems) does the rest.
-    min_disk_bw: the disk_bw floor in MB/s (--min-disk-bw; default FULL_MIN_DISK_BW)."""
+    min_disk_bw: the disk_bw floor in MB/s (--min-disk-bw; default FULL_MIN_DISK_BW); min_ram_gb: the registry box's
+    (None: 60 GB a GPU; else the larger of that and floor(RAM_QUERY_FACTOR x it))."""
+    ram = 60 * n_gpus if min_ram_gb is None else max(60 * n_gpus, math.floor(RAM_QUERY_FACTOR * min_ram_gb))
     return [f"num_gpus={n_gpus}", "verified=any", "rentable=true", "reliability>=0.98", "cuda_vers>=13.0",
-            f"cpu_cores_effective>={16 * n_gpus}", f"cpu_ram>={60 * n_gpus}", f"disk_bw>={int(min_disk_bw)}",
+            f"cpu_cores_effective>={16 * n_gpus}", f"cpu_ram>={ram}", f"disk_bw>={int(min_disk_bw)}",
             "inet_down>=500", f"inet_up>={100 * n_gpus}", "direct_port_count>=1", f"disk_space>={disk_gb}"]
 
 
@@ -283,6 +301,7 @@ class JobSpec:
     accept_verification: tuple | None = None  # the offer's "verification" must be one of these (None: any)
     min_rental_days: float = 0.0  # the host's max rental ("duration") at least this long
     ram_mb_per_gpu: int = 0  # cpu_ram (MB) at least this x n_gpus
+    ram_mb_min: int = 0  # ... and at least this (a registry box's min_ram_gb)
     max_gb_cost: float | None = None  # the host's inet_down_cost and inet_up_cost at most this ($/GB; None: any)
     max_total: float | None = None  # an est_total ranking keeps only offers whose est_total is at most this ($)
     avoid_countries: tuple = ()  # the country codes (geolocation's last part) whose offers are dropped
@@ -302,17 +321,25 @@ def study_job(box: str) -> JobSpec:
                    "dph", f"kitsune-study-{box}")
 
 
+def min_rental_days(max_hours: float) -> float:
+    """A full box's minimum host rental: MIN_RENTAL_DAYS, or its cap + RENTAL_MARGIN_DAYS when that is longer (a
+    cap past 84 h, e.g. 104 h: 4.83 d; the boxes' caps now, 21-37 h, keep the 4 d)."""
+    return max(float(MIN_RENTAL_DAYS), round(float(max_hours) / 24 + RENTAL_MARGIN_DAYS, 2))
+
+
 def full_job(box: str, spec: dict, tier: str, plan_hours: float, max_hours: float, max_dph: float,
              min_disk_bw: int = FULL_MIN_DISK_BW) -> JobSpec:
-    """The JobSpec of a full box from its registry spec: its GPU count in full_filter, the tier's GPUs, the planned and
-    capped hours, uploads at FULL_UP_GB_PER_GPU_HOUR, ranked by the estimated total, and the client filter. The
-    download (est_down_gb) comes from the extent's sizing later."""
-    n = spec["gpus"]
-    return JobSpec(FULL_TIERS[tier], full_filter(n, min_disk_bw=min_disk_bw), DISK_GB, 0.0, FULL_UP_GB_PER_GPU_HOUR * n * plan_hours,
-                   plan_hours, max_hours, max_dph, "est_total", f"kitsune-full-{box}", n_gpus=n,
-                   accept_verification=FULL_VERIFICATION, min_rental_days=MIN_RENTAL_DAYS,
-                   ram_mb_per_gpu=FULL_RAM_MB_PER_GPU, max_gb_cost=FULL_MAX_GB_COST,
-                   avoid_countries=FULL_AVOID_COUNTRIES)
+    """The JobSpec of a full box from its registry spec: its GPU count and min_ram_gb in full_filter, the tier's GPUs,
+    the planned and capped hours, uploads at FULL_UP_GB_PER_GPU_HOUR, ranked by the estimated total, and the client
+    filter (min_rental_days of the cap; RAM: FULL_RAM_MB_PER_GPU a GPU and, with min_ram_gb, RAM_CLIENT_FACTOR x it).
+    The download (est_down_gb) comes from the extent's sizing later."""
+    n, ram = spec["gpus"], spec.get("min_ram_gb")
+    return JobSpec(FULL_TIERS[tier], full_filter(n, min_disk_bw=min_disk_bw, min_ram_gb=ram), DISK_GB, 0.0,
+                   FULL_UP_GB_PER_GPU_HOUR * n * plan_hours, plan_hours, max_hours, max_dph, "est_total",
+                   f"kitsune-full-{box}", n_gpus=n, accept_verification=FULL_VERIFICATION,
+                   min_rental_days=min_rental_days(max_hours), ram_mb_per_gpu=FULL_RAM_MB_PER_GPU,
+                   ram_mb_min=0 if ram is None else round(RAM_CLIENT_FACTOR * ram * 1000),
+                   max_gb_cost=FULL_MAX_GB_COST, avoid_countries=FULL_AVOID_COUNTRIES)
 
 
 class LaunchError(RuntimeError):
@@ -423,10 +450,10 @@ def offer_problems(offer: dict, job: JobSpec, now: float | None = None) -> list[
         d = _duration_s(offer, now)
         if d is None or d < job.min_rental_days * 86400:
             out.append(f"max rental {'unknown' if d is None else f'{d / 86400:.1f} d'} < {job.min_rental_days:g} d")
-    if job.ram_mb_per_gpu:
-        ram = offer.get("cpu_ram")
-        if not isinstance(ram, (int, float)) or ram < job.ram_mb_per_gpu * job.n_gpus:
-            out.append(f"cpu_ram {ram} MB < {job.ram_mb_per_gpu * job.n_gpus} MB")
+    if job.ram_mb_per_gpu or job.ram_mb_min:
+        ram, need = offer.get("cpu_ram"), max(job.ram_mb_per_gpu * job.n_gpus, job.ram_mb_min)
+        if not isinstance(ram, (int, float)) or ram < need:
+            out.append(f"cpu_ram {ram} MB < {need} MB")
     if job.max_gb_cost is not None:
         for key in ("inet_down_cost", "inet_up_cost"):
             if _gb_cost(offer, key) > job.max_gb_cost:
@@ -1438,7 +1465,8 @@ def speed_record_notes(sha: str, box: str) -> list[str]:
 
 def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_repo: str | None, sha: str, box: str,
                    reg: dict, cfg: dict, *, reader=None, resume: bool = False, resets=(),
-                   sets: dict | None = None, allow_unverified_quant: bool = False) -> tuple[list[str], list[str]]:
+                   sets: dict | None = None, allow_unverified_quant: bool = False,
+                   allow_done_trains: bool = False, allow_fresh_over_done: bool = False) -> tuple[list[str], list[str]]:
     """-> (problems, notes) for --job full, read-only (local git and the laptop's HF login), on top of hf_preflight and
     extent_preflight:
     - every config the box reads (fullrun.box_configs: its data config, its item configs, the registry) committed at
@@ -1452,9 +1480,14 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
     - a full selection's sidecar (<selection stem>.json) passing kitsune.devslice.sidecar_problems against the Hub's
       selection and frozen manifest;
     - with resume: the box's Hub queue summary, and every --resume-reset/--resume-set id the run dir of one of its train
-      items; the notes say what will resume, with the newest state step found in the scratch and runs repos;
+      items; the notes say what will resume, with the newest state step found in the scratch and runs repos; a plain
+      resume of a box whose train items are all done needs allow_done_trains, a set-only id of a done run is refused
+      (resume_preflight);
+    - without resume: the box's Hub queue summary, when there is one, has no train item done (fresh_preflight) unless
+      allow_fresh_over_done: a fresh queue starts new runs and overwrites that summary, the only record of which run
+      a later --resume-reset continues (box p01 after box 1: its continuation is --resume-reset, never a fresh launch);
     - a box with quantised items: the quant go signal (quant_go_problems: a passing smoke-b verdict at this quant code;
-      allow_unverified_quant makes it a warning); box full: a warning while its hours are provisional
+      allow_unverified_quant makes it a warning); boxes p01, full-t, full-p: a warning while their hours are provisional
       (speed_record_notes)."""
     import hashlib
     import tempfile
@@ -1566,17 +1599,70 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
                 problems.append(f"{scratch_repo} is not private: the timed states are the trainers' full states; "
                                 f"hf repos settings {scratch_repo} --private")
     if resume:
-        problems_r, notes_r = resume_preflight(out_repo, scratch_repo, box, resets, sets or {})
+        problems_r, notes_r = resume_preflight(out_repo, scratch_repo, box, resets, sets or {},
+                                               allow_done_trains=allow_done_trains)
         problems += problems_r
         notes += notes_r
+    else:
+        problems_f, notes_f = fresh_preflight(out_repo, box, allow_fresh_over_done=allow_fresh_over_done)
+        problems += problems_f
+        notes += notes_f
     problems_q, notes_q = quant_go_problems(out_repo, sha, box, spec, allow_unverified_quant=allow_unverified_quant)
     return problems + problems_q, notes + notes_q + speed_record_notes(sha, box)
 
 
-def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, sets: dict) -> tuple[list, list]:
+def fresh_preflight(out_repo: str, box: str, *, allow_fresh_over_done: bool = False) -> tuple[list, list]:
+    """A launch without --resume: the box's queue starts afresh (new run dirs) and puts its own queue summary at
+    full/box-<box>/queue_summary.json, over the one there. When that summary has a train item done, the done run's
+    record is lost to launch's and the box's resume checks (resume_preflight, resume-pull: "no train item of box <box>
+    ran it"), and to the items of other boxes that read it (of_box): box p01 after box 1 would train a new 4-epoch
+    P-0.1B (~$15-20) and its continuation (--resume-reset) stays refused until the summary is put back by hand. So a
+    done train item refuses the launch unless allow_fresh_over_done (--fresh-over-done: a deliberate fresh start, e.g.
+    a full-smoke rerun). No summary on the Hub, or none with a done train item: no problem."""
+    import tempfile
+
+    problems, notes = [], []
+    path = fullrun.box_summary_path(box)
+    try:
+        api, download = _hub()
+        if not api.file_exists(out_repo, path):
+            return problems, notes
+        with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+            summary = json.loads(Path(download(out_repo, path, local_dir=tmp)).read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return [f"cannot read {path} in {out_repo} ({type(e).__name__}: {e}): a fresh launch would overwrite it; run "
+                f"again"], notes
+    items = summary.get("items") or {}
+    done = sorted(name for name, it in items.items()
+                  if isinstance(it, dict) and it.get("kind") == "train" and it.get("status") == "done")
+    if not done:
+        return problems, notes
+    runs = ", ".join(f"{n} (run {fullrun.run_id_of(items[n]['run_dir'])})" if items[n].get("run_dir") else n
+                     for n in done)
+    msg = (f"a fresh launch of box {box} (no --resume): its Hub summary {path} has train items done: {runs}. A fresh "
+           f"queue trains them again in new run dirs and overwrites that summary, after which their continuation "
+           f"(--resume-reset <run_id> with its --resume-set <run_id>:KEY=VALUE) is refused. Continue a done run with "
+           f"--resume-reset; pass --fresh-over-done only for a deliberate fresh start of the box")
+    if allow_fresh_over_done:
+        notes.append(f"{msg} (--fresh-over-done: not refused)")
+    else:
+        problems.append(msg)
+    return problems, notes
+
+
+def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, sets: dict, *,
+                     allow_done_trains: bool = False) -> tuple[list, list]:
     """--resume: the box's Hub queue summary (full/box-<box>/queue_summary.json, the source of truth) must exist, and
     every reset/set id must be fullrun.run_id_of(items[x].run_dir) of one of its train items; the notes list each
-    train item (its status, run and the newest full state step in the scratch pointer and the runs repo)."""
+    train item (its status, run and the newest full state step in the scratch pointer and the runs repo). Two guards
+    (DECISIONS G3, P-0.1B's continuation):
+    (a) a plain --resume (no reset, no set) of a box whose summary has every train item done is refused unless
+        allow_done_trains (--allow-done-trains: a box lost in its eval pool). resume-pull would adopt the runs as done,
+        so box p01's plain --resume before its continuation began would score its new items on the 4-epoch weights;
+        a continuation is --resume-reset (with its --resume-set). A continuation lost on its way is not refused: the
+        summary then shows the run running with its continuation record;
+    (b) a --resume-set id without --resume-reset whose train item is done is refused: resume-pull refuses a set-only
+        run past its cooldown after the paid boot."""
     import tempfile
 
     problems, notes = [], []
@@ -1595,6 +1681,22 @@ def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, 
                 if rid not in ran:
                     problems.append(f"--resume-reset/--resume-set {rid}: no train item of box {box} ran it (its Hub "
                                     f"summary's runs: {sorted(ran) or 'none'})")
+            trains = {name: it for name, it in items.items() if isinstance(it, dict) and it.get("kind") == "train"}
+            for rid in sets:
+                if rid in ran and rid not in resets and (trains.get(ran[rid]) or {}).get("status") == "done":
+                    problems.append(f"--resume-set {rid} without --resume-reset: {ran[rid]} is done, past its "
+                                    f"cooldown, and resume-pull refuses a set-only run there; continue it with "
+                                    f"--resume-reset {rid} (and its --resume-set)")
+            if not resets and not sets and trains and all(it.get("status") == "done" for it in trains.values()):
+                msg = (f"a plain --resume of box {box}: every train item of its Hub summary is done "
+                       f"({', '.join(sorted(trains))}), so the box would only adopt them and run its other items on "
+                       f"those weights. A continuation of a done run is --resume-reset <run_id> (with its "
+                       f"--resume-set <run_id>:KEY=VALUE); pass --allow-done-trains only for a box lost in its eval "
+                       f"pool")
+                if allow_done_trains:
+                    notes.append(f"{msg} (--allow-done-trains: not refused)")
+                else:
+                    problems.append(msg)
             for name, it in items.items():
                 if not isinstance(it, dict) or it.get("kind") != "train":
                     continue
@@ -1669,7 +1771,8 @@ def chain_resume_checks(out_repo: str, box: str, chain: str) -> tuple[list[str],
     elif float(cs.get("started") or 0) > float(ps.get("started") or 0):
         problems.append(f"the newest {box} summary on the Hub is from another rental (container "
                         f"{ps.get('container_id')}); chain {chain} on container {cs.get('container_id')} died before "
-                        f"{who} started: launch --box {box} fresh or the chain")
+                        f"{who} started: launch --box {box} fresh or the chain (with --fresh-over-done when its "
+                        f"summary has a train item done)")
     return problems, notes
 
 
@@ -1718,7 +1821,8 @@ def main(argv: list[str] | None = None) -> int:
                          "kitsune/full_queue.py, the registry configs/full/boxes.json)")
     ap.add_argument("--box", choices=[*STUDY_BOXES, *fullrun.ALL_BOX_NAMES], default=None,
                     help="study: A (the Cohere runs, 4 GPUs), B (Parakeet + bridge, 4 GPUs), replicate (1 GPU, after "
-                         "A) or shakedown (1 GPU, first); full: full-smoke (smoke A), p01 (box 1), full (box 2), "
+                         "A) or shakedown (1 GPU, first); full: full-smoke (smoke A), p01 (box 1, then P-0.1B's "
+                         "continuation), full-t and full-p (box 2's two 1x boxes; full: the retired 2x box), "
                          "smoke-b, or the chain p01-chain (smoke A + smoke B, then box 1 on one rental)")
     ap.add_argument("--data-repo", required=True, help="private HF dataset with the derived data (KITSUNE_DATA_REPO)")
     ap.add_argument("--out-repo", default=None, help="private HF model repo for runs/ (KITSUNE_OUT_REPO; train only)")
@@ -1763,9 +1867,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--resume-reset", action="append", default=[], metavar="RUN_ID",
                     help="full: continue this early-stopped run from its pre_cooldown state (repeatable; implies "
                          "--resume; KITSUNE_RESUME_RESET)")
-    ap.add_argument("--resume-set", action="append", default=[], metavar="RUN_ID:schedule.epochs=E",
-                    help="full: resume this run with another schedule.epochs (repeatable; implies --resume; "
-                         "KITSUNE_RESUME_SETS)")
+    ap.add_argument("--resume-set", action="append", default=[], metavar="RUN_ID:KEY=VALUE",
+                    help=f"full: resume this run with another value of KEY, one of "
+                         f"{', '.join(fullrun.RESUME_SET_KEYS)} (an int >= 1; repeatable, one KEY once per run; "
+                         f"implies --resume; KITSUNE_RESUME_SETS). With --resume-reset of the same run: a continuation "
+                         f"from its pre_cooldown state, e.g. --resume-reset <rid> --resume-set <rid>:schedule.epochs=8 "
+                         f"--resume-set <rid>:early_stop.patience=12")
+    ap.add_argument("--allow-done-trains", action="store_true",
+                    help="full: a plain --resume of a box whose Hub summary has every train item done (a box lost "
+                         "in its eval pool); refused without it, because a plain --resume never continues a done run "
+                         "(that is --resume-reset)")
+    ap.add_argument("--fresh-over-done", action="store_true",
+                    help="full: a launch without --resume of a box whose Hub summary has a train item done (a "
+                         "deliberate fresh start, e.g. a full-smoke rerun); refused without it, because the fresh "
+                         "queue overwrites that summary and a continuation of the done run (--resume-reset) then "
+                         "finds no run to continue")
     ap.add_argument("--tier", choices=sorted(FULL_TIERS), default=None,
                     help=f"full: 5090 (default) or a100 (option C; default cap {A100_MAX_DPH:g} $/h)")
     ap.add_argument("--gate-hours", type=float, default=None,
@@ -1782,7 +1898,7 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"full: drop offers whose expected total (rent for the planned hours + traffic) is above this "
                          f"(default {FULL_TOTAL_FACTOR:g} x the $/h cap x the planned hours + the traffic at the $/GB cap)")
     ap.add_argument("--allow-unverified-quant", action="store_true",
-                    help="full: rent a box with quantised items (box full) without a passing smoke-b verdict at its "
+                    help="full: rent a box with quantised items (full-t, full-p, p01) without a passing smoke-b verdict at its "
                          "quant code (DECISIONS F2's go signal; the refusal becomes a warning)")
     ap.add_argument("--no-self-stop", action="store_true",
                     help="debugging: the box does not stop itself when its on-start or bootstrap fails "
@@ -1808,7 +1924,9 @@ def main(argv: list[str] | None = None) -> int:
                                 ("--min-disk-bw", args.min_disk_bw is not None),
                                 ("--max-gb-cost", args.max_gb_cost is not None),
                                 ("--max-total", args.max_total is not None),
-                                ("--allow-unverified-quant", args.allow_unverified_quant)) if v]
+                                ("--allow-unverified-quant", args.allow_unverified_quant),
+                                ("--allow-done-trains", args.allow_done_trains),
+                                ("--fresh-over-done", args.fresh_over_done)) if v]
     if full_only and not full:
         ap.error(f"{', '.join(full_only)}: for --job full only")
     if args.machine is not None and not re.fullmatch(r"\d+", args.machine):
@@ -1826,6 +1944,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         ap.error(str(e))
     resume = args.resume or bool(resets or sets)
+    if args.fresh_over_done and resume:
+        ap.error("--fresh-over-done is for a launch without --resume/--resume-reset/--resume-set")
     if not label_job and not args.out_repo:
         ap.error("the following arguments are required: --out-repo")
     if args.cohere_procs is not None and args.cohere_procs < 1:
@@ -1887,6 +2007,15 @@ def main(argv: list[str] | None = None) -> int:
                          f"default floor is {FULL_MIN_DISK_BW}); the smoke's data_wait check guards the loader")
         job = full_job(args.box, spec, tier, plan_hours, max_hours, max_dph, min_disk_bw=min_disk_bw)
         config = spec["data_config"]
+        if spec.get("min_ram_gb") is not None:
+            notes.append(f"RAM >= {spec['min_ram_gb']:g} GB (registry min_ram_gb): the query asks cpu_ram >= "
+                         f"{math.floor(RAM_QUERY_FACTOR * spec['min_ram_gb'])} GB, the client filter >= "
+                         f"{job.ram_mb_min} MB")
+        else:
+            notes.append(f"RAM >= {FULL_RAM_MB_PER_GPU * spec['gpus']} MB ({FULL_RAM_MB_PER_GPU // 1000} GB a GPU; "
+                         f"the box sets no min_ram_gb)")
+        notes.append(f"host max rental >= {job.min_rental_days:g} d (MIN_RENTAL_DAYS {MIN_RENTAL_DAYS}, or the "
+                     f"{max_hours:g} h cap + {RENTAL_MARGIN_DAYS:g} d)")
         if chain is not None:
             # the boot bootstrap rebuilds stage 1's extent; the disk, the gate and the cap are the whole chain's. The
             # cap must hold stage 1 and the last stage's planned hours (E.6: 35 h covers the worst case the gate lets
@@ -2013,7 +2142,8 @@ def main(argv: list[str] | None = None) -> int:
                                               f"preflight: run it again")
                         problems, pre_notes = full_preflight(args.data_repo, data_rev, args.out_repo,
                                                              args.scratch_repo if pspec["timed_states"] else None, sha,
-                                                             part, reg, pcfg, reader=reader)
+                                                             part, reg, pcfg, reader=reader,
+                                                             allow_fresh_over_done=args.fresh_over_done)
                         errors += [f"part {part}: {x}" for x in problems]
                         notes += [f"part {part}: {x}" for x in pre_notes]
                     problems, pre_notes = chain_preflight(args.data_repo, data_rev, sha, args.box, reg, reader=reader)
@@ -2025,7 +2155,9 @@ def main(argv: list[str] | None = None) -> int:
                                                          args.scratch_repo if spec["timed_states"] else None, sha,
                                                          args.box, reg, cfg, reader=reader, resume=resume,
                                                          resets=resets, sets=sets,
-                                                         allow_unverified_quant=args.allow_unverified_quant)
+                                                         allow_unverified_quant=args.allow_unverified_quant,
+                                                         allow_done_trains=args.allow_done_trains,
+                                                         allow_fresh_over_done=args.fresh_over_done)
                     errors += problems
                     notes += pre_notes
                     for c in (fullrun.CHAIN_NAMES if resume else ()):  # E.8: a resume of a chain's last part

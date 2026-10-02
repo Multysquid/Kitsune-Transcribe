@@ -1,7 +1,10 @@
 """The full-data runs' shared core: names, paths, the box registry and the small helpers every full-run package uses.
 
-The full runs (plan v3) train P-0.1B alone on box `p01` (1x RTX 5090, Parakeet labels only), then T-0.6B, P-0.3B and
-P-0.05B on box `full` (2x RTX 5090, one shared GPU queue), after two short smokes (`full-smoke` = smoke A, `smoke-b`).
+The full runs (plan v3) trained P-0.1B alone on box `p01` (1x RTX 5090, Parakeet labels only; box 1), which now
+also runs its continuation to 8 epochs (DECISIONS G3: --resume-reset with --resume-set schedule.epochs /
+early_stop.patience), then T-0.6B on box `full-t` and P-0.3B and P-0.05B on box `full-p` (each 1x RTX 5090, one queue;
+DECISIONS G2: box 2's 2x box `full` is retired, its name kept for the tests' fixtures only), after two short smokes
+(`full-smoke` = smoke A, `smoke-b`).
 The selection (scripts/make_selection.py full mode, kitsune/devslice.py), the trainer (scripts/04_distill.py), the
 box queue (kitsune/full_queue.py), the vast scripts (vast/launch.py, bootstrap.sh, finish.py) and the evaluators all
 import their shared names from here, so a constant cannot drift between them. The binding definitions are the full-run
@@ -32,7 +35,9 @@ load_registry returns remembers its root, so the box readers given it read the c
   deadline_reserve_min >= 0 (the queue's per-item KITSUNE_DEADLINE = box deadline - this); watchdog {orphan_s int
   >= 0, action stop|alert}; extra_gb >= 0 (0); timed_states (false: the scratch repo is required when true); gate
   (true: the download gate); smoke (false: writes smoke_verdict.json, allows faults and verdict specs);
-  max_attempts >= 1 (4); extra_files, extra_dirs (data-repo paths the box pulls, []); faults ([]); items (non-empty)
+  max_attempts >= 1 (4); extra_files, extra_dirs (data-repo paths the box pulls, []); faults ([]); items (non-empty);
+  min_ram_gb (null: launch's 64 GB a GPU; a number > 0: the host RAM launch's offer filter asks for instead, vast/
+  launch.py full_job; a chain takes the largest of its parts')
 
 Items run in registry order where the queue allows. Every item: name (ITEM_RE, unique in its box), kind (ITEM_KINDS),
 needs (EARLIER items of the box; filled with the implicit ones below), stall_min (absent: STALL_MIN_DEFAULT[kind];
@@ -90,7 +95,7 @@ build):
   python -m kitsune.fullrun extra-files --box p01                 # the box's extra data-repo files, one per line
   python -m kitsune.fullrun extra-dirs --box full-smoke           # its extra data-repo dirs
   python -m kitsune.fullrun check-students --box p01 --root R     # every pulled student is the registered build
-  python -m kitsune.fullrun show --box full                       # the box spec with defaults, env and configs (JSON)
+  python -m kitsune.fullrun show --box full-t                     # the box spec with defaults, env and configs (JSON)
   python -m kitsune.fullrun check-students --box p01-chain --stage 2 --root R   # a chain: one stage's view
 A chain's --stage defaults to $KITSUNE_CHAIN_STAGE, else 1 (show adds both stage views).
 The registry is $KITSUNE_FULL_REGISTRY when set (tests), else <root>/configs/full/boxes.json.
@@ -113,7 +118,10 @@ REPO = Path(__file__).resolve().parents[1]
 
 JOB = "full"  # KITSUNE_JOB=full
 BOXES_FILE, ENV_REGISTRY = "configs/full/boxes.json", "KITSUNE_FULL_REGISTRY"
-BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b")  # smoke A, box 1, box 2, smoke B
+# smoke A, box p01 (box 1, then P-0.1B's continuation), "full" (the retired 2x box 2: no longer in the registry, kept
+# for tests/fixtures_full.py's 2-GPU box only), smoke B, and box 2 as two 1x boxes (DECISIONS G2): full-t (T-0.6B)
+# and full-p (P-0.3B, P-0.05B, the Whisper models and their quantised readouts)
+BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p")
 # chain boxes (contract addendum E, DECISIONS D): one rental that runs registry boxes one after the other, in two
 # stages with an automatic gate between them (kitsune/full_queue.py ChainController). p01-chain = smoke A and smoke B,
 # then box 1, on one 1x RTX 5090
@@ -177,7 +185,10 @@ DATA_KEYS = ("data_root", "teacher_root", "second_root", "parakeet_root", "selec
 
 RUN_ID_RE = r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"  # <item>-<YYYYMMDDTHHMMSSZ>[-n], 04 build's run dir name
 ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
-RESUME_SET_KEYS = ("schedule.epochs",)  # the only config key launch --resume-set may change
+# the config keys launch --resume-set may change (DECISIONS G3: P-0.1B's continuation sets its epochs and its early-stop
+# patience), each an int of at least RESUME_SET_INT_MIN[key]; 04_distill validates the same on the box
+RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience")
+RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
 
 # ------------------------------------------------------------------------------------------------ environment (1.4)
 
@@ -308,9 +319,10 @@ def dev_pick(rows, sources, per_source: int, seed: int) -> list[str]:
 
 
 def parse_resume_sets(s: str | None) -> dict[str, list[str]]:
-    """KITSUNE_RESUME_SETS ("<run_id>:schedule.epochs=4,<run_id>:...") -> {run_id: ["schedule.epochs=4", ...]} (values
-    normalised). ValueError on a bad run id (RUN_ID_RE), a key outside RESUME_SET_KEYS, epochs that are not an int
-    >= 1, or one key given twice for a run. None or "" -> {}."""
+    """KITSUNE_RESUME_SETS ("<run_id>:schedule.epochs=8,<run_id>:early_stop.patience=12,...") -> {run_id:
+    ["schedule.epochs=8", "early_stop.patience=12", ...]} (in the order given; values normalised to str(int): "012" ->
+    "12"). ValueError on a bad run id (RUN_ID_RE), a key outside RESUME_SET_KEYS, a value that is not an int >= its
+    RESUME_SET_INT_MIN (digits only: no sign, no decimal point), or one key given twice for a run. None or "" -> {}."""
     out: dict[str, list[str]] = {}
     if not s:
         return out
@@ -322,10 +334,10 @@ def parse_resume_sets(s: str | None) -> dict[str, list[str]]:
         key, eq, val = kv.partition("=")
         if not eq or key not in RESUME_SET_KEYS:
             raise ValueError(f"resume set {part!r}: only {', '.join(RESUME_SET_KEYS)} may change on a resume")
-        if key == "schedule.epochs":
-            if not re.fullmatch(r"\d+", val) or int(val) < 1:
-                raise ValueError(f"resume set {part!r}: schedule.epochs must be an int >= 1")
-            val = str(int(val))
+        lo = RESUME_SET_INT_MIN[key]
+        if not re.fullmatch(r"\d+", val) or int(val) < lo:
+            raise ValueError(f"resume set {part!r}: {key} must be an int >= {lo}")
+        val = str(int(val))
         if any(x.partition("=")[0] == key for x in out.get(run_id, [])):
             raise ValueError(f"resume set {part!r}: {key} given twice for {run_id}")
         out.setdefault(run_id, []).append(f"{key}={val}")
@@ -447,7 +459,8 @@ class RegistryError(ValueError):
 _REQ = object()  # a required field
 _BOX_FIELDS = {"gpus": _REQ, "data_config": _REQ, "est_hours": _REQ, "max_hours": _REQ, "max_dph": _REQ,
                "extra_gb": 0, "deadline_reserve_min": _REQ, "watchdog": _REQ, "timed_states": False, "gate": True,
-               "smoke": False, "max_attempts": 4, "extra_files": [], "extra_dirs": [], "faults": [], "items": _REQ}
+               "smoke": False, "max_attempts": 4, "extra_files": [], "extra_dirs": [], "faults": [], "items": _REQ,
+               "min_ram_gb": None}
 _ITEM_FIELDS = {"name": _REQ, "kind": _REQ, "needs": [], "stall_min": _REQ, "max_hours": None, "droppable": _REQ,
                 "verdict": []}  # stall_min and droppable: filled per kind
 _SOURCE_FIELDS = {"of": None, "of_box": None, "weights": [], "model": None}
@@ -473,7 +486,7 @@ _STAGE_FIELDS = ({"parts": _REQ, "gate_box": _REQ, "gate_by_hours": None, "max_h
                  {"parts": _REQ, "rebuild": None})
 # a plain box's fields that a chain derives from its parts (E.1.5): never written on a chain
 _CHAIN_DERIVED = ("items", "data_config", "watchdog", "faults", "smoke", "timed_states", "extra_files", "extra_dirs",
-                  "max_attempts", "gpus", "deadline_reserve_min")
+                  "max_attempts", "gpus", "deadline_reserve_min", "min_ram_gb")
 _ROOT_KEYS = ("data_root", "teacher_root", "second_root", "parakeet_root")  # a chain stage shares one data root
 
 
@@ -812,6 +825,8 @@ def _check_box(bname: str, box, reg_boxes: dict, p: list[str]) -> dict | None:
     for k in ("extra_gb", "deadline_reserve_min"):
         if k in out and not (_num(out[k]) and out[k] >= 0):
             p.append(f"{where}.{k} {out[k]!r} is not a number >= 0")
+    if out.get("min_ram_gb") is not None and not (_num(out["min_ram_gb"]) and out["min_ram_gb"] > 0):
+        p.append(f"{where}.min_ram_gb {out['min_ram_gb']!r} is not null or a number > 0")
     wd = out.get("watchdog")
     if "watchdog" in out:
         if not isinstance(wd, dict) or _keys(wd) != {"orphan_s", "action"}:
@@ -1335,7 +1350,8 @@ def _chain_spec(box, reg: dict, r: Path, read_json=None) -> dict:
     """A chain's derived box spec (E.1.5), computed and never stored: the parts' GPU count, the last stage's rebuild
     as the data config (launch sizes the disk and the gate on it), the chain's own hours, price, extra disk and gate,
     stage 1's watchdog (launch's env), the largest deadline reserve of the last stage, timed states if any part keeps
-    them, the union of both stage views' extra files and dirs, no items (the controller runs its parts' queues)."""
+    them, the union of both stage views' extra files and dirs, the largest min_ram_gb of its parts (None when none
+    sets one), no items (the controller runs its parts' queues)."""
     c = _chain_entry(box, reg)
     stages = chain_stages(box, reg)
     views = [stage_view(box, s["stage"], reg, r, read_json=read_json) for s in stages]
@@ -1344,6 +1360,8 @@ def _chain_spec(box, reg: dict, r: Path, read_json=None) -> dict:
                 est_hours=c["est_hours"], max_hours=c["max_hours"], max_dph=c["max_dph"], extra_gb=c["extra_gb"],
                 gate=c["gate"], watchdog=dict(stages[0]["watchdog"]),
                 deadline_reserve_min=max(s["deadline_reserve_min"] for s in last),
+                min_ram_gb=max((reg["boxes"][x].get("min_ram_gb") for st in stages for x in st["parts"]
+                                if reg["boxes"][x].get("min_ram_gb") is not None), default=None),
                 timed_states=any(v["timed_states"] for v in views),
                 extra_files=_uniq(f for v in views for f in v["extra_files"]),
                 extra_dirs=_uniq(d for v in views for d in v["extra_dirs"]), smoke=False, faults=[], items=[],

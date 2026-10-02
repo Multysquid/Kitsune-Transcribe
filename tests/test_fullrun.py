@@ -28,7 +28,7 @@ RID = "full-p03-20260927T120000Z"
 def test_constants_exact_values():
     assert fr.JOB == "full"
     assert (fr.BOXES_FILE, fr.ENV_REGISTRY) == ("configs/full/boxes.json", "KITSUNE_FULL_REGISTRY")
-    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b")
+    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p")
     assert fr.HUB_DIR == "full" and fr.STATE_DEFAULT == "/workspace/kitsune_state"
     assert (fr.TRAIN_HB, fr.HB_DIR, fr.RESUME_PLAN, fr.VERDICT_FILE, fr.ALERTS_FILE, fr.GATE_FILE, fr.SUMMARY_FILE,
             fr.DEADLINE_FILE) == ("train_hb", "hb", "resume_plan.json", "smoke_verdict.json",
@@ -52,7 +52,8 @@ def test_constants_exact_values():
                             "sources", "eval_sets", "selection_recipe", "pull_parakeet")
     assert fr.RUN_ID_RE == r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"
     assert fr.ITEM_RE == r"^[a-z0-9][a-z0-9.-]*$"
-    assert fr.RESUME_SET_KEYS == ("schedule.epochs",)
+    assert fr.RESUME_SET_KEYS == ("schedule.epochs", "early_stop.patience")
+    assert fr.RESUME_SET_INT_MIN == {"schedule.epochs": 1, "early_stop.patience": 1}
     assert fr.STALL_MIN_DEFAULT == {"stores": 360, "train": 45, "readout": 30, "speed": 30, "eval": 60}
     assert fr.ITEM_KINDS == ("stores", "train", "readout", "speed", "eval")
     assert fr.FAULT_ACTIONS == ("sigstop", "kill", "wipe_run_dir", "deadline", "freeze_controller_hb")
@@ -215,6 +216,21 @@ def test_parse_resume_sets():
     two = "full-t06-20260927T120000Z-2:schedule.epochs=04,full-p005-20260928T000000Z:schedule.epochs=5"
     assert fr.parse_resume_sets(two) == {"full-t06-20260927T120000Z-2": ["schedule.epochs=4"],
                                          "full-p005-20260928T000000Z": ["schedule.epochs=5"]}
+    # DECISIONS G3: P-0.1B's continuation sets its epochs and its early-stop patience, in the order given
+    assert fr.parse_resume_sets(f"{RID}:early_stop.patience=12") == {RID: ["early_stop.patience=12"]}
+    assert fr.parse_resume_sets(f"{RID}:early_stop.patience=012") == {RID: ["early_stop.patience=12"]}
+    both = f"{RID}:schedule.epochs=8,{RID}:early_stop.patience=12"
+    assert fr.parse_resume_sets(both) == {RID: ["schedule.epochs=8", "early_stop.patience=12"]}
+    assert fr.parse_resume_sets(f"{RID}:early_stop.patience=12,{RID}:schedule.epochs=8") == {
+        RID: ["early_stop.patience=12", "schedule.epochs=8"]}
+    for bad in (f"{RID}:early_stop.patience=0", f"{RID}:early_stop.patience=-1", f"{RID}:early_stop.patience=1.5",
+                f"{RID}:early_stop.patience=x", f"{RID}:early_stop.patience=",
+                f"{RID}:early_stop.patience=12,{RID}:early_stop.patience=6",
+                f"{RID}:early_stop.enabled=false", f"{RID}:early_stop.min_delta_rel=0.01"):
+        with pytest.raises(ValueError, match="early_stop|only schedule.epochs, early_stop.patience may change"):
+            fr.parse_resume_sets(bad)
+    with pytest.raises(ValueError, match="only schedule.epochs, early_stop.patience may change on a resume"):
+        fr.parse_resume_sets(f"{RID}:optim.lr=0.001")
     for bad in (f"{RID}:optim.lr=0.001",  # outside the whitelist
                 f"{RID}:schedule.epochs=0", f"{RID}:schedule.epochs=x", f"{RID}:schedule.epochs=1.5",
                 f"{RID}:schedule.epochs=-2", f"{RID}:schedule.epochs=", f"{RID}:schedule.epochs",
@@ -314,7 +330,7 @@ def test_tiny_registry_validates(tmp_path, reg):
     assert fr.registry_problems(reg, root=tmp_path) == []
     assert (tmp_path / "configs" / "full" / "data-p01.json").is_file()
     loaded = fr.load_registry(reg, root=tmp_path)
-    assert set(loaded["boxes"]) == set(fr.BOX_NAMES)
+    assert set(loaded["boxes"]) == {"full-smoke", "p01", "full", "smoke-b"} < set(fr.BOX_NAMES)  # the four of section 7
     assert fr.load_registry(loaded, root=tmp_path) == loaded  # filling the defaults again changes nothing
     # every value a box env or command line carries is one env-string word (launch.env_string's rule)
     for b in loaded["boxes"].values():
@@ -441,6 +457,9 @@ RULES = {
     "watchdog without orphan_s": (lambda r: _box(r, "p01").update(watchdog={"action": "stop"}), r"watchdog"),
     "gate not a bool": (lambda r: _box(r, "p01").update(gate="yes"), r"gate 'yes'"),
     "max_attempts 0": (lambda r: _box(r, "p01").update(max_attempts=0), r"max_attempts 0"),
+    "min_ram_gb 0": (lambda r: _box(r, "p01").update(min_ram_gb=0), r"min_ram_gb 0 is not null or a number > 0"),
+    "min_ram_gb -1": (lambda r: _box(r, "p01").update(min_ram_gb=-1), r"min_ram_gb -1 is not null"),
+    "min_ram_gb x": (lambda r: _box(r, "p01").update(min_ram_gb="x"), r"min_ram_gb 'x' is not null"),
     "no items": (lambda r: _box(r, "p01").update(items=[]), r"items"),
     "duplicate item name": (lambda r: _box(r, "p01")["items"].append(dict(_item(r, "p01", "m4-full-p01"))),
                             r"given twice"),

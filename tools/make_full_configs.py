@@ -5,10 +5,11 @@ tools/make_study_configs.py makes it (run_config(study_run): the trainer part of
 study/data.json, the study's settings; the queue fills max_steps, lr and the mini cadence left null), then:
   1. the data keys (kitsune.fullrun DATA_KEYS) replaced whole by the run's data block: kitsune.fullrun FULL_DATA (the
      full selection labels/full/selections/full_study/full.parquet with its dev slice, the full extent, the full_study
-     recipe) or SMOKE_DATA (the smoke selection on the study extent: a seeded 100 h train draw with its own dev slice),
-     with pull_parakeet true (both label roots) except on full-p01, which box 1 trains on the Parakeet labels alone
-     (the key left out: the box pulls parakeet_out for every stem and teacher_out for the eval stems only, fix 9);
-  2. the student's row of FULL_RUNS: the epochs clock (schedule.epochs 3/3/4/4, no max_steps), the study's warm-up,
+     recipe) or SMOKE_DATA (the smoke selection on the study extent: a seeded 100 h train draw with its own dev slice,
+     pull_parakeet true: both label roots). No full run pulls both roots (pull_parakeet left out): each box pulls one
+     family's labels (kitsune.extent.pull_plan): box p01 and box full-p (data-p01, data-p: ctc) parakeet_out for every
+     stem and teacher_out for the eval stems only (fix 9), box full-t (data-t: aed) teacher_out for every stem;
+  2. the student's row of FULL_RUNS: the epochs clock (schedule.epochs: FULL_RUNS, no max_steps), the study's warm-up,
      optim.lr, the micro-batch and the step audio (the study's REALISED audio per step at the new micro-batch,
      measured with tools/full_plan.py: FULL_RUNS' step values realise it within 0.01 % on full.parquet, PLAN_FILE),
      eval.dev.greedy (the P students' argmax is free, T-0.6B's decode is not), schedule.end_reserve_min (the
@@ -21,26 +22,36 @@ study/data.json, the study's settings; the queue fills max_steps, lr and the min
      step, metrics/scalars.parquet at the close only, and the early stop on dev_ce (mean of 5, patience 6, at least 5
      values, action cooldown, the test sets refused). Everything else stays the study's (BN, L2-SP 0, aux-CTC 0, w_ctc
      0.8, SpecAugment, the smoke block, seed 1234, verdict v2).
-  smoke-<x> is full-<x> with SMOKE (the smoke data, the same epochs: the 100 h draw is the budget; no complete evals
-  in the loop and a 100-row greedy subset at the end; minis every 100 steps; 60 dev rows per source; full states every
-  5 min and timed states every 10 min (smoke-p01: 3 and 3, so the wipe fault's second attempt uploads one); log syncs
-  every 10 min (smoke-p01: 5) with every step row full; a 2 min end reserve and 4d checked every 10 steps over a
-  20-step window), memory.probe_shapes = the full data's worst micro-batches of the matching student (PLAN_FILE, so
-  the smoke's memory probe sees box 1's and box 2's worst shapes), and on smoke-t06 and smoke-p03 a forced early stop
-  (early_stop.min_delta_abs 1e9: no dev eval can improve by that; smoke-t06 with patience 8, so it still ends after
-  300 steps or more, smoke check 2's VRAM window).
+  smoke-<x> is full-<x> with SMOKE (the smoke data, SMOKE_EPOCHS: the epochs smoke A ran, 3/3/4/4, whatever the full
+  runs' are now - the 100 h draw is the budget, and its plan_total_steps are the full runs' at those epochs; no complete
+  evals in the loop and a 100-row greedy subset at the end; minis every 100 steps; 60 dev rows per source; full states
+  every 5 min and timed states every 10 min (smoke-p01: 3 and 3, so the wipe fault's second attempt uploads one); log
+  syncs every 10 min (smoke-p01: 5) with every step row full; a 2 min end reserve and 4d checked every 10 steps over a
+  20-step window), memory.probe_shapes = the full data's worst micro-batches of the matching student (PLAN_FILE, so the
+  smoke's memory probe sees box 1's and box 2's worst shapes), and on smoke-t06 and smoke-p03 a forced early stop
+  (early_stop.min_delta_abs 1e9: no dev eval can improve by that; smoke-t06 with patience 8, so it still ends after 300
+  steps or more, smoke check 2's VRAM window).
 
 Data configs (launch's --config and bootstrap's KITSUNE_CONFIG: what a box rebuilds and pulls; no trainer settings):
-  data-p01      FULL_DATA + family ctc (box 1: CTC only, no pull_parakeet)
-  data-full     FULL_DATA + pull_parakeet true (box 2: both families)
+  data-p01      FULL_DATA + family ctc (box p01: box 1 and P-0.1B's continuation, CTC only, no pull_parakeet)
+  data-t        FULL_DATA + family aed (box full-t: T-0.6B; teacher_out for every stem, no Parakeet labels)
+  data-p        FULL_DATA + family ctc (box full-p: P-0.3B, P-0.05B, the Whisper and quant pool; data-p01's content)
+  data-full     FULL_DATA + pull_parakeet true (both families; the retired 2x box 2's, no registry box uses it: kept
+                for scripts/make_selection.py's full mode and a box whose labels need both roots)
   data-smoke    SMOKE_DATA + pull_parakeet true (smoke A)
   data-smoke-b  study/data.json's data keys verbatim (smoke B: the frozen study selection, so every study-weight eval,
                 speed probe and Whisper eval of the box shares one eval store)
 
 Inputs besides the two generators' own: PLAN_FILE (configs/full/plan/full_study.json, in a folder of its own so every
-configs/full/*.json is a config), the JSON tools/full_plan.py wrote for full.parquet and smoke.parquet (--import-plan
-records a new measurement; the local selection paths become the repo paths). The generator refuses a record measured
-with other step values than FULL_RUNS'. It gives the smoke configs' probe shapes, and the numbers the hand-written
+configs/full/*.json is a config), the JSON tools/full_plan.py wrote for full.parquet and smoke.parquet at SMOKE_EPOCHS
+(its "full" and "smoke" parts; --import-plan records a new measurement; the local selection paths become the repo
+paths), and its "launch" part: tools/full_plan.py on full.parquet at the epochs the boxes run now (FULL_RUNS; P-0.1B at
+its continuation's CONTINUATIONS epochs), --import-launch-plan:
+  python tools/full_plan.py --selection <full.parquet> --student t06=aed:450:1730:<E> --student p03=ctc:600:1350:<E>
+      --student p005=ctc:1600:1500:<E> --student p01=ctc:1600:1500:8 --json plan_launch.json
+  python tools/make_full_configs.py --import-launch-plan plan_launch.json
+The generator refuses a record measured with other step values or epochs. It gives the smoke configs' probe shapes
+(from "full": the smoke ran those epochs), the boxes' step counts (from "launch"), and the numbers the hand-written
 registry must carry (registry_numbers), which tests/test_full_configs.py checks: the full runs' plan_total_steps (the
 smoke train items', for smoke check 3), their plan_hours = plan v3's hours at the step count measured on full.parquet
 (PLAN_V3: hours x measured T / plan T, 2 decimals; also the full train items' max_hours until box 1's speed replaces
@@ -48,26 +59,27 @@ them), and F4's seconds, the deadline fault of smoke-p005 (deadline_fault_s). Af
 full_plan.py --json on full.parquet and on smoke.parquet, --import-plan with both (it prints what boxes.json must be
 changed in), then those numbers into boxes.json by hand, then --check and the tests.
 
-Box full's hours (box 2): SPEED_FILE (configs/full/plan/box2_hours.json, --import-speed) records the measured speeds
-box2_hours projects them from: smoke A's per-student s/step (smoke verdict check 3) and, after box 1, box 1's s/step,
-in-run overhead, CTC store and bootstrap hours (tools/box1_go.py --json). It prints, and --check holds, box full's
-train items' max_hours and its est_hours / max_hours (smoke only: provisional; the PR after box 1 adds box 1's part,
-contract 7).
+The boxes' hours (HOURS_BOXES: box full-t, box full-p and box p01's continuation): SPEED_FILE (configs/full/plan/
+box2_hours.json, --import-speed) records the measured speeds box_hours projects them from: smoke A's per-student s/step
+(smoke verdict check 3) and box 1's s/step, in-run overhead, CTC store and bootstrap hours (tools/box1_go.py --json,
+at the runs-repo revision of box 1's 4-epoch record). It prints, and --check holds, each box's train items' max_hours
+and its est_hours / max_hours.
 
 configs/full/boxes.json, the box registry (kitsune/fullrun.py), is hand-written; --check validates it with
 fullrun.registry_problems (every data and item config present, its data keys equal to its box's data config's; the
 chained box p01-chain's rules of contract addendum E.1.4: its parts, hours and watchdogs, each part's extent within its
 stage's rebuild config and stage 1's within stage 2's), checks that every readout of a full box fits in its run's end
 reserve (readout_reserve_problems; a chain has no items, its parts are checked) and that the numbers bound to the plan
-record equal it (registry_drift: smoke A's plan_total_steps / plan_hours, F4's seconds, box 1's train hours; box
-full's hours to the speed record; the chain's own hours are addendum E.6's and tests/test_full_configs.py checks them
-against its parts).
+record equal it (registry_drift: smoke A's plan_total_steps / plan_hours and F4's seconds; the HOURS_BOXES' hours to
+the speed record; the chain's own hours are addendum E.6's and tests/test_full_configs.py checks them against its
+parts).
 
 Usage:
   python tools/make_full_configs.py                  # write configs/full/*.json (and remove stale generated ones)
   python tools/make_full_configs.py --check          # exit 1 if a committed file differs or the registry is invalid
   python tools/make_full_configs.py --import-plan full_plan_full.json full_plan_smoke.json   # a new measurement
-  python tools/make_full_configs.py --import-speed --smoke-verdict smoke_verdict.json      # box 2's hours (smoke A)
+  python tools/make_full_configs.py --import-launch-plan plan_launch.json                   # the boxes' epochs
+  python tools/make_full_configs.py --import-speed --smoke-verdict smoke_verdict.json      # the hours (smoke A)
   python tools/make_full_configs.py --import-speed --box1-go box1_go.json                  # ... and box 1's
 """
 import argparse
@@ -96,18 +108,37 @@ STUDY_DATA = ROOT / "study" / "data.json"
 
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
-# eval.dev.greedy, whether the run pulls both label roots (full-p01: box 1 has the Parakeet labels only) and
-# schedule.end_reserve_min (end_reserve: the trainer's default 30, full-t06 55; READOUT_RESERVE below)
+# eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
+# data-p / data-p01) and schedule.end_reserve_min (end_reserve: the trainer's default 30, full-t06 55; READOUT_RESERVE
+# below). EPOCHS: DECISIONS G1, confirmed by the owner on 2026-10-02 (~11:30Z, "3 / 3 / 5" after the epoch analysis,
+# D:/kitsune-tmp/fullbuild/epochs/RECOMMENDATION.md): T-0.6B 3, P-0.3B 3, P-0.05B 5, each with COMMON's early-stop
+# patience. The owner's earlier request of the same day to plan 10 epochs for these runs was WITHDRAWN after that
+# analysis (DECISIONS G "Rejected: 10 epochs"). P-0.1B's run stays box 1's 4 epochs, its continuation's 8 (patience
+# 12, G3) are CONTINUATIONS'. This is the one epoch parameter: a change here, then --import-launch-plan of a
+# full_plan.py record at the new epochs, then the printed hours (--import-speed) into boxes.json
 FULL_RUNS = {
     "t06": dict(study_run="study-t06", epochs=3, warmup=300, lr=2e-4, micro=450, step=1730, dev_greedy=False,
-                pull_parakeet=True, end_reserve=55),
+                pull_parakeet=False, end_reserve=55),
     "p03": dict(study_run="study-p03", epochs=3, warmup=300, lr=2e-4, micro=600, step=1350, dev_greedy=True,
-                pull_parakeet=True, end_reserve=30),
+                pull_parakeet=False, end_reserve=30),
     "p01": dict(study_run="study-p01", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
                 pull_parakeet=False, end_reserve=30),
-    "p005": dict(study_run="study-p005", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
-                 pull_parakeet=True, end_reserve=30),
+    "p005": dict(study_run="study-p005", epochs=5, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
+                 pull_parakeet=False, end_reserve=30),
 }
+# the epochs smoke A ran (2026-10-01): the smoke configs keep them (the 100 h draw is the smoke's budget), and the plan
+# record's "full" and "smoke" parts are measured at them (smoke A's check 3 projected the full runs at these T; F4's
+# seconds come from smoke-p005's), so neither moves when the full runs' epochs do
+SMOKE_EPOCHS = {"t06": 3, "p03": 3, "p01": 4, "p005": 4}
+# the smoke configs' data block: before box 2's split every full run but full-p01 pulled both roots, and the smoke
+# config is built from the full one, so pull_parakeet sat at the study config's position in smoke-t06/p03/p005 and at
+# the end of smoke-p01; building them from this keeps every smoke config byte-identical (smoke A ran them)
+SMOKE_BASE_PULL = ("t06", "p03", "p005")
+# P-0.1B's continuation (DECISIONS G3): box p01 again, launched with --resume-reset run_id --resume-set
+# run_id:schedule.epochs=<epochs> --resume-set run_id:early_stop.patience=<patience>; from_step is the pre_cooldown
+# state it goes on from (checkpoints/full_step_86328), the 4-epoch record stays runs-repo revision c4604304 (G4)
+CONTINUATIONS = {"p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=8,
+                             patience=12, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
 # READOUT_RESERVE. A readout runs right after its training item on the same GPU (Resolution 25) under the same
 # KITSUNE_DEADLINE (kitsune.full_queue item_deadline: the box deadline less deadline_reserve_min). After a run that the
 # deadline cooldown (4d) shortened, 04_distill.fit_epochs_deadline has planned the end phase to finish
@@ -159,21 +190,24 @@ PLAN_V3 = {"t06": (35.19, 73452), "p03": (22.29, 109608), "p01": (13.56, 110520)
 DEADLINE_FAULT_ITEM, DEADLINE_FAULT_STUDENT = "smoke-p005", "p005"
 DEADLINE_FAULT_SHARE, DEADLINE_FAULT_ROUND_S = 0.5, 10  # contract 7: S <= 0.5 x the projected run time
 
-# BOX 2'S HOURS (contract 7 "item hours after box 1", 12.5, Resolution 31). Box full's train items' max_hours and its
-# est_hours / max_hours are projected from MEASURED speeds, recorded in SPEED_FILE (written by --import-speed, never by
-# hand): smoke A's median steady s/step per student (smoke verdict check 3's sec_per_step, the only measurement of
-# T-0.6B, P-0.3B and P-0.05B at the full configs' batches) and, once box 1 has ended, box 1's own (tools/box1_go.py
-# --json). Box 1 trains P-0.1B only, so the contract's refresh is a transfer anyway: every student's smoke s/step x r,
-# r = box 1's steady s/step / smoke A's of P-0.1B (the host and full-data effect; 1 without box 1), and box 1's in-run
-# overhead o replaces the plan's 0.08. Until box 1's part exists the record is smoke-only and boxes.json says
-# "provisional" (launch prints a warning). The owner's box-2 preparation (DECISIONS F, 2026-10-01) refreshed them from
-# the smoke before box 1 ended, so box 2's cap and cost line no longer carry plan v3's step times, which smoke check 3
-# found 1.6-1.9x too slow; the PR after box 1 adds box 1's part (contract 7's own step).
-# The run model is plan v3's (calc_v3.run_h): steps x s/step x (1 + o) + the run's fixed time (start-up, memory probe,
-# first and final complete evals, end phase) + its dev checks (every COMMON eval.dev.every_epochs epoch).
-SPEED_FILE = "plan/box2_hours.json"  # under OUT_DIR, next to PLAN_FILE
-BOX2 = "full"
-BOX2_TRAIN = ("t06", "p03", "p005")
+# THE BOXES' HOURS (contract 7 "item hours after box 1", 12.5, Resolution 31; DECISIONS G2/G3). The HOURS_BOXES' train
+# items' max_hours and their est_hours / max_hours are projected from MEASURED speeds, recorded in SPEED_FILE (written
+# by --import-speed, never by hand): smoke A's median steady s/step per student (smoke verdict check 3's sec_per_step,
+# the only measurement of T-0.6B, P-0.3B and P-0.05B at the full configs' batches) and box 1's own (tools/box1_go.py
+# --json --revision <its 4-epoch record>). Box 1 trained P-0.1B only, so the refresh is a transfer: every student's
+# smoke s/step x r, r = box 1's steady s/step / smoke A's of P-0.1B (the host and full-data effect, 1.036; 1 without
+# box 1), and box 1's in-run overhead o (0.0465) replaces the plan's 0.08. Without box 1's part the record is
+# smoke-only and launch warns that the hours are provisional.
+# The run model is plan v3's (calc_v3.run_h): steps x s/step x r x (1 + o) + the run's fixed time (start-up, memory
+# probe, first and final complete evals, end phase) + its dev checks (every COMMON eval.dev.every_epochs epoch). It
+# reproduces box 1 (9.16 h modelled vs 9.152 h measured) and so already holds box 1's 0.305 / 0.2715 s/step (x 1.124,
+# evals included): that factor is r x (1 + o) plus the fixed and dev-check time, and must not be applied again. The
+# steps are plan["launch"]'s (full.parquet at the epochs the boxes run now); a continuation runs from its pre_cooldown
+# step to its new T, with the dev checks of the epochs left.
+SPEED_FILE = "plan/box2_hours.json"  # under OUT_DIR, next to PLAN_FILE (launch's SPEED_RECORD names it)
+# the boxes whose hours are box_hours of the speed record (DECISIONS G2/G3: box 2 as two 1x RTX 5090 boxes, T and P, and
+# P-0.1B's continuation on box p01): their train runs, in queue order, or the continuation
+HOURS_BOXES = {"full-t": ("t06",), "full-p": ("p03", "p005"), "p01": "continuation"}
 OVERHEAD_PLAN = 0.08  # calc_v3 o (central): evals, saves, uploads and loader stalls on top of the steady step [X]
 FIXED_S = {"t06": 435, "p03": 348, "p005": 820, "p01": 837}  # calc_v3 fixed [M + X]
 DEV_CHECK_S = {"t06": 9.6, "p03": 9.2, "p005": 8.4, "p01": 8.5}  # calc_v3 DEV_CHECK_S, A100 = 5090 [X]
@@ -184,20 +218,27 @@ DEV_CHECK_S = {"t06": 9.6, "p03": 9.2, "p005": 8.4, "p01": 8.5}  # calc_v3 DEV_C
 SETUP_H = {"central": 1.6, "pess": 3.3}
 STORES_H = {"central": 1.37, "pess": 1.91}  # calc_v3 setup_parts stores (both stores, full extent) [X]
 AED_STORE_SHARE = 0.5  # the AED store's time / the CTC store's: smoke A's stores-aed 0.33 min / stores-ctc 0.67 [M]
-STORES_PESS = 1.91 / 1.37  # a box-1 record's measured CTC store: central x (1 + AED_STORE_SHARE), pessimistic x this
-# after T-0.6B on its GPU: m4-full-t06 (smoke: 1.3 min on the 100 h run's eval sets, which are the full ones), the 7
-# T quant readouts (smoke-B #1: 0.7-1.5 min each on P-0.3B, T ~3x) over the two idle GPUs, the re-time pair (~1 min)
-# [M + X]; the worst case also holds the last quant item's whole 0.75 h max_hours (the no-start rule's need)
-POST_T06_H, POST_T06_MAX_H = 0.3, 1.2
-# the other GPU's eval pool: the P M4 readouts, 14 P and 7 P-0.1B quant readouts (smoke-B #1: 0.65-1.0 min each) and
-# the four Whisper models on all five sets (whisper-large-v3: 5,000 JSUT rows in 3.2 min; ~25 min for all four) [M + X]
-POOL_B_H = 1.2
+STORES_PESS = 1.91 / 1.37  # a box-1 record's measured CTC store: central x 1, pessimistic x this
+# ONE store per box (each box pulls one family's labels): box 1's measured CTC store (0.548 h), the AED-only store of
+# box full-t taken as equal [X] (smoke A's AED store took half the CTC one's time, but on the full extent T-0.6B's
+# targets are 10 GiB of tokens); without a box-1 record calc_v3's both-stores time / (1 + AED_STORE_SHARE)
+# the tails, (central, worst) hours after each box's last run [M + X]; the worst case also holds the last droppable
+# item's whole max_hours (the no-start rule's need):
+#   box full-t: m4-full-t06 (smoke: 1.3 min on the 100 h run's eval sets, which are the full ones), 7 T quant readouts
+#               (smoke-B #1: 0.7-1.5 min each on P-0.3B, T ~3x) and the decision-22 re-time pair (~1 min), one GPU
+#   box full-p: 2 M4 readouts, 14 P quant readouts (smoke-B #1: 0.65-1.0 min each) and the four Whisper models on all
+#               five sets (whisper-large-v3: 5,000 JSUT rows in 3.2 min; ~25 min for all four), one GPU
+#   box p01:    m4-full-p01 and 7 P-0.1B quant readouts, plus resume-pull and check-resume before the stores
+POST_T_H = (0.6, 1.35)
+POOL_P_H = (0.9, 1.65)
+P01_TAIL_H = (0.2, 0.5)
+CONT_PULL_H = (0.1, 0.3)
 END_H = 0.35  # calc_v3 end: finish's uploads and the destroy
 # max_hours' host margin: smoke A ran on a Ryzen 9950X (calc_v3's "fast" CPU class); calc_v3's pessimistic T-0.6B
 # epoch is 13.635 / 10.846 = 1.26 x its fast one (box 2's only 2x offer on 2026-10-01, m54650, a Zen2 EPYC, is
 # blocklisted since: any slow-CPU host is what it stands for)
 HOST_PESS = 1.26
-STALL_RECOVERY_H = 1.25  # one stall of T-0.6B: stall_min 45 + up to 30 min of progress since its last full state
+STALL_RECOVERY_H = 1.25  # one trainer stall: stall_min 45 + up to 30 min of progress since its last full state
 
 
 class PlanError(ValueError):
@@ -205,46 +246,66 @@ class PlanError(ValueError):
 
 
 class SpeedError(ValueError):
-    """SPEED_FILE is malformed, or an --import-speed input lacks what box2_hours needs."""
+    """SPEED_FILE is malformed, or an --import-speed input lacks what box_hours needs."""
 
 
 # ------------------------------------------------------------------------------------------------ the plan record
 
 
-def _plan_want(x: str) -> dict:
+def launch_epochs(x: str) -> int:
+    """The epochs box x's run is planned for now: FULL_RUNS', or its continuation's (P-0.1B: 8)."""
+    cont = next((c for c in CONTINUATIONS.values() if c["student"] == x), None)
+    return int(cont["epochs"] if cont else FULL_RUNS[x]["epochs"])
+
+
+def _plan_want(x: str, epochs: int) -> dict:
     r = FULL_RUNS[x]
     return dict(family="aed" if x.startswith("t") else "ctc", micro_audio_s=float(r["micro"]),
-                step_audio_s=float(r["step"]), epochs=int(r["epochs"]))
+                step_audio_s=float(r["step"]), epochs=int(epochs))
 
 
 def plan_problems(plan) -> list[str]:
     """Why a PLAN_FILE record cannot serve the generator: {"full": <tools/full_plan.py JSON of full.parquet>,
-    "smoke": <the same of smoke.parquet>}, each at the repo's selection path, measured for every FULL_RUNS student
-    with its family, micro-batch, step and epochs, with total_steps (and worst_shapes on full.parquet)."""
+    "smoke": <the same of smoke.parquet>} measured at SMOKE_EPOCHS, and "launch": <the same of full.parquet> at
+    launch_epochs (FULL_RUNS', a continuation's), each at the repo's selection path (launch: the same file as full, by
+    its sha256), measured for every FULL_RUNS student with its family, micro-batch, step and epochs, with total_steps
+    (steps_per_epoch on launch: a continuation's dev checks; worst_shapes on full.parquet)."""
     if not isinstance(plan, dict):
         return [f"not an object: {type(plan).__name__}"]
     p = []
-    for which, sel in (("full", fullrun.FULL_SELECTION), ("smoke", fullrun.SMOKE_SELECTION)):
+    for which, sel in (("full", fullrun.FULL_SELECTION), ("smoke", fullrun.SMOKE_SELECTION),
+                       ("launch", fullrun.FULL_SELECTION)):
         rec = plan.get(which)
         if not isinstance(rec, dict):
-            p.append(f"{which}: no tools/full_plan.py record")
+            p.append(f"{which}: no tools/full_plan.py record" + (" (make_full_configs --import-launch-plan)"
+                                                                  if which == "launch" else ""))
             continue
         got_sel = (rec.get("selection") or {}).get("path")
         if got_sel != sel:
             p.append(f"{which}: measured on {got_sel!r}, not {sel}")
+        if which == "launch" and isinstance(plan.get("full"), dict):
+            a, b = (rec.get("selection") or {}).get("sha256"), (plan["full"].get("selection") or {}).get("sha256")
+            if a != b:
+                p.append(f"launch: measured on a full.parquet of sha256 {a!r}, the full part's is {b!r}")
         students = rec.get("students") if isinstance(rec.get("students"), dict) else {}
         for x in FULL_RUNS:
             s = students.get(x)
             if not isinstance(s, dict):
                 p.append(f"{which}: no student {x}")
                 continue
-            want = _plan_want(x)
+            ep, src = (launch_epochs(x), "FULL_RUNS / CONTINUATIONS") if which == "launch" else (SMOKE_EPOCHS[x],
+                                                                                                 "SMOKE_EPOCHS")
+            want = _plan_want(x, ep)
             if diff := {k: s.get(k) for k in want if s.get(k) != want[k]}:
-                p.append(f"{which}.{x}: measured with {diff}, FULL_RUNS says {({k: want[k] for k in diff})}")
+                p.append(f"{which}.{x}: measured with {diff}, {src} says {({k: want[k] for k in diff})}")
             if not (isinstance(s.get("total_steps"), int) and s["total_steps"] > 0):
                 p.append(f"{which}.{x}: total_steps {s.get('total_steps')!r}")
             if which == "full" and not (isinstance(s.get("worst_shapes"), list) and s["worst_shapes"]):
                 p.append(f"{which}.{x}: no worst_shapes")
+            spe = s.get("steps_per_epoch")
+            if which == "launch" and not (isinstance(spe, list) and len(spe) == ep and all(
+                    isinstance(v, int) and v > 0 for v in spe) and sum(spe) == s.get("total_steps")):
+                p.append(f"{which}.{x}: steps_per_epoch {spe!r} is not {ep} counts summing to total_steps")
     return p
 
 
@@ -260,8 +321,14 @@ def load_plan(out_dir: Path = OUT_DIR) -> dict:
 
 
 def plan_total_steps(x: str, plan: dict) -> int:
-    """The full run's T on full.parquet (plan_epochs pins it at the start): the registry's smoke plan_total_steps."""
+    """The full run's T on full.parquet at SMOKE_EPOCHS (plan_epochs pins it at the start): the registry's smoke
+    plan_total_steps (smoke check 3's projection)."""
     return int(plan["full"]["students"][x]["total_steps"])
+
+
+def launch_total_steps(x: str, plan: dict) -> int:
+    """The T box x's run plans now: full.parquet at launch_epochs (plan["launch"])."""
+    return int(plan["launch"]["students"][x]["total_steps"])
 
 
 def plan_hours(x: str, plan: dict) -> float:
@@ -311,7 +378,7 @@ def _up(x: float, step: float) -> float:
 
 
 def speed_problems(rec) -> list[str]:
-    """Why a SPEED_FILE record cannot serve box2_hours: {"smoke": {..., "sec_per_step": {<every FULL_RUNS student>:
+    """Why a SPEED_FILE record cannot serve box_hours: {"smoke": {..., "sec_per_step": {<every FULL_RUNS student>:
     s > 0}}, "box1": null | {..., "sec_per_step": s > 0, "overhead": 0 <= o < 1 | null, "stores_ctc_h": h > 0 | null,
     "bootstrap_h": h > 0 | null}}."""
     if not isinstance(rec, dict):
@@ -354,38 +421,76 @@ def load_speed(out_dir: Path = OUT_DIR) -> dict | None:
     return rec
 
 
-def box2_hours(plan: dict, rec: dict, reserve_min: float = 60) -> dict:
-    """Box full's hours from the plan record's step counts and a SPEED_FILE record (the model above; reserve_min: the
-    box's deadline_reserve_min). Returns run_h (every FULL_RUNS student's run, P-0.1B's as box 1's cross-check), items
-    (box full's train items' max_hours), the setup and stores hours (central, pessimistic), the two GPU lanes, the
-    box's est_hours (the longer lane) and max_hours (the pessimistic T-0.6B path + its worst tail + the deadline
-    reserve + one stall), and T-0.6B's pessimistic slack before its deadline-cooldown point."""
+def _run_h(steps: float, sps: float, r: float, o: float, fixed_s: float, dev_checks: float, dev_s: float) -> float:
+    """Plan v3's run model (calc_v3.run_h): steps x s/step x r x (1 + o) + fixed + dev checks, hours rounded up."""
+    return _up((steps * sps * r * (1 + o) + fixed_s + dev_checks * dev_s) / 3600, 0.01)
+
+
+def continuation_run(name: str, plan: dict, rec: dict) -> dict:
+    """A continuation's run (CONTINUATIONS[name]): the steps from its pre_cooldown state to its new T on full.parquet
+    (plan["launch"] at its epochs), the dev checks of the epochs left, and its hours by the run model."""
+    c = CONTINUATIONS[name]
+    x = c["student"]
+    sps, b1 = rec["smoke"]["sec_per_step"], rec.get("box1")
+    r = b1["sec_per_step"] / sps["p01"] if b1 else 1.0
+    o = b1["overhead"] if b1 and b1.get("overhead") is not None else OVERHEAD_PLAN
+    st = plan["launch"]["students"][x]
+    T = int(st["total_steps"])
+    done_epochs = c["from_step"] / (T / len(st["steps_per_epoch"]))
+    checks = (c["epochs"] - done_epochs) / COMMON["eval"]["dev"]["every_epochs"]
+    return dict(student=x, total_steps=T, steps=T - c["from_step"], dev_checks=round(checks, 2),
+                hours=_run_h(T - c["from_step"], sps[x], r, o, FIXED_S[x], checks, DEV_CHECK_S[x]))
+
+
+def box_hours(plan: dict, rec: dict, box: str, reserve_min: float = 60) -> dict:
+    """Box `box`'s hours (HOURS_BOXES) from the plan record's launch step counts and a SPEED_FILE record (the model
+    above; reserve_min: the box's deadline_reserve_min). One GPU, one queue: setup, its one store, its runs in order
+    (a continuation: continuation_run), its tail and the end. Returns r, o, run_h (every FULL_RUNS student's run at
+    launch_epochs, P-0.1B's from step 0 as a cross-check), items (the box's train items' max_hours), setup_h, store_h
+    and tail_h as (central, pessimistic), est_hours (the central path) and max_hours (the pessimistic setup and store,
+    the runs x HOST_PESS, the worst tail, the deadline reserve and one stall), and slack_h: what the pessimistic path
+    leaves before the last run's deadline-cooldown point."""
     sps, b1 = rec["smoke"]["sec_per_step"], rec.get("box1")
     r = b1["sec_per_step"] / sps["p01"] if b1 else 1.0
     o = b1["overhead"] if b1 and b1.get("overhead") is not None else OVERHEAD_PLAN
     dev_every = COMMON["eval"]["dev"]["every_epochs"]
-    runs = {}
-    for x in FULL_RUNS:
-        steps_h = plan_total_steps(x, plan) * sps[x] * r * (1 + o) / 3600
-        runs[x] = _up(steps_h + (FIXED_S[x] + FULL_RUNS[x]["epochs"] / dev_every * DEV_CHECK_S[x]) / 3600, 0.01)
+    run_h = {x: _run_h(launch_total_steps(x, plan), sps[x], r, o, FIXED_S[x], launch_epochs(x) / dev_every,
+                       DEV_CHECK_S[x]) for x in FULL_RUNS}
     setup_c, setup_p = SETUP_H["central"], SETUP_H["pess"]
-    stores_c, stores_p = STORES_H["central"], STORES_H["pess"]
     if b1 and b1.get("bootstrap_h"):
         setup_p = max(setup_p, round(b1["bootstrap_h"] + 0.2, 2))
-    if b1 and b1.get("stores_ctc_h"):
-        stores_c = round(b1["stores_ctc_h"] * (1 + AED_STORE_SHARE), 2)
-        stores_p = round(stores_c * STORES_PESS, 2)
-    ctc_c = stores_c / (1 + AED_STORE_SHARE)
-    lane_a = setup_c + stores_c + runs["t06"] + POST_T06_H + END_H  # the stores, then T-0.6B and its tail
-    lane_b = setup_c + ctc_c + runs["p03"] + runs["p005"] + POOL_B_H + END_H  # P-0.3B, P-0.05B, the eval pool
-    t06_end_p = setup_p + stores_p + runs["t06"] * HOST_PESS
-    mx = _up(t06_end_p + POST_T06_MAX_H + reserve_min / 60 + STALL_RECOVERY_H, 1)
-    # 4d plans T-0.6B's cooldown to end its end_reserve_min before KITSUNE_DEADLINE (the box's less reserve_min)
-    slack = mx - reserve_min / 60 - FULL_RUNS["t06"]["end_reserve"] / 60 - t06_end_p
-    return dict(r=round(r, 4), o=o, run_h=runs, items={f"full-{x}": runs[x] for x in BOX2_TRAIN},
-                setup_h=(setup_c, setup_p), stores_h=(stores_c, stores_p),
-                lanes={"A": round(lane_a, 2), "B": round(lane_b, 2)}, est_hours=_up(max(lane_a, lane_b), 0.1),
-                max_hours=int(mx), t06_slack_h=round(slack, 2))
+    store_c = b1["stores_ctc_h"] if b1 and b1.get("stores_ctc_h") else STORES_H["central"] / (1 + AED_STORE_SHARE)
+    store_p = round(store_c * STORES_PESS, 2)
+    runs = HOURS_BOXES[box]
+    if runs == "continuation":
+        cont = next(n for n, c in CONTINUATIONS.items() if c["box"] == box)
+        cr = continuation_run(cont, plan, rec)
+        items = {f"full-{cr['student']}": cr["hours"]}
+        tail = (P01_TAIL_H[0] + CONT_PULL_H[0], P01_TAIL_H[1] + CONT_PULL_H[1])
+        last = cr["student"]
+    else:
+        cr = None
+        items = {f"full-{x}": run_h[x] for x in runs}
+        tail = POST_T_H if runs == ("t06",) else POOL_P_H
+        last = runs[-1]
+    train = sum(items.values())
+    est = _up(setup_c + store_c + train + tail[0] + END_H, 0.1)
+    pess_end = setup_p + store_p + train * HOST_PESS
+    mx = _up(pess_end + tail[1] + reserve_min / 60 + STALL_RECOVERY_H, 1)
+    # 4d plans the last run's cooldown to end its end_reserve_min before KITSUNE_DEADLINE (the box's less reserve_min)
+    slack = mx - reserve_min / 60 - FULL_RUNS[last]["end_reserve"] / 60 - pess_end
+    return dict(box=box, r=round(r, 4), o=o, run_h=run_h, items=items, continuation=cr,
+                setup_h=(setup_c, setup_p), store_h=(round(store_c, 3), store_p),
+                tail_h=tuple(round(t, 2) for t in tail),
+                est_hours=est, max_hours=int(mx), slack_h=round(slack, 2))
+
+
+def continuation_flags(name: str) -> list[str]:
+    """launch's flags of a continuation (CONTINUATIONS[name]): the reset and its two sets."""
+    c = CONTINUATIONS[name]
+    rid = c["run_id"]
+    return ["--resume-reset", rid, "--resume-set", f"{rid}:schedule.epochs={c['epochs']}", "--resume-set",
+            f"{rid}:early_stop.patience={c['patience']}"]
 
 
 def _smoke_record(verdict: dict, src) -> dict:
@@ -408,11 +513,12 @@ def import_speed(smoke_verdict: Path | None = None, box1_json: Path | None = Non
         old = load_speed(out_dir) or {}
     except SpeedError:
         old = {}
-    rec = {"_comment": "Box full's measured speeds (tools/make_full_configs.py --import-speed; never edited by hand): "
-                       "smoke: smoke A's verdict check 3 (median steady s/step per student at the full configs' "
-                       "batches); box1: box 1's measurement from tools/box1_go.py --json (null until box 1 ended: the "
-                       "hours are then provisional). make_full_configs.box2_hours projects box full's train items' "
-                       "max_hours and its est_hours / max_hours from it, and --check holds boxes.json to them.",
+    rec = {"_comment": "The full boxes' measured speeds (tools/make_full_configs.py --import-speed; never edited by "
+                       "hand): smoke: smoke A's verdict check 3 (median steady s/step per student at the full configs' "
+                       "batches); box1: box 1's measurement from tools/box1_go.py --json at the runs-repo revision of "
+                       "its 4-epoch record (null until box 1 ended: the hours are then provisional). "
+                       "make_full_configs.box_hours projects the HOURS_BOXES' train items' max_hours and their "
+                       "est_hours / max_hours from it, and --check holds boxes.json to them.",
            "smoke": old.get("smoke"), "box1": old.get("box1")}
     if smoke_verdict is not None:
         try:
@@ -437,15 +543,16 @@ def import_speed(smoke_verdict: Path | None = None, box1_json: Path | None = Non
 
 
 # the registry's numbers that must always equal the plan record's (registry_drift): smoke A's train items (smoke check
-# 3's projection), F4's seconds and box 1's train hours. Box full's train hours and its est / max hours are held to the
-# speed record instead (SPEED_FILE, box2_hours), when there is one
-PLAN_BOUND_BOXES = {"full-smoke": "smoke", "p01": "full"}
+# 3's projection) and F4's seconds. The HOURS_BOXES' train hours and their est / max hours are held to the speed
+# record instead (SPEED_FILE, box_hours), when there is one: box p01's too, since its continuation (box 1's own hours
+# were plan v3's)
+PLAN_BOUND_BOXES = {"full-smoke": "smoke"}
 
 
 def registry_drift(reg: dict, plan: dict, speed: dict | None = None) -> list[str]:
     """Where a loaded registry's plan-bound numbers (PLAN_BOUND_BOXES) differ from registry_numbers(plan), and, given a
-    speed record, where box full's differ from box2_hours: after --import-plan of a rebuilt selection or
-    --import-speed of a new measurement, what boxes.json must be changed in by hand."""
+    speed record, where the HOURS_BOXES' differ from box_hours: after --import-plan of a rebuilt selection,
+    --import-launch-plan or --import-speed of a new measurement, what boxes.json must be changed in by hand."""
     nums, p = registry_numbers(plan), []
     boxes = reg.get("boxes") or {}
     for box, prefix in PLAN_BOUND_BOXES.items():
@@ -466,19 +573,27 @@ def registry_drift(reg: dict, plan: dict, speed: dict | None = None) -> list[str
                     and f.get("seconds") != nums["deadline_fault_s"]:
                 p.append(f"boxes.{box}.faults.{f.get('id')}: seconds {f.get('seconds')}, the plan record gives "
                          f"{nums['deadline_fault_s']} (bound {nums['deadline_fault_bound_s']} s)")
-    if speed is not None and BOX2 in boxes:
-        box = boxes[BOX2]
-        h = box2_hours(plan, speed, reserve_min=box.get("deadline_reserve_min") or 60)
+    for bname in (HOURS_BOXES if speed is not None else ()):
+        if bname not in boxes:
+            continue
+        box = boxes[bname]
+        h = box_hours(plan, speed, bname, reserve_min=box.get("deadline_reserve_min") or 60)
         items = {it["name"]: it for it in box.get("items") or []}
         for name, want in h["items"].items():
             if name in items and items[name].get("max_hours") != want:
-                p.append(f"boxes.{BOX2}.items.{name}: {{'max_hours': {items[name].get('max_hours')}}}, the speed "
+                p.append(f"boxes.{bname}.items.{name}: {{'max_hours': {items[name].get('max_hours')}}}, the speed "
                          f"record gives {{'max_hours': {want}}}")
         got = {"est_hours": box.get("est_hours"), "max_hours": box.get("max_hours")}
         exp = {"est_hours": h["est_hours"], "max_hours": h["max_hours"]}
         if got != exp:
-            p.append(f"boxes.{BOX2}: {got}, the speed record gives {exp}")
+            p.append(f"boxes.{bname}: {got}, the speed record gives {exp}")
     return p
+
+
+def box1_wall(rec: dict) -> str:
+    """Box 1's measured training wall, for the cross-check line."""
+    b1 = rec.get("box1") or {}
+    return f"{b1['train_wall_h']:g} h measured" if _num(b1.get("train_wall_h")) else "not measured"
 
 
 def readout_reserve_problems(reg: dict, root: Path) -> list[str]:
@@ -541,10 +656,11 @@ def smoke_data() -> dict:
     return dict(copy.deepcopy(fullrun.SMOKE_DATA), pull_parakeet=True)
 
 
-def full_config(x: str, r: dict | None = None) -> dict:
-    """full-<x>: the study run's config with the full data, FULL_RUNS[x] and COMMON."""
+def full_config(x: str, r: dict | None = None, data: dict | None = None) -> dict:
+    """full-<x>: the study run's config with the full data (data: another data block in its place), FULL_RUNS[x] and
+    COMMON."""
     run = FULL_RUNS[x]
-    cfg = _with_data(study.run_config(run["study_run"], r, RUNS_REPO), full_data(x))
+    cfg = _with_data(study.run_config(run["study_run"], r, RUNS_REPO), full_data(x) if data is None else data)
     cfg = study._merge(cfg, COMMON)
     return study._merge(cfg, {
         "run_name": f"full-{x}",
@@ -556,8 +672,11 @@ def full_config(x: str, r: dict | None = None) -> dict:
 
 
 def smoke_config(x: str, plan: dict, r: dict | None = None) -> dict:
-    """smoke-<x>: full-<x> on the smoke data with SMOKE, the full data's worst shapes and the forced trigger."""
-    cfg = _with_data(full_config(x, r), smoke_data())
+    """smoke-<x>: full-<x> on the smoke data with SMOKE, SMOKE_EPOCHS, the full data's worst shapes and the forced
+    trigger."""
+    base = dict(copy.deepcopy(fullrun.FULL_DATA), pull_parakeet=True) if x in SMOKE_BASE_PULL else None
+    cfg = _with_data(full_config(x, r, data=base), smoke_data())
+    cfg = study._merge(cfg, {"schedule": {"epochs": SMOKE_EPOCHS[x]}})
     cfg = study._merge(cfg, SMOKE)
     cfg = study._merge(cfg, SMOKE_OVER.get(x, {}))
     cfg = study._merge(cfg, FORCED.get(x, {}))
@@ -572,7 +691,7 @@ def _study_data_keys() -> dict:
 
 
 def data_configs() -> dict[str, dict]:
-    """The four data configs (the registry's box data_config values)."""
+    """The data configs (the registry's box data_config values; data-full: no box's, kept)."""
     return {
         "data-p01": {"_comment": "Box p01's data config (box 1, P-0.1B alone; launch --config, bootstrap "
                                  "KITSUNE_CONFIG): the full selection and extent (kitsune.fullrun FULL_DATA), family "
@@ -580,9 +699,21 @@ def data_configs() -> dict[str, dict]:
                                  "teacher_out for the eval sets' eval stems only (kitsune.extent.pull_plan, fix 9). "
                                  "Generated by tools/make_full_configs.py.",
                      **copy.deepcopy(fullrun.FULL_DATA), "family": "ctc"},
-        "data-full": {"_comment": "Box full's data config (box 2, T-0.6B, P-0.3B, P-0.05B): the full selection and "
-                                  "extent (kitsune.fullrun FULL_DATA) with pull_parakeet true (both label roots for "
-                                  "every stem). Generated by tools/make_full_configs.py.",
+        "data-t": {"_comment": "Box full-t's data config (T-0.6B alone): the full selection and extent "
+                               "(kitsune.fullrun FULL_DATA), family aed and no pull_parakeet, so the box pulls "
+                               "teacher_out (Cohere's labels) for every stem and no Parakeet labels "
+                               "(kitsune.extent.pull_plan). Generated by tools/make_full_configs.py.",
+                   **copy.deepcopy(fullrun.FULL_DATA), "family": "aed"},
+        "data-p": {"_comment": "Box full-p's data config (P-0.3B, P-0.05B, the Whisper models and their quantised "
+                               "readouts): data-p01's content, family ctc and no pull_parakeet (parakeet_out for every "
+                               "stem, teacher_out for the eval stems: enough for the CTC store and the token eval "
+                               "store the readouts read). Generated by tools/make_full_configs.py.",
+                   **copy.deepcopy(fullrun.FULL_DATA), "family": "ctc"},
+        "data-full": {"_comment": "Both label roots (pull_parakeet true) on the full selection and extent "
+                                  "(kitsune.fullrun FULL_DATA): the retired 2x box 2's data config; no registry box "
+                                  "uses it since box 2 became boxes full-t and full-p (DECISIONS G2), kept for "
+                                  "scripts/make_selection.py's full mode and a box whose labels need both roots. "
+                                  "Generated by tools/make_full_configs.py.",
                       **copy.deepcopy(fullrun.FULL_DATA), "pull_parakeet": True},
         "data-smoke": {"_comment": "Box full-smoke's data config (smoke A): the smoke selection (a seeded 100 h train "
                                    "draw with its own dev slice) on the study extent (kitsune.fullrun SMOKE_DATA), "
@@ -673,23 +804,55 @@ def check(out_dir: Path = OUT_DIR) -> list[str]:
     return problems + speed_err + registry_check(out_dir, plan, speed)
 
 
+def _plan_json(src, sel: str) -> dict:
+    """A tools/full_plan.py JSON with its local selection path replaced by the repo path sel (PlanError when it was
+    measured on another file name)."""
+    rec = json.loads(Path(src).read_text(encoding="utf-8"))
+    path = str((rec.get("selection") or {}).get("path") or "").replace("\\", "/")
+    if path.rsplit("/", 1)[-1] != sel.rsplit("/", 1)[-1]:
+        raise PlanError(f"{src}: measured on {path!r}, not a {sel.rsplit('/', 1)[-1]}")
+    rec["selection"]["path"] = sel
+    return rec
+
+
+PLAN_COMMENT = ("tools/full_plan.py on the full-data selections (labels/full/selections/full_study/full.parquet and "
+                "smoke.parquet) at the smoke's epochs (SMOKE_EPOCHS), recorded by tools/make_full_configs.py "
+                "--import-plan, and on full.parquet at the boxes' epochs now (launch: FULL_RUNS, a continuation's), "
+                "--import-launch-plan: the tool's JSON, the local selection path replaced by the repo path. "
+                "make_full_configs reads the smoke configs' memory.probe_shapes (worst_shapes on full.parquet) and the "
+                "registry's plan_total_steps / plan_hours and the deadline fault's bound (registry_numbers) from full "
+                "and smoke, and the boxes' step counts (box_hours) from launch.")
+
+
+def import_launch_plan(launch_json: Path, out_dir: Path = OUT_DIR) -> dict:
+    """Record a tools/full_plan.py measurement of full.parquet at launch_epochs as PLAN_FILE's "launch" part (the
+    "full" and "smoke" parts stay as recorded: the smoke configs' probe shapes and the registry's smoke numbers do not
+    move). Refused (PlanError, nothing written) when the result fails plan_problems."""
+    f = Path(out_dir) / PLAN_FILE
+    try:
+        plan = json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise PlanError(f"{f}: not readable ({type(e).__name__}: {e}); --import-plan first") from None
+    plan["_comment"] = PLAN_COMMENT
+    plan["launch"] = _plan_json(launch_json, fullrun.FULL_SELECTION)
+    if problems := plan_problems(plan):
+        raise PlanError("; ".join(problems))
+    f.write_bytes(render(plan).encode("utf-8"))
+    return plan
+
+
 def import_plan(full_json: Path, smoke_json: Path, out_dir: Path = OUT_DIR) -> dict:
     """Record a tools/full_plan.py measurement of full.parquet and smoke.parquet as PLAN_FILE: each JSON as the tool
     wrote it, its local selection path replaced by the repo path (the file name must be full.parquet / smoke.parquet).
     Refused (PlanError, nothing written) when a record lacks a FULL_RUNS student or was measured with other values."""
-    plan = {"_comment": "tools/full_plan.py on the full-data selections (labels/full/selections/full_study/"
-                        "full.parquet and smoke.parquet), recorded by tools/make_full_configs.py --import-plan: the "
-                        "tool's JSON, the local selection path replaced by the repo path. make_full_configs reads the "
-                        "smoke configs' memory.probe_shapes (worst_shapes on full.parquet) from it, and "
-                        "tests/test_full_configs.py the registry's plan_total_steps / plan_hours and the deadline "
-                        "fault's bound (registry_numbers)."}
-    for which, src, sel in (("full", full_json, fullrun.FULL_SELECTION), ("smoke", smoke_json, fullrun.SMOKE_SELECTION)):
-        rec = json.loads(Path(src).read_text(encoding="utf-8"))
-        path = str((rec.get("selection") or {}).get("path") or "").replace("\\", "/")
-        if path.rsplit("/", 1)[-1] != sel.rsplit("/", 1)[-1]:
-            raise PlanError(f"{src}: measured on {path!r}, not a {sel.rsplit('/', 1)[-1]}")
-        rec["selection"]["path"] = sel
-        plan[which] = rec
+    plan = {"_comment": PLAN_COMMENT}
+    for which, src, sel in (("full", full_json, fullrun.FULL_SELECTION),
+                            ("smoke", smoke_json, fullrun.SMOKE_SELECTION)):
+        plan[which] = _plan_json(src, sel)
+    try:  # the launch part stays (a rebuilt selection needs --import-launch-plan again: its sha256 then differs)
+        plan["launch"] = json.loads((Path(out_dir) / PLAN_FILE).read_text(encoding="utf-8")).get("launch")
+    except (OSError, ValueError, AttributeError):
+        plan["launch"] = None
     if problems := plan_problems(plan):
         raise PlanError("; ".join(problems))
     f = Path(out_dir) / PLAN_FILE
@@ -706,9 +869,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--import-plan", nargs=2, metavar=("FULL_JSON", "SMOKE_JSON"), default=None,
                     help="record tools/full_plan.py's JSON of full.parquet and smoke.parquet as " + PLAN_FILE +
                          ", then write the configs")
+    ap.add_argument("--import-launch-plan", default=None, metavar="LAUNCH_JSON",
+                    help="record tools/full_plan.py's JSON of full.parquet at the boxes' epochs (FULL_RUNS; a "
+                         "continuation's) as " + PLAN_FILE + "'s launch part, then write the configs")
     ap.add_argument("--import-speed", action="store_true",
-                    help="record box full's measured speeds as " + SPEED_FILE + " (--smoke-verdict and/or --box1-go; "
-                         "the part not given is kept) and print the hours boxes.json must carry")
+                    help="record the full boxes' measured speeds as " + SPEED_FILE + " (--smoke-verdict and/or "
+                         "--box1-go; the part not given is kept) and print the hours boxes.json must carry")
     ap.add_argument("--smoke-verdict", default=None, metavar="JSON",
                     help="--import-speed: smoke A's smoke_verdict.json (full/box-full-smoke/smoke_verdict.json)")
     ap.add_argument("--box1-go", default=None, metavar="JSON", help="--import-speed: tools/box1_go.py --json's file")
@@ -716,26 +882,55 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out_dir)
     if (args.smoke_verdict or args.box1_go) and not args.import_speed:
         ap.error("--smoke-verdict / --box1-go go with --import-speed")
+    if sum(bool(x) for x in (args.import_speed, args.import_plan, args.import_launch_plan, args.check)) > 1:
+        ap.error("--check, --import-plan, --import-launch-plan and --import-speed go one at a time")
     if args.import_speed:
-        if args.check or args.import_plan:
-            ap.error("--import-speed is not combined with --check or --import-plan")
         try:
             rec = import_speed(Path(args.smoke_verdict) if args.smoke_verdict else None,
                                Path(args.box1_go) if args.box1_go else None, out_dir)
             plan = load_plan(out_dir)
             reg = json.loads((out_dir / BOXES).read_text(encoding="utf-8"))
-            h = box2_hours(plan, rec, reserve_min=reg["boxes"][BOX2].get("deadline_reserve_min") or 60)
+            hs = [box_hours(plan, rec, b, reserve_min=(reg["boxes"].get(b) or {}).get("deadline_reserve_min") or 60)
+                  for b in HOURS_BOXES]
         except (SpeedError, PlanError, OSError, ValueError, KeyError) as e:
             print(f"refused: {e}", file=sys.stderr)
             return 1
         print(f"wrote {out_dir / SPEED_FILE} ({'smoke A and box 1' if rec['box1'] else 'smoke A only: provisional'}"
-              f"; r {h['r']:g}, o {h['o']:g}); {BOXES} (hand-written) must carry: "
-              + ", ".join(f"{n} max_hours {v}" for n, v in h["items"].items())
-              + f"; box {BOX2} est_hours {h['est_hours']:g}, max_hours {h['max_hours']} (lanes {h['lanes']['A']:g} / "
-              f"{h['lanes']['B']:g} h; T-0.6B's pessimistic slack {h['t06_slack_h']:g} h; P-0.1B projects to "
-              f"{h['run_h']['p01']:g} h)")
+              f"; r {hs[0]['r']:g}, o {hs[0]['o']:g}); {BOXES} (hand-written) must carry:")
+        for h in hs:
+            print(f"  box {h['box']}: " + ", ".join(f"{n} max_hours {v}" for n, v in h["items"].items())
+                  + f"; est_hours {h['est_hours']:g}, max_hours {h['max_hours']} (setup {h['setup_h'][0]:g} / "
+                  f"{h['setup_h'][1]:g} h, store {h['store_h'][0]:g} / {h['store_h'][1]:g} h, tail "
+                  f"{h['tail_h'][0]:g} / {h['tail_h'][1]:g} h; the pessimistic slack {h['slack_h']:g} h)"
+                  + (f"; continuation {h['continuation']['steps']} steps to T {h['continuation']['total_steps']}, "
+                     f"{h['continuation']['dev_checks']:g} dev checks" if h["continuation"] else ""))
+        print("  P-0.1B from step 0 at its continuation's epochs projects to "
+              f"{hs[0]['run_h']['p01']:g} h (box 1's 4 epochs: {box1_wall(rec)})")
+        for name in CONTINUATIONS:
+            print(f"  continuation {name}: launch --box {CONTINUATIONS[name]['box']} "
+                  + " ".join(continuation_flags(name)))
         todo = registry_check(out_dir, plan, rec)
         print(f"{BOXES}: " + ("carries the speed record's hours" if not todo else f"{len(todo)} change(s) by hand")
+              + "".join(f"\n  {p}" for p in todo))
+        return 0
+    if args.import_launch_plan:
+        try:
+            plan = import_launch_plan(Path(args.import_launch_plan), out_dir)
+            written, removed = write_all(out_dir)
+        except (PlanError, OSError, ValueError) as e:
+            print(f"refused: {e}", file=sys.stderr)
+            return 1
+        print(f"wrote {out_dir / PLAN_FILE} (launch: "
+              + ", ".join(f"{x} {launch_epochs(x)} epochs T {launch_total_steps(x, plan)}" for x in FULL_RUNS)
+              + f") and {len(written)} configs" + (f"; removed {removed}" if removed else ""))
+        try:
+            speed = load_speed(out_dir)
+        except SpeedError as e:
+            speed = None
+            print(f"no usable speed record ({e}): the boxes' hours are not checked")
+        todo = registry_check(out_dir, plan, speed)
+        print(f"{BOXES}: " + ("carries the launch record's hours" if not todo else f"{len(todo)} change(s) by hand "
+                              f"(make_full_configs --import-speed prints them all)")
               + "".join(f"\n  {p}" for p in todo))
         return 0
     if args.check:

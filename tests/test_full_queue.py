@@ -1449,6 +1449,61 @@ def test_a_reset_run_keeps_its_sets_until_the_state_after_the_reset_and_reads_ou
     assert fq.summary()["items"]["full-p01"]["continuation"] == cont
 
 
+def test_the_p01_continuation_takes_its_epochs_and_patience_and_scores_its_new_end(fq, hubs, monkeypatch):
+    """DECISIONS G3 end to end on the queue side: launch's KITSUNE_RESUME_RESET + KITSUNE_RESUME_SETS (epochs 8,
+    patience 12) -> resume-pull plans the reset from the pre_cooldown state with the three sets, the readout and a
+    same-box quant item the old summary never had start fresh -> adopt (the env parses to the plan's own list: no
+    resume_sets_differ) -> every train attempt carries the three --set until the reset is applied -> the readout
+    writes -r1 and the quant item (box p01's, `of` full-p01, needs m4-full-p01) reads the continuation's final step
+    after the readout."""
+    sets = ["schedule.epochs=8", "early_stop.patience=12"]
+    once = ["schedule.resume_reset=true", *sets]
+    reg = copy.deepcopy(fq.reg)
+    quant = {"name": "quant-fp16-full-p01", "kind": "eval", "of": "full-p01", "needs": ["m4-full-p01"],
+             "max_hours": 0.3, "argv": ["{python}", FAKE, "eval", "--config", "{config}", "--ckpt", "{ckpt}", "--fmt",
+                                        "--out", "{out}", "--cache-dir", "{cache_dir}", "--manifest", "{manifest}",
+                                        "--max-temp"]}
+    reg["boxes"]["p01"]["items"].append(quant)
+    result = {"run_id": RID, "steps": 12, "status": "complete"}
+    box_summary(hubs.runs, "p01", {"stores-ctc": {"status": "done"},
+                                   "full-p01": {"status": "done", "run_dir": f"runs/{RID}", "result": result},
+                                   "m4-full-p01": {"status": "done", "verified": True, "out": f"runs/m4-{RID}"}})
+    hub_run(hubs.runs, RID, fulls={10: "pre_cooldown", 12: "end"}, step_export=12, complete=True)
+    plan = F.resume_pull("p01", fq.root, runs=F.Hub("u/runs", api=FakeApi(hubs.runs, "r")), scratch=None,
+                         registry=fullrun.load_registry(reg, root=fq.root, check_files=False), state_dir=fq.state,
+                         reset=[RID], sets={RID: list(sets)}, sha="abc")
+    e = plan["items"]["full-p01"]
+    assert (e["status"], e["state"], e["reset"], e["sets"]) == ("resume", "full_step_10", True, once)
+    assert {n: plan["items"][n]["status"] for n in ("stores-ctc", "m4-full-p01", "quant-fp16-full-p01")} == {
+        "stores-ctc": "fresh", "m4-full-p01": "fresh", "quant-fp16-full-p01": "fresh"}
+    # the pulled pre_cooldown state as the trainer would read it
+    st0 = {"total_steps": 12, "t_c": 10, "pre_cooldown_done": True, "resume_resets": 0, "end_reason": "schedule",
+           "early_stop": {"triggered": None}}
+    (fq.root / "runs" / RID / "checkpoints" / "full_step_10" / "trainer.json").write_text(
+        json.dumps({"reason": "pre_cooldown", "st": st0}), encoding="utf-8")
+    monkeypatch.setenv(fullrun.ENV_RESUME_RESET, RID)
+    monkeypatch.setenv(fullrun.ENV_RESUME_SETS, ",".join(f"{RID}:{s}" for s in sets))
+    env = dict(FAKE_RC=json.dumps({"full-p01": [1, 0]}), FAKE_RC_AT="11")  # the first attempt dies after the reset
+    assert fq.make("p01", registry=reg, env=env).run() == F.EXIT_OK
+    assert fq.events("resume_sets_differ") == []
+    tr = fq.records("train")
+    assert [x["rc"] for x in tr] == [1, 0]
+    want = sum((["--set", s] for s in once), [])
+    assert all(x["argv"][-len(want):] == want for x in tr), [x["argv"] for x in tr]
+    st = fq.st()
+    it = st["items"]["full-p01"]
+    assert it["sets_once"] == [] and it["resume_reset_applied"]["sets"] == once
+    assert it["continuation"]["sets"] == once and it["continuation"]["reset"] is True
+    assert fq.summary()["items"]["full-p01"]["continuation"]["sets"] == once
+    steps = it["result"]["steps"]
+    assert st["items"]["m4-full-p01"]["out"] == f"runs/m4-{RID}-r1"
+    (ro,) = fq.records("readout")
+    (qe,) = fq.records("eval")
+    assert qe["item"] == "quant-fp16-full-p01" and qe["t0"] >= ro["t1"]
+    ck = qe["argv"][qe["argv"].index("--ckpt") + 1]
+    assert ck.replace("\\", "/").endswith(f"runs/{RID}/checkpoints/step_{steps}"), ck
+
+
 def test_adoption_carries_a_continuation_record_of_the_plan(fq):
     local_run(fq.root, RID, 10, st={"resume_resets": 1})
     write_plan(fq, {"full-p01": {"status": "resume", "run_dir": f"runs/{RID}", "continuation": CONT}})
