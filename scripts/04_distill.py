@@ -324,6 +324,27 @@ Full-data runs: timed states, heartbeats, 4e, fix 7 (the full-run build contract
                     (system stats, per source, buckets, token diagnostics), the others the CORE_STEP_TAGS keys;
                     steps.parquet keeps a row per step. mem/step_peak_reserved_gb (CUDA) is logged every step, and
                     summary.json's throughput has data_wait_frac (the loader's share of the steps' time)
+
+Train-data augmentation (augment.*, family "ctc"; off by default, and off it trains exactly as before). The owner's
+review of P-0.1B inside the app found two faults of the data, not of the model size: every train row is one whole
+utterance ending in a sentence mark, so the student puts 。 wherever its input ends (and none at a real sentence end
+inside a long chunk), and it never saw two utterances or two voices in one input (ReazonSpeech 11.9 % CER per
+utterance, 33.7 % with 4 joined; crosstalk far below Whisper). The train loader's micro-batches (setup_augment: a copy
+of R.ds, R.train_ds, that make_loader pickles into its workers) are therefore joined (concat_p: all rows of a
+micro-batch into groups of k, the teacher frame targets concatenated, so real marks sit inside long rows), cut before
+their final token (truncate_p: audio and targets at the same frame - the targets came from the whole utterance, so the
+frames before the cut carry no final mark) and mixed with another row's speech 5-20 dB down (mix_p; the targets the
+clean row's), in that order (kitsune.trainset's "augmentation" section). Memory: a joined micro-batch has rows / k rows
+of at most k x its longest row's frames, so its padded frames never exceed the planned micro-batch's, and setup_augment
+clamps concat_max_s to the longest train utterance (the `augment` event), so no joined row is longer than the one the
+memory probe's longest micro-batch ran; the probe and the smoke checks read the plain R.ds, every eval (the dev slice
+and the train probe included) a plain dataset of its own. Deterministic:
+each micro-batch's augmentation is a function of (augment.seed or the run's seed, its index list), so a crash-resume -
+which reads the run's own config - or a T/2 branch augments every step as the original. A resume may change augment.*
+(it does not shape the step plan; its `resume` event lists the change), a branch may not (BRANCH_FREE). Logged per step:
+aug/concat_frac (the share of the step's utterances in a joined row), aug/truncated_frac and aug/mixed_frac (shares of
+its rows); a joined row's train_utts record has the pieces' ids joined by "+", the first piece's source, their summed
+duration (a cut row: the seconds kept). The smoke's dropped-audio share counts utterances, not joined rows (batch_utts)
 """
 import argparse
 import concurrent.futures
@@ -449,6 +470,18 @@ DEFAULTS = {
     # with (seed, step, micro-batch index), so a resumed or branched run augments exactly as its parent would have
     "specaug": {"enabled": True, "freq_masks": 2, "freq_width": 27, "time_masks_min": 2, "time_masks_max": 5,
                 "time_width": 0.05, "seed": None},
+    # the CTC family's train-data augmentation (kitsune.trainset's "augmentation" section; the module docstring's
+    # "Train-data augmentation"): the TRAIN loader's micro-batches only - never an eval, dev, probe, smoke check or the
+    # memory probe. enabled false (the default) trains exactly as before. seed: null = the run's seed; every micro-batch
+    # draws from (seed, its index list) alone. truncate_p: per row, cut it before its final emitted token (the final
+    # sentence mark), at a frame >= truncate_min_frac of its frames and >= truncate_min_s seconds. concat_p: per
+    # micro-batch, join all its rows into groups of k (a divisor of the row count, 2..concat_max_n, with k x the longest
+    # row <= concat_max_s; the trainer clamps concat_max_s to the longest train utterance, an `augment` event). mix_p:
+    # per row, add a segment of another row of the micro-batch at an SNR drawn from mix_snr_db ([low, high] dB below
+    # the row, low >= 0), the targets the clean row's. A resume may change any of them (the step plan does not depend
+    # on them; the change is in its `resume` event's overrides), a T/2 branch none (BRANCH_FREE)
+    "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
+                "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0, "mix_snr_db": [5.0, 20.0]},
     # BatchNorm: mode "frozen" (eval mode, running stats fixed, affine trainable: the pruned students, whose BN holds
     # the teacher's statistics) or "train" (a student trained from scratch: BN trains, its running stats update, eval
     # and greedy decoding use them; gradient checkpointing is never turned on). momentum: null = the modules' own
@@ -566,7 +599,10 @@ TEST_SET_METRICS = ("heldout_kl",)
 # config keys a resume cannot change (resume_overrides): they shape the step plan or the data it walks, and the
 # planner state it restores (the epoch position) is only valid for the plan it was saved with; or they decide what the
 # model and its loss are (BN mode, the aux-CTC head in the full state, the augmentation stream, the student family);
-# or which dev rows the early stop reads (eval.dev.per_source / seed: a change would compare other rows' numbers)
+# or which dev rows the early stop reads (eval.dev.per_source / seed: a change would compare other rows' numbers).
+# augment.* is not among them: the train-data augmentation happens inside the loader's dataset and leaves the step
+# plan and its position alone, so a resume may turn it on or off or retune it (a continuation that adds it); a
+# crash-resume keeps it anyway, since it reads the run's own config
 RESUME_FIXED = ("seed", "mix", "sources", "selection", "subset", "batch.step_audio_s", "batch.micro_audio_s",
                 "batch.pool_micro", "batch.max_dec_len", "bn.mode", "loss.aux_ctc_weight", "specaug.seed", "family",
                 "eval.dev.per_source", "eval.dev.seed")
@@ -734,6 +770,7 @@ def validate(cfg: dict):
     validate_study(cfg)
     validate_full(cfg)
     validate_state(cfg)
+    validate_augment(cfg)
 
 
 def validate_study(cfg: dict):
@@ -901,6 +938,42 @@ def validate_state(cfg: dict):
         raise SystemExit(f"log.full_scalars_every_steps must be an int >= 1, got {lg['full_scalars_every_steps']!r}")
     if lg["scalars_parquet"] not in ("sync", "close"):
         raise SystemExit(f"log.scalars_parquet must be 'sync' or 'close', got {lg['scalars_parquet']!r}")
+
+
+def validate_augment(cfg: dict):
+    """augment.* (the CTC family's train-data augmentation; DEFAULTS, the module docstring), checked whether or not it
+    is enabled, so a typo in a block that a later --set turns on fails now. The AED students refuse it: their token
+    targets are per decoder position, and a cut or joined row has no such targets (kitsune.trainset.dataset_for)."""
+    a = cfg["augment"]
+    seed = a["seed"]
+    if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0):
+        raise SystemExit(f"augment.seed must be null (the run's seed) or an int >= 0, got {seed!r}")
+    for key in ("truncate_p", "concat_p", "mix_p"):
+        if not (_number(a[key]) and 0 <= a[key] <= 1):
+            raise SystemExit(f"augment.{key} must be a probability in [0, 1], got {a[key]!r}")
+    if not (_number(a["truncate_min_frac"]) and 0 <= a["truncate_min_frac"] < 1):
+        raise SystemExit(f"augment.truncate_min_frac must be a fraction in [0, 1), got {a['truncate_min_frac']!r}")
+    if not (_number(a["truncate_min_s"]) and a["truncate_min_s"] >= 0):
+        raise SystemExit(f"augment.truncate_min_s must be a number of seconds >= 0, got {a['truncate_min_s']!r}")
+    if not (_number(a["concat_max_s"]) and a["concat_max_s"] > 0):
+        raise SystemExit(f"augment.concat_max_s must be a number of seconds > 0, got {a['concat_max_s']!r}")
+    if not (isinstance(a["concat_max_n"], int) and not isinstance(a["concat_max_n"], bool) and a["concat_max_n"] >= 2):
+        raise SystemExit(f"augment.concat_max_n must be an int >= 2 (utterances per joined row), got "
+                         f"{a['concat_max_n']!r}")
+    snr = a["mix_snr_db"]
+    if not (isinstance(snr, (list, tuple)) and len(snr) == 2 and all(_number(x) for x in snr)
+            and 0 <= snr[0] <= snr[1]):
+        raise SystemExit(f"augment.mix_snr_db must be [low, high] dB with 0 <= low <= high (the interferer below the "
+                         f"row: the targets are the row's, so it must stay the dominant voice), got {snr!r}")
+    if a["enabled"] and not is_ctc(cfg):
+        raise SystemExit(f"augment.enabled is the CTC family's (family 'ctc'): an AED student's targets are per "
+                         f"decoder position and cannot follow a cut or joined row; this config's family is "
+                         f"{family(cfg)!r}")
+
+
+def augment_on(cfg: dict) -> bool:
+    """augment.enabled (False for a config without the block: a unit test's partial config, a state from before it)."""
+    return bool((cfg.get("augment") or {}).get("enabled"))
 
 
 def upload_frac(entry) -> float | None:
@@ -1147,7 +1220,8 @@ class Run:
     evalstore: object = None
     devstore: object = None  # the dev-slice store (build_dev_store; None: eval.dev off)
     deadline_marks: list = field(default_factory=list)  # 4d's (step, loop clock) samples of this launch (deadline_rate)
-    ds: object = None
+    ds: object = None  # the train store's plain dataset: the smoke checks, the memory probe, the FLOP count
+    train_ds: object = None  # the train loader's (setup_augment): ds, or under augment.enabled its augmenting copy
     planner: object = None
     probe_ids: list = field(default_factory=list)
     probe_greedy_ids: list = field(default_factory=list)
@@ -2097,6 +2171,7 @@ def setup_data(R: Run):
     R.greedy_ids = greedy_subset_ids(cfg, R.evalstore)
     R.mini_val_ids, R.mini_train_ids = mini_subsets(R)
     R.ds = trainset.dataset_for(R.train)  # FrameBatchDataset for a frame store (family "ctc")
+    R.train_ds = setup_augment(R)  # the train loader's: R.ds, or its augmenting copy (augment.enabled)
     R.src_index = {s: i for i, s in enumerate(sorted({u.source for u in R.train.utts}))}
     log.event("data", train_utts=len(R.train), train_h=round(R.train.hours, 3),
               per_source=R.train.info.get("per_source"), dropped=R.train.info.get("dropped"),
@@ -2158,6 +2233,40 @@ def setup_dev(R: Run) -> dict:
                    encoding="utf-8")
     _replace_file(tmp, path)
     return dict(dev_utts=len(store), dev_h=round(store.hours, 3), dev_per_source=store.info.get("per_source"))
+
+
+def setup_augment(R: Run):
+    """The train loader's dataset (loop's make_loader): R.ds itself, or under augment.enabled a copy of it sharing its
+    arrays (FrameBatchDataset.with_augment) that augments every micro-batch (kitsune.trainset.Augment; the module
+    docstring's "Train-data augmentation"). R.ds stays plain for the smoke checks, the memory probe and the FLOP count.
+    seed: augment.seed, else the run's. concat_max_s is clamped to the longest train utterance (stored duration): a
+    joined row is then never longer than the row the memory probe's longest micro-batch ran, and its micro-batch never
+    has more padded frames than the planned one, so the probe's peak still bounds every joined micro-batch. An
+    `augment` event (and a console line) records the settings in use at every start, a resume's too."""
+    cfg = R.cfg
+    if not augment_on(cfg):
+        return R.ds
+    a = cfg["augment"]
+    seed = int(cfg["seed"]) if a["seed"] is None else int(a["seed"])
+    longest = float(np.max(R.ds.duration)) if len(R.ds) else 0.0  # the stored durations, as the planner packs them
+    used = min(float(a["concat_max_s"]), longest) if longest > 0 else float(a["concat_max_s"])
+    spec = trainset.Augment.from_config(a, seed=seed, concat_max_s=used)
+    R.log.event("augment", seed=seed, truncate_p=spec.truncate_p, truncate_min_frac=spec.truncate_min_frac,
+                truncate_min_s=spec.truncate_min_s, concat_p=spec.concat_p, concat_max_n=spec.concat_max_n,
+                concat_max_s=used, concat_max_s_config=float(a["concat_max_s"]), longest_train_s=round(longest, 3),
+                concat_max_s_clamped=used < float(a["concat_max_s"]), mix_p=spec.mix_p,
+                mix_snr_db=list(spec.mix_snr_db))
+    print(f"augment: truncate_p {spec.truncate_p:g}, concat_p {spec.concat_p:g} (k <= {spec.concat_max_n}, "
+          f"<= {used:g} s{' = the longest train utterance' if used < float(a['concat_max_s']) else ''}), mix_p "
+          f"{spec.mix_p:g} at {spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, seed {seed}", flush=True)
+    return R.ds.with_augment(spec)
+
+
+def batch_utts(mb: dict) -> int:
+    """The utterances a micro-batch holds: one per row, except under augment.enabled, where a joined row holds several
+    and the dataset counts them (its `aug`). The smoke's dropped-audio share is per utterance either way."""
+    aug = mb.get("aug")
+    return int(aug["utts"]) if aug else len(mb["ids"])
 
 
 def mini_subsets(R: Run) -> tuple[list[str], list[str]]:
@@ -2673,6 +2782,9 @@ def train_step_ctc(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) ->
     out["masked_frac"] = float(np.concatenate(masked).mean()) if masked else float("nan")
     out["dropped"] = len(dropped)
     out["n_utts"] = len(utts)
+    augs = [mb["aug"] for mb in mbs if "aug" in mb]
+    if augs:  # augment.enabled: the step's sums of its micro-batches' counts (log_step's aug/* shares)
+        out["aug"] = {k: sum(int(a[k]) for a in augs) for k in augs[0]}
     return out
 
 
@@ -2775,6 +2887,11 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
     }
     if "aux_ctc" in out:  # the aux-CTC loss per target token (unweighted; loss.aux_ctc_weight x it is in loss/total)
         row["loss/aux_ctc"] = out["aux_ctc"]
+    if "aug" in out:  # augment.enabled (train_step_ctc): the step's share of utterances in a joined row, of rows cut
+        a = out["aug"]  # and of rows mixed; next to aug/masked_frac, and like it only on full rows (lean_step)
+        utts, rows = max(int(a["utts"]), 1), max(int(a["rows"]), 1)
+        row.update({"aug/concat_frac": a["concat_utts"] / utts, "aug/truncated_frac": a["truncated"] / rows,
+                    "aug/mixed_frac": a["mixed"] / rows})
     if flops is not None:
         row["perf/tflops"] = flops / step_s / 1e12
         row["perf/mfu"] = flops / step_s / (float(cfg["perf"]["peak_tflops"]) * 1e12)
@@ -4516,8 +4633,8 @@ def resume_overrides(saved: dict, overrides: list[tuple[str, object]]) -> tuple[
         if any(key == f or f.startswith(key + ".") or key.startswith(f + ".") for f in RESUME_FIXED):
             raise SystemExit(f"--set {key}={json.dumps(value, default=str)} differs from the checkpoint's "
                              f"{json.dumps(old, default=str)}: it changes the step plan, so a resume cannot keep its "
-                             "epoch position; start a new run (optim.*, loss.* and memory.grad_ckpt can be changed on "
-                             "resume)")
+                             "epoch position; start a new run (optim.*, loss.*, augment.* and memory.grad_ckpt can be "
+                             "changed on resume)")
         changed[key] = value
     return changed, same
 
@@ -5348,7 +5465,8 @@ def loop(R: Run):
     fit_epochs_deadline(R, at_start=True)
     log.event("phase", name="train", at_step=R.st["step"], workers=nw, micro_audio_s=R.planner.micro_audio_s,
               grad_ckpt=R.st["memory"].get("grad_ckpt"))
-    loader = trainset.make_loader(R.ds, R.planner, nw, prefetch, timeout_s=float(cfg["perf"]["loader_timeout_s"]))
+    train_ds = R.ds if getattr(R, "train_ds", None) is None else R.train_ds  # augment.enabled: the augmenting copy
+    loader = trainset.make_loader(train_ds, R.planner, nw, prefetch, timeout_s=float(cfg["perf"]["loader_timeout_s"]))
     R.loop_t0 = time.monotonic()
     epoch_seen = R.st["epoch"] if R.st["step"] else -1
     try:
@@ -5388,9 +5506,9 @@ def loop(R: Run):
                 epoch_seen = e
                 log.event("epoch", step_in_epoch=s, **(R.planner.epoch_stats.get(e) or dict(epoch=e)))
             if not R.st["smoke_done"] and smoke_n:  # rows the workers could not decode (smoke_end); before train_step,
-                # so a step that lost every row counts too
+                # so a step that lost every row counts too. Utterances, not rows: a joined row holds several (augment)
                 R.st["smoke_dropped"] += sum(len(mb["dropped"]) for mb in mbs)
-                R.st["smoke_utts"] += sum(len(mb["ids"]) for mb in mbs)
+                R.st["smoke_utts"] += sum(batch_utts(mb) for mb in mbs)
             out = train_step(R, step, lr, mbs, e)
             R.planner.step_done(e, s)
             if out is None:

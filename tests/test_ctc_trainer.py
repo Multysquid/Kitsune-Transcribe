@@ -701,6 +701,8 @@ def test_ctc_reference_run(env, ref_run):
     for tag in ("ctc/argmax_agree", "ctc/argmax_blank", "ctc/teacher_blank", "ctc/frac_dense"):
         assert ((st[tag] >= 0) & (st[tag] <= 1)).all(), tag
     assert "loss/ce" not in st and "perf/pad_eff_dec" not in st and (st["perf/mfu"] > 0).all()
+    # augment off (the default): no `augment` event, no aug/* share but SpecAugment's (tests/test_trainset_augment.py)
+    assert "augment" not in kinds and [c for c in st.columns if c.startswith("aug/")] == ["aug/masked_frac"]
     tags = set(pd.read_parquet(run / "metrics" / "scalars.parquet")["tag"])
     assert {"loss/kl_dense", "loss/kl_blank", "loss/ctc", "ctc/argmax_agree", "ctc/argmax_blank", "ctc/teacher_blank",
             "combined_loss/val", "combined_loss/val_full", "eval/tf/eval_jsut/argmax_blank",

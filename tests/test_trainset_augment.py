@@ -11,8 +11,13 @@ the module docstring's "Train-data augmentation"):
   before its cut and removes the final token; concat puts each piece at its offset, its group size divides the rows and
   its padded frames never exceed the micro-batch's; mix keeps targets and lengths and hits the SNR; the same index list
   gives the same batch in any process, another seed another
+- the trainer: augment.* validated (AED refused), changeable on resume; a tiny CTC run with all three augmentations
+  through its smoke phase logs the aug/* shares and the clamp, and a crash resumed from a mid state ends with the
+  uninterrupted run's weights
 CPU only, tiny models, synthetic data in the real on-disk formats (tests/fixtures.py, tests/fixtures_ctc.py)."""
+import copy
 import dataclasses
+import json
 import math
 import os
 import pickle
@@ -28,10 +33,11 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from fixtures import make_fake_corpus, make_fake_selection  # noqa: E402
+from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa: E402
 from fixtures_ctc import make_fake_parakeet_out, tiny_student_dir  # noqa: E402
 from kitsune import trainset as T  # noqa: E402
 from kitsune.ctc_targets import FrameTargets, collate_frame_targets  # noqa: E402
@@ -488,3 +494,131 @@ def test_same_index_list_same_batch(env):
         differs += not (z["wave"].shape == x["wave"].shape and torch.equal(z["wave"], x["wave"]))
     assert differs >= 5
 
+
+# ---------------------------------------------------------------------------------------------------- the trainer
+
+
+def test_validate_the_augment_block():
+    """augment.* off by default and checked whether or not it is on; the AED family refuses it (its token targets
+    cannot follow a cut or joined row); a resume may change it - it does not shape the step plan -, unlike the
+    RESUME_FIXED keys."""
+    m = load_script("04_distill")
+    assert m.DEFAULTS["augment"] == {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3,
+                                     "truncate_min_s": 1.0, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4,
+                                     "mix_p": 0.0, "mix_snr_db": [5.0, 20.0]}
+    assert not m.augment_on(m.load_config(None, [])) and not m.augment_on({})
+    ctc = ["family=ctc", "parakeet_root=po"]
+    assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.mix_p=0.5"]))
+    for bad, match in ((["augment.enabled=yes"], "augment.enabled must be true or false"),
+                       (["augment.seed=-1"], "augment.seed"), (["augment.seed=1.5"], "augment.seed"),
+                       (["augment.truncate_p=1.5"], "augment.truncate_p"),
+                       (["augment.concat_p=-0.1"], "augment.concat_p"),
+                       (["augment.mix_p=x"], "augment.mix_p"), (["augment.truncate_min_frac=1"], "truncate_min_frac"),
+                       (["augment.truncate_min_s=-1"], "truncate_min_s"), (["augment.concat_max_s=0"], "concat_max_s"),
+                       (["augment.concat_max_n=1"], "concat_max_n"), (["augment.concat_max_n=2.0"], "concat_max_n"),
+                       (["augment.mix_snr_db=[20, 5]"], "mix_snr_db"), (["augment.mix_snr_db=[-5, 5]"], "mix_snr_db"),
+                       (["augment.mix_snr_db=[5]"], "mix_snr_db"), (["augment.enabled=true"], "CTC family's")):
+        with pytest.raises(SystemExit, match=match):
+            m.load_config(None, (ctc if bad != ["augment.enabled=true"] else []) + bad)
+    saved = m.load_config(None, ctc)
+    changed, same = m.resume_overrides(saved, [("augment.enabled", True), ("augment.concat_p", 0.5),
+                                               ("augment.seed", None)])
+    assert changed == {"augment.enabled": True, "augment.concat_p": 0.5} and same == {"augment.seed": None}
+    assert not any(f.startswith("augment") for f in m.RESUME_FIXED)
+
+
+def write_config(env, name: str, over: dict) -> str:
+    def merged(base, o):
+        out = copy.deepcopy(base)
+        for k, v in o.items():
+            out[k] = merged(out[k], v) if isinstance(out.get(k), dict) and isinstance(v, dict) else v
+        return out
+
+    path = env["root"] / f"{name}.json"
+    path.write_text(json.dumps(merged(env["base"], dict(over, run_name=name)), indent=1), encoding="utf-8")
+    return str(path)
+
+
+def one_run(env, name: str) -> Path:
+    runs = list((env["root"] / "runs").glob(f"{name}-2*"))
+    assert len(runs) == 1, runs
+    return runs[0]
+
+
+def events(run: Path, kind: str | None = None) -> list[dict]:
+    rows = [json.loads(x) for x in (run / "events.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
+    return [r for r in rows if kind is None or r["kind"] == kind]
+
+
+def utts_of(run: Path) -> pd.DataFrame:
+    return pd.concat([pd.read_parquet(p) for p in sorted((run / "metrics" / "train_utts").glob("part-*.parquet"))])
+
+
+# the end-to-end run: all three augmentations, through a smoke phase of 3 steps, full states every 2 steps
+AUG_OVER = {"augment": {"enabled": True, "truncate_p": 0.7, "truncate_min_s": 0.3, "concat_p": 1.0, "mix_p": 0.7},
+            "smoke": {"enabled": True, "steps": 3, "min_audio_s_per_s": 0, "require_loss_decrease": False,
+                      "pad_utts": 4, "decode_per_set": 2},
+            "ckpt": {"full_every_steps": 2}}
+
+
+@pytest.fixture(scope="module")
+def aug_run(env):
+    m = load_script("04_distill")
+    assert m.main(["--config", write_config(env, "ctc-aug", AUG_OVER)]) == 0
+    return one_run(env, "ctc-aug")
+
+
+def test_a_ctc_run_with_every_augmentation(env, aug_run):
+    """A tiny CTC student trained with all three augmentations: the smoke phase passes (its checks read the plain
+    dataset; its dropped-audio share counts utterances), the clamp of concat_max_s to the longest train utterance is
+    an `augment` event, every step row has aug/concat_frac, aug/truncated_frac and aug/mixed_frac in [0, 1] - each
+    above 0 somewhere -, and the train records carry joined rows' ids."""
+    run = aug_run
+    evs = events(run)
+    kinds = [e["kind"] for e in evs]
+    assert kinds[-1] == "logger_close" and "tb_tag_unmapped" not in kinds and "nonfinite_grad_skipped" not in kinds
+    aug = next(e for e in evs if e["kind"] == "augment")
+    longest = max(u.duration for u in env["store"].utts)
+    assert aug["concat_max_s"] == pytest.approx(longest) and aug["concat_max_s_clamped"] is True
+    assert aug["concat_max_s_config"] == 28.0 and aug["longest_train_s"] == pytest.approx(longest, abs=1e-3)
+    assert aug["seed"] == 1234 and aug["concat_p"] == 1.0 and aug["mix_snr_db"] == [5.0, 20.0]
+    smoke = {e["kind"]: e for e in evs if e["kind"].startswith("smoke_")}
+    assert smoke["smoke_padded_row"]["ok"] and smoke["smoke_longest_fwd_bwd"]["ok"]
+    assert smoke["smoke_steps"]["steps"] == 3 and smoke["smoke_steps"]["dropped"] == 0
+    st = pd.read_parquet(run / "metrics" / "steps.parquet")
+    assert st["step"].tolist() == [1, 2, 3, 4, 5, 6] and np.isfinite(st["loss/objective"]).all()
+    for tag in ("aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac"):
+        assert ((st[tag] >= 0) & (st[tag] <= 1)).all() and st[tag].max() > 0, tag
+    tags = set(pd.read_parquet(run / "metrics" / "scalars.parquet")["tag"])
+    assert {"aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac", "aug/masked_frac"} <= tags
+    utts = utts_of(run)
+    joined = utts[utts["id"].str.contains("+", regex=False)]
+    assert len(joined) and (joined["n_tok"] > 0).all()
+    ids = {u.id for u in env["store"].utts}
+    assert all(x in ids for r in utts["id"] for x in r.split("+"))
+    assert json.loads((run / "summary.json").read_text(encoding="utf-8"))["status"] == "complete"
+
+
+def test_a_crash_resumed_with_augmentation_is_the_uninterrupted_run(env, aug_run, monkeypatch):
+    """A crash before step 5 resumed from full_step_4 ends with exactly the uninterrupted run's weights: the resumed
+    loader augments steps 5 and 6 as the uninterrupted one did (the same rows, cuts and mixes; the same losses)."""
+    m = load_script("04_distill")
+    monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "5")
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        m.main(["--config", write_config(env, "ctc-aug-crash", AUG_OVER)])
+    monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
+    crash = one_run(env, "ctc-aug-crash")
+    assert m.main(["--resume", str(crash / "checkpoints" / "full_step_4")]) == 0
+    a = torch.load(aug_run / "checkpoints" / "full_step_6" / "model.pt", weights_only=True)
+    b = torch.load(crash / "checkpoints" / "full_step_6" / "model.pt", weights_only=True)
+    assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a)
+    ua, ub = utts_of(aug_run), utts_of(crash)
+    for step in (5, 6):
+        x = ua[ua["step"] == step].sort_values("id")
+        y = ub[(ub["step"] == step) & (ub["attempt"] == 1)].sort_values("id")
+        assert len(x) and x["id"].tolist() == y["id"].tolist() and x["duration"].tolist() == y["duration"].tolist()
+        assert x["kl"].tolist() == y["kl"].tolist()
+    sa = pd.read_parquet(aug_run / "metrics" / "steps.parquet").set_index("step")
+    sb = pd.read_parquet(crash / "metrics" / "steps.parquet").drop_duplicates("step", keep="last").set_index("step")
+    for tag in ("loss/objective", "aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac"):
+        np.testing.assert_array_equal(sa[tag].to_numpy(), sb[tag].to_numpy())
