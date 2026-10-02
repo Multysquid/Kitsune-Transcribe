@@ -31,7 +31,8 @@ store (build_frame_stores; layout and frame preflight in the "frame stores" sect
 per utterance, kitsune.ctc_targets.FrameTargets; FrameBatchDataset collates it, and StepPlanner(max_dec_len=None) plans
 it without a decoder. dataset_for(stores) picks the dataset of a store. The CTC family's TRAIN loader may augment its
 micro-batches (dataset_for(stores, augment=Augment(...)); the "augmentation" section below; scripts/04_distill.py
-augment.*): rows cut before their final token, utterances joined into longer rows, another row's speech mixed in. A
+augment.*): rows cut inside a sentence (before one of its words, never between its last word and its mark),
+utterances joined into longer rows, another row's speech mixed in. A
 dataset built without it - every eval, dev, probe, smoke and memory-probe one - returns the stored rows as they are.
 """
 import copy
@@ -1248,7 +1249,8 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         if a.truncate_p > 0:
             for r in rows:
                 if rng.random() < a.truncate_p:
-                    c = truncate_cut(r.ft, rng, a.truncate_min_frac, a.truncate_min_s)
+                    c = truncate_cut(r.ft, rng, a.truncate_min_frac, a.truncate_min_s, a.punct_ids,
+                                     a.truncate_pause_p)
                     if c is not None:
                         r.cut_at(c)
                         n_cut += 1
@@ -1317,11 +1319,15 @@ def _nanmin(x: np.ndarray) -> float:
 #             and the trainer clamps concat_max_s to the longest train utterance, so no joined row is longer than the
 #             one the memory probe's "longest" micro-batch already ran. The audio rectangle can grow by the pads alone
 #             (< 70 ms per join, read by the convolutional subsampling only)
-#   truncate  per row (truncate_p): cut at a frame c drawn in [max(truncate_min_frac x T, truncate_min_s), e), e = the
-#             first frame of the row's final emitted token (the teacher's argmax; for a whole utterance its final
-#             sentence mark), the audio at exactly FRAME_SAMPLES x c and the targets at frame c alike. The teacher made
-#             its targets from the WHOLE utterance, so the frames before c carry no final mark: the input ending is no
-#             longer a reason to emit one
+#   truncate  per row (truncate_p): cut at a frame c >= max(truncate_min_frac x T, truncate_min_s) whose first removed
+#             token (the first token starting at or after c in the teacher's argmax) is a WORD - never a sentence mark
+#             or comma (punct_ids, the student tokenizer's) -, so the kept part ends inside a sentence with at least one
+#             of its words gone; truncate_pause_p of the cuts land inside a pause (>= TRUNCATE_PAUSE_FRAMES teacher-blank
+#             frames), as a voice-detector chunk ends. The audio at exactly FRAME_SAMPLES x c and the targets at frame c
+#             alike. The teacher made its targets from the WHOLE utterance, so the frames before c carry no final mark:
+#             the input ending is no longer a reason to emit one. A cut between a sentence's last word and its mark
+#             (the Parakeet teacher puts the mark after the trailing silence) would keep a COMPLETE sentence without its
+#             mark and teach the opposite - dropping real marks -, so the word rule excludes it (truncate_frames)
 #   mix       per row (mix_p, micro-batches of 2+ rows): a random segment of another row's audio - as it was before any
 #             cut or mix: clean, whole - added at a random offset, scaled to an SNR drawn from mix_snr_db (dB of this
 #             row's power over the segment's, both over the span they share); the targets stay this row's (clean
@@ -1341,20 +1347,26 @@ AUG_PAD_STD = 1e-5  # the noise between joined pieces (~-100 dBFS): never digita
 # no recording has, which the student would then see at every join and nowhere else
 MIX_SILENT_POWER = 1e-8  # a mean square below this (-80 dBFS) is silence: no level to scale an interferer to (or by)
 MIX_MIN_COVER = 0.5  # the interferer's segment covers a uniform share in [MIX_MIN_COVER, 1] of the shorter of the rows
+TRUNCATE_PAUSE_FRAMES = 4  # a pause cut lands in a run of >= this many teacher-blank frames (>= 320 ms of pause)
 
 
 @dataclass(frozen=True)
 class Augment:
     """What a train FrameBatchDataset does to each micro-batch (the section comment above). scripts/04_distill.py
-    builds it from augment.* (from_config) with seed = augment.seed or the run's seed and concat_max_s clamped to the
-    longest train utterance. concat_p: per micro-batch; truncate_p, mix_p: per row; truncate_min_frac / truncate_min_s:
-    the cut's lower bound (a share of the row's frames, seconds); concat_max_n / concat_max_s: the pieces and seconds of
-    a joined row; mix_snr_db: (low, high) dB of the row's power over the interferer's, drawn uniformly."""
+    builds it from augment.* (from_config) with seed = augment.seed or the run's seed, concat_max_s clamped to the
+    longest train utterance and punct_ids from the student's tokenizer. concat_p: per micro-batch; truncate_p, mix_p:
+    per row; truncate_min_frac / truncate_min_s: the cut's lower bound (a share of the row's frames, seconds);
+    truncate_pause_p: the share of cuts placed inside a pause (truncate_cut); punct_ids: the token ids a cut must never
+    remove alone - the sentence marks and commas (truncate_frames; required when truncate_p > 0, since without them
+    the rule cannot tell a sentence's mark from its words); concat_max_n / concat_max_s: the pieces and seconds of a
+    joined row; mix_snr_db: (low, high) dB of the row's power over the interferer's, drawn uniformly."""
 
     seed: int
     truncate_p: float = 0.0
     truncate_min_frac: float = 0.3
     truncate_min_s: float = 1.0
+    truncate_pause_p: float = 0.5
+    punct_ids: tuple = ()
     concat_p: float = 0.0
     concat_max_s: float = 28.0
     concat_max_n: int = 4
@@ -1364,23 +1376,27 @@ class Augment:
     def __post_init__(self):
         snr = tuple(float(x) for x in self.mix_snr_db)
         object.__setattr__(self, "mix_snr_db", snr)
-        probs = (self.truncate_p, self.concat_p, self.mix_p)
+        object.__setattr__(self, "punct_ids", tuple(sorted(int(i) for i in self.punct_ids)))
+        probs = (self.truncate_p, self.truncate_pause_p, self.concat_p, self.mix_p)
         ok = (int(self.seed) >= 0 and all(0.0 <= float(p) <= 1.0 for p in probs)
               and 0.0 <= float(self.truncate_min_frac) < 1.0 and float(self.truncate_min_s) >= 0.0
               and float(self.concat_max_s) > 0.0 and int(self.concat_max_n) >= 2 and len(snr) == 2
-              and 0.0 <= snr[0] <= snr[1])
+              and 0.0 <= snr[0] <= snr[1] and all(0 <= i < CTC_BLANK for i in self.punct_ids)
+              and (float(self.truncate_p) == 0.0 or len(self.punct_ids) > 0))
         if not ok:
             raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
-                             "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high)")
+                             "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high, "
+                             "punct_ids token ids below the blank and given whenever truncate_p > 0)")
 
     @classmethod
-    def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None) -> "Augment":
+    def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None,
+                    punct_ids: Sequence[int] = ()) -> "Augment":
         """From scripts/04_distill.py's augment block: `enabled` and `seed` are the caller's (seed: the resolved one),
-        concat_max_s (when given) replaces the block's - the trainer's clamp."""
-        kw = {f.name: block[f.name] for f in fields(cls) if f.name != "seed" and f.name in block}
+        concat_max_s (when given) replaces the block's - the trainer's clamp -, punct_ids the student tokenizer's."""
+        kw = {f.name: block[f.name] for f in fields(cls) if f.name not in ("seed", "punct_ids") and f.name in block}
         if concat_max_s is not None:
             kw["concat_max_s"] = float(concat_max_s)
-        return cls(seed=int(seed), **kw)
+        return cls(seed=int(seed), punct_ids=tuple(punct_ids), **kw)
 
 
 def _augment_spec(augment) -> "Augment | None":
@@ -1438,30 +1454,69 @@ def cut_frame_targets(ft: "FrameTargets", c: int) -> "FrameTargets":
     return out
 
 
-def last_token_start(ft: "FrameTargets") -> int | None:
-    """The first frame of the row's final emitted token: the start of the last run of one non-blank class in the
-    teacher's argmax (CTC's peaky argmax mostly gives the token a single frame, sometimes a few). None: no token."""
+def next_token_start(col0: np.ndarray) -> np.ndarray:
+    """For every frame t, the class of the first token that STARTS at or after t (a frame whose class is not blank and
+    differs from the frame before it: where CTC reads a new token), CTC_BLANK when none does. A cut at frame t keeps the
+    frames before t, so this is the first token the cut removes whole; a token whose run began before t is kept (the
+    kept frames still hold the start of its run, and CTC emits it once)."""
+    col0 = np.asarray(col0, dtype=np.int64)
+    T = len(col0)
+    prev = np.concatenate([[-1], col0[:-1]])
+    st = np.flatnonzero((col0 != CTC_BLANK) & (col0 != prev))
+    if not len(st):
+        return np.full(T, CTC_BLANK, dtype=np.int64)
+    pos = np.searchsorted(st, np.arange(T))
+    return np.where(pos < len(st), col0[st[np.minimum(pos, len(st) - 1)]], CTC_BLANK)
+
+
+def pause_frames(col0: np.ndarray, min_len: int = 0) -> np.ndarray:
+    """bool (T,): the frames inside a run of at least min_len (default TRUNCATE_PAUSE_FRAMES) teacher-blank frames -
+    a pause, where the app's voice detector would cut."""
+    b = np.asarray(col0) == CTC_BLANK
+    out = np.zeros(len(b), dtype=bool)
+    if not len(b):
+        return out
+    min_len = int(min_len) or TRUNCATE_PAUSE_FRAMES
+    d = np.diff(np.concatenate([[0], b.astype(np.int8), [0]]))
+    for s, e in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
+        if e - s >= min_len:
+            out[s:e] = True
+    return out
+
+
+def truncate_frames(ft: "FrameTargets", min_frac: float, min_s: float, punct_ids: Sequence[int]) -> np.ndarray:
+    """The frames truncate may cut a row at (increasing): c >= lo = max(ceil(min_frac x T), the frames of min_s, 1),
+    and the first token the cut removes whole (next_token_start) is a WORD, never one of punct_ids (the vocabulary's
+    sentence marks and commas, scripts/04_distill.py punct_token_ids) and never none. So the kept frames always end
+    INSIDE a sentence, with at least one word of it gone, and their targets (the teacher's, made on the whole row) carry
+    no final mark: the student learns that the input ending is no reason to emit one. A cut between a sentence's last
+    word and its mark - where the Parakeet teacher puts the mark, after the trailing silence: ~22-28 % of the frames a
+    plain "before the last token" bound allows (2026-10-02 measurement on the train shards) - would instead keep a
+    complete sentence without its mark and teach the student to drop real marks; this rule excludes it, also before the
+    mark of a piece inside a joined row (whose own sentence end, after its mark, stays a valid cut)."""
     col0 = ft.col0()
-    nz = np.flatnonzero(col0 != CTC_BLANK)
-    if not len(nz):
-        return None
-    e = int(nz[-1])
-    while e > 0 and col0[e - 1] == col0[nz[-1]]:
-        e -= 1
-    return e
-
-
-def truncate_cut(ft: "FrameTargets", rng: np.random.Generator, min_frac: float, min_s: float) -> int | None:
-    """truncate's cut frame c, uniform in [lo, e): lo = max(ceil(min_frac x T), the frames of min_s, 1), e =
-    last_token_start. Every frame from e on goes, so the final token does (and whatever else starts after c); the cut
-    never lands inside the final token's run, where the teacher's mark would survive on the frames before c. None when
-    the interval is empty: a row without a token, a short one, one whose final token starts before lo."""
-    e = last_token_start(ft)
-    if e is None:
-        return None
+    nxt = next_token_start(col0)
+    ok = (nxt != CTC_BLANK) & ~np.isin(nxt, np.asarray(list(punct_ids), dtype=np.int64))
     lo = max(math.ceil(float(min_frac) * ft.n_frames - 1e-9),
              math.ceil(float(min_s) * TARGET_SR / FRAME_SAMPLES - 1e-9), 1)
-    return int(rng.integers(lo, e)) if lo < e else None
+    ok[:lo] = False
+    return np.flatnonzero(ok)
+
+
+def truncate_cut(ft: "FrameTargets", rng: np.random.Generator, min_frac: float, min_s: float,
+                 punct_ids: Sequence[int], pause_p: float = 0.0) -> int | None:
+    """truncate's cut frame: with probability pause_p one drawn uniformly among the truncate_frames that lie inside a
+    pause (pause_frames: the kept part then ends in silence, as a voice-detector chunk does, with the sentence still
+    running), otherwise - or when there is no such frame - uniformly among all truncate_frames. None when there are
+    none: a row without a word token after lo (no token, a short row, one whose last word starts before lo)."""
+    cand = truncate_frames(ft, min_frac, min_s, punct_ids)
+    if not len(cand):
+        return None
+    if pause_p > 0 and rng.random() < pause_p:
+        p = cand[pause_frames(ft.col0())[cand]]
+        if len(p):
+            return int(p[int(rng.integers(len(p)))])
+    return int(cand[int(rng.integers(len(cand)))])
 
 
 def concat_k(n_rows: int, longest_frames: int, a: Augment, rng: np.random.Generator) -> int:
