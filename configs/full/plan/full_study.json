@@ -7337,21 +7337,14 @@
     "family": "aed",
     "micro_audio_s": 450.0,
     "step_audio_s": 1730.0,
-    "epochs": 10,
+    "epochs": 3,
     "max_dec_len": 200,
     "steps_per_epoch": [
      23982,
      23982,
-     23982,
-     23982,
-     23982,
-     23981,
-     23982,
-     23982,
-     23982,
      23982
     ],
-    "total_steps": 239819,
+    "total_steps": 71946,
     "step_real_s": {
      "mean": 1730.7678638526334,
      "min": 1522.1894307136536,
@@ -7365,7 +7358,7 @@
     "micro_targets_max": 2163,
     "excluded_dec_len": 409,
     "steps_per_0p1_epoch": 2398.2,
-    "cooldown_start_step": 191857,
+    "cooldown_start_step": 57558,
     "real_h": 11529.79858636496,
     "worst_shapes": [
      {
@@ -7718,21 +7711,14 @@
     "family": "ctc",
     "micro_audio_s": 600.0,
     "step_audio_s": 1350.0,
-    "epochs": 10,
+    "epochs": 3,
     "max_dec_len": null,
     "steps_per_epoch": [
      35292,
      35286,
-     35283,
-     35290,
-     35284,
-     35285,
-     35294,
-     35291,
-     35293,
-     35281
+     35283
     ],
-    "total_steps": 352879,
+    "total_steps": 105861,
     "step_real_s": {
      "mean": 1176.4521485553287,
      "min": 550.4910633563995,
@@ -7746,7 +7732,7 @@
     "micro_targets_max": 2818,
     "excluded_dec_len": 0,
     "steps_per_0p1_epoch": 3529.2,
-    "cooldown_start_step": 282305,
+    "cooldown_start_step": 84690,
     "real_h": 11533.152563004072,
     "worst_shapes": [
      {
@@ -8213,21 +8199,16 @@
     "family": "ctc",
     "micro_audio_s": 1600.0,
     "step_audio_s": 1500.0,
-    "epochs": 10,
+    "epochs": 5,
     "max_dec_len": null,
     "steps_per_epoch": [
      26984,
      26976,
      26977,
      26973,
-     26977,
-     26975,
-     26975,
-     26978,
-     26980,
-     26982
+     26977
     ],
-    "total_steps": 269777,
+    "total_steps": 134887,
     "step_real_s": {
      "mean": 1538.6654768312576,
      "min": 838.9929355680943,
@@ -8241,7 +8222,7 @@
     "micro_targets_max": 7189,
     "excluded_dec_len": 0,
     "steps_per_0p1_epoch": 2698.4,
-    "cooldown_start_step": 215823,
+    "cooldown_start_step": 107911,
     "real_h": 11533.152563004072,
     "worst_shapes": [
      {

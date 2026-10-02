@@ -46,7 +46,7 @@
   "clock": "epochs",
   "max_steps": null,
   "end_reserve_min": 55,
-  "epochs": 10,
+  "epochs": 3,
   "deadline_cooldown": true
  },
  "batch": {
