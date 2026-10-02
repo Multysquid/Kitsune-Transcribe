@@ -751,8 +751,12 @@ its store builder, before it can run.
 ## Full-data runs (the full boxes)
 
 Plan v3 trains the full students on the whole label set: P-0.1B alone on **box 1** (`p01`, 1x RTX 5090, Parakeet labels
-only), then T-0.6B, P-0.3B and P-0.05B on **box 2** (`full`, 2x RTX 5090, one shared GPU queue), after two short
-smokes (`full-smoke` = smoke A, `smoke-b`). Each is one `launch.py --job full --box <box>` call; on the box
+only; done 2026-10-02, 4 epochs, M4 11.45 %), after two short smokes (`full-smoke` = smoke A, `smoke-b`). Box 2 is now
+two 1x RTX 5090 boxes (DECISIONS G2): **box T** (`full-t`: T-0.6B, the Cohere labels only, `data-t`) and **box P**
+(`full-p`: P-0.3B then P-0.05B, the Parakeet labels, `data-p`, with the Whisper models and their quantised readouts);
+T-0.6B, P-0.3B and P-0.05B train 10 epochs (the owner's request of 2026-10-02). Box `p01` runs again as **P-0.1B's
+continuation** to 8 epochs (DECISIONS G3, below) with P-0.1B's 7 quantised readouts. The 2x box `full` is retired: its
+name stays in `fullrun.BOX_NAMES` for the tests' fixtures only, it is not in the registry, and launch refuses it. Each is one `launch.py --job full --box <box>` call; on the box
 `vast/supervise.py` runs `kitsune/full_queue.py` for that box. The box registry `configs/full/boxes.json`
 (`kitsune/fullrun.py`) is the one source of each box's GPU count, data config, hours (`est_hours` planned, `max_hours`
 the watchdog cap), price cap (`max_dph`), extra disk, watchdog and items; launch reads it at the commit the box runs
@@ -777,22 +781,26 @@ Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/m
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-smoke --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --machine <smoke A's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box smoke-b --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=8 --resume-set full-p01-20261001T184145Z:early_stop.patience=12 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-t --machine <id> --avoid-machine <p01's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-p --machine <id> --avoid-machine <p01's id> --avoid-machine <full-t's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
 Each line first as it is (look-only: the preflight, the offer table, the create command and the cost line), then the
 same line with `--yes` to rent. Without `--machine` the offers are ranked by the estimated total (the planned hours at
 the offer's $/h with the disk, plus the traffic at its $/GB); `--offer-id` picks another row.
 
-**Box 2's order** (DECISIONS F, 2026-10-01): the box-2 preparation merged with a green image build, then a standalone
-**smoke-B** (`--box smoke-b`, ~1.5 h on a 1x 5090, report only: it destroys itself on exit 0 whatever its checks say),
-its verdict `full/box-smoke-b/smoke_verdict.json` passing checks 12-16, box 1's go/no-go (`python tools/box1_go.py`:
-exit 0 GO, 1 NO-GO, 2 not decidable yet), the hours PR (`python tools/make_full_configs.py --import-speed --box1-go
-<box1_go --json file>`, then boxes.json by hand until `--check` passes), then box `full`. Box full's hours
-(`est_hours`, `max_hours` and the train items' no-start needs) come from the speed record
-`configs/full/plan/box2_hours.json` (smoke A's measured s/step, box 1's once imported), so its line takes no
-`--max-hours`; launch warns while the record has no box-1 part. launch refuses box `full` without **the quant go
+**The order after box 1** (DECISIONS F and G, 2026-10-02): the box-2 preparation merged with a green image build, then
+a standalone **smoke-B** (`--box smoke-b`, ~1.5 h on a 1x 5090, report only: it destroys itself on exit 0 whatever its
+checks say), its verdict `full/box-smoke-b/smoke_verdict.json` passing checks 12-16 (`python tools/box1_go.py
+--revision c4604304db76e068df7bbe39d00d006b74d6c134`: G5), this layout merged, then **box p01's continuation first**
+and **boxes full-t and full-p** right after it (they no longer depend on its timing: box p01 scores its own quantised
+readouts). The hours of boxes p01, full-t and full-p (`est_hours`, `max_hours` and the train items' no-start needs)
+come from the speed record `configs/full/plan/box2_hours.json` (smoke A's measured s/step and box 1's, `box1_go.py
+--revision <its 4-epoch record> --json` then `make_full_configs.py --import-speed --box1-go`) at the step counts of
+the plan record's launch part (`--import-launch-plan`), so their lines take no `--max-hours`; launch warns while the
+record has no box-1 part. launch refuses a box with quantised items (full-p 14, full-t 7, p01 7) without **the quant go
 signal**: smoke-b's verdict on the Hub passed overall and every one of checks 12-16, at a commit that is an ancestor of
-the one box full runs, with `kitsune/quant.py`, `tools/speed_probe.py`, `scripts/05_evaluate.py`, `kitsune/whisper.py`,
+the one the box runs, with `kitsune/quant.py`, `tools/speed_probe.py`, `scripts/05_evaluate.py`, `kitsune/whisper.py`,
 `tools/whisper_eval.py`, `requirements-train.txt` and `docker/Dockerfile` unchanged since (`QUANT_CODE`): a later
 change to any of them needs another smoke-B, or the owner's `--allow-unverified-quant` (the refusal becomes a
 warning). Offers listed in mainland China are dropped (the Hub is not reachable from there; `FULL_AVOID_COUNTRIES`).
@@ -800,9 +808,14 @@ warning). Offers listed in mainland China are dropped (the Hub is not reachable 
 What launch checks and decides, before anything is rented:
 - **Offers:** `--tier 5090` (default) or `a100` (option C, default cap $2.60/h). Per GPU: `cpu_cores_effective >= 16`,
   `cpu_ram >= 60` in the query and 64,000 MB on the client, `inet_up >= 100`; reliability >= 0.98, driver CUDA >= 13.0,
-  disk_bw and inet_down >= 500, a direct port, the disk from the extent's sizing plus the registry's `extra_gb`.
+  disk_bw and inet_down >= 500, a direct port, the disk from the extent's sizing plus the registry's `extra_gb`. A box
+  with `min_ram_gb` (boxes p01, full-t, full-p: 96) asks the query for `cpu_ram >= floor(0.94 x it)` (90) and the
+  client for `round(0.97 x it x 1000)` MB (93,120: vast lists 96 GB machines at 95,758-96,709 MB). Box 1's real peaks
+  were 33 GiB (trainer) and 37 GiB (store build); its queue summary's 164 GB `peak_rss_gb` is VmRSS summed over the
+  trainer and its 8 DataLoader workers, the stores' page cache counted once per process, and reads ~150+ on any large
+  host: judge memory by the trainer's `sys/cgroup/anon_gb` (<= ~40) and `sys/cgroup/oom_kill` (0).
   `verified=any` in the query, then the client keeps verified and deverified hosts only (never unverified), and only a
-  host whose max rental outlasts the box by `MIN_RENTAL_DAYS` (4). The registry's `max_dph` drops dearer offers before
+  host whose max rental is at least max(`MIN_RENTAL_DAYS` 4, the cap / 24 + 0.5) days (full-t at 104 h: 4.83 d). The registry's `max_dph` drops dearer offers before
   the ranking. `--gpus` may only repeat the registry's count; `--config` only its data config.
 - **Avoided machines:** `vast/blocklist.json` (every job, for good: 151760, study box A #1's 2.9 MB/s host;
   54650, which never started p01-chain's instance on 2026-10-01), the
@@ -851,8 +864,8 @@ and a toucher killed right after its fork ran the inherited EXIT trap and delete
 also waits up to 3 minutes for a held lock before it steps aside.
 
 The watchdog reads `train_hb` (bootstrap's phases, the queue's poll and the supervisor's bounded finish calls touch
-it; each trainer, 05 and the store builds beat their own `hb/<item>`, which the queue's stall check reads). On boxes p01
-and full (`action: stop`) a heartbeat stale for `orphan_s` means a dead controller: the watchdog syncs and stops the box
+it; each trainer, 05 and the store builds beat their own `hb/<item>`, which the queue's stall check reads). On boxes p01,
+full-t and full-p (`action: stop`) a heartbeat stale for `orphan_s` means a dead controller: the watchdog syncs and stops the box
 (`watchdog: box controller heartbeat stale`). The smoke box (`action: alert`) freezes it on purpose in its fault test:
 there the watchdog only appends `{"wall", "kind": "orphan_alert", "hb", "age_s", "limit_s"}` to
 `$KITSUNE_STATE/watchdog_alerts.jsonl` and re-arms once the file is fresh again.
@@ -874,7 +887,7 @@ there the watchdog only appends `{"wall", "kind": "orphan_alert", "hb", "age_s",
 | a training item failed for good (queue exit 4) | **stopped**, disk kept: the owner decides |
 | the download gate refuses the host, or any other bootstrap failure before a run dir exists | `finish.py --abort`: the infra goes up, then the box is **destroyed** (nothing on its disk is unique); a slow gate names the reason, and launch avoids the machine for 30 days |
 | a bootstrap failure after resume_pull pulled run dirs | **stopped** (`--abort` with a run dir) |
-| `train_hb` stale (boxes p01 and full) | synced and **stopped** by the watchdog |
+| `train_hb` stale (boxes p01, full-t, full-p) | synced and **stopped** by the watchdog |
 | the cap (`max_hours`) | **stopped** by the watchdog |
 
 finish.py for a full box is lean (as the study box's): the logs, every weights dir and the full states the config
@@ -884,14 +897,30 @@ uploads, never the timed states (their `.scratch_pending` marker is never upload
 
 A dead or stopped box continues elsewhere from what the Hub has:
 ```powershell
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box <box> --resume [--resume-reset <run_id>] [--resume-set <run_id>:schedule.epochs=<E>] --machine <new id> --max-hours <left + setup> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box <box> --resume [--resume-reset <run_id>] [--resume-set <run_id>:<key>=<int>] [--allow-done-trains] --machine <new id> --max-hours <left + setup> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
 - `--resume` (`KITSUNE_RESUME=1`): bootstrap's resume_pull (`python -m kitsune.full_queue resume-pull`) reads the
   box's Hub queue summary, pulls every started run with its newest full state (the scratch pointer's or the runs
   repo's) and marks the finished ones done; the queue adopts that plan.
-- `--resume-reset <run_id>` (repeatable; `KITSUNE_RESUME_RESET`): continue an early-stopped run from its pre_cooldown
-  state. `--resume-set <run_id>:schedule.epochs=<E>` (repeatable; `KITSUNE_RESUME_SETS`): resume with another epoch
-  count (the only key allowed). Both imply `--resume`.
+- `--resume-reset <run_id>` (repeatable; `KITSUNE_RESUME_RESET`): continue a run from its pre_cooldown state (an
+  early-stopped one, or one whose schedule ended: a continuation). `--resume-set <run_id>:<key>=<int>` (repeatable;
+  `KITSUNE_RESUME_SETS`): resume with another `schedule.epochs` or `early_stop.patience` (`fullrun.RESUME_SET_KEYS`,
+  each an int >= 1, once per run; nothing else may change). Both imply `--resume`.
+- **P-0.1B's continuation** (DECISIONS G3): `--box p01 --resume-reset full-p01-20261001T184145Z --resume-set
+  full-p01-20261001T184145Z:schedule.epochs=8 --resume-set full-p01-20261001T184145Z:early_stop.patience=12` (the
+  command above; `make_full_configs.py --import-speed` prints it). resume_pull takes the pre_cooldown state
+  `checkpoints/full_step_86328`, the queue passes the three `--set`s until the trainer has logged its resume_reset and
+  a full state after it (then every state carries epochs 8 and patience 12), the trainer re-plans T = 215,815, the
+  readout writes `runs/m4-full-p01-20261001T184145Z-r1` and the 7 quantised readouts read the new final step. It
+  overwrites box p01's records at the runs repo's head: box 1's 4-epoch record stays citable as revision
+  c4604304db76e068df7bbe39d00d006b74d6c134 (`box1_go.py --revision`, `full_report.py --earlier
+  full-p01-e4=<pull>/runs/m4-full-p01-20261001T184145Z@c4604304db76e068df7bbe39d00d006b74d6c134`).
+- launch refuses a **plain `--resume` of a box whose Hub summary has every train item done** (box p01 before its
+  continuation started: it would only adopt box 1's run and score the new quantised items on the 4-epoch weights);
+  `--allow-done-trains` lets it through for a box lost in its eval pool (box P after its trainings). A continuation
+  lost on its way resumes with a plain `--resume` (its summary shows the run running with its continuation record);
+  one lost before its first summary put: launch it again with the same reset/set flags. A `--resume-set` of a done run
+  without `--resume-reset` is refused too (resume-pull would refuse it after the paid boot).
 - launch refuses a box whose Hub summary is missing and a reset/set id that no train item of the box ran, prints what
   will resume with the newest state step it can see (scratch and runs repo), and warns about a live instance with
   the box's own label prefix `kitsune-full-<box>-<data config stem>-` (not `kitsune-full-<box>*`, which for box `full`
@@ -905,8 +934,20 @@ automatic gate between them. `p01-chain` is a registry entry that names the boxe
 its **parts**, in two stages; it has no items of its own. `python -m kitsune.full_queue run --box p01-chain` (what
 supervise.py runs) is its controller (`ChainController`), which runs the parts one at a time, each an unchanged box
 queue with its own state dir `$KITSUNE_STATE/chain/<part>/`, writing its summary and verdict at the standalone box's
-Hub paths (`full/box-<part>/...`): box 2's `of_box: p01`, the report and a box-1 resume read them as they are. The
-standalone boxes stay defined as fallbacks.
+Hub paths (`full/box-<part>/...`): the report and a box-1 resume read them as they are. The standalone boxes stay
+defined as fallbacks. The chain ran once (2026-10-01, its gate failed; box 1 then ran as box p01 alone) and stays as
+history: its part p01 now carries quantised readouts, so a relaunch would also need smoke-B #2's quant go signal.
+
+### Speed comparability (the report's chart)
+
+Every comparative speed number comes from one host: smoke-B #2's (`tools/full_report.py` takes the machine group with
+the most systems as its chart group). smoke-B times the 4 study students in 6 formats, the compile probes, the 4
+Whisper models and, when it lands on another machine than smoke A, the bf16 study students and the 3 teachers again.
+The full-data P rows use their study weights' record (S1: same shape and code; CTC greedy decoding does not depend on
+the weights), so the 4- and 8-epoch P-0.1B share study-p01's. Boxes full-p and p01 run no speed item. Box full-t keeps
+decision 22's bf16 re-time pair (speed-full-t06 and speed-study-t06 in one speed.json): when full-t06's tokens on the
+200 speed ids drift more than 5 % from study-t06's, S2 scales the chart group's study-t06 record (and its variants) by
+that pair's ratio; the pair's own group (2 systems) never becomes the chart group.
 
 ```powershell
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01-chain --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
