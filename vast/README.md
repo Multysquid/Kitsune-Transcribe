@@ -754,7 +754,8 @@ Plan v3 trains the full students on the whole label set: P-0.1B alone on **box 1
 only; done 2026-10-02, 4 epochs, M4 11.45 %), after two short smokes (`full-smoke` = smoke A, `smoke-b`). Box 2 is now
 two 1x RTX 5090 boxes (DECISIONS G2): **box T** (`full-t`: T-0.6B, the Cohere labels only, `data-t`) and **box P**
 (`full-p`: P-0.3B then P-0.05B, the Parakeet labels, `data-p`, with the Whisper models and their quantised readouts);
-T-0.6B, P-0.3B and P-0.05B train 10 epochs (the owner's request of 2026-10-02). Box `p01` runs again as **P-0.1B's
+T-0.6B and P-0.3B train 3 epochs, P-0.05B 5 (DECISIONS G1, confirmed by the owner on 2026-10-02; the earlier 10-epoch
+request was withdrawn), each with the common early-stop patience 6. Box `p01` runs again as **P-0.1B's
 continuation** to 8 epochs (DECISIONS G3, below) with P-0.1B's 7 quantised readouts. The 2x box `full` is retired: its
 name stays in `fullrun.BOX_NAMES` for the tests' fixtures only, it is not in the registry, and launch refuses it. Each is one `launch.py --job full --box <box>` call; on the box
 `vast/supervise.py` runs `kitsune/full_queue.py` for that box. The box registry `configs/full/boxes.json`
@@ -815,7 +816,7 @@ What launch checks and decides, before anything is rented:
   trainer and its 8 DataLoader workers, the stores' page cache counted once per process, and reads ~150+ on any large
   host: judge memory by the trainer's `sys/cgroup/anon_gb` (<= ~40) and `sys/cgroup/oom_kill` (0).
   `verified=any` in the query, then the client keeps verified and deverified hosts only (never unverified), and only a
-  host whose max rental is at least max(`MIN_RENTAL_DAYS` 4, the cap / 24 + 0.5) days (full-t at 104 h: 4.83 d). The registry's `max_dph` drops dearer offers before
+  host whose max rental is at least max(`MIN_RENTAL_DAYS` 4, the cap / 24 + 0.5) days (the caps now, 21-37 h, keep the 4 d; a 104 h cap would need 4.83 d). The registry's `max_dph` drops dearer offers before
   the ranking. `--gpus` may only repeat the registry's count; `--config` only its data config.
 - **Avoided machines:** `vast/blocklist.json` (every job, for good: 151760, study box A #1's 2.9 MB/s host;
   54650, which never started p01-chain's instance on 2026-10-01), the

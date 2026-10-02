@@ -321,7 +321,7 @@ def study_job(box: str) -> JobSpec:
 
 def min_rental_days(max_hours: float) -> float:
     """A full box's minimum host rental: MIN_RENTAL_DAYS, or its cap + RENTAL_MARGIN_DAYS when that is longer (a
-    10-epoch box T's 104 h cap: 4.83 d)."""
+    cap past 84 h, e.g. 104 h: 4.83 d; the boxes' caps now, 21-37 h, keep the 4 d)."""
     return max(float(MIN_RENTAL_DAYS), round(float(max_hours) / 24 + RENTAL_MARGIN_DAYS, 2))
 
 

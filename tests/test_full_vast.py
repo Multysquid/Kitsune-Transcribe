@@ -311,6 +311,7 @@ def test_a_registry_min_ram_and_a_long_cap_tighten_the_filter(full_launch, repo,
     assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=64439), j0, now) == []
     assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=63183), j0, now) == ["cpu_ram 63183 MB < 64000 MB"]
     assert "cpu_ram>=120" in launch.full_filter(2, min_ram_gb=96)  # never below 60 a GPU
+    # a hypothetical long box (104 h, as a 10-epoch box T would have been): the floor rises past 4 d
     long = launch.full_job("full-t", {"gpus": 1, "min_ram_gb": 96}, "5090", 78.9, 104, 1.1)
     assert long.min_rental_days == launch.min_rental_days(104) == 4.83
     assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=96000, duration=4.2 * DAY), long, now) == [
