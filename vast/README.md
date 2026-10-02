@@ -16,7 +16,7 @@ that run a queue of calibration, LR probes and study runs (`--job study --box ..
 | `launch.py` | laptop | search offers with the strict filter, print the exact `vastai create instance` command, create only with `--yes` |
 | `onstart_stub.sh` | box, every container start | what `--onstart` sends (kept under 4 KB): clone at `KITSUNE_SHA`, then run `onstart.sh`; stops the box if the clone fails |
 | `onstart.sh` | box, from the stub | env sync, limits, TensorBoard + vast portal, start watchdog, then `bootstrap.sh` + `supervise.py` |
-| `bootstrap.sh` | box | pull derived data from `KITSUNE_DATA_REPO`, rebuild audio with `scripts/01_prepare_data.py` (pinned upstream commits), check the id join |
+| `bootstrap.sh` | box | pull derived data from `KITSUNE_DATA_REPO`, rebuild audio with `scripts/01_prepare_data.py` (pinned upstream commits, up to `KITSUNE_DOWNLOAD_AHEAD` = 6 files downloading ahead of the ingest), check the id join |
 | `supervise.py` | box | run `scripts/04_distill.py`; resume once after a late crash; then `finish.py --destroy` or `--stop` |
 | `finish.py` | box | upload, verify every file in the HF output repo (path, size, hash), destroy; stop instead if anything is off |
 | `watchdog.sh` | box | stop the instance 5.5 h after first boot (log sync 10 min before); stop (or only alert) when the controller's heartbeat goes stale |
@@ -777,11 +777,25 @@ Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/m
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-smoke --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --machine <smoke A's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box smoke-b --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full --machine <id> --max-hours <re-projected> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
 Each line first as it is (look-only: the preflight, the offer table, the create command and the cost line), then the
 same line with `--yes` to rent. Without `--machine` the offers are ranked by the estimated total (the planned hours at
 the offer's $/h with the disk, plus the traffic at its $/GB); `--offer-id` picks another row.
+
+**Box 2's order** (DECISIONS F, 2026-10-01): the box-2 preparation merged with a green image build, then a standalone
+**smoke-B** (`--box smoke-b`, ~1.5 h on a 1x 5090, report only: it destroys itself on exit 0 whatever its checks say),
+its verdict `full/box-smoke-b/smoke_verdict.json` passing checks 12-16, box 1's go/no-go (`python tools/box1_go.py`:
+exit 0 GO, 1 NO-GO, 2 not decidable yet), the hours PR (`python tools/make_full_configs.py --import-speed --box1-go
+<box1_go --json file>`, then boxes.json by hand until `--check` passes), then box `full`. Box full's hours
+(`est_hours`, `max_hours` and the train items' no-start needs) come from the speed record
+`configs/full/plan/box2_hours.json` (smoke A's measured s/step, box 1's once imported), so its line takes no
+`--max-hours`; launch warns while the record has no box-1 part. launch refuses box `full` without **the quant go
+signal**: smoke-b's verdict on the Hub passed overall and every one of checks 12-16, at a commit that is an ancestor of
+the one box full runs, with `kitsune/quant.py`, `tools/speed_probe.py`, `scripts/05_evaluate.py`, `kitsune/whisper.py`,
+`tools/whisper_eval.py`, `requirements-train.txt` and `docker/Dockerfile` unchanged since (`QUANT_CODE`): a later
+change to any of them needs another smoke-B, or the owner's `--allow-unverified-quant` (the refusal becomes a
+warning). Offers listed in mainland China are dropped (the Hub is not reachable from there; `FULL_AVOID_COUNTRIES`).
 
 What launch checks and decides, before anything is rented:
 - **Offers:** `--tier 5090` (default) or `a100` (option C, default cap $2.60/h). Per GPU: `cpu_cores_effective >= 16`,
@@ -790,7 +804,8 @@ What launch checks and decides, before anything is rented:
   `verified=any` in the query, then the client keeps verified and deverified hosts only (never unverified), and only a
   host whose max rental outlasts the box by `MIN_RENTAL_DAYS` (4). The registry's `max_dph` drops dearer offers before
   the ranking. `--gpus` may only repeat the registry's count; `--config` only its data config.
-- **Avoided machines:** `vast/blocklist.json` (every job; 151760, study box A #1's 2.9 MB/s host, for good), the
+- **Avoided machines:** `vast/blocklist.json` (every job, for good: 151760, study box A #1's 2.9 MB/s host;
+  54650, which never started p01-chain's instance on 2026-10-01), the
   label runs' failed hosts, and a machine whose full box's download gate said slow in the last 30 days
   (`full/box-*/infra/*/download_gate.json` in the runs repo). A `--machine` on that list is refused.
 - **full_preflight:** every config the box reads committed at the commit; every tool its items run there (the queue,
@@ -810,14 +825,19 @@ What launch checks and decides, before anything is rented:
 ### On the box
 
 bootstrap.sh (job full) runs, in order: **download_gate** (`python -m kitsune.netgate`: three pinned upstream files,
-~2.5 GB, downloaded as 01 downloads them; a host that could not pull 571.2 GB in `KITSUNE_GATE_MAX_H` hours, 31.7 MB/s at
+~2.5 GB, downloaded with 01's own call but one at a time, the conservative floor; a host that could not pull 571.2 GB in `KITSUNE_GATE_MAX_H` hours, 31.7 MB/s at
 5 h, is refused with exit 3 after at most ~3 minutes, and a pass sets the label pull's and the rebuild's per-attempt
 timeouts from the measured rate, the rebuild's never below launch's 40 MB/s sizing; hf_xet's chunk cache is off and
 its cache dir the gate's own, so a retried gate times the link again, never the disk), **plan** (also the scratch repo's
 token check), **pull_derived** (everything but the labels: the meta files, the selection, the registry's students,
 extra files and dirs), **resume_pull** (`--resume` only), **check_students** (`python -m kitsune.fullrun
 check-students`), **pull_labels** in the background while **rebuild_audio** (01 `--extent-config`) runs, then
-**pull_labels_wait** (a failed label pull fails here) and **coverage**. On box 1 (CTC, no `pull_parakeet`) the train
+**pull_labels_wait** (a failed label pull fails here) and **coverage**. The rebuild downloads up to
+`KITSUNE_DOWNLOAD_AHEAD` (default 6, 0..16; optional, from the box's env) upstream files while its single-threaded
+ingest reads them in order (decision F3, `kitsune/fetchahead.py`): the output is byte-identical to one at a time,
+transient Hub errors retry in-process, and each step logs `downloads: T of P planned files (G GB) in W s, up to K
+ahead; the ingest waited S s`, so W - S is the ingest's own time. Box 1 (one at a time) took 3.1 h for 571 GB with a
+128.9 MB/s gate; expect ~1-1.3 h on a similar host. On box 1 (CTC, no `pull_parakeet`) the train
 stems have Parakeet labels only: the extent and coverage checks read their ids from `parakeet_out`
 (`kitsune.extent.label_root_for`, fix 9). Every phase keeps `$KITSUNE_STATE/train_hb` fresh while it runs, for at
 most its own worst case: the label pull, pull_labels_wait and the rebuild for their three attempts' timeouts (with the

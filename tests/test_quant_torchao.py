@@ -7,17 +7,26 @@ constants, never by widening a tolerance here.
 
   CPU (the image CI)   every torchao name kitsune uses resolves and every format's config builds (the MXFP4 AUTO
                        config of the selftest's decision-20 canary too); the int8 packs (weight-only and W8A8) equal
-                       torchao's quantize_ of the same weight; the NVFP4 pack (on a real-sized weight, where the
+                       torchao's quantize_ of the same weight (on real-sized weights too, where the reciprocal form
+                       round(w * (1 / s)) decides the ties), and the W8A8 activation grid equals torchao's
+                       Int8Tensor.from_hp; the NVFP4 pack (on a real-sized weight, where the
                        reciprocal scaling decides codes) and the W4A4 activation grid, and the MXFP4 (RCEIL) pack,
                        equal torchao's own quantisers (they run on CPU in the image: an API error there fails, it is
                        drift; only a CPU-kernel refusal skips); the FP8 per-row pack where torchao runs it on CPU (it
                        refuses there today: smoke B's selftest covers it); an int8 to_torchao dequantises to the pack;
                        an int8 W8A8 Linear through torchao on CPU is reproduced bit for bit from kitsune's activation
                        grid (INT8_ACT_DIV, INT8_ACT_QMIN, INT8_ACT_SCALE_DTYPE), and the emulation is within the
-                       selftest's tolerance of it
-  CUDA (smoke B, a     every timed format's to_torchao dequantises to its pack; kitsune.quant.selftest passes (real
-  5090)                kernels within SELFTEST_TOL of the emulation at every M, no int8 fp32 fallback after padding,
-                       weights quantised under autocast); a pack computed on CUDA equals the CPU one bit for bit
+                       selftest's tolerance of it; F1: the fp8 config carries activation_value_lb = FP8_ACT_LB, and
+                       torchao's own float8 primitives (_choose_scale_float8 / _quantize_affine_float8, plain torch
+                       ops) give kitsune's fp8 activation grid and weight pack bit for bit
+  CUDA (smoke B, a     every timed format's to_torchao dequantises to its pack; torchao's fp8 PerRow quantize_ of a
+  5090)                weight is kitsune's pack (F1); every W*A* format gives exactly the bias on an all-zero row (F4);
+                       the compiled conformer-convolution block is as good a quantisation as eager (F4,
+                       COMPILE_NOISE_RATIO); kitsune.quant.selftest passes with
+                       every sub-check (real kernels within SELFTEST_TOL of the emulation at every M, no int8 fp32
+                       fallback after padding, weights quantised under autocast, torchao parity, zero rows, compile, and
+                       a tiny CTC and AED student unpadded and padded); a pack computed on CUDA equals the CPU one bit
+                       for bit
 """
 import os
 import sys
@@ -29,6 +38,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 
 import pytest  # noqa: E402
 
@@ -81,6 +91,76 @@ def test_every_name_and_config_resolves():
     assert type(cfg).__name__ == "MXDynamicActivationMXWeightConfig"
     assert cfg.kernel_preference == Q._ao("KernelPreference").AUTO
     assert cfg.activation_dtype == cfg.weight_dtype == torch.float4_e2m1fn_x2
+    # F1: a padded frame's all-zero activation row quantises to zeros, not 0 / 0 (torchao's hp_value_lb)
+    assert Q.torchao_config("fp8-w8a8").activation_value_lb == Q.FP8_ACT_LB == 2.0 ** -40
+
+
+def test_fp8_scale_equals_torchaos_primitives_on_cpu():
+    """F1 against torchao 0.18's own float8 primitives (torchao.quantization.quant_primitives: plain torch ops, so they
+    run on CPU in the image, where quantize_ refuses fp8): _choose_scale_float8 per row (block [1, K]) with
+    hp_value_lb = FP8_ACT_LB, then _quantize_affine_float8, on bf16 activations with all-zero rows, give kitsune's
+    scales and codes bit for bit (zero rows: zeros); without the lb, on a weight, the same on every non-zero row, and
+    torchao's zero-row scale is 0 where kitsune keeps 1 (the documented deviation). Called by keyword, strict: a
+    renamed argument is API drift and fails."""
+    from torchao.quantization.quant_primitives import _choose_scale_float8, _quantize_affine_float8
+
+    g = torch.Generator().manual_seed(5)
+    x = (torch.randn(64, 256, generator=g) * torch.logspace(-5, 2, 64)[:, None]).to(torch.bfloat16)
+    x[[3, 40]] = 0.0
+
+    def theirs(t, lb):
+        s = _choose_scale_float8(t, block_size=[1, t.shape[1]], float8_dtype=torch.float8_e4m3fn, hp_value_lb=lb)
+        return _quantize_affine_float8(t, s, float8_dtype=torch.float8_e4m3fn), s.float().reshape(-1)
+
+    tq, ts = _cpu_or_skip(lambda: theirs(x, Q.FP8_ACT_LB), "_choose_scale_float8 (activation)", strict=True)
+    q, s = Q._fp8_rows(x.float(), lb=Q.FP8_ACT_LB)
+    assert torch.equal(s, ts), "fp8 activation scales differ from torchao's"
+    assert same_bits(q, tq.reshape(q.shape)), "fp8 activation codes differ from torchao's"
+    assert (q[[3, 40]].float() == 0).all() and torch.isfinite(Q.fake_quant_act(x.float(), "fp8")).all()
+    w = weight(96, 128)  # row 3 all zero
+    wq, ws = _cpu_or_skip(lambda: theirs(w, None), "_choose_scale_float8 (weight)", strict=True)
+    p = Q.pack_weight(w, "fp8")
+    nz = [i for i in range(96) if i != 3]
+    assert torch.equal(p.scale[nz], ws[nz]) and same_bits(p.qweight[nz], wq.reshape(p.qweight.shape)[nz])
+    assert ws[3].item() == 0.0 and p.scale[3].item() == 1.0 and (p.qweight[3].float() == 0).all()
+
+
+@pytest.mark.parametrize("seed", [0, 2])
+def test_int8_pack_equals_torchaos_on_a_real_sized_weight(seed):
+    """torchao's quantize_ of a 2560 x 1024 N(0, 0.02) bf16 weight (seed 2: the selftest's torchao parity weight, its
+    hard check on the GPU) is kitsune's int8 pack bit for bit: quantize_affine's round(w * (1.0 / s)) decides about a
+    dozen ties there, which w / s rounds the other way (the 96 x 128 weight() has none). The GPU runs the same fp32
+    reciprocal and product, both correctly rounded (_selftest_torchao_parity)."""
+    w = real_weight(seed)
+    theirs = Q.from_torchao(torchao_linear(w, "int8-w8a8").weight, "int8-w8a8")
+    ours = Q.pack_weight(w, "int8")
+    assert torch.equal(theirs.scale.float(), ours.scale), "int8 scales differ from torchao's"
+    assert _n_codes_differ(theirs.qweight, ours.qweight) == 0, "int8 codes differ from torchao's"
+    divided = torch.clamp(torch.round(w.float() / ours.scale[:, None]), -128, 127).to(torch.int8)
+    assert _n_codes_differ(theirs.qweight, divided) > 0  # the test tells the two forms apart
+
+
+def _n_codes_differ(a: torch.Tensor, b: torch.Tensor) -> int:
+    return int((a.detach().cpu().reshape(-1) != b.detach().cpu().reshape(-1)).sum())
+
+
+def test_int8_activation_grid_equals_torchaos():
+    """torchao's activation quantiser of the W8A8 path (Int8Tensor.from_hp per row, called as the int8 linear calls it
+    with the weight's act_quant_kwargs) on an N(0, 1) 4096 x 1024 bf16 input with an all-zero row and a tiny one gives
+    kitsune's activation scales and codes bit for bit (INT8_ACT_DIV, INT8_ACT_QMIN = -128, INT8_ACT_EPS = float32
+    eps, round(x * (1 / s))); some rows hold a -128 code, so the range is pinned."""
+    from torchao.quantization.quantize_.common.quantize_tensor_kwargs import _choose_quant_func_and_quantize_tensor
+
+    lin = torchao_linear(weight(), "int8-w8a8")
+    g = torch.Generator().manual_seed(6)
+    x = torch.randn(4096, 1024, generator=g).to(torch.bfloat16)
+    x[5] = 0.0
+    x[9] *= 1e-6
+    a = _choose_quant_func_and_quantize_tensor(x, lin.weight.act_quant_kwargs, scale=None, zero_point=None)
+    q, s = Q._int8_rows(x.float(), Q.INT8_ACT_DIV, Q.INT8_ACT_EPS, Q.INT8_ACT_QMIN, scale_dtype=Q.INT8_ACT_SCALE_DTYPE)
+    assert torch.equal(a.scale.float().reshape(-1), s), "int8 activation scales differ from torchao's"
+    assert torch.equal(a.qdata.float().reshape(q.shape), q), "int8 activation codes differ from torchao's"
+    assert bool((a.qdata == -128).any()) and Q.INT8_ACT_QMIN == -128
 
 
 @pytest.mark.parametrize("fmt", ["int8-w8a16", "int8-w8a8"])
@@ -158,14 +238,20 @@ def test_mxfp4_pack_equals_torchaos_rceil():
     assert same_bits(data.reshape(ours.qweight.shape).view(torch.uint8), ours.qweight), "MXFP4 codes differ"
 
 
+@needs_cuda
 def test_fp8_pack_equals_torchaos():
-    """torchao's float8 per-row weight (Float8DynamicActivationFloat8WeightConfig(PerRow)) is kitsune's pack."""
+    """torchao's float8 per-row weight (Float8DynamicActivationFloat8WeightConfig(PerRow), quantize_ on the GPU: it
+    refuses fp8 on CPU, so before F1 this test ran nowhere) is kitsune's pack on every non-zero row (F1: the
+    bf16-rounded row scale); on the all-zero row kitsune keeps scale 1 and zero codes (torchao: scale 0)."""
     w = weight()
-    lin = _cpu_or_skip(lambda: torchao_linear(w, "fp8-w8a8"), "the fp8 PerRow config")
+    lin = torchao_linear(w, "fp8-w8a8", device="cuda")
+    assert lin.weight.act_quant_kwargs.hp_value_lb == Q.FP8_ACT_LB
     theirs = Q.from_torchao(lin.weight, "fp8-w8a8")
     ours = Q.pack_weight(w, "fp8")
-    assert same_bits(theirs.qweight, ours.qweight), "fp8 codes differ from torchao's"
-    assert torch.equal(theirs.scale.float(), ours.scale), "fp8 row scales differ from torchao's"
+    nz = [i for i in range(w.shape[0]) if i != 3]
+    assert same_bits(theirs.qweight[nz], ours.qweight[nz]), "fp8 codes differ from torchao's"
+    assert torch.equal(theirs.scale.float()[nz], ours.scale[nz]), "fp8 row scales differ from torchao's"
+    assert ours.scale[3].item() == 1.0 and (ours.qweight[3].float() == 0).all()
 
 
 def _dequant_equal(t: torch.Tensor, pack: Q.QuantPack):
@@ -195,7 +281,7 @@ def _int8_act_candidates(x: torch.Tensor, pw: Q.QuantPack, yr: torch.Tensor) -> 
                                                    "int_to_bf16_first")):
         xf = x.float()
         sx = torch.clamp((xf.abs().amax(1) / div).to(sdt), min=Q.INT8_ACT_EPS).float()
-        qx = torch.clamp(torch.round(xf / sx[:, None]), qmin, 127)
+        qx = torch.clamp(torch.round(xf * (1.0 / sx[:, None])), qmin, 127)
         yint = (qx.double() @ qw.T).float()
         sw = pw.scale[None, :]
         if form == "dequant_fp32":
@@ -258,7 +344,49 @@ def test_the_pack_is_the_same_on_cuda_and_cpu():
 
 
 @needs_cuda
-def test_the_selftest_passes_on_this_gpu():
-    rec = Q.selftest("cuda:0", rows=(1, 7, 17, 128))
+@pytest.mark.parametrize("fmt", ["int8-w8a8", "nvfp4-w4a4", "fp8-w8a8"])
+def test_w_a_formats_zero_rows_finite_on_cuda(fmt):
+    """F4: a real W*A* Linear on an input with all-zero rows (a padded frame) gives exactly the bias there, finite,
+    within SELFTEST_TOL of the emulation (_selftest_zero_rows; pre-F1 fp8 gave NaN)."""
+    g = torch.Generator().manual_seed(6)
+    w, b = torch.randn(256, 512, generator=g) * 0.02, torch.randn(256, generator=g) * 0.01
+
+    def make(impl):
+        lin = nn.Linear(512, 256, device="cuda")
+        with torch.no_grad():
+            lin.weight.copy_(w)
+            lin.bias.copy_(b)
+        return Q.quantize_linear(lin, fmt, impl)
+
+    rec, checks = dict(formats={}, warnings=[]), []
+    Q._selftest_zero_rows(rec, lambda name, ok, detail=None: checks.append((name, ok, detail)),
+                          torch.device("cuda"), fmt, make("emulate"), make("torchao"), b.cuda(), 512, g)
+    assert checks[0][1], checks
+
+
+@needs_cuda
+def test_compiled_conv_block_on_cuda():
+    """F4: the conformer-convolution-like block of torchao Linears, torch.compile'd with inductor at B = 3 then B = 1
+    (box 53693389's nvfp4 contiguity assert and int8 CUBLAS_STATUS_NOT_SUPPORTED): per format its error against the
+    unquantised block is within COMPILE_NOISE_RATIO of the eager block's."""
+    rec, checks = dict(warnings=[]), []
+    Q._selftest_compile(rec, lambda name, ok, detail=None: checks.append((name, ok, detail)), torch.device("cuda"))
+    assert [c[0] for c in checks] == [f"compile {f} B={b}" for f in Q.COMPILE_FORMATS for b in (3, 1)]
+    assert all(c[1] for c in checks), [c for c in checks if not c[1]]
+
+
+@needs_cuda
+def test_the_selftest_passes_on_this_gpu(tmp_path):
+    """Every sub-check of check 12, on tiny CTC and AED students for the checkpoint part (unpadded and padded)."""
+    from test_quant import save_aed_dir, save_ctc_dir
+
+    ckpt = [save_ctc_dir(tmp_path / "ctc"), save_aed_dir(tmp_path / "aed")]
+    rec = Q.selftest("cuda:0", rows=(1, 7, 17, 128), ckpt=ckpt)
     assert rec["ok"], [c for c in rec["checks"] if not c["ok"]]
+    names = {c["name"] for c in rec["checks"]}
+    assert {"pack_device_parity", "torchao parity fp8-w8a8", "torchao parity int8-w8a8"} <= names
+    assert {f"{f} zero rows" for f in Q.TIMED_FORMATS} <= names
+    assert {f"compile {f} B={b}" for f in Q.COMPILE_FORMATS for b in (3, 1)} <= names
+    assert {f"ckpt {d.name} {f} padded finite" for d in ckpt for f in Q.TIMED_FORMATS} <= names
+    assert rec["recipe_version"] == Q.RECIPE_VERSION and rec["device_arith"]["fp8_bf16_scale_rows_differ"] == 0
 

@@ -86,6 +86,9 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.setattr(launch, "git", git)
     monkeypatch.setattr(launch, "config_at", lambda sha, c: json.loads(at(sha, c)))
     monkeypatch.setattr(launch, "worktree_file", lambda rel: None)
+    # the quant go signal's git reads: a verdict's commit is an ancestor of SHA with the same quant code
+    monkeypatch.setattr(launch, "git_ancestry", lambda old, new: "ancestor")
+    monkeypatch.setattr(launch, "git_blob", lambda sha, p: f"blob:{p}")
     return SimpleNamespace(root=root, reg=reg)
 
 
@@ -158,7 +161,7 @@ def search_query(fake, n: int = 0) -> str:
 
 
 def test_box_p01_rents_one_5090_with_the_registrys_numbers(full_launch, capsys):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--yes")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 0, out
     search = next(c for c in fake.calls if c[1:3] == ["search", "offers"])
@@ -178,7 +181,7 @@ def test_box_p01_rents_one_5090_with_the_registrys_numbers(full_launch, capsys):
         "KITSUNE_GATE_BYTES": str(int(571.3e9)), "KITSUNE_GATE_MAX_H": "5", "KITSUNE_REBUILD_BYTES": str(int(571.3e9)),
         "KITSUNE_PULL_BYTES": str(int(1e9 * (23.4 + 2))), "KITSUNE_MAX_HOURS": "22", "TZ": "UTC",
         "KITSUNE_DATA_REVISION": "d" * 40, "KITSUNE_REBUILD_TIMEOUT_MIN": "387", "KITSUNE_DPH": "0.8100",
-        "KITSUNE_MACHINE_ID": "54650"}
+        "KITSUNE_MACHINE_ID": "70001"}
     assert create[create.index("--label") + 1].startswith("kitsune-full-p01-data-p01-")
     assert create[create.index("--disk") + 1] == "1400" and "HF_TOKEN" not in " ".join(create)
     assert full_launch.seen["extra_gb"] == 25  # the registry's extra_gb goes into the sizing
@@ -228,12 +231,12 @@ def test_cost_guards_drop_dear_traffic_and_totals_over_the_cap():
 
 
 def test_cost_guard_flags_are_full_only_and_positive(full_launch, capsys):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
     out = capsys.readouterr().out
     assert rc == 0, out
     m = re.search(r"cost guards: traffic <= \$0\.01/GB each way; expected total <= \$([0-9.]+)", out)
     assert m and 24.0 < float(m.group(1)) < 40.0, out  # 1.25 x $1.00 x 19.5 h + ~620 GB x $0.01
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--max-total", "5",
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--max-total", "5",
                            "--dry-run")
     out = capsys.readouterr().out
     assert rc != 0 and "cost guards" in out and created(fake) is None
@@ -302,17 +305,19 @@ def created_or_printed(out: str) -> list[str]:
 
 
 def test_machine_picks_that_machine_or_refuses(full_launch, capsys):
-    offers = [offer(1, 1, 0.50), offer(2, 54650, 0.81)]
-    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "54650", "--yes")
+    offers = [offer(1, 1, 0.50), offer(2, 70001, 0.81)]
+    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "70001", "--yes")
     assert rc == 0, capsys.readouterr().out
-    assert env_of(created(fake))["KITSUNE_MACHINE_ID"] == "54650"
+    assert env_of(created(fake))["KITSUNE_MACHINE_ID"] == "70001"
     rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "999", "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and "machine 999 has no offer passing the filter now" in out and created(fake) is None
-    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "151760", "--yes")
-    out = capsys.readouterr().out
-    assert rc == 1 and "--machine 151760 is avoided (vast/blocklist.json" in out and created(fake) is None
-    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "54650", "--offer-id",
+    for dead in ("151760", "54650"):  # the blocklist: refused even with an offer listed for it
+        rc, fake = full_launch([offers + [offer(3, int(dead), 0.60)]], "--box", "p01", "--scratch-repo", SCRATCH,
+                               "--machine", dead, "--yes")
+        out = capsys.readouterr().out
+        assert rc == 1 and f"--machine {dead} is avoided (vast/blocklist.json" in out and created(fake) is None
+    rc, fake = full_launch([offers], "--box", "p01", "--scratch-repo", SCRATCH, "--machine", "70001", "--offer-id",
                            "1", "--yes")
     assert rc == 1 and "offer 1 is not in the results" in capsys.readouterr().out
 
@@ -328,7 +333,7 @@ def test_machine_picks_that_machine_or_refuses(full_launch, capsys):
     (["--box", "p01", "--scratch-repo", SCRATCH, "--max-dph", "0.5"], "no 1x RTX 5090 offer matches the full-box"),
 ], ids=["gpus", "no-scratch", "scratch-is-out", "disk", "config", "no-hf-check", "max-dph"])
 def test_launch_full_refusals(full_launch, capsys, args, err):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], *args, "--yes")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], *args, "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and err in out and created(fake) is None, out
 
@@ -340,7 +345,7 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "train", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
                        "only schedule.epochs may change"),
-                      (["--job", "full", "--box", "p01", "--machine", "m54650"], "machine_id (digits)")):
+                      (["--job", "full", "--box", "p01", "--machine", "m70001"], "machine_id (digits)")):
         with pytest.raises(SystemExit):
             launch.main([*args, "--data-repo", DATA, "--out-repo", RUNS, "--sha", SHA])
         assert err in capsys.readouterr().err, args
@@ -379,7 +384,7 @@ def test_the_registry_is_read_at_the_sha_and_a_dirty_copy_refuses(full_launch, r
 
 def test_resume_flags_go_to_the_box_env(full_launch, capsys):
     rid, rid2 = "full-p01-20260927T120000Z", "full-p01-20260928T010203Z-2"
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
                            rid, "--resume-set", f"{rid}:schedule.epochs=5", "--resume-set",
                            f"{rid2}:schedule.epochs=05", "--yes",
                            instances=[{"id": 5, "label": "kitsune-full-p01-data-p01-abc", "actual_status": "running"},
@@ -393,7 +398,7 @@ def test_resume_flags_go_to_the_box_env(full_launch, capsys):
     assert kw["resume"] is True and kw["resets"] == [rid] and set(kw["sets"]) == {rid, rid2}
     assert "WARNING: a live instance of box p01: kitsune-full-p01-data-p01-abc (instance 5, running)" in out
     assert "kitsune-full-full" not in out
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--dry-run")
     assert rc == 0 and "KITSUNE_RESUME" not in " ".join(created_or_printed(capsys.readouterr().out))
     assert not any(c[1:3] == ["show", "instances"] for c in fake.calls)
 
@@ -408,17 +413,17 @@ def test_live_instances_are_the_boxs_own(monkeypatch):
 
 
 def test_the_gate_follows_the_registry_and_the_flag(full_launch, repo, capsys):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--gate-hours",
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--gate-hours",
                            "8", "--dry-run")
     env = env_of(created_or_printed(capsys.readouterr().out))
     assert rc == 0 and env["KITSUNE_GATE_MAX_H"] == "8"
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--gate-hours",
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--gate-hours",
                            "0", "--dry-run")
     out = capsys.readouterr().out
     assert rc == 0 and "the download gate is OFF" in out
     assert not any(k.startswith("KITSUNE_GATE") for k in env_of(created_or_printed(out)))
     # smoke-b: gate false, no timed states: neither the gate nor the scratch repo
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "smoke-b", "--dry-run")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "smoke-b", "--dry-run")
     out = capsys.readouterr().out
     env = env_of(created_or_printed(out))
     assert rc == 0, out
@@ -427,7 +432,7 @@ def test_the_gate_follows_the_registry_and_the_flag(full_launch, repo, capsys):
 
 
 def test_the_smoke_box_alerts_and_its_gate_is_judged_on_the_reference(full_launch, capsys):
-    rc, fake = full_launch([[offer(1, 54650, 0.81)]], "--box", "full-smoke", "--scratch-repo", SCRATCH, "--dry-run")
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "full-smoke", "--scratch-repo", SCRATCH, "--dry-run")
     env = env_of(created_or_printed(capsys.readouterr().out))
     assert rc == 0
     assert env["KITSUNE_WATCHDOG_ORPHAN_ACTION"] == "alert" and env["KITSUNE_WATCHDOG_ORPHAN_S"] == "600"
@@ -537,8 +542,8 @@ def test_full_preflight_passes_a_ready_box(repo, monkeypatch, devslice):
     import hashlib
     assert side == {"kind": "full_study"} and sel_sha == "5e" * 32
     assert man_sha == hashlib.sha256(b'{"manifest": 1}').hexdigest(), "a small file in git: hashed"
-    for box in ("full", "full-smoke"):  # the other training boxes of the registry pass too
-        problems, _ = preflight(monkeypatch, FullHub(box_data(box, reg, repo.root)), box=box)
+    for box in ("full", "full-smoke"):  # the other training boxes of the registry pass too (box full: verified quant)
+        problems, _ = preflight(monkeypatch, FullHub(box_data(box, reg, repo.root), runs=go_runs()), box=box)
         assert problems == [], (box, problems)
 
 
@@ -570,9 +575,9 @@ def test_full_preflight_refuses_a_box_whose_tools_the_sha_lacks(repo, monkeypatc
     kitsune.quant, WP6's whisper kind of speed_probe) is refused before renting."""
     reg = launch.full_registry(SHA)[0]
     data = box_data("full", reg, repo.root)
-    assert preflight(monkeypatch, FullHub(data), box="full")[0] == []
+    assert preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")[0] == []
     (repo.root / "kitsune/quant.py").unlink()
-    problems, _ = preflight(monkeypatch, FullHub(data), box="full")
+    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")
     assert any("kitsune/quant.py (item quant-int8-w8a8-full-p03) does not exist" in p for p in problems), problems
     (repo.root / "kitsune/full_queue.py").unlink()
     problems, _ = preflight(monkeypatch, FullHub(data), box="p01", reg=reg)
@@ -599,7 +604,7 @@ def test_full_preflight_refuses_speed_args_the_sha_lacks(repo, monkeypatch, devs
     data = box_data("full", reg, repo.root)
     probe = repo.root / "tools/speed_probe.py"
     base = probe.read_text(encoding="utf-8")  # the kinds only: no flag of the args
-    problems, _ = preflight(monkeypatch, FullHub(data), box="full", reg=reg)
+    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full", reg=reg)
     want = {"--quant": "speed-full-t06", "--profile-kernels": "speed-full-t06", "--threads": "speed-full-t06",
             "--hf-cache": "speed-study-t06", "--compile": "speed-study-t06"}
     for flag, item in want.items():
@@ -609,11 +614,11 @@ def test_full_preflight_refuses_speed_args_the_sha_lacks(repo, monkeypatch, devs
     # a sha with every flag but --compile (WP5's, say, before its compile commit): only that one is refused
     flags = [f for f in want if f != "--compile"]
     probe.write_text(base + "".join(f'ap.add_argument("{f}")\n' for f in flags), encoding="utf-8")
-    problems, _ = preflight(monkeypatch, FullHub(data), box="full", reg=reg)
+    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full", reg=reg)
     assert [p for p in problems if "speed_probe" in p] == [
         "tools/speed_probe.py at 0123456789ab has no --compile (in the args of speed item speed-study-t06 of box full)"]
     probe.write_text(base + "".join(f'ap.add_argument("{f}")\n' for f in want), encoding="utf-8")
-    assert preflight(monkeypatch, FullHub(data), box="full", reg=reg)[0] == []
+    assert preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full", reg=reg)[0] == []
 
 
 def test_full_preflight_without_devslice_refuses_the_sidecar(repo, monkeypatch):
@@ -650,9 +655,187 @@ def test_resume_preflight_needs_the_hub_summary_and_known_run_ids(repo, monkeypa
 # ========================================================================================= blocklist and gates
 
 
-def test_the_blocklist_holds_151760_and_refuses_a_broken_file(tmp_path):
+# ======================================================================================== the quant go signal (F2)
+
+
+GO_SHA = "fedcba9876543210fedcba9876543210fedcba98"
+
+
+def go_verdict(**kw) -> dict:
+    """A passing smoke-b verdict (checks 12-16; smoke B has no built-in checks) at GO_SHA."""
+    checks = {n: {"pass": True, "evidence": []} for n in launch.QUANT_GO_CHECKS}
+    return dict({"format": 1, "box": "smoke-b", "sha": GO_SHA, "machine_id": "149252",
+                 "time_utc": "2026-10-01T23:10:00+00:00", "overall": "pass", "checks": checks}, **kw)
+
+
+def go_runs(verdict=None) -> dict:
+    """The runs repo's files of a passing smoke-b (its verdict at full/box-smoke-b/smoke_verdict.json)."""
+    return {fullrun.box_verdict_path("smoke-b"): go_verdict() if verdict is None else verdict}
+
+
+@pytest.fixture
+def quant_go(repo, monkeypatch):
+    """quant_go_problems of box full at SHA against a hub with the given verdict (None: none on the Hub); the verdict's
+    commit an ancestor with the same quant code unless .ancestry / .blobs say otherwise."""
+    st = SimpleNamespace(ancestry="ancestor", blobs={}, asked=[])
+    monkeypatch.setattr(launch, "git_ancestry", lambda old, new: st.asked.append((old, new)) or st.ancestry)
+    monkeypatch.setattr(launch, "git_blob", lambda sha, p: st.blobs.get((sha, p), f"blob:{p}"))
+
+    def go(verdict="pass", box="full", allow=False, spec=None):
+        runs = {} if verdict is None else go_runs(None if verdict == "pass" else verdict)
+        hub = FullHub({}, runs=runs)
+        monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+        spec = spec if spec is not None else fullrun.box_spec(box, repo.reg)
+        return launch.quant_go_problems(RUNS, SHA, box, spec, allow_unverified_quant=allow)
+    go.st = st
+    return go
+
+
+def test_the_quant_go_signal_passes_a_verified_box(quant_go):
+    problems, notes = quant_go()
+    assert problems == [], problems
+    assert notes[0] == ("smoke-b verdict: sha fedcba987654, machine 149252, 2026-10-01T23:10:00+00:00, overall pass, "
+                        "check 12 True, check 13 True, check 14 True, check 15 True, check 16 True")
+    assert notes[1].startswith("quant go signal: the smoke-b verdict at fedcba987654 passed checks 12-16, and "
+                               "kitsune/quant.py, tools/speed_probe.py")
+    assert quant_go.st.asked == [(GO_SHA, SHA)]
+
+
+@pytest.mark.parametrize("case, want", [
+    ("missing", "no readable full/box-smoke-b/smoke_verdict.json in Multy123/kitsune-runs (FileNotFoundError"),
+    ("overall", "its overall is 'fail'"),
+    ("check16", "check(s) 16 False (each of 12-16 must pass)"),
+    ("absent", "check(s) 14 absent (each of 12-16 must pass)"),
+    ("null", "check(s) 13 None (each of 12-16 must pass)"),
+    ("nosha", "it names no commit (sha None)"),
+    ("unknown", "its commit fedcba987654 is not in this clone (git fetch origin)"),
+    ("not_ancestor", "its commit fedcba987654 is not an ancestor of 0123456789ab"),
+    ("quant", "kitsune/quant.py differs between fedcba987654 (verified) and 0123456789ab"),
+    ("pins", "requirements-train.txt, docker/Dockerfile differ between fedcba987654"),
+])
+def test_the_quant_go_signal_refusals(quant_go, case, want):
+    """Box full is refused without a verdict, with a failed one or a check of 12-16 not passed, or when the verified
+    commit is unknown, not an ancestor of the one the box runs, or ran other quant code (QUANT_CODE: the quant path,
+    its CLIs and the image's pins)."""
+    v = go_verdict()
+    if case == "overall":
+        v["overall"] = "fail"
+    elif case == "check16":
+        v["checks"]["16"]["pass"] = False
+    elif case == "absent":
+        del v["checks"]["14"]
+    elif case == "null":
+        v["checks"]["13"]["pass"] = None
+    elif case == "nosha":
+        del v["sha"]
+    elif case in ("unknown", "not_ancestor"):
+        quant_go.st.ancestry = case
+    elif case == "quant":
+        quant_go.st.blobs[(SHA, "kitsune/quant.py")] = "changed"
+    elif case == "pins":
+        quant_go.st.blobs.update({(GO_SHA, "requirements-train.txt"): "old", (GO_SHA, "docker/Dockerfile"): "old"})
+    problems, notes = quant_go(None if case == "missing" else v)
+    assert len(problems) == 1 and want in problems[0], problems
+    assert problems[0].startswith("box full's 2 quantised item(s) (e.g. quant-int8-w8a8-full-p03) need a passing "
+                                  "smoke-b verdict (checks 12-16) at this quant code (DECISIONS F2): ")
+    assert problems[0].endswith("rent the standalone smoke-B first (launch --job full --box smoke-b) or pass "
+                                "--allow-unverified-quant")
+    # --allow-unverified-quant: the same text as a warning, nothing refused
+    problems, notes = quant_go(None if case == "missing" else v, allow=True)
+    assert problems == [] and any(n.startswith("WARNING: box full's 2 quantised item(s)") and want in n
+                                  and n.endswith("(--allow-unverified-quant: not refused)") for n in notes), notes
+
+
+def test_the_quant_go_signal_only_concerns_boxes_with_quantised_items(quant_go, repo, monkeypatch):
+    """smoke-b (the verifier) and the boxes without a quantised item never read the verdict; a box whose only
+    quantised item is a speed probe with --quant needs it."""
+    class Unreadable(FullHub):
+        def download(self, *a, **kw):
+            raise AssertionError("the verdict must not be read")
+
+    hub = Unreadable({})
+    for box in ("p01", "full-smoke", "smoke-b"):
+        monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+        assert launch.quant_go_problems(RUNS, SHA, box, fullrun.box_spec(box, repo.reg)) == ([], []), box
+    assert launch.quant_items(fullrun.box_spec("full", repo.reg)) == ["quant-int8-w8a8-full-p03",
+                                                                     "quant-int8-w8a8-full-p01"]
+    speed_only = {"items": [{"name": "speed-x", "kind": "speed", "args": ["--quant", "int8-w8a8"]},
+                            {"name": "speed-y", "kind": "speed", "args": ["--compile"]},
+                            {"name": "fp16-x", "kind": "eval", "argv": ["{python}", "scripts/05_evaluate.py", "--quant",
+                                                                        "fp16"]},
+                            {"name": "whisper", "kind": "eval", "argv": ["{python}", "tools/whisper_eval.py"]}]}
+    assert launch.quant_items(speed_only) == ["speed-x", "fp16-x"]
+    problems, _ = quant_go(None, box="p01", spec=speed_only)
+    assert problems and "box p01's 2 quantised item(s) (e.g. speed-x)" in problems[0]
+
+
+def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, monkeypatch, devslice):
+    """full_preflight ends with the quant go signal (allow_unverified_quant passed through) and, for box full, a warning
+    while its speed record has no box-1 part (never a refusal)."""
+    monkeypatch.setattr(launch, "git_ancestry", lambda old, new: "ancestor")
+    monkeypatch.setattr(launch, "git_blob", lambda sha, p: f"blob:{p}")
+    reg = launch.full_registry(SHA)[0]
+    data = box_data("full", reg, repo.root)
+    problems, notes = preflight(monkeypatch, FullHub(data), box="full")
+    assert len(problems) == 1 and "need a passing smoke-b verdict" in problems[0], problems
+    want = f"WARNING: no {launch.SPEED_RECORD} at 0123456789ab: box full's hours are not held to measured speeds"
+    assert want in notes
+    problems, notes = preflight(monkeypatch, FullHub(data), box="full", allow_unverified_quant=True)
+    assert problems == [] and any(n.startswith("WARNING: box full's 2 quantised item(s)") for n in notes)
+    rec = repo.root / launch.SPEED_RECORD
+    rec.parent.mkdir(parents=True, exist_ok=True)
+    rec.write_text(json.dumps({"smoke": {}, "box1": None}), encoding="utf-8")
+    problems, notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")
+    assert problems == [] and any(n.startswith("quant go signal: ") for n in notes)
+    assert any(n.startswith("WARNING: box full's hours are smoke-only") for n in notes), notes
+    rec.write_text(json.dumps({"smoke": {}, "box1": {"sha": "ab" * 20, "sec_per_step": 0.29}}), encoding="utf-8")
+    notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")[1]
+    assert not any("smoke-only" in n for n in notes) and any("box 1 at abababababab, 0.29 s/step" in n for n in notes)
+    assert launch.speed_record_notes(SHA, "p01") == []
+
+
+def test_allow_unverified_quant_reaches_the_preflight_and_is_full_only(full_launch, capsys):
+    rc, fake = full_launch([[offer(1, 10, 1.40, num_gpus=2, cpu_ram=130000)]], "--box", "full", "--scratch-repo",
+                           SCRATCH, "--allow-unverified-quant")
+    assert rc == 0, capsys.readouterr().out
+    assert full_launch.seen["preflight"][1]["allow_unverified_quant"] is True
+    rc, _ = full_launch([[offer(1, 10, 1.40, num_gpus=2, cpu_ram=130000)]], "--box", "full", "--scratch-repo",
+                        SCRATCH)
+    assert rc == 0 and full_launch.seen["preflight"][1]["allow_unverified_quant"] is False
+    with pytest.raises(SystemExit):
+        launch.main(["--job", "study", "--box", "A", "--data-repo", DATA, "--out-repo", RUNS,
+                     "--allow-unverified-quant"])
+    assert "--allow-unverified-quant: for --job full only" in capsys.readouterr().err
+
+
+def test_offers_in_a_country_without_hub_access_are_dropped():
+    job = launch.full_job("smoke-b", {"gpus": 1}, "5090", 1.75, 3, 1.0)
+    assert job.avoid_countries == ("CN",)
+    for geo, bad in ((", CN", True), ("Beijing, CN", True), ("Tokyo, JP", False), ("Hong Kong, HK", False),
+                     (None, False)):
+        o = offer(1, 58555, 0.5, cpu_ram=64439, **({"geolocation": geo} if geo is not None else {}))
+        problems = launch.offer_problems(o, job)
+        assert bool(problems) == bad, (geo, problems)
+        if bad:
+            assert problems == [f"geolocation {geo!r}: the Hugging Face Hub is not reachable from there"]
+    cn = offer(1, 58555, 0.5, cpu_ram=64439, geolocation=", CN")
+    assert launch.offer_problems(cn, launch.JOBS["train"]) == []  # the other jobs keep their filters
+    assert [o["id"] for o in launch.rank_offers([cn, offer(2, 149252, 0.72, cpu_ram=64439, geolocation="Japan, JP")],
+                                                job)] == [2]
+
+
+def test_the_quant_code_and_the_speed_record_exist_in_this_checkout():
+    for rel in launch.QUANT_CODE:
+        assert (ROOT / rel).is_file(), rel
+    rec = json.loads((ROOT / launch.SPEED_RECORD).read_text(encoding="utf-8"))
+    assert set(rec) >= {"smoke", "box1"}
+    assert launch.SPEED_RECORD_BOXES == ("full",) and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
+
+
+def test_the_blocklist_holds_151760_and_54650_and_refuses_a_broken_file(tmp_path):
     bl = launch.load_blocklist()
     assert "151760" in bl and "2.9 MB/s" in bl["151760"]
+    assert "54650" in bl and "2026-10-01" in bl["54650"] and "never started" in bl["54650"]  # box 2's dead m54650
     raw = json.loads(launch.BLOCKLIST.read_text(encoding="utf-8"))
     assert set(raw) == {"_comment", "machines"}
     for bad in ('{"machines": ["151760"]}', '{"machines": {"m1": "x"}}', '{"machines": {"1": ""}}',
@@ -763,7 +946,7 @@ def full_finish(tmp_path, monkeypatch):
     monkeypatch.setenv("KITSUNE_JOB", "full")
     monkeypatch.setenv("KITSUNE_BOX", "p01")
     monkeypatch.setenv("CONTAINER_ID", "C77")
-    monkeypatch.setenv("KITSUNE_MACHINE_ID", "54650")
+    monkeypatch.setenv("KITSUNE_MACHINE_ID", "70001")
 
     def go(*args, run=True):
         r = full_run(tmp_path) if run else None
@@ -794,7 +977,7 @@ def test_abort_destroys_a_box_without_a_run_dir_with_the_gates_reason(full_finis
     rc, hub, actions, events = full_finish("--abort", "--reason", "onstart failed at line 298 (exit 3)", run=False)
     assert rc == 0 and actions == ["destroy"], "no run dir: nothing on the disk is unique"
     (ab,) = [e for e in events if e["kind"] == "abort"]
-    assert ab["destroyed"] is True and ab["machine_id"] == "54650"
+    assert ab["destroyed"] is True and ab["machine_id"] == "70001"
     assert ab["reason"].startswith("download gate: 2.9 MB/s") and "onstart failed at line 298" in ab["reason"]
     assert hub.uploads == [], "no sync"
     assert "full/box-p01/infra/C77/download_gate.json" in [p for c in hub.commits for p in c]
@@ -933,7 +1116,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     """E.1.8: KITSUNE_CONFIG is stage 1's rebuild, the watchdog's stage-1 env with its hand-over bound, the disk and
     the gate on box 1's extent (+ the chain's extra_gb), the boot's rebuild bytes and timeout on stage 1's; every part
     preflighted as a box, each distinct data config's selection checked, the chain's own files; 35 h, 25.2 h, $1.00."""
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 0, out
     create = created(fake)
@@ -946,7 +1129,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
         "KITSUNE_SCRATCH_REPO": SCRATCH, "KITSUNE_GATE_BYTES": str(int(571.3e9)), "KITSUNE_GATE_MAX_H": "5",
         "KITSUNE_REBUILD_BYTES": str(int(59.2e9)), "KITSUNE_PULL_BYTES": str(int(1e9 * (5.5 + 2))),
         "KITSUNE_MAX_HOURS": "35", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
-        "KITSUNE_REBUILD_TIMEOUT_MIN": "120", "KITSUNE_DPH": "0.8100", "KITSUNE_MACHINE_ID": "54650"}
+        "KITSUNE_REBUILD_TIMEOUT_MIN": "120", "KITSUNE_DPH": "0.8100", "KITSUNE_MACHINE_ID": "70001"}
     assert create[create.index("--disk") + 1] == "1400" and create[create.index("--label") + 1].startswith(
         "kitsune-full-p01-chain-data-smoke-")
     s = chain_launch.seen
@@ -971,18 +1154,18 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     (["--max-hours", "29"], "--max-hours 29 is below chain p01-chain's floor 30"),
 ], ids=["config", "gate-off", "max-hours"])
 def test_launch_chain_refusals(chain_launch, capsys, args, err):
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, *args, "--yes")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, *args, "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and err in out and created(fake) is None, out
 
 
 def test_launch_chain_warns_below_its_cap_and_a_parts_problem_refuses(chain_launch, capsys):
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--max-hours", "32", "--dry-run")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--max-hours", "32", "--dry-run")
     out = capsys.readouterr().out
     assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 35 h" in out
     assert env_of(created_or_printed(out))["KITSUNE_MAX_HOURS"] == "32"
     chain_launch.seen["part_problems"]["smoke-b"] = ["tools/whisper_eval.py (item whisper-large-v3) does not exist"]
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and "part smoke-b: tools/whisper_eval.py (item whisper-large-v3) does not exist" in out
     assert created(fake) is None
@@ -992,7 +1175,7 @@ def test_launch_chain_warns_below_its_cap_and_a_parts_problem_refuses(chain_laun
                                   ["--resume-set", "full-p01-20260927T120000Z:schedule.epochs=5"]])
 def test_a_chain_is_never_resumed_as_a_chain(chain_launch, capsys, flag):
     """E.8: launch --box p01-chain --resume exits 1 with what to run instead; nothing is searched or rented."""
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, *flag, "--yes")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, *flag, "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and "is not resumed as a chain" in out and "--box p01 --resume" in out and fake.calls == []
 
@@ -1003,14 +1186,14 @@ def test_a_resume_of_box_1_checks_the_chains_summary_and_its_live_instances(chai
     got = []
     monkeypatch.setattr(launch, "chain_resume_checks", lambda out, box, chain: got.append((box, chain)) or (
         ["the newest p01 summary on the Hub is from another rental (container X)"], []))
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--yes", box="p01",
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--yes", box="p01",
                             instances=[{"id": 9, "label": "kitsune-full-p01-chain-data-smoke-abc",
                                         "actual_status": "running"}])
     out = capsys.readouterr().out
     assert rc == 1 and got == [("p01", CHAIN_BOX)] and "from another rental (container X)" in out
     assert "WARNING: a live instance of box p01: kitsune-full-p01-chain-data-smoke-abc (instance 9" in out
     monkeypatch.setattr(launch, "chain_resume_checks", lambda out, box, chain: ([], ["continues stage 2 of chain"]))
-    rc, fake = chain_launch([[offer(1, 54650, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--dry-run", box="p01")
+    rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--resume", "--dry-run", box="p01")
     assert rc == 0 and "continues stage 2 of chain" in capsys.readouterr().out
 
 

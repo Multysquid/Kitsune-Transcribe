@@ -14,8 +14,11 @@ the sidecars alone.
 """
 import argparse
 import functools
+import hashlib
 import io
 import json
+import os
+import random
 import shutil
 import sys
 import tarfile
@@ -33,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fixtures import load_script  # noqa: E402
 
 import kitsune.store as store  # noqa: E402
+from kitsune import fetchahead  # noqa: E402
 from kitsune.store import (  # noqa: E402
     ShardWriter, ids_sha256, iter_rows, load_progress, lock_data_root, read_ids, read_manifest, shard_ids,
     sidecar_meta, sidecar_path,
@@ -60,8 +64,10 @@ def make_tar(path: Path, clips: list[tuple[str, str, float]], gz: bool = False, 
 
 @pytest.fixture()
 def fake_hub(tmp_path, monkeypatch):
-    """Serve local tar files as if they were HF repo files; downloads are copies, frees are no-ops on the source."""
+    """Serve local tar files as if they were HF repo files; downloads are copies, frees are no-ops on the source. Each
+    download takes a seeded random 0-20 ms, so downloads fetched ahead (F3) finish out of order."""
     files: dict[str, Path] = {}
+    latency = random.Random(1234)
 
     class Api:
         def list_repo_files(self, repo, repo_type=None, revision=None):
@@ -70,6 +76,7 @@ def fake_hub(tmp_path, monkeypatch):
 
     def hf_hub_download(repo, filename, repo_type=None, revision=None, cache_dir=None):
         assert filename in files and revision == prep.REVISIONS[repo]
+        time.sleep(latency.uniform(0, 0.02))
         dst = tmp_path / "dl" / filename.replace("/", "_")
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(files[filename], dst)
@@ -81,9 +88,15 @@ def fake_hub(tmp_path, monkeypatch):
     return files
 
 
-def ingest(root: Path, source: str, fn, *args, step: str | None = None, **kwargs):
-    ing = prep.Ingest(root, root / "raw", source, None, step=step)
-    fn(ing, *args, **kwargs)
+def ingest(root: Path, source: str, fn, *args, step: str | None = None, ahead: int = 0, **kwargs):
+    """One ingest function on its own Ingest; `ahead` > 0 downloads that many inputs ahead (F3). A raising ingest stops
+    its fetch-ahead as ingest_source does."""
+    ing = prep.Ingest(root, root / "raw", source, None, step=step, download_ahead=ahead)
+    try:
+        fn(ing, *args, **kwargs)
+    except BaseException:
+        ing.end_downloads(abort=True)
+        raise
     return ing
 
 
@@ -211,13 +224,14 @@ def test_emilia_yodas_never_ingests_the_holdout_tar_or_videos(tmp_path, fake_hub
     assert ing.stats["eval_video"] == 1 and not ing.is_finished("JA/JA-B000029.tar")
 
 
-def test_disk_guard_stops_before_a_download(tmp_path, fake_hub, monkeypatch):
+@pytest.mark.parametrize("ahead", [0, 3])
+def test_disk_guard_stops_before_a_download(tmp_path, fake_hub, monkeypatch, ahead):
     t0 = tmp_path / "JA-B000000_standard.tar.gz"
     make_tar(t0, [("JA_B00000_S00000_W000000", "こんにちは。", 2.0)], gz=True, worker="worker_0/")
     fake_hub[t0.name] = t0
     monkeypatch.setattr(prep.shutil, "disk_usage", lambda p: SimpleNamespace(free=int((prep.MIN_FREE_GB - 1) * 1e9)))
     with pytest.raises(SystemExit, match="GB free"):
-        ingest(tmp_path / "data", "emilia_nc", prep.ingest_emilia_nc, float("inf"))
+        ingest(tmp_path / "data", "emilia_nc", prep.ingest_emilia_nc, float("inf"), ahead=ahead)
 
 
 
@@ -254,13 +268,14 @@ def test_reazon_tiers_dedup_against_every_smaller_tier():
     assert "reazon_large" in prep.HF_PARQUET_SOURCES and "emilia_nc" in prep.ALL_SOURCES
 
 
-def test_galgame_resume_matches_a_fresh_run(tmp_path, fake_hub, small_shards, monkeypatch):
+@pytest.mark.parametrize("ahead", [0, 3])
+def test_galgame_resume_matches_a_fresh_run(tmp_path, fake_hub, small_shards, monkeypatch, ahead):
     t0, t1 = tmp_path / "a-000.tar", tmp_path / "a-001.tar"
     make_galgame_tar(t0, [(f"k{i}", "テキストです。", 40.0 if i == 1 else 1.0) for i in range(10)])  # k1 > 30 s
     make_galgame_tar(t1, [(f"m{i}", "テキストです。", 1.0) for i in range(3)])
     fake_hub.update({t0.name: t0, t1.name: t1})
     fresh = tmp_path / "fresh"
-    ingest(fresh, "galgame", prep.ingest_galgame, 2)
+    ingest(fresh, "galgame", prep.ingest_galgame, 2, ahead=ahead)
     # absolute, not only fresh == resumed: the box's fresh ingest must match the laptop's frozen teacher outputs
     want = sorted([("eval", f"galgame/k{i}") for i in (0, 2, 3)]  # the first 3 KEPT rows: k1 is too long
                   + [("train", f"galgame/{k}") for k in [f"k{i}" for i in range(4, 10)] + ["m0", "m1", "m2"]])
@@ -273,15 +288,16 @@ def test_galgame_resume_matches_a_fresh_run(tmp_path, fake_hub, small_shards, mo
         resumed = tmp_path / f"resumed{n}"
         restore = crash_after(monkeypatch, n)
         with pytest.raises(RuntimeError, match="simulated crash"):
-            ingest(resumed, "galgame", prep.ingest_galgame, 2)
+            ingest(resumed, "galgame", prep.ingest_galgame, 2, ahead=ahead)
         assert split_ids(resumed, "galgame") == after_crash[n]
         restore()
-        ing = ingest(resumed, "galgame", prep.ingest_galgame, 2)
+        ing = ingest(resumed, "galgame", prep.ingest_galgame, 2, ahead=ahead)
         assert split_ids(resumed, "galgame") == want, f"crash after {n} adds"
         assert ing.stats["dup"] == dup
 
 
-def test_parquet_resume_matches_a_fresh_run(tmp_path, fake_hub, small_shards, monkeypatch):
+@pytest.mark.parametrize("ahead", [0, 3])
+def test_parquet_resume_matches_a_fresh_run(tmp_path, fake_hub, small_shards, monkeypatch, ahead):
     repo, split = prep.HF_PARQUET_SOURCES["reazon_small"]
     sizes = (8, 3)
     for j, n in enumerate(sizes):
@@ -289,14 +305,14 @@ def test_parquet_resume_matches_a_fresh_run(tmp_path, fake_hub, small_shards, mo
         make_reazon_parquet(p, [f"f{j}r{i}" for i in range(n)])
         fake_hub[f"data/train-{j}.parquet"] = p
     fresh, resumed = tmp_path / "fresh", tmp_path / "resumed"
-    ingest(fresh, "reazon_small", prep.ingest_hf_parquet, repo, split)
+    ingest(fresh, "reazon_small", prep.ingest_hf_parquet, repo, split, ahead=ahead)
     want = sorted(("train", f"reazon_small/f{j}r{i}") for j, n in enumerate(sizes) for i in range(n))
     assert split_ids(fresh, "reazon_small") == want
     restore = crash_after(monkeypatch, 6)  # train-00000 (f0r0..f0r3) flushed; f0r4, f0r5 lost with the buffer
     with pytest.raises(RuntimeError, match="simulated crash"):
-        ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split)
+        ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split, ahead=ahead)
     restore()
-    ing = ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split)
+    ing = ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split, ahead=ahead)
     assert split_ids(resumed, "reazon_small") == want and ing.stats["dup"] == 4
     # a larger tier skips every row already in a smaller one (DEDUP_AGAINST), by name
     p = tmp_path / "train-2.parquet"
@@ -376,21 +392,22 @@ def test_orphan_shard_is_removed_and_stems_match_a_clean_run(tmp_path, fake_hub,
         assert on_disk(root) == before
 
 
+@pytest.mark.parametrize("ahead", [0, 3])
 @pytest.mark.parametrize("where", ["sidecar", "manifest"])
-def test_crash_resume_gives_identical_stems(tmp_path, fake_hub, small_shards, monkeypatch, where):
+def test_crash_resume_gives_identical_stems(tmp_path, fake_hub, small_shards, monkeypatch, where, ahead):
     """Not only the ids: a run killed inside a shard flush and resumed leaves the same shard files, rows and sidecars as
     an uninterrupted one. The crash hits the second flush after its rename: parquet train-00001 (f0r4..f0r7), galgame
     eval-00000 (the hold-out, flushed at tar 0's end)."""
     repo, split = prep.HF_PARQUET_SOURCES["reazon_small"]
     add_reazon_files(tmp_path, fake_hub, (8, 3))
     fresh, resumed = tmp_path / "fresh", tmp_path / "resumed"
-    ingest(fresh, "reazon_small", prep.ingest_hf_parquet, repo, split)
+    ingest(fresh, "reazon_small", prep.ingest_hf_parquet, repo, split, ahead=ahead)
     restore = crash_in_flush(monkeypatch, where, 2)
     with pytest.raises(RuntimeError, match="simulated crash"):
-        ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split)
+        ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split, ahead=ahead)
     restore()
     assert (resumed / "shards" / "reazon_small" / "train-00001.parquet").is_file()  # the orphan the crash left
-    ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split)
+    ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split, ahead=ahead)
     assert layout(resumed, "reazon_small") == layout(fresh, "reazon_small")
 
     fake_hub.clear()
@@ -398,13 +415,13 @@ def test_crash_resume_gives_identical_stems(tmp_path, fake_hub, small_shards, mo
     make_galgame_tar(t0, [(f"k{i}", "テキストです。", 40.0 if i == 1 else 1.0) for i in range(10)])  # k1 > 30 s
     make_galgame_tar(t1, [(f"m{i}", "テキストです。", 1.0) for i in range(3)])
     fake_hub.update({t0.name: t0, t1.name: t1})
-    ingest(fresh, "galgame", prep.ingest_galgame, 2)
+    ingest(fresh, "galgame", prep.ingest_galgame, 2, ahead=ahead)
     restore = crash_in_flush(monkeypatch, where, 2)
     with pytest.raises(RuntimeError, match="simulated crash"):
-        ingest(resumed, "galgame", prep.ingest_galgame, 2)
+        ingest(resumed, "galgame", prep.ingest_galgame, 2, ahead=ahead)
     restore()
     assert (resumed / "shards" / "galgame" / "eval-00000.parquet").is_file()
-    ingest(resumed, "galgame", prep.ingest_galgame, 2)
+    ingest(resumed, "galgame", prep.ingest_galgame, 2, ahead=ahead)
     rows, metas, files = layout(resumed, "galgame")
     assert (rows, metas, files) == layout(fresh, "galgame")
     assert rows["shards/galgame/eval-00000.parquet"] == ["galgame/k0", "galgame/k2", "galgame/k3"]
@@ -664,10 +681,12 @@ def test_whisper_capture_keeps_nulls_and_is_written_before_finish_input(tmp_path
     assert sorted(d.name for d in wdir.iterdir()) == ["reazon_small"]
 
 
-def test_hold_file_blocks_the_next_download(tmp_path, fake_hub, monkeypatch):
+@pytest.mark.parametrize("ahead", [0, 4])
+def test_hold_file_blocks_the_next_download(tmp_path, fake_hub, monkeypatch, ahead):
     """The label box's janitor holds the ingest while too much unlabelled audio is on disk: 01 waits before its next
     download and touches its heartbeat at every poll, so the controller does not take the wait for a hang. It is also
-    touched at each download start and every HEARTBEAT_ROWS kept rows."""
+    touched at each download start and every HEARTBEAT_ROWS kept rows. A hold file forces one download at a time
+    (files fetched ahead would slip past the hold), so the events are the same with a download-ahead."""
     t0 = tmp_path / "JA-B000000_standard.tar.gz"
     make_tar(t0, [(f"JA_B00000_S00000_W00000{i}", "こんにちは。", 2.0) for i in range(2)], gz=True, worker="worker_0/")
     fake_hub[t0.name] = t0
@@ -691,8 +710,246 @@ def test_hold_file_blocks_the_next_download(tmp_path, fake_hub, monkeypatch):
     monkeypatch.setattr(prep, "time", SimpleNamespace(sleep=sleep))
     monkeypatch.setattr(prep, "HEARTBEAT_ROWS", 2)
     root = tmp_path / "data"
-    ing = prep.Ingest(root, root / "raw", "emilia_nc", None, heartbeat=hb, hold_file=hold)
+    ing = prep.Ingest(root, root / "raw", "emilia_nc", None, heartbeat=hb, hold_file=hold, download_ahead=ahead)
+    assert ing.download_ahead == 0
     prep.ingest_emilia_nc(ing, float("inf"))
     assert events == [("sleep", prep.HOLD_POLL_S, True)] * 3 + [("download", True)]  # touched at the download start
     assert hb.is_file()  # touched again at the 2nd kept row
     assert ids(root, "emilia_nc") == [f"emilia_nc/JA_B00000_S00000_W00000{i}" for i in range(2)]
+
+
+# ------------------------------------------------------------------------------------- downloads ahead of the ingest
+# Decision F3: 01 downloads up to --download-ahead upstream files while it ingests the current one. The rebuild's
+# output must be the one-at-a-time run's, byte for byte, and only ingested inputs may be recorded.
+
+
+def tree_bytes(root: Path) -> dict[str, bytes]:
+    """Every file under a data root but raw/ (download caches) and the lock: shards, sidecars, manifest, progress."""
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*"))
+            if p.is_file() and p.name != ".ingest.lock" and p.relative_to(root).parts[0] != "raw"}
+
+
+def test_fetch_ahead_output_is_byte_identical(tmp_path, fake_hub, small_shards):
+    """parquet (with a nested tier's dedup), galgame (the hold-out) and Emilia (a budget cut inside a tar, then the
+    rest continuing it) at ahead 0 and 4: every file of the two data roots is equal, progress.json input_bytes
+    included (only the ingested inputs, in the same key order)."""
+    up = tmp_path / "up"
+    up.mkdir()
+    parquet = {}
+    for j, n in enumerate((5, 3, 6)):
+        p = up / f"r{j}.parquet"
+        make_reazon_parquet(p, [f"f{j}r{i}" for i in range(n)])
+        parquet[f"data/train-{j}.parquet"] = p
+    galgame = {}
+    for j in range(3):
+        t = up / f"g-00{j}.tar"
+        make_galgame_tar(t, [(f"g{j}k{i}", "テキストです。", 1.0) for i in range(5)])
+        galgame[t.name] = t
+    emilia = {}
+    for j in range(4):
+        t = up / f"JA-B00000{j}.tar"
+        make_tar(t, [(f"JA_vid{j}_W00000{i}", "日本語です。", 2.0) for i in range(3)])
+        emilia[f"JA/{t.name}"] = t
+
+    def run(root: Path, ahead: int):
+        for files, source, fn, args in (
+                (parquet, "reazon_small", prep.ingest_hf_parquet, prep.HF_PARQUET_SOURCES["reazon_small"]),
+                (galgame, "galgame", prep.ingest_galgame, (3,)),
+                (emilia, "emilia_yodas@300h", prep.ingest_emilia, (9 / 3600,)),  # cut inside tar 1, no hint
+                (emilia, "emilia_yodas", prep.ingest_emilia, (float("inf"),))):
+            fake_hub.clear()
+            fake_hub.update(files)
+            ingest(root, source.split("@")[0], fn, *args, step=source, ahead=ahead)
+
+    run(tmp_path / "one", 0)
+    run(tmp_path / "ahead", 4)
+    one, ahead = tree_bytes(tmp_path / "one"), tree_bytes(tmp_path / "ahead")
+    assert one == ahead
+    assert "manifest.jsonl" in one and "shards/emilia_yodas/progress.json" in one and len(one) > 20
+    prog = json.loads(one["shards/emilia_yodas/progress.json"])
+    assert list(prog["input_bytes"]) == [f"JA/JA-B00000{j}.tar" for j in range(4)]
+
+
+def test_emilia_budget_cut_discards_fetched_ahead_tars(tmp_path, fake_hub, monkeypatch):
+    """A budget that cuts inside tar 1: without a hint up to K tars past it come down and are freed unread, and
+    progress.json records only the two tars the ingest read. With the hint (the extent's EMILIA_300H_INPUTS) nothing
+    past it downloads."""
+    for j in range(6):
+        t = tmp_path / f"JA-B00000{j}.tar"
+        make_tar(t, [(f"JA_vid{j}_W00000{i}", "日本語です。", 2.0) for i in range(2)])
+        fake_hub[f"JA/{t.name}"] = t
+    real, downloads, freed = prep.hf_hub_download, [], []
+
+    def download(repo, filename, **kw):
+        downloads.append(filename)
+        return real(repo, filename, **kw)
+
+    monkeypatch.setattr(prep, "hf_hub_download", download)
+    monkeypatch.setattr(prep.Ingest, "free_download", staticmethod(lambda local: (
+        freed.append(Path(local).name), Path(local).unlink(missing_ok=True))))
+    read = ["JA/JA-B000000.tar", "JA/JA-B000001.tar"]
+    want = None
+    for ahead, hint in ((0, None), (3, None), (3, 2)):
+        downloads.clear()
+        freed.clear()
+        root = tmp_path / f"a{ahead}h{hint}"
+        ing = ingest(root, "emilia_yodas", prep.ingest_emilia, 5 / 3600, ahead=ahead, plan_inputs=hint)
+        prog = load_progress(root, "emilia_yodas")
+        assert list(prog["input_bytes"]) == read and prog["finished_inputs"] == read[:1]
+        assert sorted(downloads)[:2] == read and len(downloads) == len(set(downloads))
+        if ahead and hint is None:
+            assert 2 <= len(downloads) <= 2 + ahead
+        elif ahead:  # both tars come down at once: their start order is the threads' (progress.json's is checked above)
+            assert sorted(downloads) == read
+        else:
+            assert downloads == read
+        assert sorted(freed) == sorted(f.replace("/", "_") for f in downloads)  # every one freed, read or not
+        got = ids(root, "emilia_yodas")
+        assert want is None or got == want
+        want = got
+        assert ing.stats["seconds"] >= 5
+
+
+def hf_layout(tmp_path: Path, files: dict[str, Path], symlinks: bool = False):
+    """A fake hf_hub_download that honours cache_dir as the Hub client does: blobs/<hash> plus the pinned revision's
+    snapshots/<rev>/<file> (a copy, or a symlink to the blob), a .locks dir, and the commit-hash short-circuit (the
+    pointer exists -> no network). Records the network downloads and the cache hits."""
+    hub = SimpleNamespace(network=[], hits=[])
+
+    def download(repo, filename, repo_type=None, revision=None, cache_dir=None):
+        assert revision == prep.REVISIONS[repo] and cache_dir is not None
+        repo_dir = Path(cache_dir) / f"datasets--{repo.replace('/', '--')}"
+        pointer = repo_dir / "snapshots" / revision / filename
+        if pointer.exists():
+            hub.hits.append(filename)
+            return str(pointer)
+        hub.network.append(filename)
+        (Path(cache_dir) / ".locks" / repo_dir.name).mkdir(parents=True, exist_ok=True)
+        blob = repo_dir / "blobs" / hashlib.sha256(filename.encode()).hexdigest()
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(files[filename], blob)
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        if symlinks:
+            os.symlink(blob, pointer)
+        else:
+            shutil.copy(blob, pointer)
+        return str(pointer)
+
+    return hub, download
+
+
+def symlinks_work(tmp_path: Path) -> bool:
+    try:
+        os.symlink(tmp_path / "nowhere", tmp_path / "link-probe")
+        return True
+    except (OSError, NotImplementedError):
+        return False
+
+
+@pytest.mark.parametrize("symlinks", [False, True])
+def test_cache_dir_per_input_and_free_removes_only_its_own(tmp_path, monkeypatch, symlinks):
+    """The regression test for the old free_download, which deleted every finished blob of the repo's shared cache:
+    with downloads ahead that was a file fetched and not yet ingested. Each input now has its own cache dir, and
+    freeing one removes that dir whole (.locks included) and leaves the other input's blob alone."""
+    if symlinks and not symlinks_work(tmp_path):
+        pytest.skip("no symlink privilege (the Hub client then copies, the other case)")
+    repo = prep.HF_PARQUET_SOURCES["reazon_small"][0]
+    src = {}
+    for j in range(2):
+        p = tmp_path / f"src{j}.parquet"
+        make_reazon_parquet(p, [f"r{j}"])
+        src[f"data/train-{j}.parquet"] = p
+    hub, download = hf_layout(tmp_path, src, symlinks)
+    monkeypatch.setattr(prep, "hf_hub_download", download)
+    root = tmp_path / "data"
+    ing = prep.Ingest(root, root / "raw", "reazon_small", None)
+    a, b = (ing._fetch(repo, f) for f in src)
+    da, db = ing.cache_for(repo, "data/train-0.parquet"), ing.cache_for(repo, "data/train-1.parquet")
+    assert da != db and da.parent == db.parent == root / "raw" / prep.DL_DIR
+    assert a.is_relative_to(da) and b.is_relative_to(db) and (a.is_symlink() == symlinks)
+    prep.Ingest.free_download(a)
+    assert not da.exists() and b.read_bytes() == src["data/train-1.parquet"].read_bytes()
+    assert len(list((db / f"datasets--{repo.replace('/', '--')}" / "blobs").iterdir())) == 1
+    prep.Ingest.free_download(b)
+    assert not db.exists() and not any(p.is_file() for p in (root / "raw").rglob("*"))
+    assert hub.network == list(src)
+
+
+def test_resumed_run_reuses_complete_fetched_ahead_files(tmp_path, monkeypatch, small_shards):
+    """A crash with files fetched ahead keeps them (abort): the resumed run finds them as cache hits and downloads only
+    what was not complete. Every input it reads is freed, so raw/ ends with no file, and the shards are a fresh run's."""
+    repo, split = prep.HF_PARQUET_SOURCES["reazon_small"]
+    src = {}
+    for j in range(4):
+        p = tmp_path / f"src{j}.parquet"
+        make_reazon_parquet(p, [f"f{j}r{i}" for i in range(3)])
+        src[f"data/train-{j}.parquet"] = p
+
+    class Api:
+        def list_repo_files(self, repo, repo_type=None, revision=None):
+            return sorted(src)
+
+    hub, download = hf_layout(tmp_path, src)
+    monkeypatch.setattr(prep, "HfApi", Api)
+    monkeypatch.setattr(prep, "hf_hub_download", download)
+    fresh, root = tmp_path / "fresh", tmp_path / "data"
+    ingest(fresh, "reazon_small", prep.ingest_hf_parquet, repo, split)
+    hub.network.clear()
+    restore = crash_after(monkeypatch, 4)  # inside input 1
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        ingest(root, "reazon_small", prep.ingest_hf_parquet, repo, split, ahead=3)
+    restore()
+    ing = prep.Ingest(root, root / "raw", "reazon_small", None)
+    complete = {f for f in src if (ing.cache_for(repo, f) / f"datasets--{repo.replace('/', '--')}" / "snapshots"
+                                   / prep.REVISIONS[repo] / f).is_file()}
+    assert "data/train-0.parquet" not in complete and "data/train-1.parquet" in complete  # freed / in use at the crash
+    assert load_progress(root, "reazon_small")["finished_inputs"] == ["data/train-0.parquet"]
+    hub.network.clear()
+    hub.hits.clear()
+    ingest(root, "reazon_small", prep.ingest_hf_parquet, repo, split, ahead=3)
+    assert sorted(hub.hits) == sorted(complete) and sorted(hub.network) == sorted(set(src) - complete - {
+        "data/train-0.parquet"})
+    assert not any(p.is_file() for p in (root / "raw").rglob("*"))
+    assert layout(root, "reazon_small") == layout(fresh, "reazon_small")
+
+
+def test_listing_retries_a_transient_error(tmp_path, fake_hub, monkeypatch):
+    """A Hub 503 at a listing is retried after the policy's backoff instead of failing the rebuild attempt."""
+    import httpx
+    from huggingface_hub.errors import HfHubHTTPError
+
+    add_reazon_files(tmp_path, fake_hub, (2,))
+    real_api, calls, waits = prep.HfApi, [], []
+
+    class Flaky(real_api):
+        def list_repo_files(self, repo, **kw):
+            calls.append(repo)
+            if len(calls) == 1:
+                raise HfHubHTTPError("503 Service Unavailable", response=httpx.Response(
+                    503, request=httpx.Request("GET", "https://huggingface.co/api/datasets/x")))
+            return super().list_repo_files(repo, **kw)
+
+    monkeypatch.setattr(prep, "HfApi", Flaky)
+    monkeypatch.setattr(prep, "time", SimpleNamespace(sleep=waits.append))
+    root = tmp_path / "data"
+    ingest(root, "reazon_small", prep.ingest_hf_parquet, *prep.HF_PARQUET_SOURCES["reazon_small"])
+    assert len(calls) == 2 and len(waits) == 1 and 8 <= waits[0] <= 12
+    assert ids(root, "reazon_small") == ["reazon_small/f0r0", "reazon_small/f0r1"]
+
+
+def test_space_guard_reserves_in_flight_and_exempts_cache_hits(tmp_path, monkeypatch):
+    repo, f = prep.EMOLIA_REPO, "JA-B000000_standard.tar.gz"
+    free = [prep.MIN_FREE_GB + 5]
+    monkeypatch.setattr(prep.shutil, "disk_usage", lambda p: SimpleNamespace(free=int(free[0] * 1e9)))
+    ing = prep.Ingest(tmp_path / "data", tmp_path / "data" / "raw", "emilia_nc", None)
+    assert ing._space_problem(repo, f) is None and ing._space_problem(repo, f, 1) is None
+    msg = ing._space_problem(repo, f, 2)  # 5 GB over the floor < 2 x RESERVE_GB
+    assert "GB free" in msg and "3 GB for each of 2 other downloads in flight" in msg and msg.endswith(f"before {f}")
+    free[0] = prep.MIN_FREE_GB - 1
+    assert "GB free" in ing._space_problem(repo, f)
+    pointer = ing.cache_for(repo, f) / "datasets--laion--Emolia" / "snapshots" / prep.REVISIONS[repo] / f
+    pointer.parent.mkdir(parents=True)
+    pointer.write_bytes(b"complete")  # a file a killed run fetched ahead: no download, no space needed
+    assert ing._space_problem(repo, f, 5) is None
+    assert prep.RESERVE_GB * 1e9 > 2_520_000_000  # emilia_nc's largest input (labels/full/extent.json)
+    assert fetchahead.DEFAULT_AHEAD == 6 and fetchahead.MAX_AHEAD == 16

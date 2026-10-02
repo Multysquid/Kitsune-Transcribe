@@ -44,6 +44,15 @@ of kitsune/extent.py, in this one process: the label box and the A100 rebuild ru
 same ids and stems (the order changes ids: reazon_small before reazon_large, Emilia as 300 h -> eval_emilia -> the
 rest). It replaces --sources and the per-source flags, and <data>/extent_progress.json records the finished steps.
 
+Downloads (decision F3): up to --download-ahead N upstream files (default $KITSUNE_DOWNLOAD_AHEAD, else 6; 0 = one at
+a time) download while the ingest reads the current one (kitsune/fetchahead.py). The ingest still takes them one by one
+in its own order, so shards, sidecars, manifest and progress are byte-identical to the one-at-a-time run; only the
+inputs it ingests are recorded (progress.json input_bytes), never one fetched ahead. Box 1 (2026-10-01) spent 3.1 h on
+571 GB one file at a time, the link idle during every ingest. Each input has an HF cache dir of its own
+(raw/dl/<hash>), which free_download removes whole; a killed run leaves the files it fetched ahead there, the resumed
+run finds them as cache hits, and a finished run removes raw/dl. Downloads and listings retry transient Hub errors
+(429, 5xx, dead connections) in-process. --hold-file forces one at a time (the label box's hold is per download).
+
 Usage:
   python scripts/01_prepare_data.py --sources reazon_small galgame eval --galgame-shards 6
   python scripts/01_prepare_data.py --sources eval_cv8 --limit-rows 64      # smoke run -> writes to data_smoke/
@@ -53,7 +62,9 @@ Usage:
 """
 import argparse
 import csv
+import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -69,7 +80,7 @@ import pyarrow.parquet as pq  # noqa: E402
 from huggingface_hub import HfApi, hf_hub_download  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
-from kitsune import extent  # noqa: E402
+from kitsune import extent, fetchahead  # noqa: E402
 from kitsune.audio import audio_info  # noqa: E402
 from kitsune.store import (  # noqa: E402
     ShardWriter, fsync_path, iter_rows, load_progress, lock_data_root, read_ids, read_manifest, remove_source,
@@ -121,20 +132,38 @@ HEARTBEAT_ROWS = 1000  # touch --heartbeat every this many kept rows (one input 
 # sources whose upstream files have a sorted listing that --max-inputs can cut (galgame: the same as --galgame-shards)
 MAX_INPUT_SOURCES = (*HF_PARQUET_SOURCES, "galgame", "emilia_yodas", "emilia_nc")
 REFUSED_EXIT = 3  # an --extent-config that is no valid extent: vast/bootstrap.sh's retry() does not repeat exit 3
+# F3: every upstream input downloads into raw/DL_DIR/<sha1(repo, file)[:16]>, an HF cache dir of its own (hashed: the
+# Windows path limit). The old shared raw/datasets--<repo> cache could not take downloads ahead: free_download deleted
+# every finished blob of the repo, a file fetched ahead and not yet ingested included
+DL_DIR = "dl"
+# the disk guard's reserve per other download in flight: the largest upstream input is emilia_nc's 2.52 GB
+# (labels/full/extent.json input bytes)
+RESERVE_GB = 3.0
+DOWNLOAD_AHEAD_ENV = "KITSUNE_DOWNLOAD_AHEAD"
 
 
 class Ingest:
     """Shared bookkeeping for one source: writers, stats, progress, download cleanup.
 
     `step` (default: the source) and the current input go into every shard's id sidecar; `heartbeat` is touched while
-    the ingest makes progress; while `hold_file` exists, the next download waits."""
+    the ingest makes progress; while `hold_file` exists, the next download waits. `download_ahead` > 0: the inputs
+    an ingest function announces (plan_downloads) download up to that many ahead of the ingest (F3); constructed
+    without it, an Ingest downloads one at a time."""
 
     def __init__(self, root: Path, raw: Path, source: str, limit_rows: int | None, step: str | None = None,
-                 heartbeat: Path | None = None, hold_file: Path | None = None):
+                 heartbeat: Path | None = None, hold_file: Path | None = None, download_ahead: int = 0):
         self.root, self.raw, self.source, self.limit = root, raw, source, limit_rows
         self.step = step or source
         self.heartbeat = Path(heartbeat) if heartbeat else None
         self.hold_file = Path(hold_file) if hold_file else None
+        if self.hold_file is not None and download_ahead:
+            # the label box's janitor holds the NEXT download while too much unlabelled audio is on disk: files fetched
+            # ahead would slip past the hold, and that box is GPU-bound anyway
+            print(f"  {source}: --hold-file: one download at a time")
+            download_ahead = 0
+        self.download_ahead = int(download_ahead)
+        self._plan: tuple[str, list[str]] | None = None  # (repo, the inputs the ingest will download, in order)
+        self._fa: fetchahead.FetchAhead | None = None
         self.progress = load_progress(root, source)
         self.writers: dict[str, ShardWriter] = {}
         self.cur = {"input": None, "step": self.step}  # the sidecar meta of the rows being added
@@ -197,6 +226,69 @@ class Ingest:
         self.progress["finished_inputs"].append(input_name)
         save_progress(self.root, self.source, self.progress)
 
+    def cache_for(self, repo: str, filename: str) -> Path:
+        """The HF cache dir of one upstream input (DL_DIR)."""
+        return self.raw / DL_DIR / hashlib.sha1(f"{repo}\n{filename}".encode("utf-8")).hexdigest()[:16]
+
+    def _fetch(self, repo: str, filename: str) -> Path:
+        # the module's hf_hub_download, looked up at call time (tests patch it), from a fetch-ahead worker thread too
+        return Path(hf_hub_download(repo, filename, repo_type="dataset", revision=REVISIONS[repo],
+                                    cache_dir=str(self.cache_for(repo, filename))))
+
+    def _space_problem(self, repo: str, filename: str, in_flight: int = 0) -> str | None:
+        """The disk guard: a message when the download of `filename` would start with less than MIN_FREE_GB free,
+        counting RESERVE_GB for each other download in flight. A file already complete in its cache dir (fetched
+        ahead by a killed run) needs no space: hf_hub_download returns it without the network."""
+        pointer = (self.cache_for(repo, filename) / f"datasets--{repo.replace('/', '--')}" / "snapshots"
+                   / REVISIONS[repo] / filename)
+        if pointer.exists():
+            return None
+        here = next(d for d in (self.root, *self.root.parents) if d.exists())  # the data root may not exist yet
+        free_gb = shutil.disk_usage(here).free / 1e9
+        if free_gb - RESERVE_GB * in_flight >= MIN_FREE_GB:
+            return None
+        held = f" + {RESERVE_GB:g} GB for each of {in_flight} other downloads in flight" if in_flight else ""
+        return (f"  {self.source}: only {free_gb:.0f} GB free on the data disk (< {MIN_FREE_GB:.0f} GB{held}); "
+                f"stopping before {filename}")
+
+    def plan_downloads(self, repo: str, filenames: list[str]):
+        """Announce the inputs this ingest will download, in order (finished inputs left out). Nothing downloads yet:
+        the fetch-ahead starts at the first download() of a planned input, so an ingest that stops before its first
+        download (a budget already reached) downloads nothing. Also removes the cache dirs of finished inputs, which a
+        kill between finish_input and free_download leaves behind."""
+        for f in self.progress["finished_inputs"]:
+            shutil.rmtree(self.cache_for(repo, f), ignore_errors=True)
+        self._plan = (repo, list(filenames))
+
+    def _pool_for(self, repo: str, filename: str) -> "fetchahead.FetchAhead | None":
+        """The fetch-ahead serving `filename`, started at the first planned download; None: download it here, one at
+        a time (no fetch-ahead, no plan, or a file outside the plan, e.g. an Emilia tar past the 300 h hint)."""
+        if self.download_ahead <= 0 or self._plan is None:
+            return None
+        plan_repo, names = self._plan
+        if self._fa is None:
+            if plan_repo != repo or filename not in names:
+                return None
+            keys = names[names.index(filename):]
+            self._fa = fetchahead.FetchAhead(
+                keys, lambda f: self._fetch(repo, f), ahead=self.download_ahead,
+                free=lambda p: self.free_download(p),  # the class attribute at call time (tests patch it)
+                guard=lambda f, n: self._space_problem(repo, f, n),
+                progress=lambda f: fetchahead.dir_bytes(self.cache_for(repo, f)), name=self.source)
+            print(f"  {self.source}: downloading up to {self.download_ahead} of {len(keys)} inputs ahead of the ingest")
+            return self._fa
+        if plan_repo == repo and self._fa.next_key() == filename:
+            return self._fa
+        self.end_downloads()  # off the plan (no ingest function does this): one at a time from here
+        return None
+
+    def end_downloads(self, abort: bool = False):
+        """Stop the fetch-ahead: at the end of an ingest (done), or with abort=True when it raised (ingest_source),
+        which keeps the files fetched ahead for the resumed run."""
+        fa, self._fa, self._plan = self._fa, None, None
+        if fa is not None:
+            fa.close(abort=abort)
+
     def download(self, repo: str, filename: str) -> Path:
         if self.hold_file is not None and self.hold_file.exists():
             # the label box holds the ingest while too much unlabelled audio is on disk; waiting is progress, not a hang
@@ -204,13 +296,19 @@ class Ingest:
             while self.hold_file.exists():
                 self.beat()
                 time.sleep(HOLD_POLL_S)
-        here = next(d for d in (self.root, *self.root.parents) if d.exists())  # the data root may not exist yet
-        free_gb = shutil.disk_usage(here).free / 1e9
-        if free_gb < MIN_FREE_GB:  # everything flushed so far stays; a re-run continues with this input file
-            raise SystemExit(f"  {self.source}: only {free_gb:.0f} GB free on the data disk (< {MIN_FREE_GB:.0f} GB); "
-                             f"stopping before {filename}")
-        self.beat()
-        local = Path(hf_hub_download(repo, filename, repo_type="dataset", revision=REVISIONS[repo], cache_dir=self.raw))
+        pool = self._pool_for(repo, filename)
+        if pool is not None:  # the pool ran the disk guard before it started this download
+            self.beat()
+            local = Path(pool.take(filename, beat=self.beat))
+        else:
+            problem = self._space_problem(repo, filename)
+            if problem:  # everything flushed so far stays; a re-run continues with this input file
+                raise SystemExit(problem)
+            self.beat()
+            local = fetchahead.with_retries(lambda: self._fetch(repo, filename), f"{self.source}: {filename}",
+                                            wait=lambda s: time.sleep(s))
+        # recorded when the ingest takes the file, never when it was fetched: progress.json (and so the extent record)
+        # names exactly the inputs the one-at-a-time run reads, in its order
         if local.is_file():  # for the extent record; saved now, as a kill before finish_input would lose it
             self.progress.setdefault("input_bytes", {})[filename] = local.stat().st_size
             save_progress(self.root, self.source, self.progress)
@@ -219,19 +317,26 @@ class Ingest:
     @staticmethod
     def free_download(local: Path):
         """Delete a finished hf_hub_download: the snapshot entry AND its blob (the snapshot is a symlink or a copy
-        depending on Windows privileges; unlinking only it leaves the multi-GB blob behind)."""
+        depending on Windows privileges; unlinking only it leaves the multi-GB blob behind). In a per-input cache dir
+        (raw/DL_DIR/<hash>/datasets--*) that whole dir goes, a killed attempt's .incomplete file and hf's lock files
+        included; in an old shared cache only the repo's finished blobs, as before."""
+        local = Path(local)
         real = local.resolve()
         local.unlink(missing_ok=True)
         if real != local:
             real.unlink(missing_ok=True)
         for parent in local.parents:
             if parent.name.startswith("datasets--"):
-                for blob in (parent / "blobs").glob("*"):
-                    if not blob.name.endswith(".incomplete"):
-                        blob.unlink(missing_ok=True)
+                if parent.parent.parent.name == DL_DIR:
+                    shutil.rmtree(parent.parent, ignore_errors=True)
+                else:
+                    for blob in (parent / "blobs").glob("*"):
+                        if not blob.name.endswith(".incomplete"):
+                            blob.unlink(missing_ok=True)
                 break
 
     def done(self):
+        self.end_downloads()
         for w in self.writers.values():
             w.close()
         self.progress["done"] = True
@@ -239,6 +344,14 @@ class Ingest:
         s = self.stats
         print(f"  {self.source}: kept={s['kept']} ({s['seconds'] / 3600:.1f} h)  dropped: empty_text={s['empty_text']} "
               f"bad_audio={s['bad_audio']} bad_duration={s['bad_duration']} dup={s['dup']}")
+
+
+def _listing(repo: str) -> list[str]:
+    """The repo's files at its pinned revision, under the download retry policy (a Hub 5xx or 429 at a listing used to
+    fail the whole rebuild attempt). HfApi() per call: tests replace the class."""
+    return fetchahead.with_retries(
+        lambda: HfApi().list_repo_files(repo, repo_type="dataset", revision=REVISIONS[repo]), f"list {repo}",
+        wait=lambda s: time.sleep(s))
 
 
 def capture_whisper(local: Path, part: Path):
@@ -257,8 +370,7 @@ def ingest_hf_parquet(ing: Ingest, repo: str, split: str, max_inputs: int | None
                       whisper_dir: Path | None = None):
     """`max_inputs`: only the first N of the sorted upstream files. `whisper_dir`: for the ReazonSpeech mirrors, keep
     each file's whisper transcripts in <whisper_dir>/<source>/<file name> before the file is marked finished."""
-    files = sorted(f for f in HfApi().list_repo_files(repo, repo_type="dataset", revision=REVISIONS[repo])
-                   if f.endswith(".parquet"))
+    files = sorted(f for f in _listing(repo) if f.endswith(".parquet"))
     ing.progress["n_listed"] = len(files)
     files = files[:max_inputs]
     columns = ["audio", "transcription"] + (["name"] if ing.source.startswith("reazon") else [])
@@ -273,6 +385,7 @@ def ingest_hf_parquet(ing: Ingest, repo: str, split: str, max_inputs: int | None
                 seen.add(row["id"].split("/", 1)[1])
     if seen:
         print(f"  {ing.source}: deduplicating against {len(seen)} rows already in {sorted(dedup_sources)}")
+    ing.plan_downloads(repo, [f for f in files if not ing.is_finished(f)])
     for f in tqdm(files, desc=ing.source, unit="file"):
         if ing.is_finished(f):
             continue
@@ -296,8 +409,7 @@ def ingest_hf_parquet(ing: Ingest, repo: str, split: str, max_inputs: int | None
 
 
 def ingest_galgame(ing: Ingest, n_shards: int):
-    tars = sorted(f for f in HfApi().list_repo_files(GALGAME_REPO, repo_type="dataset", revision=REVISIONS[GALGAME_REPO])
-                  if f.endswith(".tar"))
+    tars = sorted(f for f in _listing(GALGAME_REPO) if f.endswith(".tar"))
     ing.progress["n_listed"] = len(tars)
     tars = tars[:n_shards]
     # self-dedup: resuming an interrupted tar re-reads rows already stored; skip everything already ingested.
@@ -313,6 +425,7 @@ def ingest_galgame(ing: Ingest, n_shards: int):
     if seen:
         print(f"  galgame: {len(seen)} rows already ingested (duplicates will be skipped), eval hold-out {eval_kept}")
     pending: dict[str, dict] = {}  # webdataset pairs <key>.ogg / <key>.txt can arrive in either order
+    ing.plan_downloads(GALGAME_REPO, [f for f in tars if not ing.is_finished(f)])
     for f in tqdm(tars, desc="galgame", unit="tar"):
         if ing.is_finished(f):
             continue
@@ -346,13 +459,15 @@ def ingest_galgame(ing: Ingest, n_shards: int):
     ing.done()
 
 
-def ingest_emilia(ing: Ingest, max_hours: float, max_inputs: int | None = None):
+def ingest_emilia(ing: Ingest, max_hours: float, max_inputs: int | None = None, plan_inputs: int | None = None):
     """Emilia-YODAS JA webdataset tars (<key>.mp3 + <key>.json), taken in order until max_hours of kept audio.
     The budget is counted over everything already in the manifest, so a resumed or re-run ingest (e.g. on the
     training box) stops at the same utterance. A tar cut short by the budget is not marked finished, so raising
     --emilia-hours later continues inside it (the id dedup skips what is already stored). `max_inputs`: only the first
-    N of the sorted train tars."""
-    tars = sorted(f for f in HfApi().list_repo_files(EMILIA_REPO, repo_type="dataset", revision=REVISIONS[EMILIA_REPO])
+    N of the sorted train tars. `plan_inputs`: a hint that the budget ends within the first N tars, so only those
+    download ahead (the extent's 300 h step: extent.EMILIA_300H_INPUTS); a tar past it downloads one at a time. Without
+    it, up to --download-ahead tars past the cut are fetched and discarded. Never changes what is ingested."""
+    tars = sorted(f for f in _listing(EMILIA_REPO)
                   if f.startswith("JA/") and f.endswith(".tar") and f != EMILIA_EVAL_TAR)  # never the hold-out's tar
     ing.progress["n_listed"] = len(tars)
     tars = tars[:max_inputs]
@@ -371,6 +486,7 @@ def ingest_emilia(ing: Ingest, max_hours: float, max_inputs: int | None = None):
         print(f"  {ing.source}: {len(seen)} rows / {ing.stats['seconds'] / 3600:.1f} h already ingested")
     ing.stats.setdefault("non_ja", 0)
     pending: dict[str, dict] = {}
+    ing.plan_downloads(EMILIA_REPO, [f for f in tars[:plan_inputs] if not ing.is_finished(f)])
     for f in tqdm(tars, desc=ing.source, unit="tar"):
         if ing.stats["seconds"] >= budget_s or ing.limit_hit():
             break
@@ -418,8 +534,7 @@ def ingest_emilia_nc(ing: Ingest, max_hours: float, max_inputs: int | None = Non
     """Emilia's non-YODAS JA part from laion/Emolia JA-B*_standard.tar.gz (<worker>/<key>.mp3 + .json), in order until
     max_hours of kept audio. Same filters and resume logic as ingest_emilia; the budget counts stored audio.
     `max_inputs`: only the first N of the sorted tars."""
-    tars = sorted(f for f in HfApi().list_repo_files(EMOLIA_REPO, repo_type="dataset", revision=REVISIONS[EMOLIA_REPO])
-                  if f.startswith("JA-") and f.endswith("_standard.tar.gz"))
+    tars = sorted(f for f in _listing(EMOLIA_REPO) if f.startswith("JA-") and f.endswith("_standard.tar.gz"))
     ing.progress["n_listed"] = len(tars)
     tars = tars[:max_inputs]
     seen: set[str] = set()
@@ -430,6 +545,7 @@ def ingest_emilia_nc(ing: Ingest, max_hours: float, max_inputs: int | None = Non
                 ing.stats["seconds"] += row["duration"]
     budget_s = max_hours * 3600
     ing.stats.setdefault("non_ja", 0)
+    ing.plan_downloads(EMOLIA_REPO, [f for f in tars if not ing.is_finished(f)])
     for f in tqdm(tars, desc=ing.source, unit="tar"):
         if ing.stats["seconds"] >= budget_s or ing.limit_hit():
             break
@@ -562,21 +678,27 @@ def source_repo(source: str) -> str | None:
 
 
 def ingest_source(ing: Ingest, cap: int | None, whisper_dir: Path | None = None, emilia_hours: float = 300.0,
-                  emilia_nc_hours: float = float("inf")):
-    """Ingest ing.source. `cap`: only its first N sorted upstream files (galgame: its tars); None: all of them."""
+                  emilia_nc_hours: float = float("inf"), plan_inputs: int | None = None):
+    """Ingest ing.source. `cap`: only its first N sorted upstream files (galgame: its tars); None: all of them.
+    `plan_inputs`: ingest_emilia's fetch-ahead hint. An ingest that raises stops its fetch-ahead, keeping the files
+    already fetched for the resumed run (Ingest.end_downloads)."""
     s = ing.source
-    if s in HF_PARQUET_SOURCES:
-        ingest_hf_parquet(ing, *HF_PARQUET_SOURCES[s], max_inputs=cap, whisper_dir=whisper_dir)
-    elif s == "galgame":
-        ingest_galgame(ing, cap)
-    elif s == "emilia_yodas":
-        ingest_emilia(ing, emilia_hours, max_inputs=cap)
-    elif s == "eval_emilia":
-        ingest_emilia_eval(ing, EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS)
-    elif s == "emilia_nc":
-        ingest_emilia_nc(ing, emilia_nc_hours, max_inputs=cap)
-    elif s == "cv":
-        ingest_common_voice(ing)
+    try:
+        if s in HF_PARQUET_SOURCES:
+            ingest_hf_parquet(ing, *HF_PARQUET_SOURCES[s], max_inputs=cap, whisper_dir=whisper_dir)
+        elif s == "galgame":
+            ingest_galgame(ing, cap)
+        elif s == "emilia_yodas":
+            ingest_emilia(ing, emilia_hours, max_inputs=cap, plan_inputs=plan_inputs)
+        elif s == "eval_emilia":
+            ingest_emilia_eval(ing, EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS)
+        elif s == "emilia_nc":
+            ingest_emilia_nc(ing, emilia_nc_hours, max_inputs=cap)
+        elif s == "cv":
+            ingest_common_voice(ing)
+    except BaseException:
+        ing.end_downloads(abort=True)
+        raise
 
 
 def load_extent_config(path: Path) -> dict:
@@ -595,7 +717,7 @@ def load_extent_config(path: Path) -> dict:
 
 
 def ingest_extent(root: Path, raw: Path, cfg: dict, config: Path, whisper_dir: Path | None = None,
-                  heartbeat: Path | None = None, hold_file: Path | None = None):
+                  heartbeat: Path | None = None, hold_file: Path | None = None, download_ahead: int = 0):
     """The extent of the (valid) run config `cfg`, step by step in the canonical order (kitsune.extent.plan_steps), each
     step an ingest of its source under the step's key, cap and Emilia budget. After each step
     <root>/extent_progress.json lists it as completed, and a re-run skips it. Re-running a step is idempotent anyway
@@ -619,8 +741,12 @@ def ingest_extent(root: Path, raw: Path, cfg: dict, config: Path, whisper_dir: P
             print(f"== {name}: {step.key} already complete")
             continue
         print(f"== {name}: {step.key}" + (f" (the first {cap} inputs)" if cap is not None else ""))
-        ing = Ingest(root, raw, step.source, None, step=step.key, heartbeat=heartbeat, hold_file=hold_file)
-        ingest_source(ing, cap, whisper_dir=whisper_dir, emilia_hours=step.emilia_hours)
+        ing = Ingest(root, raw, step.source, None, step=step.key, heartbeat=heartbeat, hold_file=hold_file,
+                     download_ahead=download_ahead)
+        # the 300 h step reads tars 0..EMILIA_300H_INPUTS-1 and cuts inside the last, so no tar past it downloads
+        # ahead only to be discarded (looked up now: tests shrink it)
+        hint = extent.EMILIA_300H_INPUTS if step.key == "emilia_yodas@300h" else None
+        ingest_source(ing, cap, whisper_dir=whisper_dir, emilia_hours=step.emilia_hours, plan_inputs=hint)
         completed.append(step.key)
         extent.write_progress(root, progress)
     print(f"== {name}: all {len(plan)} steps complete")
@@ -660,6 +786,10 @@ def main():
     ap.add_argument("--heartbeat", type=Path, default=None, help="touch this file at each download, every "
                     f"{HEARTBEAT_ROWS} kept rows and while held")
     ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB, help="stop before a download would leave less free")
+    ap.add_argument("--download-ahead", type=int, default=None, metavar="N",
+                    help=f"download up to N upstream files ahead of the ingest, 0..{fetchahead.MAX_AHEAD} (default "
+                         f"${DOWNLOAD_AHEAD_ENV}, else {fetchahead.DEFAULT_AHEAD}; 0 = one at a time; --hold-file "
+                         "forces 0); the output is the same for every N")
     ap.add_argument("--limit-rows", type=int, default=None, help="debug: stop each source after N kept rows (galgame hold-out exempt)")
     ap.add_argument("--force", action="store_true", help="wipe and re-ingest sources that are already present")
     ap.add_argument("--extent-config", type=Path, default=None, metavar="CFG",
@@ -687,6 +817,18 @@ def main():
         ap.error("--galgame-shards and --max-inputs galgame=N both cap galgame; give one of them")
     galgame_shards = max_inputs.get("galgame", 6 if args.galgame_shards is None else args.galgame_shards)
     MIN_FREE_GB = args.min_free_gb
+    # not in the --extent-config refusal above: it changes no id, stem or byte of the output, only the wall time
+    ahead = args.download_ahead
+    if ahead is None:
+        env = os.environ.get(DOWNLOAD_AHEAD_ENV, "").strip()
+        try:
+            ahead = int(env) if env else fetchahead.DEFAULT_AHEAD
+        except ValueError:
+            ap.error(f"{DOWNLOAD_AHEAD_ENV}={env!r} is not an integer")
+    if not 0 <= ahead <= fetchahead.MAX_AHEAD:
+        ap.error(f"--download-ahead / {DOWNLOAD_AHEAD_ENV} is {ahead}, not 0..{fetchahead.MAX_AHEAD}")
+    if args.hold_file is not None:
+        ahead = 0  # the label box's hold is per download (Ingest)
 
     # a row-limited run must never look like a finished dataset: keep it in its own root
     root = Path(args.data) if args.data else ROOT / ("data_smoke" if args.limit_rows else "data")
@@ -697,6 +839,11 @@ def main():
         raise SystemExit(f"{root}: another 01_prepare_data is ingesting into this data root ({root / '.ingest.lock'}); "
                          "wait for it to finish")
     print(f"data root: {root}")
+    print(f"downloads: up to {ahead} upstream files ahead of the ingest (0 = one at a time)", flush=True)
+    if ahead > 0:
+        # N interleaved per-file bars would clutter kitsune.log; each step's summary line says what came down
+        from huggingface_hub.utils import disable_progress_bars
+        disable_progress_bars()
 
     todo, sources = [], args.sources or ["reazon_small", "galgame", "eval"]
     for s in [] if cfg is not None else sources:  # --extent-config: ingest_extent below
@@ -708,13 +855,16 @@ def main():
         prog = load_progress(root, s)
         if prog["finished_inputs"]:
             print(f"  {s}: resuming, {len(prog['finished_inputs'])} input files already done")
-        ing = Ingest(root, raw, s, args.limit_rows, heartbeat=args.heartbeat, hold_file=args.hold_file)
+        ing = Ingest(root, raw, s, args.limit_rows, heartbeat=args.heartbeat, hold_file=args.hold_file,
+                     download_ahead=ahead)
         ingest_source(ing, galgame_shards if s == "galgame" else max_inputs.get(s), whisper_dir=args.whisper_dir,
                       emilia_hours=300.0 if args.emilia_hours is None else args.emilia_hours,
                       emilia_nc_hours=float("inf") if args.emilia_nc_hours is None else args.emilia_nc_hours)
     if cfg is not None:
         ingest_extent(root, raw, cfg, args.extent_config, whisper_dir=args.whisper_dir, heartbeat=args.heartbeat,
-                      hold_file=args.hold_file)
+                      hold_file=args.hold_file, download_ahead=ahead)
+    # every ingest finished: no input is left to resume, so nothing fetched ahead (or left by a kill) is needed
+    shutil.rmtree(raw / DL_DIR, ignore_errors=True)
 
     print("\n== manifest ==")
     by = {}

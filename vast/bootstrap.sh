@@ -23,7 +23,9 @@
 # outputs cover exactly the first 6 Galgame tars and 300 h of Emilia-YODAS, which are 01's defaults, and a larger
 # --galgame-shards/--emilia-hours only downloads audio without teacher output), KITSUNE_MIN_COVERAGE (default 0.99),
 # HF_TOKEN (vast account env; never printed), KITSUNE_REBUILD_TIMEOUT_MIN (extent mode only: the per-attempt timeout
-# of the audio rebuild in minutes, default 60; vast/launch.py sizes it from the extent record's upstream bytes).
+# of the audio rebuild in minutes, default 60; vast/launch.py sizes it from the extent record's upstream bytes),
+# KITSUNE_DOWNLOAD_AHEAD (optional, read by 01 itself: how many upstream files download ahead of its ingest, 0..16,
+# default 6, 0 = one at a time; decision F3. Not a flag on the rebuild lines, which the contract keeps byte-identical).
 #
 # Extent mode (a run config with an "extent" block, labels from the label box under <extent root>/, e.g. labels/full):
 # the plan requires <root>/COMPLETE.json and <root>/extent.json in the listing (else it refuses, exit 3), downloads the
@@ -692,7 +694,10 @@ if [ "${#REBUILD[@]}" -gt 0 ] && [ -z "$EXTENT" ]; then
         --sources "${REBUILD[@]}" "${PREP_ARGS[@]}"
 elif [ -n "$EXTENT" ]; then
     # the canonical ingest sequence the label box ran, capped by the config's extent (a retry skips 01's finished
-    # inputs and steps); vast/launch.py sizes the per-attempt timeout from the record's upstream bytes
+    # inputs and steps); vast/launch.py sizes the per-attempt timeout from the record's upstream bytes. 01 downloads up
+    # to KITSUNE_DOWNLOAD_AHEAD (default 6) inputs ahead of its ingest (F3; box 1 spent 3.1 h on 571 GB one at a time)
+    # with the same output, retries transient Hub errors itself and exits on a download stuck for 15 min, which this
+    # retry re-runs (the files it fetched ahead are cache hits then). train_hb stays this phase's toucher's job
     [ -z "${KITSUNE_PREP_ARGS:-}" ] || log "KITSUNE_PREP_ARGS ignored: the config's extent defines the rebuild"
     phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \
         scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" --extent-config "$CONFIG"

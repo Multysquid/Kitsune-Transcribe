@@ -754,3 +754,65 @@ def test_a_killed_extent_run_resumes_to_the_full_runs_stems(full, world, tmp_pat
     run01(monkeypatch, root, "--extent-config", str(full.config))
     assert layout(root) == full.layout
     assert extent.build_record(root, full.cfg, run_ids=full.record["run_ids"], kitsune_sha="0" * 40) == full.record
+
+
+def test_extent_run_with_fetch_ahead_is_byte_identical(upstream, tmp_path, monkeypatch):
+    """Decision F3 on the whole canonical sequence: 01 --extent-config one file at a time and with 4 downloading
+    ahead (random download latencies, so they finish out of order) gives the same bytes in every file of the data
+    root, extent_progress.json and every progress.json included, and the full layout. raw/dl is gone after a finished
+    run."""
+    hub = patch_world(monkeypatch, upstream, tmp_path / "dl")
+    real, rng = prep.hf_hub_download, __import__("random").Random(5)
+
+    def slow(repo, filename, **kw):
+        time.sleep(rng.uniform(0, 0.03))
+        return real(repo, filename, **kw)
+
+    monkeypatch.setattr(prep, "hf_hub_download", slow)
+    config = write_cfg(tmp_path / "full.json", make_cfg())
+    roots = {}
+    for ahead in (0, 4):
+        hub.downloads.clear()
+        roots[ahead] = tmp_path / f"ahead{ahead}"
+        run01(monkeypatch, roots[ahead], "--extent-config", str(config), "--download-ahead", str(ahead))
+        assert layout(roots[ahead]) == FULL_LAYOUT
+        assert not (roots[ahead] / "raw" / prep.DL_DIR).exists()
+
+    def tree(root: Path) -> dict:
+        return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*"))
+                if p.is_file() and p.name != ".ingest.lock"}
+
+    one, ahead = tree(roots[0]), tree(roots[4])
+    assert one == ahead and extent.PROGRESS_FILE in one and "shards/galgame/progress.json" in one
+
+
+def test_download_ahead_flag(full, world, tmp_path, monkeypatch, capsys):
+    """--download-ahead N (0..16) is accepted next to --extent-config (it changes no output); its default is
+    $KITSUNE_DOWNLOAD_AHEAD, else 6; anything else is an argparse error (2) before the data root is touched."""
+    seen = []
+    real = prep.ingest_extent
+
+    def spy(*a, **kw):
+        seen.append(kw["download_ahead"])
+        return real(*a, **kw)
+
+    monkeypatch.setattr(prep, "ingest_extent", spy)
+    root = tmp_path / "data"
+    shutil.copytree(full.root, root)  # every step complete: a no-op run
+    monkeypatch.delenv(prep.DOWNLOAD_AHEAD_ENV, raising=False)
+    run01(monkeypatch, root, "--extent-config", str(full.config))
+    assert "downloads: up to 6 upstream files ahead of the ingest" in capsys.readouterr().out
+    monkeypatch.setenv(prep.DOWNLOAD_AHEAD_ENV, "2")
+    run01(monkeypatch, root, "--extent-config", str(full.config))
+    run01(monkeypatch, root, "--extent-config", str(full.config), "--download-ahead", "0")
+    run01(monkeypatch, root, "--extent-config", str(full.config), "--download-ahead", "16",
+          "--hold-file", str(tmp_path / "no-hold"))  # the label box: one at a time whatever is asked
+    assert seen == [6, 2, 0, 0]
+    for i, (env, flags) in enumerate((("2", ["--download-ahead", "-1"]), ("2", ["--download-ahead", "17"]),
+                                      ("x", []), ("99", []))):
+        monkeypatch.setenv(prep.DOWNLOAD_AHEAD_ENV, env)
+        with pytest.raises(SystemExit) as e:
+            run01(monkeypatch, tmp_path / f"bad{i}", "--extent-config", str(full.config), *flags)
+        assert e.value.code == 2 and prep.DOWNLOAD_AHEAD_ENV in capsys.readouterr().err
+        assert not (tmp_path / f"bad{i}").exists()
+    assert world.downloads == []

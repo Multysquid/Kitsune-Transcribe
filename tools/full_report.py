@@ -12,17 +12,19 @@ Inputs (lean pulls of the runs repo; no weights are read)
   --tables DIR ...       the study's per-utterance tables, DIR/<system>/<set>.parquet (tools/study_report.load_tables:
                          the study students, the teachers, the anchor, the T/2 branches)
   --readouts DIR ...     every study.json under DIR (05_evaluate --out dirs: the M4 readouts runs/m4-<run_id>[-r<N>],
-                         the quant readouts, whisper_eval dirs). Per hit: study.json (system, family, the quant block
-                         of WP5, weights.file_bytes), its tables <hit>/tables/<system>/<set>.parquet or else its
-                         greedy_<set>.parquet (scored here as 05 scores them; never the box paths study.json.tables
-                         names), summary.json (tf.sets.<set>.kl and n_tok: KL to the own teacher) and whisper.json
-                         (params, file bytes, decode counts). A greedy set whose rows are not exactly its manifest ids
-                         gets no table, as 05 refuses it: that system lacks the set (inputs.readouts_refused_sets).
-                         greedy_<set>.parquet also give the clip durations (the short-clip counts) and the AED token
-                         counts (flag S2). One system found twice: the one scored on every manifest set wins, then a
-                         real (not simulated) one, then one scored from its exported file over one scored from memory
-                         (smoke B scores study-p03@<fmt> both ways; only the file has its true bytes), then the newest
-                         time_utc; the others are listed. A --tables system always wins over a readout of that name.
+                         the quant readouts, whisper_eval dirs; a quant readout whose quant block's recipe_version is
+                         below QUANT_RECIPE_MIN, or absent, is ignored: quant code older than F1). Per hit: study.json
+                         (system, family, the quant block of WP5, weights.file_bytes), its tables
+                         <hit>/tables/<system>/<set>.parquet or else its greedy_<set>.parquet (scored here as 05 scores
+                         them; never the box paths study.json.tables names), summary.json (tf.sets.<set>.kl and n_tok:
+                         KL to the own teacher) and whisper.json (params, file bytes, decode counts). A greedy set whose
+                         rows are not exactly its manifest ids gets no table, as 05 refuses it: that system lacks the
+                         set (inputs.readouts_refused_sets). greedy_<set>.parquet also give the clip durations (the
+                         short-clip counts) and the AED token counts (flag S2). One system found twice: the one scored
+                         on every manifest set wins, then a real (not simulated) one, then one scored from its exported
+                         file over one scored from memory (smoke B scores study-p03@<fmt> both ways; only the file has
+                         its true bytes), then the newest time_utc; the others are listed. A --tables system always wins
+                         over a readout of that name.
   --speed FILE ...       tools/speed_probe.py outputs (every runs/speed-*/speed.json given). Every file must hold
                          the same id list (ids_sha256: the study's 200 ids); another list refuses (exit 2). Records
                          are grouped by machine + GPU: a group is one machine, and only numbers of one group are
@@ -34,7 +36,14 @@ Inputs (lean pulls of the runs repo; no weights are read)
                          per rental: without the summary, smoke A and smoke B on one machine would be two groups. One
                          name timed twice in one group: the newest time_utc counts, the others are listed
                          (speed_groups.superseded). The CHART GROUP is the group holding the most systems; the speed
-                         columns and the charts come from it.
+                         columns and the charts come from it. F4 (DECISIONS F): a quantised record timed by quant
+                         code older than F1 (quant_recipe.version below QUANT_RECIPE_MIN = 2, or absent: box
+                         53693389's smoke B #1, whose fp8 records decoded garbage) and a quantised or compiled record
+                         without a passing CER sanity (speed_probe's sanity) are never used; each file's failed block
+                         and its dir's events.jsonl (the queue's line per speed item) give the probes that failed.
+                         report.json's speed_probes and report.md's "Speed probes not measured or left out" list them
+                         all, with the offered rows without any speed record (S5) and the queue summaries' speed
+                         items not done; check speed_probes fails on a failed or absent one.
   --queue-summaries PATH ...  the full boxes' full/box-<box>/queue_summary.json (CONTRACT.md 5: box, machine_id,
                          started, the speed items' out), as files or dirs searched for them. The summary at the runs
                          repo's layout beside a speed file (<root>/full/box-<box>/ for <root>/runs/speed-<box>-*/) is
@@ -89,10 +98,11 @@ quant.weights_bytes (a variant scored from memory: never its bf16 checkpoint's w
 model.weights_file_bytes, else the speed record's in-memory weights_bytes (both in-memory sources are marked so).
 
 Outputs (--out, written atomically): report.json; report.md (the offer table first, then study -> full, quantisation,
-Whisper with its seven caveats verbatim from plan v3 section 7, the charts, hallucinations, per-set CERs, the flags,
-inputs and checks); offer.csv; chart_error_vs_speed.svg (x batched RTFx, log; y M4-all CER %) and
-chart_error_vs_latency.svg (x batch-1 p50 ms, log), hand-written SVG with deterministic bytes (matplotlib is not in
-the box image), drawn from the chart group only; chart_points.json / .csv (the same points, for a live chart).
+the speed probes not measured or left out, Whisper with its seven caveats verbatim from plan v3 section 7, the charts,
+hallucinations, per-set CERs, the flags, inputs and checks); offer.csv; chart_error_vs_speed.svg (x batched RTFx, log; y
+M4-all CER %) and chart_error_vs_latency.svg (x batch-1 p50 ms, log), hand-written SVG with deterministic bytes
+(matplotlib is not in the box image), drawn from the chart group only; chart_points.json / .csv (the same points, for a
+live chart).
 
 Exit codes: 0 written; 2 refused (manifest, tables, speed id lists, an unreadable or malformed input file: JSON,
 parquet, the params, a run summary); 1 anything else.
@@ -147,6 +157,12 @@ FULL_RUNS = {"full-t06": ("study-t06", "aed", "T-0.6B"), "full-p03": ("study-p03
 STUDY_TO_FULL = {v[0]: k for k, v in FULL_RUNS.items()}
 # kitsune.quant.QUANT_FORMATS (CONTRACT.md 1.1; a test compares them when kitsune.quant is importable)
 QUANT_FORMATS = ("fp16", "int8-w8a16", "int8-w8a8", "nvfp4-w4a16", "nvfp4-w4a4", "mxfp4-w4a4", "fp8-w8a8")
+# kitsune.quant.RECIPE_VERSION (a test compares them): a quant readout or a quantised speed record below it was made by
+# quant code older than F1 (DECISIONS F, 2026-10-01; box 53693389's smoke B #1 ran 14bfcad: fp32 fp8 scales, NaN on
+# every padded row, its fp8 records decoding garbage) and is never used (F4): such a readout goes to
+# inputs.readouts_ignored, such a speed record to speed_probes.excluded (a record or readout without the field is
+# version 1)
+QUANT_RECIPE_MIN = 2
 FORMAT_LABEL = {"fp16": "FP16", "int8-w8a16": "INT8 W8A16", "int8-w8a8": "INT8 W8A8", "nvfp4-w4a16": "NVFP4 W4A16",
                 "nvfp4-w4a4": "NVFP4 W4A4", "mxfp4-w4a4": "MXFP4 W4A4", "fp8-w8a8": "FP8 W8A8"}
 UNTIMED_FORMATS = ("mxfp4-w4a4",)  # no real kernel on the 5090 (decision 20): accuracy only, never a speed
@@ -369,6 +385,22 @@ def _simulated(study: dict) -> bool:
     return bool(q) and (bool(q.get("simulated")) or q.get("impl") == "emulate" or q.get("format") in UNTIMED_FORMATS)
 
 
+def _recipe_version(v) -> int:
+    """A record's quant recipe version: the number, or 1 (the field absent or not a number: quant code before F4)."""
+    return int(v) if _num(v) is not None else 1
+
+
+def _old_quant_recipe(q) -> str | None:
+    """Why a 05 study.json quant block may not be used (QUANT_RECIPE_MIN), or None (no quant block: not a variant)."""
+    if not isinstance(q, dict) or not q:
+        return None
+    v = _recipe_version(q.get("recipe_version"))
+    if v < QUANT_RECIPE_MIN:
+        return (f"quant recipe version {v}: scored by quant code older than F1 (box 53693389's smoke B #1, 14bfcad); "
+                "never used (F4)")
+    return None
+
+
 def load_readouts(dirs, man: ss.Manifest) -> tuple[dict, dict]:
     """(system -> readout dict, notes) from every study.json under the --readouts dirs (module docstring)."""
     found: dict[str, list[dict]] = {}
@@ -382,6 +414,9 @@ def load_readouts(dirs, man: ss.Manifest) -> tuple[dict, dict]:
             system = rec.get("system") if isinstance(rec, dict) else None
             if not isinstance(system, str) or not system:
                 notes["ignored"].append(dict(path=str(f), why="no system in study.json"))
+                continue
+            if (why := _old_quant_recipe(rec.get("quant"))) is not None:  # F4: never a pre-F1 quant readout
+                notes["ignored"].append(dict(path=str(f), system=system, why=why))
                 continue
             hit = f.parent
             frames = _greedy_frames(hit, man.sets)
@@ -665,10 +700,11 @@ def kotoba_bias(path: Path, tables: dict[str, pd.DataFrame], man: ss.Manifest) -
 
 
 def load_queue_summaries(paths, speed_paths) -> list[dict]:
-    """[{path, box, machine_id, started, claims}] of the full boxes' queue summaries (CONTRACT.md 5): the
+    """[{path, box, machine_id, started, claims, speed_items}] of the full boxes' queue summaries (CONTRACT.md 5): the
     --queue-summaries files and the queue_summary.json under the given dirs, plus the one at the runs repo's layout
     beside each speed file (<root>/runs/speed-<box>-<stamp>/speed.json -> <root>/full/box-<box>/queue_summary.json)
-    when it exists. claims = the speed dirs the summary names (its speed_dir, its speed items' out)."""
+    when it exists. claims = the speed dirs the summary names (its speed_dir, its speed items' out); speed_items =
+    its speed items' {item, status, why, system} (speed_probes lists the ones not done)."""
     files = []
     for p in paths or []:
         p = Path(p)
@@ -693,13 +729,16 @@ def load_queue_summaries(paths, speed_paths) -> list[dict]:
         if not isinstance(items, dict) or not isinstance(doc.get("box"), str):
             raise InputError(f"{f}: not a full box's queue summary (no box, or items not a mapping)")
         claims = {Path(doc["speed_dir"]).name} if isinstance(doc.get("speed_dir"), str) else set()
-        for it in items.values():
+        speed_items = []
+        for name, it in sorted(items.items()):
             if isinstance(it, dict) and it.get("kind") == "speed":
                 res = it.get("result") if isinstance(it.get("result"), dict) else {}
                 claims |= {Path(o).name for o in (it.get("out"), res.get("out")) if isinstance(o, str) and o}
+                speed_items.append(dict(item=name, status=it.get("status"), why=it.get("why"),
+                                        system=res.get("system")))
         mid = doc.get("machine_id")
         out.append(dict(path=str(f), box=doc["box"], machine_id=None if mid in (None, "") else str(mid),
-                        started=_unix(doc.get("started")), claims=sorted(claims)))
+                        started=_unix(doc.get("started")), claims=sorted(claims), speed_items=speed_items))
     return out
 
 
@@ -754,11 +793,75 @@ def machine_of(rec: dict, file: str, qs: list[dict], override: dict[str, str]) -
     return None, "unknown"
 
 
+def _speed_variant(name: str, rec: dict) -> tuple[str | None, bool]:
+    """(the quantised format or None, compiled) of a speed record: by its name (<base>@<fmt>[+compile], as
+    kitsune.quant.split_system) or else its quant / compile fields."""
+    s = name[:-len("+compile")] if name.endswith("+compile") else name
+    base, sep, fmt = s.rpartition("@")
+    if not (sep and base and fmt in QUANT_FORMATS):
+        fmt = rec.get("quant") if rec.get("quant") in QUANT_FORMATS else None
+    return fmt, name.endswith("+compile") or bool(rec.get("compile"))
+
+
+def speed_excluded(name: str, rec: dict) -> str | None:
+    """Why a speed record is left out (F4), or None: a quantised record timed by quant code older than F1
+    (quant_recipe.version below QUANT_RECIPE_MIN; absent = 1: box 53693389's smoke B #1, whose fp8 records decoded
+    garbage), or a quantised or compiled record without a passing CER sanity (speed_probe's sanity against the same
+    weights' bf16 decode: absent before F4, ok false when the model decoded garbage)."""
+    fmt, compiled = _speed_variant(name, rec)
+    if fmt:
+        qr = rec.get("quant_recipe") if isinstance(rec.get("quant_recipe"), dict) else {}
+        v = _recipe_version(qr.get("version"))
+        if v < QUANT_RECIPE_MIN:
+            return (f"quant recipe version {v}: timed by quant code older than F1 (box 53693389's smoke B #1, 14bfcad, "
+                    "whose fp8 records decoded garbage); never used (F4)")
+    if fmt or compiled:
+        sanity = rec.get("sanity")
+        if not isinstance(sanity, dict):
+            return "no CER sanity record (speed_probe before F4): a quantised or compiled speed needs a passing one"
+        if sanity.get("ok") is not True:
+            return f"CER sanity failed: {sanity.get('reason') or 'not ok'}"
+    return None
+
+
+def _speed_failures(p, doc: dict) -> list[dict]:
+    """The probes a speed file and its dir record as failed: the file's failed block (speed_probe: a load, probe or
+    reference that raised) and the dir's events.jsonl (the queue's line per speed item that ran; the last line of a
+    system counts, failed with its why: "exit 4" is an insane CER, "exit 1" a crash), one entry per system and dir
+    ({system, file, why, stage, rc, item, time})."""
+    out: dict[str, dict] = {}
+    fails = doc.get("failed")
+    for name, info in sorted((fails if isinstance(fails, dict) else {}).items()):
+        info = info if isinstance(info, dict) else {}
+        out[name] = dict(system=name, file=str(p), why=str(info.get("error") or "failed")[:300],
+                         stage=info.get("stage"), rc=None, item=None, time=_unix(info.get("time_utc")))
+    ev = Path(p).parent / "events.jsonl"
+    if ev.is_file():
+        last: dict[str, dict] = {}
+        for line in ev.read_text(encoding="utf-8").splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("kind") == "speed" and isinstance(r.get("system"), str):
+                last[r["system"]] = r
+        for name, r in sorted(last.items()):
+            if r.get("status") != "failed":
+                continue
+            e = out.setdefault(name, dict(system=name, file=str(ev), why=str(r.get("why") or f"exit {r.get('rc')}"),
+                                          stage=None, rc=None, item=None, time=None))
+            times = [t for t in (e["time"], _unix(r.get("wall"))) if t is not None]
+            e.update(rc=r.get("rc"), item=r.get("item"), time=max(times) if times else None)
+    return list(out.values())
+
+
 def load_speed(paths, qs: list[dict] | None = None, override: dict[str, str] | None = None) -> dict:
-    """{records: {(group, name): record}, ids, ids_sha256, files, superseded, groups, primary} from the speed files.
-    One id list for all (else InputError). A group is machine (machine_of) + GPU; one record per name and group (the
-    newest time_utc; the others listed)."""
-    recs, sup, files = {}, [], []
+    """{records: {(group, name): record}, ids, ids_sha256, files, superseded, groups, primary, excluded, failed,
+    failures_resolved} from the speed files. One id list for all (else InputError). A group is machine (machine_of) +
+    GPU; one record per name and group (the newest time_utc; the others listed). A record speed_excluded names is
+    never used (excluded: group, system, file, time_utc, why). failed: the probes the files and their dirs record as
+    failed (_speed_failures), unless a used record of that system is newer (failures_resolved)."""
+    recs, sup, files, excluded, fails = {}, [], [], [], []
     ids = sha = first = None
     for p in paths or []:
         doc = read_json(p)
@@ -772,12 +875,16 @@ def load_speed(paths, qs: list[dict] | None = None, override: dict[str, str] | N
             raise InputError(f"--speed: {p} was timed on another id list ({str(h)[:12]}) than {first} "
                              f"({str(sha)[:12]}): every system of one report is timed on the same audio")
         files.append(str(p))
+        fails += _speed_failures(p, doc)
         for name, rec in sorted(systems.items()):
             if not isinstance(rec, dict) or _num(rec.get("rtf")) is None:
                 continue
             machine, where = machine_of(rec, str(p), qs or [], override or {})
             gpu = rec.get("gpu") or (str(rec.get("device")) if rec.get("device") else None)
             key = (f"{machine or '?'} / {gpu or '?'}", name)
+            if (why := speed_excluded(name, rec)) is not None:
+                excluded.append(dict(group=key[0], system=name, file=str(p), time_utc=rec.get("time_utc"), why=why))
+                continue
             rec = dict(rec, _file=str(p), _machine_from=where)
             old = recs.get(key)
             if old is None or str(rec.get("time_utc") or "") > str(old.get("time_utc") or ""):
@@ -796,8 +903,29 @@ def load_speed(paths, qs: list[dict] | None = None, override: dict[str, str] | N
     for e in groups.values():
         e["files"], e["machine_from"] = sorted(e["files"]), sorted(e["machine_from"])
     primary = max(sorted(groups), key=lambda g: len(groups[g]["systems"])) if groups else None
+    newest: dict[str, float] = {}
+    for (_, name), rec in recs.items():
+        t = _unix(rec.get("time_utc"))
+        if t is not None:
+            newest[name] = max(newest.get(name, t), t)
+    failed, resolved = [], []
+    for f in fails:  # a failure a later good probe of the system superseded is listed apart, not as a failure
+        (resolved if f["time"] is not None and newest.get(f["system"], -math.inf) > f["time"] else failed).append(f)
     return dict(records=recs, ids=ids or [], ids_sha256=sha, files=files, superseded=sup, groups=groups,
-                primary=primary)
+                primary=primary, excluded=excluded, failed=failed, failures_resolved=resolved)
+
+
+def speed_probes(rep: dict, sp: dict, qs: list[dict]) -> dict:
+    """The probes the report could not use (F4: no speed row is silently empty): failed (load_speed: crashed, or
+    exit 4 for an insane CER), excluded (speed_excluded: an old quant recipe, a missing or failed CER sanity), absent
+    (offered rows without any speed record, flag S5) and queue_not_done (speed items of the queue summaries whose
+    status is neither done nor not_needed: failed, skipped by the no-start rule, never run), plus
+    failures_resolved."""
+    absent = [r["system"] for r in rep["offer"]["rows"] if "S5" in (r.get("flags") or [])]
+    not_done = [dict(it, box=q["box"], path=q["path"]) for q in qs for it in q.get("speed_items") or []
+                if it.get("status") not in ("done", "not_needed")]
+    return dict(failed=sp["failed"], excluded=sp["excluded"], absent=absent, queue_not_done=not_done,
+                failures_resolved=sp["failures_resolved"])
 
 
 def speed_fields(rec: dict) -> dict:
@@ -1090,6 +1218,7 @@ def build_report(args) -> dict:
                                machine_of=parse_machine_of(args.machine_of))
     rep["chart"] = dict(points=chart_points(rep), files=["chart_error_vs_speed.svg", "chart_error_vs_latency.svg",
                                                          "chart_points.json", "chart_points.csv"])
+    rep["speed_probes"] = speed_probes(rep, sp, qs)
     rep["flags_legend"] = FLAGS
     rep["checks"] = checks(rep, readouts, sp, man_sha)
     expected = [*FULL_RUNS, *ss.TEACHERS]
@@ -1275,6 +1404,17 @@ def checks(rep: dict, readouts: dict, sp: dict, man_sha: str) -> list[dict]:
                                + ("; a group is keyed by a container host (a record without machine_id that no "
                                   "queue summary covers): give --queue-summaries or --machine-of if it is another "
                                   "group's machine" if by_host else "")))
+    pr = rep.get("speed_probes") or {}
+    failed, absent = pr.get("failed") or [], pr.get("absent") or []
+    out.append(dict(rule="speed_probes", status="fail" if failed or absent else
+                    ("pass" if sp["files"] else "not_checked"),
+                    detail=f"{len(failed)} failed probe(s)" + (f" ({', '.join(f['system'] for f in failed)})"
+                                                               if failed else "")
+                           + f", {len(absent)} offered row(s) without a speed record (S5)"
+                           + (f" ({', '.join(absent)})" if absent else "")
+                           + f"; {len(pr.get('excluded') or [])} record(s) left out (an old quant recipe, or no / a "
+                             f"failed CER sanity), {len(pr.get('queue_not_done') or [])} speed item(s) not done in the "
+                             "queue summaries"))
     return out
 
 
@@ -1567,6 +1707,33 @@ def _pp(x) -> str:
     return "n/a" if x is None else f"{100 * x:+.2f}"
 
 
+def speed_probes_md(pr: dict) -> list[str]:
+    """report.md's "Speed probes not measured or left out" (F4): every failed, left-out or absent probe and every
+    speed item the queue did not finish, one table row each; one line when there is none."""
+    def why_failed(f):
+        rc = f.get("rc")
+        return f["why"] + (f" (exit {rc})" if rc not in (None, "") and f"exit {rc}" not in f["why"] else "")
+
+    rows = [[f["system"], "failed" + (f" ({f['stage']})" if f.get("stage") else ""), why_failed(f), f["file"]]
+            for f in pr.get("failed") or []]
+    rows += [[x["system"], "left out", x["why"], x["file"]] for x in pr.get("excluded") or []]
+    rows += [[s, "no speed record (S5)", "no usable speed record of it or of its study weights", "n/a"]
+             for s in pr.get("absent") or []]
+    rows += [[x.get("system") or x["item"], f"queue: {x.get('status')}", x.get("why") or "n/a", x["path"]]
+             for x in pr.get("queue_not_done") or []]
+    L = ["## Speed probes not measured or left out", ""]
+    if not rows:
+        return L + ["Every speed probe given was measured and used.", ""]
+    L += ["A probe that failed (a crash, or exit 4: its CER was not sane against the same weights' bf16 decode), a "
+          "record left out (timed by quant code older than F1, or without a passing CER sanity), an offered row with "
+          "no speed record at all, and a speed item the queue did not finish.", ""]
+    L += sr.table(["system", "what", "why", "file"], rows)
+    if pr.get("failures_resolved"):
+        L += ["", "Failures a later good probe of the same system superseded: "
+              + "; ".join(f"`{f['system']}` ({f['why']})" for f in pr["failures_resolved"]) + "."]
+    return L + [""]
+
+
 def render_md(rep: dict) -> str:
     sysd, comp = rep["systems"], rep["comparisons"]
     m = rep["manifest"]
@@ -1641,8 +1808,15 @@ def render_md(rep: dict) -> str:
                        "KL", "delta KL", "file MB", "x smaller than bf16", "RTFx", "x bf16 speed",
                        "non-finite rows", "flags"], rows) + [""]
         comp_rows = [(g, n) for g, e in sg["groups"].items() for n in e["compiled"]]
-        if comp_rows:
-            L += ["torch.compile records (speed only): " + ", ".join(f"`{n}` ({g})" for g, n in comp_rows) + ".", ""]
+        pr = rep.get("speed_probes") or {}
+        comp_bad = [(x["system"], x["why"]) for x in (pr.get("failed") or []) + (pr.get("excluded") or [])
+                    if x["system"].endswith("+compile")]
+        if comp_rows or comp_bad:
+            L += ["torch.compile records (speed only): " + (", ".join(f"`{n}` ({g})" for g, n in comp_rows) or "none")
+                  + "." + (" Not measured or left out: " + "; ".join(f"`{n}` ({w})" for n, w in comp_bad) + "."
+                           if comp_bad else ""), ""]
+
+    L += speed_probes_md(rep.get("speed_probes") or {})
 
     wh = rep["whisper"]
     if wh["systems"]:
