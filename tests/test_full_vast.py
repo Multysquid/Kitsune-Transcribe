@@ -485,9 +485,9 @@ def test_the_recipe_test_flags_reach_the_box_env_in_one_spelling(full_launch, ca
     the same list; the preflight sees the normalised sets too."""
     rid = "full-p01-20261001T184145Z"
     loose = ["schedule.epochs=04", "augment.enabled=True", "augment.truncate_p=.3", "augment.concat_p=0.50",
-             "augment.mix_p=2e-1"]
+             "augment.mix_p=0.00"]
     want = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
-            "augment.mix_p=0.2"]
+            "augment.mix_p=0.0"]  # mix off: DECISIONS H3
     rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
                            rid, *sum((["--resume-set", f"{rid}:{s}"] for s in loose), []), "--yes")
     out = capsys.readouterr().out

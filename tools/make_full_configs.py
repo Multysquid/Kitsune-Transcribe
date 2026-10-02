@@ -113,12 +113,14 @@ STUDY_DATA = ROOT / "study" / "data.json"
 # THE RECIPE (DECISIONS H0/H1, owner 2026-10-02 ~20:30Z): the CTC train-data augmentation the stream and period fixes
 # train with (scripts/04_distill.py augment.*, kitsune/trainset.py): truncate 0.3 (a row cut before a word, never
 # between a sentence's last word and its mark, half of the cuts in a pause), concat 0.5 (a micro-batch's rows joined k
-# at a time inside its planned padded frames, <= 28 s) and mix 0.2 (another row 5-20 dB down, the clean row's targets),
-# the training-plan investigator's values; every other augment.* key stays the trainer's default, so the block names
-# only what it changes. One constant for both places the recipe goes, so the test and the run it decides on cannot
-# drift apart: the recipe test box's --resume-set flags (CONTINUATIONS p01, continuation_flags) and P-0.3B's run, whose
+# at a time inside its planned padded frames, <= 28 s), the training-plan investigator's values, and mix OFF:
+# mix_p 0.0 (DECISIONS H3, owner 2026-10-02 ~23:00Z, the stream plan's D2: another row 5-20 dB down under the
+# clean row's targets teaches the student to leave a second voice blank, the stream failure; the key stays, at 0,
+# so every record of the recipe says so). Every other augment.* key stays the trainer's default, so the block
+# names only what the recipe sets. One constant for both places the recipe goes, so the test and the run it decides
+# on cannot drift apart: the recipe test box's --resume-set flags (CONTINUATIONS p01, continuation_flags) and P-0.3B's run, whose
 # config carries it as its augment block (FULL_RUNS p03; launched only if the test shows that it helps, H1 step 2)
-RECIPE = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.2}
+RECIPE = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.0}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /

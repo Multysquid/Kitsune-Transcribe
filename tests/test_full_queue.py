@@ -1452,9 +1452,9 @@ def test_a_reset_run_keeps_its_sets_until_the_state_after_the_reset_and_reads_ou
 @pytest.mark.parametrize("sets,spelled", [
     (["schedule.epochs=8", "early_stop.patience=12"], None),
     (["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
-      "augment.mix_p=0.2"],
+      "augment.mix_p=0.0"],
      ["schedule.epochs=04", "augment.enabled=TRUE", "augment.truncate_p=.30", "augment.concat_p=5e-1",
-      "augment.mix_p=0.2"])], ids=["G3-epochs-patience", "H1-recipe"])
+      "augment.mix_p=0"])], ids=["G3-epochs-patience", "H1-recipe"])
 def test_the_p01_continuation_takes_its_sets_and_scores_its_new_end(fq, hubs, monkeypatch, sets, spelled):
     """DECISIONS G3 and H1 end to end on the queue side: launch's KITSUNE_RESUME_RESET + KITSUNE_RESUME_SETS (G3: epochs
     8, patience 12; H1, the recipe test box: epochs 4 = box 1's T and the augmentation's enabled / truncate_p /

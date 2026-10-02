@@ -58,7 +58,7 @@ BOX_H = {"full-t": (26.0, 37), "full-p": (16.8, 25), "p01": (5.0, 10)}
 P01_RID = "full-p01-20261001T184145Z"
 # DECISIONS H1: the recipe test box's sets, as launch puts them in KITSUNE_RESUME_SETS (one spelling each)
 RECIPE_SETS = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
-               "augment.mix_p=0.2"]
+               "augment.mix_p=0.0"]  # mix off: DECISIONS H3
 
 
 def cfg(name: str) -> dict:
@@ -774,7 +774,7 @@ def test_box_p01_is_the_recipe_test(reg, plan, trainer):
     c = M.CONTINUATIONS["p01"]
     assert (c["box"], c["run_id"], c["from_step"], c["epochs"], c["patience"], c["augment"], c["revision"]) == (
         "p01", P01_RID, 86328, 4, None, M.RECIPE, "c4604304db76e068df7bbe39d00d006b74d6c134")
-    assert M.RECIPE == {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.2}  # DECISIONS H1
+    assert M.RECIPE == {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.0}  # DECISIONS H1, H3
     assert c["epochs"] == M.FULL_RUNS["p01"]["epochs"] == cfg("full-p01")["schedule"]["epochs"]  # box 1's T again
     raw = (FULL / "full-p01.json").read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(raw).hexdigest() == FULL_P01_SHA256
@@ -787,11 +787,12 @@ def test_box_p01_is_the_recipe_test(reg, plan, trainer):
     assert set(keys) <= set(fullrun.RESUME_SET_KEYS) and "early_stop.patience" not in keys
     # ... and the trainer takes them on a resume of box 1's config: none is RESUME_FIXED, the values validate (the
     # augmentation on a CTC student), schedule.epochs repeats the state's (a resume reset plans the same T again)
+    # and augment.mix_p 0.0 the trainer's default (box 1's config has no augment block; mix off, H3)
     saved = trainer.load_config(str(FULL / "full-p01.json"), [])
     sets = [trainer.apply_set(copy.deepcopy(saved), s) for s in RECIPE_SETS]
     changed, same = trainer.resume_overrides(saved, sets)
-    assert changed == {"augment.enabled": True, "augment.truncate_p": 0.3, "augment.concat_p": 0.5,
-                       "augment.mix_p": 0.2} and same == {"schedule.epochs": 4}
+    assert changed == {"augment.enabled": True, "augment.truncate_p": 0.3, "augment.concat_p": 0.5}
+    assert same == {"schedule.epochs": 4, "augment.mix_p": 0.0}
     assert trainer.augment_on(trainer.load_config(str(FULL / "full-p01.json"), RECIPE_SETS))
 
 

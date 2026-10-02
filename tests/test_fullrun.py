@@ -249,7 +249,7 @@ def test_parse_resume_sets():
 
 
 RECIPE_SETS = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
-               "augment.mix_p=0.2"]  # DECISIONS H1: the recipe test box's sets (tools/make_full_configs.py CONTINUATIONS)
+               "augment.mix_p=0.0"]  # DECISIONS H1: the recipe test box's sets (tools/make_full_configs.py CONTINUATIONS)
 
 
 def test_parse_resume_sets_types_and_normalises_each_value():
@@ -257,7 +257,7 @@ def test_parse_resume_sets_types_and_normalises_each_value():
     word, the resume plan and the trainer's --set carry - so the env word round-trips to itself, and two spellings of
     one continuation are one continuation on the box (full_queue adopt's resume_sets_differ compares them)."""
     loose = [f"{RID}:schedule.epochs=04", f"{RID}:augment.enabled=True", f"{RID}:augment.truncate_p=.30",
-             f"{RID}:augment.concat_p=5e-1", f"{RID}:augment.mix_p=0.2000"]
+             f"{RID}:augment.concat_p=5e-1", f"{RID}:augment.mix_p=0.000"]
     got = fr.parse_resume_sets(",".join(loose))
     assert got == {RID: RECIPE_SETS}
     word = ",".join(f"{rid}:{kv}" for rid, kvs in got.items() for kv in kvs)  # vast/launch.py's env word
