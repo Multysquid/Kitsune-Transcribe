@@ -177,7 +177,10 @@ DATA_KEYS = ("data_root", "teacher_root", "second_root", "parakeet_root", "selec
 
 RUN_ID_RE = r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"  # <item>-<YYYYMMDDTHHMMSSZ>[-n], 04 build's run dir name
 ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
-RESUME_SET_KEYS = ("schedule.epochs",)  # the only config key launch --resume-set may change
+# the config keys launch --resume-set may change (DECISIONS G3: P-0.1B's continuation sets its epochs and its early-stop
+# patience), each an int of at least RESUME_SET_INT_MIN[key]; 04_distill validates the same on the box
+RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience")
+RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
 
 # ------------------------------------------------------------------------------------------------ environment (1.4)
 
@@ -308,9 +311,10 @@ def dev_pick(rows, sources, per_source: int, seed: int) -> list[str]:
 
 
 def parse_resume_sets(s: str | None) -> dict[str, list[str]]:
-    """KITSUNE_RESUME_SETS ("<run_id>:schedule.epochs=4,<run_id>:...") -> {run_id: ["schedule.epochs=4", ...]} (values
-    normalised). ValueError on a bad run id (RUN_ID_RE), a key outside RESUME_SET_KEYS, epochs that are not an int
-    >= 1, or one key given twice for a run. None or "" -> {}."""
+    """KITSUNE_RESUME_SETS ("<run_id>:schedule.epochs=8,<run_id>:early_stop.patience=12,...") -> {run_id:
+    ["schedule.epochs=8", "early_stop.patience=12", ...]} (in the order given; values normalised to str(int): "012" ->
+    "12"). ValueError on a bad run id (RUN_ID_RE), a key outside RESUME_SET_KEYS, a value that is not an int >= its
+    RESUME_SET_INT_MIN (digits only: no sign, no decimal point), or one key given twice for a run. None or "" -> {}."""
     out: dict[str, list[str]] = {}
     if not s:
         return out
@@ -322,10 +326,10 @@ def parse_resume_sets(s: str | None) -> dict[str, list[str]]:
         key, eq, val = kv.partition("=")
         if not eq or key not in RESUME_SET_KEYS:
             raise ValueError(f"resume set {part!r}: only {', '.join(RESUME_SET_KEYS)} may change on a resume")
-        if key == "schedule.epochs":
-            if not re.fullmatch(r"\d+", val) or int(val) < 1:
-                raise ValueError(f"resume set {part!r}: schedule.epochs must be an int >= 1")
-            val = str(int(val))
+        lo = RESUME_SET_INT_MIN[key]
+        if not re.fullmatch(r"\d+", val) or int(val) < lo:
+            raise ValueError(f"resume set {part!r}: {key} must be an int >= {lo}")
+        val = str(int(val))
         if any(x.partition("=")[0] == key for x in out.get(run_id, [])):
             raise ValueError(f"resume set {part!r}: {key} given twice for {run_id}")
         out.setdefault(run_id, []).append(f"{key}={val}")

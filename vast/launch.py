@@ -1438,7 +1438,8 @@ def speed_record_notes(sha: str, box: str) -> list[str]:
 
 def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_repo: str | None, sha: str, box: str,
                    reg: dict, cfg: dict, *, reader=None, resume: bool = False, resets=(),
-                   sets: dict | None = None, allow_unverified_quant: bool = False) -> tuple[list[str], list[str]]:
+                   sets: dict | None = None, allow_unverified_quant: bool = False,
+                   allow_done_trains: bool = False) -> tuple[list[str], list[str]]:
     """-> (problems, notes) for --job full, read-only (local git and the laptop's HF login), on top of hf_preflight and
     extent_preflight:
     - every config the box reads (fullrun.box_configs: its data config, its item configs, the registry) committed at
@@ -1452,7 +1453,9 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
     - a full selection's sidecar (<selection stem>.json) passing kitsune.devslice.sidecar_problems against the Hub's
       selection and frozen manifest;
     - with resume: the box's Hub queue summary, and every --resume-reset/--resume-set id the run dir of one of its train
-      items; the notes say what will resume, with the newest state step found in the scratch and runs repos;
+      items; the notes say what will resume, with the newest state step found in the scratch and runs repos; a plain
+      resume of a box whose train items are all done needs allow_done_trains, a set-only id of a done run is refused
+      (resume_preflight);
     - a box with quantised items: the quant go signal (quant_go_problems: a passing smoke-b verdict at this quant code;
       allow_unverified_quant makes it a warning); box full: a warning while its hours are provisional
       (speed_record_notes)."""
@@ -1566,17 +1569,27 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
                 problems.append(f"{scratch_repo} is not private: the timed states are the trainers' full states; "
                                 f"hf repos settings {scratch_repo} --private")
     if resume:
-        problems_r, notes_r = resume_preflight(out_repo, scratch_repo, box, resets, sets or {})
+        problems_r, notes_r = resume_preflight(out_repo, scratch_repo, box, resets, sets or {},
+                                               allow_done_trains=allow_done_trains)
         problems += problems_r
         notes += notes_r
     problems_q, notes_q = quant_go_problems(out_repo, sha, box, spec, allow_unverified_quant=allow_unverified_quant)
     return problems + problems_q, notes + notes_q + speed_record_notes(sha, box)
 
 
-def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, sets: dict) -> tuple[list, list]:
+def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, sets: dict, *,
+                     allow_done_trains: bool = False) -> tuple[list, list]:
     """--resume: the box's Hub queue summary (full/box-<box>/queue_summary.json, the source of truth) must exist, and
     every reset/set id must be fullrun.run_id_of(items[x].run_dir) of one of its train items; the notes list each
-    train item (its status, run and the newest full state step in the scratch pointer and the runs repo)."""
+    train item (its status, run and the newest full state step in the scratch pointer and the runs repo). Two guards
+    (DECISIONS G3, P-0.1B's continuation):
+    (a) a plain --resume (no reset, no set) of a box whose summary has every train item done is refused unless
+        allow_done_trains (--allow-done-trains: a box lost in its eval pool). resume-pull would adopt the runs as done,
+        so box p01's plain --resume before its continuation began would score its new items on the 4-epoch weights;
+        a continuation is --resume-reset (with its --resume-set). A continuation lost on its way is not refused: the
+        summary then shows the run running with its continuation record;
+    (b) a --resume-set id without --resume-reset whose train item is done is refused: resume-pull refuses a set-only
+        run past its cooldown after the paid boot."""
     import tempfile
 
     problems, notes = [], []
@@ -1595,6 +1608,22 @@ def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, 
                 if rid not in ran:
                     problems.append(f"--resume-reset/--resume-set {rid}: no train item of box {box} ran it (its Hub "
                                     f"summary's runs: {sorted(ran) or 'none'})")
+            trains = {name: it for name, it in items.items() if isinstance(it, dict) and it.get("kind") == "train"}
+            for rid in sets:
+                if rid in ran and rid not in resets and (trains.get(ran[rid]) or {}).get("status") == "done":
+                    problems.append(f"--resume-set {rid} without --resume-reset: {ran[rid]} is done, past its "
+                                    f"cooldown, and resume-pull refuses a set-only run there; continue it with "
+                                    f"--resume-reset {rid} (and its --resume-set)")
+            if not resets and not sets and trains and all(it.get("status") == "done" for it in trains.values()):
+                msg = (f"a plain --resume of box {box}: every train item of its Hub summary is done "
+                       f"({', '.join(sorted(trains))}), so the box would only adopt them and run its other items on "
+                       f"those weights. A continuation of a done run is --resume-reset <run_id> (with its "
+                       f"--resume-set <run_id>:KEY=VALUE); pass --allow-done-trains only for a box lost in its eval "
+                       f"pool")
+                if allow_done_trains:
+                    notes.append(f"{msg} (--allow-done-trains: not refused)")
+                else:
+                    problems.append(msg)
             for name, it in items.items():
                 if not isinstance(it, dict) or it.get("kind") != "train":
                     continue
@@ -1763,9 +1792,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--resume-reset", action="append", default=[], metavar="RUN_ID",
                     help="full: continue this early-stopped run from its pre_cooldown state (repeatable; implies "
                          "--resume; KITSUNE_RESUME_RESET)")
-    ap.add_argument("--resume-set", action="append", default=[], metavar="RUN_ID:schedule.epochs=E",
-                    help="full: resume this run with another schedule.epochs (repeatable; implies --resume; "
-                         "KITSUNE_RESUME_SETS)")
+    ap.add_argument("--resume-set", action="append", default=[], metavar="RUN_ID:KEY=VALUE",
+                    help=f"full: resume this run with another value of KEY, one of "
+                         f"{', '.join(fullrun.RESUME_SET_KEYS)} (an int >= 1; repeatable, one KEY once per run; "
+                         f"implies --resume; KITSUNE_RESUME_SETS). With --resume-reset of the same run: a continuation "
+                         f"from its pre_cooldown state, e.g. --resume-reset <rid> --resume-set <rid>:schedule.epochs=8 "
+                         f"--resume-set <rid>:early_stop.patience=12")
+    ap.add_argument("--allow-done-trains", action="store_true",
+                    help="full: a plain --resume of a box whose Hub summary has every train item done (a box lost "
+                         "in its eval pool); refused without it, because a plain --resume never continues a done run "
+                         "(that is --resume-reset)")
     ap.add_argument("--tier", choices=sorted(FULL_TIERS), default=None,
                     help=f"full: 5090 (default) or a100 (option C; default cap {A100_MAX_DPH:g} $/h)")
     ap.add_argument("--gate-hours", type=float, default=None,
@@ -1808,7 +1844,8 @@ def main(argv: list[str] | None = None) -> int:
                                 ("--min-disk-bw", args.min_disk_bw is not None),
                                 ("--max-gb-cost", args.max_gb_cost is not None),
                                 ("--max-total", args.max_total is not None),
-                                ("--allow-unverified-quant", args.allow_unverified_quant)) if v]
+                                ("--allow-unverified-quant", args.allow_unverified_quant),
+                                ("--allow-done-trains", args.allow_done_trains)) if v]
     if full_only and not full:
         ap.error(f"{', '.join(full_only)}: for --job full only")
     if args.machine is not None and not re.fullmatch(r"\d+", args.machine):
@@ -2025,7 +2062,8 @@ def main(argv: list[str] | None = None) -> int:
                                                          args.scratch_repo if spec["timed_states"] else None, sha,
                                                          args.box, reg, cfg, reader=reader, resume=resume,
                                                          resets=resets, sets=sets,
-                                                         allow_unverified_quant=args.allow_unverified_quant)
+                                                         allow_unverified_quant=args.allow_unverified_quant,
+                                                         allow_done_trains=args.allow_done_trains)
                     errors += problems
                     notes += pre_notes
                     for c in (fullrun.CHAIN_NAMES if resume else ()):  # E.8: a resume of a chain's last part
