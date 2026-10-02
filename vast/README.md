@@ -755,8 +755,9 @@ only; done 2026-10-02, 4 epochs, M4 11.45 %), after two short smokes (`full-smok
 two 1x RTX 5090 boxes (DECISIONS G2): **box T** (`full-t`: T-0.6B, the Cohere labels only, `data-t`) and **box P**
 (`full-p`: P-0.3B then P-0.05B, the Parakeet labels, `data-p`, with the Whisper models and their quantised readouts);
 T-0.6B and P-0.3B train 3 epochs, P-0.05B 5 (DECISIONS G1, confirmed by the owner on 2026-10-02; the earlier 10-epoch
-request was withdrawn), each with the common early-stop patience 6. Box `p01` runs again as **P-0.1B's
-continuation** to 8 epochs (DECISIONS G3, below) with P-0.1B's 7 quantised readouts. The 2x box `full` is retired: its
+request was withdrawn), each with the common early-stop patience 6. Box `p01` runs again as **the recipe test**
+(DECISIONS H1, below): box 1's cooldown re-run from its pre_cooldown state to the same end with the CTC train-data
+augmentation on, then P-0.1B's 7 quantised readouts (G3's 8-epoch continuation is postponed, H2). The 2x box `full` is retired: its
 name stays in `fullrun.BOX_NAMES` for the tests' fixtures only, it is not in the registry, and launch refuses it. Each is one `launch.py --job full --box <box>` call; on the box
 `vast/supervise.py` runs `kitsune/full_queue.py` for that box. The box registry `configs/full/boxes.json`
 (`kitsune/fullrun.py`) is the one source of each box's GPU count, data config, hours (`est_hours` planned, `max_hours`
@@ -782,7 +783,7 @@ Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/m
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-smoke --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --machine <smoke A's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box smoke-b --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=8 --resume-set full-p01-20261001T184145Z:early_stop.patience=12 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=4 --resume-set full-p01-20261001T184145Z:augment.enabled=true --resume-set full-p01-20261001T184145Z:augment.truncate_p=0.3 --resume-set full-p01-20261001T184145Z:augment.concat_p=0.5 --resume-set full-p01-20261001T184145Z:augment.mix_p=0.2 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-t --machine <id> --avoid-machine <p01's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-p --machine <id> --avoid-machine <p01's id> --avoid-machine <full-t's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
@@ -793,9 +794,10 @@ the offer's $/h with the disk, plus the traffic at its $/GB); `--offer-id` picks
 **The order after box 1** (DECISIONS F and G, 2026-10-02): the box-2 preparation merged with a green image build, then
 a standalone **smoke-B** (`--box smoke-b`, ~1.5 h on a 1x 5090, report only: it destroys itself on exit 0 whatever its
 checks say), its verdict `full/box-smoke-b/smoke_verdict.json` passing checks 12-16 (`python tools/box1_go.py
---revision c4604304db76e068df7bbe39d00d006b74d6c134`: G5), this layout merged, then **box p01's continuation first**
-and **boxes full-t and full-p** right after it (they no longer depend on its timing: box p01 scores its own quantised
-readouts). The hours of boxes p01, full-t and full-p (`est_hours`, `max_hours` and the train items' no-start needs)
+--revision c4604304db76e068df7bbe39d00d006b74d6c134`: G5), this layout merged, then **box p01's recipe test** (DECISIONS
+H1 step 1, the `--resume-reset ... augment.*` line above: box 1's cooldown again with the train-data augmentation, a
+paired A/B against the 4-epoch record) and **boxes full-t and full-p** after it (they do not depend on its timing: box
+p01 scores its own quantised readouts). The hours of boxes p01, full-t and full-p (`est_hours`, `max_hours` and the train items' no-start needs)
 come from the speed record `configs/full/plan/box2_hours.json` (smoke A's measured s/step and box 1's, `box1_go.py
 --revision <its 4-epoch record> --json` then `make_full_configs.py --import-speed --box1-go`) at the step counts of
 the plan record's launch part (`--import-launch-plan`), so their lines take no `--max-hours`; launch warns while the
@@ -816,7 +818,7 @@ What launch checks and decides, before anything is rented:
   trainer and its 8 DataLoader workers, the stores' page cache counted once per process, and reads ~150+ on any large
   host: judge memory by the trainer's `sys/cgroup/anon_gb` (<= ~40) and `sys/cgroup/oom_kill` (0).
   `verified=any` in the query, then the client keeps verified and deverified hosts only (never unverified), and only a
-  host whose max rental is at least max(`MIN_RENTAL_DAYS` 4, the cap / 24 + 0.5) days (the caps now, 21-37 h, keep the 4 d; a 104 h cap would need 4.83 d). The registry's `max_dph` drops dearer offers before
+  host whose max rental is at least max(`MIN_RENTAL_DAYS` 4, the cap / 24 + 0.5) days (the caps now, 10-37 h, keep the 4 d; a 104 h cap would need 4.83 d). The registry's `max_dph` drops dearer offers before
   the ranking. `--gpus` may only repeat the registry's count; `--config` only its data config.
 - **Avoided machines:** `vast/blocklist.json` (every job, for good: 151760, study box A #1's 2.9 MB/s host;
   54650, which never started p01-chain's instance on 2026-10-01), the
@@ -911,15 +913,21 @@ A dead or stopped box continues elsewhere from what the Hub has:
   augmentation, DECISIONS H1; launch refuses them for a box without a CTC train item, where the trainer would refuse
   them only on the box). Each value reaches the box in one spelling (`fullrun.resume_set_value`: `True` -> `true`,
   `.30` -> `0.3`, `012` -> `12`), so two launches of one continuation compare equal there. Both imply `--resume`.
-- **P-0.1B's continuation** (DECISIONS G3): `--box p01 --resume-reset full-p01-20261001T184145Z --resume-set
-  full-p01-20261001T184145Z:schedule.epochs=8 --resume-set full-p01-20261001T184145Z:early_stop.patience=12` (the
-  command above; `make_full_configs.py --import-speed` prints it). resume_pull takes the pre_cooldown state
-  `checkpoints/full_step_86328`, the queue passes the three `--set`s until the trainer has logged its resume_reset and
-  a full state after it (then every state carries epochs 8 and patience 12), the trainer re-plans T = 215,815, the
-  readout writes `runs/m4-full-p01-20261001T184145Z-r1` and the 7 quantised readouts read the new final step. It
-  overwrites box p01's records at the runs repo's head: box 1's 4-epoch record stays citable as revision
-  c4604304db76e068df7bbe39d00d006b74d6c134 (`box1_go.py --revision`, `full_report.py --earlier
-  full-p01-e4=<pull>/runs/m4-full-p01-20261001T184145Z@c4604304db76e068df7bbe39d00d006b74d6c134`).
+- **The recipe test** (DECISIONS H1): `--box p01 --resume-reset full-p01-20261001T184145Z` with `--resume-set
+  full-p01-20261001T184145Z:<set>` for each of `schedule.epochs=4`, `augment.enabled=true`, `augment.truncate_p=0.3`,
+  `augment.concat_p=0.5`, `augment.mix_p=0.2` (the command above; `make_full_configs.py --import-speed` prints it from
+  `CONTINUATIONS` / `RECIPE`). resume_pull takes the pre_cooldown state `checkpoints/full_step_86328`, the queue passes
+  the six `--set`s until the trainer has logged its resume_reset and a full state after it (then every state carries
+  the recipe), the trainer re-plans the SAME T = 107,910 (4 epochs), so the WSD cooldown starts at once (0.8 T =
+  86,328) and the whole 21,582-step re-run is the cooldown with the augmentation on: everything before it, and the
+  cooldown's step plan and LR, are the baseline's - a paired A/B. No patience set: inside a cooldown an early-stop
+  trigger changes nothing. The readout writes `runs/m4-full-p01-20261001T184145Z-r1` and the 7 quantised readouts read
+  the new final step. It overwrites box p01's records at the runs repo's head (the run's summary, config, final evals
+  and export, and the pre_cooldown state's trainer.pt/.json: same weights, the recipe in its config, so a later
+  continuation from it sets `augment.enabled` explicitly): box 1's 4-epoch record, the A/B's baseline, stays citable as
+  revision c4604304db76e068df7bbe39d00d006b74d6c134 (`box1_go.py --revision`, `full_report.py --earlier
+  full-p01-e4=<pull>/runs/m4-full-p01-20261001T184145Z@c4604304db76e068df7bbe39d00d006b74d6c134`). G3's 8-epoch
+  continuation (`schedule.epochs=8`, `early_stop.patience=12`) is postponed (H2); it can go on from the same state later.
 - launch refuses a **plain `--resume` of a box whose Hub summary has every train item done** (box p01 before its
   continuation started: it would only adopt box 1's run and score the new quantised items on the 4-epoch weights);
   `--allow-done-trains` lets it through for a box lost in its eval pool (box P after its trainings). A continuation
@@ -949,7 +957,7 @@ Every comparative speed number comes from one host: smoke-B #2's (`tools/full_re
 the most systems as its chart group). smoke-B times the 4 study students in 6 formats, the compile probes, the 4
 Whisper models and, when it lands on another machine than smoke A, the bf16 study students and the 3 teachers again.
 The full-data P rows use their study weights' record (S1: same shape and code; CTC greedy decoding does not depend on
-the weights), so the 4- and 8-epoch P-0.1B share study-p01's. Boxes full-p and p01 run no speed item. Box full-t keeps
+the weights), so box 1's P-0.1B and its recipe re-run share study-p01's. Boxes full-p and p01 run no speed item. Box full-t keeps
 decision 22's bf16 re-time pair (speed-full-t06 and speed-study-t06 in one speed.json): when full-t06's tokens on the
 200 speed ids drift more than 5 % from study-t06's, S2 scales the chart group's study-t06 record (and its variants) by
 that pair's ratio; the pair's own group (2 systems) never becomes the chart group.

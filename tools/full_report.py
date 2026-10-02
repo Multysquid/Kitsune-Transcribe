@@ -52,7 +52,8 @@ Inputs (lean pulls of the runs repo; no weights are read)
                          host NAME (versions.host), for a file no summary covers (a box launched again elsewhere
                          replaces its summary)
   --earlier NAME=DIR[@REV] ...  an earlier readout of a full run that a continuation went on from (DECISIONS G4:
-                         P-0.1B's 4 epochs, runs-repo c4604304, before its continuation to 8): NAME = full-<x>-e<epochs>
+                         P-0.1B's 4 epochs, runs-repo c4604304, before box p01 continued its run - the recipe test,
+                         DECISIONS H1): NAME = full-<x>-e<epochs>
                          (full-p01-e4), DIR its 05 --out dir (runs/m4-<run_id>, pulled at REV), REV the runs-repo
                          revision it is cited at. Its study.json is read as system NAME, role full_earlier: listed in
                          study -> full and vs_teacher, compared with the final run (vs_final: final / earlier, the same

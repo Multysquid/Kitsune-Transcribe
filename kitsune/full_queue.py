@@ -1,7 +1,7 @@
 """The full-data runs' box queue: one registry box (kitsune/fullrun.py, configs/full/boxes.json) from its store builds
 to its last verified upload, on a shared GPU queue; plus the resume of a box on a new host.
 
-A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1 and P-0.1B's continuation, full-t and full-p = box 2's two
+A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1 and its recipe test, full-t and full-p = box 2's two
 1x boxes, smoke-b; full = the retired 2x box 2, test fixtures only) is the list of registry items of its spec, in
 registry order. FullQueue(study_queue.Queue) runs them with the study queue's process, state and upload
 machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it never reads prereg.rules()["boxes"].

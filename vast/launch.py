@@ -243,8 +243,8 @@ GATE_RE = re.compile(r"full/box-[^/]+/infra/[^/]+/download_gate\.json")
 FULL_TOOLS = {"stores": "kitsune/full_queue.py", "train": "scripts/04_distill.py", "readout": "scripts/05_evaluate.py",
               "speed": "tools/speed_probe.py"}
 # THE QUANT GO SIGNAL (DECISIONS F2, 2026-10-01: "the quant/compile fixes are verified on a GPU by a standalone smoke-B
-# box before box 2 launches"). A box with quantised items (box full-p: 14 quantised readouts, full-t 7, p01 7 - P-0.1B's
-# continuation scores its 8-epoch weights on its own box) is refused unless the runs
+# box before box 2 launches"). A box with quantised items (box full-p: 14 quantised readouts, full-t 7, p01 7 - the
+# recipe test scores its re-run's weights on its own box) is refused unless the runs
 # repo's smoke-b verdict (full/box-smoke-b/smoke_verdict.json) passed overall and every one of checks 12-16 (12 the
 # torchao selftest and the emulate-vs-real NVFP4 compare, 13 fp16 without non-finite rows, 14 export = in-memory, 15
 # Whisper, 16 every speed probe), at a commit that is an ancestor of the one the box runs with QUANT_CODE (the quant
@@ -255,9 +255,9 @@ QUANT_GO_BOX = "smoke-b"
 QUANT_GO_CHECKS = ("12", "13", "14", "15", "16")
 QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.py", "kitsune/whisper.py",
               "tools/whisper_eval.py", "requirements-train.txt", "docker/Dockerfile")
-# the hours of boxes p01 (P-0.1B's continuation), full-t and full-p come from make_full_configs' speed record (its
-# SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's; without box 1's part they are
-# provisional (contract 7), and launch says so
+# the hours of boxes p01 (box 1's cooldown again: the recipe test), full-t and full-p come from make_full_configs' speed
+# record (its SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's; without box 1's part
+# they are provisional (contract 7), and launch says so
 SPEED_RECORD = "configs/full/plan/box2_hours.json"
 SPEED_RECORD_BOXES = ("p01", "full-t", "full-p")
 # offers in a country whose hosts cannot reach the Hugging Face Hub: a full box downloads everything from it, and with
@@ -324,7 +324,7 @@ def study_job(box: str) -> JobSpec:
 
 def min_rental_days(max_hours: float) -> float:
     """A full box's minimum host rental: MIN_RENTAL_DAYS, or its cap + RENTAL_MARGIN_DAYS when that is longer (a
-    cap past 84 h, e.g. 104 h: 4.83 d; the boxes' caps now, 21-37 h, keep the 4 d)."""
+    cap past 84 h, e.g. 104 h: 4.83 d; the boxes' caps now, 10-37 h, keep the 4 d)."""
     return max(float(MIN_RENTAL_DAYS), round(float(max_hours) / 24 + RENTAL_MARGIN_DAYS, 2))
 
 
@@ -1822,8 +1822,9 @@ def main(argv: list[str] | None = None) -> int:
                          "kitsune/full_queue.py, the registry configs/full/boxes.json)")
     ap.add_argument("--box", choices=[*STUDY_BOXES, *fullrun.ALL_BOX_NAMES], default=None,
                     help="study: A (the Cohere runs, 4 GPUs), B (Parakeet + bridge, 4 GPUs), replicate (1 GPU, after "
-                         "A) or shakedown (1 GPU, first); full: full-smoke (smoke A), p01 (box 1, then P-0.1B's "
-                         "continuation), full-t and full-p (box 2's two 1x boxes; full: the retired 2x box), "
+                         "A) or shakedown (1 GPU, first); full: full-smoke (smoke A), p01 (box 1, then its recipe "
+                         "test: box 1's cooldown again), full-t and full-p (box 2's two 1x boxes; full: the retired 2x "
+                         "box), "
                          "smoke-b, or the chain p01-chain (smoke A + smoke B, then box 1 on one rental)")
     ap.add_argument("--data-repo", required=True, help="private HF dataset with the derived data (KITSUNE_DATA_REPO)")
     ap.add_argument("--out-repo", default=None, help="private HF model repo for runs/ (KITSUNE_OUT_REPO; train only)")
