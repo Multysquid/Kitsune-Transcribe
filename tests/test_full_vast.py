@@ -296,6 +296,41 @@ def test_the_client_filter_keeps_only_verified_long_rentals_with_the_ram(full_la
     assert launch.offer_problems(offer(1, 1, 0.5, verification="unverified", duration=0), launch.JOBS["label"]) == []
 
 
+def test_a_registry_min_ram_and_a_long_cap_tighten_the_filter(full_launch, repo, capsys):
+    """min_ram_gb (registry; RAM analysis 2026-10-02: box 1's real peaks were 33 GiB trainer, 37 GiB store build, the
+    164 GB peak_rss_gb is page cache counted per DataLoader worker): the query asks floor(0.94 x it) GB, the client
+    filter round(0.97 x it x 1000) MB, so vast's 96 GB machines listed at 95,758 MB stay; None keeps 64,000 MB a GPU
+    and the query's 60. A cap past MIN_RENTAL_DAYS raises the rental floor to cap / 24 + 0.5 d."""
+    now = time.time()
+    j = launch.full_job("full-t", {"gpus": 1, "min_ram_gb": 96}, "5090", 26.0, 37, 1.1)
+    assert "cpu_ram>=90" in j.base_filter and j.ram_mb_min == 93120 and j.min_rental_days == 4
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=95758), j, now) == []
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=64439), j, now) == ["cpu_ram 64439 MB < 93120 MB"]
+    j0 = launch.full_job("p01", {"gpus": 1, "min_ram_gb": None}, "5090", 19.5, 22, 1.0)
+    assert "cpu_ram>=60" in j0.base_filter and j0.ram_mb_min == 0
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=64439), j0, now) == []
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=63183), j0, now) == ["cpu_ram 63183 MB < 64000 MB"]
+    assert "cpu_ram>=120" in launch.full_filter(2, min_ram_gb=96)  # never below 60 a GPU
+    long = launch.full_job("full-t", {"gpus": 1, "min_ram_gb": 96}, "5090", 78.9, 104, 1.1)
+    assert long.min_rental_days == launch.min_rental_days(104) == 4.83
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=96000, duration=4.2 * DAY), long, now) == [
+        "max rental 4.2 d < 4.83 d"]
+    assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=96000, duration=4.9 * DAY), long, now) == []
+    assert launch.min_rental_days(37) == launch.min_rental_days(22) == launch.MIN_RENTAL_DAYS == 4
+    # the launch: the registry's min_ram_gb reaches the query and the look-only says so
+    reg = copy.deepcopy(dict(repo.reg))
+    reg["boxes"]["p01"]["min_ram_gb"] = 96
+    write_reg(repo.root, reg)
+    rc, fake = full_launch([[offer(1, 2, 0.50, cpu_ram=64439), offer(2, 3, 0.60, cpu_ram=95758)]], "--box", "p01",
+                           "--scratch-repo", SCRATCH, "--dry-run")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "cpu_ram>=90" in search_query(fake).split(" ") and "cpu_ram>=60" not in search_query(fake).split(" ")
+    assert "RAM >= 96 GB (registry min_ram_gb): the query asks cpu_ram >= 90 GB, the client filter >= 93120 MB" in out
+    assert "host max rental >= 4 d" in out
+    assert env_of(created_or_printed(out))["KITSUNE_MACHINE_ID"] == "3"
+
+
 def created_or_printed(out: str) -> list[str]:
     """The create command as printed (look-only runs print it with the offer they would rent)."""
     import shlex

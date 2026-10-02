@@ -1271,3 +1271,17 @@ def test_plan_and_resume_pull_on_a_chain(ch, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "is not resumed as a chain" in out and "--box p01 --resume" in out
 
+
+
+def test_a_chain_takes_the_largest_min_ram_of_its_parts(tmp_path):
+    """min_ram_gb (launch's RAM filter) is a part's field: the derived chain spec takes the largest one of its parts,
+    None when no part sets one; the chain entry itself may not carry it (E.1.5: derived, never written)."""
+    reg = with_chain(tiny_registry(tmp_path))
+    assert fullrun.box_spec(CHAIN_BOX, fullrun.load_registry(reg, root=tmp_path))["min_ram_gb"] is None
+    reg["boxes"]["p01"]["min_ram_gb"] = 96
+    reg["boxes"]["smoke-b"]["min_ram_gb"] = 48.5
+    loaded = fullrun.load_registry(reg, root=tmp_path)
+    assert fullrun.box_spec(CHAIN_BOX, loaded)["min_ram_gb"] == 96
+    assert fullrun.box_spec("p01", loaded)["min_ram_gb"] == 96 and fullrun.box_spec("full", loaded)["min_ram_gb"] is None
+    reg["boxes"][CHAIN_BOX]["min_ram_gb"] = 128
+    assert any("min_ram_gb" in p for p in fullrun.registry_problems(reg, root=tmp_path))

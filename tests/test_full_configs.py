@@ -942,7 +942,7 @@ def test_the_chained_box(reg):
         gpus=1, data_config="configs/full/data-p01.json", est_hours=25.2, max_hours=35, max_dph=1.0, extra_gb=120,
         gate=True, watchdog={"orphan_s": 600, "action": "alert"}, deadline_reserve_min=45, timed_states=True,
         extra_files=[manifest, smoke_side, STUDY_SELECTION, SIDECAR[STUDY_SELECTION], full_side],
-        extra_dirs=[PARAKEET], smoke=False, faults=[], items=[], max_attempts=4)
+        extra_dirs=[PARAKEET], smoke=False, faults=[], items=[], max_attempts=4, min_ram_gb=None)
     s1_configs = {"full-smoke": "configs/full/data-smoke.json", "smoke-b": "configs/full/data-smoke-b.json"}
     assert spec["chain"] == fullrun.chain_stages(CHAIN, reg) == [
         dict(stage=1, parts=["full-smoke", "smoke-b"], gate_box="full-smoke", gate_by_hours=9, max_hours=10.5,

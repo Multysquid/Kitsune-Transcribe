@@ -51,8 +51,8 @@ count goes along (KITSUNE_N_GPUS). Boxes A and B may be live at the same time: n
 and is the one source of its GPU count (--gpus may only repeat it), data config (--config), hours (--max-hours; planned
 hours est_hours), price cap (--max-dph), extra disk and watchdog (KITSUNE_N_GPUS, KITSUNE_WATCHDOG_*). The offers: RTX
 5090s (--tier a100: A100s, option C, cap A100_MAX_DPH), full_filter per GPU, then a client filter (verified or
-deverified hosts only, a rental that runs >= MIN_RENTAL_DAYS, >= 64 GB RAM per GPU, --machine), ranked by the estimated
-total. Refused before renting (full_preflight): a box config not committed at the commit, a student not the
+deverified hosts only, a rental that runs >= max(MIN_RENTAL_DAYS, the cap + RENTAL_MARGIN_DAYS), >= 64 GB RAM per GPU or
+the registry box's min_ram_gb (x RAM_CLIENT_FACTOR), --machine), ranked by the estimated total. Refused before renting (full_preflight): a box config not committed at the commit, a student not the
 registered build, an extra file or dir the data repo lacks, an eval/speed tool the commit does not have, a scratch
 repo (--scratch-repo, required for a box with timed states) that is not private, a selection sidecar that is not the
 selection's, with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no
@@ -205,9 +205,18 @@ FULL_TIERS = {
 A100_MAX_DPH = 2.60  # --tier a100's default price cap (option C: 2x A100 for box 2)
 FULL_VERIFICATION = ("verified", "deverified")  # never "unverified" (decision 1)
 MIN_RENTAL_DAYS = 4  # the host's max rental must outlast the box (decision 12; m52214 listed 0.4 d)
+# ... and its cap with a margin: a full box rents for at least max(MIN_RENTAL_DAYS, max_hours / 24 + this) days
+RENTAL_MARGIN_DAYS = 0.5
 # vast converts the query's cpu_ram GB to MB itself, loosely (m54650's 1x lists 64,439 MB), so the query asks for 60 GB
 # a GPU and the client filter for 64,000 MB a GPU (m140586's 2x at 126,367 MB fails, as planned)
 FULL_RAM_MB_PER_GPU = 64_000
+# a registry box's min_ram_gb (kitsune.fullrun; null keeps the per-GPU rule above): the query asks for
+# floor(RAM_QUERY_FACTOR x it) GB, the client filter for round(RAM_CLIENT_FACTOR x it x 1000) MB. The looser client
+# factor is load-bearing: vast lists 96 GB machines at 95,758-96,709 MB (2026-10-02), so a plain x 1000 rule would drop
+# every one of them. Box 1's real peak was 33 GiB for the trainer and 37 GiB for the CTC store build (cgroup anon, not
+# the queue summary's peak_rss_gb, which sums VmRSS over the item's processes and so counts the store's page cache once
+# per DataLoader worker: 164 GB on a 187 GB host)
+RAM_QUERY_FACTOR, RAM_CLIENT_FACTOR = 0.94, 0.97
 # full_filter's disk_bw floor in MB/s (plan v3 section 3), and the lowest value --min-disk-bw takes. A full box writes
 # ~1 TB once (the rebuilt shards and the store) at the rebuild's ~40 MB/s and then reads its stores at ~120 MB/s (box 1
 # measured as P-0.1B's 1,539 audio-s step every ~0.4 s); the floor keeps headroom over that, and the smoke's
@@ -250,11 +259,14 @@ SPEED_RECORD_BOXES = ("full",)
 FULL_AVOID_COUNTRIES = ("CN",)
 
 
-def full_filter(n_gpus: int, disk_gb: int = DISK_GB, min_disk_bw: int = FULL_MIN_DISK_BW) -> list[str]:
+def full_filter(n_gpus: int, disk_gb: int = DISK_GB, min_disk_bw: int = FULL_MIN_DISK_BW,
+                min_ram_gb: float | None = None) -> list[str]:
     """The full box's host filter for n GPUs (plan v3 section 3); the client filter (offer_problems) does the rest.
-    min_disk_bw: the disk_bw floor in MB/s (--min-disk-bw; default FULL_MIN_DISK_BW)."""
+    min_disk_bw: the disk_bw floor in MB/s (--min-disk-bw; default FULL_MIN_DISK_BW); min_ram_gb: the registry box's
+    (None: 60 GB a GPU; else the larger of that and floor(RAM_QUERY_FACTOR x it))."""
+    ram = 60 * n_gpus if min_ram_gb is None else max(60 * n_gpus, math.floor(RAM_QUERY_FACTOR * min_ram_gb))
     return [f"num_gpus={n_gpus}", "verified=any", "rentable=true", "reliability>=0.98", "cuda_vers>=13.0",
-            f"cpu_cores_effective>={16 * n_gpus}", f"cpu_ram>={60 * n_gpus}", f"disk_bw>={int(min_disk_bw)}",
+            f"cpu_cores_effective>={16 * n_gpus}", f"cpu_ram>={ram}", f"disk_bw>={int(min_disk_bw)}",
             "inet_down>=500", f"inet_up>={100 * n_gpus}", "direct_port_count>=1", f"disk_space>={disk_gb}"]
 
 
@@ -283,6 +295,7 @@ class JobSpec:
     accept_verification: tuple | None = None  # the offer's "verification" must be one of these (None: any)
     min_rental_days: float = 0.0  # the host's max rental ("duration") at least this long
     ram_mb_per_gpu: int = 0  # cpu_ram (MB) at least this x n_gpus
+    ram_mb_min: int = 0  # ... and at least this (a registry box's min_ram_gb)
     max_gb_cost: float | None = None  # the host's inet_down_cost and inet_up_cost at most this ($/GB; None: any)
     max_total: float | None = None  # an est_total ranking keeps only offers whose est_total is at most this ($)
     avoid_countries: tuple = ()  # the country codes (geolocation's last part) whose offers are dropped
@@ -302,17 +315,25 @@ def study_job(box: str) -> JobSpec:
                    "dph", f"kitsune-study-{box}")
 
 
+def min_rental_days(max_hours: float) -> float:
+    """A full box's minimum host rental: MIN_RENTAL_DAYS, or its cap + RENTAL_MARGIN_DAYS when that is longer (a
+    10-epoch box T's 104 h cap: 4.83 d)."""
+    return max(float(MIN_RENTAL_DAYS), round(float(max_hours) / 24 + RENTAL_MARGIN_DAYS, 2))
+
+
 def full_job(box: str, spec: dict, tier: str, plan_hours: float, max_hours: float, max_dph: float,
              min_disk_bw: int = FULL_MIN_DISK_BW) -> JobSpec:
-    """The JobSpec of a full box from its registry spec: its GPU count in full_filter, the tier's GPUs, the planned and
-    capped hours, uploads at FULL_UP_GB_PER_GPU_HOUR, ranked by the estimated total, and the client filter. The
-    download (est_down_gb) comes from the extent's sizing later."""
-    n = spec["gpus"]
-    return JobSpec(FULL_TIERS[tier], full_filter(n, min_disk_bw=min_disk_bw), DISK_GB, 0.0, FULL_UP_GB_PER_GPU_HOUR * n * plan_hours,
-                   plan_hours, max_hours, max_dph, "est_total", f"kitsune-full-{box}", n_gpus=n,
-                   accept_verification=FULL_VERIFICATION, min_rental_days=MIN_RENTAL_DAYS,
-                   ram_mb_per_gpu=FULL_RAM_MB_PER_GPU, max_gb_cost=FULL_MAX_GB_COST,
-                   avoid_countries=FULL_AVOID_COUNTRIES)
+    """The JobSpec of a full box from its registry spec: its GPU count and min_ram_gb in full_filter, the tier's GPUs,
+    the planned and capped hours, uploads at FULL_UP_GB_PER_GPU_HOUR, ranked by the estimated total, and the client
+    filter (min_rental_days of the cap; RAM: FULL_RAM_MB_PER_GPU a GPU and, with min_ram_gb, RAM_CLIENT_FACTOR x it).
+    The download (est_down_gb) comes from the extent's sizing later."""
+    n, ram = spec["gpus"], spec.get("min_ram_gb")
+    return JobSpec(FULL_TIERS[tier], full_filter(n, min_disk_bw=min_disk_bw, min_ram_gb=ram), DISK_GB, 0.0,
+                   FULL_UP_GB_PER_GPU_HOUR * n * plan_hours, plan_hours, max_hours, max_dph, "est_total",
+                   f"kitsune-full-{box}", n_gpus=n, accept_verification=FULL_VERIFICATION,
+                   min_rental_days=min_rental_days(max_hours), ram_mb_per_gpu=FULL_RAM_MB_PER_GPU,
+                   ram_mb_min=0 if ram is None else round(RAM_CLIENT_FACTOR * ram * 1000),
+                   max_gb_cost=FULL_MAX_GB_COST, avoid_countries=FULL_AVOID_COUNTRIES)
 
 
 class LaunchError(RuntimeError):
@@ -423,10 +444,10 @@ def offer_problems(offer: dict, job: JobSpec, now: float | None = None) -> list[
         d = _duration_s(offer, now)
         if d is None or d < job.min_rental_days * 86400:
             out.append(f"max rental {'unknown' if d is None else f'{d / 86400:.1f} d'} < {job.min_rental_days:g} d")
-    if job.ram_mb_per_gpu:
-        ram = offer.get("cpu_ram")
-        if not isinstance(ram, (int, float)) or ram < job.ram_mb_per_gpu * job.n_gpus:
-            out.append(f"cpu_ram {ram} MB < {job.ram_mb_per_gpu * job.n_gpus} MB")
+    if job.ram_mb_per_gpu or job.ram_mb_min:
+        ram, need = offer.get("cpu_ram"), max(job.ram_mb_per_gpu * job.n_gpus, job.ram_mb_min)
+        if not isinstance(ram, (int, float)) or ram < need:
+            out.append(f"cpu_ram {ram} MB < {need} MB")
     if job.max_gb_cost is not None:
         for key in ("inet_down_cost", "inet_up_cost"):
             if _gb_cost(offer, key) > job.max_gb_cost:
@@ -1924,6 +1945,15 @@ def main(argv: list[str] | None = None) -> int:
                          f"default floor is {FULL_MIN_DISK_BW}); the smoke's data_wait check guards the loader")
         job = full_job(args.box, spec, tier, plan_hours, max_hours, max_dph, min_disk_bw=min_disk_bw)
         config = spec["data_config"]
+        if spec.get("min_ram_gb") is not None:
+            notes.append(f"RAM >= {spec['min_ram_gb']:g} GB (registry min_ram_gb): the query asks cpu_ram >= "
+                         f"{math.floor(RAM_QUERY_FACTOR * spec['min_ram_gb'])} GB, the client filter >= "
+                         f"{job.ram_mb_min} MB")
+        else:
+            notes.append(f"RAM >= {FULL_RAM_MB_PER_GPU * spec['gpus']} MB ({FULL_RAM_MB_PER_GPU // 1000} GB a GPU; "
+                         f"the box sets no min_ram_gb)")
+        notes.append(f"host max rental >= {job.min_rental_days:g} d (MIN_RENTAL_DAYS {MIN_RENTAL_DAYS}, or the "
+                     f"{max_hours:g} h cap + {RENTAL_MARGIN_DAYS:g} d)")
         if chain is not None:
             # the boot bootstrap rebuilds stage 1's extent; the disk, the gate and the cap are the whole chain's. The
             # cap must hold stage 1 and the last stage's planned hours (E.6: 35 h covers the worst case the gate lets

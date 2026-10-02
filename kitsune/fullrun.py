@@ -32,7 +32,9 @@ load_registry returns remembers its root, so the box readers given it read the c
   deadline_reserve_min >= 0 (the queue's per-item KITSUNE_DEADLINE = box deadline - this); watchdog {orphan_s int
   >= 0, action stop|alert}; extra_gb >= 0 (0); timed_states (false: the scratch repo is required when true); gate
   (true: the download gate); smoke (false: writes smoke_verdict.json, allows faults and verdict specs);
-  max_attempts >= 1 (4); extra_files, extra_dirs (data-repo paths the box pulls, []); faults ([]); items (non-empty)
+  max_attempts >= 1 (4); extra_files, extra_dirs (data-repo paths the box pulls, []); faults ([]); items (non-empty);
+  min_ram_gb (null: launch's 64 GB a GPU; a number > 0: the host RAM launch's offer filter asks for instead, vast/
+  launch.py full_job; a chain takes the largest of its parts')
 
 Items run in registry order where the queue allows. Every item: name (ITEM_RE, unique in its box), kind (ITEM_KINDS),
 needs (EARLIER items of the box; filled with the implicit ones below), stall_min (absent: STALL_MIN_DEFAULT[kind];
@@ -451,7 +453,8 @@ class RegistryError(ValueError):
 _REQ = object()  # a required field
 _BOX_FIELDS = {"gpus": _REQ, "data_config": _REQ, "est_hours": _REQ, "max_hours": _REQ, "max_dph": _REQ,
                "extra_gb": 0, "deadline_reserve_min": _REQ, "watchdog": _REQ, "timed_states": False, "gate": True,
-               "smoke": False, "max_attempts": 4, "extra_files": [], "extra_dirs": [], "faults": [], "items": _REQ}
+               "smoke": False, "max_attempts": 4, "extra_files": [], "extra_dirs": [], "faults": [], "items": _REQ,
+               "min_ram_gb": None}
 _ITEM_FIELDS = {"name": _REQ, "kind": _REQ, "needs": [], "stall_min": _REQ, "max_hours": None, "droppable": _REQ,
                 "verdict": []}  # stall_min and droppable: filled per kind
 _SOURCE_FIELDS = {"of": None, "of_box": None, "weights": [], "model": None}
@@ -477,7 +480,7 @@ _STAGE_FIELDS = ({"parts": _REQ, "gate_box": _REQ, "gate_by_hours": None, "max_h
                  {"parts": _REQ, "rebuild": None})
 # a plain box's fields that a chain derives from its parts (E.1.5): never written on a chain
 _CHAIN_DERIVED = ("items", "data_config", "watchdog", "faults", "smoke", "timed_states", "extra_files", "extra_dirs",
-                  "max_attempts", "gpus", "deadline_reserve_min")
+                  "max_attempts", "gpus", "deadline_reserve_min", "min_ram_gb")
 _ROOT_KEYS = ("data_root", "teacher_root", "second_root", "parakeet_root")  # a chain stage shares one data root
 
 
@@ -816,6 +819,8 @@ def _check_box(bname: str, box, reg_boxes: dict, p: list[str]) -> dict | None:
     for k in ("extra_gb", "deadline_reserve_min"):
         if k in out and not (_num(out[k]) and out[k] >= 0):
             p.append(f"{where}.{k} {out[k]!r} is not a number >= 0")
+    if out.get("min_ram_gb") is not None and not (_num(out["min_ram_gb"]) and out["min_ram_gb"] > 0):
+        p.append(f"{where}.min_ram_gb {out['min_ram_gb']!r} is not null or a number > 0")
     wd = out.get("watchdog")
     if "watchdog" in out:
         if not isinstance(wd, dict) or _keys(wd) != {"orphan_s", "action"}:
@@ -1339,7 +1344,8 @@ def _chain_spec(box, reg: dict, r: Path, read_json=None) -> dict:
     """A chain's derived box spec (E.1.5), computed and never stored: the parts' GPU count, the last stage's rebuild
     as the data config (launch sizes the disk and the gate on it), the chain's own hours, price, extra disk and gate,
     stage 1's watchdog (launch's env), the largest deadline reserve of the last stage, timed states if any part keeps
-    them, the union of both stage views' extra files and dirs, no items (the controller runs its parts' queues)."""
+    them, the union of both stage views' extra files and dirs, the largest min_ram_gb of its parts (None when none
+    sets one), no items (the controller runs its parts' queues)."""
     c = _chain_entry(box, reg)
     stages = chain_stages(box, reg)
     views = [stage_view(box, s["stage"], reg, r, read_json=read_json) for s in stages]
@@ -1348,6 +1354,8 @@ def _chain_spec(box, reg: dict, r: Path, read_json=None) -> dict:
                 est_hours=c["est_hours"], max_hours=c["max_hours"], max_dph=c["max_dph"], extra_gb=c["extra_gb"],
                 gate=c["gate"], watchdog=dict(stages[0]["watchdog"]),
                 deadline_reserve_min=max(s["deadline_reserve_min"] for s in last),
+                min_ram_gb=max((reg["boxes"][x].get("min_ram_gb") for st in stages for x in st["parts"]
+                                if reg["boxes"][x].get("min_ram_gb") is not None), default=None),
                 timed_states=any(v["timed_states"] for v in views),
                 extra_files=_uniq(f for v in views for f in v["extra_files"]),
                 extra_dirs=_uniq(d for v in views for d in v["extra_dirs"]), smoke=False, faults=[], items=[],
