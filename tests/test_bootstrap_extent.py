@@ -1037,33 +1037,6 @@ def test_a_toucher_takes_its_sleep_with_it(tmp_path):
     assert r.returncode == 0 and "sleep gone" in r.stdout, r.stdout + r.stderr
 
 
-def test_a_toucher_killed_before_it_noted_its_sleep_still_kills_it(tmp_path):
-    """Bash may run the toucher's TERM trap after `sleep 60 &` forked and before `s=$!` is set: the trap kills the
-    toucher's own jobs, not a remembered pid, so that sleep goes too; with no job left it still exits 0 (set -e would
-    end it at the failing kill). The trap line of beat_train_hb, verbatim, in a background subshell under set -e."""
-    bash = find_bash()
-    if bash is None:
-        pytest.skip("bash not available")
-    trap = re.search(r"^ *(trap '.*' TERM)$", bootstrap_funcs("beat_train_hb"), re.M).group(1)
-    script = bash_script(
-        tmp_path / "trap_term.sh", "set -euo pipefail",
-        "command sleep 300 & pull=$!  # bootstrap's own job (the label pull): not the toucher's",
-        "toucher() {", f"    {trap}", '    command sleep 300 & echo "$!" > "$1"',
-        '    [ "$2" = with-sleep ] || { kill "$(cat "$1")"; wait || true; }', "    kill -TERM $BASHPID",
-        "    command sleep 300  # never reached", "}",
-        f'for m in with-sleep none; do f="{tmp_path.as_posix()}/$m"',
-        '    toucher "$f" "$m" & t=$!; wait "$t" && echo "$m: toucher exit 0" || echo "$m: toucher exit $?"',
-        '    for i in $(seq 200); do kill -0 "$(cat "$f")" 2>/dev/null || break; command sleep 0.05; done',
-        '    if kill -0 "$(cat "$f")" 2>/dev/null; then echo "$m: sleep left"; kill "$(cat "$f")"',
-        '    else echo "$m: sleep gone"; fi',
-        "done", 'kill -0 "$pull" && echo "pull alive"; kill "$pull"')
-    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=180)
-    out = r.stdout + r.stderr
-    for line in ("with-sleep: toucher exit 0", "with-sleep: sleep gone", "none: toucher exit 0", "none: sleep gone",
-                 "pull alive"):
-        assert line in r.stdout, out
-
-
 def test_nothing_of_bootstraps_holds_onstarts_supervise_lock():
     """onstart's detached subshell holds supervise.lock (fd 7) while bootstrap runs and closes it right before it execs
     supervise.py: bootstrap runs with fd 7 closed, and bootstrap closes it itself before its first command (for a
@@ -1225,3 +1198,43 @@ def test_linux_onstarts_exit_trap_unlocks_in_onstart_only(tmp_path):
         f'flock -n "{lock}" true && echo "SIGTERM exit: unlocked"')
     r = run_linux(driver)
     assert "normal exit: unlocked" in r.stdout and "SIGTERM exit: unlocked" in r.stdout, r.stdout + r.stderr
+
+
+def toucher_term_script(path: Path, trap: str) -> Path:
+    """The toucher of the test below, for a given TERM trap line, under Linux bash: a background subshell under set -e
+    starts `sleep 300 &`, records its pid only in the test's own file (never in `s`), and TERMs itself at once - the
+    race of beat_train_hb, a TERM between `sleep 60 &` and `s=$!` -, so only the trap can take that sleep along
+    (with-sleep); or it first kills and reaps the sleep itself, so the trap meets no job and must still exit 0 (none).
+    The checks give the killed sleep 400 polls (20 s) to go, well short of its 300 s."""
+    d = linux_path(path.parent)
+    return bash_script(
+        path, "set -euo pipefail",
+        "command sleep 300 & pull=$!  # bootstrap's own job (the label pull): not the toucher's",
+        "toucher() {", f"    {trap}", '    command sleep 300 & echo "$!" > "$1"',
+        '    [ "$2" = with-sleep ] || { kill "$(cat "$1")"; wait || true; }', "    kill -TERM $BASHPID",
+        "    command sleep 300  # never reached", "}",
+        f'for m in with-sleep none; do f="{d}/$m"',
+        '    toucher "$f" "$m" & t=$!; wait "$t" && echo "$m: toucher exit 0" || echo "$m: toucher exit $?"',
+        '    for i in $(seq 400); do kill -0 "$(cat "$f")" 2>/dev/null || break; command sleep 0.05; done',
+        '    if kill -0 "$(cat "$f")" 2>/dev/null; then echo "$m: sleep left"; kill "$(cat "$f")"',
+        '    else echo "$m: sleep gone"; fi',
+        "done", 'kill -0 "$pull" && echo "pull alive"; kill "$pull"')
+
+
+def test_linux_a_toucher_killed_before_it_noted_its_sleep_still_kills_it(tmp_path):
+    """Bash may run the toucher's TERM trap after `sleep 60 &` forked and before `s=$!` is set: the trap kills the
+    toucher's own jobs, not a remembered pid, so that sleep goes too; with no job left it still exits 0 (set -e would
+    end it at the failing kill). beat_train_hb's trap line, verbatim (toucher_term_script); PR #34's earlier trap,
+    which killed the remembered "$s", leaves the sleep behind. Under Linux bash only - the boxes' bash: Git Bash's
+    emulated signals lost the trap's kill (or the TERM's interruption of a `wait`) in up to 33 of 36 runs at 12 copies
+    at once on a busy laptop (2026-10-02, whichever way the test sent the TERM), so there it tested MSYS's signal
+    emulation, not the trap."""
+    trap = re.search(r"^ *(trap '.*' TERM)$", bootstrap_funcs("beat_train_hb"), re.M).group(1)
+    r = run_linux(toucher_term_script(tmp_path / "trap_term.sh", trap))
+    for line in ("with-sleep: toucher exit 0", "with-sleep: sleep gone", "none: toucher exit 0", "none: sleep gone",
+                 "pull alive"):
+        assert line in r.stdout, r.stdout + r.stderr
+    (tmp_path / "old").mkdir()
+    old = "trap '[ -z \"${s:-}\" ] || kill \"$s\" 2>/dev/null; exit 0' TERM"  # 7f87a7f's: $s is not set yet
+    r = run_linux(toucher_term_script(tmp_path / "old" / "trap_term.sh", old))
+    assert "with-sleep: sleep left" in r.stdout, r.stdout + r.stderr
