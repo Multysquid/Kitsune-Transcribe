@@ -631,6 +631,68 @@ def test_a_ctc_run_with_every_augmentation(env, aug_run):
     assert json.loads((run / "summary.json").read_text(encoding="utf-8"))["status"] == "complete"
 
 
+def test_a_resume_reset_takes_the_recipe_sets_of_the_env_word(env, monkeypatch):
+    """DECISIONS H1 end to end on the trainer side - the recipe test box in miniature: a finished CTC run on the epochs
+    clock, trained without augmentation, is re-run from its pre_cooldown state to the SAME T with the recipe on. The
+    sets come the way the box gets them: launch's env word (KITSUNE_RESUME_SETS, typed loosely here; launch normalises
+    it) -> fullrun.parse_resume_sets -> the queue's sets_once (schedule.resume_reset=true first: kitsune.full_queue
+    resume_pull / adopt) -> one --set each (FullQueue.argv_for) -> 04_distill --resume <pre_cooldown> takes them: one
+    resume_reset at the pre_cooldown step whose re-planned T is the first run's (the paired A/B: the steps before it,
+    their data and LR, are the baseline's), the augment event with the set values and the trainer's defaults for the
+    rest, aug/* shares on the re-run steps only, and the recipe in every state saved after the reset - so a
+    crash-resume without the sets (the queue drops them once the reset is applied) keeps it - to the end at the same T.
+    """
+    from kitsune import fullrun
+
+    m = load_script("04_distill")
+    path = write_config(env, "ctc-recipe", {"schedule": {"clock": "epochs", "epochs": 1, "max_steps": None}})
+    assert m.main(["--config", path]) == 0
+    run = one_run(env, "ctc-recipe")
+    first = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    T = int(first["steps"])
+    (pc_event,) = [e for e in events(run, "checkpoint") if e.get("reason") == "pre_cooldown"]
+    t_c = int(pc_event["name"].rsplit("_", 1)[1])
+    assert first["status"] == "complete" and t_c + 2 <= T and not events(run, "augment")
+    pc = run / "checkpoints" / pc_event["name"]
+    rid = run.name
+    word = ",".join(f"{rid}:{s}" for s in ("schedule.epochs=01", "augment.enabled=True", "augment.truncate_p=.3",
+                                           "augment.concat_p=0.50", "augment.mix_p=2e-1"))
+    sets = ["schedule.resume_reset=true", *fullrun.parse_resume_sets(word)[rid]]
+    assert sets == ["schedule.resume_reset=true", "schedule.epochs=1", "augment.enabled=true", "augment.truncate_p=0.3",
+                    "augment.concat_p=0.5", "augment.mix_p=0.2"]
+    argv = sum((["--set", s] for s in sets), [])
+    # ckpt.full_every_steps is the test's own (a state after the reset for the crash below), not a queue set
+    monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", str(T))
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        m.main(["--resume", str(pc), *argv, "--set", "ckpt.full_every_steps=1"])
+    monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
+    (r,) = events(run, "resume_reset")
+    assert (r["at_step"], r["T"], r["total_steps_before"], r["total_steps_after"], r["epochs"], r["resume_resets"]) \
+        == (t_c, T, T, T, 1, 1)
+    newest = run / "checkpoints" / f"full_step_{T - 1}"
+    saved = json.loads((newest / "trainer.json").read_text(encoding="utf-8"))["cfg"]
+    want_aug = dict(m.DEFAULTS["augment"], enabled=True, truncate_p=0.3, concat_p=0.5, mix_p=0.2)
+    assert saved["augment"] == want_aug and saved["schedule"]["resume_reset"] is False
+    assert m.main(["--resume", str(newest)]) == 0  # no sets: the state's config holds the recipe
+    assert len(events(run, "resume_reset")) == 1
+    augs = events(run, "augment")
+    assert len(augs) == 2  # the reset's start and the crash-resume's, both with the recipe
+    for a in augs:
+        assert (a["truncate_p"], a["concat_p"], a["mix_p"], a["truncate_pause_p"], a["truncate_min_s"], a["seed"]) == (
+            0.3, 0.5, 0.2, 0.5, 1.0, 1234)
+        assert a["punct_ids"] == {"1": "。"} and a["mix_snr_db"] == [5.0, 20.0]
+    s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert (s["status"], s["steps"], s["resume_resets"]) == ("complete", T, 1)
+    end = json.loads((run / "checkpoints" / f"full_step_{T}" / "trainer.json").read_text(encoding="utf-8"))
+    assert end["cfg"]["augment"] == want_aug and end["st"]["resume_resets"] == 1
+    st = pd.read_parquet(run / "metrics" / "steps.parquet").drop_duplicates("step", keep="last").set_index("step")
+    assert st.index.tolist() == list(range(1, T + 1))
+    tags = ("aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac")
+    after = st.loc[t_c + 1:, list(tags)]
+    assert ((after >= 0) & (after <= 1)).all().all() and after.to_numpy().sum() > 0  # the recipe acted
+    assert st.loc[:t_c, list(tags)].isna().all().all()  # the baseline's steps: no augmentation
+
+
 def test_a_crash_resumed_with_augmentation_is_the_uninterrupted_run(env, aug_run, monkeypatch):
     """A crash before step 5 resumed from full_step_4 ends with exactly the uninterrupted run's weights: the resumed
     loader augments steps 5 and 6 as the uninterrupted one did (the same rows, cuts and mixes; the same losses)."""

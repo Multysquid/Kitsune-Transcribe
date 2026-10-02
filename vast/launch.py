@@ -58,7 +58,8 @@ the registered build, an extra file or dir the data repo lacks, an eval/speed to
 repo (--scratch-repo, required for a box with timed states) that is not private, a selection sidecar that is not the
 selection's, with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no train
 item of it ran (a plain --resume of a box whose train items are all done needs --allow-done-trains; a --resume-set id of
-a done run without --resume-reset is refused), without --resume a box whose Hub queue summary has a train item done
+a done run without --resume-reset is refused; an augment.* --resume-set on a box without a CTC train item is refused
+before any of it), without --resume a box whose Hub queue summary has a train item done
 (a fresh queue would overwrite that summary, and the run's continuation, --resume-reset, reads it; --fresh-over-done
 for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01) without the quant go
 signal: smoke-b's verdict on the Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE;
@@ -1868,11 +1869,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="full: continue this early-stopped run from its pre_cooldown state (repeatable; implies "
                          "--resume; KITSUNE_RESUME_RESET)")
     ap.add_argument("--resume-set", action="append", default=[], metavar="RUN_ID:KEY=VALUE",
-                    help=f"full: resume this run with another value of KEY, one of "
-                         f"{', '.join(fullrun.RESUME_SET_KEYS)} (an int >= 1; repeatable, one KEY once per run; "
-                         f"implies --resume; KITSUNE_RESUME_SETS). With --resume-reset of the same run: a continuation "
-                         f"from its pre_cooldown state, e.g. --resume-reset <rid> --resume-set <rid>:schedule.epochs=8 "
-                         f"--resume-set <rid>:early_stop.patience=12")
+                    help="full: resume this run with another value of KEY, one of "
+                         + ", ".join(f"{k} ({fullrun.resume_set_rule(k)})" for k in fullrun.RESUME_SET_KEYS)
+                         + " (repeatable, one KEY once per run; implies --resume; KITSUNE_RESUME_SETS carries each "
+                         "value in one spelling: True -> true, .30 -> 0.3, 012 -> 12). With --resume-reset of the same "
+                         "run: a continuation from its pre_cooldown state, e.g. --resume-reset <rid> --resume-set "
+                         "<rid>:schedule.epochs=8 --resume-set <rid>:early_stop.patience=12, or the recipe test "
+                         "(DECISIONS H1) --resume-reset <rid> --resume-set <rid>:schedule.epochs=4 --resume-set "
+                         "<rid>:augment.enabled=true --resume-set <rid>:augment.truncate_p=0.3 ... (augment.*: a box "
+                         "with a CTC train item only)")
     ap.add_argument("--allow-done-trains", action="store_true",
                     help="full: a plain --resume of a box whose Hub summary has every train item done (a box lost "
                          "in its eval pool); refused without it, because a plain --resume never continues a done run "
@@ -1989,6 +1994,16 @@ def main(argv: list[str] | None = None) -> int:
         elif args.config is not None and args.config != spec["data_config"]:
             errors.append(f"box {args.box}'s data config is {spec['data_config']} ({fullrun.BOXES_FILE}): --config "
                           f"{args.config} refused (its items' configs share that data block)")
+        # augment.* is the CTC family's train-data augmentation (DECISIONS H0/H1): 04_distill's validate_augment refuses
+        # augment.enabled on an AED student, but only on the box - after the paid boot, the label pull and the store
+        # build, and then on every attempt the queue retries. A box whose train items are all AED has no run the recipe
+        # could apply to, so its augment sets are refused here, before anything is rented
+        aug_keys = sorted({kv.partition("=")[0] for kvs in sets.values() for kv in kvs if kv.startswith("augment.")})
+        families = sorted({it.get("family") or "aed" for it in spec.get("items") or [] if it.get("kind") == "train"})
+        if aug_keys and "ctc" not in families:
+            errors.append(f"--resume-set {', '.join(aug_keys)}: box {args.box} trains no CTC student (its train "
+                          f"items' families: {', '.join(families) or 'none'}), and augment.* is the CTC family's "
+                          f"(scripts/04_distill.py validate_augment would refuse it on the box, after the paid boot)")
         if spec["timed_states"] and not args.scratch_repo:
             errors.append(f"box {args.box} keeps timed full states: --scratch-repo <the private scratch model repo> is "
                           f"required (vast/README.md, full-data runs)")

@@ -52,8 +52,11 @@ def test_constants_exact_values():
                             "sources", "eval_sets", "selection_recipe", "pull_parakeet")
     assert fr.RUN_ID_RE == r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"
     assert fr.ITEM_RE == r"^[a-z0-9][a-z0-9.-]*$"
-    assert fr.RESUME_SET_KEYS == ("schedule.epochs", "early_stop.patience")
+    assert fr.RESUME_SET_KEYS == ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
+                                  "augment.concat_p", "augment.mix_p")
     assert fr.RESUME_SET_INT_MIN == {"schedule.epochs": 1, "early_stop.patience": 1}
+    assert fr.RESUME_SET_KINDS == {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
+                                   "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob"}
     assert fr.STALL_MIN_DEFAULT == {"stores": 360, "train": 45, "readout": 30, "speed": 30, "eval": 60}
     assert fr.ITEM_KINDS == ("stores", "train", "readout", "speed", "eval")
     assert fr.FAULT_ACTIONS == ("sigstop", "kill", "wipe_run_dir", "deadline", "freeze_controller_hb")
@@ -223,14 +226,18 @@ def test_parse_resume_sets():
     assert fr.parse_resume_sets(both) == {RID: ["schedule.epochs=8", "early_stop.patience=12"]}
     assert fr.parse_resume_sets(f"{RID}:early_stop.patience=12,{RID}:schedule.epochs=8") == {
         RID: ["early_stop.patience=12", "schedule.epochs=8"]}
+    only = "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, augment.concat_p, " \
+           "augment.mix_p may change on a resume"
     for bad in (f"{RID}:early_stop.patience=0", f"{RID}:early_stop.patience=-1", f"{RID}:early_stop.patience=1.5",
                 f"{RID}:early_stop.patience=x", f"{RID}:early_stop.patience=",
                 f"{RID}:early_stop.patience=12,{RID}:early_stop.patience=6",
                 f"{RID}:early_stop.enabled=false", f"{RID}:early_stop.min_delta_rel=0.01"):
-        with pytest.raises(ValueError, match="early_stop|only schedule.epochs, early_stop.patience may change"):
+        with pytest.raises(ValueError, match=f"early_stop|{only}"):
             fr.parse_resume_sets(bad)
-    with pytest.raises(ValueError, match="only schedule.epochs, early_stop.patience may change on a resume"):
+    with pytest.raises(ValueError, match=only):
         fr.parse_resume_sets(f"{RID}:optim.lr=0.001")
+    with pytest.raises(ValueError, match="early_stop.patience must be an int >= 1, not '0'"):
+        fr.parse_resume_sets(f"{RID}:early_stop.patience=0")
     for bad in (f"{RID}:optim.lr=0.001",  # outside the whitelist
                 f"{RID}:schedule.epochs=0", f"{RID}:schedule.epochs=x", f"{RID}:schedule.epochs=1.5",
                 f"{RID}:schedule.epochs=-2", f"{RID}:schedule.epochs=", f"{RID}:schedule.epochs",
@@ -239,6 +246,59 @@ def test_parse_resume_sets():
                 f"{RID}:schedule.epochs=4,{RID}:schedule.epochs=5", f"{RID}:schedule.epochs=4,"):
         with pytest.raises(ValueError):
             fr.parse_resume_sets(bad)
+
+
+RECIPE_SETS = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
+               "augment.mix_p=0.2"]  # DECISIONS H1: the recipe test box's sets (tools/make_full_configs.py CONTINUATIONS)
+
+
+def test_parse_resume_sets_types_and_normalises_each_value():
+    """The typed sets (RESUME_SET_KINDS): an int, a bool, a probability, each normalised to the one spelling the env
+    word, the resume plan and the trainer's --set carry - so the env word round-trips to itself, and two spellings of
+    one continuation are one continuation on the box (full_queue adopt's resume_sets_differ compares them)."""
+    loose = [f"{RID}:schedule.epochs=04", f"{RID}:augment.enabled=True", f"{RID}:augment.truncate_p=.30",
+             f"{RID}:augment.concat_p=5e-1", f"{RID}:augment.mix_p=0.2000"]
+    got = fr.parse_resume_sets(",".join(loose))
+    assert got == {RID: RECIPE_SETS}
+    word = ",".join(f"{rid}:{kv}" for rid, kvs in got.items() for kv in kvs)  # vast/launch.py's env word
+    assert re.fullmatch(fr._ENV_WORD, word) and fr.parse_resume_sets(word) == got
+    for key, val, want in (("augment.enabled", "FALSE", "false"), ("augment.enabled", "true", "true"),
+                           ("augment.mix_p", "0", "0.0"), ("augment.mix_p", "1", "1.0"), ("augment.mix_p", "1.", "1.0"),
+                           ("augment.concat_p", "0.50", "0.5"), ("augment.truncate_p", "3E-1", "0.3"),
+                           ("augment.truncate_p", "1e-7", "1e-07"), ("schedule.epochs", "008", "8"),
+                           ("early_stop.patience", "12", "12")):
+        assert fr.resume_set_value(key, val) == want, (key, val)
+        assert fr.resume_set_value(key, want) == want  # normalised once is normalised
+        # ... and JSON of the key's type, as 04_distill's --set reads it (apply_set: json.loads)
+        assert type(json.loads(want)) is {"int": int, "bool": bool, "prob": float}[fr.RESUME_SET_KINDS[key]]
+    # the rule of every key, as launch's help says it and each refusal names it
+    assert {k: fr.resume_set_rule(k) for k in fr.RESUME_SET_KEYS} == {
+        "schedule.epochs": "an int >= 1", "early_stop.patience": "an int >= 1", "augment.enabled": "true or false",
+        "augment.truncate_p": "a probability in [0, 1]", "augment.concat_p": "a probability in [0, 1]",
+        "augment.mix_p": "a probability in [0, 1]"}
+    for bad, msg in ((f"{RID}:augment.enabled=yes", "augment.enabled must be true or false, not 'yes'"),
+                     (f"{RID}:augment.enabled=1", "augment.enabled must be true or false"),
+                     (f"{RID}:augment.enabled=", "augment.enabled must be true or false"),
+                     (f"{RID}:augment.truncate_p=1.5", "augment.truncate_p must be a probability in \\[0, 1\\]"),
+                     (f"{RID}:augment.concat_p=-0.1", "augment.concat_p must be a probability"),
+                     (f"{RID}:augment.mix_p=+0.2", "augment.mix_p must be a probability"),
+                     (f"{RID}:augment.mix_p=nan", "augment.mix_p must be a probability"),
+                     (f"{RID}:augment.mix_p=inf", "augment.mix_p must be a probability"),
+                     (f"{RID}:augment.mix_p=1_0", "augment.mix_p must be a probability"),
+                     (f"{RID}:augment.mix_p=0.2.1", "augment.mix_p must be a probability"),
+                     (f"{RID}:augment.mix_p=x", "augment.mix_p must be a probability"),
+                     (f"{RID}:augment.mix_p=", "augment.mix_p must be a probability"),
+                     (f"{RID}:augment.mix_p=0.2,{RID}:augment.mix_p=0.3", "augment.mix_p given twice"),
+                     # the recipe's other keys keep the trainer's defaults: another value would be another recipe
+                     (f"{RID}:augment.seed=1", "may change on a resume"),
+                     (f"{RID}:augment.concat_max_s=20", "may change on a resume"),
+                     (f"{RID}:augment.mix_snr_db=[0,5]", "may change on a resume")):
+        with pytest.raises(ValueError, match=msg):
+            fr.parse_resume_sets(bad)
+    # one run's int and recipe sets together, another run's apart, in the order given
+    two = f"{RID}:augment.mix_p=0.2,full-p01-20261001T184145Z:augment.enabled=false,{RID}:schedule.epochs=4"
+    assert fr.parse_resume_sets(two) == {RID: ["augment.mix_p=0.2", "schedule.epochs=4"],
+                                         "full-p01-20261001T184145Z": ["augment.enabled=false"]}
 
 
 def test_parse_resume_reset():

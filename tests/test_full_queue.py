@@ -1449,14 +1449,20 @@ def test_a_reset_run_keeps_its_sets_until_the_state_after_the_reset_and_reads_ou
     assert fq.summary()["items"]["full-p01"]["continuation"] == cont
 
 
-def test_the_p01_continuation_takes_its_epochs_and_patience_and_scores_its_new_end(fq, hubs, monkeypatch):
-    """DECISIONS G3 end to end on the queue side: launch's KITSUNE_RESUME_RESET + KITSUNE_RESUME_SETS (epochs 8,
-    patience 12) -> resume-pull plans the reset from the pre_cooldown state with the three sets, the readout and a
-    same-box quant item the old summary never had start fresh -> adopt (the env parses to the plan's own list: no
-    resume_sets_differ) -> every train attempt carries the three --set until the reset is applied -> the readout
-    writes -r1 and the quant item (box p01's, `of` full-p01, needs m4-full-p01) reads the continuation's final step
-    after the readout."""
-    sets = ["schedule.epochs=8", "early_stop.patience=12"]
+@pytest.mark.parametrize("sets,spelled", [
+    (["schedule.epochs=8", "early_stop.patience=12"], None),
+    (["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
+      "augment.mix_p=0.2"],
+     ["schedule.epochs=04", "augment.enabled=TRUE", "augment.truncate_p=.30", "augment.concat_p=5e-1",
+      "augment.mix_p=0.2"])], ids=["G3-epochs-patience", "H1-recipe"])
+def test_the_p01_continuation_takes_its_sets_and_scores_its_new_end(fq, hubs, monkeypatch, sets, spelled):
+    """DECISIONS G3 and H1 end to end on the queue side: launch's KITSUNE_RESUME_RESET + KITSUNE_RESUME_SETS (G3: epochs
+    8, patience 12; H1, the recipe test box: epochs 4 = box 1's T and the augmentation's enabled / truncate_p /
+    concat_p / mix_p) -> resume-pull plans the reset from the pre_cooldown state with its sets, the readout and a
+    same-box quant item the old summary never had start fresh -> adopt (the env parses to the plan's own list - for H1
+    from another spelling of the same values: fullrun.resume_set_value normalises both, so no resume_sets_differ) ->
+    every train attempt carries every --set until the reset is applied -> the readout writes -r1 and the quant item
+    (box p01's, `of` full-p01, needs m4-full-p01) reads the continuation's final step after the readout."""
     once = ["schedule.resume_reset=true", *sets]
     reg = copy.deepcopy(fq.reg)
     quant = {"name": "quant-fp16-full-p01", "kind": "eval", "of": "full-p01", "needs": ["m4-full-p01"],
@@ -1482,7 +1488,8 @@ def test_the_p01_continuation_takes_its_epochs_and_patience_and_scores_its_new_e
     (fq.root / "runs" / RID / "checkpoints" / "full_step_10" / "trainer.json").write_text(
         json.dumps({"reason": "pre_cooldown", "st": st0}), encoding="utf-8")
     monkeypatch.setenv(fullrun.ENV_RESUME_RESET, RID)
-    monkeypatch.setenv(fullrun.ENV_RESUME_SETS, ",".join(f"{RID}:{s}" for s in sets))
+    monkeypatch.setenv(fullrun.ENV_RESUME_SETS, ",".join(f"{RID}:{s}" for s in spelled or sets))
+    assert fullrun.parse_resume_sets(os.environ[fullrun.ENV_RESUME_SETS]) == {RID: sets}
     env = dict(FAKE_RC=json.dumps({"full-p01": [1, 0]}), FAKE_RC_AT="11")  # the first attempt dies after the reset
     assert fq.make("p01", registry=reg, env=env).run() == F.EXIT_OK
     assert fq.events("resume_sets_differ") == []

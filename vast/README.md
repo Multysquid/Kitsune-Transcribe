@@ -898,15 +898,19 @@ uploads, never the timed states (their `.scratch_pending` marker is never upload
 
 A dead or stopped box continues elsewhere from what the Hub has:
 ```powershell
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box <box> --resume [--resume-reset <run_id>] [--resume-set <run_id>:<key>=<int>] [--allow-done-trains] --machine <new id> --max-hours <left + setup> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box <box> --resume [--resume-reset <run_id>] [--resume-set <run_id>:<key>=<value>] [--allow-done-trains] --machine <new id> --max-hours <left + setup> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
 - `--resume` (`KITSUNE_RESUME=1`): bootstrap's resume_pull (`python -m kitsune.full_queue resume-pull`) reads the
   box's Hub queue summary, pulls every started run with its newest full state (the scratch pointer's or the runs
   repo's) and marks the finished ones done; the queue adopts that plan.
 - `--resume-reset <run_id>` (repeatable; `KITSUNE_RESUME_RESET`): continue a run from its pre_cooldown state (an
-  early-stopped one, or one whose schedule ended: a continuation). `--resume-set <run_id>:<key>=<int>` (repeatable;
-  `KITSUNE_RESUME_SETS`): resume with another `schedule.epochs` or `early_stop.patience` (`fullrun.RESUME_SET_KEYS`,
-  each an int >= 1, once per run; nothing else may change). Both imply `--resume`.
+  early-stopped one, or one whose schedule ended: a continuation). `--resume-set <run_id>:<key>=<value>` (repeatable;
+  `KITSUNE_RESUME_SETS`): resume with another value of one of `fullrun.RESUME_SET_KEYS`, once per run; nothing else
+  may change: `schedule.epochs` and `early_stop.patience` (ints >= 1), `augment.enabled` (true / false) and
+  `augment.truncate_p`, `augment.concat_p`, `augment.mix_p` (probabilities in [0, 1]: the CTC train-data
+  augmentation, DECISIONS H1; launch refuses them for a box without a CTC train item, where the trainer would refuse
+  them only on the box). Each value reaches the box in one spelling (`fullrun.resume_set_value`: `True` -> `true`,
+  `.30` -> `0.3`, `012` -> `12`), so two launches of one continuation compare equal there. Both imply `--resume`.
 - **P-0.1B's continuation** (DECISIONS G3): `--box p01 --resume-reset full-p01-20261001T184145Z --resume-set
   full-p01-20261001T184145Z:schedule.epochs=8 --resume-set full-p01-20261001T184145Z:early_stop.patience=12` (the
   command above; `make_full_configs.py --import-speed` prints it). resume_pull takes the pre_cooldown state

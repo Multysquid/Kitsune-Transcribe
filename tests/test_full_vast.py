@@ -380,9 +380,17 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "study", "--box", "p01"], "--box p01 is not a box of --job study"),
                       (["--job", "train", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
-                       "only schedule.epochs, early_stop.patience may change on a resume"),
+                       "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, "
+                       "augment.concat_p, augment.mix_p may change on a resume"),
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:early_stop.patience=0"], "early_stop.patience must be an int >= 1"),
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:augment.enabled=yes"], "augment.enabled must be true or false"),
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:augment.concat_p=1.5"],
+                       "augment.concat_p must be a probability in [0, 1]"),
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:augment.seed=7"], "may change on a resume"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=8",
                         "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=9"], "given twice"),
                       (["--job", "train", "--allow-done-trains"], "--allow-done-trains: for --job full only"),
@@ -468,6 +476,53 @@ def test_the_continuation_flags_go_to_the_box_env(full_launch, capsys):
     a, kw = full_launch.seen["preflight"]
     assert kw["resets"] == [rid] and kw["sets"] == {rid: ["schedule.epochs=8", "early_stop.patience=12"]}
     assert kw["allow_done_trains"] is False and kw["allow_fresh_over_done"] is False
+
+
+def test_the_recipe_test_flags_reach_the_box_env_in_one_spelling(full_launch, capsys):
+    """DECISIONS H1: the recipe test box re-runs box 1's cooldown with the augmentation on - launch's reset and five
+    sets of one run, typed in loose spellings, reach the box as one KITSUNE_RESUME_SETS word in the normalised spelling
+    (fullrun.resume_set_value: the trainer's --set parses JSON, so "True" must arrive as true), which parses back to
+    the same list; the preflight sees the normalised sets too."""
+    rid = "full-p01-20261001T184145Z"
+    loose = ["schedule.epochs=04", "augment.enabled=True", "augment.truncate_p=.3", "augment.concat_p=0.50",
+             "augment.mix_p=2e-1"]
+    want = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
+            "augment.mix_p=0.2"]
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
+                           rid, *sum((["--resume-set", f"{rid}:{s}"] for s in loose), []), "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    env = env_of(created(fake))
+    assert env["KITSUNE_RESUME"] == "1" and env["KITSUNE_RESUME_RESET"] == rid
+    assert env["KITSUNE_RESUME_SETS"] == ",".join(f"{rid}:{s}" for s in want)
+    assert re.fullmatch(fullrun._ENV_WORD, env["KITSUNE_RESUME_SETS"])
+    assert fullrun.parse_resume_sets(env["KITSUNE_RESUME_SETS"]) == {rid: want}
+    a, kw = full_launch.seen["preflight"]
+    assert kw["resets"] == [rid] and kw["sets"] == {rid: want}
+
+
+def test_augment_sets_are_refused_for_a_box_without_a_ctc_trainer(full_launch, repo, capsys):
+    """augment.* is the CTC family's: on a box whose train items are all AED, launch refuses the sets before renting
+    (04_distill's validate_augment would refuse augment.enabled only on the box, after the paid boot and the store
+    build, on every attempt); a CTC box's sets pass (box p01 above), and so do an AED box's int sets."""
+    reg = copy.deepcopy(dict(repo.reg))
+    reg["boxes"]["full-t"] = dict(copy.deepcopy(reg["boxes"]["p01"]), data_config="configs/full/data-full.json", items=[
+        {"name": "stores-aed", "kind": "stores", "config": "configs/full/full-t06.json"},
+        {"name": "full-t06", "kind": "train", "config": "configs/full/full-t06.json", "study_run": "study-t06",
+         "family": "aed", "max_hours": 22.81, "needs": ["stores-aed"]}])
+    write_reg(repo.root, reg)
+    rid = "full-t06-20261003T000000Z"
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "full-t", "--scratch-repo", SCRATCH, "--resume-reset",
+                           rid, "--resume-set", f"{rid}:schedule.epochs=4", "--resume-set",
+                           f"{rid}:augment.enabled=true", "--resume-set", f"{rid}:augment.mix_p=0.2", "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and created(fake) is None, out
+    assert ("--resume-set augment.enabled, augment.mix_p: box full-t trains no CTC student (its train items' "
+            "families: aed), and augment.* is the CTC family's") in out
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "full-t", "--scratch-repo", SCRATCH, "--resume-reset",
+                           rid, "--resume-set", f"{rid}:schedule.epochs=4", "--dry-run")
+    out = capsys.readouterr().out
+    assert rc == 0 and "trains no CTC student" not in out, out
 
 
 def test_the_fresh_over_done_flag_goes_to_the_preflight(full_launch, capsys):
