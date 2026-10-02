@@ -58,14 +58,16 @@ the registered build, an extra file or dir the data repo lacks, an eval/speed to
 repo (--scratch-repo, required for a box with timed states) that is not private, a selection sidecar that is not the
 selection's, with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no train
 item of it ran (a plain --resume of a box whose train items are all done needs --allow-done-trains; a --resume-set id of
-a done run without --resume-reset is refused), and a box with quantised items (full-t, full-p, p01) without the quant go
+a done run without --resume-reset is refused), without --resume a box whose Hub queue summary has a train item done
+(a fresh queue would overwrite that summary, and the run's continuation, --resume-reset, reads it; --fresh-over-done
+for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01) without the quant go
 signal: smoke-b's verdict on the Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE;
 DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of boxes p01, full-t and full-p warn while
 their speed record has no box-1 part. Offers listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped.
 Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate said slow in the last
 GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link
 first (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
-  python vast/launch.py --job full --box p01 --image-tag main --data-repo Multy123/kitsune-data \\
+  python vast/launch.py --job full --box full-t --image-tag main --data-repo Multy123/kitsune-data \\
       --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch                  # look only
 --job full --box p01-chain rents a chain box (contract addendum E; kitsune/full_queue.py ChainController): smoke A and
 smoke B, an automatic gate, then box 1, on one 1x RTX 5090. Its disk and download gate are sized on the last stage's
@@ -1464,7 +1466,7 @@ def speed_record_notes(sha: str, box: str) -> list[str]:
 def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_repo: str | None, sha: str, box: str,
                    reg: dict, cfg: dict, *, reader=None, resume: bool = False, resets=(),
                    sets: dict | None = None, allow_unverified_quant: bool = False,
-                   allow_done_trains: bool = False) -> tuple[list[str], list[str]]:
+                   allow_done_trains: bool = False, allow_fresh_over_done: bool = False) -> tuple[list[str], list[str]]:
     """-> (problems, notes) for --job full, read-only (local git and the laptop's HF login), on top of hf_preflight and
     extent_preflight:
     - every config the box reads (fullrun.box_configs: its data config, its item configs, the registry) committed at
@@ -1481,6 +1483,9 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
       items; the notes say what will resume, with the newest state step found in the scratch and runs repos; a plain
       resume of a box whose train items are all done needs allow_done_trains, a set-only id of a done run is refused
       (resume_preflight);
+    - without resume: the box's Hub queue summary, when there is one, has no train item done (fresh_preflight) unless
+      allow_fresh_over_done: a fresh queue starts new runs and overwrites that summary, the only record of which run
+      a later --resume-reset continues (box p01 after box 1: its continuation is --resume-reset, never a fresh launch);
     - a box with quantised items: the quant go signal (quant_go_problems: a passing smoke-b verdict at this quant code;
       allow_unverified_quant makes it a warning); boxes p01, full-t, full-p: a warning while their hours are provisional
       (speed_record_notes)."""
@@ -1598,8 +1603,51 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
                                                allow_done_trains=allow_done_trains)
         problems += problems_r
         notes += notes_r
+    else:
+        problems_f, notes_f = fresh_preflight(out_repo, box, allow_fresh_over_done=allow_fresh_over_done)
+        problems += problems_f
+        notes += notes_f
     problems_q, notes_q = quant_go_problems(out_repo, sha, box, spec, allow_unverified_quant=allow_unverified_quant)
     return problems + problems_q, notes + notes_q + speed_record_notes(sha, box)
+
+
+def fresh_preflight(out_repo: str, box: str, *, allow_fresh_over_done: bool = False) -> tuple[list, list]:
+    """A launch without --resume: the box's queue starts afresh (new run dirs) and puts its own queue summary at
+    full/box-<box>/queue_summary.json, over the one there. When that summary has a train item done, the done run's
+    record is lost to launch's and the box's resume checks (resume_preflight, resume-pull: "no train item of box <box>
+    ran it"), and to the items of other boxes that read it (of_box): box p01 after box 1 would train a new 4-epoch
+    P-0.1B (~$15-20) and its continuation (--resume-reset) stays refused until the summary is put back by hand. So a
+    done train item refuses the launch unless allow_fresh_over_done (--fresh-over-done: a deliberate fresh start, e.g.
+    a full-smoke rerun). No summary on the Hub, or none with a done train item: no problem."""
+    import tempfile
+
+    problems, notes = [], []
+    path = fullrun.box_summary_path(box)
+    try:
+        api, download = _hub()
+        if not api.file_exists(out_repo, path):
+            return problems, notes
+        with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
+            summary = json.loads(Path(download(out_repo, path, local_dir=tmp)).read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return [f"cannot read {path} in {out_repo} ({type(e).__name__}: {e}): a fresh launch would overwrite it; run "
+                f"again"], notes
+    items = summary.get("items") or {}
+    done = sorted(name for name, it in items.items()
+                  if isinstance(it, dict) and it.get("kind") == "train" and it.get("status") == "done")
+    if not done:
+        return problems, notes
+    runs = ", ".join(f"{n} (run {fullrun.run_id_of(items[n]['run_dir'])})" if items[n].get("run_dir") else n
+                     for n in done)
+    msg = (f"a fresh launch of box {box} (no --resume): its Hub summary {path} has train items done: {runs}. A fresh "
+           f"queue trains them again in new run dirs and overwrites that summary, after which their continuation "
+           f"(--resume-reset <run_id> with its --resume-set <run_id>:KEY=VALUE) is refused. Continue a done run with "
+           f"--resume-reset; pass --fresh-over-done only for a deliberate fresh start of the box")
+    if allow_fresh_over_done:
+        notes.append(f"{msg} (--fresh-over-done: not refused)")
+    else:
+        problems.append(msg)
+    return problems, notes
 
 
 def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, sets: dict, *,
@@ -1723,7 +1771,8 @@ def chain_resume_checks(out_repo: str, box: str, chain: str) -> tuple[list[str],
     elif float(cs.get("started") or 0) > float(ps.get("started") or 0):
         problems.append(f"the newest {box} summary on the Hub is from another rental (container "
                         f"{ps.get('container_id')}); chain {chain} on container {cs.get('container_id')} died before "
-                        f"{who} started: launch --box {box} fresh or the chain")
+                        f"{who} started: launch --box {box} fresh or the chain (with --fresh-over-done when its "
+                        f"summary has a train item done)")
     return problems, notes
 
 
@@ -1828,6 +1877,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="full: a plain --resume of a box whose Hub summary has every train item done (a box lost "
                          "in its eval pool); refused without it, because a plain --resume never continues a done run "
                          "(that is --resume-reset)")
+    ap.add_argument("--fresh-over-done", action="store_true",
+                    help="full: a launch without --resume of a box whose Hub summary has a train item done (a "
+                         "deliberate fresh start, e.g. a full-smoke rerun); refused without it, because the fresh "
+                         "queue overwrites that summary and a continuation of the done run (--resume-reset) then "
+                         "finds no run to continue")
     ap.add_argument("--tier", choices=sorted(FULL_TIERS), default=None,
                     help=f"full: 5090 (default) or a100 (option C; default cap {A100_MAX_DPH:g} $/h)")
     ap.add_argument("--gate-hours", type=float, default=None,
@@ -1871,7 +1925,8 @@ def main(argv: list[str] | None = None) -> int:
                                 ("--max-gb-cost", args.max_gb_cost is not None),
                                 ("--max-total", args.max_total is not None),
                                 ("--allow-unverified-quant", args.allow_unverified_quant),
-                                ("--allow-done-trains", args.allow_done_trains)) if v]
+                                ("--allow-done-trains", args.allow_done_trains),
+                                ("--fresh-over-done", args.fresh_over_done)) if v]
     if full_only and not full:
         ap.error(f"{', '.join(full_only)}: for --job full only")
     if args.machine is not None and not re.fullmatch(r"\d+", args.machine):
@@ -1889,6 +1944,8 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         ap.error(str(e))
     resume = args.resume or bool(resets or sets)
+    if args.fresh_over_done and resume:
+        ap.error("--fresh-over-done is for a launch without --resume/--resume-reset/--resume-set")
     if not label_job and not args.out_repo:
         ap.error("the following arguments are required: --out-repo")
     if args.cohere_procs is not None and args.cohere_procs < 1:
@@ -2085,7 +2142,8 @@ def main(argv: list[str] | None = None) -> int:
                                               f"preflight: run it again")
                         problems, pre_notes = full_preflight(args.data_repo, data_rev, args.out_repo,
                                                              args.scratch_repo if pspec["timed_states"] else None, sha,
-                                                             part, reg, pcfg, reader=reader)
+                                                             part, reg, pcfg, reader=reader,
+                                                             allow_fresh_over_done=args.fresh_over_done)
                         errors += [f"part {part}: {x}" for x in problems]
                         notes += [f"part {part}: {x}" for x in pre_notes]
                     problems, pre_notes = chain_preflight(args.data_repo, data_rev, sha, args.box, reg, reader=reader)
@@ -2098,7 +2156,8 @@ def main(argv: list[str] | None = None) -> int:
                                                          args.box, reg, cfg, reader=reader, resume=resume,
                                                          resets=resets, sets=sets,
                                                          allow_unverified_quant=args.allow_unverified_quant,
-                                                         allow_done_trains=args.allow_done_trains)
+                                                         allow_done_trains=args.allow_done_trains,
+                                                         allow_fresh_over_done=args.fresh_over_done)
                     errors += problems
                     notes += pre_notes
                     for c in (fullrun.CHAIN_NAMES if resume else ()):  # E.8: a resume of a chain's last part

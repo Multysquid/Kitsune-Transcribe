@@ -386,6 +386,11 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=8",
                         "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=9"], "given twice"),
                       (["--job", "train", "--allow-done-trains"], "--allow-done-trains: for --job full only"),
+                      (["--job", "train", "--fresh-over-done"], "--fresh-over-done: for --job full only"),
+                      (["--job", "full", "--box", "p01", "--resume", "--fresh-over-done"],
+                       "--fresh-over-done is for a launch without --resume"),
+                      (["--job", "full", "--box", "p01", "--fresh-over-done", "--resume-reset",
+                        "full-p01-20261001T184145Z"], "--fresh-over-done is for a launch without --resume"),
                       (["--job", "full", "--box", "p01", "--machine", "m70001"], "machine_id (digits)")):
         with pytest.raises(SystemExit):
             launch.main([*args, "--data-repo", DATA, "--out-repo", RUNS, "--sha", SHA])
@@ -462,7 +467,22 @@ def test_the_continuation_flags_go_to_the_box_env(full_launch, capsys):
         rid: ["schedule.epochs=8", "early_stop.patience=12"]}
     a, kw = full_launch.seen["preflight"]
     assert kw["resets"] == [rid] and kw["sets"] == {rid: ["schedule.epochs=8", "early_stop.patience=12"]}
-    assert kw["allow_done_trains"] is False
+    assert kw["allow_done_trains"] is False and kw["allow_fresh_over_done"] is False
+
+
+def test_the_fresh_over_done_flag_goes_to_the_preflight(full_launch, capsys):
+    """--fresh-over-done reaches full_preflight (a fresh launch, resume False); a refusal of the preflight (a done
+    train item on the Hub) stops the launch, look-only or not."""
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "full-smoke", "--scratch-repo", SCRATCH,
+                           "--fresh-over-done", "--dry-run")
+    assert rc == 0, capsys.readouterr().out
+    a, kw = full_launch.seen["preflight"]
+    assert kw["resume"] is False and kw["allow_fresh_over_done"] is True
+    full_launch.seen["preflight_problems"] = ["a fresh launch of box p01 (no --resume): its Hub summary ..."]
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and "a fresh launch of box p01 (no --resume)" in out and created(fake) is None, out
+    assert full_launch.seen["preflight"][1]["allow_fresh_over_done"] is False
 
 
 def test_live_instances_are_the_boxs_own(monkeypatch):
@@ -748,6 +768,44 @@ def test_resume_preflight_guards_a_done_box(repo, monkeypatch, devslice):
                                             "resume_resets_before": 0})
     problems, _ = preflight(monkeypatch, FullHub(data, lost), resume=True, resets=[], sets={})
     assert problems == [], "a continuation lost on its way resumes with a plain --resume"
+
+
+def test_a_fresh_launch_over_a_done_box_is_refused(repo, monkeypatch, devslice):
+    """Box p01 after box 1: its Hub summary has full-p01 done. A launch without --resume would train a new 4-epoch
+    P-0.1B in a new run dir and overwrite that summary, after which the continuation (--resume-reset of box 1's run)
+    is refused ("no train item of box p01 ran it"). So a fresh launch over a done train item is refused unless
+    --fresh-over-done; no summary, or one whose train items are not done (a box that died in its first training: its
+    owner relaunches it fresh or resumes it), passes; the continuation itself passes."""
+    rid = "full-p01-20261001T184145Z"
+    reg = launch.full_registry(SHA)[0]
+    data = box_data("p01", reg, repo.root)
+
+    def summary(status):
+        return {fullrun.box_summary_path("p01"): {"items": {
+            "full-p01": {"kind": "train", "status": status, "run_dir": f"runs/{rid}", "result": {"steps": 107910}},
+            "m4-full-p01": {"kind": "readout", "status": "done", "verified": True}}}}
+
+    problems, _ = preflight(monkeypatch, FullHub(data, summary("done")))
+    (p,) = [p for p in problems if "a fresh launch" in p]
+    assert p.startswith(f"a fresh launch of box p01 (no --resume): its Hub summary full/box-p01/queue_summary.json has "
+                        f"train items done: full-p01 (run {rid})") and "--fresh-over-done" in p, p
+    problems, notes = preflight(monkeypatch, FullHub(data, summary("done")), allow_fresh_over_done=True)
+    assert problems == [], problems
+    assert any("--fresh-over-done: not refused" in n for n in notes), notes
+    for runs in ({}, summary("running"), summary("failed")):
+        problems, notes = preflight(monkeypatch, FullHub(data, runs))
+        assert problems == [] and not any("fresh launch" in n for n in notes), (runs, problems, notes)
+    sets = {rid: ["schedule.epochs=8", "early_stop.patience=12"]}
+    problems, _ = preflight(monkeypatch, FullHub(data, summary("done")), resume=True, resets=[rid], sets=sets)
+    assert problems == [], "the continuation is a resume: the fresh guard does not apply"
+
+    class Down(FullHub):
+        def file_exists(self, repo, path, repo_type=None):
+            raise ConnectionError("Hub down")
+
+    problems, _ = preflight(monkeypatch, Down(data))
+    assert any("cannot read full/box-p01/queue_summary.json" in p and "a fresh launch would overwrite it" in p
+               for p in problems), problems
 
 
 # ========================================================================================= blocklist and gates
@@ -1240,6 +1298,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     assert s["hf"] == [fullrun.SMOKE_SELECTION, "labels/full/selections/study_1000h.parquet", fullrun.FULL_SELECTION]
     parts = {a[5]: (a, kw) for a, kw in s["preflight"]}
     assert list(parts) == ["full-smoke", "smoke-b", "p01"]
+    assert all(kw["allow_fresh_over_done"] is False for _, kw in parts.values()), "each part: a fresh launch's guard"
     assert parts["smoke-b"][0][3] is None and parts["p01"][0][3] == SCRATCH, "the scratch repo only for timed parts"
     assert parts["smoke-b"][0][7]["selection"] == "labels/full/selections/study_1000h.parquet"
     assert all(not kw.get("resume") for _, kw in parts.values())
