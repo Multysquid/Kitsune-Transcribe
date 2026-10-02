@@ -323,3 +323,30 @@ def test_the_hub_reader_tells_a_missing_file_from_an_unreachable_hub(tmp_path, c
     capsys.readouterr()
     fake.head_down = True
     assert G.main([]) == G.EXIT_HUB and "Hub unreachable" in capsys.readouterr().out
+
+
+def test_revision_pins_box_1s_reads_and_never_smoke_bs(tmp_path, capsys, monkeypatch):
+    """DECISIONS G4: --revision REV reads G1-G4 at that runs-repo commit (P-0.1B's continuation overwrites box p01's
+    records at the head) without resolving the head for them, and records it as box1.revision; G5, smoke-B's verdict,
+    still reads the head (a pinned G5 would hide a newer smoke-B)."""
+    rev = "c4604304db76e068df7bbe39d00d006b74d6c134"
+    hub = go_hub(tmp_path / "hub")
+    fake = FakeHfHub(hub)
+    fake.install(monkeypatch)
+    out = tmp_path / "go.json"
+    assert G.main(["--revision", rev, "--json", str(out)]) == G.EXIT_GO, capsys.readouterr().out
+    rec = json.loads(out.read_text(encoding="utf-8"))
+    assert rec["box1"]["revision"] == rev
+    dl = [c for c in fake.calls if c[0] == "download"]
+    verdict = fullrun.box_verdict_path("smoke-b")
+    assert {c[2] for c in dl if c[1] != verdict} == {rev}
+    assert {c[2] for c in dl if c[1] == verdict} == {fake.sha}
+    assert fake.calls.count(("repo_info", G.RUNS_REPO)) == 1  # the head, for G5 only
+    # without --revision the head is recorded
+    fake.calls.clear()
+    assert G.main(["--json", str(out)]) == G.EXIT_GO
+    assert json.loads(out.read_text(encoding="utf-8"))["box1"]["revision"] == fake.sha
+    capsys.readouterr()
+    for bad in (["--revision", "c4604304"], ["--revision", rev, "--hub-dir", str(hub)]):
+        with pytest.raises(SystemExit):
+            G.main(bad)

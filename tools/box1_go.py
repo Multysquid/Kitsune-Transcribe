@@ -27,16 +27,25 @@ auth, a missing repo - never reads as a missing file, which could print a false 
 repo's head commit first, so a cached copy is used only when it is that commit's file, never a stale one. While box 1
 trains, its scalars so far give a partial projection of its run.
 
+--revision REV reads G1-G4 (box 1's summary, run, infra) at that runs-repo commit instead of the head, and records it
+as box1.revision. DECISIONS G4: P-0.1B's continuation (box p01 again, the same run dir) overwrites box 1's summary,
+the run's summary.json, config.json and evals/step_107910 at the head and appends duplicate scalars rows, so every
+4-epoch read after it pins c4604304db76e068df7bbe39d00d006b74d6c134. G5 (smoke-B's verdict) always reads the head:
+pinning it would hide a newer smoke-B.
+
 It then projects box 2's hours with box 1's measurement (tools/make_full_configs.py box2_hours on this checkout's plan
 and speed record) and lists what boxes.json would change; --json OUT writes {go, exit, lines, box1}, whose box1 object
 `python tools/make_full_configs.py --import-speed --box1-go OUT` records (only for an ended box 1).
 
 Usage:
   python tools/box1_go.py --cache-dir D:/kitsune-tmp/fullbuild/hubcache --json box1_go.json
+  python tools/box1_go.py --revision c4604304db76e068df7bbe39d00d006b74d6c134 \
+      --cache-dir D:/kitsune-tmp/fullbuild/hubcache --json box1_go.json            # box 1's 4-epoch record
 """
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -78,14 +87,15 @@ class DirReader:
 
 class HubReader:
     """The runs repo through huggingface_hub (read-only downloads into cache_dir) at its head commit, resolved once
-    (HfApi.repo_info): every file is read at that revision, so the cache serves only that commit's copy - without the
-    pin, hf_hub_download whose HEAD request fails returns whatever main's cached copy is, silently. A file is None only
-    when the Hub answered that it is not there (RemoteEntryNotFoundError); huggingface_hub 1.x's
-    LocalEntryNotFoundError is an EntryNotFoundError too, but it means the Hub could not be asked: HubUnreadable."""
+    (HfApi.repo_info), or at `revision` when given (--revision: never resolved): every file is read at that revision,
+    so the cache serves only that commit's copy - without the pin, hf_hub_download whose HEAD request fails returns
+    whatever main's cached copy is, silently. A file is None only when the Hub answered that it is not there
+    (RemoteEntryNotFoundError); huggingface_hub 1.x's LocalEntryNotFoundError is an EntryNotFoundError too, but it
+    means the Hub could not be asked: HubUnreadable."""
 
-    def __init__(self, repo: str = RUNS_REPO, cache_dir=None):
+    def __init__(self, repo: str = RUNS_REPO, cache_dir=None, revision: str | None = None):
         self.repo, self.cache_dir = repo, cache_dir
-        self.revision: str | None = None
+        self.revision: str | None = revision
 
     def get(self, path: str) -> Path | None:
         try:
@@ -216,15 +226,17 @@ def _smoke_p01_sps(reader) -> float | None:
     return float(s) if _finite(s) else None
 
 
-def analyse(reader) -> Report:
-    """Every go / no-go line of box 1 (HubUnreadable propagates: not decidable)."""
+def analyse(reader, g5_reader=None) -> Report:
+    """Every go / no-go line of box 1 (HubUnreadable propagates: not decidable). reader serves G1-G4 (box 1's files,
+    pinned with --revision), g5_reader smoke-B's verdict (the head; default reader)."""
     import make_full_configs as M
 
     rep = Report()
+    g5_reader = g5_reader if g5_reader is not None else reader
     summ = read_json(reader, fullrun.box_summary_path(BOX))
     if not isinstance(summ, dict):
         rep.add("G1", WAIT, f"no {fullrun.box_summary_path(BOX)} on the Hub: box 1 has not started its queue")
-        _smoke_b(reader, rep)
+        _smoke_b(g5_reader, rep)
         return rep
     items = summ.get("items") or {}
     tr, ro = items.get(TRAIN) or {}, items.get(READOUT) or {}
@@ -376,8 +388,9 @@ def analyse(reader) -> Report:
                         stores_ctc_h=None if stores_h is None else round(stores_h, 3),
                         bootstrap_h=None if boot_h is None else round(boot_h, 3),
                         rebuild_h=None if rebuild_h is None else round(rebuild_h, 3),
-                        host_mem_peak_gb=host if _finite(host) else anon, peak_rss_gb=rss, m4=m4)
-    _smoke_b(reader, rep)
+                        host_mem_peak_gb=host if _finite(host) else anon, peak_rss_gb=rss, m4=m4,
+                        revision=getattr(reader, "revision", None))
+    _smoke_b(g5_reader, rep)
     return rep
 
 
@@ -425,12 +438,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--runs-repo", default=RUNS_REPO)
     ap.add_argument("--cache-dir", default=None, help="huggingface_hub's cache for the downloads")
     ap.add_argument("--hub-dir", default=None, help="read a local folder with the runs repo's layout instead")
+    ap.add_argument("--revision", default=None, metavar="REV",
+                    help="read box 1's files (G1-G4) at this runs-repo commit, recorded as box1.revision (DECISIONS "
+                         "G4: c4604304db76e068df7bbe39d00d006b74d6c134 = the 4-epoch P-0.1B, before its continuation "
+                         "overwrote box p01's records); smoke-B's verdict (G5) is always read at the head")
     ap.add_argument("--json", default=None, metavar="OUT",
                     help="write {go, exit, lines, box1} (box1: make_full_configs --import-speed --box1-go's input)")
     args = ap.parse_args(argv)
-    reader = DirReader(args.hub_dir) if args.hub_dir else HubReader(args.runs_repo, args.cache_dir)
+    if args.revision is not None and not re.fullmatch(r"[0-9a-f]{40}", args.revision):
+        ap.error(f"--revision takes a full 40-hex runs-repo commit, not {args.revision!r}")
+    if args.revision is not None and args.hub_dir:
+        ap.error("--revision reads the Hub: not with --hub-dir")
+    if args.hub_dir:
+        reader = g5_reader = DirReader(args.hub_dir)
+    else:
+        reader = HubReader(args.runs_repo, args.cache_dir, revision=args.revision)
+        g5_reader = HubReader(args.runs_repo, args.cache_dir) if args.revision else reader
     try:
-        rep = analyse(reader)
+        rep = analyse(reader, g5_reader)
     except HubUnreadable as e:
         print(f"NOT DECIDABLE (Hub unreachable): the runs repo could not be read ({e}); nothing here is a NO-GO, run "
               f"again")
