@@ -128,7 +128,8 @@ RECIPE = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}
 # data-p / data-p01) and schedule.end_reserve_min (end_reserve: the trainer's default 30, full-t06 55; READOUT_RESERVE
 # below). EPOCHS: DECISIONS G1, confirmed by the owner on 2026-10-02 (~11:30Z, "3 / 3 / 5" after the epoch analysis,
 # D:/kitsune-tmp/fullbuild/epochs/RECOMMENDATION.md): T-0.6B 3, P-0.3B 3, P-0.05B 5, each with COMMON's early-stop
-# patience. The owner's earlier request of the same day to plan 10 epochs for these runs was WITHDRAWN after that
+# patience; P-0.3B 6 since DECISIONS H5 (the owner, 2026-10-03, after the recipe test: its augmentation varies the
+# data every epoch, and the early stop still cools down early if dev stops improving). The owner's earlier request of the same day to plan 10 epochs for these runs was WITHDRAWN after that
 # analysis (DECISIONS G "Rejected: 10 epochs"). P-0.1B's run stays box 1's 4 epochs, and so does its recipe test, which
 # re-runs box 1's cooldown to the same end (CONTINUATIONS, DECISIONS H1; G3's 8-epoch continuation is postponed, H2).
 # This is the one epoch parameter: a change here, then --import-launch-plan of a full_plan.py record at the new
@@ -140,7 +141,7 @@ RECIPE = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}
 FULL_RUNS = {
     "t06": dict(study_run="study-t06", epochs=3, warmup=300, lr=2e-4, micro=450, step=1730, dev_greedy=False,
                 pull_parakeet=False, end_reserve=55, augment=None),
-    "p03": dict(study_run="study-p03", epochs=3, warmup=300, lr=2e-4, micro=600, step=1350, dev_greedy=True,
+    "p03": dict(study_run="study-p03", epochs=6, warmup=300, lr=2e-4, micro=600, step=1350, dev_greedy=True,
                 pull_parakeet=False, end_reserve=30, augment=RECIPE),
     "p01": dict(study_run="study-p01", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
                 pull_parakeet=False, end_reserve=30, augment=None),
