@@ -102,14 +102,18 @@ def label_files() -> list[str]:
 
 
 STUB = '''\
-import json, os, shutil
+import json, os, shutil, threading
 from pathlib import Path
 REMOTE = Path(os.environ["FAKE_REMOTE"])
 LOG = Path(os.environ["FAKE_LOG"])
+_LOG_LOCK = threading.Lock()
 
 def _log(*a):
-    with open(LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(a) + "\\n")
+    # one call at a time, each line one write on an O_APPEND fd: the pull calls hf_hub_download from 16 threads, and
+    # Windows' C runtime emulates O_APPEND (seek to the end, then write), so two threads could write at one offset and
+    # lose a line or leave a torn one (Box.calls(): a missing call, or JSONDecodeError, 2026-10-03)
+    with _LOG_LOCK, open(LOG, "ab", buffering=0) as f:
+        f.write((json.dumps(a) + "\\n").encode("utf-8"))
 
 def _files():
     return sorted(p.relative_to(REMOTE).as_posix() for p in REMOTE.rglob("*") if p.is_file())
