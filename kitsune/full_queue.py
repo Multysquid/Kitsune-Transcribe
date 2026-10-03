@@ -1,7 +1,7 @@
 """The full-data runs' box queue: one registry box (kitsune/fullrun.py, configs/full/boxes.json) from its store builds
 to its last verified upload, on a shared GPU queue; plus the resume of a box on a new host.
 
-A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1 and P-0.1B's continuation, full-t and full-p = box 2's two
+A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1 and its recipe test, full-t and full-p = box 2's two
 1x boxes, smoke-b; full = the retired 2x box 2, test fixtures only) is the list of registry items of its spec, in
 registry order. FullQueue(study_queue.Queue) runs them with the study queue's process, state and upload
 machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it never reads prereg.rules()["boxes"].
@@ -71,8 +71,9 @@ synchronous child, bounded by its own budget and by box 1's fit, and box p01 run
 records every step, so a restart goes on where it stopped; the chain summary is at full/box-<chain>/queue_summary.json.
 `plan` prints the stages and their parts' items; `resume-pull` refuses a chain (exit 3; fullrun.chain_resume_hint).
 
-Resume on a new host (launch --resume / --resume-reset <run_id> / --resume-set <run_id>:<key>=<int>, key schedule.epochs
-or early_stop.patience, fullrun.RESUME_SET_KEYS): bootstrap runs `resume-pull` before its paid rebuild. It reads the
+Resume on a new host (launch --resume / --resume-reset <run_id> / --resume-set <run_id>:<key>=<value>, a key of
+fullrun.RESUME_SET_KEYS - schedule.epochs, early_stop.patience, augment.enabled and three augment.* probabilities -, its
+value in fullrun.resume_set_value's one spelling): bootstrap runs `resume-pull` before its paid rebuild. It reads the
 box's queue summary from the runs repo, pulls every started run's logs and its newest full state (the scratch repo's
 timed state or a runs-repo full state, whichever is newer, checked against the pointer's or the LFS sha256), and writes
 $KITSUNE_STATE/resume_plan.json. The queue adopts that plan only when it has no queue.json yet: done items stay done,

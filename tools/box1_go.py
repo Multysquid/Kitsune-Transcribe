@@ -28,13 +28,14 @@ repo's head commit first, so a cached copy is used only when it is that commit's
 trains, its scalars so far give a partial projection of its run.
 
 --revision REV reads G1-G4 (box 1's summary, run, infra) at that runs-repo commit instead of the head, and records it
-as box1.revision. DECISIONS G4: P-0.1B's continuation (box p01 again, the same run dir) overwrites box 1's summary,
-the run's summary.json, config.json and evals/step_107910 at the head and appends duplicate scalars rows, so every
-4-epoch read after it pins c4604304db76e068df7bbe39d00d006b74d6c134. G5 (smoke-B's verdict) always reads the head:
+as box1.revision. DECISIONS G4: a continuation of P-0.1B's run (box p01 again, the same run dir; now the recipe test,
+DECISIONS H1) overwrites box 1's summary, the run's summary.json, config.json and evals/step_107910 at the head and
+appends duplicate scalars rows, so every 4-epoch read after it pins c4604304db76e068df7bbe39d00d006b74d6c134 - the
+recipe test's baseline. G5 (smoke-B's verdict) always reads the head:
 pinning it would hide a newer smoke-B.
 
 It then projects the hours of the boxes after box 1 with its measurement (tools/make_full_configs.py box_hours of each
-HOURS_BOXES box - full-t, full-p and P-0.1B's continuation on p01 - on this checkout's plan and speed record) and lists
+HOURS_BOXES box - full-t, full-p and the recipe test on p01 - on this checkout's plan and speed record) and lists
 what boxes.json would change; --json OUT writes {go, exit, lines, box1}, whose box1 object `python tools/
 make_full_configs.py --import-speed --box1-go OUT` records (only for an ended box 1).
 

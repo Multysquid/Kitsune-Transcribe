@@ -58,7 +58,8 @@ the registered build, an extra file or dir the data repo lacks, an eval/speed to
 repo (--scratch-repo, required for a box with timed states) that is not private, a selection sidecar that is not the
 selection's, with --resume a box whose Hub queue summary is missing or a --resume-reset/--resume-set run id no train
 item of it ran (a plain --resume of a box whose train items are all done needs --allow-done-trains; a --resume-set id of
-a done run without --resume-reset is refused), without --resume a box whose Hub queue summary has a train item done
+a done run without --resume-reset is refused; an augment.* --resume-set on a box without a CTC train item is refused
+before any of it), without --resume a box whose Hub queue summary has a train item done
 (a fresh queue would overwrite that summary, and the run's continuation, --resume-reset, reads it; --fresh-over-done
 for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01) without the quant go
 signal: smoke-b's verdict on the Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE;
@@ -242,8 +243,8 @@ GATE_RE = re.compile(r"full/box-[^/]+/infra/[^/]+/download_gate\.json")
 FULL_TOOLS = {"stores": "kitsune/full_queue.py", "train": "scripts/04_distill.py", "readout": "scripts/05_evaluate.py",
               "speed": "tools/speed_probe.py"}
 # THE QUANT GO SIGNAL (DECISIONS F2, 2026-10-01: "the quant/compile fixes are verified on a GPU by a standalone smoke-B
-# box before box 2 launches"). A box with quantised items (box full-p: 14 quantised readouts, full-t 7, p01 7 - P-0.1B's
-# continuation scores its 8-epoch weights on its own box) is refused unless the runs
+# box before box 2 launches"). A box with quantised items (box full-p: 7 quantised readouts, full-t 7, p01 7 - the
+# recipe test scores its re-run's weights on its own box) is refused unless the runs
 # repo's smoke-b verdict (full/box-smoke-b/smoke_verdict.json) passed overall and every one of checks 12-16 (12 the
 # torchao selftest and the emulate-vs-real NVFP4 compare, 13 fp16 without non-finite rows, 14 export = in-memory, 15
 # Whisper, 16 every speed probe), at a commit that is an ancestor of the one the box runs with QUANT_CODE (the quant
@@ -254,9 +255,9 @@ QUANT_GO_BOX = "smoke-b"
 QUANT_GO_CHECKS = ("12", "13", "14", "15", "16")
 QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.py", "kitsune/whisper.py",
               "tools/whisper_eval.py", "requirements-train.txt", "docker/Dockerfile")
-# the hours of boxes p01 (P-0.1B's continuation), full-t and full-p come from make_full_configs' speed record (its
-# SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's; without box 1's part they are
-# provisional (contract 7), and launch says so
+# the hours of boxes p01 (box 1's cooldown again: the recipe test), full-t and full-p come from make_full_configs' speed
+# record (its SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's; without box 1's part
+# they are provisional (contract 7), and launch says so
 SPEED_RECORD = "configs/full/plan/box2_hours.json"
 SPEED_RECORD_BOXES = ("p01", "full-t", "full-p")
 # offers in a country whose hosts cannot reach the Hugging Face Hub: a full box downloads everything from it, and with
@@ -323,7 +324,7 @@ def study_job(box: str) -> JobSpec:
 
 def min_rental_days(max_hours: float) -> float:
     """A full box's minimum host rental: MIN_RENTAL_DAYS, or its cap + RENTAL_MARGIN_DAYS when that is longer (a
-    cap past 84 h, e.g. 104 h: 4.83 d; the boxes' caps now, 21-37 h, keep the 4 d)."""
+    cap past 84 h, e.g. 104 h: 4.83 d; the boxes' caps now, 10-37 h, keep the 4 d)."""
     return max(float(MIN_RENTAL_DAYS), round(float(max_hours) / 24 + RENTAL_MARGIN_DAYS, 2))
 
 
@@ -1821,8 +1822,9 @@ def main(argv: list[str] | None = None) -> int:
                          "kitsune/full_queue.py, the registry configs/full/boxes.json)")
     ap.add_argument("--box", choices=[*STUDY_BOXES, *fullrun.ALL_BOX_NAMES], default=None,
                     help="study: A (the Cohere runs, 4 GPUs), B (Parakeet + bridge, 4 GPUs), replicate (1 GPU, after "
-                         "A) or shakedown (1 GPU, first); full: full-smoke (smoke A), p01 (box 1, then P-0.1B's "
-                         "continuation), full-t and full-p (box 2's two 1x boxes; full: the retired 2x box), "
+                         "A) or shakedown (1 GPU, first); full: full-smoke (smoke A), p01 (box 1, then its recipe "
+                         "test: box 1's cooldown again), full-t and full-p (box 2's two 1x boxes; full: the retired 2x "
+                         "box), "
                          "smoke-b, or the chain p01-chain (smoke A + smoke B, then box 1 on one rental)")
     ap.add_argument("--data-repo", required=True, help="private HF dataset with the derived data (KITSUNE_DATA_REPO)")
     ap.add_argument("--out-repo", default=None, help="private HF model repo for runs/ (KITSUNE_OUT_REPO; train only)")
@@ -1868,11 +1870,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="full: continue this early-stopped run from its pre_cooldown state (repeatable; implies "
                          "--resume; KITSUNE_RESUME_RESET)")
     ap.add_argument("--resume-set", action="append", default=[], metavar="RUN_ID:KEY=VALUE",
-                    help=f"full: resume this run with another value of KEY, one of "
-                         f"{', '.join(fullrun.RESUME_SET_KEYS)} (an int >= 1; repeatable, one KEY once per run; "
-                         f"implies --resume; KITSUNE_RESUME_SETS). With --resume-reset of the same run: a continuation "
-                         f"from its pre_cooldown state, e.g. --resume-reset <rid> --resume-set <rid>:schedule.epochs=8 "
-                         f"--resume-set <rid>:early_stop.patience=12")
+                    help="full: resume this run with another value of KEY, one of "
+                         + ", ".join(f"{k} ({fullrun.resume_set_rule(k)})" for k in fullrun.RESUME_SET_KEYS)
+                         + " (repeatable, one KEY once per run; implies --resume; KITSUNE_RESUME_SETS carries each "
+                         "value in one spelling: True -> true, .30 -> 0.3, 012 -> 12). With --resume-reset of the same "
+                         "run: a continuation from its pre_cooldown state, e.g. --resume-reset <rid> --resume-set "
+                         "<rid>:schedule.epochs=8 --resume-set <rid>:early_stop.patience=12, or the recipe test "
+                         "(DECISIONS H1) --resume-reset <rid> --resume-set <rid>:schedule.epochs=4 --resume-set "
+                         "<rid>:augment.enabled=true --resume-set <rid>:augment.truncate_p=0.3 ... (augment.*: a box "
+                         "with a CTC train item only)")
     ap.add_argument("--allow-done-trains", action="store_true",
                     help="full: a plain --resume of a box whose Hub summary has every train item done (a box lost "
                          "in its eval pool); refused without it, because a plain --resume never continues a done run "
@@ -1989,6 +1995,16 @@ def main(argv: list[str] | None = None) -> int:
         elif args.config is not None and args.config != spec["data_config"]:
             errors.append(f"box {args.box}'s data config is {spec['data_config']} ({fullrun.BOXES_FILE}): --config "
                           f"{args.config} refused (its items' configs share that data block)")
+        # augment.* is the CTC family's train-data augmentation (DECISIONS H0/H1): 04_distill's validate_augment refuses
+        # augment.enabled on an AED student, but only on the box - after the paid boot, the label pull and the store
+        # build, and then on every attempt the queue retries. A box whose train items are all AED has no run the recipe
+        # could apply to, so its augment sets are refused here, before anything is rented
+        aug_keys = sorted({kv.partition("=")[0] for kvs in sets.values() for kv in kvs if kv.startswith("augment.")})
+        families = sorted({it.get("family") or "aed" for it in spec.get("items") or [] if it.get("kind") == "train"})
+        if aug_keys and "ctc" not in families:
+            errors.append(f"--resume-set {', '.join(aug_keys)}: box {args.box} trains no CTC student (its train "
+                          f"items' families: {', '.join(families) or 'none'}), and augment.* is the CTC family's "
+                          f"(scripts/04_distill.py validate_augment would refuse it on the box, after the paid boot)")
         if spec["timed_states"] and not args.scratch_repo:
             errors.append(f"box {args.box} keeps timed full states: --scratch-repo <the private scratch model repo> is "
                           f"required (vast/README.md, full-data runs)")

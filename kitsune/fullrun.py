@@ -1,10 +1,11 @@
 """The full-data runs' shared core: names, paths, the box registry and the small helpers every full-run package uses.
 
 The full runs (plan v3) trained P-0.1B alone on box `p01` (1x RTX 5090, Parakeet labels only; box 1), which now
-also runs its continuation to 8 epochs (DECISIONS G3: --resume-reset with --resume-set schedule.epochs /
-early_stop.patience), then T-0.6B on box `full-t` and P-0.3B and P-0.05B on box `full-p` (each 1x RTX 5090, one queue;
-DECISIONS G2: box 2's 2x box `full` is retired, its name kept for the tests' fixtures only), after two short smokes
-(`full-smoke` = smoke A, `smoke-b`).
+re-runs that run's cooldown with the CTC train-data augmentation on, the recipe test (DECISIONS H1: --resume-reset with
+--resume-set schedule.epochs and augment.*; G3's 8-epoch continuation is postponed, H2), then T-0.6B on box `full-t`
+(postponed, H2) and P-0.3B with that recipe on box `full-p` if the test shows it helps (H1 step 2; P-0.05B postponed,
+H2), each 1x RTX 5090, one queue (DECISIONS G2: box 2's 2x box `full` is retired, its name kept for the tests'
+fixtures only), after two short smokes (`full-smoke` = smoke A, `smoke-b`).
 The selection (scripts/make_selection.py full mode, kitsune/devslice.py), the trainer (scripts/04_distill.py), the
 box queue (kitsune/full_queue.py), the vast scripts (vast/launch.py, bootstrap.sh, finish.py) and the evaluators all
 import their shared names from here, so a constant cannot drift between them. The binding definitions are the full-run
@@ -17,7 +18,8 @@ build contract (sections 1 and 2); this module is its code.
   helpers      shard_split (a dev row's audio and labels live in its train shard), full_recipe_problems (the
                recipe block a full selection must carry), seeded_subset (make_selection's seeded draw), dev_pick (the
                scored dev ids: per source a seeded draw of per_source kept dev rows, in selection order), the resume
-               flags' parsers (parse_resume_sets / parse_resume_reset: launch -> env -> full_queue resume-pull),
+               flags' parsers (parse_resume_sets with its typed, normalised values - resume_set_value - and
+               parse_resume_reset: launch -> env -> full_queue resume-pull),
                run_id_of, the Hub and scratch paths, pointer_problems (the timed-state pointer, format 1)
   registry     configs/full/boxes.json, hand-written next to the generated configs/full/*.json (make_full_configs.py
                --check validates it with registry_problems). One source of truth: launch reads the hours, price, GPU
@@ -118,9 +120,10 @@ REPO = Path(__file__).resolve().parents[1]
 
 JOB = "full"  # KITSUNE_JOB=full
 BOXES_FILE, ENV_REGISTRY = "configs/full/boxes.json", "KITSUNE_FULL_REGISTRY"
-# smoke A, box p01 (box 1, then P-0.1B's continuation), "full" (the retired 2x box 2: no longer in the registry, kept
-# for tests/fixtures_full.py's 2-GPU box only), smoke B, and box 2 as two 1x boxes (DECISIONS G2): full-t (T-0.6B)
-# and full-p (P-0.3B, P-0.05B, the Whisper models and their quantised readouts)
+# smoke A, box p01 (box 1, then its recipe test: box 1's cooldown again), "full" (the retired 2x box 2: no longer in
+# the registry, kept for tests/fixtures_full.py's 2-GPU box only), smoke B, and box 2 as two 1x boxes (DECISIONS G2):
+# full-t (T-0.6B) and full-p (P-0.3B with the augmentation recipe, the Whisper models and the quantised readouts;
+# P-0.05B postponed, DECISIONS H2)
 BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p")
 # chain boxes (contract addendum E, DECISIONS D): one rental that runs registry boxes one after the other, in two
 # stages with an automatic gate between them (kitsune/full_queue.py ChainController). p01-chain = smoke A and smoke B,
@@ -185,10 +188,24 @@ DATA_KEYS = ("data_root", "teacher_root", "second_root", "parakeet_root", "selec
 
 RUN_ID_RE = r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"  # <item>-<YYYYMMDDTHHMMSSZ>[-n], 04 build's run dir name
 ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
-# the config keys launch --resume-set may change (DECISIONS G3: P-0.1B's continuation sets its epochs and its early-stop
-# patience), each an int of at least RESUME_SET_INT_MIN[key]; 04_distill validates the same on the box
-RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience")
+# the config keys launch --resume-set may change, and the kind of each one's value (RESUME_SET_KINDS; resume_set_value
+# parses and normalises it). DECISIONS G3: P-0.1B's continuation sets its epochs and its early-stop patience (ints of at
+# least RESUME_SET_INT_MIN[key]). DECISIONS H1: the recipe test box re-runs box 1's cooldown from its pre_cooldown state
+# with the CTC train-data augmentation on - augment.enabled (a bool) and the three probabilities the owner's recipe sets
+# (truncate 0.3, concat 0.5, mix 0.0 = off since H3: floats in [0, 1]). The augmentation's other keys (its seed, the
+# truncate bounds and pause share, concat_max_s / concat_max_n, mix_snr_db) keep the trainer's defaults on purpose: a resume that moved
+# them would test another recipe than the one P-0.3B is to train with, so they are not settable here. None of these
+# keys shapes the step plan (scripts/04_distill.py RESUME_FIXED holds none of them: augment.* happens inside the train
+# loader), so a resume keeps its epoch position; 04_distill validates every value again on the box (validate: epochs,
+# bools; validate_augment: the probabilities, and augment.enabled on a CTC student only)
+RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
+                   "augment.concat_p", "augment.mix_p")
 RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
+RESUME_SET_KINDS = {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
+                    "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob"}
+# a probability's spelling: a plain decimal (digits, one point, an exponent), no sign, no "inf" / "nan" / "1_0" - the
+# forms float() would also take but JSON (04_distill's --set) would not, or not as a number
+_DECIMAL_RE = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 
 # ------------------------------------------------------------------------------------------------ environment (1.4)
 
@@ -318,11 +335,44 @@ def dev_pick(rows, sources, per_source: int, seed: int) -> list[str]:
     return out
 
 
+def resume_set_rule(key: str) -> str:
+    """The rule a resume set's value must follow (RESUME_SET_KINDS), as launch's --resume-set help and the refusals
+    say it."""
+    kind = RESUME_SET_KINDS[key]
+    if kind == "int":
+        return f"an int >= {RESUME_SET_INT_MIN[key]}"
+    return "true or false" if kind == "bool" else "a probability in [0, 1]"
+
+
+def resume_set_value(key: str, val: str) -> str:
+    """A resume set's value of key (one of RESUME_SET_KEYS) in its one normalised spelling - the word launch puts in
+    KITSUNE_RESUME_SETS, resume-pull records in the plan and the queue passes to the trainer as --set key=<it>:
+      int   digits only, at least RESUME_SET_INT_MIN[key], as str(int): "012" -> "12" (no sign, no decimal point)
+      bool  true or false in any case, as JSON: "True" -> "true". 04_distill's --set parses JSON, and the string
+            "True" it would keep instead fails its bool check - on the box, after the paid boot and the store build
+      prob  a plain decimal in [0, 1] (_DECIMAL_RE), as the shortest repr of its float: "0.30", ".3", "3e-1" -> "0.3",
+            "1" -> "1.0"; JSON reads that back as the same float
+    One spelling per value is what lets the queue compare launches: adopt() records `resume_sets_differ` when the env's
+    sets differ from the resume plan's, and a relaunch of the same continuation spelled ".3" must not look like a
+    different one. ValueError naming the rule otherwise."""
+    kind = RESUME_SET_KINDS[key]
+    if kind == "int":
+        if re.fullmatch(r"\d+", val) and int(val) >= RESUME_SET_INT_MIN[key]:
+            return str(int(val))
+    elif kind == "bool":
+        if val.lower() in ("true", "false"):
+            return val.lower()
+    elif re.fullmatch(_DECIMAL_RE, val) and 0.0 <= float(val) <= 1.0:
+        return repr(float(val))
+    raise ValueError(f"{key} must be {resume_set_rule(key)}, not {val!r}")
+
+
 def parse_resume_sets(s: str | None) -> dict[str, list[str]]:
-    """KITSUNE_RESUME_SETS ("<run_id>:schedule.epochs=8,<run_id>:early_stop.patience=12,...") -> {run_id:
-    ["schedule.epochs=8", "early_stop.patience=12", ...]} (in the order given; values normalised to str(int): "012" ->
-    "12"). ValueError on a bad run id (RUN_ID_RE), a key outside RESUME_SET_KEYS, a value that is not an int >= its
-    RESUME_SET_INT_MIN (digits only: no sign, no decimal point), or one key given twice for a run. None or "" -> {}."""
+    """KITSUNE_RESUME_SETS ("<run_id>:schedule.epochs=4,<run_id>:augment.enabled=true,...") -> {run_id:
+    ["schedule.epochs=4", "augment.enabled=true", ...]} (in the order given; each value normalised by
+    resume_set_value: "012" -> "12", "True" -> "true", ".30" -> "0.3"). ValueError on a bad run id (RUN_ID_RE), a key
+    outside RESUME_SET_KEYS, a value that breaks its key's rule (RESUME_SET_KINDS: an int >= RESUME_SET_INT_MIN, true /
+    false, a probability in [0, 1]), or one key given twice for a run. None or "" -> {}."""
     out: dict[str, list[str]] = {}
     if not s:
         return out
@@ -334,10 +384,10 @@ def parse_resume_sets(s: str | None) -> dict[str, list[str]]:
         key, eq, val = kv.partition("=")
         if not eq or key not in RESUME_SET_KEYS:
             raise ValueError(f"resume set {part!r}: only {', '.join(RESUME_SET_KEYS)} may change on a resume")
-        lo = RESUME_SET_INT_MIN[key]
-        if not re.fullmatch(r"\d+", val) or int(val) < lo:
-            raise ValueError(f"resume set {part!r}: {key} must be an int >= {lo}")
-        val = str(int(val))
+        try:
+            val = resume_set_value(key, val)
+        except ValueError as e:
+            raise ValueError(f"resume set {part!r}: {e}") from None
         if any(x.partition("=")[0] == key for x in out.get(run_id, [])):
             raise ValueError(f"resume set {part!r}: {key} given twice for {run_id}")
         out.setdefault(run_id, []).append(f"{key}={val}")
