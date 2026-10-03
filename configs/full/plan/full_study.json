@@ -7711,14 +7711,17 @@
     "family": "ctc",
     "micro_audio_s": 600.0,
     "step_audio_s": 1350.0,
-    "epochs": 3,
+    "epochs": 6,
     "max_dec_len": null,
     "steps_per_epoch": [
      35292,
      35286,
-     35283
+     35283,
+     35290,
+     35284,
+     35285
     ],
-    "total_steps": 105861,
+    "total_steps": 211720,
     "step_real_s": {
      "mean": 1176.4521485553287,
      "min": 550.4910633563995,
@@ -7732,7 +7735,7 @@
     "micro_targets_max": 2818,
     "excluded_dec_len": 0,
     "steps_per_0p1_epoch": 3529.2,
-    "cooldown_start_step": 84690,
+    "cooldown_start_step": 169377,
     "real_h": 11533.152563004072,
     "worst_shapes": [
      {
