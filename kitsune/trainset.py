@@ -1224,14 +1224,15 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         return out
 
     def _augmented(self, idx: Sequence[int], keep: list[int], waves: list[np.ndarray], dropped: list[str]) -> dict:
-        """__getitem__ under self.augment: the decoded rows (store indices `keep`, audio `waves`) joined, cut and mixed
-        in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's own stream, a function of its
-        index list alone - then collated as the plain path collates. The order matters: a joined row can be cut (inside
-        any piece, never before truncate_min_s), and mix takes its interferers from the rows as they were before the cut
-        and before any mixing (clean speech, the length of the whole row). Metadata of a row: ids its pieces' joined by
-        "+" (a cut row only those that start before the cut), sources and index the first piece's (the trainer's
-        per-source sums count a joined row under its first piece's source), durations the pieces' stored durations
-        summed (a cut row: the seconds it keeps, c x 80 ms), agree the smallest known one (NaN if none is known)."""
+        """__getitem__ under self.augment: the decoded rows (store indices `keep`, audio `waves`) joined, cut, padded
+        and mixed in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's own stream, a
+        function of its index list alone - then collated as the plain path collates. The order matters: a joined row can
+        be cut (inside any piece, never before truncate_min_s), a pad follows the cut (or the whole row's end), and mix
+        takes its interferers from the rows as they were before the cut and before any mixing (clean speech, the length
+        of the whole row). Metadata of a row: ids its pieces' joined by "+" (a cut row only those that start before the
+        cut), sources and index the first piece's (the trainer's per-source sums count a joined row under its first
+        piece's source), durations the pieces' stored durations summed (a cut row: the seconds it keeps, c x 80 ms) plus
+        a pad's seconds, agree the smallest known one (NaN if none is known)."""
         from kitsune.ctc_targets import collate_frame_targets
 
         a = self.augment
@@ -1244,8 +1245,12 @@ class FrameBatchDataset(torch.utils.data.Dataset):
                 order = rng.permutation(len(rows))  # which utterances share a row, and in which order: random
                 rows = [_join_rows([rows[j] for j in order[g:g + k]], rng) for g in range(0, len(rows), k)]
                 groups = len(rows)
-        originals = [r.wave for r in rows]  # mix's interferers: the rows before any cut (a view) or mix (a copy)
-        n_cut = n_mixed = 0
+        # mix's interferers and the pads' room tone: the rows before any cut (a view) or mix (a copy)
+        originals = [r.wave for r in rows]
+        # the micro-batch's padded frames after the join, before any cut: a pad never makes a row longer than this, so
+        # the rows x longest rectangle the planner and the memory probe sized stays as it is
+        width = max((r.ft.n_frames for r in rows), default=0)
+        n_cut = n_mixed = n_cut_pad = n_end_pad = 0
         if a.truncate_p > 0:
             for r in rows:
                 if rng.random() < a.truncate_p:
@@ -1254,6 +1259,19 @@ class FrameBatchDataset(torch.utils.data.Dataset):
                     if c is not None:
                         r.cut_at(c)
                         n_cut += 1
+        if a.truncate_pad_p > 0 or a.end_pad_p > 0:
+            for p, r in enumerate(rows):
+                prob = a.truncate_pad_p if r.cut is not None else a.end_pad_p
+                if prob <= 0 or rng.random() >= prob:
+                    continue
+                room = width - r.ft.n_frames
+                if room < 1:  # the longest whole row: a pad would widen the micro-batch
+                    continue
+                r.pad_quiet(min(int(rng.integers(a.pad_frames[0], a.pad_frames[1] + 1)), room), originals[p], rng)
+                if r.cut is not None:
+                    n_cut_pad += 1
+                else:
+                    n_end_pad += 1
         if a.mix_p > 0 and len(rows) >= 2:
             for p, r in enumerate(rows):
                 if rng.random() >= a.mix_p:
@@ -1269,8 +1287,9 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         wave = np.zeros((B, int(lengths.max()) if B else 0), dtype=np.float32)
         for b, r in enumerate(rows):
             wave[b, :len(r.wave)] = r.wave
-        durations = np.array([r.cut * FRAME_SAMPLES / TARGET_SR if r.cut is not None
-                              else self.duration[r.pieces].sum(dtype=np.float32) for r in rows], dtype=np.float32)
+        durations = np.array([(r.cut * FRAME_SAMPLES / TARGET_SR if r.cut is not None
+                               else self.duration[r.pieces].sum(dtype=np.float32)) + r.pad * FRAME_SAMPLES / TARGET_SR
+                              for r in rows], dtype=np.float32)
         agree = np.array([_nanmin(self.agree[r.pieces]) for r in rows], dtype=np.float32)
         out = dict(wave=torch.from_numpy(wave), lengths=torch.from_numpy(lengths),
                    durations=torch.from_numpy(durations), agree=torch.from_numpy(agree),
@@ -1280,7 +1299,7 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         out.update(collate_frame_targets([r.ft for r in rows]) if B else _empty_frame_targets())
         out["n_tok"] = out["ctc_target_lengths"].clone()
         out["aug"] = dict(utts=len(keep), rows=B, concat_groups=groups, concat_utts=len(keep) if groups else 0,
-                          truncated=n_cut, mixed=n_mixed)
+                          truncated=n_cut, mixed=n_mixed, cut_padded=n_cut_pad, end_padded=n_end_pad)
         return out
 
 
@@ -1328,13 +1347,25 @@ def _nanmin(x: np.ndarray) -> float:
 #             the input ending is no longer a reason to emit one. A cut between a sentence's last word and its mark
 #             (the Parakeet teacher puts the mark after the trailing silence) would keep a COMPLETE sentence without its
 #             mark and teach the opposite - dropping real marks -, so the word rule excludes it (truncate_frames)
+#   pad       per cut row (truncate_pad_p) and per whole row (end_pad_p): n frames of quiet appended (n uniform in
+#             pad_frames, 80 ms each; quiet_pad: PAD_ROOM_P of the pads the row's own room tone, the rest AUG_PAD_STD
+#             noise) with pure-blank targets (blank_frame_targets). Why (the external review of the first recipe's
+#             test model, 2026-10-03): the app ends a chunk at a window edge - mostly inside a word - and pads it with
+#             0.2 s of quiet, and a cut that only ever ENDED the input taught nothing about "the speech stops, then
+#             quiet": that model still put 。 after 99.7 % of cuts through a word. A cut row with a pad keeps no mark
+#             (its sentence still runs); a whole row with a pad keeps its mark before the quiet (a complete sentence,
+#             then silence), so silence alone is no cue either way. The audio is first squared to whole frames
+#             (join_waves), so the pad starts on an encoder frame boundary. A pad never makes a row longer than the
+#             micro-batch's longest row after the join (the planned rectangle): the longest whole row gets none, and a
+#             pad is clipped to the room left
 #   mix       per row (mix_p, micro-batches of 2+ rows): a random segment of another row's audio - as it was before any
 #             cut or mix: clean, whole - added at a random offset, scaled to an SNR drawn from mix_snr_db (dB of this
 #             row's power over the segment's, both over the span they share); the targets stay this row's (clean
 #             teacher, noisy student), so the student transcribes the dominant voice through crosstalk and background
 #             talk. The length never changes
 # No step changes a row's frame count other than as its targets change (concat sums whole frames, truncate cuts at a
-# frame boundary, mix keeps the length), so ctc_frames(samples) == n_frames holds for every row the loss reads.
+# frame boundary, a pad adds whole frames, mix keeps the length), so ctc_frames(samples) == n_frames holds for every row
+# the loss reads.
 # Deterministic: each micro-batch draws from augment_rng(seed, its index list) alone, so a resumed or branched run -
 # which replays the same index lists - augments every micro-batch exactly as the original did, whichever worker decodes
 # it (a micro-batch whose index list recurs in a later epoch is augmented the same way again; with the planner's
@@ -1348,6 +1379,12 @@ AUG_PAD_STD = 1e-5  # the noise between joined pieces (~-100 dBFS): never digita
 MIX_SILENT_POWER = 1e-8  # a mean square below this (-80 dBFS) is silence: no level to scale an interferer to (or by)
 MIX_MIN_COVER = 0.5  # the interferer's segment covers a uniform share in [MIX_MIN_COVER, 1] of the shorter of the rows
 TRUNCATE_PAUSE_FRAMES = 4  # a pause cut lands in a run of >= this many teacher-blank frames (>= 320 ms of pause)
+PAD_MAX_FRAMES = 25  # the longest pad augment.pad_frames may ask for (2 s)
+PAD_ROOM_P = 0.5  # the share of pads cut from the row's own room tone (a voice-detector chunk's silence); the rest is
+# AUG_PAD_STD noise (an app's zero pad, without the exact zeros whose LogMel floor no recording has)
+PAD_ROOM_FRAMES = 8  # room tone: whole frames drawn among the row's this-many quietest ...
+PAD_ROOM_MAX_POWER = 1e-4  # ... whose mean square is below this (-40 dBFS); a row without one gets noise
+PAD_MIN_BLANK_LP = math.log(0.99)  # a pad frame's log p(blank): the row's most confident blank frame's, at least this
 
 
 @dataclass(frozen=True)
@@ -1359,7 +1396,8 @@ class Augment:
     truncate_pause_p: the share of cuts placed inside a pause (truncate_cut); punct_ids: the token ids a cut must never
     remove alone - the sentence marks and commas (truncate_frames; required when truncate_p > 0, since without them
     the rule cannot tell a sentence's mark from its words); concat_max_n / concat_max_s: the pieces and seconds of a
-    joined row; mix_snr_db: (low, high) dB of the row's power over the interferer's, drawn uniformly."""
+    joined row; mix_snr_db: (low, high) dB of the row's power over the interferer's, drawn uniformly; truncate_pad_p /
+    end_pad_p: per cut row / per whole row, a quiet pad of (low, high) pad_frames 80 ms frames (inclusive) after it."""
 
     seed: int
     truncate_p: float = 0.0
@@ -1372,21 +1410,30 @@ class Augment:
     concat_max_n: int = 4
     mix_p: float = 0.0
     mix_snr_db: tuple = (5.0, 20.0)
+    truncate_pad_p: float = 0.0
+    end_pad_p: float = 0.0
+    pad_frames: tuple = (1, 5)
 
     def __post_init__(self):
         snr = tuple(float(x) for x in self.mix_snr_db)
         object.__setattr__(self, "mix_snr_db", snr)
         object.__setattr__(self, "punct_ids", tuple(sorted(int(i) for i in self.punct_ids)))
-        probs = (self.truncate_p, self.truncate_pause_p, self.concat_p, self.mix_p)
+        pf = tuple(self.pad_frames)
+        whole = len(pf) == 2 and all(float(x) == int(x) for x in pf)
+        object.__setattr__(self, "pad_frames", tuple(int(x) for x in pf) if whole else pf)
+        probs = (self.truncate_p, self.truncate_pause_p, self.concat_p, self.mix_p, self.truncate_pad_p,
+                 self.end_pad_p)
         ok = (int(self.seed) >= 0 and all(0.0 <= float(p) <= 1.0 for p in probs)
               and 0.0 <= float(self.truncate_min_frac) < 1.0 and float(self.truncate_min_s) >= 0.0
               and float(self.concat_max_s) > 0.0 and int(self.concat_max_n) >= 2 and len(snr) == 2
               and 0.0 <= snr[0] <= snr[1] and all(0 <= i < CTC_BLANK for i in self.punct_ids)
-              and (float(self.truncate_p) == 0.0 or len(self.punct_ids) > 0))
+              and (float(self.truncate_p) == 0.0 or len(self.punct_ids) > 0)
+              and whole and 1 <= self.pad_frames[0] <= self.pad_frames[1] <= PAD_MAX_FRAMES)
         if not ok:
             raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
                              "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high, "
-                             "punct_ids token ids below the blank and given whenever truncate_p > 0)")
+                             "punct_ids token ids below the blank and given whenever truncate_p > 0, pad_frames whole "
+                             f"(low, high) with 1 <= low <= high <= {PAD_MAX_FRAMES})")
 
     @classmethod
     def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None,
@@ -1574,14 +1621,54 @@ def mix_into(dst: np.ndarray, src: np.ndarray, rng: np.random.Generator,
     return out, dict(src_start=s0, offset=off, n=n, snr_db=snr, gain=gain)
 
 
+def blank_frame_targets(n: int, blank_lp: float, k: int) -> "FrameTargets":
+    """n frames of pure blank, a quiet pad's targets: log p(blank) = blank_lp at every frame and no dense frame (the
+    teacher's p(blank) there is above its dense threshold), so no token - and no mark - comes from them; top-k width k,
+    the row's, for join_frame_targets."""
+    from kitsune.ctc_targets import FrameTargets
+
+    n, k = int(n), int(k)
+    return FrameTargets(n, np.full(n, blank_lp, dtype=np.float16), np.zeros(0, np.int32), np.zeros((0, k), np.int16),
+                        np.zeros((0, k), np.float16), np.zeros(0, np.int32))
+
+
+def quiet_pad(src: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
+    """n x FRAME_SAMPLES samples of quiet for a pad: with probability PAD_ROOM_P the room tone of src (the row's audio
+    before any cut) - n whole frames drawn, with replacement and in random order, among its PAD_ROOM_FRAMES quietest
+    whose mean square is below PAD_ROOM_MAX_POWER, as a voice-detector chunk ends in its own silence -, otherwise, or
+    when src has no such frame, AUG_PAD_STD noise, as an app's zero pad reads."""
+    n = int(n)
+    if rng.random() < PAD_ROOM_P:
+        m = len(src) // FRAME_SAMPLES
+        if m:
+            fr = np.asarray(src[:m * FRAME_SAMPLES], dtype=np.float32).reshape(m, FRAME_SAMPLES)
+            ms = np.einsum("ij,ij->i", fr, fr) / FRAME_SAMPLES
+            order = np.argsort(ms, kind="stable")[:PAD_ROOM_FRAMES]
+            quiet = order[ms[order] < PAD_ROOM_MAX_POWER]
+            if len(quiet):
+                return fr[quiet[rng.integers(len(quiet), size=n)]].reshape(-1).copy()
+    return np.float32(AUG_PAD_STD) * rng.standard_normal(n * FRAME_SAMPLES, dtype=np.float32)
+
+
 class _AugRow:
     """One row of an augmented micro-batch: its audio, targets, the store indices of its pieces and their first frames,
-    and the frame it was cut at (None: whole)."""
+    the frame it was cut at (None: whole) and the frames of quiet appended after it (0: none)."""
 
-    __slots__ = ("wave", "ft", "pieces", "offsets", "cut")
+    __slots__ = ("wave", "ft", "pieces", "offsets", "cut", "pad")
 
     def __init__(self, wave: np.ndarray, ft, pieces: list[int], offsets: list[int]):
-        self.wave, self.ft, self.pieces, self.offsets, self.cut = wave, ft, pieces, offsets, None
+        self.wave, self.ft, self.pieces, self.offsets, self.cut, self.pad = wave, ft, pieces, offsets, None, 0
+
+    def pad_quiet(self, n: int, src: np.ndarray, rng: np.random.Generator):
+        """Append n frames of quiet (quiet_pad, room tone from src) with pure-blank targets at the row's most confident
+        blank (at least PAD_MIN_BLANK_LP): the audio first squared to exactly FRAME_SAMPLES x its frames as a joined
+        piece is (join_waves), so the pad starts on an encoder frame boundary and the row's frames grow by exactly n.
+        The targets before the pad are unchanged: a cut row still ends without a mark, a whole row keeps its own."""
+        n, T = int(n), self.ft.n_frames
+        b = max(float(np.max(self.ft.blank_lp)) if T else 0.0, PAD_MIN_BLANK_LP)
+        self.wave = join_waves([self.wave, quiet_pad(src, n, rng)], [T, n], rng)
+        self.ft = join_frame_targets([self.ft, blank_frame_targets(n, b, self.ft.k)])
+        self.pad += n
 
     def cut_at(self, c: int):
         """Keep the first c frames: the audio at exactly FRAME_SAMPLES x c samples (ctc_frames of it is c; a row of

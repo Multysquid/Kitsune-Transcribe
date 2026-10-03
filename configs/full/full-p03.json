@@ -208,8 +208,10 @@
  "family": "ctc",
  "augment": {
   "enabled": true,
-  "truncate_p": 0.3,
+  "truncate_p": 0.2,
   "concat_p": 0.5,
-  "mix_p": 0.05
+  "mix_p": 0.0,
+  "truncate_pad_p": 0.5,
+  "end_pad_p": 0.15
  }
 }
