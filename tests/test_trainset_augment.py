@@ -656,10 +656,10 @@ def test_a_resume_reset_takes_the_recipe_sets_of_the_env_word(env, monkeypatch):
     pc = run / "checkpoints" / pc_event["name"]
     rid = run.name
     word = ",".join(f"{rid}:{s}" for s in ("schedule.epochs=01", "augment.enabled=True", "augment.truncate_p=.3",
-                                           "augment.concat_p=0.50", "augment.mix_p=0e0"))
+                                           "augment.concat_p=0.50", "augment.mix_p=5e-2"))
     sets = ["schedule.resume_reset=true", *fullrun.parse_resume_sets(word)[rid]]
     assert sets == ["schedule.resume_reset=true", "schedule.epochs=1", "augment.enabled=true", "augment.truncate_p=0.3",
-                    "augment.concat_p=0.5", "augment.mix_p=0.0"]
+                    "augment.concat_p=0.5", "augment.mix_p=0.05"]
     argv = sum((["--set", s] for s in sets), [])
     # ckpt.full_every_steps is the test's own (a state after the reset for the crash below), not a queue set
     monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", str(T))
@@ -671,7 +671,7 @@ def test_a_resume_reset_takes_the_recipe_sets_of_the_env_word(env, monkeypatch):
         == (t_c, T, T, T, 1, 1)
     newest = run / "checkpoints" / f"full_step_{T - 1}"
     saved = json.loads((newest / "trainer.json").read_text(encoding="utf-8"))["cfg"]
-    want_aug = dict(m.DEFAULTS["augment"], enabled=True, truncate_p=0.3, concat_p=0.5, mix_p=0.0)
+    want_aug = dict(m.DEFAULTS["augment"], enabled=True, truncate_p=0.3, concat_p=0.5, mix_p=0.05)
     assert saved["augment"] == want_aug and saved["schedule"]["resume_reset"] is False
     assert m.main(["--resume", str(newest)]) == 0  # no sets: the state's config holds the recipe
     assert len(events(run, "resume_reset")) == 1
@@ -679,7 +679,7 @@ def test_a_resume_reset_takes_the_recipe_sets_of_the_env_word(env, monkeypatch):
     assert len(augs) == 2  # the reset's start and the crash-resume's, both with the recipe
     for a in augs:
         assert (a["truncate_p"], a["concat_p"], a["mix_p"], a["truncate_pause_p"], a["truncate_min_s"], a["seed"]) == (
-            0.3, 0.5, 0.0, 0.5, 1.0, 1234)
+            0.3, 0.5, 0.05, 0.5, 1.0, 1234)
         assert a["punct_ids"] == {"1": "。"} and a["mix_snr_db"] == [5.0, 20.0]
     s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
     assert (s["status"], s["steps"], s["resume_resets"]) == ("complete", T, 1)
@@ -690,7 +690,6 @@ def test_a_resume_reset_takes_the_recipe_sets_of_the_env_word(env, monkeypatch):
     tags = ("aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac")
     after = st.loc[t_c + 1:, list(tags)]
     assert ((after >= 0) & (after <= 1)).all().all() and after.to_numpy().sum() > 0  # the recipe acted
-    assert (after["aug/mixed_frac"] == 0).all()  # mix off (DECISIONS H3): no row mixed
     assert st.loc[:t_c, list(tags)].isna().all().all()  # the baseline's steps: no augmentation
 
 

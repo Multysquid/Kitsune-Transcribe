@@ -785,7 +785,7 @@ Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/m
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-smoke --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --machine <smoke A's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box smoke-b --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=4 --resume-set full-p01-20261001T184145Z:augment.enabled=true --resume-set full-p01-20261001T184145Z:augment.truncate_p=0.3 --resume-set full-p01-20261001T184145Z:augment.concat_p=0.5 --resume-set full-p01-20261001T184145Z:augment.mix_p=0.0 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=4 --resume-set full-p01-20261001T184145Z:augment.enabled=true --resume-set full-p01-20261001T184145Z:augment.truncate_p=0.3 --resume-set full-p01-20261001T184145Z:augment.concat_p=0.5 --resume-set full-p01-20261001T184145Z:augment.mix_p=0.05 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-t --machine <id> --avoid-machine <p01's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-p --machine <id> --avoid-machine <p01's id> --avoid-machine <full-t's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
@@ -918,8 +918,8 @@ A dead or stopped box continues elsewhere from what the Hub has:
   `.30` -> `0.3`, `012` -> `12`), so two launches of one continuation compare equal there. Both imply `--resume`.
 - **The recipe test** (DECISIONS H1): `--box p01 --resume-reset full-p01-20261001T184145Z` with `--resume-set
   full-p01-20261001T184145Z:<set>` for each of `schedule.epochs=4`, `augment.enabled=true`, `augment.truncate_p=0.3`,
-  `augment.concat_p=0.5`, `augment.mix_p=0.0` (mix off, DECISIONS H3; the command above; `make_full_configs.py --import-speed` prints it from
-  `CONTINUATIONS` / `RECIPE`). resume_pull takes the pre_cooldown state `checkpoints/full_step_86328`, the queue passes
+  `augment.concat_p=0.5`, `augment.mix_p=0.05` (weak mixing, DECISIONS H4; the command above;
+  `make_full_configs.py --import-speed` prints it from `CONTINUATIONS` / `RECIPE`). resume_pull takes the pre_cooldown state `checkpoints/full_step_86328`, the queue passes
   the six `--set`s until the trainer has logged its resume_reset and a full state after it (then every state carries
   the recipe), the trainer re-plans the SAME T = 107,910 (4 epochs), so the WSD cooldown starts at once (0.8 T =
   86,328) and the whole 21,582-step re-run is the cooldown with the augmentation on: everything before it, and the
