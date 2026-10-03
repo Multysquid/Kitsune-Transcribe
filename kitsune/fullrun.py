@@ -192,7 +192,7 @@ ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # parses and normalises it). DECISIONS G3: P-0.1B's continuation sets its epochs and its early-stop patience (ints of at
 # least RESUME_SET_INT_MIN[key]). DECISIONS H1: the recipe test box re-runs box 1's cooldown from its pre_cooldown state
 # with the CTC train-data augmentation on - augment.enabled (a bool) and the three probabilities the owner's recipe sets
-# (truncate 0.3, concat 0.5, mix 0.0 = off since H3: floats in [0, 1]). The augmentation's other keys (its seed, the
+# (truncate 0.3, concat 0.5, mix 0.05 since H4: floats in [0, 1]). The augmentation's other keys (its seed, the
 # truncate bounds and pause share, concat_max_s / concat_max_n, mix_snr_db) keep the trainer's defaults on purpose: a resume that moved
 # them would test another recipe than the one P-0.3B is to train with, so they are not settable here. None of these
 # keys shapes the step plan (scripts/04_distill.py RESUME_FIXED holds none of them: augment.* happens inside the train
