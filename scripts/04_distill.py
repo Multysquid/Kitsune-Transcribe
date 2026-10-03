@@ -489,11 +489,14 @@ DEFAULTS = {
     # the row, low >= 0), the targets the clean row's. truncate_pad_p / end_pad_p: per cut row (no mark: the sentence
     # still runs) / per whole row (its mark kept, before the quiet), append [low, high] pad_frames 80 ms frames of quiet
     # (the row's room tone or near-silent noise) with blank targets - the app's padded chunk ends -, never past the
-    # micro-batch's longest row. A resume may change any of them (the step plan does not depend on them; the change is
-    # in its `resume` event's overrides), a T/2 branch none (BRANCH_FREE)
+    # micro-batch's longest row. truncate_min_row_s: rows shorter than this many seconds are never cut. A cut row's
+    # audio ends at a sample drawn where it is still the cut's frames (trainset.end_samples), never always on an 80 ms
+    # boundary. A resume may change any of them (the step plan does not depend on them; the change is in its
+    # `resume` event's overrides), a T/2 branch none (BRANCH_FREE)
     "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
                 "truncate_pause_p": 0.5, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0,
-                "mix_snr_db": [5.0, 20.0], "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5]},
+                "mix_snr_db": [5.0, 20.0], "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
+                "truncate_min_row_s": 0.0},
     # BatchNorm: mode "frozen" (eval mode, running stats fixed, affine trainable: the pruned students, whose BN holds
     # the teacher's statistics) or "train" (a student trained from scratch: BN trains, its running stats update, eval
     # and greedy decoding use them; gradient checkpointing is never turned on). momentum: null = the modules' own
@@ -971,6 +974,9 @@ def validate_augment(cfg: dict):
                          f"{trainset.PAD_MAX_FRAMES}, got {pf!r}")
     if not (_number(a["truncate_min_frac"]) and 0 <= a["truncate_min_frac"] < 1):
         raise SystemExit(f"augment.truncate_min_frac must be a fraction in [0, 1), got {a['truncate_min_frac']!r}")
+    if not (_number(a["truncate_min_row_s"]) and a["truncate_min_row_s"] >= 0):
+        raise SystemExit(f"augment.truncate_min_row_s must be a number of seconds >= 0, got "
+                         f"{a['truncate_min_row_s']!r}")
     if not (_number(a["truncate_min_s"]) and a["truncate_min_s"] >= 0):
         raise SystemExit(f"augment.truncate_min_s must be a number of seconds >= 0, got {a['truncate_min_s']!r}")
     if not (_number(a["concat_max_s"]) and a["concat_max_s"] > 0):
@@ -2280,8 +2286,10 @@ def setup_augment(R: Run):
                 concat_max_n=spec.concat_max_n, concat_max_s=used, concat_max_s_config=float(a["concat_max_s"]),
                 longest_train_s=round(longest, 3), concat_max_s_clamped=used < float(a["concat_max_s"]),
                 mix_p=spec.mix_p, mix_snr_db=list(spec.mix_snr_db), truncate_pad_p=spec.truncate_pad_p,
-                end_pad_p=spec.end_pad_p, pad_frames=list(spec.pad_frames))
-    print(f"augment: truncate_p {spec.truncate_p:g} (pause cuts {spec.truncate_pause_p:g}, never removing only "
+                end_pad_p=spec.end_pad_p, pad_frames=list(spec.pad_frames),
+                truncate_min_row_s=spec.truncate_min_row_s)
+    print(f"augment: truncate_p {spec.truncate_p:g} (rows >= {spec.truncate_min_row_s:g} s, pause cuts "
+          f"{spec.truncate_pause_p:g}, never removing only "
           f"{''.join(punct.values()) or 'punctuation'}), concat_p {spec.concat_p:g} (k <= {spec.concat_max_n}, "
           f"<= {used:g} s{' = the longest train utterance' if used < float(a['concat_max_s']) else ''}), mix_p "
           f"{spec.mix_p:g} at {spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, quiet pads after cuts "

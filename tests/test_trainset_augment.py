@@ -182,7 +182,7 @@ def test_augment_spec_and_where_it_applies(env, tmp_path):
                 dict(truncate_p=0.5),  # a cut needs the punctuation ids: without them a mark looks like a word
                 dict(truncate_p=0.5, punct_ids=(BLANK,)), dict(truncate_pad_p=1.5), dict(end_pad_p=-0.1),
                 dict(pad_frames=(0, 5)), dict(pad_frames=(3, 2)), dict(pad_frames=(1, T.PAD_MAX_FRAMES + 1)),
-                dict(pad_frames=(1.5, 2)), dict(pad_frames=(1,))):
+                dict(pad_frames=(1.5, 2)), dict(pad_frames=(1,)), dict(truncate_min_row_s=-1)):
         with pytest.raises(ValueError, match="not an augmentation"):
             T.Augment(**{"seed": 1, **bad})
     with pytest.raises(TypeError):
@@ -365,7 +365,8 @@ def test_a_quiet_pad_after_a_cut_and_after_a_whole_row():
     r = T._AugRow(wave, t, [0], [0])
     r.cut_at(5)
     r.pad_quiet(3, wave, np.random.default_rng(1))
-    assert (r.cut, r.pad, r.ft.n_frames, len(r.wave), T.ctc_frames(len(r.wave))) == (5, 3, 8, FS * 8, 8)
+    assert (r.cut, r.pad, r.ft.n_frames, T.ctc_frames(len(r.wave))) == (5, 3, 8, 8)
+    assert FS * 8 - T.END_BELOW <= len(r.wave) <= FS * 8  # the padded end drawn, as a cut's
     assert np.array_equal(r.wave[:FS * 5], wave[:FS * 5])
     assert r.ft.col0().tolist() == col0[:5] + [BLANK] * 3 and r.ft.ctc_ids.tolist() == [40, 41]  # no mark
     b = np.float16(max(float(t.blank_lp[:5].max()), T.PAD_MIN_BLANK_LP))
@@ -373,8 +374,8 @@ def test_a_quiet_pad_after_a_cut_and_after_a_whole_row():
     assert (r.ft.dense_frame < 5).all() and r.ft.topk_idx.shape[1] == t.k
     w = T._AugRow(wave, t, [0], [0])
     w.pad_quiet(4, wave, np.random.default_rng(2))
-    assert (w.cut, w.pad, w.ft.n_frames, len(w.wave), T.ctc_frames(len(w.wave))) == (None, 4, T0 + 4, FS * (T0 + 4),
-                                                                                      T0 + 4)
+    assert (w.cut, w.pad, w.ft.n_frames, T.ctc_frames(len(w.wave))) == (None, 4, T0 + 4, T0 + 4)
+    assert FS * (T0 + 4) - T.END_BELOW <= len(w.wave) <= FS * (T0 + 4)
     assert np.array_equal(w.wave[:len(wave)], wave) and np.abs(w.wave[len(wave):FS * T0]).max() < 1e-4
     assert w.ft.col0().tolist() == col0 + [BLANK] * 4 and w.ft.ctc_ids.tolist() == [40, 41, 42, MARK]  # mark kept
     assert np.array_equal(w.ft.blank_lp[:T0], t.blank_lp) and (w.ft.blank_lp[T0:] == b).all()
@@ -442,14 +443,16 @@ def test_every_row_keeps_its_frames(env):
 
 
 def test_truncate_keeps_the_frames_before_its_cut(env):
-    """truncate alone (p 1): a cut row's audio is the row's first 1280 x c samples and its targets the row's first c
-    frames, bit for bit; c is one of truncate_frames, so its CTC path is a strict prefix of the row's whose next token
-    (the first one the cut removed) is a word, never the mark; a row with nothing to cut stays whole."""
+    """truncate alone (p 1): a cut row's targets are the row's first c frames, bit for bit, and its audio the row's
+    first L samples, L drawn where the audio is still c frames (1280 c - 1120 .. + 159: never always on an 80 ms
+    boundary, which the first recipe's student learned as its "no mark" cue); c is one of truncate_frames, so its CTC
+    path is a strict prefix of the row's whose next token (the first one the cut removed) is a word, never the mark;
+    a row with nothing to cut stays whole."""
     store = env["store"]
     plain = T.dataset_for(store)
     a = T.Augment(seed=2, truncate_p=1.0, truncate_min_frac=0.3, truncate_min_s=0.3, punct_ids=(MARK,))
     ds = plain.with_augment(a)
-    n_cut = 0
+    n_cut, ends = 0, []
     for idx in micro_batches(store)[:20]:
         p, g = plain[idx], ds[idx]
         assert g["ids"] == p["ids"] and g["aug"]["concat_groups"] == g["aug"]["mixed"] == 0
@@ -464,18 +467,46 @@ def test_truncate_keeps_the_frames_before_its_cut(env):
                 assert row_ids(g, b) == row_ids(p, b) and float(g["durations"][b]) == float(p["durations"][b])
                 continue
             cut += 1
-            assert c in set(cand.tolist()) and int(g["lengths"][b]) == FS * c
-            assert torch.equal(g["wave"][b, :FS * c], p["wave"][b, :FS * c]) and not g["wave"][b, FS * c:].any()
+            L = int(g["lengths"][b])
+            assert c in set(cand.tolist()) and T.ctc_frames(L) == c
+            assert FS * c - T.END_BELOW <= L <= FS * c + T.END_ABOVE
+            assert torch.equal(g["wave"][b, :L], p["wave"][b, :L]) and not g["wave"][b, L:].any()
+            ends.append(L - FS * c)
             for k in ("blank_lp", "dense_mask", "topk_idx", "topk_lp", "frame_mask"):
                 assert torch.equal(g[k][b, :c], p[k][b, :c]), k
             assert not g["frame_mask"][b, c:].any() and not g["dense_mask"][b, c:].any()
             ids, full_ids = row_ids(g, b), row_ids(p, b)
             assert len(ids) < len(full_ids) and ids == full_ids[:len(ids)]  # a prefix: the final token is gone
             assert full_ids[len(ids)] != MARK  # and the first token the cut removed is a word, not only the mark
-            assert float(g["durations"][b]) == pytest.approx(c * 0.08)
+            assert float(g["durations"][b]) == pytest.approx(L / 16000)
         assert g["aug"]["truncated"] == cut
         n_cut += cut
     assert n_cut > 10
+    # the ends spread over the frame: a full last frame (the valid mel frames a multiple of 8) about 1 in 8
+    full = sum(((FS * 100 + e) // T.HOP) % 8 == 0 for e in ends)
+    assert min(ends) < 0 < max(ends) and full < 0.4 * len(ends)
+
+
+def test_short_rows_are_never_cut(env):
+    """truncate_min_row_s: with truncate at p 1, a row shorter than the bound (its frames x 80 ms) is never cut, and
+    truncate_frames has no candidate for it; a longer row with a candidate is cut as before."""
+    store = env["store"]
+    plain = T.dataset_for(store)
+    ds = plain.with_augment(T.Augment(seed=10, truncate_p=1.0, truncate_min_s=0.3, punct_ids=(MARK,),
+                                      truncate_min_row_s=1.5))
+    short = long_cut = 0
+    for idx in micro_batches(store)[:25]:
+        p, g = plain[idx], ds[idx]
+        for b, i in enumerate(idx):
+            T0, t = int(p["n_frames"][b]), int(g["n_frames"][b])
+            ft = store.targets(i)
+            if T0 * 0.08 < 1.5:
+                short += 1
+                assert t == T0 and not len(T.truncate_frames(ft, 0.3, 0.3, (MARK,), 1.5))
+            elif len(T.truncate_frames(ft, 0.3, 0.3, (MARK,), 1.5)):
+                long_cut += 1
+                assert t < T0
+    assert short > 10 and long_cut > 5
 
 
 def test_concat_puts_each_piece_at_its_offset(env):
@@ -597,16 +628,18 @@ def test_end_pads_never_widen_the_micro_batch(env):
             n_pad += 1
             assert 1 <= t - T0 <= min(5, width - T0)
             n = int(p["lengths"][b])
-            assert int(g["lengths"][b]) == FS * t and T.ctc_frames(FS * t) == t
+            L = int(g["lengths"][b])
+            assert FS * t - T.END_BELOW <= L <= FS * t and T.ctc_frames(L) == t
             keep = min(n, FS * T0)
             assert torch.equal(g["wave"][b, :keep], p["wave"][b, :keep])
-            q = g["wave"][b, FS * T0:FS * t].double().reshape(t - T0, FS)
-            assert bool(((q ** 2).mean(1) < T.PAD_ROOM_MAX_POWER).all())  # quiet: room tone or near-silent noise
+            if L > FS * T0:  # the pad's audio (its end drawn): quiet, room tone or near-silent noise
+                q = g["wave"][b, FS * T0:L].double()
+                assert float((q ** 2).mean()) < T.PAD_ROOM_MAX_POWER
             for k in ("blank_lp", "dense_mask", "topk_idx", "topk_lp"):
                 assert torch.equal(g[k][b, :T0], p[k][b, :T0]), k
             assert not g["dense_mask"][b, T0:t].any() and bool(g["frame_mask"][b, :t].all())
             assert row_ids(g, b) == row_ids(p, b)
-            assert float(g["durations"][b]) == pytest.approx(float(p["durations"][b]) + 0.08 * (t - T0), abs=1e-5)
+            assert float(g["durations"][b]) == pytest.approx(L / 16000)
         assert g["aug"]["end_padded"] == n_pad
         padded += n_pad
     assert padded > 10
@@ -632,12 +665,13 @@ def test_a_cut_pad_keeps_the_cut_and_adds_quiet(env):
                 assert t == T0 and int(g["lengths"][b]) == int(p["lengths"][b])
                 continue
             cut_rows += 1
-            assert t <= width and int(g["lengths"][b]) == FS * t
+            L = int(g["lengths"][b])
+            assert t <= width and FS * t - T.END_BELOW <= L <= FS * t and T.ctc_frames(L) == t
             full = store.targets(i).col0().tolist()
             fits = [c for c in range(max(t - 5, 1), t) if c in cand
                     and row_ids(g, b) == ctc_greedy(full[:c]) and len(ctc_greedy(full[:c])) < len(ctc_greedy(full))
                     and torch.equal(g["blank_lp"][b, :c], p["blank_lp"][b, :c])
-                    and torch.equal(g["wave"][b, :FS * c], p["wave"][b, :FS * c])
+                    and torch.equal(g["wave"][b, :FS * c - T.END_BELOW], p["wave"][b, :FS * c - T.END_BELOW])
                     and not g["dense_mask"][b, c:t].any()]
             assert fits, (idx, b)
         assert g["aug"]["cut_padded"] == g["aug"]["truncated"] and g["aug"]["end_padded"] == 0
@@ -655,7 +689,8 @@ def test_validate_the_augment_block():
     assert m.DEFAULTS["augment"] == {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3,
                                      "truncate_min_s": 1.0, "truncate_pause_p": 0.5, "concat_p": 0.0,
                                      "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0, "mix_snr_db": [5.0, 20.0],
-                                     "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5]}
+                                     "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
+                                     "truncate_min_row_s": 0.0}
     assert not m.augment_on(m.load_config(None, [])) and not m.augment_on({})
     ctc = ["family=ctc", "parakeet_root=po"]
     assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.mix_p=0.5"]))
@@ -672,7 +707,8 @@ def test_validate_the_augment_block():
                        (["augment.truncate_pad_p=1.5"], "augment.truncate_pad_p"),
                        (["augment.end_pad_p=-0.1"], "augment.end_pad_p"), (["augment.pad_frames=[0, 5]"], "pad_frames"),
                        (["augment.pad_frames=[3, 2]"], "pad_frames"), (["augment.pad_frames=[1, 26]"], "pad_frames"),
-                       (["augment.pad_frames=[1.0, 2]"], "pad_frames"), (["augment.pad_frames=3"], "pad_frames")):
+                       (["augment.pad_frames=[1.0, 2]"], "pad_frames"), (["augment.pad_frames=3"], "pad_frames"),
+                       (["augment.truncate_min_row_s=-1"], "truncate_min_row_s")):
         with pytest.raises(SystemExit, match=match):
             m.load_config(None, (ctc if bad != ["augment.enabled=true"] else []) + bad)
     saved = m.load_config(None, ctc)
