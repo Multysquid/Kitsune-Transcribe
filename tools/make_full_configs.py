@@ -119,15 +119,15 @@ STUDY_DATA = ROOT / "study" / "data.json"
 RECIPE_TEST = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}
 # THE RECIPE (v2, DECISIONS H6, owner 2026-10-03 "Fix, then launch P-0.3B anew with the new recipe"), after the
 # external review of the test's model: truncate 0.2 (0.3 left the final 。 off 3-8 % of complete sentences, JSUT 92 %
-# against the gate's 95 %), concat 0.5 as tested (the collab +5 pp), mixing OFF (0.05 already made two equally loud
+# against the gate's 95 %), concat 0.5 as tested (the collab +5 pp) and mixing OFF (0.05 already made two equally loud
 # voices much worse, 56 % against 47 % CER, mostly deleted text, and short utterances lost more words - "いない。"
-# read "。"), and the quiet pads: truncate_pad_p 0.5 of the cut rows end in 80-400 ms of quiet with no mark (the app
-# pads its chunk ends with 0.2 s, and the tested model still put 。 after 99.7 % of cuts through a word), end_pad_p
-# 0.15 of the whole rows keep their mark before the same quiet (about as many padded rows with a mark as without), so
-# silence alone is no cue. Every other augment.* key stays the trainer's default (pad_frames [1, 5]), so the block
-# names only what the recipe sets; mix_p stays in it, at 0, so the record says mixing is off. P-0.3B's run carries it
-# as its augment block (FULL_RUNS p03)
-RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0, "truncate_pad_p": 0.5, "end_pad_p": 0.15}
+# read "。"). The quiet pads (truncate_pad_p / end_pad_p, kitsune/trainset.py) stay OFF: in the CPU pilot from A0
+# (30 steps; streamfix/periods-model/out/pause_probe_v2.log) they only moved the overall mark bias - end pads 0.3 cut
+# the right marks after a complete sentence to 0.35-0.60 - and never improved telling a cut from a sentence end; the
+# app's chunk ends inside a word are the engine's (Shisu-ko F1: cut at pauses, F2: strip marks at in-speech cuts).
+# Every other augment.* key stays the trainer's default, so the block names only what the recipe sets; mix_p stays in
+# it, at 0, so the record says mixing is off. P-0.3B's run carries it as its augment block (FULL_RUNS p03)
+RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
