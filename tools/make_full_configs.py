@@ -23,7 +23,7 @@ study/data.json, the study's settings; the queue fills max_steps, lr and the min
      values, action cooldown, the test sets refused). Everything else stays the study's (BN, L2-SP 0, aux-CTC 0, w_ctc
      0.8, SpecAugment, the smoke block, seed 1234, verdict v2);
   4. the run's augment block, when its FULL_RUNS row names one: full-p03 trains with RECIPE (DECISIONS H1 step 2, the
-     CTC train-data augmentation; the block names only what it changes, the trainer's defaults the rest).
+     CTC train-data augmentation, v2 since H6; the block names only what it changes, the trainer's defaults the rest).
   smoke-<x> is full-<x> without its augment block (the configs smoke A ran stay byte for byte as they were) and with
   SMOKE (the smoke data, SMOKE_EPOCHS: the epochs smoke A ran, 3/3/4/4, whatever the full runs' are now - the 100 h
   draw is the budget, and its plan_total_steps are the full runs' at those epochs; no complete
@@ -110,18 +110,24 @@ PLAN_FILE = "plan/full_study.json"  # under OUT_DIR: tools/full_plan.py on full.
 RUNS_REPO = study.RUNS_REPO
 STUDY_DATA = ROOT / "study" / "data.json"
 
-# THE RECIPE (DECISIONS H0/H1, owner 2026-10-02 ~20:30Z): the CTC train-data augmentation the stream and period fixes
-# train with (scripts/04_distill.py augment.*, kitsune/trainset.py): truncate 0.3 (a row cut before a word, never
-# between a sentence's last word and its mark, half of the cuts in a pause), concat 0.5 (a micro-batch's rows joined k
-# at a time inside its planned padded frames, <= 28 s), the training-plan investigator's values, and WEAK mixing:
-# mix_p 0.05 (another row 5-20 dB down under the clean row's targets). DECISIONS H3 had turned mixing off (at 0.2
-# it would teach the student to leave a second voice blank, the stream failure); H4 (owner, 2026-10-03 12:37Z)
-# launched the recipe test box with mix_p 0.05, "more resilient but not too much", and step 2 trains what was tested.
-# Every other augment.* key stays the trainer's default, so the block names only what the recipe sets. One constant
-# for both places the recipe goes, so the test and the run it decides on cannot drift apart: the recipe test box's
-# --resume-set flags (CONTINUATIONS p01, continuation_flags) and P-0.3B's run, whose config carries it as its augment
-# block (FULL_RUNS p03; launched only if the test shows that it helps, H1 step 2)
-RECIPE = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}
+# THE RECIPE TEST'S RECIPE (DECISIONS H0/H1/H4; box p01, instance 54012106, 2026-10-03): the CTC train-data
+# augmentation (scripts/04_distill.py augment.*, kitsune/trainset.py) as box 1's cooldown re-run trained with it:
+# truncate 0.3 (a row cut before a word, never between a sentence's last word and its mark, half of the cuts in a
+# pause), concat 0.5 (a micro-batch's rows joined k at a time inside its planned padded frames, <= 28 s) and weak
+# mixing, mix_p 0.05 (another row 5-20 dB down under the clean row's targets; the owner's launch line). Kept as the
+# record of what ran: the recipe test box's --resume-set flags (CONTINUATIONS p01, continuation_flags)
+RECIPE_TEST = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}
+# THE RECIPE (v2, DECISIONS H6, owner 2026-10-03 "Fix, then launch P-0.3B anew with the new recipe"), after the
+# external review of the test's model: truncate 0.2 (0.3 left the final 。 off 3-8 % of complete sentences, JSUT 92 %
+# against the gate's 95 %), concat 0.5 as tested (the collab +5 pp) and mixing OFF (0.05 already made two equally loud
+# voices much worse, 56 % against 47 % CER, mostly deleted text, and short utterances lost more words - "いない。"
+# read "。"). The quiet pads (truncate_pad_p / end_pad_p, kitsune/trainset.py) stay OFF: in the CPU pilot from A0
+# (30 steps; streamfix/periods-model/out/pause_probe_v2.log) they only moved the overall mark bias - end pads 0.3 cut
+# the right marks after a complete sentence to 0.35-0.60 - and never improved telling a cut from a sentence end; the
+# app's chunk ends inside a word are the engine's (Shisu-ko F1: cut at pauses, F2: strip marks at in-speech cuts).
+# Every other augment.* key stays the trainer's default, so the block names only what the recipe sets; mix_p stays in
+# it, at 0, so the record says mixing is off. P-0.3B's run carries it as its augment block (FULL_RUNS p03)
+RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
@@ -129,13 +135,14 @@ RECIPE = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}
 # below). EPOCHS: DECISIONS G1, confirmed by the owner on 2026-10-02 (~11:30Z, "3 / 3 / 5" after the epoch analysis,
 # D:/kitsune-tmp/fullbuild/epochs/RECOMMENDATION.md): T-0.6B 3, P-0.3B 3, P-0.05B 5, each with COMMON's early-stop
 # patience; P-0.3B 6 since DECISIONS H5 (the owner, 2026-10-03, after the recipe test: its augmentation varies the
-# data every epoch, and the early stop still cools down early if dev stops improving). The owner's earlier request of the same day to plan 10 epochs for these runs was WITHDRAWN after that
+# data every epoch, and the early stop still cools down early if dev stops improving). The owner's earlier request
+# of the same day to plan 10 epochs for these runs was WITHDRAWN after that
 # analysis (DECISIONS G "Rejected: 10 epochs"). P-0.1B's run stays box 1's 4 epochs, and so does its recipe test, which
 # re-runs box 1's cooldown to the same end (CONTINUATIONS, DECISIONS H1; G3's 8-epoch continuation is postponed, H2).
 # This is the one epoch parameter: a change here, then --import-launch-plan of a full_plan.py record at the new
 # epochs, then the printed hours (--import-speed) into boxes.json. AUGMENT: the run's augment block (full_config; the
-# smoke configs never take it), None for none. DECISIONS H1 step 2: P-0.3B trains with RECIPE, prepared now and
-# launched only if the recipe test on box p01 shows that the recipe helps; T-0.6B (box full-t, postponed: the AED
+# smoke configs never take it), None for none. DECISIONS H1 step 2: P-0.3B trains with RECIPE (v2 since H6, after
+# the recipe test on box p01 and its external review); T-0.6B (box full-t, postponed: the AED
 # family has no truncate or concat yet, H2), P-0.05B (postponed, H2; its config stays) and P-0.1B's 4-epoch run (box
 # 1, done: its config is the one the test resumes, byte for byte) have none
 FULL_RUNS = {
@@ -158,7 +165,7 @@ SMOKE_EPOCHS = {"t06": 3, "p03": 3, "p01": 4, "p005": 4}
 SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # box p01's continuation, now THE RECIPE TEST (DECISIONS H1; the 8-epoch continuation of G3, patience 12, is postponed:
 # H2), launched with --resume-reset run_id --resume-set run_id:schedule.epochs=<epochs> and one --resume-set
-# run_id:augment.<key>=<value> per RECIPE key (continuation_flags; fullrun.RESUME_SET_KEYS). It re-runs ONLY the
+# run_id:augment.<key>=<value> per RECIPE_TEST key (continuation_flags; fullrun.RESUME_SET_KEYS). It re-runs ONLY the
 # cooldown of box 1's run: from its pre_cooldown state (from_step: checkpoints/full_step_86328, on the Hub) to the SAME
 # end (epochs 4: T 107,910 on full.parquet, so 21,582 steps, ~2 h) with the recipe on. The WSD cooldown starts at
 # t_c = 0.8 T = 86,328 = from_step: the whole re-run is cooldown. Everything before from_step - the data order, the
@@ -171,7 +178,7 @@ SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # the 4-epoch record stays runs-repo revision c4604304 (G4): the re-run overwrites the run's summary, config, final
 # evals, export and its pre_cooldown state's trainer.pt/.json (same weights, the recipe in its config) at the head
 CONTINUATIONS = {"p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=4,
-                             patience=None, augment=RECIPE, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
+                             patience=None, augment=RECIPE_TEST, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
 # READOUT_RESERVE. A readout runs right after its training item on the same GPU (Resolution 25) under the same
 # KITSUNE_DEADLINE (kitsune.full_queue item_deadline: the box deadline less deadline_reserve_min). After a run that the
 # deadline cooldown (4d) shortened, 04_distill.fit_epochs_deadline has planned the end phase to finish

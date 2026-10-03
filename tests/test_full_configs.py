@@ -298,7 +298,8 @@ def test_the_section_7_table():
     # config has one (full-p01 is box 1's own, the smokes are smoke A's)
     assert {x: r["augment"] for x, r in M.FULL_RUNS.items()} == {"t06": None, "p03": M.RECIPE, "p01": None,
                                                                  "p005": None}
-    assert M.FULL_RUNS["p03"]["augment"] is M.RECIPE is M.CONTINUATIONS["p01"]["augment"]
+    # P-0.3B trains recipe v2 (DECISIONS H6); the recipe test's record keeps what box p01 ran (RECIPE_TEST)
+    assert M.FULL_RUNS["p03"]["augment"] is M.RECIPE and M.CONTINUATIONS["p01"]["augment"] is M.RECIPE_TEST
     assert cfg("full-p03")["augment"] == M.RECIPE and list(cfg("full-p03"))[-1] == "augment"
     assert [n for n in GENERATED if "augment" in cfg(n)] == ["full-p03"]
 
@@ -774,8 +775,9 @@ def test_box_p01_is_the_recipe_test(reg, plan, trainer):
     import hashlib
     c = M.CONTINUATIONS["p01"]
     assert (c["box"], c["run_id"], c["from_step"], c["epochs"], c["patience"], c["augment"], c["revision"]) == (
-        "p01", P01_RID, 86328, 4, None, M.RECIPE, "c4604304db76e068df7bbe39d00d006b74d6c134")
-    assert M.RECIPE == {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}  # DECISIONS H1, H4
+        "p01", P01_RID, 86328, 4, None, M.RECIPE_TEST, "c4604304db76e068df7bbe39d00d006b74d6c134")
+    assert M.RECIPE_TEST == {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}  # H1, H4: as run
+    assert M.RECIPE == {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0}  # DECISIONS H6: v2, P-0.3B's
     assert c["epochs"] == M.FULL_RUNS["p01"]["epochs"] == cfg("full-p01")["schedule"]["epochs"]  # box 1's T again
     raw = (FULL / "full-p01.json").read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(raw).hexdigest() == FULL_P01_SHA256

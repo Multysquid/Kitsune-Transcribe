@@ -335,7 +335,9 @@ micro-batch into groups of k, the teacher frame targets concatenated, so real ma
 a sentence (truncate_p: at a frame whose first removed token is a word - never a mark or comma, the student
 tokenizer's punct_token_ids -, half of them in a pause; audio and targets at the same frame - the targets came from the
 whole utterance, so the frames before the cut carry no final mark, and the kept part is never a complete sentence
-stripped of its mark) and mixed with another row's speech 5-20 dB down (mix_p; the targets the
+stripped of its mark), padded with quiet (truncate_pad_p per cut row: the sentence still runs, no mark; end_pad_p per
+whole row: the mark kept before the quiet; pad_frames 80 ms frames, never past the micro-batch's longest row) and
+mixed with another row's speech 5-20 dB down (mix_p; the targets the
 clean row's), in that order (kitsune.trainset's "augmentation" section). Memory: a joined micro-batch has rows / k rows
 of at most k x its longest row's frames, so its padded frames never exceed the planned micro-batch's, and setup_augment
 clamps concat_max_s to the longest train utterance (the `augment` event), so no joined row is longer than the one the
@@ -344,9 +346,10 @@ and the train probe included) a plain dataset of its own. Deterministic:
 each micro-batch's augmentation is a function of (augment.seed or the run's seed, its index list), so a crash-resume -
 which reads the run's own config - or a T/2 branch augments every step as the original. A resume may change augment.*
 (it does not shape the step plan; its `resume` event lists the change), a branch may not (BRANCH_FREE). Logged per step:
-aug/concat_frac (the share of the step's utterances in a joined row), aug/truncated_frac and aug/mixed_frac (shares of
-its rows); a joined row's train_utts record has the pieces' ids joined by "+", the first piece's source, their summed
-duration (a cut row: the seconds kept). The smoke's dropped-audio share counts utterances, not joined rows (batch_utts)
+aug/concat_frac (the share of the step's utterances in a joined row), aug/truncated_frac, aug/mixed_frac,
+aug/cut_padded_frac and aug/end_padded_frac (shares of its rows); a joined row's train_utts record has the pieces' ids
+joined by "+", the first piece's source, their summed duration (a cut row: the seconds kept; plus a pad's). The smoke's
+dropped-audio share counts utterances, not joined rows (batch_utts)
 """
 import argparse
 import concurrent.futures
@@ -483,11 +486,14 @@ DEFAULTS = {
     # micro-batch, join all its rows into groups of k (a divisor of the row count, 2..concat_max_n, with k x the longest
     # row <= concat_max_s; the trainer clamps concat_max_s to the longest train utterance, an `augment` event). mix_p:
     # per row, add a segment of another row of the micro-batch at an SNR drawn from mix_snr_db ([low, high] dB below
-    # the row, low >= 0), the targets the clean row's. A resume may change any of them (the step plan does not depend
-    # on them; the change is in its `resume` event's overrides), a T/2 branch none (BRANCH_FREE)
+    # the row, low >= 0), the targets the clean row's. truncate_pad_p / end_pad_p: per cut row (no mark: the sentence
+    # still runs) / per whole row (its mark kept, before the quiet), append [low, high] pad_frames 80 ms frames of quiet
+    # (the row's room tone or near-silent noise) with blank targets - the app's padded chunk ends -, never past the
+    # micro-batch's longest row. A resume may change any of them (the step plan does not depend on them; the change is
+    # in its `resume` event's overrides), a T/2 branch none (BRANCH_FREE)
     "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
                 "truncate_pause_p": 0.5, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0,
-                "mix_snr_db": [5.0, 20.0]},
+                "mix_snr_db": [5.0, 20.0], "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5]},
     # BatchNorm: mode "frozen" (eval mode, running stats fixed, affine trainable: the pruned students, whose BN holds
     # the teacher's statistics) or "train" (a student trained from scratch: BN trains, its running stats update, eval
     # and greedy decoding use them; gradient checkpointing is never turned on). momentum: null = the modules' own
@@ -954,9 +960,15 @@ def validate_augment(cfg: dict):
     seed = a["seed"]
     if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0):
         raise SystemExit(f"augment.seed must be null (the run's seed) or an int >= 0, got {seed!r}")
-    for key in ("truncate_p", "truncate_pause_p", "concat_p", "mix_p"):
+    for key in ("truncate_p", "truncate_pause_p", "concat_p", "mix_p", "truncate_pad_p", "end_pad_p"):
         if not (_number(a[key]) and 0 <= a[key] <= 1):
             raise SystemExit(f"augment.{key} must be a probability in [0, 1], got {a[key]!r}")
+    pf = a["pad_frames"]
+    if not (isinstance(pf, (list, tuple)) and len(pf) == 2
+            and all(isinstance(x, int) and not isinstance(x, bool) for x in pf)
+            and 1 <= pf[0] <= pf[1] <= trainset.PAD_MAX_FRAMES):
+        raise SystemExit(f"augment.pad_frames must be [low, high] whole 80 ms frames with 1 <= low <= high <= "
+                         f"{trainset.PAD_MAX_FRAMES}, got {pf!r}")
     if not (_number(a["truncate_min_frac"]) and 0 <= a["truncate_min_frac"] < 1):
         raise SystemExit(f"augment.truncate_min_frac must be a fraction in [0, 1), got {a['truncate_min_frac']!r}")
     if not (_number(a["truncate_min_s"]) and a["truncate_min_s"] >= 0):
@@ -2267,11 +2279,14 @@ def setup_augment(R: Run):
                 punct_ids={str(i): t for i, t in sorted(punct.items())}, concat_p=spec.concat_p,
                 concat_max_n=spec.concat_max_n, concat_max_s=used, concat_max_s_config=float(a["concat_max_s"]),
                 longest_train_s=round(longest, 3), concat_max_s_clamped=used < float(a["concat_max_s"]),
-                mix_p=spec.mix_p, mix_snr_db=list(spec.mix_snr_db))
+                mix_p=spec.mix_p, mix_snr_db=list(spec.mix_snr_db), truncate_pad_p=spec.truncate_pad_p,
+                end_pad_p=spec.end_pad_p, pad_frames=list(spec.pad_frames))
     print(f"augment: truncate_p {spec.truncate_p:g} (pause cuts {spec.truncate_pause_p:g}, never removing only "
           f"{''.join(punct.values()) or 'punctuation'}), concat_p {spec.concat_p:g} (k <= {spec.concat_max_n}, "
           f"<= {used:g} s{' = the longest train utterance' if used < float(a['concat_max_s']) else ''}), mix_p "
-          f"{spec.mix_p:g} at {spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, seed {seed}", flush=True)
+          f"{spec.mix_p:g} at {spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, quiet pads after cuts "
+          f"{spec.truncate_pad_p:g} / after whole rows {spec.end_pad_p:g} ({spec.pad_frames[0]}-{spec.pad_frames[1]} "
+          f"frames), seed {seed}", flush=True)
     return R.ds.with_augment(spec)
 
 
@@ -2916,11 +2931,12 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
     }
     if "aux_ctc" in out:  # the aux-CTC loss per target token (unweighted; loss.aux_ctc_weight x it is in loss/total)
         row["loss/aux_ctc"] = out["aux_ctc"]
-    if "aug" in out:  # augment.enabled (train_step_ctc): the step's share of utterances in a joined row, of rows cut
-        a = out["aug"]  # and of rows mixed; next to aug/masked_frac, and like it only on full rows (lean_step)
+    if "aug" in out:  # augment.enabled (train_step_ctc): the step's share of utterances in a joined row, of rows cut,
+        a = out["aug"]  # mixed and padded; next to aug/masked_frac, and like it only on full rows (lean_step)
         utts, rows = max(int(a["utts"]), 1), max(int(a["rows"]), 1)
         row.update({"aug/concat_frac": a["concat_utts"] / utts, "aug/truncated_frac": a["truncated"] / rows,
-                    "aug/mixed_frac": a["mixed"] / rows})
+                    "aug/mixed_frac": a["mixed"] / rows, "aug/cut_padded_frac": a.get("cut_padded", 0) / rows,
+                    "aug/end_padded_frac": a.get("end_padded", 0) / rows})
     if flops is not None:
         row["perf/tflops"] = flops / step_s / 1e12
         row["perf/mfu"] = flops / step_s / (float(cfg["perf"]["peak_tflops"]) * 1e12)
