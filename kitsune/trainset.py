@@ -1231,8 +1231,8 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         takes its interferers from the rows as they were before the cut and before any mixing (clean speech, the length
         of the whole row). Metadata of a row: ids its pieces' joined by "+" (a cut row only those that start before the
         cut), sources and index the first piece's (the trainer's per-source sums count a joined row under its first
-        piece's source), durations the pieces' stored durations summed (a cut row: the seconds it keeps, c x 80 ms) plus
-        a pad's seconds, agree the smallest known one (NaN if none is known)."""
+        piece's source), durations the pieces' stored durations summed (a cut or padded row: the seconds of audio it
+        holds), agree the smallest known one (NaN if none is known)."""
         from kitsune.ctc_targets import collate_frame_targets
 
         a = self.augment
@@ -1255,9 +1255,9 @@ class FrameBatchDataset(torch.utils.data.Dataset):
             for r in rows:
                 if rng.random() < a.truncate_p:
                     c = truncate_cut(r.ft, rng, a.truncate_min_frac, a.truncate_min_s, a.punct_ids,
-                                     a.truncate_pause_p)
+                                     a.truncate_pause_p, a.truncate_min_row_s)
                     if c is not None:
-                        r.cut_at(c)
+                        r.cut_at(c, rng)
                         n_cut += 1
         if a.truncate_pad_p > 0 or a.end_pad_p > 0:
             for p, r in enumerate(rows):
@@ -1287,9 +1287,8 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         wave = np.zeros((B, int(lengths.max()) if B else 0), dtype=np.float32)
         for b, r in enumerate(rows):
             wave[b, :len(r.wave)] = r.wave
-        durations = np.array([(r.cut * FRAME_SAMPLES / TARGET_SR if r.cut is not None
-                               else self.duration[r.pieces].sum(dtype=np.float32)) + r.pad * FRAME_SAMPLES / TARGET_SR
-                              for r in rows], dtype=np.float32)
+        durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None or r.pad
+                              else self.duration[r.pieces].sum(dtype=np.float32) for r in rows], dtype=np.float32)
         agree = np.array([_nanmin(self.agree[r.pieces]) for r in rows], dtype=np.float32)
         out = dict(wave=torch.from_numpy(wave), lengths=torch.from_numpy(lengths),
                    durations=torch.from_numpy(durations), agree=torch.from_numpy(agree),
@@ -1342,8 +1341,14 @@ def _nanmin(x: np.ndarray) -> float:
 #             token (the first token starting at or after c in the teacher's argmax) is a WORD - never a sentence mark
 #             or comma (punct_ids, the student tokenizer's) -, so the kept part ends inside a sentence with at least one
 #             of its words gone; truncate_pause_p of the cuts land inside a pause (>= TRUNCATE_PAUSE_FRAMES teacher-blank
-#             frames), as a voice-detector chunk ends. The audio at exactly FRAME_SAMPLES x c and the targets at frame c
-#             alike. The teacher made its targets from the WHOLE utterance, so the frames before c carry no final mark:
+#             frames), as a voice-detector chunk ends. The targets at frame c; the audio ends at a sample drawn
+#             uniformly where it is still c frames (end_samples: FRAME_SAMPLES x c - 1120 .. + 159), as a natural
+#             utterance or an app's chunk ends anywhere: the first recipe cut at exactly FRAME_SAMPLES x c, and its
+#             student learned "an input that ends on an 80 ms boundary has no mark" (the external review's own cuts:
+#             2.8 % false marks on a boundary, 100 % mid-frame; and the natural ends that happen to fill their last
+#             frame lost their real mark). Rows shorter than truncate_min_row_s are never cut (short utterances lost
+#             more words under the first recipe).
+#             The teacher made its targets from the WHOLE utterance, so the frames before c carry no final mark:
 #             the input ending is no longer a reason to emit one. A cut between a sentence's last word and its mark
 #             (the Parakeet teacher puts the mark after the trailing silence) would keep a COMPLETE sentence without its
 #             mark and teach the opposite - dropping real marks -, so the word rule excludes it (truncate_frames)
@@ -1380,6 +1385,10 @@ MIX_SILENT_POWER = 1e-8  # a mean square below this (-80 dBFS) is silence: no le
 MIX_MIN_COVER = 0.5  # the interferer's segment covers a uniform share in [MIX_MIN_COVER, 1] of the shorter of the rows
 TRUNCATE_PAUSE_FRAMES = 4  # a pause cut lands in a run of >= this many teacher-blank frames (>= 320 ms of pause)
 PAD_MAX_FRAMES = 25  # the longest pad augment.pad_frames may ask for (2 s)
+# where a cut (or padded) row's audio may end and still be c encoder frames: ctc_frames(L) == c for every L in
+# [FRAME_SAMPLES c - END_BELOW, FRAME_SAMPLES c + END_ABOVE] (the valid mel frames L // HOP run 8c - 7 .. 8c)
+END_BELOW = FRAME_SAMPLES - HOP  # 1120 samples
+END_ABOVE = HOP - 1  # 159 samples
 PAD_ROOM_P = 0.5  # the share of pads cut from the row's own room tone (a voice-detector chunk's silence); the rest is
 # AUG_PAD_STD noise (an app's zero pad, without the exact zeros whose LogMel floor no recording has)
 PAD_ROOM_FRAMES = 8  # room tone: whole frames drawn among the row's this-many quietest ...
@@ -1397,7 +1406,8 @@ class Augment:
     remove alone - the sentence marks and commas (truncate_frames; required when truncate_p > 0, since without them
     the rule cannot tell a sentence's mark from its words); concat_max_n / concat_max_s: the pieces and seconds of a
     joined row; mix_snr_db: (low, high) dB of the row's power over the interferer's, drawn uniformly; truncate_pad_p /
-    end_pad_p: per cut row / per whole row, a quiet pad of (low, high) pad_frames 80 ms frames (inclusive) after it."""
+    end_pad_p: per cut row / per whole row, a quiet pad of (low, high) pad_frames 80 ms frames (inclusive) after it;
+    truncate_min_row_s: rows shorter than this (seconds, the row's frames) are never cut."""
 
     seed: int
     truncate_p: float = 0.0
@@ -1413,6 +1423,7 @@ class Augment:
     truncate_pad_p: float = 0.0
     end_pad_p: float = 0.0
     pad_frames: tuple = (1, 5)
+    truncate_min_row_s: float = 0.0
 
     def __post_init__(self):
         snr = tuple(float(x) for x in self.mix_snr_db)
@@ -1428,12 +1439,13 @@ class Augment:
               and float(self.concat_max_s) > 0.0 and int(self.concat_max_n) >= 2 and len(snr) == 2
               and 0.0 <= snr[0] <= snr[1] and all(0 <= i < CTC_BLANK for i in self.punct_ids)
               and (float(self.truncate_p) == 0.0 or len(self.punct_ids) > 0)
-              and whole and 1 <= self.pad_frames[0] <= self.pad_frames[1] <= PAD_MAX_FRAMES)
+              and whole and 1 <= self.pad_frames[0] <= self.pad_frames[1] <= PAD_MAX_FRAMES
+              and float(self.truncate_min_row_s) >= 0.0)
         if not ok:
             raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
                              "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high, "
                              "punct_ids token ids below the blank and given whenever truncate_p > 0, pad_frames whole "
-                             f"(low, high) with 1 <= low <= high <= {PAD_MAX_FRAMES})")
+                             f"(low, high) with 1 <= low <= high <= {PAD_MAX_FRAMES}, truncate_min_row_s >= 0)")
 
     @classmethod
     def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None,
@@ -1531,7 +1543,8 @@ def pause_frames(col0: np.ndarray, min_len: int = 0) -> np.ndarray:
     return out
 
 
-def truncate_frames(ft: "FrameTargets", min_frac: float, min_s: float, punct_ids: Sequence[int]) -> np.ndarray:
+def truncate_frames(ft: "FrameTargets", min_frac: float, min_s: float, punct_ids: Sequence[int],
+                    min_row_s: float = 0.0) -> np.ndarray:
     """The frames truncate may cut a row at (increasing): c >= lo = max(ceil(min_frac x T), the frames of min_s, 1),
     and the first token the cut removes whole (next_token_start) is a WORD, never one of punct_ids (the vocabulary's
     sentence marks and commas, scripts/04_distill.py punct_token_ids) and never none. So the kept frames always end
@@ -1540,7 +1553,10 @@ def truncate_frames(ft: "FrameTargets", min_frac: float, min_s: float, punct_ids
     word and its mark - where the Parakeet teacher puts the mark, after the trailing silence: ~22-28 % of the frames a
     plain "before the last token" bound allows (2026-10-02 measurement on the train shards) - would instead keep a
     complete sentence without its mark and teach the student to drop real marks; this rule excludes it, also before the
-    mark of a piece inside a joined row (whose own sentence end, after its mark, stays a valid cut)."""
+    mark of a piece inside a joined row (whose own sentence end, after its mark, stays a valid cut). A row shorter
+    than min_row_s seconds (its frames) has none."""
+    if ft.n_frames * FRAME_SAMPLES < float(min_row_s) * TARGET_SR - 1e-6:
+        return np.zeros(0, np.int64)
     col0 = ft.col0()
     nxt = next_token_start(col0)
     ok = (nxt != CTC_BLANK) & ~np.isin(nxt, np.asarray(list(punct_ids), dtype=np.int64))
@@ -1551,12 +1567,12 @@ def truncate_frames(ft: "FrameTargets", min_frac: float, min_s: float, punct_ids
 
 
 def truncate_cut(ft: "FrameTargets", rng: np.random.Generator, min_frac: float, min_s: float,
-                 punct_ids: Sequence[int], pause_p: float = 0.0) -> int | None:
+                 punct_ids: Sequence[int], pause_p: float = 0.0, min_row_s: float = 0.0) -> int | None:
     """truncate's cut frame: with probability pause_p one drawn uniformly among the truncate_frames that lie inside a
     pause (pause_frames: the kept part then ends in silence, as a voice-detector chunk does, with the sentence still
     running), otherwise - or when there is no such frame - uniformly among all truncate_frames. None when there are
     none: a row without a word token after lo (no token, a short row, one whose last word starts before lo)."""
-    cand = truncate_frames(ft, min_frac, min_s, punct_ids)
+    cand = truncate_frames(ft, min_frac, min_s, punct_ids, min_row_s)
     if not len(cand):
         return None
     if pause_p > 0 and rng.random() < pause_p:
@@ -1621,6 +1637,14 @@ def mix_into(dst: np.ndarray, src: np.ndarray, rng: np.random.Generator,
     return out, dict(src_start=s0, offset=off, n=n, snr_db=snr, gain=gain)
 
 
+def end_samples(c: int, rng: np.random.Generator) -> int:
+    """Where a row of c encoder frames ends when it is cut (or padded): a sample drawn uniformly in [FRAME_SAMPLES c -
+    END_BELOW, FRAME_SAMPLES c + END_ABOVE], every one of which is still c frames (ctc_frames), so its last frame
+    is as full or as empty as a natural utterance's or an app chunk's - never always exactly full, which the first
+    recipe's student learned to read as "cut, so no mark"."""
+    return FRAME_SAMPLES * int(c) + int(rng.integers(-END_BELOW, END_ABOVE + 1))
+
+
 def blank_frame_targets(n: int, blank_lp: float, k: int) -> "FrameTargets":
     """n frames of pure blank, a quiet pad's targets: log p(blank) = blank_lp at every frame and no dense frame (the
     teacher's p(blank) there is above its dense threshold), so no token - and no mark - comes from them; top-k width k,
@@ -1662,18 +1686,24 @@ class _AugRow:
     def pad_quiet(self, n: int, src: np.ndarray, rng: np.random.Generator):
         """Append n frames of quiet (quiet_pad, room tone from src) with pure-blank targets at the row's most confident
         blank (at least PAD_MIN_BLANK_LP): the audio first squared to exactly FRAME_SAMPLES x its frames as a joined
-        piece is (join_waves), so the pad starts on an encoder frame boundary and the row's frames grow by exactly n.
+        piece is (join_waves), so the pad starts on an encoder frame boundary and the row's frames grow by exactly n;
+        the padded row's end drawn as a cut's (end_samples).
         The targets before the pad are unchanged: a cut row still ends without a mark, a whole row keeps its own."""
         n, T = int(n), self.ft.n_frames
         b = max(float(np.max(self.ft.blank_lp)) if T else 0.0, PAD_MIN_BLANK_LP)
-        self.wave = join_waves([self.wave, quiet_pad(src, n, rng)], [T, n], rng)
+        wave = join_waves([self.wave, quiet_pad(src, n, rng)], [T, n], rng)
+        self.wave = wave[:min(end_samples(T + n, rng), len(wave))]  # the end drawn, as a cut's (end_samples)
         self.ft = join_frame_targets([self.ft, blank_frame_targets(n, b, self.ft.k)])
         self.pad += n
 
-    def cut_at(self, c: int):
-        """Keep the first c frames: the audio at exactly FRAME_SAMPLES x c samples (ctc_frames of it is c; a row of
-        T > c frames always has that many), the targets cut_frame_targets', and only the pieces that start before c."""
-        self.wave = self.wave[:FRAME_SAMPLES * int(c)]
+    def cut_at(self, c: int, rng: np.random.Generator | None = None):
+        """Keep the first c frames: the targets cut_frame_targets', only the pieces that start before c, and the audio
+        up to end_samples(c, rng) - any sample where it is still c frames - or, without rng, exactly FRAME_SAMPLES x c
+        (a row of T > c frames always has the audio: at least FRAME_SAMPLES x T - END_BELOW samples)."""
+        n = FRAME_SAMPLES * int(c) if rng is None else min(end_samples(c, rng), len(self.wave))
+        if ctc_frames(n) != int(c):  # never for a row of more than c frames; kept as the frame contract's guard
+            n = FRAME_SAMPLES * int(c)
+        self.wave = self.wave[:n]
         self.ft = cut_frame_targets(self.ft, c)
         n = sum(1 for o in self.offsets if o < c)
         self.pieces, self.offsets, self.cut = self.pieces[:n], self.offsets[:n], int(c)

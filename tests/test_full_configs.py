@@ -777,7 +777,8 @@ def test_box_p01_is_the_recipe_test(reg, plan, trainer):
     assert (c["box"], c["run_id"], c["from_step"], c["epochs"], c["patience"], c["augment"], c["revision"]) == (
         "p01", P01_RID, 86328, 4, None, M.RECIPE_TEST, "c4604304db76e068df7bbe39d00d006b74d6c134")
     assert M.RECIPE_TEST == {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}  # H1, H4: as run
-    assert M.RECIPE == {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0}  # DECISIONS H6: v2, P-0.3B's
+    assert M.RECIPE == {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0,
+                        "truncate_min_row_s": 3.0}  # DECISIONS H6: v2, P-0.3B's
     assert c["epochs"] == M.FULL_RUNS["p01"]["epochs"] == cfg("full-p01")["schedule"]["epochs"]  # box 1's T again
     raw = (FULL / "full-p01.json").read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(raw).hexdigest() == FULL_P01_SHA256

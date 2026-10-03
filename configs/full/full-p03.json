@@ -210,6 +210,7 @@
   "enabled": true,
   "truncate_p": 0.2,
   "concat_p": 0.5,
-  "mix_p": 0.0
+  "mix_p": 0.0,
+  "truncate_min_row_s": 3.0
  }
 }

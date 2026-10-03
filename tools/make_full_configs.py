@@ -117,17 +117,20 @@ STUDY_DATA = ROOT / "study" / "data.json"
 # mixing, mix_p 0.05 (another row 5-20 dB down under the clean row's targets; the owner's launch line). Kept as the
 # record of what ran: the recipe test box's --resume-set flags (CONTINUATIONS p01, continuation_flags)
 RECIPE_TEST = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}
-# THE RECIPE (v2, DECISIONS H6, owner 2026-10-03 "Fix, then launch P-0.3B anew with the new recipe"), after the
-# external review of the test's model: truncate 0.2 (0.3 left the final 。 off 3-8 % of complete sentences, JSUT 92 %
-# against the gate's 95 %), concat 0.5 as tested (the collab +5 pp) and mixing OFF (0.05 already made two equally loud
-# voices much worse, 56 % against 47 % CER, mostly deleted text, and short utterances lost more words - "いない。"
-# read "。"). The quiet pads (truncate_pad_p / end_pad_p, kitsune/trainset.py) stay OFF: in the CPU pilot from A0
-# (30 steps; streamfix/periods-model/out/pause_probe_v2.log) they only moved the overall mark bias - end pads 0.3 cut
-# the right marks after a complete sentence to 0.35-0.60 - and never improved telling a cut from a sentence end; the
-# app's chunk ends inside a word are the engine's (Shisu-ko F1: cut at pauses, F2: strip marks at in-speech cuts).
-# Every other augment.* key stays the trainer's default, so the block names only what the recipe sets; mix_p stays in
-# it, at 0, so the record says mixing is off. P-0.3B's run carries it as its augment block (FULL_RUNS p03)
-RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0}
+# THE RECIPE (v2, DECISIONS H6, owner 2026-10-03 "Fix, then launch P-0.3B anew with the new recipe"), after the external
+# review of the test's model: truncate 0.2 (0.3 left the final 。 off 3-8 % of complete sentences, JSUT 92 % against the
+# gate's 95 %), truncate_min_row_s 3.0 (rows under 3 s are never cut: short utterances lost more words), concat 0.5 as
+# tested (joined broadcast chunks 29.8 -> 17.4 % CER, the collab +5 pp) and mixing OFF (0.05 already made two equally
+# loud voices much worse, 56 % against 47 % CER, mostly deleted text). The trainer now ends every cut row's audio at a
+# drawn sample (trainset.end_samples): the first recipe cut on 80 ms boundaries only, and the tested model learned that
+# alignment, not the words, as its "no mark" cue (the review's own cuts: 2.8 % false marks on a boundary, 100 %
+# mid-frame - every cut through a word and most of the app's chunk ends). The quiet pads (truncate_pad_p / end_pad_p)
+# stay OFF: in the CPU pilot from A0 (30 steps; streamfix/periods-model/out/pause_probe_v2.log) they only moved the
+# overall mark bias (end pads 0.3 cut the right marks after a complete sentence to 0.35-0.60), and they too ended on
+# frame boundaries then. Every other augment.* key stays the trainer's default, so the block names only what the recipe
+# sets; mix_p stays in it, at 0, so the record says mixing is off. P-0.3B's run carries it as its augment block
+# (FULL_RUNS p03)
+RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0, "truncate_min_row_s": 3.0}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
