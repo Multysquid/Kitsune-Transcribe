@@ -325,7 +325,7 @@ Full-data runs: timed states, heartbeats, 4e, fix 7 (the full-run build contract
                     steps.parquet keeps a row per step. mem/step_peak_reserved_gb (CUDA) is logged every step, and
                     summary.json's throughput has data_wait_frac (the loader's share of the steps' time)
 
-Train-data augmentation (augment.*, family "ctc"; off by default, and off it trains exactly as before). The owner's
+Train-data augmentation (augment.*, either family; off by default, and off it trains exactly as before). The owner's
 review of P-0.1B inside the app found two faults of the data, not of the model size: every train row is one whole
 utterance ending in a sentence mark, so the student puts 。 wherever its input ends (and none at a real sentence end
 inside a long chunk), and it never saw two utterances or two voices in one input (ReazonSpeech 11.9 % CER per
@@ -349,7 +349,14 @@ which reads the run's own config - or a T/2 branch augments every step as the or
 aug/concat_frac (the share of the step's utterances in a joined row), aug/truncated_frac, aug/mixed_frac,
 aug/cut_padded_frac and aug/end_padded_frac (shares of its rows); a joined row's train_utts record has the pieces' ids
 joined by "+", the first piece's source, their summed duration (a cut row: the seconds kept; plus a pad's). The smoke's
-dropped-audio share counts utterances, not joined rows (batch_utts)
+dropped-audio share counts utterances, not joined rows (batch_utts).
+An AED student (the T students, DECISIONS H7) takes the same recipe on its token targets (kitsune.trainset's "AED
+rows"): a join concatenates the pieces' Cohere tokens (each piece's EOS dropped but the last's; a micro-batch whose joined rows
+would pass batch.max_dec_len stays unjoined, aug/concat_capped), and a cut keeps the tokens the cut table names for
+its frame, then EOS. An AED row has no frame targets, so augment.cuts names the cut table (tools/aed_cut_table.py,
+kitsune/aed_cuts.py: the Parakeet teacher's CTC alignment of the same rows, carried over to the Cohere tokens by
+aligning the two teachers' texts), augment.cuts_sha256 pins it, and setup_augment joins it to the train store once
+(under the store's cache dir). No pads for an AED student (truncate_pad_p and end_pad_p must stay 0)
 """
 import argparse
 import concurrent.futures
@@ -475,7 +482,7 @@ DEFAULTS = {
     # with (seed, step, micro-batch index), so a resumed or branched run augments exactly as its parent would have
     "specaug": {"enabled": True, "freq_masks": 2, "freq_width": 27, "time_masks_min": 2, "time_masks_max": 5,
                 "time_width": 0.05, "seed": None},
-    # the CTC family's train-data augmentation (kitsune.trainset's "augmentation" section; the module docstring's
+    # the train-data augmentation (kitsune.trainset's "augmentation" section; the module docstring's
     # "Train-data augmentation"): the TRAIN loader's micro-batches only - never an eval, dev, probe, smoke check or the
     # memory probe. enabled false (the default) trains exactly as before. seed: null = the run's seed; every micro-batch
     # draws from (seed, its index list) alone. truncate_p: per row, cut it at a frame >= truncate_min_frac of its
@@ -492,11 +499,13 @@ DEFAULTS = {
     # micro-batch's longest row. truncate_min_row_s: rows shorter than this many seconds are never cut. A cut row's
     # audio ends at a sample drawn where it is still the cut's frames (trainset.end_samples), never always on an 80 ms
     # boundary. A resume may change any of them (the step plan does not depend on them; the change is in its
-    # `resume` event's overrides), a T/2 branch none (BRANCH_FREE)
+    # `resume` event's overrides), a T/2 branch none (BRANCH_FREE). An AED student cuts where the cut table cuts: cuts
+    # is its path (rpath: relative to the repo root; required when an AED student's truncate_p > 0, null for a CTC
+    # one), cuts_sha256 the table's pinned sha256 (null: not checked); its truncate_pad_p and end_pad_p stay 0
     "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
                 "truncate_pause_p": 0.5, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0,
                 "mix_snr_db": [5.0, 20.0], "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
-                "truncate_min_row_s": 0.0},
+                "truncate_min_row_s": 0.0, "cuts": None, "cuts_sha256": None},
     # BatchNorm: mode "frozen" (eval mode, running stats fixed, affine trainable: the pruned students, whose BN holds
     # the teacher's statistics) or "train" (a student trained from scratch: BN trains, its running stats update, eval
     # and greedy decoding use them; gradient checkpointing is never turned on). momentum: null = the modules' own
@@ -956,9 +965,10 @@ def validate_state(cfg: dict):
 
 
 def validate_augment(cfg: dict):
-    """augment.* (the CTC family's train-data augmentation; DEFAULTS, the module docstring), checked whether or not it
-    is enabled, so a typo in a block that a later --set turns on fails now. The AED students refuse it: their token
-    targets are per decoder position, and a cut or joined row has no such targets (kitsune.trainset.dataset_for)."""
+    """augment.* (the train-data augmentation; DEFAULTS, the module docstring), checked whether or not it is enabled,
+    so a typo in a block that a later --set turns on fails now. An AED student's cuts come from the cut table
+    (augment.cuts, required when it cuts) and it takes no pads; a CTC student cuts on its own frame targets and names no
+    table."""
     a = cfg["augment"]
     seed = a["seed"]
     if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0):
@@ -989,10 +999,22 @@ def validate_augment(cfg: dict):
             and 0 <= snr[0] <= snr[1]):
         raise SystemExit(f"augment.mix_snr_db must be [low, high] dB with 0 <= low <= high (the interferer below the "
                          f"row: the targets are the row's, so it must stay the dominant voice), got {snr!r}")
-    if a["enabled"] and not is_ctc(cfg):
-        raise SystemExit(f"augment.enabled is the CTC family's (family 'ctc'): an AED student's targets are per "
-                         f"decoder position and cannot follow a cut or joined row; this config's family is "
-                         f"{family(cfg)!r}")
+    if a["cuts"] is not None and not (isinstance(a["cuts"], str) and a["cuts"]):
+        raise SystemExit(f"augment.cuts must be null or the cut table's path, got {a['cuts']!r}")
+    sha = a["cuts_sha256"]
+    if sha is not None and not (isinstance(sha, str) and len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)):
+        raise SystemExit(f"augment.cuts_sha256 must be null or a sha256 (64 lowercase hex digits), got {sha!r}")
+    if is_ctc(cfg):
+        if a["cuts"] is not None or sha is not None:
+            raise SystemExit("augment.cuts / cuts_sha256 are an AED student's (its cut table, kitsune.aed_cuts); a CTC "
+                             "student cuts on its own frame targets")
+    elif a["enabled"]:
+        if a["truncate_pad_p"] or a["end_pad_p"]:
+            raise SystemExit(f"augment.truncate_pad_p / end_pad_p must be 0 on an AED student (a quiet pad adds no "
+                             f"token; kitsune.trainset's \"AED rows\"), got {a['truncate_pad_p']} / {a['end_pad_p']}")
+        if a["truncate_p"] and a["cuts"] is None:
+            raise SystemExit(f"augment.truncate_p {a['truncate_p']} on an AED student needs augment.cuts, the cut "
+                             f"table (tools/aed_cut_table.py): an AED row has no frame targets to say what a cut keeps")
 
 
 def augment_on(cfg: dict) -> bool:
@@ -2261,8 +2283,10 @@ def setup_dev(R: Run) -> dict:
 
 def setup_augment(R: Run):
     """The train loader's dataset (loop's make_loader): R.ds itself, or under augment.enabled a copy of it sharing its
-    arrays (FrameBatchDataset.with_augment) that augments every micro-batch (kitsune.trainset.Augment; the module
-    docstring's "Train-data augmentation"). R.ds stays plain for the smoke checks, the memory probe and the FLOP count.
+    arrays (FrameBatchDataset / AudioBatchDataset .with_augment) that augments every micro-batch (kitsune.trainset.
+    Augment; the module docstring's "Train-data augmentation"). R.ds stays plain for the smoke checks, the memory probe
+    and the FLOP count. An AED student's copy also gets the cut table joined to the train store (setup_aed_cuts) and
+    max_tokens, the planner's decoder cap a joined row must keep.
     seed: augment.seed, else the run's. concat_max_s is clamped to the longest train utterance (stored duration): a
     joined row is then never longer than the row the memory probe's longest micro-batch ran, and its micro-batch never
     has more padded frames than the planned one, so the probe's peak still bounds every joined micro-batch. An
@@ -2274,6 +2298,8 @@ def setup_augment(R: Run):
     seed = int(cfg["seed"]) if a["seed"] is None else int(a["seed"])
     longest = float(np.max(R.ds.duration)) if len(R.ds) else 0.0  # the stored durations, as the planner packs them
     used = min(float(a["concat_max_s"]), longest) if longest > 0 else float(a["concat_max_s"])
+    if not is_ctc(cfg):
+        return setup_aed_augment(R, a, seed, used, longest)
     punct = punct_token_ids(R.tokenizer)
     if float(a["truncate_p"]) > 0 and not any(t in SENTENCE_MARKS for t in punct.values()):
         raise SystemExit(f"augment.truncate_p {a['truncate_p']} needs the student tokenizer's sentence marks "
@@ -2296,6 +2322,43 @@ def setup_augment(R: Run):
           f"{spec.truncate_pad_p:g} / after whole rows {spec.end_pad_p:g} ({spec.pad_frames[0]}-{spec.pad_frames[1]} "
           f"frames), seed {seed}", flush=True)
     return R.ds.with_augment(spec)
+
+
+def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float):
+    """setup_augment of an AED student: the cut table joined to the train dataset (when it cuts; kitsune.aed_cuts.
+    build_cut_index under <the train store>/aed_cuts, reused across restarts, the table's sha256 checked against
+    augment.cuts_sha256) and an Augment with max_tokens = batch.max_dec_len - (prompt length - 1), the most target
+    tokens the planner lets a row have. The `augment` event records the table and its coverage."""
+    from kitsune import aed_cuts
+
+    prompt_len = len(R.train.info.get("prompt", trainset.PROMPT))
+    max_tokens = int(R.cfg["batch"]["max_dec_len"]) - (prompt_len - 1)
+    cuts = info = None
+    if float(a["truncate_p"]) > 0:
+        cuts = aed_cuts.build_cut_index(rpath(a["cuts"]), R.ds.ids, Path(R.ds.cache_dir) / "aed_cuts",
+                                        expect_sha256=a["cuts_sha256"], log=lambda m: print(m, flush=True))
+        info = dict(cuts.info)
+        if not info["rows_with_cuts"]:
+            raise SystemExit(f"augment.cuts {a['cuts']}: none of the {info['rows']} train rows has a cut in the table "
+                             f"({info['rows_in_table']} are in it): a table of another selection?")
+    spec = trainset.Augment.from_config(a, seed=seed, concat_max_s=used, max_tokens=max_tokens)
+    R.log.event("augment", seed=seed, family="aed", truncate_p=spec.truncate_p,
+                truncate_min_frac=spec.truncate_min_frac, truncate_min_s=spec.truncate_min_s,
+                truncate_pause_p=spec.truncate_pause_p, concat_p=spec.concat_p, concat_max_n=spec.concat_max_n,
+                concat_max_s=used, concat_max_s_config=float(a["concat_max_s"]), longest_train_s=round(longest, 3),
+                concat_max_s_clamped=used < float(a["concat_max_s"]), mix_p=spec.mix_p,
+                mix_snr_db=list(spec.mix_snr_db), truncate_min_row_s=spec.truncate_min_row_s, max_tokens=max_tokens,
+                truncate_pad_p=0.0, end_pad_p=0.0, cuts=a["cuts"], cuts_sha256=(info or {}).get("table_sha256"),
+                cuts_index=str(cuts.path) if cuts is not None else None,
+                cuts_rows=(info or {}).get("rows"), cuts_rows_in_table=(info or {}).get("rows_in_table"),
+                cuts_rows_with_cuts=(info or {}).get("rows_with_cuts"), cuts_entries=(info or {}).get("entries"))
+    clamp = " = the longest train utterance" if used < float(a["concat_max_s"]) else ""
+    print(f"augment (aed): truncate_p {spec.truncate_p:g} (rows >= {spec.truncate_min_row_s:g} s, pause cuts "
+          f"{spec.truncate_pause_p:g}, at the cut table's frames"
+          + (f": {info['rows_with_cuts']} of {info['rows']} rows" if info else "") + f"), concat_p {spec.concat_p:g} "
+          f"(k <= {spec.concat_max_n}, <= {used:g} s{clamp}, <= {max_tokens} tokens), mix_p {spec.mix_p:g} at "
+          f"{spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, seed {seed}", flush=True)
+    return R.ds.with_augment(spec, cuts)
 
 
 # the text of the tokens truncate must never remove alone (punct_token_ids): sentence marks and commas, full- and
@@ -2709,6 +2772,9 @@ def train_step(R: Run, step: int, lr: float, mbs: list[dict], epoch: int) -> dic
     out["masked_frac"] = float(np.concatenate(masked).mean()) if masked else float("nan")
     out["dropped"] = len(dropped)
     out["n_utts"] = len(utts)
+    augs = [mb["aug"] for mb in mbs if "aug" in mb]
+    if augs:  # augment.enabled: the step's sums of its micro-batches' counts (log_step's aug/* shares)
+        out["aug"] = {k: sum(int(a[k]) for a in augs) for k in augs[0]}
     return out
 
 
@@ -2939,12 +3005,15 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
     }
     if "aux_ctc" in out:  # the aux-CTC loss per target token (unweighted; loss.aux_ctc_weight x it is in loss/total)
         row["loss/aux_ctc"] = out["aux_ctc"]
-    if "aug" in out:  # augment.enabled (train_step_ctc): the step's share of utterances in a joined row, of rows cut,
-        a = out["aug"]  # mixed and padded; next to aug/masked_frac, and like it only on full rows (lean_step)
+    if "aug" in out:  # augment.enabled (either train step): the step's share of utterances in a joined row, of rows
+        a = out["aug"]  # cut, mixed and padded; next to aug/masked_frac, and like it only on full rows (lean_step)
         utts, rows = max(int(a["utts"]), 1), max(int(a["rows"]), 1)
         row.update({"aug/concat_frac": a["concat_utts"] / utts, "aug/truncated_frac": a["truncated"] / rows,
                     "aug/mixed_frac": a["mixed"] / rows, "aug/cut_padded_frac": a.get("cut_padded", 0) / rows,
                     "aug/end_padded_frac": a.get("end_padded", 0) / rows})
+        if "concat_capped" in a:  # an AED step: micro-batches whose join the decoder cap refused, and cut-table pieces
+            # whose frames differ from their decoded audio's (counts; the second is expected to stay 0)
+            row.update({"aug/concat_capped": a["concat_capped"], "aug/cut_mismatch": a["cut_mismatch"]})
     if flops is not None:
         row["perf/tflops"] = flops / step_s / 1e12
         row["perf/mfu"] = flops / step_s / (float(cfg["perf"]["peak_tflops"]) * 1e12)

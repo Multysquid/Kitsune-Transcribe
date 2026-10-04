@@ -46,7 +46,7 @@
   "clock": "epochs",
   "max_steps": null,
   "end_reserve_min": 55,
-  "epochs": 3,
+  "epochs": 8,
   "deadline_cooldown": true
  },
  "batch": {
@@ -203,5 +203,14 @@
  "student": "students/study/t06",
  "bn": {
   "mode": "frozen"
+ },
+ "augment": {
+  "enabled": true,
+  "truncate_p": 0.2,
+  "concat_p": 0.5,
+  "mix_p": 0.0,
+  "truncate_min_row_s": 3.0,
+  "cuts": "labels/full/selections/full_study/aed_cuts.parquet",
+  "cuts_sha256": "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb"
  }
 }

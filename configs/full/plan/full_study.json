@@ -7337,14 +7337,19 @@
     "family": "aed",
     "micro_audio_s": 450.0,
     "step_audio_s": 1730.0,
-    "epochs": 3,
+    "epochs": 8,
     "max_dec_len": 200,
     "steps_per_epoch": [
      23982,
      23982,
+     23982,
+     23982,
+     23982,
+     23981,
+     23982,
      23982
     ],
-    "total_steps": 71946,
+    "total_steps": 191855,
     "step_real_s": {
      "mean": 1730.7678638526334,
      "min": 1522.1894307136536,
@@ -7358,7 +7363,7 @@
     "micro_targets_max": 2163,
     "excluded_dec_len": 409,
     "steps_per_0p1_epoch": 2398.2,
-    "cooldown_start_step": 57558,
+    "cooldown_start_step": 153485,
     "real_h": 11529.79858636496,
     "worst_shapes": [
      {

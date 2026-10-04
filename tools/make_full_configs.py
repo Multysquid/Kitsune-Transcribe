@@ -131,6 +131,16 @@ RECIPE_TEST = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.0
 # sets; mix_p stays in it, at 0, so the record says mixing is off. P-0.3B's run carries it as its augment block
 # (FULL_RUNS p03)
 RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0, "truncate_min_row_s": 3.0}
+# THE AED RECIPE (DECISIONS H7, owner 2026-10-05: "prepare the T-box run with 8 epochs with the same recipe"): RECIPE on
+# the T student's token targets (kitsune.trainset's "AED rows"). An AED row has no frame targets, so its cuts come from
+# the cut table (AED_CUTS, tools/aed_cut_table.py on full.parquet and the two label roots: every frame where the
+# Parakeet teacher's CTC alignment has a word start whose boundary maps onto the Cohere tokens - 96.5-99.8 % of the rows
+# >= 3 s have one, 55-69 % one in a pause), pinned by its sha256 and pulled by box full-t (boxes.json extra_files); a
+# cut row keeps the Cohere tokens before that boundary and ends in EOS. The joins and their cap (batch.max_dec_len) as
+# the trainer's; no pads (an AED student takes none)
+AED_CUTS = "labels/full/selections/full_study/aed_cuts.parquet"
+AED_CUTS_SHA256 = "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb"
+RECIPE_AED = {**RECIPE, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
@@ -138,19 +148,20 @@ RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0, "tr
 # below). EPOCHS: DECISIONS G1, confirmed by the owner on 2026-10-02 (~11:30Z, "3 / 3 / 5" after the epoch analysis,
 # D:/kitsune-tmp/fullbuild/epochs/RECOMMENDATION.md): T-0.6B 3, P-0.3B 3, P-0.05B 5, each with COMMON's early-stop
 # patience; P-0.3B 6 since DECISIONS H5 (the owner, 2026-10-03, after the recipe test: its augmentation varies the
-# data every epoch, and the early stop still cools down early if dev stops improving). The owner's earlier request
+# data every epoch, and the early stop still cools down early if dev stops improving); T-0.6B 8 since DECISIONS H7 (the
+# owner, 2026-10-05, after P-0.3B's 6-epoch result, with the same recipe). The owner's earlier request
 # of the same day to plan 10 epochs for these runs was WITHDRAWN after that
 # analysis (DECISIONS G "Rejected: 10 epochs"). P-0.1B's run stays box 1's 4 epochs, and so does its recipe test, which
 # re-runs box 1's cooldown to the same end (CONTINUATIONS, DECISIONS H1; G3's 8-epoch continuation is postponed, H2).
 # This is the one epoch parameter: a change here, then --import-launch-plan of a full_plan.py record at the new
 # epochs, then the printed hours (--import-speed) into boxes.json. AUGMENT: the run's augment block (full_config; the
 # smoke configs never take it), None for none. DECISIONS H1 step 2: P-0.3B trains with RECIPE (v2 since H6, after
-# the recipe test on box p01 and its external review); T-0.6B (box full-t, postponed: the AED
-# family has no truncate or concat yet, H2), P-0.05B (postponed, H2; its config stays) and P-0.1B's 4-epoch run (box
-# 1, done: its config is the one the test resumes, byte for byte) have none
+# the recipe test on box p01 and its external review); T-0.6B (box full-t) with RECIPE_AED (H7); P-0.05B (postponed,
+# H2; its config stays) and P-0.1B's 4-epoch run (box 1, done: its config is the one the test resumes, byte for byte)
+# have none
 FULL_RUNS = {
-    "t06": dict(study_run="study-t06", epochs=3, warmup=300, lr=2e-4, micro=450, step=1730, dev_greedy=False,
-                pull_parakeet=False, end_reserve=55, augment=None),
+    "t06": dict(study_run="study-t06", epochs=8, warmup=300, lr=2e-4, micro=450, step=1730, dev_greedy=False,
+                pull_parakeet=False, end_reserve=55, augment=RECIPE_AED),
     "p03": dict(study_run="study-p03", epochs=6, warmup=300, lr=2e-4, micro=600, step=1350, dev_greedy=True,
                 pull_parakeet=False, end_reserve=30, augment=RECIPE),
     "p01": dict(study_run="study-p01", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,

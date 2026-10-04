@@ -1995,16 +1995,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.config is not None and args.config != spec["data_config"]:
             errors.append(f"box {args.box}'s data config is {spec['data_config']} ({fullrun.BOXES_FILE}): --config "
                           f"{args.config} refused (its items' configs share that data block)")
-        # augment.* is the CTC family's train-data augmentation (DECISIONS H0/H1): 04_distill's validate_augment refuses
-        # augment.enabled on an AED student, but only on the box - after the paid boot, the label pull and the store
-        # build, and then on every attempt the queue retries. A box whose train items are all AED has no run the recipe
-        # could apply to, so its augment sets are refused here, before anything is rented
+        # augment.* resume sets are the CTC family's (DECISIONS H0/H1). An AED student takes its augmentation from its
+        # config (DECISIONS H7: full-t06.json's augment block with augment.cuts, its cut table, which no resume set can
+        # name), and a set that turned truncate on without one would be refused by 04_distill's validate_augment only on
+        # the box - after the paid boot, the label pull and the store build, and then on every attempt the queue
+        # retries. So a box whose train items are all AED has its augment sets refused here, before anything is rented
         aug_keys = sorted({kv.partition("=")[0] for kvs in sets.values() for kv in kvs if kv.startswith("augment.")})
         families = sorted({it.get("family") or "aed" for it in spec.get("items") or [] if it.get("kind") == "train"})
         if aug_keys and "ctc" not in families:
             errors.append(f"--resume-set {', '.join(aug_keys)}: box {args.box} trains no CTC student (its train "
-                          f"items' families: {', '.join(families) or 'none'}), and augment.* is the CTC family's "
-                          f"(scripts/04_distill.py validate_augment would refuse it on the box, after the paid boot)")
+                          f"items' families: {', '.join(families) or 'none'}), and augment.* resume sets are the CTC "
+                          f"family's (an AED student's augmentation is its config's, with its cut table)")
         if spec["timed_states"] and not args.scratch_repo:
             errors.append(f"box {args.box} keeps timed full states: --scratch-repo <the private scratch model repo> is "
                           f"required (vast/README.md, full-data runs)")

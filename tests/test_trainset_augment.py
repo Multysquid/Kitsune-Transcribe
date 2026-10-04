@@ -11,7 +11,8 @@ the module docstring's "Train-data augmentation"):
   before its cut and removes the final token; concat puts each piece at its offset, its group size divides the rows and
   its padded frames never exceed the micro-batch's; mix keeps targets and lengths and hits the SNR; the same index list
   gives the same batch in any process, another seed another
-- the trainer: augment.* validated (AED refused), changeable on resume; a tiny CTC run with all three augmentations
+- the trainer: augment.* validated (an AED student's rules: tests/test_aed_augment.py), changeable on resume; a tiny
+  CTC run with all three augmentations
   through its smoke phase logs the aug/* shares and the clamp, and a crash resumed from a mid state ends with the
   uninterrupted run's weights
 CPU only, tiny models, synthetic data in the real on-disk formats (tests/fixtures.py, tests/fixtures_ctc.py)."""
@@ -174,8 +175,9 @@ def test_off_is_the_plain_dataset(env):
 
 
 def test_augment_spec_and_where_it_applies(env, tmp_path):
-    """Augment refuses settings outside its ranges; dataset_for takes an augmentation for a frame store only (a token
-    store's per-position targets cannot follow a cut); with_augment shares the plain dataset's arrays."""
+    """Augment refuses settings outside its ranges; dataset_for takes a CTC augmentation for a frame store only (a
+    token store takes an AED one: tests/test_aed_augment.py) and a frame store no AED one; with_augment shares the plain
+    dataset's arrays."""
     for bad in (dict(truncate_p=1.5), dict(concat_p=-0.1), dict(mix_p=2), dict(truncate_min_frac=1.0),
                 dict(truncate_min_s=-1), dict(concat_max_s=0), dict(concat_max_n=1), dict(mix_snr_db=(10, 5)),
                 dict(mix_snr_db=(-3, 5)), dict(seed=-1), dict(truncate_pause_p=1.5),
@@ -198,8 +200,10 @@ def test_augment_spec_and_where_it_applies(env, tmp_path):
     fc = env["fc"]
     tok = T.build_stores(env["sel"], fc.data, fc.teacher_out, tmp_path / "tok", ["src_b"], ["train"],
                          log=lambda s: None)
-    with pytest.raises(ValueError, match="frame store"):
+    with pytest.raises(ValueError, match="CTC augmentation"):
         T.dataset_for(tok, augment=a)
+    with pytest.raises(ValueError, match="on a frame store"):
+        T.dataset_for(env["store"], augment=T.Augment(seed=1, concat_p=0.5, max_tokens=191))
 
 
 # ---------------------------------------------------------------------------------------------------- the pieces
@@ -682,15 +686,15 @@ def test_a_cut_pad_keeps_the_cut_and_adds_quiet(env):
 
 
 def test_validate_the_augment_block():
-    """augment.* off by default and checked whether or not it is on; the AED family refuses it (its token targets
-    cannot follow a cut or joined row); a resume may change it - it does not shape the step plan -, unlike the
+    """augment.* off by default and checked whether or not it is on (an AED student's own rules - the cut table, no
+    pads -: tests/test_aed_augment.py); a resume may change it - it does not shape the step plan -, unlike the
     RESUME_FIXED keys."""
     m = load_script("04_distill")
     assert m.DEFAULTS["augment"] == {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3,
                                      "truncate_min_s": 1.0, "truncate_pause_p": 0.5, "concat_p": 0.0,
                                      "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0, "mix_snr_db": [5.0, 20.0],
                                      "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
-                                     "truncate_min_row_s": 0.0}
+                                     "truncate_min_row_s": 0.0, "cuts": None, "cuts_sha256": None}
     assert not m.augment_on(m.load_config(None, [])) and not m.augment_on({})
     ctc = ["family=ctc", "parakeet_root=po"]
     assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.mix_p=0.5"]))
@@ -703,14 +707,14 @@ def test_validate_the_augment_block():
                        (["augment.truncate_min_s=-1"], "truncate_min_s"), (["augment.concat_max_s=0"], "concat_max_s"),
                        (["augment.concat_max_n=1"], "concat_max_n"), (["augment.concat_max_n=2.0"], "concat_max_n"),
                        (["augment.mix_snr_db=[20, 5]"], "mix_snr_db"), (["augment.mix_snr_db=[-5, 5]"], "mix_snr_db"),
-                       (["augment.mix_snr_db=[5]"], "mix_snr_db"), (["augment.enabled=true"], "CTC family's"),
+                       (["augment.mix_snr_db=[5]"], "mix_snr_db"),
                        (["augment.truncate_pad_p=1.5"], "augment.truncate_pad_p"),
                        (["augment.end_pad_p=-0.1"], "augment.end_pad_p"), (["augment.pad_frames=[0, 5]"], "pad_frames"),
                        (["augment.pad_frames=[3, 2]"], "pad_frames"), (["augment.pad_frames=[1, 26]"], "pad_frames"),
                        (["augment.pad_frames=[1.0, 2]"], "pad_frames"), (["augment.pad_frames=3"], "pad_frames"),
                        (["augment.truncate_min_row_s=-1"], "truncate_min_row_s")):
         with pytest.raises(SystemExit, match=match):
-            m.load_config(None, (ctc if bad != ["augment.enabled=true"] else []) + bad)
+            m.load_config(None, ctc + bad)
     saved = m.load_config(None, ctc)
     changed, same = m.resume_overrides(saved, [("augment.enabled", True), ("augment.concat_p", 0.5),
                                                ("augment.seed", None)])

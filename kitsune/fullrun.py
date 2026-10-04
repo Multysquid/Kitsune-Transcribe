@@ -197,7 +197,7 @@ ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # them would test another recipe than the one P-0.3B is to train with, so they are not settable here. None of these
 # keys shapes the step plan (scripts/04_distill.py RESUME_FIXED holds none of them: augment.* happens inside the train
 # loader), so a resume keeps its epoch position; 04_distill validates every value again on the box (validate: epochs,
-# bools; validate_augment: the probabilities, and augment.enabled on a CTC student only)
+# bools; validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set)
 RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
                    "augment.concat_p", "augment.mix_p")
 RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
