@@ -356,7 +356,9 @@ would pass batch.max_dec_len stays unjoined, aug/concat_capped), and a cut keeps
 its frame, then EOS. An AED row has no frame targets, so augment.cuts names the cut table (tools/aed_cut_table.py,
 kitsune/aed_cuts.py: the Parakeet teacher's CTC alignment of the same rows, carried over to the Cohere tokens by
 aligning the two teachers' texts), augment.cuts_sha256 pins it, and setup_augment joins it to the train store once
-(under the store's cache dir). No pads for an AED student (truncate_pad_p and end_pad_p must stay 0)
+(under the store's cache dir). No pads for an AED student (truncate_pad_p and end_pad_p must stay 0); its end_trim_p
+trims the trailing silence of rows that were not cut, keeping their mark (aug/end_trimmed_frac), so a tight end alone
+no longer reads as a cut
 """
 import argparse
 import concurrent.futures
@@ -501,11 +503,18 @@ DEFAULTS = {
     # boundary. A resume may change any of them (the step plan does not depend on them; the change is in its
     # `resume` event's overrides), a T/2 branch none (BRANCH_FREE). An AED student cuts where the cut table cuts: cuts
     # is its path (rpath: relative to the repo root; required when an AED student's truncate_p > 0, null for a CTC
-    # one), cuts_sha256 the table's pinned sha256 (null: not checked); its truncate_pad_p and end_pad_p stay 0
+    # one), cuts_sha256 the table's pinned sha256 (null: not checked); its truncate_pad_p and end_pad_p stay 0.
+    # end_trim_p: per row that was not cut, its trailing silence trimmed to a short tail, its sentence mark kept (an
+    # AED row: 10-80 ms after its last voiced sound, kitsune.trainset's "AED rows"; a CTC row: its mark's frames moved
+    # up behind its last word, _AugRow.trim_end). noise_p: per row, background audio from the bank noise_bank (a
+    # data-repo dir, tools/build_noise_bank.py; noise_bank_sha256 pins its index.json) mixed under the whole row at an
+    # SNR drawn from noise_snr_db ([low, high] dB of the row's voiced power over the background's), its targets the
+    # clean row's (DECISIONS H8: the teachers fall silent on long stretches of talk over game sound and music)
     "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
                 "truncate_pause_p": 0.5, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0,
                 "mix_snr_db": [5.0, 20.0], "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
-                "truncate_min_row_s": 0.0, "cuts": None, "cuts_sha256": None},
+                "truncate_min_row_s": 0.0, "cuts": None, "cuts_sha256": None, "end_trim_p": 0.0, "noise_p": 0.0,
+                "noise_snr_db": [0.0, 20.0], "noise_bank": None, "noise_bank_sha256": None},
     # BatchNorm: mode "frozen" (eval mode, running stats fixed, affine trainable: the pruned students, whose BN holds
     # the teacher's statistics) or "train" (a student trained from scratch: BN trains, its running stats update, eval
     # and greedy decoding use them; gradient checkpointing is never turned on). momentum: null = the modules' own
@@ -973,7 +982,8 @@ def validate_augment(cfg: dict):
     seed = a["seed"]
     if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0):
         raise SystemExit(f"augment.seed must be null (the run's seed) or an int >= 0, got {seed!r}")
-    for key in ("truncate_p", "truncate_pause_p", "concat_p", "mix_p", "truncate_pad_p", "end_pad_p"):
+    for key in ("truncate_p", "truncate_pause_p", "concat_p", "mix_p", "truncate_pad_p", "end_pad_p", "end_trim_p",
+                "noise_p"):
         if not (_number(a[key]) and 0 <= a[key] <= 1):
             raise SystemExit(f"augment.{key} must be a probability in [0, 1], got {a[key]!r}")
     pf = a["pad_frames"]
@@ -999,6 +1009,17 @@ def validate_augment(cfg: dict):
             and 0 <= snr[0] <= snr[1]):
         raise SystemExit(f"augment.mix_snr_db must be [low, high] dB with 0 <= low <= high (the interferer below the "
                          f"row: the targets are the row's, so it must stay the dominant voice), got {snr!r}")
+    nsnr = a["noise_snr_db"]
+    if not (isinstance(nsnr, (list, tuple)) and len(nsnr) == 2 and all(_number(x) for x in nsnr) and nsnr[0] <= nsnr[1]):
+        raise SystemExit(f"augment.noise_snr_db must be [low, high] dB with low <= high, got {nsnr!r}")
+    if a["noise_bank"] is not None and not (isinstance(a["noise_bank"], str) and a["noise_bank"]):
+        raise SystemExit(f"augment.noise_bank must be null or the noise bank's dir, got {a['noise_bank']!r}")
+    nsha = a["noise_bank_sha256"]
+    if nsha is not None and not (isinstance(nsha, str) and len(nsha) == 64 and all(c in "0123456789abcdef" for c in nsha)):
+        raise SystemExit(f"augment.noise_bank_sha256 must be null or a sha256 (64 lowercase hex digits), got {nsha!r}")
+    if a["enabled"] and a["noise_p"] and a["noise_bank"] is None:
+        raise SystemExit(f"augment.noise_p {a['noise_p']} needs augment.noise_bank, the background bank "
+                         f"(tools/build_noise_bank.py)")
     if a["cuts"] is not None and not (isinstance(a["cuts"], str) and a["cuts"]):
         raise SystemExit(f"augment.cuts must be null or the cut table's path, got {a['cuts']!r}")
     sha = a["cuts_sha256"]
@@ -2298,8 +2319,9 @@ def setup_augment(R: Run):
     seed = int(cfg["seed"]) if a["seed"] is None else int(a["seed"])
     longest = float(np.max(R.ds.duration)) if len(R.ds) else 0.0  # the stored durations, as the planner packs them
     used = min(float(a["concat_max_s"]), longest) if longest > 0 else float(a["concat_max_s"])
+    noise = setup_noise_bank(R, a)
     if not is_ctc(cfg):
-        return setup_aed_augment(R, a, seed, used, longest)
+        return setup_aed_augment(R, a, seed, used, longest, noise)
     punct = punct_token_ids(R.tokenizer)
     if float(a["truncate_p"]) > 0 and not any(t in SENTENCE_MARKS for t in punct.values()):
         raise SystemExit(f"augment.truncate_p {a['truncate_p']} needs the student tokenizer's sentence marks "
@@ -2313,18 +2335,43 @@ def setup_augment(R: Run):
                 longest_train_s=round(longest, 3), concat_max_s_clamped=used < float(a["concat_max_s"]),
                 mix_p=spec.mix_p, mix_snr_db=list(spec.mix_snr_db), truncate_pad_p=spec.truncate_pad_p,
                 end_pad_p=spec.end_pad_p, pad_frames=list(spec.pad_frames),
-                truncate_min_row_s=spec.truncate_min_row_s)
+                truncate_min_row_s=spec.truncate_min_row_s, end_trim_p=spec.end_trim_p, **noise_fields(spec, noise))
     print(f"augment: truncate_p {spec.truncate_p:g} (rows >= {spec.truncate_min_row_s:g} s, pause cuts "
           f"{spec.truncate_pause_p:g}, never removing only "
           f"{''.join(punct.values()) or 'punctuation'}), concat_p {spec.concat_p:g} (k <= {spec.concat_max_n}, "
           f"<= {used:g} s{' = the longest train utterance' if used < float(a['concat_max_s']) else ''}), mix_p "
           f"{spec.mix_p:g} at {spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, quiet pads after cuts "
           f"{spec.truncate_pad_p:g} / after whole rows {spec.end_pad_p:g} ({spec.pad_frames[0]}-{spec.pad_frames[1]} "
-          f"frames), seed {seed}", flush=True)
-    return R.ds.with_augment(spec)
+          f"frames), end trim {spec.end_trim_p:g}, background {spec.noise_p:g} at {spec.noise_snr_db[0]:g}-"
+          f"{spec.noise_snr_db[1]:g} dB, seed {seed}", flush=True)
+    return R.ds.with_augment(spec, noise=noise)
 
 
-def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float):
+def setup_noise_bank(R: Run, a: dict):
+    """The background bank of augment.noise_p > 0 (kitsune.noise_bank.NoiseBank.load of rpath(noise_bank), its
+    index.json's sha256 checked against noise_bank_sha256), None otherwise."""
+    if not float(a["noise_p"]) > 0:
+        return None
+    from kitsune.noise_bank import NoiseBank
+
+    try:
+        bank = NoiseBank.load(rpath(a["noise_bank"]), expect_sha256=a["noise_bank_sha256"])
+    except (OSError, ValueError, KeyError) as e:
+        raise SystemExit(f"augment.noise_bank {a['noise_bank']}: {type(e).__name__}: {e}") from None
+    print(f"noise bank: {a['noise_bank']} ({len(bank.lengths)} clips, {bank.hours:.1f} h)", flush=True)
+    return bank
+
+
+def noise_fields(spec, bank) -> dict:
+    """The `augment` event's background fields."""
+    return dict(noise_p=spec.noise_p, noise_snr_db=list(spec.noise_snr_db),
+                noise_bank=None if bank is None else bank.path,
+                noise_bank_sha256=None if bank is None else bank.info.get("index_sha256"),
+                noise_clips=None if bank is None else len(bank.lengths),
+                noise_hours=None if bank is None else round(bank.hours, 2))
+
+
+def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float, noise=None):
     """setup_augment of an AED student: the cut table joined to the train dataset (when it cuts; kitsune.aed_cuts.
     build_cut_index under <the train store>/aed_cuts, reused across restarts, the table's sha256 checked against
     augment.cuts_sha256) and an Augment with max_tokens = batch.max_dec_len - (prompt length - 1), the most target
@@ -2348,17 +2395,19 @@ def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float):
                 concat_max_s=used, concat_max_s_config=float(a["concat_max_s"]), longest_train_s=round(longest, 3),
                 concat_max_s_clamped=used < float(a["concat_max_s"]), mix_p=spec.mix_p,
                 mix_snr_db=list(spec.mix_snr_db), truncate_min_row_s=spec.truncate_min_row_s, max_tokens=max_tokens,
-                truncate_pad_p=0.0, end_pad_p=0.0, cuts=a["cuts"], cuts_sha256=(info or {}).get("table_sha256"),
-                cuts_index=str(cuts.path) if cuts is not None else None,
+                truncate_pad_p=0.0, end_pad_p=0.0, end_trim_p=spec.end_trim_p, cuts=a["cuts"],
+                cuts_sha256=(info or {}).get("table_sha256"), cuts_index=str(cuts.path) if cuts is not None else None,
                 cuts_rows=(info or {}).get("rows"), cuts_rows_in_table=(info or {}).get("rows_in_table"),
-                cuts_rows_with_cuts=(info or {}).get("rows_with_cuts"), cuts_entries=(info or {}).get("entries"))
+                cuts_rows_with_cuts=(info or {}).get("rows_with_cuts"), cuts_entries=(info or {}).get("entries"),
+                **noise_fields(spec, noise))
     clamp = " = the longest train utterance" if used < float(a["concat_max_s"]) else ""
     print(f"augment (aed): truncate_p {spec.truncate_p:g} (rows >= {spec.truncate_min_row_s:g} s, pause cuts "
           f"{spec.truncate_pause_p:g}, at the cut table's frames"
           + (f": {info['rows_with_cuts']} of {info['rows']} rows" if info else "") + f"), concat_p {spec.concat_p:g} "
           f"(k <= {spec.concat_max_n}, <= {used:g} s{clamp}, <= {max_tokens} tokens), mix_p {spec.mix_p:g} at "
-          f"{spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, seed {seed}", flush=True)
-    return R.ds.with_augment(spec, cuts)
+          f"{spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, end trim {spec.end_trim_p:g}, background "
+          f"{spec.noise_p:g} at {spec.noise_snr_db[0]:g}-{spec.noise_snr_db[1]:g} dB, seed {seed}", flush=True)
+    return R.ds.with_augment(spec, cuts, noise=noise)
 
 
 # the text of the tokens truncate must never remove alone (punct_token_ids): sentence marks and commas, full- and
@@ -3010,7 +3059,9 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
         utts, rows = max(int(a["utts"]), 1), max(int(a["rows"]), 1)
         row.update({"aug/concat_frac": a["concat_utts"] / utts, "aug/truncated_frac": a["truncated"] / rows,
                     "aug/mixed_frac": a["mixed"] / rows, "aug/cut_padded_frac": a.get("cut_padded", 0) / rows,
-                    "aug/end_padded_frac": a.get("end_padded", 0) / rows})
+                    "aug/end_padded_frac": a.get("end_padded", 0) / rows,
+                    "aug/end_trimmed_frac": a.get("end_trimmed", 0) / rows,
+                    "aug/noised_frac": a.get("noised", 0) / rows})
         if "concat_capped" in a:  # an AED step: micro-batches whose join the decoder cap refused, and cut-table pieces
             # whose frames differ from their decoded audio's (counts; the second is expected to stay 0)
             row.update({"aug/concat_capped": a["concat_capped"], "aug/cut_mismatch": a["cut_mismatch"]})

@@ -357,6 +357,27 @@ def tb_layouts(tb_file) -> list[tuple[int, dict]]:
     return out
 
 
+def make_noise_bank(d, seconds: float = 4.0, seed: int = 0) -> Path:
+    """A background bank in kitsune.noise_bank's layout: two clips of band-limited noise (int16, 16 kHz). Returns its
+    dir; its index.json's sha256 is what a config pins."""
+    from kitsune import noise_bank as NB
+
+    d = Path(d)
+    d.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    n = int(seconds * NB.SR)
+    a = np.convolve(rng.standard_normal(n), np.ones(8) / 8, mode="same")
+    audio = (np.clip(a, -1, 1) * 0.2 * 32767).astype(np.int16)
+    np.save(d / NB.AUDIO, audio)
+    half = n // 2
+    info = dict(version=NB.VERSION, sr=NB.SR, audio_bytes=(d / NB.AUDIO).stat().st_size,
+                audio_sha256=NB.sha256_file(d / NB.AUDIO), samples=n, source="test", licence="test",
+                clips=[dict(id="noise/t/a", kind="noise", offset=0, length=half),
+                       dict(id="noise/t/b", kind="noise", offset=half, length=n - half)])
+    (d / NB.INDEX).write_text(json.dumps(info, indent=1), encoding="utf-8")
+    return d
+
+
 def load_script(name: str):
     """Import scripts/<name>.py as a module (works for names starting with a digit, e.g. "02_teacher_pass")."""
     spec = importlib.util.spec_from_file_location(f"kitsune_script_{name}", ROOT / "scripts" / f"{name}.py")

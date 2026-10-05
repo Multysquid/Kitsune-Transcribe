@@ -72,7 +72,8 @@ records every step, so a restart goes on where it stopped; the chain summary is 
 `plan` prints the stages and their parts' items; `resume-pull` refuses a chain (exit 3; fullrun.chain_resume_hint).
 
 Resume on a new host (launch --resume / --resume-reset <run_id> / --resume-set <run_id>:<key>=<value>, a key of
-fullrun.RESUME_SET_KEYS - schedule.epochs, early_stop.patience, augment.enabled and three augment.* probabilities -, its
+fullrun.RESUME_SET_KEYS - schedule.epochs, early_stop.patience, augment.enabled, the augment.* probabilities and the P
+test box's truncate_min_row_s, noise bank path and sha256 (DECISIONS H8) -, its
 value in fullrun.resume_set_value's one spelling): bootstrap runs `resume-pull` before its paid rebuild. It reads the
 box's queue summary from the runs repo, pulls every started run's logs and its newest full state (the scratch repo's
 timed state or a runs-repo full state, whichever is newer, checked against the pointer's or the LFS sha256), and writes

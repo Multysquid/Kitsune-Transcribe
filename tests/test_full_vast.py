@@ -381,7 +381,11 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "train", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
                        "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, "
-                       "augment.concat_p, augment.mix_p may change on a resume"),
+                       "augment.concat_p, augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, "
+                       "augment.noise_p, augment.noise_bank, augment.noise_bank_sha256 may change on a resume"),
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:augment.noise_bank=../bank"],
+                       "augment.noise_bank must be a relative data-repo path"),
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:early_stop.patience=0"], "early_stop.patience must be an int >= 1"),
                       (["--job", "full", "--box", "p01", "--resume-set",
@@ -499,6 +503,27 @@ def test_the_recipe_test_flags_reach_the_box_env_in_one_spelling(full_launch, ca
     assert fullrun.parse_resume_sets(env["KITSUNE_RESUME_SETS"]) == {rid: want}
     a, kw = full_launch.seen["preflight"]
     assert kw["resets"] == [rid] and kw["sets"] == {rid: want}
+
+
+def test_the_p_test_box_flags_reach_the_box_env_in_one_spelling(full_launch, capsys):
+    """DECISIONS H8: the P test box re-runs box 1's cooldown with recipe v3 - its seconds, path and sha256 sets, in
+    loose spellings, reach the box in the normalised spelling (3 -> 3.0, the sha256 lowercased, the path as given)
+    and parse back to the same list."""
+    rid, sha = "full-p01-20261001T184145Z", "89abcdef" * 8
+    loose = ["schedule.epochs=4", "augment.enabled=TRUE", "augment.truncate_p=.2", "augment.concat_p=0.5",
+             "augment.mix_p=0", "augment.truncate_min_row_s=3", "augment.end_trim_p=0.30", "augment.noise_p=.3",
+             "augment.noise_bank=aug/musan-bg-v1", f"augment.noise_bank_sha256={sha.upper()}"]
+    want = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.2", "augment.concat_p=0.5",
+            "augment.mix_p=0.0", "augment.truncate_min_row_s=3.0", "augment.end_trim_p=0.3", "augment.noise_p=0.3",
+            "augment.noise_bank=aug/musan-bg-v1", f"augment.noise_bank_sha256={sha}"]
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
+                           rid, *sum((["--resume-set", f"{rid}:{s}"] for s in loose), []), "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    env = env_of(created(fake))
+    assert env["KITSUNE_RESUME_SETS"] == ",".join(f"{rid}:{s}" for s in want)
+    assert re.fullmatch(fullrun._ENV_WORD, env["KITSUNE_RESUME_SETS"])
+    assert fullrun.parse_resume_sets(env["KITSUNE_RESUME_SETS"]) == {rid: want}
 
 
 def test_augment_sets_are_refused_for_a_box_without_a_ctc_trainer(full_launch, repo, capsys):

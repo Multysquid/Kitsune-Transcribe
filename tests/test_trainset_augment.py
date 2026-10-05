@@ -38,7 +38,7 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa: E402
+from fixtures import load_script, make_fake_corpus, make_fake_selection, make_noise_bank  # noqa: E402
 from fixtures_ctc import make_fake_parakeet_out, tiny_student_dir  # noqa: E402
 from kitsune import trainset as T  # noqa: E402
 from kitsune.ctc_targets import FrameTargets, collate_frame_targets  # noqa: E402
@@ -171,7 +171,7 @@ def test_off_is_the_plain_dataset(env):
         assert set(z) == set(want) | {"aug"}
         assert_same(z, want)
         assert z["aug"] == dict(utts=len(idx), rows=len(idx), concat_groups=0, concat_utts=0, truncated=0, mixed=0,
-                                cut_padded=0, end_padded=0)
+                                cut_padded=0, end_padded=0, end_trimmed=0, noised=0)
 
 
 def test_augment_spec_and_where_it_applies(env, tmp_path):
@@ -685,6 +685,102 @@ def test_a_cut_pad_keeps_the_cut_and_adds_quiet(env):
 # ---------------------------------------------------------------------------------------------------- the trainer
 
 
+def test_mark_tail_and_slice():
+    """mark_tail finds the last word's run end and the marks after a blank gap; none without a word, without a final
+    mark, or with the mark right behind the word. slice_frame_targets keeps frames [a, b) with their own frame
+    numbers."""
+    W = 300
+    assert T.mark_tail(ft([W, W, BLANK, BLANK, BLANK, MARK, BLANK], 1), [MARK]) == (1, 5, 5)
+    assert T.mark_tail(ft([W, BLANK, MARK, BLANK, MARK], 2), [MARK]) == (0, 2, 4)  # marks, a blank between them
+    assert T.mark_tail(ft([W, MARK, BLANK], 3), [MARK]) is None  # no gap
+    assert T.mark_tail(ft([W, BLANK, BLANK], 4), [MARK]) is None  # no final mark
+    assert T.mark_tail(ft([BLANK, MARK], 5), [MARK]) is None  # no word
+    f = ft([W, BLANK, 301, 301, BLANK, MARK], 6)
+    s = T.slice_frame_targets(f, 2, 6)
+    assert s.n_frames == 4 and s.col0().tolist() == [301, 301, BLANK, MARK] and s.ctc_ids.tolist() == [301, MARK]
+    assert np.array_equal(s.blank_lp, f.blank_lp[2:6])
+
+
+def test_end_trim_moves_the_mark_up_behind_the_last_word():
+    """A row ending "word, 3 blank frames, mark": the blank frames go, the mark's frame follows the word, the greedy
+    path is unchanged, and the audio ends at a drawn sample of the new last frame (still its frames); a row without a
+    gap is left as it is."""
+    W = 300
+    f = ft([W, W, BLANK, 301, BLANK, BLANK, BLANK, MARK], 7)
+    wave = np.random.default_rng(1).standard_normal(FS * 8).astype(np.float32)
+    r = T._AugRow(wave, f, [0], [0])
+    assert r.trim_end([MARK], np.random.default_rng(2))
+    assert r.ft.col0().tolist() == [W, W, BLANK, 301, MARK] and r.ft.ctc_ids.tolist() == [W, 301, MARK]
+    assert T.ctc_frames(len(r.wave)) == 5 and np.array_equal(r.wave, wave[:len(r.wave)]) and r.trimmed
+    lens = []
+    for seed in range(40):
+        q = T._AugRow(wave, f, [0], [0])
+        q.trim_end([MARK], np.random.default_rng(seed))
+        lens.append(len(q.wave))
+    assert min(lens) >= FS * 5 - T.END_BELOW and max(lens) <= FS * 5 + T.END_ABOVE and len(set(lens)) > 10
+    g = T._AugRow(wave[:FS * 3], ft([W, W, MARK], 8), [0], [0])
+    assert not g.trim_end([MARK], np.random.default_rng(0)) and not g.trimmed and len(g.wave) == FS * 3
+
+
+def mark_tailed(monkeypatch):
+    """Every stored row's targets end "word, 3 blank frames, mark" (its frame count unchanged): the fake teacher's
+    random tokens rarely end in a mark."""
+    real = T.FrameBatchDataset.targets
+
+    def targets(self, i):
+        c = real(self, i).col0().copy()
+        if len(c) >= 6:
+            c[-5:] = [300, BLANK, BLANK, BLANK, MARK]
+        return ft(c.tolist(), int(i))
+
+    monkeypatch.setattr(T.FrameBatchDataset, "targets", targets)
+
+
+def test_end_trim_on_a_frame_store(env, monkeypatch):
+    """end_trim_p 1: every row that is not cut loses its 3 blank frames before its final mark - n_frames, ctc targets
+    and audio in step (ctc_frames(samples) == n_frames) -, durations its audio's; cut rows (truncate_p 0.5) never."""
+    mark_tailed(monkeypatch)
+    st = env["store"]
+    for truncate in (0.0, 0.5):
+        ds = T.dataset_for(st, augment=T.Augment(seed=3, end_trim_p=1.0, truncate_p=truncate, truncate_min_s=0.3,
+                                                 punct_ids=(MARK,)))
+        trimmed = 0
+        for idx in micro_batches(st)[:12]:
+            got = ds[idx]
+            here = 0
+            for b, i in enumerate(idx):
+                n, T0 = int(got["n_frames"][b]), ds.targets(i).n_frames
+                assert T.ctc_frames(int(got["lengths"][b])) == n
+                if T0 >= 6 and n == T0 - 3 and row_ids(got, b)[-1:] == [MARK]:  # trimmed: the mark behind the word
+                    here += 1
+                    assert got["durations"][b] == pytest.approx(int(got["lengths"][b]) / T.TARGET_SR)
+                else:  # cut (inside the row, never trimmed after) or too short to carry the tail
+                    assert n < T0 - 3 or T0 < 6 or n == T0
+            assert got["aug"]["end_trimmed"] == here
+            trimmed += here
+        assert trimmed > 0
+
+
+def test_background_keeps_targets_and_lengths(env, tmp_path):
+    """noise_p 1: every row's audio has the bank's background added (its length and targets unchanged); without the
+    bank the augmentation is refused; the same index list gives the same background."""
+    from kitsune.noise_bank import NoiseBank
+
+    bank = NoiseBank.load(make_noise_bank(tmp_path / "bank"))
+    st = env["store"]
+    with pytest.raises(ValueError, match="needs a noise bank"):
+        T.dataset_for(st, augment=T.Augment(seed=1, noise_p=1.0))
+    ds = T.dataset_for(st, augment=T.Augment(seed=1, noise_p=1.0, noise_snr_db=(5.0, 5.0)), noise=bank)
+    plain = T.dataset_for(st)
+    for idx in micro_batches(st)[:6]:
+        got, ref = ds[idx], plain[idx]
+        assert got["aug"]["noised"] == len(idx)
+        assert torch.equal(got["lengths"], ref["lengths"]) and torch.equal(got["ctc_targets"], ref["ctc_targets"])
+        assert not torch.equal(got["wave"], ref["wave"])
+        again = ds[idx]
+        assert torch.equal(again["wave"], got["wave"])
+
+
 def test_validate_the_augment_block():
     """augment.* off by default and checked whether or not it is on (an AED student's own rules - the cut table, no
     pads -: tests/test_aed_augment.py); a resume may change it - it does not shape the step plan -, unlike the
@@ -694,7 +790,9 @@ def test_validate_the_augment_block():
                                      "truncate_min_s": 1.0, "truncate_pause_p": 0.5, "concat_p": 0.0,
                                      "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0, "mix_snr_db": [5.0, 20.0],
                                      "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
-                                     "truncate_min_row_s": 0.0, "cuts": None, "cuts_sha256": None}
+                                     "truncate_min_row_s": 0.0, "cuts": None, "cuts_sha256": None,
+                                     "end_trim_p": 0.0, "noise_p": 0.0, "noise_snr_db": [0.0, 20.0],
+                                     "noise_bank": None, "noise_bank_sha256": None}
     assert not m.augment_on(m.load_config(None, [])) and not m.augment_on({})
     ctc = ["family=ctc", "parakeet_root=po"]
     assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.mix_p=0.5"]))
@@ -712,7 +810,11 @@ def test_validate_the_augment_block():
                        (["augment.end_pad_p=-0.1"], "augment.end_pad_p"), (["augment.pad_frames=[0, 5]"], "pad_frames"),
                        (["augment.pad_frames=[3, 2]"], "pad_frames"), (["augment.pad_frames=[1, 26]"], "pad_frames"),
                        (["augment.pad_frames=[1.0, 2]"], "pad_frames"), (["augment.pad_frames=3"], "pad_frames"),
-                       (["augment.truncate_min_row_s=-1"], "truncate_min_row_s")):
+                       (["augment.truncate_min_row_s=-1"], "truncate_min_row_s"),
+                       (["augment.end_trim_p=2"], "augment.end_trim_p"), (["augment.noise_p=-1"], "augment.noise_p"),
+                       (["augment.noise_snr_db=[10, 0]"], "noise_snr_db"),
+                       (["augment.noise_bank_sha256=xyz"], "noise_bank_sha256"),
+                       (["augment.enabled=true", "augment.noise_p=0.3"], "needs augment.noise_bank")):
         with pytest.raises(SystemExit, match=match):
             m.load_config(None, ctc + bad)
     saved = m.load_config(None, ctc)
@@ -751,7 +853,7 @@ def utts_of(run: Path) -> pd.DataFrame:
 
 # the end-to-end run: all three augmentations, through a smoke phase of 3 steps, full states every 2 steps
 AUG_OVER = {"augment": {"enabled": True, "truncate_p": 0.7, "truncate_min_s": 0.3, "concat_p": 1.0, "mix_p": 0.7,
-                        "truncate_pad_p": 0.7, "end_pad_p": 0.5},
+                        "truncate_pad_p": 0.7, "end_pad_p": 0.5, "end_trim_p": 0.5, "noise_p": 0.5},
             "smoke": {"enabled": True, "steps": 3, "min_audio_s_per_s": 0, "require_loss_decrease": False,
                       "pad_utts": 4, "decode_per_set": 2},
             "ckpt": {"full_every_steps": 2}}
@@ -760,8 +862,18 @@ AUG_OVER = {"augment": {"enabled": True, "truncate_p": 0.7, "truncate_min_s": 0.
 @pytest.fixture(scope="module")
 def aug_run(env):
     m = load_script("04_distill")
-    assert m.main(["--config", write_config(env, "ctc-aug", AUG_OVER)]) == 0
+    assert m.main(["--config", write_config(env, "ctc-aug", aug_over(env))]) == 0
     return one_run(env, "ctc-aug")
+
+
+def aug_over(env) -> dict:
+    """AUG_OVER with the env's background bank (built once per module, under its root)."""
+    d = env["root"] / "noise_bank"
+    if not (d / "index.json").exists():
+        make_noise_bank(d)
+    out = copy.deepcopy(AUG_OVER)
+    out["augment"]["noise_bank"] = str(d)
+    return out
 
 
 def test_a_ctc_run_with_every_augmentation(env, aug_run):
@@ -869,7 +981,7 @@ def test_a_crash_resumed_with_augmentation_is_the_uninterrupted_run(env, aug_run
     m = load_script("04_distill")
     monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "5")
     with pytest.raises(RuntimeError, match="simulated crash"):
-        m.main(["--config", write_config(env, "ctc-aug-crash", AUG_OVER)])
+        m.main(["--config", write_config(env, "ctc-aug-crash", aug_over(env))])
     monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
     crash = one_run(env, "ctc-aug-crash")
     assert m.main(["--resume", str(crash / "checkpoints" / "full_step_4")]) == 0

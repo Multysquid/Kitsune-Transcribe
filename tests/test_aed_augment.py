@@ -7,8 +7,8 @@ tools/aed_cut_table.py, scripts/04_distill.py augment.* on an AED student):
 - on a real token store: off is the plain dataset; a cut keeps the tokens the table names for its frame and ends in EOS
   with a one-hot top-k row, its audio still the cut's frames; a join concatenates the pieces' tokens (each piece's EOS
   dropped but the last's) at frame-aligned audio offsets, and the decoder cap refuses a join whose rows would pass it;
-  short rows and rows whose decoded frames differ from the table's are never cut; the same index list gives the same
-  batch in any process
+  short rows and rows whose decoded frames differ from the table's are never cut; the end trim shortens the trailing
+  silence of rows that were not cut and keeps their tokens; the same index list gives the same batch in any process
 - the trainer: augment.* on an AED student validated (cuts required to cut, no pads, no table on a CTC student), and a
   tiny AED run with all three augmentations through its smoke phase logs the aug/* shares and the table's coverage
 CPU only, tiny models, synthetic data in the real on-disk formats (tests/fixtures.py)."""
@@ -34,7 +34,7 @@ import pyarrow.parquet as pq  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa: E402
+from fixtures import load_script, make_fake_corpus, make_fake_selection, make_noise_bank  # noqa: E402
 from kitsune import aed_cuts as A  # noqa: E402
 from kitsune import trainset as T  # noqa: E402
 from kitsune.ctc_targets import FrameTargets  # noqa: E402
@@ -267,7 +267,8 @@ def test_off_is_the_plain_dataset(env):
             np.int64)))
         zero = ds.with_augment(spec(), env["cuts"])[idx]
         assert zero["aug"] == dict(utts=len(idx), rows=len(idx), concat_groups=0, concat_utts=0, truncated=0, mixed=0,
-                                   cut_padded=0, end_padded=0, concat_capped=0, cut_mismatch=0)
+                                   cut_padded=0, end_padded=0, concat_capped=0, cut_mismatch=0, end_trimmed=0,
+                                   noised=0)
         for k, v in got.items():
             assert (torch.equal(v, zero[k]) if isinstance(v, torch.Tensor) else v == zero[k]), k
 
@@ -278,6 +279,8 @@ def test_where_an_aed_augmentation_applies(env):
         T.Augment(seed=1, max_tokens=191, punct_ids=(1,))
     with pytest.raises(ValueError, match="AED one"):
         T.Augment(seed=1, max_tokens=191, truncate_pad_p=0.5)
+    with pytest.raises(ValueError, match="end_trim_p needs punct_ids"):
+        T.Augment(seed=1, end_trim_p=0.3)  # a CTC one: it finds the final mark by its ids
     with pytest.raises(ValueError, match="needs the cut table"):
         T.dataset_for(st, augment=spec(truncate_p=0.5))
     with pytest.raises(ValueError, match="CTC augmentation"):
@@ -385,16 +388,89 @@ def test_the_decoder_cap_refuses_a_join(env):
     assert all("+" not in x for g in got for x in g["ids"])
 
 
+def test_voiced_end():
+    """The sample after the last 10 ms frame within END_TRIM_DB of the loudest: a tone's end before 0.3 s of near
+    silence (to the frame), the whole row when nothing is quieter (a tone to its end, digital silence) or the row is
+    under 5 frames."""
+    sr = T.TARGET_SR
+    t = np.arange(int(0.5 * sr)) / sr
+    tone = (0.3 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    quiet = (1e-5 * np.random.default_rng(0).standard_normal(int(0.3 * sr))).astype(np.float32)
+    assert T.voiced_end(np.concatenate([tone, quiet])) == len(tone)
+    assert T.voiced_end(tone) == len(tone)
+    assert T.voiced_end(np.zeros(sr, np.float32)) == sr
+    assert T.voiced_end(tone[:4 * T.HOP]) == 4 * T.HOP
+
+
+def quiet_tail(monkeypatch, s: float = 0.4):
+    """Every decoded row gets s seconds of near silence after it (the fake corpus's rows are a tone to their end)."""
+    real = T.decode_audio
+
+    def decode(b):
+        w = real(b)
+        q = 1e-5 * np.random.default_rng(len(w)).standard_normal(int(s * T.TARGET_SR))
+        return np.concatenate([w, q.astype(np.float32)])
+
+    monkeypatch.setattr(T, "decode_audio", decode)
+
+
+def test_end_trim_shortens_whole_rows_and_keeps_their_tokens(env, monkeypatch, tmp_path):
+    """end_trim_p 1 with quiet tails: every row that was not cut ends END_TRIM_TAIL_S after its last voiced frame, with
+    its stored tokens (mark and EOS) and its audio's duration; a cut row (truncate_p 0.5, its table built on the same
+    audio) is never trimmed: its audio still ends where its cut frame does."""
+    quiet_tail(monkeypatch)
+    st = env["store"]
+    lo, hi = (int(round(x * T.TARGET_SR)) for x in T.END_TRIM_TAIL_S)
+    cuts = A.build_cut_index(store_table(st, tmp_path / "cuts.parquet"), [u.id for u in st.utts], tmp_path / "idx",
+                             log=lambda s: None)
+    for truncate in (0.0, 0.5):
+        ds = T.dataset_for(st, augment=spec(end_trim_p=1.0, truncate_p=truncate, truncate_min_s=0.0,
+                                            truncate_min_frac=0.0), cuts=cuts if truncate else None)
+        trimmed = cut = 0
+        for idx in micro_batches(st)[:10]:
+            got = ds[idx]
+            n = got["n_tok"].tolist()
+            off = np.concatenate([[0], np.cumsum(n)])
+            for b, i in enumerate(idx):
+                L, full = int(got["lengths"][b]), st.wave(i)
+                tok = got["top_idx"][off[b]:off[b + 1], 0].tolist()
+                if tok != st.targets(i)[0].tolist():  # cut: its audio ends where its cut frame does, untrimmed
+                    cut += 1
+                    assert T.ctc_frames(L) < T.ctc_frames(len(full))
+                    continue
+                end = T.voiced_end(full)
+                assert end + lo <= L <= end + hi and L < len(full), (L, end, len(full))
+                assert got["durations"][b] == pytest.approx(L / T.TARGET_SR)
+                trimmed += 1
+            assert got["aug"]["end_trimmed"] == len(idx) - got["aug"]["truncated"]
+        assert trimmed > 0 and (cut > 0) == bool(truncate)
+
+
+def test_background_on_aed_rows(env, tmp_path):
+    """noise_p 1 on a token store: the background under every row, its tokens and length unchanged."""
+    from kitsune.noise_bank import NoiseBank
+
+    bank = NoiseBank.load(make_noise_bank(tmp_path / "bank"))
+    st = env["store"]
+    ds = T.dataset_for(st, augment=spec(noise_p=1.0), noise=bank)
+    plain = T.dataset_for(st)
+    for idx in micro_batches(st)[:5]:
+        got, ref = ds[idx], plain[idx]
+        assert got["aug"]["noised"] == len(idx) and not torch.equal(got["wave"], ref["wave"])
+        assert torch.equal(got["lengths"], ref["lengths"]) and torch.equal(got["top_idx"], ref["top_idx"])
+
+
 def test_same_index_list_same_batch(env):
     st = env["store"]
-    a = spec(truncate_p=0.6, truncate_min_s=0.2, concat_p=0.7, mix_p=0.5)
+    a = spec(truncate_p=0.6, truncate_min_s=0.2, concat_p=0.7, mix_p=0.5, end_trim_p=0.5)
     ds = T.dataset_for(st, augment=a, cuts=env["cuts"])
     other = pickle.loads(pickle.dumps(ds))  # what a spawn worker gets
     for idx in micro_batches(st)[:8]:
         x, y = ds[idx], other[idx]
         for k, v in x.items():
             assert (torch.equal(v, y[k]) if isinstance(v, torch.Tensor) else v == y[k]), k
-    z = T.dataset_for(st, augment=spec(seed=6, truncate_p=0.6, truncate_min_s=0.2, concat_p=0.7, mix_p=0.5),
+    z = T.dataset_for(st, augment=spec(seed=6, truncate_p=0.6, truncate_min_s=0.2, concat_p=0.7, mix_p=0.5,
+                                       end_trim_p=0.5),
                       cuts=env["cuts"])
     assert any(not torch.equal(ds[idx]["wave"], z[idx]["wave"]) or ds[idx]["ids"] != z[idx]["ids"]
                for idx in micro_batches(st)[:8])
@@ -414,7 +490,8 @@ def test_validate_the_aed_augment_block():
                        (["augment.enabled=true", "augment.truncate_pad_p=0.2"], "must be 0 on an AED student"),
                        (["augment.enabled=true", "augment.end_pad_p=0.2"], "must be 0 on an AED student"),
                        (["augment.cuts_sha256=abc"], "cuts_sha256"),
-                       (["family=ctc", "parakeet_root=po", "augment.cuts=x.parquet"], "AED student's")):
+                       (["family=ctc", "parakeet_root=po", "augment.cuts=x.parquet"], "AED student's"),
+                       (["augment.end_trim_p=1.5"], "augment.end_trim_p")):
         with pytest.raises(SystemExit, match=match):
             m.load_config(None, bad)
 
@@ -470,7 +547,8 @@ def test_an_aed_run_with_every_augmentation(env):
                   "decode_per_set": 2},
         # concat_p 0.5: a joined micro-batch of these 3 s micro-batches is mostly one row, and mix needs two
         "augment": {"enabled": True, "truncate_p": 0.7, "truncate_min_s": 0.3, "concat_p": 0.5, "mix_p": 1.0,
-                    "cuts": str(env["table"]), "cuts_sha256": sha},
+                    "end_trim_p": 0.3, "cuts": str(env["table"]), "cuts_sha256": sha, "noise_p": 0.5,
+                    "noise_bank": str(make_noise_bank(root / "noise_bank"))},
     }
     path = root / "aed-aug.json"
     path.write_text(json.dumps(config, indent=1), encoding="utf-8")
@@ -490,6 +568,9 @@ def test_an_aed_run_with_every_augmentation(env):
     for tag in ("aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac"):
         assert ((st[tag] >= 0) & (st[tag] <= 1)).all() and st[tag].max() > 0, tag
     assert (st["aug/cut_mismatch"] == 0).all() and (st["aug/cut_padded_frac"] == 0).all()
+    # the fake rows are a tone to their end: nothing to trim, but the share is logged
+    assert ((st["aug/end_trimmed_frac"] >= 0) & (st["aug/end_trimmed_frac"] <= 1)).all() and aug["end_trim_p"] == 0.3
+    assert st["aug/noised_frac"].max() > 0 and aug["noise_p"] == 0.5 and aug["noise_clips"] == 2
     utts = pd.concat([pd.read_parquet(p) for p in sorted((run / "metrics" / "train_utts").glob("part-*.parquet"))])
     ids = {u.id for u in env["store"].utts}
     assert all(x in ids for r in utts["id"] for x in r.split("+")) and (utts["n_tok"] > 0).all()
