@@ -49,9 +49,9 @@ Inputs besides the two generators' own: PLAN_FILE (configs/full/plan/full_study.
 configs/full/*.json is a config), the JSON tools/full_plan.py wrote for full.parquet and smoke.parquet at SMOKE_EPOCHS
 (its "full" and "smoke" parts; --import-plan records a new measurement; the local selection paths become the repo
 paths), and its "launch" part: tools/full_plan.py on full.parquet at the epochs the boxes run now (FULL_RUNS; P-0.1B at
-its continuation's CONTINUATIONS epochs: 4, the recipe test's, DECISIONS H1), --import-launch-plan:
+its continuation's CONTINUATIONS epochs: 8, DECISIONS H9), --import-launch-plan:
   python tools/full_plan.py --selection <full.parquet> --student t06=aed:450:1730:<E> --student p03=ctc:600:1350:<E>
-      --student p005=ctc:1600:1500:<E> --student p01=ctc:1600:1500:4 --json plan_launch.json
+      --student p005=ctc:1600:1500:<E> --student p01=ctc:1600:1500:8 --json plan_launch.json
   python tools/make_full_configs.py --import-launch-plan plan_launch.json
 The generator refuses a record measured with other step values or epochs. It gives the smoke configs' probe shapes
 (from "full": the smoke ran those epochs), the boxes' step counts (from "launch"), and the numbers the hand-written
@@ -152,7 +152,8 @@ RECIPE_AED = {**RECIPE, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256, "end_t
 # index.json and pulled by box p01, boxes.json extra_dirs), mixed under the whole row - a joined row's utterances and
 # the gaps between them alike -, the targets the teacher's on the clean audio. Why: on 30 s windows of stream audio
 # (talk over game sound and music) the Parakeet teacher writes nothing and P-0.3B with it, while both transcribe the
-# same talk alone. Box p01 tests it: box 1's cooldown again (CONTINUATIONS p01) and P-0.05B from step 0 (FULL_RUNS p005)
+# same talk alone. Box p01 tests it: box 1's run continued to 8 epochs (CONTINUATIONS p01) and P-0.05B from step 0 at
+# 10 epochs (FULL_RUNS p005; DECISIONS H9)
 NOISE_BANK = "aug/musan-bg-v1"
 NOISE_BANK_SHA256 = "a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803"
 RECIPE_V3 = {**RECIPE, "end_trim_p": 0.3, "noise_p": 0.3, "noise_bank": NOISE_BANK,
@@ -167,14 +168,16 @@ RECIPE_V3 = {**RECIPE, "end_trim_p": 0.3, "noise_p": 0.3, "noise_bank": NOISE_BA
 # data every epoch, and the early stop still cools down early if dev stops improving); T-0.6B 8 since DECISIONS H7 (the
 # owner, 2026-10-05, after P-0.3B's 6-epoch result, with the same recipe). The owner's earlier request
 # of the same day to plan 10 epochs for these runs was WITHDRAWN after that
-# analysis (DECISIONS G "Rejected: 10 epochs"). P-0.1B's run stays box 1's 4 epochs, and so does its recipe test, which
-# re-runs box 1's cooldown to the same end (CONTINUATIONS, DECISIONS H1; G3's 8-epoch continuation is postponed, H2).
+# analysis (DECISIONS G "Rejected: 10 epochs"). P-0.05B 10 and P-0.1B 8 since DECISIONS H9 (the owner, 2026-10-05, for
+# the P test box: "the p-0.05 run needs more epochs as well as the 0.1 run. They are smaller and as p-0.3 has shown more
+# epochs improve the performance of these models"; chose "P-0.1B 8, P-0.05B 10" and "Continue box 1's run"). P-0.1B's
+# config stays box 1's 4-epoch one byte for byte (its run continues: CONTINUATIONS sets the 8 epochs on the resume).
 # This is the one epoch parameter: a change here, then --import-launch-plan of a full_plan.py record at the new
 # epochs, then the printed hours (--import-speed) into boxes.json. AUGMENT: the run's augment block (full_config; the
 # smoke configs never take it), None for none. DECISIONS H1 step 2: P-0.3B trains with RECIPE (v2 since H6, after
-# the recipe test on box p01 and its external review); T-0.6B (box full-t) with RECIPE_AED (H7); P-0.05B (postponed,
-# H2; its config stays) and P-0.1B's 4-epoch run (box 1, done: its config is the one the test resumes, byte for byte)
-# have none
+# the recipe test on box p01 and its external review); T-0.6B (box full-t) with RECIPE_AED (H7); P-0.05B with RECIPE_V3
+# on box p01 (H8); P-0.1B's 4-epoch run (box 1, done: its config is the one the continuation resumes, byte for byte) has
+# none - its continuation sets RECIPE_V3 (CONTINUATIONS)
 FULL_RUNS = {
     "t06": dict(study_run="study-t06", epochs=8, warmup=300, lr=2e-4, micro=450, step=1730, dev_greedy=False,
                 pull_parakeet=False, end_reserve=55, augment=RECIPE_AED),
@@ -182,7 +185,7 @@ FULL_RUNS = {
                 pull_parakeet=False, end_reserve=30, augment=RECIPE),
     "p01": dict(study_run="study-p01", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
                 pull_parakeet=False, end_reserve=30, augment=None),
-    "p005": dict(study_run="study-p005", epochs=5, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
+    "p005": dict(study_run="study-p005", epochs=10, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
                  pull_parakeet=False, end_reserve=30, augment=RECIPE_V3),
 }
 # the epochs smoke A ran (2026-10-01): the smoke configs keep them (the 100 h draw is the smoke's budget), and the plan
@@ -207,9 +210,17 @@ SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # baseline, and the only config difference is augment.*. from_step is the pre_cooldown state the reset goes on from;
 # the 4-epoch record stays runs-repo revision c4604304 (G4): the re-run overwrites the run's summary, config, final
 # evals, export and its pre_cooldown state's trainer.pt/.json (same weights, the recipe in its config) at the head
-# DECISIONS H8: the same re-run again, now with RECIPE_V3 (RECIPE_TEST stays the record of what the first test ran)
-CONTINUATIONS = {"p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=4,
-                             patience=None, augment=RECIPE_V3, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
+# DECISIONS H8: box 1's run again from the same state, now with RECIPE_V3 (RECIPE_TEST stays the record of what the
+# first test ran); H9: to 8 EPOCHS - G3's continuation, with its patience 12, after all. The reset plans T for 8 epochs
+# on full.parquet (~215,800 steps; plan["launch"]), so the stable phase at the peak LR goes on from from_step (the
+# state is the end of box 1's stable phase: no LR jump) to t_c = 0.8 T and the cooldown follows: ~129,500 steps, every
+# one with the recipe. Its early stop now matters (a long stable phase before the cooldown): patience 12 dev checks
+# (1.2 epochs at eval.dev.every_epochs 0.1) instead of COMMON's 6, so the switch to augmented data does not cool it
+# down early (the first test's dev CER jumped 0.155 -> 0.170 at its first check with the recipe, then fell). Not a
+# paired A/B with box 1 and the first test any more (more epochs and the recipe together):
+# the review's fixes are checked by its probes
+CONTINUATIONS = {"p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=8,
+                             patience=12, augment=RECIPE_V3, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
 # READOUT_RESERVE. A readout runs right after its training item on the same GPU (Resolution 25) under the same
 # KITSUNE_DEADLINE (kitsune.full_queue item_deadline: the box deadline less deadline_reserve_min). After a run that the
 # deadline cooldown (4d) shortened, 04_distill.fit_epochs_deadline has planned the end phase to finish

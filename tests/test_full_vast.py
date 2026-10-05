@@ -1357,7 +1357,7 @@ def chain_launch(repo, monkeypatch):
 def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     """E.1.8: KITSUNE_CONFIG is stage 1's rebuild, the watchdog's stage-1 env with its hand-over bound, the disk and
     the gate on box 1's extent (+ the chain's extra_gb), the boot's rebuild bytes and timeout on stage 1's; every part
-    preflighted as a box, each distinct data config's selection checked, the chain's own files; 35 h, 25.2 h, $1.00."""
+    preflighted as a box, each distinct data config's selection checked, the chain's own files; 41 h, 25.2 h, $1.00."""
     rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 0, out
@@ -1370,7 +1370,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
         "KITSUNE_WATCHDOG_ORPHAN_ACTION": "alert", "KITSUNE_CHAIN_STAGE": "1", "KITSUNE_WATCHDOG_HANDOVER_S": "34200",
         "KITSUNE_SCRATCH_REPO": SCRATCH, "KITSUNE_GATE_BYTES": str(int(571.3e9)), "KITSUNE_GATE_MAX_H": "5",
         "KITSUNE_REBUILD_BYTES": str(int(59.2e9)), "KITSUNE_PULL_BYTES": str(int(1e9 * (5.5 + 2))),
-        "KITSUNE_MAX_HOURS": "35", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
+        "KITSUNE_MAX_HOURS": "41", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
         "KITSUNE_REBUILD_TIMEOUT_MIN": "120", "KITSUNE_DPH": "0.8100", "KITSUNE_MACHINE_ID": "70001"}
     assert create[create.index("--disk") + 1] == "1400" and create[create.index("--label") + 1].startswith(
         "kitsune-full-p01-chain-data-smoke-")
@@ -1384,7 +1384,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     assert parts["smoke-b"][0][7]["selection"] == "labels/full/selections/study_1000h.parquet"
     assert all(not kw.get("resume") for _, kw in parts.values())
     assert len(s["chain"]) == 1 and "chain preflight ok" in out and "part p01: p01 preflight ok" in out
-    assert "x ~25.2 h (box p01-chain; watchdog cap 35 h)" in out
+    assert "x ~25.2 h (box p01-chain; watchdog cap 41 h)" in out
     assert "chain p01-chain: the gate part must end by first boot + 9 h" in out and "+ 9.5 h" in out
     assert "free disk was re-checked just now: the offer search keeps only offers with disk_space >= 1400 GB" in out
     assert "disk_space>=1400" in search_query(fake).split(" "), "the offer search itself filters on the chain's disk"
@@ -1405,7 +1405,7 @@ def test_launch_chain_refusals(chain_launch, capsys, args, err):
 def test_launch_chain_warns_below_its_cap_and_a_parts_problem_refuses(chain_launch, capsys):
     rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--max-hours", "32", "--dry-run")
     out = capsys.readouterr().out
-    assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 35 h" in out
+    assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 41 h" in out
     assert env_of(created_or_printed(out))["KITSUNE_MAX_HOURS"] == "32"
     chain_launch.seen["part_problems"]["smoke-b"] = ["tools/whisper_eval.py (item whisper-large-v3) does not exist"]
     rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")

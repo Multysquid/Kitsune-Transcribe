@@ -760,9 +760,10 @@ two 1x RTX 5090 boxes (DECISIONS G2): **box T** (`full-t`: T-0.6B with the same 
 `data-p`, with the Whisper models and the quantised readouts; done 2026-10-04, M4 9.73 %). T-0.6B trains 8 epochs
 (DECISIONS H7, 2026-10-05) and P-0.3B trained 6 (H5); 3 each under G1 before, with the common early-stop patience 6.
 DECISIONS H2 postponed P-0.05B (its items left box P). Box `p01`, which ran **the recipe test** after box 1 (DECISIONS
-H1), is now **the P test box** (DECISIONS H8, below): box 1's cooldown re-run once more from its pre_cooldown state to
-the same end with recipe v3 (recipe v2 plus the P-0.3B review's two fixes, the end trim and background audio), then
-P-0.05B from step 0 at 5 epochs (`full-p005.json`) with the same recipe, each with its M4 and 7 quantised readouts;
+H1), is now **the P test box** (DECISIONS H8, H9, below): box 1's run continued from its pre_cooldown state to 8
+epochs (G3's continuation) with recipe v3 (recipe v2 plus the P-0.3B review's two fixes, the end trim and background
+audio), then P-0.05B from step 0 at 10 epochs (`full-p005.json`) with the same recipe, each with its M4 and 7 quantised
+readouts;
 box T waits for its result (G3's 8-epoch continuation of P-0.1B stays postponed, H2). The 2x box `full` is retired: its
 name stays in `fullrun.BOX_NAMES` for the tests' fixtures only, it is not in the registry, and launch refuses it. Each is one `launch.py --job full --box <box>` call; on the box
 `vast/supervise.py` runs `kitsune/full_queue.py` for that box. The box registry `configs/full/boxes.json`
@@ -789,7 +790,7 @@ Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/m
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-smoke --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --machine <smoke A's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box smoke-b --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=4 --resume-set full-p01-20261001T184145Z:augment.enabled=true --resume-set full-p01-20261001T184145Z:augment.truncate_p=0.2 --resume-set full-p01-20261001T184145Z:augment.concat_p=0.5 --resume-set full-p01-20261001T184145Z:augment.mix_p=0.0 --resume-set full-p01-20261001T184145Z:augment.truncate_min_row_s=3.0 --resume-set full-p01-20261001T184145Z:augment.end_trim_p=0.3 --resume-set full-p01-20261001T184145Z:augment.noise_p=0.3 --resume-set full-p01-20261001T184145Z:augment.noise_bank=aug/musan-bg-v1 --resume-set full-p01-20261001T184145Z:augment.noise_bank_sha256=a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=8 --resume-set full-p01-20261001T184145Z:early_stop.patience=12 --resume-set full-p01-20261001T184145Z:augment.enabled=true --resume-set full-p01-20261001T184145Z:augment.truncate_p=0.2 --resume-set full-p01-20261001T184145Z:augment.concat_p=0.5 --resume-set full-p01-20261001T184145Z:augment.mix_p=0.0 --resume-set full-p01-20261001T184145Z:augment.truncate_min_row_s=3.0 --resume-set full-p01-20261001T184145Z:augment.end_trim_p=0.3 --resume-set full-p01-20261001T184145Z:augment.noise_p=0.3 --resume-set full-p01-20261001T184145Z:augment.noise_bank=aug/musan-bg-v1 --resume-set full-p01-20261001T184145Z:augment.noise_bank_sha256=a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-t --machine <id> --avoid-machine <p01's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-p --machine <id> --avoid-machine <p01's id> --avoid-machine <full-t's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
@@ -805,9 +806,9 @@ H1 step 1, the `--resume-reset ... augment.*` line above: box 1's cooldown again
 paired A/B against the 4-epoch record), then **box full-p** (P-0.3B with the recipe) only if the test shows that the
 recipe helps (H1 step 2: its readout `runs/m4-full-p01-20261001T184145Z-r1` against the record's at revision
 c4604304); box full-t (T-0.6B, 8 epochs, the AED recipe: DECISIONS H7) needs the cut table uploaded to the data repo
-first (launch refuses a missing extra file). After the P-0.3B review, **box p01 as the P test box** (DECISIONS H8, the
-`--resume-reset ... augment.noise_bank_sha256=...` line above; it needs the background bank `aug/musan-bg-v1` in the
-data repo) comes before box full-t, which waits for its result. The hours of boxes p01, full-t and full-p (`est_hours`, `max_hours` and the train items' no-start needs)
+first (launch refuses a missing extra file). After the P-0.3B review, **box p01 as the P test box** (DECISIONS H8 and
+H9, the `--resume-reset ... augment.noise_bank_sha256=...` line above; it needs the background bank `aug/musan-bg-v1`
+in the data repo) comes before box full-t, which waits for its result. The hours of boxes p01, full-t and full-p (`est_hours`, `max_hours` and the train items' no-start needs)
 come from the speed record `configs/full/plan/box2_hours.json` (smoke A's measured s/step and box 1's, `box1_go.py
 --revision <its 4-epoch record> --json` then `make_full_configs.py --import-speed --box1-go`) at the step counts of
 the plan record's launch part (`--import-launch-plan`), so their lines take no `--max-hours`; launch warns while the
@@ -940,14 +941,16 @@ A dead or stopped box continues elsewhere from what the Hub has:
   revision c4604304db76e068df7bbe39d00d006b74d6c134 (`box1_go.py --revision`, `full_report.py --earlier
   full-p01-e4=<pull>/runs/m4-full-p01-20261001T184145Z@c4604304db76e068df7bbe39d00d006b74d6c134`). G3's 8-epoch
   continuation (`schedule.epochs=8`, `early_stop.patience=12`) is postponed (H2); it can go on from the same state later.
-- **The P test box** (DECISIONS H8, after the P-0.3B review): box p01 again, now with RECIPE V3 (recipe v2 plus the
-  end trim and the background audio; `make_full_configs.py` `RECIPE_V3`): the same `--resume-reset` of box 1's run with
-  one `--resume-set` per `RECIPE_V3` key (`make_full_configs.py --import-speed` prints the line; the command above),
-  then P-0.05B from step 0 at 5 epochs with the same recipe, each with its M4 and 7 quantised readouts. The box pulls the
+- **The P test box** (DECISIONS H8, after the P-0.3B review; H9, more epochs): box p01 again, now with RECIPE V3
+  (recipe v2 plus the end trim and the background audio; `make_full_configs.py` `RECIPE_V3`): the `--resume-reset` of
+  box 1's run with `schedule.epochs=8`, `early_stop.patience=12` and one `--resume-set` per `RECIPE_V3` key
+  (`make_full_configs.py --import-speed` prints the line; the command above) - G3's 8-epoch continuation: the stable
+  phase goes on from the pre_cooldown state at the peak LR to 0.8 T, then the cooldown, every step with the recipe -,
+  then P-0.05B from step 0 at 10 epochs with the same recipe, each with its M4 and 7 quantised readouts. The box pulls the
   background bank `aug/musan-bg-v1` (MUSAN music without vocals and noise, `tools/build_noise_bank.py`) as an extra dir;
   launch refuses the box until the bank is in the data repo. The runs repo's pre_cooldown state is the first test's
   re-save at the same step (model, optimizer and L2-SP byte for byte box 1's; st.resume_resets 1), so this reset counts
-  2: the re-run's readout writes `runs/m4-full-p01-20261001T184145Z-r2`, and a lost host resumes only from the re-run's
+  2: the continuation's readout writes `runs/m4-full-p01-20261001T184145Z-r2`, and a lost host resumes only from its
   own states. A1's record stays citable as runs-repo revision 41ce1f0.
 - launch refuses a **plain `--resume` of a box whose Hub summary has every train item done** (box p01 before its
   continuation started: it would only adopt box 1's run and score the new quantised items on the 4-epoch weights);
@@ -990,8 +993,9 @@ Look-only first, then the same line with `--yes`. Launch re-checks the machine's
 offer search keeps only offers with `disk_space` >= the chain's disk (box 1's, ~1,450 GB), so a pinned `--machine`
 that no longer has it is refused. The disk and the download gate are sized on box 1's extent (with the chain's
 `extra_gb` 120: p01's own 25 GB and ~95 GB of stage-1 leftovers), the boot's rebuild on the smoke (study) extent. Launch
-refuses `--config`, `--gate-hours 0`, `--max-hours` below 30 (stage 1's 10.5 h + box 1's 19.5 h; a warning below the
-chain's 35 h) and every resume flag, and prints the chain's deadlines: the gate part by first boot + 9 h, stage 1 by
+refuses `--config`, `--gate-hours 0`, `--max-hours` below stage 1's 10.5 h + box p01's est_hours (box 1's 19.5 h: 30;
+the P test box's 30.3 h since DECISIONS H9: 40.8; a warning below the chain's cap, 35 h then, 41 h since H9) and every
+resume flag, and prints the chain's deadlines: the gate part by first boot + 9 h, stage 1 by
 + 10.5 h, the cap.
 
 What happens on the box:
@@ -1029,4 +1033,5 @@ What happens on the box:
   on that rental -> `--box p01 --resume ...` (stage 2's part is box p01: its Hub summary, timed states and run ids are
   box 1's, and launch checks that the Hub's p01 summary is that rental's); dead during the stage-2 bootstrap -> `--box
   p01` fresh or the chain fresh (the owner's call: the gate passed on the old machine only).
-- **Cost** (addendum E.9.5, m54650's rates): ~25.2 h central, ~$21; the 35 h cap ~$29.3; a failed gate ~6.6 h, ~$5.5.
+- **Cost** (addendum E.9.5, m54650's rates, with box 1): ~25.2 h central, ~$21; the 35 h cap ~$29.3; a failed gate
+  ~6.6 h, ~$5.5. (The cap is 41 h since DECISIONS H9: rule 3 against the P test box.)
