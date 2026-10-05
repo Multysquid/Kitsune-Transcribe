@@ -754,13 +754,16 @@ Plan v3 trains the full students on the whole label set: P-0.1B alone on **box 1
 only; done 2026-10-02, 4 epochs, M4 11.45 %), after two short smokes (`full-smoke` = smoke A, `smoke-b`). Box 2 is now
 two 1x RTX 5090 boxes (DECISIONS G2): **box T** (`full-t`: T-0.6B with the same recipe on its Cohere token targets,
 `full-t06.json`'s `augment` block - its cuts from the cut table `labels/full/selections/full_study/aed_cuts.parquet`
-(`tools/aed_cut_table.py`), which the box pulls as an extra file -, the Cohere labels only, `data-t`) and **box P**
+(`tools/aed_cut_table.py`), which the box pulls as an extra file, and the end trim of the P-0.3B review's fix B
+(DECISIONS H7 amendment) -, the Cohere labels only, `data-t`) and **box P**
 (`full-p`: P-0.3B with the CTC train-data augmentation recipe, `full-p03.json`'s `augment` block, the Parakeet labels,
 `data-p`, with the Whisper models and the quantised readouts; done 2026-10-04, M4 9.73 %). T-0.6B trains 8 epochs
 (DECISIONS H7, 2026-10-05) and P-0.3B trained 6 (H5); 3 each under G1 before, with the common early-stop patience 6.
-DECISIONS H2 postponed P-0.05B (its config `full-p005.json` stays, 5 epochs; its items left box P). Box `p01` runs again as **the recipe test**
-(DECISIONS H1, below): box 1's cooldown re-run from its pre_cooldown state to the same end with the CTC train-data
-augmentation on, then P-0.1B's 7 quantised readouts (G3's 8-epoch continuation is postponed, H2). The 2x box `full` is retired: its
+DECISIONS H2 postponed P-0.05B (its items left box P). Box `p01`, which ran **the recipe test** after box 1 (DECISIONS
+H1), is now **the P test box** (DECISIONS H8, below): box 1's cooldown re-run once more from its pre_cooldown state to
+the same end with recipe v3 (recipe v2 plus the P-0.3B review's two fixes, the end trim and background audio), then
+P-0.05B from step 0 at 5 epochs (`full-p005.json`) with the same recipe, each with its M4 and 7 quantised readouts;
+box T waits for its result (G3's 8-epoch continuation of P-0.1B stays postponed, H2). The 2x box `full` is retired: its
 name stays in `fullrun.BOX_NAMES` for the tests' fixtures only, it is not in the registry, and launch refuses it. Each is one `launch.py --job full --box <box>` call; on the box
 `vast/supervise.py` runs `kitsune/full_queue.py` for that box. The box registry `configs/full/boxes.json`
 (`kitsune/fullrun.py`) is the one source of each box's GPU count, data config, hours (`est_hours` planned, `max_hours`
@@ -786,7 +789,7 @@ Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/m
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-smoke --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --machine <smoke A's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box smoke-b --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=4 --resume-set full-p01-20261001T184145Z:augment.enabled=true --resume-set full-p01-20261001T184145Z:augment.truncate_p=0.3 --resume-set full-p01-20261001T184145Z:augment.concat_p=0.5 --resume-set full-p01-20261001T184145Z:augment.mix_p=0.05 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=4 --resume-set full-p01-20261001T184145Z:augment.enabled=true --resume-set full-p01-20261001T184145Z:augment.truncate_p=0.2 --resume-set full-p01-20261001T184145Z:augment.concat_p=0.5 --resume-set full-p01-20261001T184145Z:augment.mix_p=0.0 --resume-set full-p01-20261001T184145Z:augment.truncate_min_row_s=3.0 --resume-set full-p01-20261001T184145Z:augment.end_trim_p=0.3 --resume-set full-p01-20261001T184145Z:augment.noise_p=0.3 --resume-set full-p01-20261001T184145Z:augment.noise_bank=aug/musan-bg-v1 --resume-set full-p01-20261001T184145Z:augment.noise_bank_sha256=a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-t --machine <id> --avoid-machine <p01's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-p --machine <id> --avoid-machine <p01's id> --avoid-machine <full-t's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
@@ -802,11 +805,13 @@ H1 step 1, the `--resume-reset ... augment.*` line above: box 1's cooldown again
 paired A/B against the 4-epoch record), then **box full-p** (P-0.3B with the recipe) only if the test shows that the
 recipe helps (H1 step 2: its readout `runs/m4-full-p01-20261001T184145Z-r1` against the record's at revision
 c4604304); box full-t (T-0.6B, 8 epochs, the AED recipe: DECISIONS H7) needs the cut table uploaded to the data repo
-first (launch refuses a missing extra file). The hours of boxes p01, full-t and full-p (`est_hours`, `max_hours` and the train items' no-start needs)
+first (launch refuses a missing extra file). After the P-0.3B review, **box p01 as the P test box** (DECISIONS H8, the
+`--resume-reset ... augment.noise_bank_sha256=...` line above; it needs the background bank `aug/musan-bg-v1` in the
+data repo) comes before box full-t, which waits for its result. The hours of boxes p01, full-t and full-p (`est_hours`, `max_hours` and the train items' no-start needs)
 come from the speed record `configs/full/plan/box2_hours.json` (smoke A's measured s/step and box 1's, `box1_go.py
 --revision <its 4-epoch record> --json` then `make_full_configs.py --import-speed --box1-go`) at the step counts of
 the plan record's launch part (`--import-launch-plan`), so their lines take no `--max-hours`; launch warns while the
-record has no box-1 part. launch refuses a box with quantised items (full-p 7, full-t 7, p01 7) without **the quant go
+record has no box-1 part. launch refuses a box with quantised items (full-p 7, full-t 7, p01 14) without **the quant go
 signal**: smoke-b's verdict on the Hub passed overall and every one of checks 12-16, at a commit that is an ancestor of
 the one the box runs, with `kitsune/quant.py`, `tools/speed_probe.py`, `scripts/05_evaluate.py`, `kitsune/whisper.py`,
 `tools/whisper_eval.py`, `requirements-train.txt` and `docker/Dockerfile` unchanged since (`QUANT_CODE`): a later
@@ -913,11 +918,13 @@ A dead or stopped box continues elsewhere from what the Hub has:
 - `--resume-reset <run_id>` (repeatable; `KITSUNE_RESUME_RESET`): continue a run from its pre_cooldown state (an
   early-stopped one, or one whose schedule ended: a continuation). `--resume-set <run_id>:<key>=<value>` (repeatable;
   `KITSUNE_RESUME_SETS`): resume with another value of one of `fullrun.RESUME_SET_KEYS`, once per run; nothing else
-  may change: `schedule.epochs` and `early_stop.patience` (ints >= 1), `augment.enabled` (true / false) and
-  `augment.truncate_p`, `augment.concat_p`, `augment.mix_p` (probabilities in [0, 1]: the CTC train-data
-  augmentation, DECISIONS H1; launch refuses them for a box without a CTC train item, where the trainer would refuse
-  them only on the box). Each value reaches the box in one spelling (`fullrun.resume_set_value`: `True` -> `true`,
-  `.30` -> `0.3`, `012` -> `12`), so two launches of one continuation compare equal there. Both imply `--resume`.
+  may change: `schedule.epochs` and `early_stop.patience` (ints >= 1), `augment.enabled` (true / false),
+  `augment.truncate_p`, `augment.concat_p`, `augment.mix_p`, `augment.end_trim_p`, `augment.noise_p` (probabilities in
+  [0, 1]: the CTC train-data augmentation, DECISIONS H1 / H8), `augment.truncate_min_row_s` (seconds >= 0),
+  `augment.noise_bank` (a relative data-repo path) and `augment.noise_bank_sha256` (64 hex digits); launch refuses
+  `augment.*` for a box without a CTC train item, where the trainer would refuse them only on the box. Each value
+  reaches the box in one spelling (`fullrun.resume_set_value`: `True` -> `true`, `.30` -> `0.3`, `012` -> `12`,
+  `3` -> `3.0` for seconds), so two launches of one continuation compare equal there. Both imply `--resume`.
 - **The recipe test** (DECISIONS H1): `--box p01 --resume-reset full-p01-20261001T184145Z` with `--resume-set
   full-p01-20261001T184145Z:<set>` for each of `schedule.epochs=4`, `augment.enabled=true`, `augment.truncate_p=0.3`,
   `augment.concat_p=0.5`, `augment.mix_p=0.05` (weak mixing, DECISIONS H4; the command above;
@@ -933,6 +940,15 @@ A dead or stopped box continues elsewhere from what the Hub has:
   revision c4604304db76e068df7bbe39d00d006b74d6c134 (`box1_go.py --revision`, `full_report.py --earlier
   full-p01-e4=<pull>/runs/m4-full-p01-20261001T184145Z@c4604304db76e068df7bbe39d00d006b74d6c134`). G3's 8-epoch
   continuation (`schedule.epochs=8`, `early_stop.patience=12`) is postponed (H2); it can go on from the same state later.
+- **The P test box** (DECISIONS H8, after the P-0.3B review): box p01 again, now with RECIPE V3 (recipe v2 plus the
+  end trim and the background audio; `make_full_configs.py` `RECIPE_V3`): the same `--resume-reset` of box 1's run with
+  one `--resume-set` per `RECIPE_V3` key (`make_full_configs.py --import-speed` prints the line; the command above),
+  then P-0.05B from step 0 at 5 epochs with the same recipe, each with its M4 and 7 quantised readouts. The box pulls the
+  background bank `aug/musan-bg-v1` (MUSAN music without vocals and noise, `tools/build_noise_bank.py`) as an extra dir;
+  launch refuses the box until the bank is in the data repo. The runs repo's pre_cooldown state is the first test's
+  re-save at the same step (model, optimizer and L2-SP byte for byte box 1's; st.resume_resets 1), so this reset counts
+  2: the re-run's readout writes `runs/m4-full-p01-20261001T184145Z-r2`, and a lost host resumes only from the re-run's
+  own states. A1's record stays citable as runs-repo revision 41ce1f0.
 - launch refuses a **plain `--resume` of a box whose Hub summary has every train item done** (box p01 before its
   continuation started: it would only adopt box 1's run and score the new quantised items on the 4-epoch weights);
   `--allow-done-trains` lets it through for a box lost in its eval pool (box P after its trainings). A continuation

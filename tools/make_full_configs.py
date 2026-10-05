@@ -137,10 +137,26 @@ RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0, "tr
 # Parakeet teacher's CTC alignment has a word start whose boundary maps onto the Cohere tokens - 96.5-99.8 % of the rows
 # >= 3 s have one, 55-69 % one in a pause), pinned by its sha256 and pulled by box full-t (boxes.json extra_files); a
 # cut row keeps the Cohere tokens before that boundary and ends in EOS. The joins and their cap (batch.max_dec_len) as
-# the trainer's; no pads (an AED student takes none)
+# the trainer's; no pads (an AED student takes none). end_trim_p 0.3 (DECISIONS H7, fix B; the owner on 2026-10-05,
+# after the P-0.3B review: 7 % of JSUT's complete sentences lost their mark): about a third of the rows that are not
+# cut lose their trailing silence down to a 10-80 ms tail, their mark kept, so a clean tight end is no longer only a
+# cut's
 AED_CUTS = "labels/full/selections/full_study/aed_cuts.parquet"
 AED_CUTS_SHA256 = "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb"
-RECIPE_AED = {**RECIPE, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}
+RECIPE_AED = {**RECIPE, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256, "end_trim_p": 0.3}
+# RECIPE V3 (DECISIONS H8, the owner on 2026-10-05: "retrain p0.1 and p0.05 with the changes and see if our changes fixed
+# the problem"): recipe v2 plus the two fixes of the P-0.3B review on the CTC students - B, end_trim_p 0.3 (a third of
+# the rows that are not cut lose their trailing silence, their mark's frames moved up behind their last word:
+# trainset._AugRow.trim_end), and A, background audio under 30 % of the rows (noise_p 0.3 at the trainer's 0-20 dB):
+# MUSAN's music without vocals and its noise (NOISE_BANK, tools/build_noise_bank.py, pinned by the sha256 of its
+# index.json and pulled by box p01, boxes.json extra_dirs), mixed under the whole row - a joined row's utterances and
+# the gaps between them alike -, the targets the teacher's on the clean audio. Why: on 30 s windows of stream audio
+# (talk over game sound and music) the Parakeet teacher writes nothing and P-0.3B with it, while both transcribe the
+# same talk alone. Box p01 tests it: box 1's cooldown again (CONTINUATIONS p01) and P-0.05B from step 0 (FULL_RUNS p005)
+NOISE_BANK = "aug/musan-bg-v1"
+NOISE_BANK_SHA256 = "a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803"
+RECIPE_V3 = {**RECIPE, "end_trim_p": 0.3, "noise_p": 0.3, "noise_bank": NOISE_BANK,
+             "noise_bank_sha256": NOISE_BANK_SHA256}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
@@ -167,7 +183,7 @@ FULL_RUNS = {
     "p01": dict(study_run="study-p01", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
                 pull_parakeet=False, end_reserve=30, augment=None),
     "p005": dict(study_run="study-p005", epochs=5, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
-                 pull_parakeet=False, end_reserve=30, augment=None),
+                 pull_parakeet=False, end_reserve=30, augment=RECIPE_V3),
 }
 # the epochs smoke A ran (2026-10-01): the smoke configs keep them (the 100 h draw is the smoke's budget), and the plan
 # record's "full" and "smoke" parts are measured at them (smoke A's check 3 projected the full runs at these T; F4's
@@ -191,8 +207,9 @@ SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # baseline, and the only config difference is augment.*. from_step is the pre_cooldown state the reset goes on from;
 # the 4-epoch record stays runs-repo revision c4604304 (G4): the re-run overwrites the run's summary, config, final
 # evals, export and its pre_cooldown state's trainer.pt/.json (same weights, the recipe in its config) at the head
+# DECISIONS H8: the same re-run again, now with RECIPE_V3 (RECIPE_TEST stays the record of what the first test ran)
 CONTINUATIONS = {"p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=4,
-                             patience=None, augment=RECIPE_TEST, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
+                             patience=None, augment=RECIPE_V3, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
 # READOUT_RESERVE. A readout runs right after its training item on the same GPU (Resolution 25) under the same
 # KITSUNE_DEADLINE (kitsune.full_queue item_deadline: the box deadline less deadline_reserve_min). After a run that the
 # deadline cooldown (4d) shortened, 04_distill.fit_epochs_deadline has planned the end phase to finish
@@ -263,7 +280,7 @@ SPEED_FILE = "plan/box2_hours.json"  # under OUT_DIR, next to PLAN_FILE (launch'
 # the boxes whose hours are box_hours of the speed record (DECISIONS G2/G3/H1: box 2 as two 1x RTX 5090 boxes, T and P,
 # and box p01's continuation, the recipe test): their train runs, in queue order, or the continuation. Box P trains
 # P-0.3B only (DECISIONS H1 step 2, with the recipe; P-0.05B is postponed, H2: its config stays, its items left the box)
-HOURS_BOXES = {"full-t": ("t06",), "full-p": ("p03",), "p01": "continuation"}
+HOURS_BOXES = {"full-t": ("t06",), "full-p": ("p03",), "p01": ("continuation", "p005")}
 # CONCAT'S EXTRA ATTENTION (DECISIONS H1: "add a few % for concat's extra attention"). A joined row holds k utterances
 # (k <= concat_max_n 4, <= 28 s) in the frames its micro-batch had planned, but its self-attention grows with the
 # square of its length: on full.parquet at concat_p 0.5 the attention's elements grow 1.27x over the planned
@@ -298,7 +315,7 @@ STORES_PESS = 1.91 / 1.37  # a box-1 record's measured CTC store: central x 1, p
 #   box p01:    m4-full-p01 and 7 P-0.1B quant readouts, plus resume-pull and check-resume before the stores
 POST_T_H = (0.6, 1.35)
 POOL_P_H = (0.9, 1.65)
-P01_TAIL_H = (0.2, 0.5)
+P01_TAIL_H = (0.4, 1.0)  # box p01: m4 + 7 quantised readouts of each of its two runs (DECISIONS H8)
 CONT_PULL_H = (0.1, 0.3)
 END_H = 0.35  # calc_v3 end: finish's uploads and the destroy
 # max_hours' host margin: smoke A ran on a Ryzen 9950X (calc_v3's "fast" CPU class); calc_v3's pessimistic T-0.6B
@@ -538,17 +555,17 @@ def box_hours(plan: dict, rec: dict, box: str, reserve_min: float = 60) -> dict:
     store_c = b1["stores_ctc_h"] if b1 and b1.get("stores_ctc_h") else STORES_H["central"] / (1 + AED_STORE_SHARE)
     store_p = round(store_c * STORES_PESS, 2)
     runs = HOURS_BOXES[box]
-    if runs == "continuation":
-        cont = next(n for n, c in CONTINUATIONS.items() if c["box"] == box)
-        cr = continuation_run(cont, plan, rec)
-        items = {f"full-{cr['student']}": cr["hours"]}
+    cr, items, last = None, {}, None
+    for x in runs:  # in queue order; "continuation": the box's CONTINUATIONS entry
+        if x == "continuation":
+            cr = continuation_run(next(n for n, c in CONTINUATIONS.items() if c["box"] == box), plan, rec)
+            items[f"full-{cr['student']}"], last = cr["hours"], cr["student"]
+        else:
+            items[f"full-{x}"], last = run_h[x], x
+    if cr is not None:
         tail = (P01_TAIL_H[0] + CONT_PULL_H[0], P01_TAIL_H[1] + CONT_PULL_H[1])
-        last = cr["student"]
     else:
-        cr = None
-        items = {f"full-{x}": run_h[x] for x in runs}
         tail = POST_T_H if runs == ("t06",) else POOL_P_H
-        last = runs[-1]
     train = sum(items.values())
     est = _up(setup_c + store_c + train + tail[0] + END_H, 0.1)
     pess_end = setup_p + store_p + train * HOST_PESS
@@ -570,7 +587,8 @@ def continuation_flags(name: str) -> list[str]:
     sets = [("schedule.epochs", str(c["epochs"]))]
     if c.get("patience") is not None:
         sets.append(("early_stop.patience", str(c["patience"])))
-    sets += [(f"augment.{k}", json.dumps(v)) for k, v in (c.get("augment") or {}).items()]
+    # a string (the noise bank's path, its sha256) as it is; a number or bool as JSON spells it
+    sets += [(f"augment.{k}", v if isinstance(v, str) else json.dumps(v)) for k, v in (c.get("augment") or {}).items()]
     out = ["--resume-reset", rid]
     for key, val in sets:
         out += ["--resume-set", f"{rid}:{key}={fullrun.resume_set_value(key, val)}"]
