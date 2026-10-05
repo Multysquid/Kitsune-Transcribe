@@ -29,10 +29,12 @@ decoder input is prompt + tokens[:-1]; see AudioBatchDataset for the exact batch
 The CTC family (the size study's Parakeet students) trains on the Parakeet teacher's per-frame targets instead: a FRAME
 store (build_frame_stores; layout and frame preflight in the "frame stores" section below) holds the same audio and,
 per utterance, kitsune.ctc_targets.FrameTargets; FrameBatchDataset collates it, and StepPlanner(max_dec_len=None) plans
-it without a decoder. dataset_for(stores) picks the dataset of a store. The CTC family's TRAIN loader may augment its
+it without a decoder. dataset_for(stores) picks the dataset of a store. Either family's TRAIN loader may augment its
 micro-batches (dataset_for(stores, augment=Augment(...)); the "augmentation" section below; scripts/04_distill.py
 augment.*): rows cut inside a sentence (before one of its words, never between its last word and its mark),
-utterances joined into longer rows, another row's speech mixed in. A
+utterances joined into longer rows, another row's speech mixed in. An AED row has no frame targets to cut, so its cuts
+come from a cut table (kitsune.aed_cuts: the Parakeet teacher's alignment of the same rows, mapped onto the Cohere
+tokens) joined to the dataset (cuts=CutIndex). A
 dataset built without it - every eval, dev, probe, smoke and memory-probe one - returns the stored rows as they are.
 """
 import copy
@@ -483,17 +485,18 @@ def is_frame_store(stores: "Stores") -> bool:
     return (stores.info or {}).get("kind") == "frames"
 
 
-def dataset_for(stores: "Stores", augment: "Augment | None" = None) -> "AudioBatchDataset | FrameBatchDataset":
+def dataset_for(stores: "Stores", augment: "Augment | None" = None,
+                cuts=None) -> "AudioBatchDataset | FrameBatchDataset":
     """The micro-batch dataset of a store: FrameBatchDataset for a frame store, else AudioBatchDataset. augment: the
-    TRAIN loader's augmentation (Augment; a frame store only - a token store's targets are per decoder position, and
-    no cut or join of the audio keeps them aligned). Every other dataset - the evals, the dev slice, the probe, the
-    smoke checks, the memory probe - is built without it and reads the stored rows as they are."""
+    TRAIN loader's augmentation (Augment: a CTC one on a frame store; an AED one - max_tokens set - on a token store,
+    with cuts, the cut table's kitsune.aed_cuts.CutIndex over the store's rows, when it cuts). Every other dataset -
+    the evals, the dev slice, the probe, the smoke checks, the memory probe - is built without it and reads the stored
+    rows as they are."""
     if is_frame_store(stores):
+        if cuts is not None:
+            raise ValueError("a cut index is an AED store's (kitsune.aed_cuts); a frame store cuts on its own targets")
         return FrameBatchDataset(stores, augment=augment)
-    if augment is not None:
-        raise ValueError("augmentation needs a frame store (the CTC family's per-frame targets): a token store's "
-                         "targets are per decoder position and cannot follow a cut or joined row")
-    return AudioBatchDataset(stores)
+    return AudioBatchDataset(stores, augment=augment, cuts=cuts)
 
 
 def _frame_cache_complete(cache_dir: Path) -> bool:
@@ -1008,13 +1011,22 @@ class AudioBatchDataset(torch.utils.data.Dataset):
                                           (B can be 0 if all failed - skip such a micro-batch)
 
     Picklable without the data (spawn workers get only small arrays); the memmaps open lazily in each process.
+
+    augment (an Augment with max_tokens set; the train loader's only, scripts/04_distill.py augment.* on an AED student)
+    and cuts (a kitsune.aed_cuts.CutIndex over this dataset's rows; needed when augment.truncate_p > 0): each
+    micro-batch is augmented after decoding (_augmented; the "AED rows" part of the "augmentation" section below) - its
+    rows joined, cut at a cut-table frame and mixed - and collated as above, plus `aug`, a dict of counts (utts, rows,
+    concat_groups, concat_utts, truncated, mixed, cut_padded and end_padded - always 0 -, concat_capped,
+    cut_mismatch). A joined row holds several utterances: its ids are theirs joined by "+", sources and index the
+    first one's. None (the default) returns the stored rows exactly as before the augmentation existed, without `aug`.
     """
 
-    def __init__(self, stores: Stores):
+    def __init__(self, stores: Stores, augment: "Augment | None" = None, cuts=None):
         u = stores.utts
         self.cache_dir = str(stores.cache_dir)
         self.prompt = np.array(stores.info.get("prompt", PROMPT), dtype=np.int64)
         self.pad = int(stores.info.get("pad", PAD))
+        self.eos = int(stores.info.get("eos", EOS))
         self.ids = [x.id for x in u]
         self.sources = [x.source for x in u]
         self.duration = np.array([x.duration for x in u], dtype=np.float32)
@@ -1023,6 +1035,7 @@ class AudioBatchDataset(torch.utils.data.Dataset):
         self.audio_len = np.array([x.audio_len for x in u], dtype=np.int64)
         self.tok_off = np.array([x.tok_off for x in u], dtype=np.int64)
         self.n_tok = np.array([x.n_tok for x in u], dtype=np.int64)
+        self.augment, self.cuts = _token_augment(augment, cuts)
         self._mm = None
 
     def __len__(self) -> int:
@@ -1032,6 +1045,15 @@ class AudioBatchDataset(torch.utils.data.Dataset):
         state = self.__dict__.copy()
         state["_mm"] = None  # never pickle memmaps: each process maps the files itself
         return state
+
+    def with_augment(self, augment: "Augment | None", cuts=None) -> "AudioBatchDataset":
+        """This dataset with another augmentation and cut index (None: none), as a shallow copy sharing the
+        per-utterance arrays (FrameBatchDataset.with_augment's reason): the trainer keeps the plain dataset for the
+        smoke checks and the memory probe."""
+        out = copy.copy(self)
+        out.augment, out.cuts = _token_augment(augment, cuts)
+        out._mm = None
+        return out
 
     def _open(self) -> dict:
         if self._mm is None:
@@ -1063,19 +1085,29 @@ class AudioBatchDataset(torch.utils.data.Dataset):
             except Exception as e:
                 print(f"trainset: undecodable audio, dropping {self.ids[i]}: {e}", file=sys.stderr)
                 dropped.append(self.ids[i])
-        B, P = len(keep), len(self.prompt)
+        if self.augment is not None:
+            return self._augmented(idx, keep, waves, dropped)
+        out = self._collate(waves, [self.targets(i) for i in keep])
+        out.update(durations=torch.from_numpy(self.duration[keep]), agree=torch.from_numpy(self.agree[keep]),
+                   index=torch.tensor(keep, dtype=torch.int64), ids=[self.ids[i] for i in keep],
+                   sources=[self.sources[i] for i in keep], dropped=dropped)
+        return out
+
+    def _collate(self, waves: list[np.ndarray], targets: list[tuple]) -> dict:
+        """The batch contract's tensors (all but the per-row metadata) of rows given as audio and (tokens, topk_idx,
+        topk_lp), each row's tokens ending in its EOS."""
+        B, P = len(waves), len(self.prompt)
         lengths = np.array([len(w) for w in waves], dtype=np.int64)
         wave = np.zeros((B, int(lengths.max()) if B else 0), dtype=np.float32)
         for b, w in enumerate(waves):
             wave[b, :len(w)] = w
-        T = self.n_tok[keep]
+        T = np.array([len(t[0]) for t in targets], dtype=np.int64)
         L = P - 1 + int(T.max()) if B else P
         dec = np.full((B, L), self.pad, dtype=np.int64)
         dec_mask = np.zeros((B, L), dtype=np.int64)
         tgt_mask = np.zeros((B, L), dtype=bool)
         rows, pos, top_idx, top_lp = [], [], [], []
-        for b, i in enumerate(keep):
-            tok, ti, tl = self.targets(i)
+        for b, (tok, ti, tl) in enumerate(targets):
             t = len(tok)
             dec[b, :P] = self.prompt
             dec[b, P:P + t - 1] = tok[:-1]
@@ -1091,10 +1123,69 @@ class AudioBatchDataset(torch.utils.data.Dataset):
             decoder_input_ids=torch.from_numpy(dec), dec_mask=torch.from_numpy(dec_mask),
             tgt_row=_cat(rows, np.int64, (0,)), tgt_pos=_cat(pos, np.int64, (0,)), tgt_mask=torch.from_numpy(tgt_mask),
             top_idx=_cat(top_idx, np.int64, (0, k)), top_lp=_cat(top_lp, np.float32, (0, k)),
-            n_tok=torch.from_numpy(T.astype(np.int64)), durations=torch.from_numpy(self.duration[keep]),
-            agree=torch.from_numpy(self.agree[keep]), index=torch.tensor(keep, dtype=torch.int64),
-            ids=[self.ids[i] for i in keep], sources=[self.sources[i] for i in keep], dropped=dropped,
+            n_tok=torch.from_numpy(T),
         )
+
+    def _augmented(self, idx: Sequence[int], keep: list[int], waves: list[np.ndarray], dropped: list[str]) -> dict:
+        """__getitem__ under self.augment: the decoded rows (store indices `keep`, audio `waves`) joined, cut and mixed
+        in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's own stream, as
+        FrameBatchDataset._augmented - then collated as the plain path collates. A join is refused (the micro-batch
+        stays as it is, concat_capped) when one of its rows would hold more than max_tokens target tokens: the planner
+        never planned such a decoder. A cut lands on a frame of the rows' cut-table entries (aed_cut_candidates) and
+        keeps the Cohere tokens that entry names, then EOS. Metadata of a row as FrameBatchDataset._augmented's."""
+        a, eos = self.augment, self.eos
+        rng = augment_rng(a.seed, idx)
+        rows = [_TokRow(w, *self.targets(i), i, ctc_frames(len(w))) for w, i in zip(waves, keep)]
+        groups = capped = 0
+        if a.concat_p > 0 and len(rows) >= 2 and rng.random() < a.concat_p:
+            k = concat_k(len(rows), max(r.n_frames for r in rows), a, rng)
+            if k:
+                order = rng.permutation(len(rows))  # which utterances share a row, and in which order: random
+                parts = [[rows[j] for j in order[g:g + k]] for g in range(0, len(rows), k)]
+                if all(sum(r.body(eos) for r in p[:-1]) + len(p[-1].tok) <= a.max_tokens for p in parts):
+                    rows = [_join_tok_rows(p, eos, rng) for p in parts]
+                    groups = len(rows)
+                else:
+                    capped = 1
+        originals = [r.wave for r in rows]  # mix's interferers: the rows before any cut or mix
+        n_cut = n_mixed = mismatch = 0
+        if a.truncate_p > 0:
+            for r in rows:
+                if rng.random() < a.truncate_p:
+                    frames, kept, pause, bad = aed_cut_candidates(r, self.cuts, a, eos)
+                    mismatch += bad
+                    if not len(frames):
+                        continue
+                    if a.truncate_pause_p > 0 and rng.random() < a.truncate_pause_p and pause.any():
+                        p = np.flatnonzero(pause)
+                        j = int(p[int(rng.integers(len(p)))])
+                    else:
+                        j = int(rng.integers(len(frames)))
+                    r.cut_at(int(frames[j]), int(kept[j]), eos, rng)
+                    n_cut += 1
+        if a.mix_p > 0 and len(rows) >= 2:
+            for p, r in enumerate(rows):
+                if rng.random() >= a.mix_p:
+                    continue
+                q = int(rng.integers(len(rows) - 1))
+                q += q >= p  # another row: a different utterance (every utterance is in exactly one row)
+                got = mix_into(r.wave, originals[q], rng, a.mix_snr_db)
+                if got is not None:
+                    r.wave = got[0]
+                    n_mixed += 1
+        B = len(rows)
+        durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None
+                              else self.duration[r.pieces].sum(dtype=np.float32) for r in rows], dtype=np.float32)
+        agree = np.array([_nanmin(self.agree[r.pieces]) for r in rows], dtype=np.float32)
+        out = self._collate([r.wave for r in rows], [(r.tok, r.ti, r.tl) for r in rows])
+        out.update(durations=torch.from_numpy(durations), agree=torch.from_numpy(agree),
+                   index=torch.tensor([r.pieces[0] for r in rows], dtype=torch.int64),
+                   ids=["+".join(self.ids[i] for i in r.pieces) for r in rows],
+                   sources=[self.sources[r.pieces[0]] for r in rows], dropped=dropped)
+        out["aug"] = dict(utts=len(keep), rows=B, concat_groups=groups, concat_utts=len(keep) if groups else 0,
+                          truncated=n_cut, mixed=n_mixed, cut_padded=0, end_padded=0, concat_capped=capped,
+                          cut_mismatch=mismatch)
+        return out
 
 
 def _cat(parts: list[np.ndarray], dtype, empty_shape: tuple) -> torch.Tensor:
@@ -1126,7 +1217,7 @@ class FrameBatchDataset(torch.utils.data.Dataset):
     ARRAYS = ("frames_blank_lp", "dense_frame", "dense_topk_idx", "dense_topk_lp", "ctc_ids")
 
     def __init__(self, stores: Stores, augment: "Augment | None" = None):
-        self.augment = _augment_spec(augment)
+        self.augment = _frame_augment(augment)
         u = stores.utts
         d = Path(stores.cache_dir)
         self.cache_dir = str(d)
@@ -1157,7 +1248,7 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         the trainer keeps its plain dataset for the smoke checks and the memory probe next to the augmenting one its
         train loader pickles into the workers."""
         out = copy.copy(self)
-        out.augment, out._mm = _augment_spec(augment), None
+        out.augment, out._mm = _frame_augment(augment), None
         return out
 
     def _open(self) -> dict:
@@ -1317,8 +1408,9 @@ def _nanmin(x: np.ndarray) -> float:
 
 # ---------------------------------------------------------------------------------------------------- augmentation
 #
-# The CTC family's train-time augmentation (scripts/04_distill.py augment.*, off by default; FrameBatchDataset(
-# augment=Augment(...)), in the loader's workers, after decoding). Why: trained on the stored rows alone, the student
+# The train-time augmentation (scripts/04_distill.py augment.*, off by default; FrameBatchDataset(augment=Augment(...))
+# for the CTC family, AudioBatchDataset(augment=..., cuts=...) for the AED students - "AED rows" below), in the loader's
+# workers, after decoding. Why: trained on the stored rows alone, the student
 # learns two artefacts of its data rather than of speech (the owner's review of P-0.1B inside the app):
 #   - every row is ONE whole utterance that ends in a sentence mark, so "the input ends" becomes "emit 。": a decoded
 #     chunk gets 。/？/！ at its end whether the speaker stopped or not (moving the chunk's end 3 s later moves the mark
@@ -1398,7 +1490,8 @@ PAD_MIN_BLANK_LP = math.log(0.99)  # a pad frame's log p(blank): the row's most 
 
 @dataclass(frozen=True)
 class Augment:
-    """What a train FrameBatchDataset does to each micro-batch (the section comment above). scripts/04_distill.py
+    """What a train FrameBatchDataset (or AudioBatchDataset) does to each micro-batch (the section comment above).
+    scripts/04_distill.py
     builds it from augment.* (from_config) with seed = augment.seed or the run's seed, concat_max_s clamped to the
     longest train utterance and punct_ids from the student's tokenizer. concat_p: per micro-batch; truncate_p, mix_p:
     per row; truncate_min_frac / truncate_min_s: the cut's lower bound (a share of the row's frames, seconds);
@@ -1407,7 +1500,11 @@ class Augment:
     the rule cannot tell a sentence's mark from its words); concat_max_n / concat_max_s: the pieces and seconds of a
     joined row; mix_snr_db: (low, high) dB of the row's power over the interferer's, drawn uniformly; truncate_pad_p /
     end_pad_p: per cut row / per whole row, a quiet pad of (low, high) pad_frames 80 ms frames (inclusive) after it;
-    truncate_min_row_s: rows shorter than this (seconds, the row's frames) are never cut."""
+    truncate_min_row_s: rows shorter than this (seconds, the row's frames) are never cut.
+    max_tokens: set for an AED (token-target) dataset - AudioBatchDataset's augmentation, the section comment's "AED
+    rows" - and None for the CTC family's: the most target tokens (EOS included) a joined row may hold, the planner's
+    max_dec_len less the prompt's length - 1. An AED augmentation takes no punct_ids (its cuts come from the cut table,
+    whose rule already keeps every cut before a word) and no pads (truncate_pad_p and end_pad_p 0)."""
 
     seed: int
     truncate_p: float = 0.0
@@ -1424,6 +1521,7 @@ class Augment:
     end_pad_p: float = 0.0
     pad_frames: tuple = (1, 5)
     truncate_min_row_s: float = 0.0
+    max_tokens: int | None = None
 
     def __post_init__(self):
         snr = tuple(float(x) for x in self.mix_snr_db)
@@ -1434,34 +1532,66 @@ class Augment:
         object.__setattr__(self, "pad_frames", tuple(int(x) for x in pf) if whole else pf)
         probs = (self.truncate_p, self.truncate_pause_p, self.concat_p, self.mix_p, self.truncate_pad_p,
                  self.end_pad_p)
+        aed = self.max_tokens is not None
         ok = (int(self.seed) >= 0 and all(0.0 <= float(p) <= 1.0 for p in probs)
               and 0.0 <= float(self.truncate_min_frac) < 1.0 and float(self.truncate_min_s) >= 0.0
               and float(self.concat_max_s) > 0.0 and int(self.concat_max_n) >= 2 and len(snr) == 2
               and 0.0 <= snr[0] <= snr[1] and all(0 <= i < CTC_BLANK for i in self.punct_ids)
-              and (float(self.truncate_p) == 0.0 or len(self.punct_ids) > 0)
+              and (aed or float(self.truncate_p) == 0.0 or len(self.punct_ids) > 0)
               and whole and 1 <= self.pad_frames[0] <= self.pad_frames[1] <= PAD_MAX_FRAMES
-              and float(self.truncate_min_row_s) >= 0.0)
+              and float(self.truncate_min_row_s) >= 0.0
+              and (not aed or (int(self.max_tokens) >= 2 and not self.punct_ids
+                               and float(self.truncate_pad_p) == 0.0 and float(self.end_pad_p) == 0.0)))
         if not ok:
             raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
                              "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high, "
                              "punct_ids token ids below the blank and given whenever truncate_p > 0, pad_frames whole "
-                             f"(low, high) with 1 <= low <= high <= {PAD_MAX_FRAMES}, truncate_min_row_s >= 0)")
+                             f"(low, high) with 1 <= low <= high <= {PAD_MAX_FRAMES}, truncate_min_row_s >= 0; an AED "
+                             "one (max_tokens set): max_tokens >= 2, no punct_ids, truncate_pad_p and end_pad_p 0)")
 
     @classmethod
     def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None,
-                    punct_ids: Sequence[int] = ()) -> "Augment":
+                    punct_ids: Sequence[int] = (), max_tokens: int | None = None) -> "Augment":
         """From scripts/04_distill.py's augment block: `enabled` and `seed` are the caller's (seed: the resolved one),
-        concat_max_s (when given) replaces the block's - the trainer's clamp -, punct_ids the student tokenizer's."""
-        kw = {f.name: block[f.name] for f in fields(cls) if f.name not in ("seed", "punct_ids") and f.name in block}
+        concat_max_s (when given) replaces the block's - the trainer's clamp -, punct_ids the student tokenizer's (a CTC
+        student's), max_tokens the planner's (an AED student's)."""
+        kw = {f.name: block[f.name] for f in fields(cls)
+              if f.name not in ("seed", "punct_ids", "max_tokens") and f.name in block}
         if concat_max_s is not None:
             kw["concat_max_s"] = float(concat_max_s)
-        return cls(seed=int(seed), punct_ids=tuple(punct_ids), **kw)
+        return cls(seed=int(seed), punct_ids=tuple(punct_ids), max_tokens=max_tokens, **kw)
 
 
 def _augment_spec(augment) -> "Augment | None":
     if augment is None or isinstance(augment, Augment):
         return augment
     raise TypeError(f"augment must be an Augment or None, got {type(augment).__name__}")
+
+
+def _frame_augment(augment) -> "Augment | None":
+    """A FrameBatchDataset's augmentation: a CTC one (max_tokens None)."""
+    augment = _augment_spec(augment)
+    if augment is not None and augment.max_tokens is not None:
+        raise ValueError("an AED augmentation (max_tokens set) on a frame store: the CTC family's takes punct_ids and "
+                         "no max_tokens")
+    return augment
+
+
+def _token_augment(augment, cuts) -> "tuple[Augment | None, object]":
+    """An AudioBatchDataset's (augmentation, cut index): an AED augmentation (max_tokens set), with a cut index when it
+    cuts; no cut index without an augmentation."""
+    augment = _augment_spec(augment)
+    if augment is None:
+        if cuts is not None:
+            raise ValueError("a cut index without an augmentation")
+        return None, None
+    if augment.max_tokens is None:
+        raise ValueError("a CTC augmentation (no max_tokens) on a token store: an AED student's needs max_tokens - the "
+                         "planner's decoder cap a joined row must keep")
+    if augment.truncate_p > 0 and cuts is None:
+        raise ValueError("augment.truncate_p > 0 on a token store needs the cut table's index (kitsune.aed_cuts): an "
+                         "AED row has no frame targets to say what a cut keeps")
+    return augment, cuts
 
 
 def augment_rng(seed: int, idx: Sequence[int]) -> np.random.Generator:
@@ -1714,6 +1844,114 @@ def _join_rows(parts: list[_AugRow], rng: np.random.Generator) -> _AugRow:
     t = [r.ft.n_frames for r in parts]
     return _AugRow(join_waves([r.wave for r in parts], t, rng), join_frame_targets([r.ft for r in parts]),
                    [r.pieces[0] for r in parts], np.cumsum([0] + t[:-1]).astype(int).tolist())
+
+
+# AED rows (AudioBatchDataset(augment=Augment(max_tokens=...), cuts=...); scripts/04_distill.py augment.* on an AED
+# student). The same three steps, on the Cohere teacher's token targets:
+#   concat    as above (concat_k: the same divisor rule and concat_max_s), the pieces' audio joined by join_waves at
+#             their ctc_frames, so each piece starts on an encoder frame boundary of the joined row; the targets are
+#             the pieces' tokens one after another, each piece's EOS dropped but the last's - with their stored top-k
+#             rows -, so a joined row reads "sentence. sentence. sentence.<EOS>" and the teacher's marks sit inside it.
+#             The first token of a later piece keeps the top-k the teacher gave it at its own utterance's start, an
+#             approximation of the teacher on the joined context. A join is refused for the whole micro-batch (no row
+#             joined; aug concat_capped) when a joined row would hold more than max_tokens target tokens: the planner
+#             excludes rows over max_dec_len and never planned a longer decoder. Kept within it, a joined micro-batch's
+#             decoder rectangle - rows x longest - is at most the planned one's: rows / k rows of at most the k pieces'
+#             tokens, sum(T) - (k - 1) <= k x max(T)
+#   truncate  per row (truncate_p): a frame drawn as truncate_cut draws it - truncate_pause_p of the cuts inside a
+#             pause, uniformly among the frames otherwise -, among the frames the cut table names for the row's pieces
+#             (kitsune.aed_cuts: where the Parakeet teacher's CTC alignment has a word start whose boundary maps onto
+#             the Cohere text), shifted to the piece's offset, at or after the same lower bound (truncate_min_frac of
+#             the row's frames, truncate_min_s) and never on a row under truncate_min_row_s. The audio ends at a drawn
+#             sample (end_samples), as a CTC row's; the targets keep the Cohere tokens that entry names (the pieces'
+#             before it whole, EOS dropped) and end in EOS, without a sentence mark: the input ending inside a sentence
+#             is no reason to emit one. The EOS position's target is one-hot (top-k row: EOS at log-prob 0, the
+#             teacher's next ids at TOKEN_CUT_FLOOR_LP), so its KL is its CE: the teacher never saw the cut input. A
+#             piece whose decoded audio gives other frames than the table recorded contributes no cuts (cut_mismatch)
+#   mix       as above (the targets the clean row's)
+# No pads: a quiet pad would add no token, and the recipe keeps them off for both families.
+TOKEN_CUT_FLOOR_LP = -30.0  # the cut row's EOS position: the log-prob of its other top-k ids (e^-30 ~ 1e-13 each)
+
+
+class _TokRow:
+    """One row of an augmented AED micro-batch: its audio, tokens (EOS last) with their top-k rows, the store indices of
+    its pieces, their first frames, their frames and the tokens of the pieces before each (EOS dropped), and the frame
+    it was cut at (None: whole)."""
+
+    __slots__ = ("wave", "tok", "ti", "tl", "pieces", "offsets", "frames", "before", "cut")
+
+    def __init__(self, wave: np.ndarray, tok: np.ndarray, ti: np.ndarray, tl: np.ndarray, i: int, n_frames: int):
+        self.wave, self.tok, self.ti, self.tl = wave, tok, ti, tl
+        self.pieces, self.offsets, self.frames, self.before, self.cut = [int(i)], [0], [int(n_frames)], [0], None
+
+    @property
+    def n_frames(self) -> int:
+        return int(sum(self.frames))
+
+    def body(self, eos: int) -> int:
+        """The tokens before the final EOS (all of them for a row the teacher's length cap cut, which has none)."""
+        return len(self.tok) - int(len(self.tok) > 0 and int(self.tok[-1]) == int(eos))
+
+    def cut_at(self, c: int, kept: int, eos: int, rng: np.random.Generator):
+        """Keep the first c frames - the audio up to end_samples(c, rng), still c frames - and the first `kept` tokens,
+        then EOS with a one-hot top-k row (the teacher's ids at the first removed token, EOS first, the rest at
+        TOKEN_CUT_FLOOR_LP); only the pieces that start before c stay named."""
+        n = min(end_samples(c, rng), len(self.wave))
+        if ctc_frames(n) != int(c):  # never for a row of more than c frames; the frame contract's guard
+            n = FRAME_SAMPLES * int(c)
+        self.wave = self.wave[:n]
+        k = self.ti.shape[1]
+        nxt = [int(x) for x in self.ti[kept] if int(x) != int(eos)][:k - 1]
+        e_idx = np.asarray([eos] + nxt, dtype=self.ti.dtype)
+        e_lp = np.asarray([0.0] + [TOKEN_CUT_FLOOR_LP] * (k - 1), dtype=self.tl.dtype)
+        self.tok = np.concatenate([self.tok[:kept], np.asarray([eos], dtype=self.tok.dtype)])
+        self.ti = np.concatenate([self.ti[:kept], e_idx[None]])
+        self.tl = np.concatenate([self.tl[:kept], e_lp[None]])
+        m = sum(1 for o in self.offsets if o < c)
+        self.pieces, self.offsets, self.frames, self.before = (self.pieces[:m], self.offsets[:m], self.frames[:m],
+                                                               self.before[:m])
+        self.cut = int(c)
+
+
+def _join_tok_rows(parts: list[_TokRow], eos: int, rng: np.random.Generator) -> _TokRow:
+    """concat's join of single-utterance AED rows, in the given order: the audio join_waves', the targets the pieces'
+    without the EOS of every piece but the last."""
+    body = [r.body(eos) for r in parts]
+    t = [r.n_frames for r in parts]
+    keep = [slice(0, n) for n in body[:-1]] + [slice(None)]
+    row = _TokRow(join_waves([r.wave for r in parts], t, rng),
+                  np.concatenate([r.tok[s] for r, s in zip(parts, keep)]),
+                  np.concatenate([r.ti[s] for r, s in zip(parts, keep)]),
+                  np.concatenate([r.tl[s] for r, s in zip(parts, keep)]), parts[0].pieces[0], t[0])
+    row.pieces, row.frames = [r.pieces[0] for r in parts], t
+    row.offsets = np.cumsum([0] + t[:-1]).astype(int).tolist()
+    row.before = np.cumsum([0] + body[:-1]).astype(int).tolist()
+    return row
+
+
+def aed_cut_candidates(r: _TokRow, cuts, a: Augment, eos: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """truncate's candidate frames of an AED row (kitsune.aed_cuts.row_candidates over its pieces' cut-table entries, at
+    each piece's offset): (frames, the tokens each keeps, in a pause, the pieces the table holds whose frames differ
+    from their decoded audio's - they add none). None on a row under truncate_min_row_s; never a frame below
+    max(truncate_min_frac x its frames, truncate_min_s, 1 frame), nor one that keeps no token or every token."""
+    from kitsune import aed_cuts
+
+    z = np.zeros(0, np.int64)
+    T = r.n_frames
+    if T * FRAME_SAMPLES < float(a.truncate_min_row_s) * TARGET_SR - 1e-6:
+        return z, z, np.zeros(0, dtype=bool), 0
+    lo = max(math.ceil(float(a.truncate_min_frac) * T - 1e-9),
+             math.ceil(float(a.truncate_min_s) * TARGET_SR / FRAME_SAMPLES - 1e-9), 1)
+    pieces, bad = [], 0
+    for i, off, nf, before in zip(r.pieces, r.offsets, r.frames, r.before):
+        tf = cuts.n_frames(i)
+        if tf != nf:
+            bad += tf >= 0  # a row the table holds whose audio decodes to other frames
+            continue
+        pieces.append((cuts.entries(i), off, before))
+    frames, kept, pause = aed_cuts.row_candidates(pieces, lo, TRUNCATE_PAUSE_FRAMES)
+    ok = (kept >= 1) & (kept < r.body(eos))
+    return frames[ok], kept[ok], pause[ok], bad
 
 
 # --------------------------------------------------------------------------------------------------------- loader

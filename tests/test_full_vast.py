@@ -502,9 +502,10 @@ def test_the_recipe_test_flags_reach_the_box_env_in_one_spelling(full_launch, ca
 
 
 def test_augment_sets_are_refused_for_a_box_without_a_ctc_trainer(full_launch, repo, capsys):
-    """augment.* is the CTC family's: on a box whose train items are all AED, launch refuses the sets before renting
-    (04_distill's validate_augment would refuse augment.enabled only on the box, after the paid boot and the store
-    build, on every attempt); a CTC box's sets pass (box p01 above), and so do an AED box's int sets."""
+    """augment.* resume sets are the CTC family's: on a box whose train items are all AED, launch refuses them before
+    renting (an AED student's augmentation is its config's, with the cut table no set can name, and 04_distill's
+    validate_augment would refuse a cut without it only on the box, after the paid boot and the store build, on every
+    attempt); a CTC box's sets pass (box p01 above), and so do an AED box's int sets."""
     reg = copy.deepcopy(dict(repo.reg))
     reg["boxes"]["full-t"] = dict(copy.deepcopy(reg["boxes"]["p01"]), data_config="configs/full/data-full.json", items=[
         {"name": "stores-aed", "kind": "stores", "config": "configs/full/full-t06.json"},
@@ -518,7 +519,7 @@ def test_augment_sets_are_refused_for_a_box_without_a_ctc_trainer(full_launch, r
     out = capsys.readouterr().out
     assert rc == 1 and created(fake) is None, out
     assert ("--resume-set augment.enabled, augment.mix_p: box full-t trains no CTC student (its train items' "
-            "families: aed), and augment.* is the CTC family's") in out
+            "families: aed), and augment.* resume sets are the CTC family's") in out
     rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "full-t", "--scratch-repo", SCRATCH, "--resume-reset",
                            rid, "--resume-set", f"{rid}:schedule.epochs=4", "--dry-run")
     out = capsys.readouterr().out
