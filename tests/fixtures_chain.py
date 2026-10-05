@@ -11,7 +11,7 @@ import copy
 
 CHAIN_BOX = "p01-chain"
 CHAIN = {"_comment": "addendum E.1.7 (the entry the finalize step adds to configs/full/boxes.json)",
-         "est_hours": 25.2, "max_hours": 35, "max_dph": 1.00, "extra_gb": 120, "gate": True,
+         "est_hours": 25.2, "max_hours": 41, "max_dph": 1.00, "extra_gb": 120, "gate": True,
          "chain": [{"parts": ["full-smoke", "smoke-b"], "gate_box": "full-smoke",
                     "rebuild": "configs/full/data-smoke.json", "gate_by_hours": 9, "max_hours": 10.5},
                    {"parts": ["p01"], "rebuild": "configs/full/data-p01.json"}]}

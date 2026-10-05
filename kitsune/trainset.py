@@ -485,8 +485,8 @@ def is_frame_store(stores: "Stores") -> bool:
     return (stores.info or {}).get("kind") == "frames"
 
 
-def dataset_for(stores: "Stores", augment: "Augment | None" = None,
-                cuts=None) -> "AudioBatchDataset | FrameBatchDataset":
+def dataset_for(stores: "Stores", augment: "Augment | None" = None, cuts=None,
+                noise=None) -> "AudioBatchDataset | FrameBatchDataset":
     """The micro-batch dataset of a store: FrameBatchDataset for a frame store, else AudioBatchDataset. augment: the
     TRAIN loader's augmentation (Augment: a CTC one on a frame store; an AED one - max_tokens set - on a token store,
     with cuts, the cut table's kitsune.aed_cuts.CutIndex over the store's rows, when it cuts). Every other dataset -
@@ -495,8 +495,8 @@ def dataset_for(stores: "Stores", augment: "Augment | None" = None,
     if is_frame_store(stores):
         if cuts is not None:
             raise ValueError("a cut index is an AED store's (kitsune.aed_cuts); a frame store cuts on its own targets")
-        return FrameBatchDataset(stores, augment=augment)
-    return AudioBatchDataset(stores, augment=augment, cuts=cuts)
+        return FrameBatchDataset(stores, augment=augment, noise=noise)
+    return AudioBatchDataset(stores, augment=augment, cuts=cuts, noise=noise)
 
 
 def _frame_cache_complete(cache_dir: Path) -> bool:
@@ -1017,11 +1017,11 @@ class AudioBatchDataset(torch.utils.data.Dataset):
     micro-batch is augmented after decoding (_augmented; the "AED rows" part of the "augmentation" section below) - its
     rows joined, cut at a cut-table frame and mixed - and collated as above, plus `aug`, a dict of counts (utts, rows,
     concat_groups, concat_utts, truncated, mixed, cut_padded and end_padded - always 0 -, concat_capped,
-    cut_mismatch). A joined row holds several utterances: its ids are theirs joined by "+", sources and index the
+    cut_mismatch, end_trimmed). A joined row holds several utterances: its ids are theirs joined by "+", sources and index the
     first one's. None (the default) returns the stored rows exactly as before the augmentation existed, without `aug`.
     """
 
-    def __init__(self, stores: Stores, augment: "Augment | None" = None, cuts=None):
+    def __init__(self, stores: Stores, augment: "Augment | None" = None, cuts=None, noise=None):
         u = stores.utts
         self.cache_dir = str(stores.cache_dir)
         self.prompt = np.array(stores.info.get("prompt", PROMPT), dtype=np.int64)
@@ -1036,6 +1036,7 @@ class AudioBatchDataset(torch.utils.data.Dataset):
         self.tok_off = np.array([x.tok_off for x in u], dtype=np.int64)
         self.n_tok = np.array([x.n_tok for x in u], dtype=np.int64)
         self.augment, self.cuts = _token_augment(augment, cuts)
+        self.noise = _noise_of(self.augment, noise)
         self._mm = None
 
     def __len__(self) -> int:
@@ -1046,12 +1047,13 @@ class AudioBatchDataset(torch.utils.data.Dataset):
         state["_mm"] = None  # never pickle memmaps: each process maps the files itself
         return state
 
-    def with_augment(self, augment: "Augment | None", cuts=None) -> "AudioBatchDataset":
+    def with_augment(self, augment: "Augment | None", cuts=None, noise=None) -> "AudioBatchDataset":
         """This dataset with another augmentation and cut index (None: none), as a shallow copy sharing the
         per-utterance arrays (FrameBatchDataset.with_augment's reason): the trainer keeps the plain dataset for the
         smoke checks and the memory probe."""
         out = copy.copy(self)
         out.augment, out.cuts = _token_augment(augment, cuts)
+        out.noise = _noise_of(out.augment, noise)
         out._mm = None
         return out
 
@@ -1127,8 +1129,8 @@ class AudioBatchDataset(torch.utils.data.Dataset):
         )
 
     def _augmented(self, idx: Sequence[int], keep: list[int], waves: list[np.ndarray], dropped: list[str]) -> dict:
-        """__getitem__ under self.augment: the decoded rows (store indices `keep`, audio `waves`) joined, cut and mixed
-        in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's own stream, as
+        """__getitem__ under self.augment: the decoded rows (store indices `keep`, audio `waves`) joined, cut, end-trimmed
+        and mixed in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's own stream, as
         FrameBatchDataset._augmented - then collated as the plain path collates. A join is refused (the micro-batch
         stays as it is, concat_capped) when one of its rows would hold more than max_tokens target tokens: the planner
         never planned such a decoder. A cut lands on a frame of the rows' cut-table entries (aed_cut_candidates) and
@@ -1163,6 +1165,16 @@ class AudioBatchDataset(torch.utils.data.Dataset):
                         j = int(rng.integers(len(frames)))
                     r.cut_at(int(frames[j]), int(kept[j]), eos, rng)
                     n_cut += 1
+        n_trim = 0
+        if a.end_trim_p > 0:
+            lo, hi = (int(round(s * TARGET_SR)) for s in END_TRIM_TAIL_S)
+            for r in rows:
+                if r.cut is not None or rng.random() >= a.end_trim_p:
+                    continue
+                n = voiced_end(r.wave) + int(rng.integers(lo, hi + 1))
+                if n < len(r.wave):
+                    r.wave, r.trimmed = r.wave[:n], True
+                    n_trim += 1
         if a.mix_p > 0 and len(rows) >= 2:
             for p, r in enumerate(rows):
                 if rng.random() >= a.mix_p:
@@ -1173,8 +1185,9 @@ class AudioBatchDataset(torch.utils.data.Dataset):
                 if got is not None:
                     r.wave = got[0]
                     n_mixed += 1
+        n_noise = mix_background(rows, self.noise, a, rng)
         B = len(rows)
-        durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None
+        durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None or r.trimmed
                               else self.duration[r.pieces].sum(dtype=np.float32) for r in rows], dtype=np.float32)
         agree = np.array([_nanmin(self.agree[r.pieces]) for r in rows], dtype=np.float32)
         out = self._collate([r.wave for r in rows], [(r.tok, r.ti, r.tl) for r in rows])
@@ -1184,7 +1197,7 @@ class AudioBatchDataset(torch.utils.data.Dataset):
                    sources=[self.sources[r.pieces[0]] for r in rows], dropped=dropped)
         out["aug"] = dict(utts=len(keep), rows=B, concat_groups=groups, concat_utts=len(keep) if groups else 0,
                           truncated=n_cut, mixed=n_mixed, cut_padded=0, end_padded=0, concat_capped=capped,
-                          cut_mismatch=mismatch)
+                          cut_mismatch=mismatch, end_trimmed=n_trim, noised=n_noise)
         return out
 
 
@@ -1216,8 +1229,9 @@ class FrameBatchDataset(torch.utils.data.Dataset):
 
     ARRAYS = ("frames_blank_lp", "dense_frame", "dense_topk_idx", "dense_topk_lp", "ctc_ids")
 
-    def __init__(self, stores: Stores, augment: "Augment | None" = None):
+    def __init__(self, stores: Stores, augment: "Augment | None" = None, noise=None):
         self.augment = _frame_augment(augment)
+        self.noise = _noise_of(self.augment, noise)
         u = stores.utts
         d = Path(stores.cache_dir)
         self.cache_dir = str(d)
@@ -1242,13 +1256,14 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         state["_mm"] = None  # never pickle memmaps: each process maps the files itself
         return state
 
-    def with_augment(self, augment: "Augment | None") -> "FrameBatchDataset":
+    def with_augment(self, augment: "Augment | None", noise=None) -> "FrameBatchDataset":
         """This dataset with another augmentation (None: none), as a shallow copy: the per-utterance arrays (ids,
         offsets, durations; on the full data ~10M rows, most of a GiB) are shared, not built or held a second time, so
         the trainer keeps its plain dataset for the smoke checks and the memory probe next to the augmenting one its
         train loader pickles into the workers."""
         out = copy.copy(self)
         out.augment, out._mm = _frame_augment(augment), None
+        out.noise = _noise_of(out.augment, noise)
         return out
 
     def _open(self) -> dict:
@@ -1363,6 +1378,11 @@ class FrameBatchDataset(torch.utils.data.Dataset):
                     n_cut_pad += 1
                 else:
                     n_end_pad += 1
+        n_trim = 0
+        if a.end_trim_p > 0:
+            for r in rows:
+                if r.cut is None and not r.pad and rng.random() < a.end_trim_p and r.trim_end(a.punct_ids, rng):
+                    n_trim += 1
         if a.mix_p > 0 and len(rows) >= 2:
             for p, r in enumerate(rows):
                 if rng.random() >= a.mix_p:
@@ -1373,12 +1393,13 @@ class FrameBatchDataset(torch.utils.data.Dataset):
                 if got is not None:
                     r.wave = got[0]
                     n_mixed += 1
+        n_noise = mix_background(rows, self.noise, a, rng)
         B = len(rows)
         lengths = np.array([len(r.wave) for r in rows], dtype=np.int64)
         wave = np.zeros((B, int(lengths.max()) if B else 0), dtype=np.float32)
         for b, r in enumerate(rows):
             wave[b, :len(r.wave)] = r.wave
-        durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None or r.pad
+        durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None or r.pad or r.trimmed
                               else self.duration[r.pieces].sum(dtype=np.float32) for r in rows], dtype=np.float32)
         agree = np.array([_nanmin(self.agree[r.pieces]) for r in rows], dtype=np.float32)
         out = dict(wave=torch.from_numpy(wave), lengths=torch.from_numpy(lengths),
@@ -1389,7 +1410,8 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         out.update(collate_frame_targets([r.ft for r in rows]) if B else _empty_frame_targets())
         out["n_tok"] = out["ctc_target_lengths"].clone()
         out["aug"] = dict(utts=len(keep), rows=B, concat_groups=groups, concat_utts=len(keep) if groups else 0,
-                          truncated=n_cut, mixed=n_mixed, cut_padded=n_cut_pad, end_padded=n_end_pad)
+                          truncated=n_cut, mixed=n_mixed, cut_padded=n_cut_pad, end_padded=n_end_pad,
+                          end_trimmed=n_trim, noised=n_noise)
         return out
 
 
@@ -1504,7 +1526,11 @@ class Augment:
     max_tokens: set for an AED (token-target) dataset - AudioBatchDataset's augmentation, the section comment's "AED
     rows" - and None for the CTC family's: the most target tokens (EOS included) a joined row may hold, the planner's
     max_dec_len less the prompt's length - 1. An AED augmentation takes no punct_ids (its cuts come from the cut table,
-    whose rule already keeps every cut before a word) and no pads (truncate_pad_p and end_pad_p 0)."""
+    whose rule already keeps every cut before a word) and no pads (truncate_pad_p and end_pad_p 0). end_trim_p: per
+    row that was not cut (nor padded), trim its trailing silence to a short drawn tail, its sentence mark kept (end
+    trim: an AED row's tokens as they are, a CTC row's mark frames moved up to its last word; a CTC one needs
+    punct_ids). noise_p: per row, background audio from the bank (kitsune.noise_bank) mixed under the whole row at an
+    SNR drawn from noise_snr_db ((low, high) dB of the row's voiced power over the background's)."""
 
     seed: int
     truncate_p: float = 0.0
@@ -1522,16 +1548,21 @@ class Augment:
     pad_frames: tuple = (1, 5)
     truncate_min_row_s: float = 0.0
     max_tokens: int | None = None
+    end_trim_p: float = 0.0
+    noise_p: float = 0.0
+    noise_snr_db: tuple = (0.0, 20.0)
 
     def __post_init__(self):
         snr = tuple(float(x) for x in self.mix_snr_db)
         object.__setattr__(self, "mix_snr_db", snr)
+        nsnr = tuple(float(x) for x in self.noise_snr_db)
+        object.__setattr__(self, "noise_snr_db", nsnr)
         object.__setattr__(self, "punct_ids", tuple(sorted(int(i) for i in self.punct_ids)))
         pf = tuple(self.pad_frames)
         whole = len(pf) == 2 and all(float(x) == int(x) for x in pf)
         object.__setattr__(self, "pad_frames", tuple(int(x) for x in pf) if whole else pf)
         probs = (self.truncate_p, self.truncate_pause_p, self.concat_p, self.mix_p, self.truncate_pad_p,
-                 self.end_pad_p)
+                 self.end_pad_p, self.end_trim_p, self.noise_p)
         aed = self.max_tokens is not None
         ok = (int(self.seed) >= 0 and all(0.0 <= float(p) <= 1.0 for p in probs)
               and 0.0 <= float(self.truncate_min_frac) < 1.0 and float(self.truncate_min_s) >= 0.0
@@ -1541,13 +1572,16 @@ class Augment:
               and whole and 1 <= self.pad_frames[0] <= self.pad_frames[1] <= PAD_MAX_FRAMES
               and float(self.truncate_min_row_s) >= 0.0
               and (not aed or (int(self.max_tokens) >= 2 and not self.punct_ids
-                               and float(self.truncate_pad_p) == 0.0 and float(self.end_pad_p) == 0.0)))
+                               and float(self.truncate_pad_p) == 0.0 and float(self.end_pad_p) == 0.0))
+              and (aed or float(self.end_trim_p) == 0.0 or len(self.punct_ids) > 0)
+              and len(nsnr) == 2 and nsnr[0] <= nsnr[1])
         if not ok:
             raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
                              "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high, "
                              "punct_ids token ids below the blank and given whenever truncate_p > 0, pad_frames whole "
                              f"(low, high) with 1 <= low <= high <= {PAD_MAX_FRAMES}, truncate_min_row_s >= 0; an AED "
-                             "one (max_tokens set): max_tokens >= 2, no punct_ids, truncate_pad_p and end_pad_p 0)")
+                             "one (max_tokens set): max_tokens >= 2, no punct_ids, truncate_pad_p and end_pad_p 0; "
+                             "a CTC one's end_trim_p needs punct_ids; noise_snr_db low <= high)")
 
     @classmethod
     def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None,
@@ -1566,6 +1600,18 @@ def _augment_spec(augment) -> "Augment | None":
     if augment is None or isinstance(augment, Augment):
         return augment
     raise TypeError(f"augment must be an Augment or None, got {type(augment).__name__}")
+
+
+def _noise_of(augment, noise):
+    """A dataset's background bank (kitsune.noise_bank.NoiseBank): required when its augmentation's noise_p > 0, none
+    without an augmentation."""
+    if augment is None:
+        if noise is not None:
+            raise ValueError("a noise bank without an augmentation")
+        return None
+    if augment.noise_p > 0 and noise is None:
+        raise ValueError("augment.noise_p > 0 needs a noise bank (kitsune.noise_bank: augment.noise_bank)")
+    return noise
 
 
 def _frame_augment(augment) -> "Augment | None":
@@ -1808,10 +1854,11 @@ class _AugRow:
     """One row of an augmented micro-batch: its audio, targets, the store indices of its pieces and their first frames,
     the frame it was cut at (None: whole) and the frames of quiet appended after it (0: none)."""
 
-    __slots__ = ("wave", "ft", "pieces", "offsets", "cut", "pad")
+    __slots__ = ("wave", "ft", "pieces", "offsets", "cut", "pad", "trimmed")
 
     def __init__(self, wave: np.ndarray, ft, pieces: list[int], offsets: list[int]):
         self.wave, self.ft, self.pieces, self.offsets, self.cut, self.pad = wave, ft, pieces, offsets, None, 0
+        self.trimmed = False
 
     def pad_quiet(self, n: int, src: np.ndarray, rng: np.random.Generator):
         """Append n frames of quiet (quiet_pad, room tone from src) with pure-blank targets at the row's most confident
@@ -1837,6 +1884,72 @@ class _AugRow:
         self.ft = cut_frame_targets(self.ft, c)
         n = sum(1 for o in self.offsets if o < c)
         self.pieces, self.offsets, self.cut = self.pieces[:n], self.offsets[:n], int(c)
+
+
+    def trim_end(self, punct_ids: Sequence[int], rng: np.random.Generator) -> bool:
+        """The CTC end trim: when the row ends in sentence marks (punct_ids) after a run of blank frames following its
+        last word, the frames of that gap are dropped and the marks' frames moved up behind the word, the audio ending
+        at a drawn sample of the new last frame (end_samples). The Parakeet teacher puts a mark after the trailing
+        silence, so the audio cannot just be cut short - the mark would go with it. False (nothing done) for a row
+        without a final mark or without such a gap."""
+        tail = mark_tail(self.ft, punct_ids)
+        if tail is None:
+            return False
+        e_w, s_m, e_m = tail
+        ft = join_frame_targets([cut_frame_targets(self.ft, e_w + 1), slice_frame_targets(self.ft, s_m, e_m + 1)])
+        n = min(end_samples(ft.n_frames, rng), len(self.wave))
+        if ctc_frames(n) != ft.n_frames:  # never for a shortened row; the frame contract's guard
+            n = FRAME_SAMPLES * ft.n_frames
+        self.wave, self.ft, self.trimmed = self.wave[:n], ft, True
+        return True
+
+
+def slice_frame_targets(ft: "FrameTargets", a: int, b: int) -> "FrameTargets":
+    """Frames [a, b) of ft as targets of their own: blank_lp[a:b], the dense frames in it shifted by -a with their top-k,
+    the greedy path recomputed."""
+    from kitsune.ctc_targets import FrameTargets
+
+    a, b = int(a), int(b)
+    lo, hi = (int(np.searchsorted(ft.dense_frame, x)) for x in (a, b))
+    out = FrameTargets(b - a, ft.blank_lp[a:b].copy(), (ft.dense_frame[lo:hi] - a).astype(np.int32),
+                       ft.topk_idx[lo:hi].copy(), ft.topk_lp[lo:hi].copy(), np.zeros(0, np.int32))
+    out.ctc_ids = greedy_ids(out.col0())
+    return out
+
+
+def mark_tail(ft: "FrameTargets", punct_ids: Sequence[int]) -> tuple[int, int, int] | None:
+    """(the last frame of the row's last word's run, the first frame of the marks after it, the last frame of the last
+    mark's run) when the row's argmax ends in punct_ids tokens after a gap of at least one blank frame behind its last
+    word; None otherwise (no word, no final mark, the mark right behind the word)."""
+    from kitsune.aed_cuts import token_runs
+
+    starts, ends, cls = token_runs(ft.col0())
+    punct = np.isin(cls, np.asarray(list(punct_ids), dtype=np.int64))
+    words = np.flatnonzero(~punct)
+    if not len(words) or words[-1] == len(cls) - 1:
+        return None
+    w = int(words[-1])
+    e_w, s_m, e_m = int(ends[w]), int(starts[w + 1]), int(ends[-1])
+    return (e_w, s_m, e_m) if s_m > e_w + 1 else None
+
+
+def mix_background(rows, bank, a: Augment, rng: np.random.Generator) -> int:
+    """The background step of either family's rows (noise_p): per row, a stretch of the bank as long as the row mixed
+    under all of it at an SNR drawn from noise_snr_db (kitsune.noise_bank.add_background), its targets unchanged - the
+    teacher's on the clean audio. Returns the rows it changed (a silent row or stretch is left as it is)."""
+    if a.noise_p <= 0 or bank is None:
+        return 0
+    from kitsune.noise_bank import add_background
+
+    n = 0
+    for r in rows:
+        if rng.random() >= a.noise_p:
+            continue
+        got = add_background(r.wave, bank.segment(len(r.wave), rng), rng, a.noise_snr_db)
+        if got is not None:
+            r.wave = got[0]
+            n += 1
+    return n
 
 
 def _join_rows(parts: list[_AugRow], rng: np.random.Generator) -> _AugRow:
@@ -1868,9 +1981,33 @@ def _join_rows(parts: list[_AugRow], rng: np.random.Generator) -> _AugRow:
 #             is no reason to emit one. The EOS position's target is one-hot (top-k row: EOS at log-prob 0, the
 #             teacher's next ids at TOKEN_CUT_FLOOR_LP), so its KL is its CE: the teacher never saw the cut input. A
 #             piece whose decoded audio gives other frames than the table recorded contributes no cuts (cut_mismatch)
+#   end trim  per row that was not cut (end_trim_p): its trailing silence - the audio after its last voiced 10 ms frame
+#             (voiced_end: within END_TRIM_DB of the row's loudest) - trimmed to a tail drawn uniformly in
+#             END_TRIM_TAIL_S, its tokens kept, sentence mark and EOS included (a row whose silence is already shorter
+#             stays as it is). Why (the P-0.3B review's issue B, 2026-10-05): a cut ends tightly before a word with no
+#             mark, and the clean source, Galgame, almost always ends a complete row in a long pause (median 0.28 s;
+#             ReazonSpeech and Emilia end tightly but are noisy or spontaneous), so "clean audio that ends tightly" was
+#             "a cut": P-0.3B left the mark off 7 % of JSUT's complete sentences, whose audio ends within ~0.05 s of the
+#             last word, and kept it on 100 % of Galgame's. Trimmed complete rows make a tight end mean nothing by
+#             itself. Before mix, so the interferer does not hide the row's silence
 #   mix       as above (the targets the clean row's)
 # No pads: a quiet pad would add no token, and the recipe keeps them off for both families.
+END_TRIM_DB = 35.0  # a 10 ms frame is voiced within this many dB of the row's loudest (the review's tail_sil.py rule)
+END_TRIM_TAIL_S = (0.01, 0.08)  # the trimmed row keeps this much audio after its last voiced frame (JSUT: 0.00-0.05 s)
 TOKEN_CUT_FLOOR_LP = -30.0  # the cut row's EOS position: the log-prob of its other top-k ids (e^-30 ~ 1e-13 each)
+
+
+def voiced_end(wave: np.ndarray) -> int:
+    """The sample just after a row's last voiced HOP-sample (10 ms) frame: voiced = mean power within END_TRIM_DB of
+    the row's loudest frame. len(wave) for a row of under 5 frames or no frame at all; everything after it is the row's
+    trailing silence (end trim)."""
+    n = len(wave) // HOP
+    if n < 5:
+        return len(wave)
+    fr = np.asarray(wave[:n * HOP], dtype=np.float32).reshape(n, HOP)
+    db = 10.0 * np.log10(np.einsum("ij,ij->i", fr, fr) / HOP + 1e-12)
+    voiced = np.flatnonzero(db > db.max() - END_TRIM_DB)
+    return int((voiced[-1] + 1) * HOP) if len(voiced) else len(wave)
 
 
 class _TokRow:
@@ -1878,11 +2015,12 @@ class _TokRow:
     its pieces, their first frames, their frames and the tokens of the pieces before each (EOS dropped), and the frame
     it was cut at (None: whole)."""
 
-    __slots__ = ("wave", "tok", "ti", "tl", "pieces", "offsets", "frames", "before", "cut")
+    __slots__ = ("wave", "tok", "ti", "tl", "pieces", "offsets", "frames", "before", "cut", "trimmed")
 
     def __init__(self, wave: np.ndarray, tok: np.ndarray, ti: np.ndarray, tl: np.ndarray, i: int, n_frames: int):
         self.wave, self.tok, self.ti, self.tl = wave, tok, ti, tl
         self.pieces, self.offsets, self.frames, self.before, self.cut = [int(i)], [0], [int(n_frames)], [0], None
+        self.trimmed = False
 
     @property
     def n_frames(self) -> int:

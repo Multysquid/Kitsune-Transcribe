@@ -94,7 +94,7 @@ def test_the_chain_entry_validates_round_trips_and_derives_its_spec(tmp_path):
     assert {k: spec[k] for k in ("gpus", "data_config", "est_hours", "max_hours", "max_dph", "extra_gb", "gate",
                                   "watchdog", "deadline_reserve_min", "timed_states", "smoke", "faults", "items",
                                   "max_attempts")} == dict(
-        gpus=1, data_config="configs/full/data-p01.json", est_hours=25.2, max_hours=35, max_dph=1.0, extra_gb=120,
+        gpus=1, data_config="configs/full/data-p01.json", est_hours=25.2, max_hours=41, max_dph=1.0, extra_gb=120,
         gate=True, watchdog={"orphan_s": 600, "action": "alert"}, deadline_reserve_min=45, timed_states=True,
         smoke=False, faults=[], items=[], max_attempts=4)
     assert [s["stage"] for s in spec["chain"]] == [1, 2] and spec["chain"][0]["data_configs"] == {
@@ -219,8 +219,8 @@ RULES = {
     "a rebuild that is no part's": (lambda r, root: stage(r, 1).update(rebuild="configs/full/data-full.json"),
                                     r"rebuild 'configs/full/data-full.json' is not the data config of one"),
     "gate_by past stage 1": (lambda r, root: stage(r, 0).update(gate_by_hours=11), r"gate_by_hours 11"),
-    "stage 1 as long as the chain": (lambda r, root: stage(r, 0).update(max_hours=35),
-                                     r"max_hours 35 must be < the chain's max_hours 35"),
+    "stage 1 as long as the chain": (lambda r, root: stage(r, 0).update(max_hours=41),
+                                     r"max_hours 41 must be < the chain's max_hours 41"),
     "extra_gb below the last stage's": (lambda r, root: r["boxes"][CHAIN_BOX].update(extra_gb=10),
                                         r"extra_gb 10 is below its last stage's parts' \(25\)"),
     "gate_box on the last stage": (lambda r, root: stage(r, 1).update(gate_box="p01"),
@@ -1216,11 +1216,11 @@ def test_first_boot_falls_back_to_the_deadline_less_the_cap(ch, monkeypatch):
     assert ch.make(parts=FakeParts()).st["first_boot"] == now + 30 * 3600 - 32 * 3600
     monkeypatch.delenv(fullrun.ENV_MAX_HOURS)
     ctl = ch.make(parts=FakeParts())
-    assert ctl.st["first_boot"] == now + 30 * 3600 - 35 * 3600
+    assert ctl.st["first_boot"] == now + 30 * 3600 - 41 * 3600
     assert ctl.st["gate_by"] == ctl.st["first_boot"] + 9 * 3600
     ctl.save()
     (ch.state / "first_boot").write_text(f"{now}\n")  # a later file never moves a recorded chain
-    assert ch.make(parts=FakeParts()).st["first_boot"] == now + 30 * 3600 - 35 * 3600
+    assert ch.make(parts=FakeParts()).st["first_boot"] == now + 30 * 3600 - 41 * 3600
 
 
 def test_stage2_timeouts_from_the_stage_1_plan(ch, tmp_path):

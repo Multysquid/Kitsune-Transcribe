@@ -53,10 +53,15 @@ def test_constants_exact_values():
     assert fr.RUN_ID_RE == r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"
     assert fr.ITEM_RE == r"^[a-z0-9][a-z0-9.-]*$"
     assert fr.RESUME_SET_KEYS == ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
-                                  "augment.concat_p", "augment.mix_p")
+                                  "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s",
+                                  "augment.end_trim_p", "augment.noise_p", "augment.noise_bank",
+                                  "augment.noise_bank_sha256")
     assert fr.RESUME_SET_INT_MIN == {"schedule.epochs": 1, "early_stop.patience": 1}
     assert fr.RESUME_SET_KINDS == {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
-                                   "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob"}
+                                   "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
+                                   "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob",
+                                   "augment.noise_p": "prob", "augment.noise_bank": "path",
+                                   "augment.noise_bank_sha256": "sha256"}
     assert fr.STALL_MIN_DEFAULT == {"stores": 360, "train": 45, "readout": 30, "speed": 30, "eval": 60}
     assert fr.ITEM_KINDS == ("stores", "train", "readout", "speed", "eval")
     assert fr.FAULT_ACTIONS == ("sigstop", "kill", "wipe_run_dir", "deadline", "freeze_controller_hb")
@@ -227,7 +232,8 @@ def test_parse_resume_sets():
     assert fr.parse_resume_sets(f"{RID}:early_stop.patience=12,{RID}:schedule.epochs=8") == {
         RID: ["early_stop.patience=12", "schedule.epochs=8"]}
     only = "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, augment.concat_p, " \
-           "augment.mix_p may change on a resume"
+           "augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, augment.noise_p, augment.noise_bank, " \
+           "augment.noise_bank_sha256 may change on a resume"
     for bad in (f"{RID}:early_stop.patience=0", f"{RID}:early_stop.patience=-1", f"{RID}:early_stop.patience=1.5",
                 f"{RID}:early_stop.patience=x", f"{RID}:early_stop.patience=",
                 f"{RID}:early_stop.patience=12,{RID}:early_stop.patience=6",
@@ -253,9 +259,10 @@ RECIPE_SETS = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=
 
 
 def test_parse_resume_sets_types_and_normalises_each_value():
-    """The typed sets (RESUME_SET_KINDS): an int, a bool, a probability, each normalised to the one spelling the env
-    word, the resume plan and the trainer's --set carry - so the env word round-trips to itself, and two spellings of
-    one continuation are one continuation on the box (full_queue adopt's resume_sets_differ compares them)."""
+    """The typed sets (RESUME_SET_KINDS): an int, a bool, a probability, seconds, a data-repo path and a sha256, each
+    normalised to the one spelling the env word, the resume plan and the trainer's --set carry - so the env word
+    round-trips to itself, and two spellings of one continuation are one continuation on the box (full_queue adopt's
+    resume_sets_differ compares them)."""
     loose = [f"{RID}:schedule.epochs=04", f"{RID}:augment.enabled=True", f"{RID}:augment.truncate_p=.30",
              f"{RID}:augment.concat_p=5e-1", f"{RID}:augment.mix_p=.050"]
     got = fr.parse_resume_sets(",".join(loose))
@@ -266,16 +273,30 @@ def test_parse_resume_sets_types_and_normalises_each_value():
                            ("augment.mix_p", "0", "0.0"), ("augment.mix_p", "1", "1.0"), ("augment.mix_p", "1.", "1.0"),
                            ("augment.concat_p", "0.50", "0.5"), ("augment.truncate_p", "3E-1", "0.3"),
                            ("augment.truncate_p", "1e-7", "1e-07"), ("schedule.epochs", "008", "8"),
-                           ("early_stop.patience", "12", "12")):
+                           ("early_stop.patience", "12", "12"), ("augment.truncate_min_row_s", "3", "3.0"),
+                           ("augment.truncate_min_row_s", "2.50", "2.5"), ("augment.truncate_min_row_s", "0", "0.0"),
+                           ("augment.end_trim_p", ".3", "0.3"), ("augment.noise_p", "0.30", "0.3")):
         assert fr.resume_set_value(key, val) == want, (key, val)
         assert fr.resume_set_value(key, want) == want  # normalised once is normalised
         # ... and JSON of the key's type, as 04_distill's --set reads it (apply_set: json.loads)
-        assert type(json.loads(want)) is {"int": int, "bool": bool, "prob": float}[fr.RESUME_SET_KINDS[key]]
+        assert type(json.loads(want)) is {"int": int, "bool": bool, "prob": float,
+                                          "seconds": float}[fr.RESUME_SET_KINDS[key]]
+    # a path and a sha256 stay strings: 04_distill's --set keeps a value json.loads cannot read (or reads as a string)
+    sha = "0123456789abcdef" * 4
+    for key, val, want in (("augment.noise_bank", "aug/musan-bg-v1", "aug/musan-bg-v1"),
+                           ("augment.noise_bank", "aug/v1.2_b", "aug/v1.2_b"),
+                           ("augment.noise_bank_sha256", sha.upper(), sha), ("augment.noise_bank_sha256", sha, sha)):
+        assert fr.resume_set_value(key, val) == want, (key, val)
+        with pytest.raises(ValueError):
+            json.loads(want)
     # the rule of every key, as launch's help says it and each refusal names it
     assert {k: fr.resume_set_rule(k) for k in fr.RESUME_SET_KEYS} == {
         "schedule.epochs": "an int >= 1", "early_stop.patience": "an int >= 1", "augment.enabled": "true or false",
         "augment.truncate_p": "a probability in [0, 1]", "augment.concat_p": "a probability in [0, 1]",
-        "augment.mix_p": "a probability in [0, 1]"}
+        "augment.mix_p": "a probability in [0, 1]", "augment.truncate_min_row_s": "a number of seconds >= 0",
+        "augment.end_trim_p": "a probability in [0, 1]", "augment.noise_p": "a probability in [0, 1]",
+        "augment.noise_bank": "a relative data-repo path (letters, digits, _ . - and /, no ..)",
+        "augment.noise_bank_sha256": "a sha256 (64 lowercase hex digits)"}
     for bad, msg in ((f"{RID}:augment.enabled=yes", "augment.enabled must be true or false, not 'yes'"),
                      (f"{RID}:augment.enabled=1", "augment.enabled must be true or false"),
                      (f"{RID}:augment.enabled=", "augment.enabled must be true or false"),
@@ -289,6 +310,23 @@ def test_parse_resume_sets_types_and_normalises_each_value():
                      (f"{RID}:augment.mix_p=x", "augment.mix_p must be a probability"),
                      (f"{RID}:augment.mix_p=", "augment.mix_p must be a probability"),
                      (f"{RID}:augment.mix_p=0.2,{RID}:augment.mix_p=0.3", "augment.mix_p given twice"),
+                     (f"{RID}:augment.truncate_min_row_s=-1", "truncate_min_row_s must be a number of seconds >= 0"),
+                     (f"{RID}:augment.truncate_min_row_s=inf", "truncate_min_row_s must be a number of seconds"),
+                     (f"{RID}:augment.end_trim_p=1.5", "augment.end_trim_p must be a probability"),
+                     (f"{RID}:augment.noise_p=-0.3", "augment.noise_p must be a probability"),
+                     (f"{RID}:augment.noise_bank=/abs/bank", "augment.noise_bank must be a relative data-repo path"),
+                     (f"{RID}:augment.noise_bank=aug/../labels", "augment.noise_bank must be a relative"),
+                     (f"{RID}:augment.noise_bank=aug//bank", "augment.noise_bank must be a relative"),
+                     (f"{RID}:augment.noise_bank=aug/bank/", "augment.noise_bank must be a relative"),
+                     (f"{RID}:augment.noise_bank=aug\\bank", "augment.noise_bank must be a relative"),
+                     (f"{RID}:augment.noise_bank=12", "augment.noise_bank must be a relative"),  # JSON: a number
+                     (f"{RID}:augment.noise_bank=true", "augment.noise_bank must be a relative"),  # JSON: a bool
+                     (f"{RID}:augment.noise_bank=null", "augment.noise_bank must be a relative"),
+                     (f"{RID}:augment.noise_bank=", "augment.noise_bank must be a relative"),
+                     (f"{RID}:augment.noise_bank_sha256=abc", "augment.noise_bank_sha256 must be a sha256"),
+                     (f"{RID}:augment.noise_bank_sha256={'g' * 64}", "augment.noise_bank_sha256 must be a sha256"),
+                     (f"{RID}:augment.noise_bank_sha256={'1' * 64}", "augment.noise_bank_sha256 must be a sha256"),
+                     (f"{RID}:augment.noise_bank_sha256={'0' * 65}", "augment.noise_bank_sha256 must be a sha256"),
                      # the recipe's other keys keep the trainer's defaults: another value would be another recipe
                      (f"{RID}:augment.seed=1", "may change on a resume"),
                      (f"{RID}:augment.concat_max_s=20", "may change on a resume"),

@@ -381,7 +381,11 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "train", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
                        "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, "
-                       "augment.concat_p, augment.mix_p may change on a resume"),
+                       "augment.concat_p, augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, "
+                       "augment.noise_p, augment.noise_bank, augment.noise_bank_sha256 may change on a resume"),
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:augment.noise_bank=../bank"],
+                       "augment.noise_bank must be a relative data-repo path"),
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:early_stop.patience=0"], "early_stop.patience must be an int >= 1"),
                       (["--job", "full", "--box", "p01", "--resume-set",
@@ -499,6 +503,27 @@ def test_the_recipe_test_flags_reach_the_box_env_in_one_spelling(full_launch, ca
     assert fullrun.parse_resume_sets(env["KITSUNE_RESUME_SETS"]) == {rid: want}
     a, kw = full_launch.seen["preflight"]
     assert kw["resets"] == [rid] and kw["sets"] == {rid: want}
+
+
+def test_the_p_test_box_flags_reach_the_box_env_in_one_spelling(full_launch, capsys):
+    """DECISIONS H8: the P test box re-runs box 1's cooldown with recipe v3 - its seconds, path and sha256 sets, in
+    loose spellings, reach the box in the normalised spelling (3 -> 3.0, the sha256 lowercased, the path as given)
+    and parse back to the same list."""
+    rid, sha = "full-p01-20261001T184145Z", "89abcdef" * 8
+    loose = ["schedule.epochs=4", "augment.enabled=TRUE", "augment.truncate_p=.2", "augment.concat_p=0.5",
+             "augment.mix_p=0", "augment.truncate_min_row_s=3", "augment.end_trim_p=0.30", "augment.noise_p=.3",
+             "augment.noise_bank=aug/musan-bg-v1", f"augment.noise_bank_sha256={sha.upper()}"]
+    want = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.2", "augment.concat_p=0.5",
+            "augment.mix_p=0.0", "augment.truncate_min_row_s=3.0", "augment.end_trim_p=0.3", "augment.noise_p=0.3",
+            "augment.noise_bank=aug/musan-bg-v1", f"augment.noise_bank_sha256={sha}"]
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
+                           rid, *sum((["--resume-set", f"{rid}:{s}"] for s in loose), []), "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    env = env_of(created(fake))
+    assert env["KITSUNE_RESUME_SETS"] == ",".join(f"{rid}:{s}" for s in want)
+    assert re.fullmatch(fullrun._ENV_WORD, env["KITSUNE_RESUME_SETS"])
+    assert fullrun.parse_resume_sets(env["KITSUNE_RESUME_SETS"]) == {rid: want}
 
 
 def test_augment_sets_are_refused_for_a_box_without_a_ctc_trainer(full_launch, repo, capsys):
@@ -1332,7 +1357,7 @@ def chain_launch(repo, monkeypatch):
 def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     """E.1.8: KITSUNE_CONFIG is stage 1's rebuild, the watchdog's stage-1 env with its hand-over bound, the disk and
     the gate on box 1's extent (+ the chain's extra_gb), the boot's rebuild bytes and timeout on stage 1's; every part
-    preflighted as a box, each distinct data config's selection checked, the chain's own files; 35 h, 25.2 h, $1.00."""
+    preflighted as a box, each distinct data config's selection checked, the chain's own files; 41 h, 25.2 h, $1.00."""
     rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 0, out
@@ -1345,7 +1370,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
         "KITSUNE_WATCHDOG_ORPHAN_ACTION": "alert", "KITSUNE_CHAIN_STAGE": "1", "KITSUNE_WATCHDOG_HANDOVER_S": "34200",
         "KITSUNE_SCRATCH_REPO": SCRATCH, "KITSUNE_GATE_BYTES": str(int(571.3e9)), "KITSUNE_GATE_MAX_H": "5",
         "KITSUNE_REBUILD_BYTES": str(int(59.2e9)), "KITSUNE_PULL_BYTES": str(int(1e9 * (5.5 + 2))),
-        "KITSUNE_MAX_HOURS": "35", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
+        "KITSUNE_MAX_HOURS": "41", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
         "KITSUNE_REBUILD_TIMEOUT_MIN": "120", "KITSUNE_DPH": "0.8100", "KITSUNE_MACHINE_ID": "70001"}
     assert create[create.index("--disk") + 1] == "1400" and create[create.index("--label") + 1].startswith(
         "kitsune-full-p01-chain-data-smoke-")
@@ -1359,7 +1384,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     assert parts["smoke-b"][0][7]["selection"] == "labels/full/selections/study_1000h.parquet"
     assert all(not kw.get("resume") for _, kw in parts.values())
     assert len(s["chain"]) == 1 and "chain preflight ok" in out and "part p01: p01 preflight ok" in out
-    assert "x ~25.2 h (box p01-chain; watchdog cap 35 h)" in out
+    assert "x ~25.2 h (box p01-chain; watchdog cap 41 h)" in out
     assert "chain p01-chain: the gate part must end by first boot + 9 h" in out and "+ 9.5 h" in out
     assert "free disk was re-checked just now: the offer search keeps only offers with disk_space >= 1400 GB" in out
     assert "disk_space>=1400" in search_query(fake).split(" "), "the offer search itself filters on the chain's disk"
@@ -1380,7 +1405,7 @@ def test_launch_chain_refusals(chain_launch, capsys, args, err):
 def test_launch_chain_warns_below_its_cap_and_a_parts_problem_refuses(chain_launch, capsys):
     rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--max-hours", "32", "--dry-run")
     out = capsys.readouterr().out
-    assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 35 h" in out
+    assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 41 h" in out
     assert env_of(created_or_printed(out))["KITSUNE_MAX_HOURS"] == "32"
     chain_launch.seen["part_problems"]["smoke-b"] = ["tools/whisper_eval.py (item whisper-large-v3) does not exist"]
     rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")

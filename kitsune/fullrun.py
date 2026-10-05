@@ -197,12 +197,21 @@ ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # them would test another recipe than the one P-0.3B is to train with, so they are not settable here. None of these
 # keys shapes the step plan (scripts/04_distill.py RESUME_FIXED holds none of them: augment.* happens inside the train
 # loader), so a resume keeps its epoch position; 04_distill validates every value again on the box (validate: epochs,
-# bools; validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set)
+# bools; validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set).
+# DECISIONS H8 (the P test box after the P-0.3B review): box 1's cooldown re-run with recipe v2 and the review's fixes
+# also sets truncate_min_row_s (seconds >= 0), end_trim_p (a probability) and the background noise - noise_p (a
+# probability), the bank's data-repo path noise_bank and the sha256 of its index.json, noise_bank_sha256
 RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
-                   "augment.concat_p", "augment.mix_p")
+                   "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s", "augment.end_trim_p",
+                   "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256")
 RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
 RESUME_SET_KINDS = {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
-                    "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob"}
+                    "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
+                    "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob", "augment.noise_p": "prob",
+                    "augment.noise_bank": "path", "augment.noise_bank_sha256": "sha256"}
+# a data-repo path a resume set may name: relative, of path segments without "..", no comma (KITSUNE_RESUME_SETS'
+# separator) and nothing JSON would read as another type (04_distill's --set keeps a string that is not JSON)
+_REPO_PATH_RE = r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*"
 # a probability's spelling: a plain decimal (digits, one point, an exponent), no sign, no "inf" / "nan" / "1_0" - the
 # forms float() would also take but JSON (04_distill's --set) would not, or not as a number
 _DECIMAL_RE = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
@@ -341,7 +350,9 @@ def resume_set_rule(key: str) -> str:
     kind = RESUME_SET_KINDS[key]
     if kind == "int":
         return f"an int >= {RESUME_SET_INT_MIN[key]}"
-    return "true or false" if kind == "bool" else "a probability in [0, 1]"
+    return {"bool": "true or false", "prob": "a probability in [0, 1]", "seconds": "a number of seconds >= 0",
+            "path": "a relative data-repo path (letters, digits, _ . - and /, no ..)",
+            "sha256": "a sha256 (64 lowercase hex digits)"}[kind]
 
 
 def resume_set_value(key: str, val: str) -> str:
@@ -352,6 +363,9 @@ def resume_set_value(key: str, val: str) -> str:
             "True" it would keep instead fails its bool check - on the box, after the paid boot and the store build
       prob  a plain decimal in [0, 1] (_DECIMAL_RE), as the shortest repr of its float: "0.30", ".3", "3e-1" -> "0.3",
             "1" -> "1.0"; JSON reads that back as the same float
+      seconds  a plain decimal >= 0, spelled as a prob: "3" -> "3.0"
+      path  a relative data-repo path (_REPO_PATH_RE), as given; never one that JSON reads as a number, bool or null
+      sha256  64 lowercase hex digits, as given (lowercased)
     One spelling per value is what lets the queue compare launches: adopt() records `resume_sets_differ` when the env's
     sets differ from the resume plan's, and a relaunch of the same continuation spelled ".3" must not look like a
     different one. ValueError naming the rule otherwise."""
@@ -362,9 +376,26 @@ def resume_set_value(key: str, val: str) -> str:
     elif kind == "bool":
         if val.lower() in ("true", "false"):
             return val.lower()
+    elif kind == "seconds":
+        if re.fullmatch(_DECIMAL_RE, val) and float(val) >= 0.0:
+            return repr(float(val))
+    elif kind == "path":
+        if re.fullmatch(_REPO_PATH_RE, val) and ".." not in val.split("/") and _not_json_scalar(val):
+            return val
+    elif kind == "sha256":
+        if re.fullmatch(r"[0-9a-fA-F]{64}", val) and _not_json_scalar(val.lower()):
+            return val.lower()
     elif re.fullmatch(_DECIMAL_RE, val) and 0.0 <= float(val) <= 1.0:
         return repr(float(val))
     raise ValueError(f"{key} must be {resume_set_rule(key)}, not {val!r}")
+
+
+def _not_json_scalar(val: str) -> bool:
+    """True when 04_distill's --set would keep val as the string it is (json.loads fails on it, or reads a string)."""
+    try:
+        return isinstance(json.loads(val), str)
+    except ValueError:
+        return True
 
 
 def parse_resume_sets(s: str | None) -> dict[str, list[str]]:

@@ -47,7 +47,7 @@
   "clock": "epochs",
   "max_steps": null,
   "end_reserve_min": 30,
-  "epochs": 5,
+  "epochs": 10,
   "deadline_cooldown": true
  },
  "batch": {
@@ -205,5 +205,16 @@
  "bn": {
   "mode": "frozen"
  },
- "family": "ctc"
+ "family": "ctc",
+ "augment": {
+  "enabled": true,
+  "truncate_p": 0.2,
+  "concat_p": 0.5,
+  "mix_p": 0.0,
+  "truncate_min_row_s": 3.0,
+  "end_trim_p": 0.3,
+  "noise_p": 0.3,
+  "noise_bank": "aug/musan-bg-v1",
+  "noise_bank_sha256": "a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803"
+ }
 }
