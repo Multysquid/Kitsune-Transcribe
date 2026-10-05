@@ -6,7 +6,9 @@
 - In parallel (pytest-xdist, requirements-dev.txt: `python -m pytest tests -n 8 --dist loadfile`), each worker runs
   its torch and BLAS pools on KITSUNE_TEST_THREADS threads (default 1): N workers of one thread each instead of N pools
   the size of the machine. --dist loadfile keeps a file's tests on one worker, so its module fixtures (the synthetic
-  corpora, stores and tiny runs) are built once, as in a serial run.
+  corpora, stores and tiny runs) are built once, as in a serial run. The extent tests refuse a data disk with under
+  30 GB free, and N workers hold their temp dirs at once: on a full system disk, pass --basetemp on another one
+  (python -m pytest tests -n 8 --dist loadfile --basetemp D:/kitsune-tmp/pytest-tmp; pytest wipes it at the start).
 """
 import os
 
