@@ -123,8 +123,9 @@ BOXES_FILE, ENV_REGISTRY = "configs/full/boxes.json", "KITSUNE_FULL_REGISTRY"
 # smoke A, box p01 (box 1, then its recipe test: box 1's cooldown again), "full" (the retired 2x box 2: no longer in
 # the registry, kept for tests/fixtures_full.py's 2-GPU box only), smoke B, and box 2 as two 1x boxes (DECISIONS G2):
 # full-t (T-0.6B) and full-p (P-0.3B with the augmentation recipe, the Whisper models and the quantised readouts;
-# P-0.05B postponed, DECISIONS H2)
-BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p")
+# P-0.05B postponed, DECISIONS H2), and p005: P-0.05B alone, the P test box of recipe v3 (DECISIONS H10; box p01 keeps
+# P-0.1B's run, whose continuation reads box p01's Hub summary)
+BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005")
 # chain boxes (contract addendum E, DECISIONS D): one rental that runs registry boxes one after the other, in two
 # stages with an automatic gate between them (kitsune/full_queue.py ChainController). p01-chain = smoke A and smoke B,
 # then box 1, on one 1x RTX 5090

@@ -61,9 +61,9 @@ item of it ran (a plain --resume of a box whose train items are all done needs -
 a done run without --resume-reset is refused; an augment.* --resume-set on a box without a CTC train item is refused
 before any of it), without --resume a box whose Hub queue summary has a train item done
 (a fresh queue would overwrite that summary, and the run's continuation, --resume-reset, reads it; --fresh-over-done
-for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01) without the quant go
+for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01, p005) without the quant go
 signal: smoke-b's verdict on the Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE;
-DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of boxes p01, full-t and full-p warn while
+DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of boxes p01, full-t, full-p, p005 warn while
 their speed record has no box-1 part. Offers listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped.
 Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate said slow in the last
 GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link
@@ -255,11 +255,11 @@ QUANT_GO_BOX = "smoke-b"
 QUANT_GO_CHECKS = ("12", "13", "14", "15", "16")
 QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.py", "kitsune/whisper.py",
               "tools/whisper_eval.py", "requirements-train.txt", "docker/Dockerfile")
-# the hours of boxes p01 (box 1's cooldown again: the recipe test), full-t and full-p come from make_full_configs' speed
-# record (its SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's; without box 1's part
-# they are provisional (contract 7), and launch says so
+# the hours of boxes p01 (P-0.1B's continuation of box 1's run), full-t, full-p and p005 (P-0.05B) come from
+# make_full_configs' speed record (its SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's;
+# without box 1's part they are provisional (contract 7), and launch says so
 SPEED_RECORD = "configs/full/plan/box2_hours.json"
-SPEED_RECORD_BOXES = ("p01", "full-t", "full-p")
+SPEED_RECORD_BOXES = ("p01", "full-t", "full-p", "p005")
 # offers in a country whose hosts cannot reach the Hugging Face Hub: a full box downloads everything from it, and with
 # no download gate (smoke-b) such a host burns its rebuild attempts up to the cap (2026-10-01: the cheapest 1x 5090,
 # m58555, was listed in CN)

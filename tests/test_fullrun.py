@@ -28,7 +28,7 @@ RID = "full-p03-20260927T120000Z"
 def test_constants_exact_values():
     assert fr.JOB == "full"
     assert (fr.BOXES_FILE, fr.ENV_REGISTRY) == ("configs/full/boxes.json", "KITSUNE_FULL_REGISTRY")
-    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p")
+    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005")
     assert fr.HUB_DIR == "full" and fr.STATE_DEFAULT == "/workspace/kitsune_state"
     assert (fr.TRAIN_HB, fr.HB_DIR, fr.RESUME_PLAN, fr.VERDICT_FILE, fr.ALERTS_FILE, fr.GATE_FILE, fr.SUMMARY_FILE,
             fr.DEADLINE_FILE) == ("train_hb", "hb", "resume_plan.json", "smoke_verdict.json",

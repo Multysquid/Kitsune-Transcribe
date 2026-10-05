@@ -152,8 +152,8 @@ RECIPE_AED = {**RECIPE, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256, "end_t
 # index.json and pulled by box p01, boxes.json extra_dirs), mixed under the whole row - a joined row's utterances and
 # the gaps between them alike -, the targets the teacher's on the clean audio. Why: on 30 s windows of stream audio
 # (talk over game sound and music) the Parakeet teacher writes nothing and P-0.3B with it, while both transcribe the
-# same talk alone. Box p01 tests it: box 1's run continued to 8 epochs (CONTINUATIONS p01) and P-0.05B from step 0 at
-# 10 epochs (FULL_RUNS p005; DECISIONS H9)
+# same talk alone. Box p005 tests it first: P-0.05B from step 0 at 10 epochs (FULL_RUNS p005; DECISIONS H9, H10); box
+# p01's 8-epoch continuation of P-0.1B with it (CONTINUATIONS p01) waits for that result
 NOISE_BANK = "aug/musan-bg-v1"
 NOISE_BANK_SHA256 = "a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803"
 RECIPE_V3 = {**RECIPE, "end_trim_p": 0.3, "noise_p": 0.3, "noise_bank": NOISE_BANK,
@@ -289,9 +289,10 @@ DEADLINE_FAULT_SHARE, DEADLINE_FAULT_ROUND_S = 0.5, 10  # contract 7: S <= 0.5 x
 # augment_step_factor x the s/step (below).
 SPEED_FILE = "plan/box2_hours.json"  # under OUT_DIR, next to PLAN_FILE (launch's SPEED_RECORD names it)
 # the boxes whose hours are box_hours of the speed record (DECISIONS G2/G3/H1: box 2 as two 1x RTX 5090 boxes, T and P,
-# and box p01's continuation, the recipe test): their train runs, in queue order, or the continuation. Box P trains
-# P-0.3B only (DECISIONS H1 step 2, with the recipe; P-0.05B is postponed, H2: its config stays, its items left the box)
-HOURS_BOXES = {"full-t": ("t06",), "full-p": ("p03",), "p01": ("continuation", "p005")}
+# and box p01's continuation): their train runs, in queue order, "continuation" for the box's CONTINUATIONS entry. Box
+# P trains P-0.3B only (DECISIONS H1 step 2, with the recipe; P-0.05B was postponed, H2); box p005 trains P-0.05B alone
+# (the P test box, DECISIONS H10); box p01 P-0.1B's 8-epoch continuation (H9, for after the test)
+HOURS_BOXES = {"full-t": ("t06",), "full-p": ("p03",), "p01": ("continuation",), "p005": ("p005",)}
 # CONCAT'S EXTRA ATTENTION (DECISIONS H1: "add a few % for concat's extra attention"). A joined row holds k utterances
 # (k <= concat_max_n 4, <= 28 s) in the frames its micro-batch had planned, but its self-attention grows with the
 # square of its length: on full.parquet at concat_p 0.5 the attention's elements grow 1.27x over the planned
@@ -324,10 +325,14 @@ STORES_PESS = 1.91 / 1.37  # a box-1 record's measured CTC store: central x 1, p
 #               is with P-0.05B postponed (H2): its M4 and 7 quant readouts (~0.2 h) left the box and stay in the
 #               tail as margin, so the box need not be re-derived when P-0.05B comes back
 #   box p01:    m4-full-p01 and 7 P-0.1B quant readouts, plus resume-pull and check-resume before the stores
+#               (CONT_PULL_H: any box whose runs hold a continuation)
+#   box p005:   m4-full-p005 and 7 P-0.05B quant readouts (box p01's readouts without the pull)
 POST_T_H = (0.6, 1.35)
 POOL_P_H = (0.9, 1.65)
-P01_TAIL_H = (0.4, 1.0)  # box p01: m4 + 7 quantised readouts of each of its two runs (DECISIONS H8)
+P01_TAIL_H = (0.2, 0.5)
+P005_TAIL_H = (0.2, 0.5)
 CONT_PULL_H = (0.1, 0.3)
+BOX_TAIL_H = {"full-t": POST_T_H, "full-p": POOL_P_H, "p01": P01_TAIL_H, "p005": P005_TAIL_H}
 END_H = 0.35  # calc_v3 end: finish's uploads and the destroy
 # max_hours' host margin: smoke A ran on a Ryzen 9950X (calc_v3's "fast" CPU class); calc_v3's pessimistic T-0.6B
 # epoch is 13.635 / 10.846 = 1.26 x its fast one (box 2's only 2x offer on 2026-10-01, m54650, a Zen2 EPYC, is
@@ -573,10 +578,9 @@ def box_hours(plan: dict, rec: dict, box: str, reserve_min: float = 60) -> dict:
             items[f"full-{cr['student']}"], last = cr["hours"], cr["student"]
         else:
             items[f"full-{x}"], last = run_h[x], x
-    if cr is not None:
-        tail = (P01_TAIL_H[0] + CONT_PULL_H[0], P01_TAIL_H[1] + CONT_PULL_H[1])
-    else:
-        tail = POST_T_H if runs == ("t06",) else POOL_P_H
+    tail = BOX_TAIL_H[box]
+    if cr is not None:  # the continuation's run is pulled and checked before the stores
+        tail = (tail[0] + CONT_PULL_H[0], tail[1] + CONT_PULL_H[1])
     train = sum(items.values())
     est = _up(setup_c + store_c + train + tail[0] + END_H, 0.1)
     pess_end = setup_p + store_p + train * HOST_PESS
