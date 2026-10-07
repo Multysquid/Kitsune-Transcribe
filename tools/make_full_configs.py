@@ -140,10 +140,9 @@ RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0, "tr
 # the trainer's; no pads (an AED student takes none). end_trim_p 0.3 (DECISIONS H7, fix B; the owner on 2026-10-05,
 # after the P-0.3B review: 7 % of JSUT's complete sentences lost their mark): about a third of the rows that are not
 # cut lose their trailing silence down to a 10-80 ms tail, their mark kept, so a clean tight end is no longer only a
-# cut's
+# cut's. Since DECISIONS H11 also recipe v3's background (below): RECIPE_AED is RECIPE_V3 plus the cut table
 AED_CUTS = "labels/full/selections/full_study/aed_cuts.parquet"
 AED_CUTS_SHA256 = "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb"
-RECIPE_AED = {**RECIPE, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256, "end_trim_p": 0.3}
 # RECIPE V3 (DECISIONS H8, the owner on 2026-10-05: "retrain p0.1 and p0.05 with the changes and see if our changes fixed
 # the problem"): recipe v2 plus the two fixes of the P-0.3B review on the CTC students - B, end_trim_p 0.3 (a third of
 # the rows that are not cut lose their trailing silence, their mark's frames moved up behind their last word:
@@ -158,6 +157,11 @@ NOISE_BANK = "aug/musan-bg-v1"
 NOISE_BANK_SHA256 = "a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803"
 RECIPE_V3 = {**RECIPE, "end_trim_p": 0.3, "noise_p": 0.3, "noise_bank": NOISE_BANK,
              "noise_bank_sha256": NOISE_BANK_SHA256}
+# DECISIONS H11 (the owner, 2026-10-07: "make sure we have augmentation for noises, music and so on. The last
+# generalisation failures were due to not having those so its extremly important we now add them"): box T's AED
+# recipe takes the background as well - the same bank, rate and SNRs as the CTC students (kitsune.trainset mixes it
+# under an AED row after its join, cut and trim, the Cohere tokens unchanged); box full-t pulls the bank
+RECIPE_AED = {**RECIPE_V3, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /

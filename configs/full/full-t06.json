@@ -210,8 +210,11 @@
   "concat_p": 0.5,
   "mix_p": 0.0,
   "truncate_min_row_s": 3.0,
+  "end_trim_p": 0.3,
+  "noise_p": 0.3,
+  "noise_bank": "aug/musan-bg-v1",
+  "noise_bank_sha256": "a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803",
   "cuts": "labels/full/selections/full_study/aed_cuts.parquet",
-  "cuts_sha256": "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb",
-  "end_trim_p": 0.3
+  "cuts_sha256": "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb"
  }
 }

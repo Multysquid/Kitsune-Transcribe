@@ -303,8 +303,9 @@ def test_the_section_7_table():
                                    "min_delta_abs": 0.0, "min_evals": 5, "floor": None, "action": "cooldown",
                                    "smooth": 5, "allow_test_sets": False}
     # the augmentation recipe (DECISIONS H1 step 2): full-p03 carries RECIPE as its augment block, at the config's end
-    # (only the keys it changes: 04_distill's DEFAULTS give the rest), and full-t06 RECIPE_AED - RECIPE plus its cut
-    # table (DECISIONS H7); no other config has one (full-p01 is box 1's own, the smokes are smoke A's)
+    # (only the keys it changes: 04_distill's DEFAULTS give the rest), and full-t06 RECIPE_AED - recipe v3 (the end
+    # trim, and the background since DECISIONS H11) plus its cut table (H7); full-p005 RECIPE_V3 (H8); no other config
+    # has one (full-p01 is box 1's own, the smokes are smoke A's)
     assert {x: r["augment"] for x, r in M.FULL_RUNS.items()} == {"t06": M.RECIPE_AED, "p03": M.RECIPE, "p01": None,
                                                                  "p005": M.RECIPE_V3}
     # P-0.3B trains recipe v2 (DECISIONS H6); box p01's re-run and P-0.05B recipe v3 (H8); RECIPE_TEST stays the record
@@ -314,9 +315,12 @@ def test_the_section_7_table():
                                noise_bank_sha256=M.NOISE_BANK_SHA256)
     assert cfg("full-p03")["augment"] == M.RECIPE and list(cfg("full-p03"))[-1] == "augment"
     assert cfg("full-t06")["augment"] == M.RECIPE_AED and list(cfg("full-t06"))[-1] == "augment"
-    assert M.RECIPE_AED == dict(M.RECIPE, cuts="labels/full/selections/full_study/aed_cuts.parquet",
-                                cuts_sha256="cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb",
-                                end_trim_p=0.3)
+    # every run still to come trains with the background - music without vocals and noise (DECISIONS H8, H11)
+    assert M.RECIPE_AED == dict(M.RECIPE_V3, cuts="labels/full/selections/full_study/aed_cuts.parquet",
+                                cuts_sha256="cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb")
+    for a in (M.RECIPE_AED, M.RECIPE_V3, M.CONTINUATIONS["p01"]["augment"]):
+        assert (a["noise_p"], a["noise_bank"], a["noise_bank_sha256"], a["end_trim_p"]) == (
+            0.3, M.NOISE_BANK, M.NOISE_BANK_SHA256, 0.3)
     assert [n for n in GENERATED if "augment" in cfg(n)] == ["full-t06", "full-p03", "full-p005"]
 
 
@@ -764,7 +768,7 @@ def test_the_registry_loads_with_its_boxes(reg, monkeypatch):
         want += [M.AED_CUTS] if box == "full-t" else []  # T-0.6B's cut table (DECISIONS H7)
         assert fullrun.box_extra_files(box, reg) == want, box
         assert fullrun.box_extra_dirs(box, reg) == ([PARAKEET] if box in ("full-smoke", "smoke-b") else
-                                                    [M.NOISE_BANK] if box in ("p01", "p005") else []), box
+                                                    [M.NOISE_BANK] if box in ("p01", "p005", "full-t") else []), box
     for x in ("p01", "p005"):
         assert fullrun.box_students(x, reg) == fullrun.box_ctc_students(x, reg) == [f"students/study/{x}"]
     assert fullrun.box_students("full-t", reg) == ["students/study/t06"] and fullrun.box_ctc_students("full-t", reg) == []

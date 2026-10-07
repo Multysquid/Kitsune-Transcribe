@@ -754,8 +754,9 @@ Plan v3 trains the full students on the whole label set: P-0.1B alone on **box 1
 only; done 2026-10-02, 4 epochs, M4 11.45 %), after two short smokes (`full-smoke` = smoke A, `smoke-b`). Box 2 is now
 two 1x RTX 5090 boxes (DECISIONS G2): **box T** (`full-t`: T-0.6B with the same recipe on its Cohere token targets,
 `full-t06.json`'s `augment` block - its cuts from the cut table `labels/full/selections/full_study/aed_cuts.parquet`
-(`tools/aed_cut_table.py`), which the box pulls as an extra file, and the end trim of the P-0.3B review's fix B
-(DECISIONS H7 amendment) -, the Cohere labels only, `data-t`) and **box P**
+(`tools/aed_cut_table.py`), which the box pulls as an extra file, the end trim of the P-0.3B review's fix B
+(DECISIONS H7 amendment) and recipe v3's background audio, music without vocals and noise from the bank
+`aug/musan-bg-v1` the box pulls as an extra dir (H11) -, the Cohere labels only, `data-t`) and **box P**
 (`full-p`: P-0.3B with the CTC train-data augmentation recipe, `full-p03.json`'s `augment` block, the Parakeet labels,
 `data-p`, with the Whisper models and the quantised readouts; done 2026-10-04, M4 9.73 %). T-0.6B trains 8 epochs
 (DECISIONS H7, 2026-10-05) and P-0.3B trained 6 (H5); 3 each under G1 before, with the common early-stop patience 6.
@@ -950,8 +951,9 @@ A dead or stopped box continues elsewhere from what the Hub has:
   `schedule.epochs=8`, `early_stop.patience=12` and one `--resume-set` per `RECIPE_V3` key (`make_full_configs.py
   --import-speed` prints the line; the command above) - G3's 8-epoch continuation: the stable phase goes on from the
   pre_cooldown state at the peak LR to 0.8 T, then the cooldown, every step with the recipe -, with its M4 and 7
-  quantised readouts. Both boxes pull the background bank `aug/musan-bg-v1` (MUSAN music without vocals and noise,
-  `tools/build_noise_bank.py`) as an extra dir; launch refuses them until the bank is in the data repo. The runs
+  quantised readouts. Boxes p005, p01 and full-t pull the background bank `aug/musan-bg-v1` (MUSAN music without
+  vocals and noise, `tools/build_noise_bank.py`) as an extra dir; launch refuses them until the bank is in the data
+  repo. The runs
   repo's pre_cooldown state is the first test's
   re-save at the same step (model, optimizer and L2-SP byte for byte box 1's; st.resume_resets 1), so this reset counts
   2: the continuation's readout writes `runs/m4-full-p01-20261001T184145Z-r2`, and a lost host resumes only from its
