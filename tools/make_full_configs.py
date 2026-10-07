@@ -153,15 +153,35 @@ AED_CUTS_SHA256 = "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb
 # (talk over game sound and music) the Parakeet teacher writes nothing and P-0.3B with it, while both transcribe the
 # same talk alone. Box p005 tests it first: P-0.05B from step 0 at 10 epochs (FULL_RUNS p005; DECISIONS H9, H10); box
 # p01's 8-epoch continuation of P-0.1B with it (CONTINUATIONS p01) waits for that result
-NOISE_BANK = "aug/musan-bg-v1"
-NOISE_BANK_SHA256 = "a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803"
+# DECISIONS H12: the bank is v2 since (aug/musan-bg-v1 - music without vocals and noise only - stays on the data repo,
+# never trained with): v1's music and noise plus 10 h of songs with lyrics and 10 h of speech (17 languages)
+NOISE_BANK = "aug/musan-bg-v2"
+NOISE_BANK_SHA256 = "1d56c7bf5cb0f1ad036f551a81c0029360ba821186f3c5abe41d344c381339f0"
 RECIPE_V3 = {**RECIPE, "end_trim_p": 0.3, "noise_p": 0.3, "noise_bank": NOISE_BANK,
              "noise_bank_sha256": NOISE_BANK_SHA256}
+# RECIPE V4 (DECISIONS H12, the owner on 2026-10-07: "Lets do room echo, volume and codec variations and also
+# background speech and songs with lyrics. The actual output should not change, thats still the main model but it
+# should become equivariant to these variables"): recipe v3 plus the other acoustic steps of kitsune.trainset, each
+# per row, the targets always the teacher's on the clean row - the student is to write the main speaker's words
+# whatever the room, level, codec or what plays behind them:
+#   speech_p 0.15  1-4 voices behind the row at 10-25 dB of voiced power below it (half of them other rows of the
+#                  micro-batch, Japanese; half the bank's speech, 17 languages); two or more are babble
+#   noise_p 0.3    (v3's) now draws songs with lyrics too, by duration: music 15 h, noise 6.2 h, songs 10 h
+#   reverb_p 0.2   a room impulse response of RIR_BANK (OpenSLR 28: 600 small and 600 medium simulated rooms and 325
+#                  real ones; RT60 0.12 / 0.41 / 1.17 s at p10 / 50 / 90), one room for the row and its voices
+#   gain_p 0.3     -20..+10 dB, clipped at full scale
+#   codec_p 0.1    MP3 (30-100 kbit/s), GSM 6.10 or mu-law at 8 kHz, encoded and decoded in memory (libsndfile)
+# The loader pays for them (measured on real rows: +45-65 % of its decode's CPU, the codecs most); FULL_RUNS'
+# `workers` gives P-0.05B, whose GPU takes ~7,900 audio-s/s, 12 loader workers instead of the default 8
+RIR_BANK = "aug/rirs-v1"
+RIR_BANK_SHA256 = "af6d19310210aa2578c902b55d2e8d6f9e67924ede368a86fe5d6f8bce40e588"
+RECIPE_V4 = {**RECIPE_V3, "speech_p": 0.15, "reverb_p": 0.2, "rir_bank": RIR_BANK, "rir_bank_sha256": RIR_BANK_SHA256,
+             "gain_p": 0.3, "codec_p": 0.1}
 # DECISIONS H11 (the owner, 2026-10-07: "make sure we have augmentation for noises, music and so on. The last
 # generalisation failures were due to not having those so its extremly important we now add them"): box T's AED
 # recipe takes the background as well - the same bank, rate and SNRs as the CTC students (kitsune.trainset mixes it
 # under an AED row after its join, cut and trim, the Cohere tokens unchanged); box full-t pulls the bank
-RECIPE_AED = {**RECIPE_V3, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}
+RECIPE_AED = {**RECIPE_V4, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}  # recipe v4 since DECISIONS H12
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
@@ -190,7 +210,7 @@ FULL_RUNS = {
     "p01": dict(study_run="study-p01", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
                 pull_parakeet=False, end_reserve=30, augment=None),
     "p005": dict(study_run="study-p005", epochs=10, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
-                 pull_parakeet=False, end_reserve=30, augment=RECIPE_V3),
+                 pull_parakeet=False, end_reserve=30, augment=RECIPE_V4, workers=12),
 }
 # the epochs smoke A ran (2026-10-01): the smoke configs keep them (the 100 h draw is the smoke's budget), and the plan
 # record's "full" and "smoke" parts are measured at them (smoke A's check 3 projected the full runs at these T; F4's
@@ -224,7 +244,7 @@ SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # paired A/B with box 1 and the first test any more (more epochs and the recipe together):
 # the review's fixes are checked by its probes
 CONTINUATIONS = {"p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=8,
-                             patience=12, augment=RECIPE_V3, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
+                             patience=12, augment=RECIPE_V4, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
 # READOUT_RESERVE. A readout runs right after its training item on the same GPU (Resolution 25) under the same
 # KITSUNE_DEADLINE (kitsune.full_queue item_deadline: the box deadline less deadline_reserve_min). After a run that the
 # deadline cooldown (4d) shortened, 04_distill.fit_epochs_deadline has planned the end phase to finish
@@ -793,6 +813,8 @@ def full_config(x: str, r: dict | None = None, data: dict | None = None, augment
     })
     if augment and run["augment"]:
         cfg = study._merge(cfg, {"augment": dict(run["augment"])})
+    if augment and run.get("workers"):  # the full run's loader (never the smoke configs': smoke A's, byte for byte)
+        cfg = study._merge(cfg, {"perf": {"num_workers": int(run["workers"])}})
     return cfg
 
 

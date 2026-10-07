@@ -53,16 +53,18 @@ LAUNCH_T = {"t06": 191855, "p03": 211720, "p01": 215815, "p005": 269777}  # P-0.
 # re-run of box 1's cooldown, 21,582 steps, full-p03 = P-0.3B with the recipe and full-t06 = T-0.6B with the AED recipe
 # (DECISIONS H7), all at AUGMENT_STEP_FACTOR 1.05 (concat); full-p005 = P-0.05B from step 0 at 10 epochs on box p005,
 # the P test box (15.76 h, 15.03 without the factor; H9, H10), and full-p01 = box 1's run continued to 8 epochs on box
-# p01, 129,487 steps (H9; after the test), both with RECIPE_V3
+# p01, 129,487 steps (H9; after the test), both with RECIPE_V4 (H12)
 RUN_H = {"full-t06": 63.62, "full-p03": 26.53, "full-p01": 11.47, "full-p005": 15.76}
 BOX_H = {"full-t": (66.8, 88), "full-p": (30.0, 42), "p01": (14.3, 22), "p005": (18.5, 27)}
 P01_RID = "full-p01-20261001T184145Z"
-# DECISIONS H9: box p01's sets (G3's 8-epoch continuation of box 1's run, its patience 12, with RECIPE_V3; launched
-# after the P test box, H10), as launch puts them in KITSUNE_RESUME_SETS (one spelling each)
+# DECISIONS H9, H12: box p01's sets (G3's 8-epoch continuation of box 1's run, its patience 12, with RECIPE_V4;
+# launched after the P test box, H10), as launch puts them in KITSUNE_RESUME_SETS (one spelling each)
 RECIPE_SETS = ["schedule.epochs=8", "early_stop.patience=12", "augment.enabled=true", "augment.truncate_p=0.2",
                "augment.concat_p=0.5", "augment.mix_p=0.0", "augment.truncate_min_row_s=3.0", "augment.end_trim_p=0.3",
-               "augment.noise_p=0.3", "augment.noise_bank=aug/musan-bg-v1",
-               f"augment.noise_bank_sha256={M.NOISE_BANK_SHA256}"]
+               "augment.noise_p=0.3", "augment.noise_bank=aug/musan-bg-v2",
+               f"augment.noise_bank_sha256={M.NOISE_BANK_SHA256}", "augment.speech_p=0.15", "augment.reverb_p=0.2",
+               "augment.rir_bank=aug/rirs-v1", f"augment.rir_bank_sha256={M.RIR_BANK_SHA256}", "augment.gain_p=0.3",
+               "augment.codec_p=0.1"]
 
 
 def cfg(name: str) -> dict:
@@ -213,7 +215,7 @@ def test_every_config_loads_with_the_trainer(trainer, reg):
             assert c["run_name"] == n and c["schedule"]["clock"] == "epochs"
         # full-p03 trains with the recipe, full-t06 with the AED recipe, full-p005 with recipe v3 (validate_augment:
         # a CTC student; an AED one with its cut table; the rest of the block the defaults)
-        want = {"full-p03": M.RECIPE, "full-t06": M.RECIPE_AED, "full-p005": M.RECIPE_V3}.get(n)
+        want = {"full-p03": M.RECIPE, "full-t06": M.RECIPE_AED, "full-p005": M.RECIPE_V4}.get(n)
         assert trainer.augment_on(c) == (want is not None), n
         if want is not None:
             assert c["augment"] == dict(trainer.DEFAULTS["augment"], **want)
@@ -247,6 +249,7 @@ def test_a_config_is_its_study_run_but_for_the_contract_keys(x):
     # DECISIONS H1 step 2 / H7: full-p03 and full-t06 also carry their recipe's augment keys; no smoke config does
     # (smoke A ran them)
     recipe = {f"augment.{k}" for k in (M.FULL_RUNS[x]["augment"] or {})}
+    recipe |= {"perf.num_workers"} if M.FULL_RUNS[x].get("workers") else set()  # P-0.05B's loader (DECISIONS H12)
     for name, allowed in ((f"full-{x}", FULL_KEYS | recipe), (f"smoke-{x}", FULL_KEYS | SMOKE_ONLY)):
         c = cfg(name)
         a = dict(flat({k: v for k, v in base.items() if k not in fullrun.DATA_KEYS}))
@@ -304,23 +307,32 @@ def test_the_section_7_table():
                                    "smooth": 5, "allow_test_sets": False}
     # the augmentation recipe (DECISIONS H1 step 2): full-p03 carries RECIPE as its augment block, at the config's end
     # (only the keys it changes: 04_distill's DEFAULTS give the rest), and full-t06 RECIPE_AED - recipe v3 (the end
-    # trim, and the background since DECISIONS H11) plus its cut table (H7); full-p005 RECIPE_V3 (H8); no other config
+    # trim, and the background since DECISIONS H11; recipe v4 since H12) plus its cut table (H7); full-p005 RECIPE_V4
+    # (H8, H12); no other config
     # has one (full-p01 is box 1's own, the smokes are smoke A's)
     assert {x: r["augment"] for x, r in M.FULL_RUNS.items()} == {"t06": M.RECIPE_AED, "p03": M.RECIPE, "p01": None,
-                                                                 "p005": M.RECIPE_V3}
+                                                                 "p005": M.RECIPE_V4}
     # P-0.3B trains recipe v2 (DECISIONS H6); box p01's re-run and P-0.05B recipe v3 (H8); RECIPE_TEST stays the record
     # of what the first test ran
-    assert M.FULL_RUNS["p03"]["augment"] is M.RECIPE and M.CONTINUATIONS["p01"]["augment"] is M.RECIPE_V3
-    assert M.RECIPE_V3 == dict(M.RECIPE, end_trim_p=0.3, noise_p=0.3, noise_bank="aug/musan-bg-v1",
+    assert M.FULL_RUNS["p03"]["augment"] is M.RECIPE and M.CONTINUATIONS["p01"]["augment"] is M.RECIPE_V4
+    assert M.RECIPE_V3 == dict(M.RECIPE, end_trim_p=0.3, noise_p=0.3, noise_bank="aug/musan-bg-v2",
                                noise_bank_sha256=M.NOISE_BANK_SHA256)
+    # DECISIONS H12: recipe v4 = v3 + background speech, room echo, volume and codecs (the targets the clean row's)
+    assert M.RECIPE_V4 == dict(M.RECIPE_V3, speech_p=0.15, reverb_p=0.2, rir_bank="aug/rirs-v1",
+                               rir_bank_sha256=M.RIR_BANK_SHA256, gain_p=0.3, codec_p=0.1)
+    # P-0.05B's loader: 12 workers for the chain's CPU (its GPU takes ~7,900 audio-s/s); the smoke configs keep "auto"
+    assert cfg("full-p005")["perf"]["num_workers"] == 12 and cfg("smoke-p005")["perf"]["num_workers"] == "auto"
+    assert all(cfg(f"full-{x}")["perf"]["num_workers"] == "auto" for x in ("t06", "p03", "p01"))
     assert cfg("full-p03")["augment"] == M.RECIPE and list(cfg("full-p03"))[-1] == "augment"
     assert cfg("full-t06")["augment"] == M.RECIPE_AED and list(cfg("full-t06"))[-1] == "augment"
     # every run still to come trains with the background - music without vocals and noise (DECISIONS H8, H11)
-    assert M.RECIPE_AED == dict(M.RECIPE_V3, cuts="labels/full/selections/full_study/aed_cuts.parquet",
+    assert M.RECIPE_AED == dict(M.RECIPE_V4, cuts="labels/full/selections/full_study/aed_cuts.parquet",
                                 cuts_sha256="cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb")
-    for a in (M.RECIPE_AED, M.RECIPE_V3, M.CONTINUATIONS["p01"]["augment"]):
+    for a in (M.RECIPE_AED, M.RECIPE_V4, M.CONTINUATIONS["p01"]["augment"]):
         assert (a["noise_p"], a["noise_bank"], a["noise_bank_sha256"], a["end_trim_p"]) == (
             0.3, M.NOISE_BANK, M.NOISE_BANK_SHA256, 0.3)
+        assert (a["speech_p"], a["reverb_p"], a["rir_bank"], a["rir_bank_sha256"], a["gain_p"], a["codec_p"]) == (
+            0.15, 0.2, M.RIR_BANK, M.RIR_BANK_SHA256, 0.3, 0.1)
     assert [n for n in GENERATED if "augment" in cfg(n)] == ["full-t06", "full-p03", "full-p005"]
 
 
@@ -768,7 +780,8 @@ def test_the_registry_loads_with_its_boxes(reg, monkeypatch):
         want += [M.AED_CUTS] if box == "full-t" else []  # T-0.6B's cut table (DECISIONS H7)
         assert fullrun.box_extra_files(box, reg) == want, box
         assert fullrun.box_extra_dirs(box, reg) == ([PARAKEET] if box in ("full-smoke", "smoke-b") else
-                                                    [M.NOISE_BANK] if box in ("p01", "p005", "full-t") else []), box
+                                                    [M.NOISE_BANK, M.RIR_BANK] if box in ("p01", "p005", "full-t")
+                                                    else []), box
     for x in ("p01", "p005"):
         assert fullrun.box_students(x, reg) == fullrun.box_ctc_students(x, reg) == [f"students/study/{x}"]
     assert fullrun.box_students("full-t", reg) == ["students/study/t06"] and fullrun.box_ctc_students("full-t", reg) == []
@@ -793,7 +806,8 @@ def p_box_items(reg, box: str, x: str) -> dict:
     assert it["stores-ctc"]["config"] == it[f"full-{x}"]["config"] == f"configs/full/full-{x}.json"
     t = it[f"full-{x}"]
     assert (t["kind"], t["study_run"], t["family"], t["max_hours"], t["needs"], t["droppable"], t["stall_min"],
-            t["plan_total_steps"]) == ("train", f"study-{x}", "ctc", RUN_H[f"full-{x}"], ["stores-ctc"], False, 45, None)
+            t["plan_total_steps"]) == ("train", f"study-{x}", "ctc", RUN_H[f"full-{x}"], ["stores-ctc"], False, 45,
+                                       None)
     m4 = it[f"m4-full-{x}"]
     assert (m4["of"], m4["max_hours"], m4["needs"]) == (f"full-{x}", 0.3, [f"full-{x}"])
     for f, n in zip(QUANT_FORMATS, quant):
@@ -805,14 +819,14 @@ def p_box_items(reg, box: str, x: str) -> dict:
 
 def test_box_p005_is_the_p_test_box(reg, trainer):
     """Box p005 (DECISIONS H10, the owner: "lets only do p0.05 for now to reduce costs and first see if these changes
-    helped"): P-0.05B from step 0 at 10 epochs (H9) with RECIPE_V3 (H8) - its config's augment block, the bank pinned
-    and pulled as the box's extra dir - and its readouts. Its own box: box p01's Hub summary holds box 1's run, which
-    P-0.1B's continuation resumes, and a fresh queue there would overwrite it."""
+    helped"): P-0.05B from step 0 at 10 epochs (H9) with RECIPE_V4 (H8, H12) - its config's augment block, the
+    banks pinned and pulled as the box's extra dirs - and its readouts. Its own box: box p01's Hub summary holds box
+    1's run, which P-0.1B's continuation resumes, and a fresh queue there would overwrite it."""
     p_box_items(reg, "p005", "p005")
     c = trainer.load_config(str(FULL / "full-p005.json"), [])
-    assert c["schedule"]["epochs"] == 10 and c["augment"] == dict(trainer.DEFAULTS["augment"], **M.RECIPE_V3)
+    assert c["schedule"]["epochs"] == 10 and c["augment"] == dict(trainer.DEFAULTS["augment"], **M.RECIPE_V4)
     assert c["early_stop"]["patience"] == M.COMMON["early_stop"]["patience"] == 6
-    assert fullrun.box_extra_dirs("p005", reg) == [M.NOISE_BANK] and M.HOURS_BOXES["p005"] == ("p005",)
+    assert fullrun.box_extra_dirs("p005", reg) == [M.NOISE_BANK, M.RIR_BANK] and M.HOURS_BOXES["p005"] == ("p005",)
 
 
 def test_box_p01_is_p01s_continuation(reg, plan, trainer):
@@ -831,7 +845,7 @@ def test_box_p01_is_p01s_continuation(reg, plan, trainer):
     import hashlib
     c = M.CONTINUATIONS["p01"]
     assert (c["box"], c["run_id"], c["from_step"], c["epochs"], c["patience"], c["augment"], c["revision"]) == (
-        "p01", P01_RID, 86328, 8, 12, M.RECIPE_V3, "c4604304db76e068df7bbe39d00d006b74d6c134")
+        "p01", P01_RID, 86328, 8, 12, M.RECIPE_V4, "c4604304db76e068df7bbe39d00d006b74d6c134")
     assert M.RECIPE_TEST == {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}  # H1, H4: as run
     assert M.RECIPE == {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0,
                         "truncate_min_row_s": 3.0}  # DECISIONS H6: v2, P-0.3B's
@@ -854,7 +868,9 @@ def test_box_p01_is_p01s_continuation(reg, plan, trainer):
     assert changed == {"schedule.epochs": 8, "early_stop.patience": 12, "augment.enabled": True,
                        "augment.truncate_p": 0.2, "augment.concat_p": 0.5, "augment.truncate_min_row_s": 3.0,
                        "augment.end_trim_p": 0.3, "augment.noise_p": 0.3, "augment.noise_bank": M.NOISE_BANK,
-                       "augment.noise_bank_sha256": M.NOISE_BANK_SHA256}
+                       "augment.noise_bank_sha256": M.NOISE_BANK_SHA256, "augment.speech_p": 0.15,
+                       "augment.reverb_p": 0.2, "augment.rir_bank": M.RIR_BANK,
+                       "augment.rir_bank_sha256": M.RIR_BANK_SHA256, "augment.gain_p": 0.3, "augment.codec_p": 0.1}
     assert same == {"augment.mix_p": 0.0}  # mixing off: the trainer's default
     assert trainer.augment_on(trainer.load_config(str(FULL / "full-p01.json"), RECIPE_SETS))
 
@@ -1211,7 +1227,8 @@ def test_the_chained_box(reg):
         gpus=1, data_config="configs/full/data-p01.json", est_hours=25.2, max_hours=35, max_dph=1.0, extra_gb=120,
         gate=True, watchdog={"orphan_s": 600, "action": "alert"}, deadline_reserve_min=45, timed_states=True,
         extra_files=[manifest, smoke_side, STUDY_SELECTION, SIDECAR[STUDY_SELECTION], full_side],
-        extra_dirs=[PARAKEET, M.NOISE_BANK], smoke=False, faults=[], items=[], max_attempts=4, min_ram_gb=96)
+        extra_dirs=[PARAKEET, M.NOISE_BANK, M.RIR_BANK], smoke=False, faults=[], items=[], max_attempts=4,
+        min_ram_gb=96)
     s1_configs = {"full-smoke": "configs/full/data-smoke.json", "smoke-b": "configs/full/data-smoke-b.json"}
     assert spec["chain"] == fullrun.chain_stages(CHAIN, reg) == [
         dict(stage=1, parts=["full-smoke", "smoke-b"], gate_box="full-smoke", gate_by_hours=9, max_hours=10.5,
@@ -1228,11 +1245,12 @@ def test_the_chained_box(reg):
                       ctc_students=[f"students/study/{x}" for x in STUDENTS if x.startswith("p")],
                       extra_files=[manifest, smoke_side, STUDY_SELECTION, SIDECAR[STUDY_SELECTION]],
                       extra_dirs=[PARAKEET], timed_states=True, watchdog={"orphan_s": 600, "action": "alert"})
-    # box p01 is P-0.1B's continuation box now (DECISIONS H9, H10): the bank of its recipe v3 is an extra dir
+    # box p01 is P-0.1B's continuation box now (DECISIONS H9, H10): the banks of its recipe v4 are extra dirs
     assert v2 == dict(stage=2, parts=["p01"], gate_box=None, rebuild="configs/full/data-p01.json",
                       data_configs={"p01": "configs/full/data-p01.json"}, students=["students/study/p01"],
-                      ctc_students=["students/study/p01"], extra_files=[manifest, full_side], extra_dirs=[M.NOISE_BANK],
-                      timed_states=True, watchdog={"orphan_s": 3600, "action": "stop"})
+                      ctc_students=["students/study/p01"], extra_files=[manifest, full_side],
+                      extra_dirs=[M.NOISE_BANK, M.RIR_BANK], timed_states=True,
+                      watchdog={"orphan_s": 3600, "action": "stop"})
     # the files are the data configs' own: each part's selection sidecar, and smoke-b's frozen study selection, which
     # stage 1's rebuild (the smoke selection) does not bring
     assert (cfg("data-smoke")["selection"], cfg("data-p01")["selection"], cfg("data-smoke-b")["selection"]) == (

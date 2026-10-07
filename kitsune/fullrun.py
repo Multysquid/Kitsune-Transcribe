@@ -201,15 +201,21 @@ ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # bools; validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set).
 # DECISIONS H8 (the P test box after the P-0.3B review): box 1's cooldown re-run with recipe v2 and the review's fixes
 # also sets truncate_min_row_s (seconds >= 0), end_trim_p (a probability) and the background noise - noise_p (a
-# probability), the bank's data-repo path noise_bank and the sha256 of its index.json, noise_bank_sha256
+# probability), the bank's data-repo path noise_bank and the sha256 of its index.json, noise_bank_sha256. DECISIONS
+# H12 adds the other acoustic steps' rates (speech_p, reverb_p, gain_p, codec_p) and the RIR bank (rir_bank, its pin
+# rir_bank_sha256); their ranges (speech_snr_db, gain_db, codecs, ...) stay the trainer's defaults
 RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
                    "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s", "augment.end_trim_p",
-                   "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256")
+                   "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256", "augment.speech_p",
+                   "augment.reverb_p", "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p",
+                   "augment.codec_p")
 RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
 RESUME_SET_KINDS = {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
                     "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
                     "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob", "augment.noise_p": "prob",
-                    "augment.noise_bank": "path", "augment.noise_bank_sha256": "sha256"}
+                    "augment.noise_bank": "path", "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob",
+                    "augment.reverb_p": "prob", "augment.rir_bank": "path", "augment.rir_bank_sha256": "sha256",
+                    "augment.gain_p": "prob", "augment.codec_p": "prob"}
 # a data-repo path a resume set may name: relative, every segment starting with a letter, digit or _ (so never "." or
 # ".."), no comma (KITSUNE_RESUME_SETS' separator) and nothing JSON would read as another type (04_distill's --set
 # keeps a string that is not JSON)

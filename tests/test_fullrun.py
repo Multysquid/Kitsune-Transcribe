@@ -55,13 +55,17 @@ def test_constants_exact_values():
     assert fr.RESUME_SET_KEYS == ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
                                   "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s",
                                   "augment.end_trim_p", "augment.noise_p", "augment.noise_bank",
-                                  "augment.noise_bank_sha256")
+                                  "augment.noise_bank_sha256", "augment.speech_p", "augment.reverb_p",
+                                  "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p", "augment.codec_p")
     assert fr.RESUME_SET_INT_MIN == {"schedule.epochs": 1, "early_stop.patience": 1}
     assert fr.RESUME_SET_KINDS == {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
                                    "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
                                    "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob",
                                    "augment.noise_p": "prob", "augment.noise_bank": "path",
-                                   "augment.noise_bank_sha256": "sha256"}
+                                   "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob",
+                                   "augment.reverb_p": "prob", "augment.rir_bank": "path",
+                                   "augment.rir_bank_sha256": "sha256", "augment.gain_p": "prob",
+                                   "augment.codec_p": "prob"}
     assert fr.STALL_MIN_DEFAULT == {"stores": 360, "train": 45, "readout": 30, "speed": 30, "eval": 60}
     assert fr.ITEM_KINDS == ("stores", "train", "readout", "speed", "eval")
     assert fr.FAULT_ACTIONS == ("sigstop", "kill", "wipe_run_dir", "deadline", "freeze_controller_hb")
@@ -233,7 +237,8 @@ def test_parse_resume_sets():
         RID: ["early_stop.patience=12", "schedule.epochs=8"]}
     only = "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, augment.concat_p, " \
            "augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, augment.noise_p, augment.noise_bank, " \
-           "augment.noise_bank_sha256 may change on a resume"
+           "augment.noise_bank_sha256, augment.speech_p, augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, " \
+           "augment.gain_p, augment.codec_p may change on a resume"
     for bad in (f"{RID}:early_stop.patience=0", f"{RID}:early_stop.patience=-1", f"{RID}:early_stop.patience=1.5",
                 f"{RID}:early_stop.patience=x", f"{RID}:early_stop.patience=",
                 f"{RID}:early_stop.patience=12,{RID}:early_stop.patience=6",
@@ -296,7 +301,11 @@ def test_parse_resume_sets_types_and_normalises_each_value():
         "augment.mix_p": "a probability in [0, 1]", "augment.truncate_min_row_s": "a number of seconds >= 0",
         "augment.end_trim_p": "a probability in [0, 1]", "augment.noise_p": "a probability in [0, 1]",
         "augment.noise_bank": "a relative data-repo path (letters, digits, _ . - and /, no ..)",
-        "augment.noise_bank_sha256": "a sha256 (64 lowercase hex digits)"}
+        "augment.noise_bank_sha256": "a sha256 (64 lowercase hex digits)",
+        "augment.speech_p": "a probability in [0, 1]", "augment.reverb_p": "a probability in [0, 1]",
+        "augment.rir_bank": "a relative data-repo path (letters, digits, _ . - and /, no ..)",
+        "augment.rir_bank_sha256": "a sha256 (64 lowercase hex digits)", "augment.gain_p": "a probability in [0, 1]",
+        "augment.codec_p": "a probability in [0, 1]"}
     for bad, msg in ((f"{RID}:augment.enabled=yes", "augment.enabled must be true or false, not 'yes'"),
                      (f"{RID}:augment.enabled=1", "augment.enabled must be true or false"),
                      (f"{RID}:augment.enabled=", "augment.enabled must be true or false"),

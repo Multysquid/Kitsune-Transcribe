@@ -382,7 +382,9 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
                        "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, "
                        "augment.concat_p, augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, "
-                       "augment.noise_p, augment.noise_bank, augment.noise_bank_sha256 may change on a resume"),
+                       "augment.noise_p, augment.noise_bank, augment.noise_bank_sha256, augment.speech_p, "
+                       "augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, augment.gain_p, augment.codec_p "
+                       "may change on a resume"),
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:augment.noise_bank=../bank"],
                        "augment.noise_bank must be a relative data-repo path"),
@@ -757,21 +759,29 @@ def test_full_preflight_holds_the_background_bank_and_the_cut_table_to_their_pin
 
     on = {"enabled": True, "noise_p": 0.3, "noise_bank": bank, "noise_bank_sha256": pin}
     problems, notes = run(on)
-    assert problems == [] and any(f"background bank {bank}, index.json sha256 {pin[:12]}" in n for n in notes), (
+    assert problems == [] and any(f"bank {bank}, index.json sha256 {pin[:12]}" in n for n in notes), (
         problems, notes)
     problems, _ = run(dict(on, noise_bank_sha256="0" * 64))
     assert any(f"full-p01 pins {bank}/index.json at sha256 000000000000..., {DATA} holds {pin[:12]}" in x
                for x in problems), problems
     problems, _ = run(on, extra_dirs=())
-    assert any(f"full-p01 mixes the background bank {bank}, which box p01 does not pull" in x for x in problems)
+    assert any(f"full-p01 reads the bank {bank}, which box p01 does not pull" in x for x in problems)
     problems, _ = run(on, data={k: v for k, v in good.items() if k != f"{bank}/index.json"})
-    assert any(f"no {bank}/index.json (full-p01's background bank" in x for x in problems), problems
+    assert any(f"no {bank}/index.json (full-p01's bank" in x for x in problems), problems
     assert run(dict(on, enabled=False))[0] == [] and run(dict(on, noise_p=0.0))[0] == []  # no background: no pin
     # a continuation's sets: its bank and pin are checked as a config's
     rid = "full-p01-20261001T184145Z"
     problems, _ = run(sets={rid: ["augment.noise_bank=" + bank, "augment.noise_bank_sha256=" + "1" * 64]})
     assert any(f"--resume-set {rid} pins {bank}/index.json at sha256 111111111111" in x for x in problems), problems
     assert run(sets={rid: ["augment.noise_bank=" + bank, "augment.noise_bank_sha256=" + pin]})[0] == []
+    # an RIR bank (DECISIONS H12): its pin and the box's pull checked as a background bank's, from a config and from
+    # a continuation's sets
+    room = {"enabled": True, "reverb_p": 0.2, "rir_bank": bank, "rir_bank_sha256": pin}
+    assert run(room)[0] == [] and run(dict(room, reverb_p=0.0, rir_bank_sha256="2" * 64))[0] == []
+    problems, _ = run(dict(room, rir_bank_sha256="2" * 64))
+    assert any(f"full-p01 pins {bank}/index.json at sha256 222222222222" in x for x in problems), problems
+    problems, _ = run(sets={rid: ["augment.rir_bank=" + bank, "augment.rir_bank_sha256=" + "3" * 64]})
+    assert any(f"--resume-set {rid} pins {bank}/index.json at sha256 333333333333" in x for x in problems), problems
     # the cut table: its LFS sha256 (FullHub: "5e" x 32 for a .parquet)
     cuts = fullrun.FULL_DIR + "/aed_cuts.parquet"
     data = dict(good, **{cuts: b"parquet"})

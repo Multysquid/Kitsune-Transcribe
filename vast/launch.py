@@ -991,9 +991,10 @@ NOISE_INDEX = "index.json"  # kitsune.noise_bank.INDEX: the file augment.noise_b
 
 
 def augment_pins(spec: dict, reader, sets: dict | None) -> tuple[list[tuple], list[tuple]]:
-    """The background banks and cut tables a box's runs read, as (who, data-repo path, pinned sha256 or None): each
-    train item's config with its augmentation on (a bank when noise_p > 0, its cut table), then each --resume-set
-    run's augment.noise_bank / noise_bank_sha256 (a continuation sets them on top of its run's config)."""
+    """The banks and cut tables a box's runs read, as (who, data-repo path, pinned sha256 or None): each train
+    item's config with its augmentation on (its background bank when noise_p > 0 or its speech step draws from it,
+    its RIR bank when reverb_p > 0, its cut table), then each --resume-set run's augment.noise_bank /
+    noise_bank_sha256 and rir_bank / rir_bank_sha256 (a continuation sets them on top of its run's config)."""
     banks, cuts = [], []
     for it in spec["items"]:
         if it["kind"] != "train":
@@ -1001,14 +1002,18 @@ def augment_pins(spec: dict, reader, sets: dict | None) -> tuple[list[tuple], li
         a = reader(it["config"]).get("augment") or {}
         if not a.get("enabled"):
             continue
-        if float(a.get("noise_p") or 0) > 0 and a.get("noise_bank"):
+        bank_speech = float(a.get("speech_p") or 0) > 0 and float(a.get("speech_batch_p", 0.5)) < 1
+        if (float(a.get("noise_p") or 0) > 0 or bank_speech) and a.get("noise_bank"):
             banks.append((it["name"], a["noise_bank"], a.get("noise_bank_sha256")))
+        if float(a.get("reverb_p") or 0) > 0 and a.get("rir_bank"):
+            banks.append((it["name"], a["rir_bank"], a.get("rir_bank_sha256")))
         if a.get("cuts"):
             cuts.append((it["name"], a["cuts"], a.get("cuts_sha256")))
     for rid, kvs in (sets or {}).items():
         kv = dict(x.split("=", 1) for x in kvs)
-        if kv.get("augment.noise_bank"):
-            banks.append((f"--resume-set {rid}", kv["augment.noise_bank"], kv.get("augment.noise_bank_sha256")))
+        for key in ("noise_bank", "rir_bank"):
+            if kv.get(f"augment.{key}"):
+                banks.append((f"--resume-set {rid}", kv[f"augment.{key}"], kv.get(f"augment.{key}_sha256")))
     return banks, cuts
 
 
@@ -1595,19 +1600,20 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
             banks, cuts = augment_pins(spec, reader, sets)
             for who, d, pin in banks:
                 if d not in spec["extra_dirs"]:
-                    problems.append(f"{who} mixes the background bank {d}, which box {box} does not pull "
+                    problems.append(f"{who} reads the bank {d}, which box {box} does not pull "
                                     f"(boxes.json extra_dirs)")
                 idx = f"{d}/{NOISE_INDEX}"
                 if idx not in have:
-                    problems.append(f"{data_repo}: no {idx} ({who}'s background bank: tools/build_noise_bank.py, "
-                                    f"then upload it)")
+                    problems.append(f"{data_repo}: no {idx} ({who}'s bank: tools/build_noise_bank.py or "
+                                    f"build_rir_bank.py, then upload it)")
                     continue
                 got = hub_sha256(idx)
                 if pin and got != pin:
                     problems.append(f"{who} pins {idx} at sha256 {pin[:12]}..., {data_repo} holds {got[:12]}...: "
-                                    f"make_full_configs NOISE_BANK_SHA256 must be the uploaded bank's (regenerate)")
+                                    f"make_full_configs' NOISE_BANK_SHA256 / RIR_BANK_SHA256 must be the uploaded "
+                                    f"bank's (regenerate)")
                 elif pin:
-                    notes.append(f"{who}: background bank {d}, index.json sha256 {got[:12]}... as pinned")
+                    notes.append(f"{who}: bank {d}, index.json sha256 {got[:12]}... as pinned")
             for who, path, pin in cuts:
                 if path not in have:
                     problems.append(f"{data_repo}: no {path} ({who}'s cut table)")

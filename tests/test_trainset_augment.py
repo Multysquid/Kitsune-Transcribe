@@ -38,7 +38,7 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from fixtures import load_script, make_fake_corpus, make_fake_selection, make_noise_bank  # noqa: E402
+from fixtures import load_script, make_fake_corpus, make_fake_selection, make_noise_bank, make_rir_bank  # noqa: E402
 from fixtures_ctc import make_fake_parakeet_out, tiny_student_dir  # noqa: E402
 from kitsune import trainset as T  # noqa: E402
 from kitsune.ctc_targets import FrameTargets, collate_frame_targets  # noqa: E402
@@ -171,7 +171,8 @@ def test_off_is_the_plain_dataset(env):
         assert set(z) == set(want) | {"aug"}
         assert_same(z, want)
         assert z["aug"] == dict(utts=len(idx), rows=len(idx), concat_groups=0, concat_utts=0, truncated=0, mixed=0,
-                                cut_padded=0, end_padded=0, end_trimmed=0, noised=0)
+                                cut_padded=0, end_padded=0, end_trimmed=0, speech_mixed=0, reverbed=0, noised=0,
+                                gained=0, clipped=0, coded=0)
 
 
 def test_augment_spec_and_where_it_applies(env, tmp_path):
@@ -792,7 +793,10 @@ def test_validate_the_augment_block():
                                      "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
                                      "truncate_min_row_s": 0.0, "cuts": None, "cuts_sha256": None,
                                      "end_trim_p": 0.0, "noise_p": 0.0, "noise_snr_db": [0.0, 20.0],
-                                     "noise_bank": None, "noise_bank_sha256": None}
+                                     "noise_bank": None, "noise_bank_sha256": None, "speech_p": 0.0,
+                                     "speech_snr_db": [10.0, 25.0], "speech_talkers": [1, 4], "speech_batch_p": 0.5,
+                                     "reverb_p": 0.0, "rir_bank": None, "rir_bank_sha256": None, "gain_p": 0.0,
+                                     "gain_db": [-20.0, 10.0], "codec_p": 0.0, "codecs": ["mp3", "gsm", "ulaw8k"]}
     assert not m.augment_on(m.load_config(None, [])) and not m.augment_on({})
     ctc = ["family=ctc", "parakeet_root=po"]
     assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.mix_p=0.5"]))
@@ -814,6 +818,17 @@ def test_validate_the_augment_block():
                        (["augment.end_trim_p=2"], "augment.end_trim_p"), (["augment.noise_p=-1"], "augment.noise_p"),
                        (["augment.noise_snr_db=[10, 0]"], "noise_snr_db"),
                        (["augment.noise_bank_sha256=xyz"], "noise_bank_sha256"),
+                       (["augment.speech_p=2"], "augment.speech_p"), (["augment.reverb_p=-0.1"], "augment.reverb_p"),
+                       (["augment.gain_p=1.5"], "augment.gain_p"), (["augment.codec_p=-1"], "augment.codec_p"),
+                       (["augment.speech_snr_db=[25, 10]"], "speech_snr_db"), (["augment.gain_db=[5, -5]"], "gain_db"),
+                       (["augment.speech_talkers=[0, 3]"], "speech_talkers"),
+                       (["augment.speech_talkers=[2, 9]"], "speech_talkers"),
+                       (["augment.codecs=[\"mp3\", \"aac\"]"], "augment.codecs"),
+                       (["augment.codecs=[\"mp3\", \"mp3\"]"], "augment.codecs"),
+                       (["augment.rir_bank_sha256=xyz"], "rir_bank_sha256"),
+                       (["augment.enabled=true", "augment.reverb_p=0.3"], "needs augment.rir_bank"),
+                       (["augment.enabled=true", "augment.codec_p=0.3", "augment.codecs=[]"], "at least one"),
+                       (["augment.enabled=true", "augment.speech_p=0.3"], "needs augment.noise_bank with speech"),
                        (["augment.enabled=true", "augment.noise_p=0.3"], "needs augment.noise_bank")):
         with pytest.raises(SystemExit, match=match):
             m.load_config(None, ctc + bad)
@@ -853,7 +868,8 @@ def utts_of(run: Path) -> pd.DataFrame:
 
 # the end-to-end run: all three augmentations, through a smoke phase of 3 steps, full states every 2 steps
 AUG_OVER = {"augment": {"enabled": True, "truncate_p": 0.7, "truncate_min_s": 0.3, "concat_p": 1.0, "mix_p": 0.7,
-                        "truncate_pad_p": 0.7, "end_pad_p": 0.5, "end_trim_p": 0.5, "noise_p": 0.5},
+                        "truncate_pad_p": 0.7, "end_pad_p": 0.5, "end_trim_p": 0.5, "noise_p": 0.5, "speech_p": 0.5,
+                        "speech_batch_p": 0.5, "reverb_p": 0.5, "gain_p": 0.5, "codec_p": 0.5},
             "smoke": {"enabled": True, "steps": 3, "min_audio_s_per_s": 0, "require_loss_decrease": False,
                       "pad_utts": 4, "decode_per_set": 2},
             "ckpt": {"full_every_steps": 2}}
@@ -867,12 +883,15 @@ def aug_run(env):
 
 
 def aug_over(env) -> dict:
-    """AUG_OVER with the env's background bank (built once per module, under its root)."""
-    d = env["root"] / "noise_bank"
+    """AUG_OVER with the env's background bank (music, speech, song, noise) and RIR bank (built once per module, under
+    its root)."""
+    d, r = env["root"] / "noise_bank", env["root"] / "rir_bank"
     if not (d / "index.json").exists():
-        make_noise_bank(d)
+        make_noise_bank(d, kinds=("music", "speech", "song", "noise"))
+    if not (r / "index.json").exists():
+        make_rir_bank(r)
     out = copy.deepcopy(AUG_OVER)
-    out["augment"]["noise_bank"] = str(d)
+    out["augment"]["noise_bank"], out["augment"]["rir_bank"] = str(d), str(r)
     return out
 
 
@@ -896,8 +915,15 @@ def test_a_ctc_run_with_every_augmentation(env, aug_run):
     assert smoke["smoke_steps"]["steps"] == 3 and smoke["smoke_steps"]["dropped"] == 0
     st = pd.read_parquet(run / "metrics" / "steps.parquet")
     assert st["step"].tolist() == [1, 2, 3, 4, 5, 6] and np.isfinite(st["loss/objective"]).all()
-    for tag in ("aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac", "aug/cut_padded_frac"):
+    for tag in ("aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac", "aug/cut_padded_frac", "aug/noised_frac",
+                "aug/speech_frac", "aug/reverb_frac", "aug/gain_frac", "aug/codec_frac"):
         assert ((st[tag] >= 0) & (st[tag] <= 1)).all() and st[tag].max() > 0, tag
+    # the acoustic steps' settings and banks (DECISIONS H12), and the codec probe's verdict
+    assert (aug["speech_p"], aug["reverb_p"], aug["gain_p"], aug["codec_p"], aug["rir_clips"]) == (0.5, 0.5, 0.5, 0.5, 3)
+    assert aug["codecs"] == ["mp3", "gsm", "ulaw8k"] and set(aug["noise_kind_hours"]) == {"music", "speech", "song",
+                                                                                       "noise"}
+    probe = next(e for e in evs if e["kind"] == "augment_codecs")
+    assert probe["available"] == ["mp3", "gsm", "ulaw8k"] and probe["unavailable"] == {}
     end = st["aug/end_padded_frac"]  # whole rows: in a joined micro-batch most are its longest, so maybe never
     assert ((end >= 0) & (end <= 1)).all()
     assert (aug["truncate_pad_p"], aug["end_pad_p"], aug["pad_frames"]) == (0.7, 0.5, [1, 5])

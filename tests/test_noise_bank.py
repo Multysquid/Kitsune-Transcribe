@@ -47,6 +47,10 @@ def musan(tmp_path_factory):
         sf.write(str(p), x, SR, subtype="PCM_16")
     (root / "music/fma/ANNOTATIONS").write_text("music-fma-0000 Classical N Somebody\nmusic-fma-0001 Pop Y Someone\n",
                                                 encoding="utf-8")
+    (root / "speech/librivox/ANNOTATIONS").write_text("speech-librivox-0000 f japanese\n", encoding="utf-8")
+    p = root / "speech/us-gov/speech-us-gov-0000.wav"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(p), tone(0.6, 170), SR, subtype="PCM_16")
     return root
 
 
@@ -82,7 +86,7 @@ def test_load_checks_the_pin_and_the_size(bank_dir, tmp_path):
     sha = NB.sha256_file(bank_dir / NB.INDEX)
     bank = NB.NoiseBank.load(bank_dir, expect_sha256=sha)
     assert bank.info["index_sha256"] == sha and bank.hours == pytest.approx(1.5 / 3600)
-    with pytest.raises(ValueError, match="another noise bank"):
+    with pytest.raises(ValueError, match="another bank"):
         NB.NoiseBank.load(bank_dir, expect_sha256="0" * 64)
     short = tmp_path / "short"
     short.mkdir()
@@ -150,3 +154,80 @@ def test_segment_of_nothing_and_near_silent_stretches(bank_dir, tmp_path):
                 clips=[dict(id="noise/q/a", kind="noise", offset=0, length=SR)])
     (quiet / NB.INDEX).write_text(json.dumps(info), encoding="utf-8")
     assert NB.background_segment(NB.NoiseBank.load(quiet), SR // 2, np.random.default_rng(0)) is None
+
+
+def test_the_builder_adds_songs_and_speech_when_asked(musan, tmp_path):
+    """--song-hours / --speech-hours (DECISIONS H12): music with vocals as kind song and MUSAN's speech as kind speech
+    with its language (librivox's ANNOTATIONS; us-gov English), each capped like the music; none by default."""
+    out = tmp_path / "v2"
+    assert load_tool("build_noise_bank").main(["--musan", str(musan), "--out", str(out), "--song-hours", "1",
+                                               "--speech-hours", "1"]) == 0
+    info = json.loads((out / NB.INDEX).read_text(encoding="utf-8"))
+    kinds = {c["id"]: (c["kind"], c.get("language")) for c in info["clips"]}
+    assert kinds == {"music/fma/music-fma-0000": ("music", None), "music/fma/music-fma-0001": ("song", None),
+                     "noise/free-sound/noise-free-sound-0000": ("noise", None),
+                     "noise/free-sound/noise-free-sound-0001": ("noise", None),
+                     "speech/librivox/speech-librivox-0000": ("speech", "japanese"),
+                     "speech/us-gov/speech-us-gov-0000": ("speech", "english")}
+    assert set(info["hours"]) == {"music", "noise", "song", "speech"} and info["dtype"] == "int16"
+    bank = NB.NoiseBank.load(out)
+    assert bank.has(("song",)) and bank.has(("speech",)) and bank.kind_hours("song") == pytest.approx(0.5 / 3600)
+    capped = tmp_path / "capped"
+    assert load_tool("build_noise_bank").main(["--musan", str(musan), "--out", str(capped), "--speech-hours",
+                                               str(0.5 / 3600)]) == 0
+    sp = [c for c in json.loads((capped / NB.INDEX).read_text(encoding="utf-8"))["clips"] if c["kind"] == "speech"]
+    assert len(sp) == 1  # one of the two speech clips fits the cap
+
+
+def fake_rirs_zip(path):
+    """A RIRS_NOISES zip in miniature: 3 small, 2 medium, 1 large simulated RIRs and one real stereo one, each with a
+    pre-delay before its direct path and an exponential tail, listed as OpenSLR 28 lists them."""
+    import io
+    import zipfile
+
+    rng = np.random.default_rng(0)
+
+    def rir(delay, n=4000, tau=400.0):
+        h = np.zeros(delay + n)
+        h[delay] = 0.8
+        h[delay + 1:] = 0.05 * rng.standard_normal(n - 1) * np.exp(-np.arange(1, n) / tau)
+        return h
+
+    with zipfile.ZipFile(path, "w") as z:
+        for size, k in (("smallroom", 3), ("mediumroom", 2), ("largeroom", 1)):
+            lines = []
+            for i in range(k):
+                member = f"RIRS_NOISES/simulated_rirs/{size}/Room001/Room001-0000{i}.wav"
+                b = io.BytesIO()
+                sf.write(b, rir(30 + 10 * i), SR, format="WAV", subtype="FLOAT")
+                z.writestr(member, b.getvalue())
+                lines.append(f"--rir-id {size}-Room001-0000{i} --room-id {size}-Room001 {member}")
+            z.writestr(f"RIRS_NOISES/simulated_rirs/{size}/rir_list", "\n".join(lines) + "\n")
+        b = io.BytesIO()
+        sf.write(b, np.stack([rir(50, n=8005), rir(55, n=8000)], axis=1), SR, format="WAV", subtype="FLOAT")
+        z.writestr("RIRS_NOISES/real_rirs_isotropic_noises/real_a.wav", b.getvalue())
+        z.writestr("RIRS_NOISES/real_rirs_isotropic_noises/rir_list",
+                   "--rir-id 00001 --room-id real_room RIRS_NOISES/real_rirs_isotropic_noises/real_a.wav\n")
+    return path
+
+
+def test_the_rir_builder_cuts_each_room_to_its_direct_path(tmp_path):
+    """tools/build_rir_bank.py: --per-size simulated RIRs of the asked sets (small and medium by default) and every
+    real one, each starting at its direct path (1.0 at sample 0) and ending 60 dB down, as a float32 kind-rir bank."""
+    z = fake_rirs_zip(tmp_path / "rirs_noises.zip")
+    out = tmp_path / "rirs"
+    assert load_tool("build_rir_bank").main(["--zip", str(z), "--out", str(out), "--per-size", "2"]) == 0
+    info = json.loads((out / NB.INDEX).read_text(encoding="utf-8"))
+    assert info["sets"] == {"smallroom": 2, "mediumroom": 2, "largeroom": 0, "real": 1} and info["dtype"] == "float32"
+    bank = NB.NoiseBank.load(out)
+    assert bank.has(("rir",)) and len(bank.lengths) == 5
+    for i in range(5):
+        h = bank.clip(i)
+        assert h[0] == pytest.approx(1.0) and np.abs(h).max() == pytest.approx(1.0) and len(h) < 4000
+    every = tmp_path / "every"
+    assert load_tool("build_rir_bank").main(["--zip", str(z), "--out", str(every), "--per-size", "5", "--sets",
+                                             "smallroom,mediumroom,largeroom"]) == 0
+    assert json.loads((every / NB.INDEX).read_text(encoding="utf-8"))["sets"] == {
+        "smallroom": 3, "mediumroom": 2, "largeroom": 1, "real": 1}
+    with pytest.raises(SystemExit, match="--sets"):
+        load_tool("build_rir_bank").main(["--zip", str(z), "--out", str(tmp_path / "bad"), "--sets", "hall"])
