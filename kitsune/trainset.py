@@ -1939,13 +1939,14 @@ def mix_background(rows, bank, a: Augment, rng: np.random.Generator) -> int:
     teacher's on the clean audio. Returns the rows it changed (a silent row or stretch is left as it is)."""
     if a.noise_p <= 0 or bank is None:
         return 0
-    from kitsune.noise_bank import add_background
+    from kitsune.noise_bank import add_background, background_segment
 
     n = 0
     for r in rows:
         if rng.random() >= a.noise_p:
             continue
-        got = add_background(r.wave, bank.segment(len(r.wave), rng), rng, a.noise_snr_db)
+        seg = background_segment(bank, len(r.wave), rng)  # a near-silent stretch is drawn again
+        got = None if seg is None else add_background(r.wave, seg, rng, a.noise_snr_db)
         if got is not None:
             r.wave = got[0]
             n += 1

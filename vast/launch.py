@@ -987,6 +987,31 @@ def _lfs_sha256(info) -> str | None:
     return getattr(lfs, "sha256", None) or (lfs.get("sha256") if isinstance(lfs, dict) else None)
 
 
+NOISE_INDEX = "index.json"  # kitsune.noise_bank.INDEX: the file augment.noise_bank_sha256 pins
+
+
+def augment_pins(spec: dict, reader, sets: dict | None) -> tuple[list[tuple], list[tuple]]:
+    """The background banks and cut tables a box's runs read, as (who, data-repo path, pinned sha256 or None): each
+    train item's config with its augmentation on (a bank when noise_p > 0, its cut table), then each --resume-set
+    run's augment.noise_bank / noise_bank_sha256 (a continuation sets them on top of its run's config)."""
+    banks, cuts = [], []
+    for it in spec["items"]:
+        if it["kind"] != "train":
+            continue
+        a = reader(it["config"]).get("augment") or {}
+        if not a.get("enabled"):
+            continue
+        if float(a.get("noise_p") or 0) > 0 and a.get("noise_bank"):
+            banks.append((it["name"], a["noise_bank"], a.get("noise_bank_sha256")))
+        if a.get("cuts"):
+            cuts.append((it["name"], a["cuts"], a.get("cuts_sha256")))
+    for rid, kvs in (sets or {}).items():
+        kv = dict(x.split("=", 1) for x in kvs)
+        if kv.get("augment.noise_bank"):
+            banks.append((f"--resume-set {rid}", kv["augment.noise_bank"], kv.get("augment.noise_bank_sha256")))
+    return banks, cuts
+
+
 def label_preflight(data_repo: str, sha: str, cfg: dict, label_cfgs: dict[str, dict], *, steal_lease: bool = False,
                     now: float | None = None) -> tuple[str | None, list[str], list[str]]:
     """-> (data repo commit to pin, problems, notes) for --job label, read-only with the laptop's login; it replaces
@@ -1487,6 +1512,9 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
     - without resume: the box's Hub queue summary, when there is one, has no train item done (fresh_preflight) unless
       allow_fresh_over_done: a fresh queue starts new runs and overwrites that summary, the only record of which run
       a later --resume-reset continues (box p01 after box 1: its continuation is --resume-reset, never a fresh launch);
+    - the background banks and cut tables its runs read (augment_pins: their configs', a continuation's
+      --resume-set): each bank one of the box's extra dirs, and each bank's index.json and cut table the sha256 its
+      pin names - a stale pin would fail every train attempt on the box after its paid rebuild (DECISIONS H11);
     - a box with quantised items: the quant go signal (quant_go_problems: a passing smoke-b verdict at this quant code;
       allow_unverified_quant makes it a warning); boxes p01, full-t, full-p: a warning while their hours are provisional
       (speed_record_notes)."""
@@ -1555,6 +1583,36 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
             problems += [f"{data_repo}: {x}" for x in bad]
             if not bad:
                 notes.append(f"box {box}'s {len(students)} student(s) are the registered builds")
+
+            def hub_sha256(path: str) -> str | None:  # the LFS sha256, else (a small file in git) its bytes' hash
+                info = api.get_paths_info(data_repo, [path], repo_type="dataset", revision=data_rev)
+                got = _lfs_sha256(info[0]) if info else None
+                if got is None:
+                    got = hashlib.sha256(Path(download(data_repo, path, repo_type="dataset", revision=data_rev,
+                                                       local_dir=tmp)).read_bytes()).hexdigest()
+                return got
+
+            banks, cuts = augment_pins(spec, reader, sets)
+            for who, d, pin in banks:
+                if d not in spec["extra_dirs"]:
+                    problems.append(f"{who} mixes the background bank {d}, which box {box} does not pull "
+                                    f"(boxes.json extra_dirs)")
+                idx = f"{d}/{NOISE_INDEX}"
+                if idx not in have:
+                    problems.append(f"{data_repo}: no {idx} ({who}'s background bank: tools/build_noise_bank.py, "
+                                    f"then upload it)")
+                    continue
+                got = hub_sha256(idx)
+                if pin and got != pin:
+                    problems.append(f"{who} pins {idx} at sha256 {pin[:12]}..., {data_repo} holds {got[:12]}...: "
+                                    f"make_full_configs NOISE_BANK_SHA256 must be the uploaded bank's (regenerate)")
+                elif pin:
+                    notes.append(f"{who}: background bank {d}, index.json sha256 {got[:12]}... as pinned")
+            for who, path, pin in cuts:
+                if path not in have:
+                    problems.append(f"{data_repo}: no {path} ({who}'s cut table)")
+                elif pin and (got := hub_sha256(path)) != pin:
+                    problems.append(f"{who} pins {path} at sha256 {pin[:12]}..., {data_repo} holds {got[:12]}...")
             recipe = (cfg.get("selection_recipe") or {}).get("full_study")
             if recipe is not None:
                 sel = cfg["selection"]

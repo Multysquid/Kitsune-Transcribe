@@ -210,8 +210,9 @@ RESUME_SET_KINDS = {"schedule.epochs": "int", "early_stop.patience": "int", "aug
                     "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
                     "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob", "augment.noise_p": "prob",
                     "augment.noise_bank": "path", "augment.noise_bank_sha256": "sha256"}
-# a data-repo path a resume set may name: relative, of path segments without "..", no comma (KITSUNE_RESUME_SETS'
-# separator) and nothing JSON would read as another type (04_distill's --set keeps a string that is not JSON)
+# a data-repo path a resume set may name: relative, every segment starting with a letter, digit or _ (so never "." or
+# ".."), no comma (KITSUNE_RESUME_SETS' separator) and nothing JSON would read as another type (04_distill's --set
+# keeps a string that is not JSON)
 _REPO_PATH_RE = r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*"
 # a probability's spelling: a plain decimal (digits, one point, an exponent), no sign, no "inf" / "nan" / "1_0" - the
 # forms float() would also take but JSON (04_distill's --set) would not, or not as a number
@@ -381,7 +382,7 @@ def resume_set_value(key: str, val: str) -> str:
         if re.fullmatch(_DECIMAL_RE, val) and float(val) >= 0.0:
             return repr(float(val))
     elif kind == "path":
-        if re.fullmatch(_REPO_PATH_RE, val) and ".." not in val.split("/") and _not_json_scalar(val):
+        if re.fullmatch(_REPO_PATH_RE, val) and _not_json_scalar(val):
             return val
     elif kind == "sha256":
         if re.fullmatch(r"[0-9a-fA-F]{64}", val) and _not_json_scalar(val.lower()):

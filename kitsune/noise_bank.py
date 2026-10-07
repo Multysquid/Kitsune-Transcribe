@@ -44,9 +44,11 @@ class NoiseBank:
         self.cum = np.cumsum(self.lengths)
 
     @classmethod
-    def load(cls, path, expect_sha256: str | None = None) -> "NoiseBank":
+    def load(cls, path, expect_sha256: str | None = None, check_audio: bool = True) -> "NoiseBank":
         """Open the bank at path: its index.json's sha256 checked against expect_sha256 (when given), its audio.npy's
-        size against the index's audio_bytes (a short download fails here, not inside a worker)."""
+        size against the index's audio_bytes (a short download fails here, not inside a worker) and, with check_audio,
+        its sha256 against the index's audio_sha256 (the pin covers the audio through the index; ~5 s for 2.3 GiB,
+        once per trainer start)."""
         path = Path(path)
         sha = sha256_file(path / INDEX)
         if expect_sha256 and sha != expect_sha256:
@@ -58,6 +60,8 @@ class NoiseBank:
         size = (path / AUDIO).stat().st_size
         if size != int(info["audio_bytes"]):
             raise ValueError(f"{path / AUDIO}: {size} bytes, the index says {info['audio_bytes']}")
+        if check_audio and info.get("audio_sha256") and sha256_file(path / AUDIO) != info["audio_sha256"]:
+            raise ValueError(f"{path / AUDIO}: not the audio its index records (sha256 {info['audio_sha256'][:12]}...)")
         bank = cls(str(path), dict(info, index_sha256=sha))
         if not len(bank.lengths) or int(bank.cum[-1]) <= 0:
             raise ValueError(f"{path}: no audio in the bank")
@@ -81,6 +85,8 @@ class NoiseBank:
         """n float32 samples of background: from a position drawn uniformly over the whole bank (a clip in proportion
         to its length, a start inside it) to its clip's end, then again from another drawn position, until n samples
         are filled - a long row gets one or more clips back to back."""
+        if n <= 0:
+            return np.zeros(0, dtype=np.float32)
         audio, out, filled = self._audio(), [], 0
         while filled < n:
             pos = int(rng.integers(int(self.cum[-1])))
@@ -104,6 +110,20 @@ def voiced_power(wave: np.ndarray, hop: int = 160, db_range: float = 35.0) -> fl
     p = np.einsum("ij,ij->i", fr, fr) / hop
     db = 10.0 * np.log10(p + 1e-12)
     return float(p[db > db.max() - db_range].mean())
+
+
+BG_MIN_POWER = 1e-6  # -60 dBFS mean power: a quieter stretch (a fade, a pause inside a clip) is drawn again
+BG_TRIES = 4  # draws before a row keeps its clean audio (0.2 % of the bank's stretches are this quiet)
+
+
+def background_segment(bank: "NoiseBank", n: int, rng: np.random.Generator) -> np.ndarray | None:
+    """A stretch of n samples of the bank loud enough to mix (mean power >= BG_MIN_POWER), within BG_TRIES draws;
+    None otherwise. Scaling a near-silent stretch up to the drawn SNR would turn its noise floor into hiss."""
+    for _ in range(BG_TRIES):
+        seg = bank.segment(n, rng)
+        if len(seg) and float(np.dot(seg, seg)) / len(seg) >= BG_MIN_POWER:
+            return seg
+    return None
 
 
 def add_background(wave: np.ndarray, seg: np.ndarray, rng: np.random.Generator, snr_db, min_power: float = 1e-8):

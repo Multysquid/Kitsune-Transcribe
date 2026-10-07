@@ -733,6 +733,54 @@ def test_full_preflight_refusals(repo, monkeypatch, devslice):
     (repo.root / "moved.json").rename(repo.root / "configs/full/full-p01.json")
 
 
+def test_full_preflight_holds_the_background_bank_and_the_cut_table_to_their_pins(repo, monkeypatch, devslice):
+    """DECISIONS H11: a run's background bank (its config's augment block, or a continuation's --resume-set) must be
+    one of the box's extra dirs and its index.json the sha256 the run pins, and a cut table its pinned sha256 - checked
+    before renting, since a stale pin fails every train attempt on the box after the paid rebuild."""
+    import hashlib
+
+    bank, index = "aug/bank-v1", b'{"version": 1, "clips": []}'
+    pin = hashlib.sha256(index).hexdigest()
+    f = repo.root / "configs/full/full-p01.json"
+    plain = f.read_text(encoding="utf-8")
+    reg = launch.full_registry(SHA)[0]
+    reg["boxes"]["p01"]["extra_dirs"] = [bank]
+    good = dict(box_data("p01", reg, repo.root), **{f"{bank}/index.json": index})
+
+    def run(augment=None, sets=None, extra_dirs=(bank,), data=good):
+        cfg = json.loads(plain)
+        if augment is not None:
+            cfg["augment"] = augment
+        f.write_text(json.dumps(cfg), encoding="utf-8")
+        reg["boxes"]["p01"]["extra_dirs"] = list(extra_dirs)
+        return preflight(monkeypatch, FullHub(data), reg=reg, sets=sets)
+
+    on = {"enabled": True, "noise_p": 0.3, "noise_bank": bank, "noise_bank_sha256": pin}
+    problems, notes = run(on)
+    assert problems == [] and any(f"background bank {bank}, index.json sha256 {pin[:12]}" in n for n in notes), (
+        problems, notes)
+    problems, _ = run(dict(on, noise_bank_sha256="0" * 64))
+    assert any(f"full-p01 pins {bank}/index.json at sha256 000000000000..., {DATA} holds {pin[:12]}" in x
+               for x in problems), problems
+    problems, _ = run(on, extra_dirs=())
+    assert any(f"full-p01 mixes the background bank {bank}, which box p01 does not pull" in x for x in problems)
+    problems, _ = run(on, data={k: v for k, v in good.items() if k != f"{bank}/index.json"})
+    assert any(f"no {bank}/index.json (full-p01's background bank" in x for x in problems), problems
+    assert run(dict(on, enabled=False))[0] == [] and run(dict(on, noise_p=0.0))[0] == []  # no background: no pin
+    # a continuation's sets: its bank and pin are checked as a config's
+    rid = "full-p01-20261001T184145Z"
+    problems, _ = run(sets={rid: ["augment.noise_bank=" + bank, "augment.noise_bank_sha256=" + "1" * 64]})
+    assert any(f"--resume-set {rid} pins {bank}/index.json at sha256 111111111111" in x for x in problems), problems
+    assert run(sets={rid: ["augment.noise_bank=" + bank, "augment.noise_bank_sha256=" + pin]})[0] == []
+    # the cut table: its LFS sha256 (FullHub: "5e" x 32 for a .parquet)
+    cuts = fullrun.FULL_DIR + "/aed_cuts.parquet"
+    data = dict(good, **{cuts: b"parquet"})
+    assert run({"enabled": True, "cuts": cuts, "cuts_sha256": "5e" * 32}, data=data)[0] == []
+    problems, _ = run({"enabled": True, "cuts": cuts, "cuts_sha256": "ab" * 32}, data=data)
+    assert any(f"full-p01 pins {cuts} at sha256 abababababab..., {DATA} holds 5e5e5e5e5e5e" in x for x in problems)
+    f.write_text(plain, encoding="utf-8")
+
+
 def test_full_preflight_refuses_a_box_whose_tools_the_sha_lacks(repo, monkeypatch, devslice):
     """The eval and speed items name the CLI they run; a box that needs a tool of a package not merged yet (WP5's
     kitsune.quant, WP6's whisper kind of speed_probe) is refused before renting."""

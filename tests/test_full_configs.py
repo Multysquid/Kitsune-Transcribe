@@ -863,7 +863,7 @@ def test_box_p01_is_p01s_continuation(reg, plan, trainer):
 FULL_P01_SHA256 = "918d8e020d1ff6c70789297e93963aefa40e3f6431f1c6d7cb9de8b1c5e5ee1d"
 
 
-@pytest.mark.parametrize("box", ["p01", "full-t", "full-p"])
+@pytest.mark.parametrize("box", ["p01", "full-t", "full-p", "p005"])
 def test_a_readout_starts_after_a_shortened_run(tmp_path, reg, box):
     """A readout runs right after its run, and the run's KITSUNE_DEADLINE (full_queue.item_deadline) is the one the
     trainer's deadline cooldown (4d) plans against: 04_distill.fit_epochs_deadline ends a shortened run's end phase
@@ -944,7 +944,7 @@ def test_boxes_t_and_p(reg, plan):
     assert (b["system"], b["speed_kind"], b["weights"], b["max_hours"]) == (
         "study-t06", "aed", [{"name": "study-t06", "run_id": STUDY_WEIGHTS["study-t06"][0], "step": 9370}], 0.2)
     assert not any(v["kind"] == "speed" for v in p.values())
-    for box in ("full-t", "full-p", "p01"):
+    for box in M.HOURS_BOXES:  # full-t, full-p, p01, p005
         h = M.box_hours(plan, M.load_speed(), box, reserve_min=fullrun.box_spec(box, reg)["deadline_reserve_min"])
         assert (fullrun.box_spec(box, reg)["est_hours"], fullrun.box_spec(box, reg)["max_hours"]) == (
             h["est_hours"], h["max_hours"]) == BOX_H[box]

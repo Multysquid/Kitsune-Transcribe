@@ -121,3 +121,32 @@ def test_the_background_hits_its_snr_on_the_voiced_frames():
     assert NB.voiced_power(speech) == pytest.approx(0.045, rel=0.01)  # the tone's power, not halved by the pause
     assert NB.add_background(np.zeros(SR, np.float32), bg[:SR], np.random.default_rng(0), (0, 10)) is None
     assert NB.add_background(speech, np.zeros(len(speech), np.float32), np.random.default_rng(0), (0, 10)) is None
+
+
+def test_load_holds_the_audio_to_the_sha256_its_index_records(bank_dir, tmp_path):
+    """The pin covers the audio through the index: an audio.npy of the right size but other samples is refused (a stale
+    or broken pull would otherwise be mixed under the rows); check_audio=False skips the hash."""
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / NB.INDEX).write_bytes((bank_dir / NB.INDEX).read_bytes())
+    a = np.load(bank_dir / NB.AUDIO)
+    np.save(other / NB.AUDIO, a[::-1].copy())  # the same size, other samples
+    with pytest.raises(ValueError, match="not the audio its index records"):
+        NB.NoiseBank.load(other)
+    assert NB.NoiseBank.load(other, check_audio=False).hours == pytest.approx(1.5 / 3600)
+
+
+def test_segment_of_nothing_and_near_silent_stretches(bank_dir, tmp_path):
+    """segment(0) is an empty array; background_segment draws again past a stretch quieter than BG_MIN_POWER (-60
+    dBFS), and gives None for a bank with nothing louder."""
+    bank = NB.NoiseBank.load(bank_dir)
+    assert bank.segment(0, np.random.default_rng(0)).shape == (0,)
+    seg = NB.background_segment(bank, SR // 4, np.random.default_rng(1))
+    assert seg is not None and float(np.mean(seg ** 2)) >= NB.BG_MIN_POWER
+    quiet = tmp_path / "quiet"
+    quiet.mkdir()
+    np.save(quiet / NB.AUDIO, np.ones(SR, np.int16))  # one LSB: about -90 dBFS
+    info = dict(version=NB.VERSION, sr=SR, audio_bytes=(quiet / NB.AUDIO).stat().st_size, samples=SR,
+                clips=[dict(id="noise/q/a", kind="noise", offset=0, length=SR)])
+    (quiet / NB.INDEX).write_text(json.dumps(info), encoding="utf-8")
+    assert NB.background_segment(NB.NoiseBank.load(quiet), SR // 2, np.random.default_rng(0)) is None
