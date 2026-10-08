@@ -255,7 +255,8 @@ QUANT_GO_BOX = "smoke-b"
 QUANT_GO_CHECKS = ("12", "13", "14", "15", "16")
 QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.py", "kitsune/whisper.py",
               "tools/whisper_eval.py", "requirements-train.txt", "docker/Dockerfile")
-# the hours of boxes p01 (P-0.1B's continuation of box 1's run), full-t, full-p and p005 (P-0.05B) come from
+# the hours of boxes p01 and full-p (the recipe-v4 cooldown re-runs of P-0.1B's and P-0.3B's runs, DECISIONS H13),
+# full-t and p005 (P-0.05B) come from
 # make_full_configs' speed record (its SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's;
 # without box 1's part they are provisional (contract 7), and launch says so
 SPEED_RECORD = "configs/full/plan/box2_hours.json"

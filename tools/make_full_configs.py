@@ -48,10 +48,11 @@ Data configs (launch's --config and bootstrap's KITSUNE_CONFIG: what a box rebui
 Inputs besides the two generators' own: PLAN_FILE (configs/full/plan/full_study.json, in a folder of its own so every
 configs/full/*.json is a config), the JSON tools/full_plan.py wrote for full.parquet and smoke.parquet at SMOKE_EPOCHS
 (its "full" and "smoke" parts; --import-plan records a new measurement; the local selection paths become the repo
-paths), and its "launch" part: tools/full_plan.py on full.parquet at the epochs the boxes run now (FULL_RUNS; P-0.1B at
-its continuation's CONTINUATIONS epochs: 8, DECISIONS H9), --import-launch-plan:
+paths), and its "launch" part: tools/full_plan.py on full.parquet at the epochs the boxes run now (FULL_RUNS; a student
+with a continuation at its CONTINUATIONS epochs: since DECISIONS H13 the cooldown re-runs keep their runs' 6 and 4),
+--import-launch-plan:
   python tools/full_plan.py --selection <full.parquet> --student t06=aed:450:1730:<E> --student p03=ctc:600:1350:<E>
-      --student p005=ctc:1600:1500:<E> --student p01=ctc:1600:1500:8 --json plan_launch.json
+      --student p005=ctc:1600:1500:<E> --student p01=ctc:1600:1500:<E> --json plan_launch.json
   python tools/make_full_configs.py --import-launch-plan plan_launch.json
 The generator refuses a record measured with other step values or epochs. It gives the smoke configs' probe shapes
 (from "full": the smoke ran those epochs), the boxes' step counts (from "launch"), and the numbers the hand-written
@@ -62,7 +63,8 @@ them), and F4's seconds, the deadline fault of smoke-p005 (deadline_fault_s). Af
 full_plan.py --json on full.parquet and on smoke.parquet, --import-plan with both (it prints what boxes.json must be
 changed in), then those numbers into boxes.json by hand, then --check and the tests.
 
-The boxes' hours (HOURS_BOXES: box full-t, box full-p and box p01's continuation, now the recipe test): SPEED_FILE
+The boxes' hours (HOURS_BOXES: box full-t, box p005, and boxes full-p and p01, whose continuations are the recipe-v4
+cooldown re-runs of P-0.3B and P-0.1B, DECISIONS H13): SPEED_FILE
 (configs/full/plan/box2_hours.json, --import-speed) records the measured speeds box_hours projects them from: smoke A's
 per-student s/step (smoke verdict check 3) and box 1's s/step, in-run overhead, CTC store and bootstrap hours
 (tools/box1_go.py --json, at the runs-repo revision of box 1's 4-epoch record), a run with the augmentation recipe at
@@ -151,8 +153,8 @@ AED_CUTS_SHA256 = "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb
 # index.json and pulled by box p01, boxes.json extra_dirs), mixed under the whole row - a joined row's utterances and
 # the gaps between them alike -, the targets the teacher's on the clean audio. Why: on 30 s windows of stream audio
 # (talk over game sound and music) the Parakeet teacher writes nothing and P-0.3B with it, while both transcribe the
-# same talk alone. Box p005 tests it first: P-0.05B from step 0 at 10 epochs (FULL_RUNS p005; DECISIONS H9, H10); box
-# p01's 8-epoch continuation of P-0.1B with it (CONTINUATIONS p01) waits for that result
+# same talk alone. Box p005 tests it first: P-0.05B from step 0 at 10 epochs (FULL_RUNS p005; DECISIONS H9, H10); the
+# recipe-v4 cooldown re-runs of P-0.3B and P-0.1B (CONTINUATIONS, DECISIONS H13) wait for that result
 # DECISIONS H12: the bank is v2 since (aug/musan-bg-v1 - music without vocals and noise only - stays on the data repo,
 # never trained with): v1's music and noise plus 10 h of songs with lyrics and 10 h of speech (17 languages)
 NOISE_BANK = "aug/musan-bg-v2"
@@ -195,7 +197,8 @@ RECIPE_AED = {**RECIPE_V4, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}  # 
 # analysis (DECISIONS G "Rejected: 10 epochs"). P-0.05B 10 and P-0.1B 8 since DECISIONS H9 (the owner, 2026-10-05, for
 # the P test box: "the p-0.05 run needs more epochs as well as the 0.1 run. They are smaller and as p-0.3 has shown more
 # epochs improve the performance of these models"; chose "P-0.1B 8, P-0.05B 10" and "Continue box 1's run"). P-0.1B's
-# config stays box 1's 4-epoch one byte for byte (its run continues: CONTINUATIONS sets the 8 epochs on the resume).
+# config stays box 1's 4-epoch one byte for byte (its run continues: CONTINUATIONS sets its epochs on the resume - 8
+# under H9, 4 again since H13's cooldown re-run), and so does P-0.3B's 6-epoch one (its H13 re-run sets recipe v4).
 # This is the one epoch parameter: a change here, then --import-launch-plan of a full_plan.py record at the new
 # epochs, then the printed hours (--import-speed) into boxes.json. AUGMENT: the run's augment block (full_config; the
 # smoke configs never take it), None for none. DECISIONS H1 step 2: P-0.3B trains with RECIPE (v2 since H6, after
@@ -243,8 +246,27 @@ SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # down early (the first test's dev CER jumped 0.155 -> 0.170 at its first check with the recipe, then fell). Not a
 # paired A/B with box 1 and the first test any more (more epochs and the recipe together):
 # the review's fixes are checked by its probes
-CONTINUATIONS = {"p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=8,
-                             patience=12, augment=RECIPE_V4, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
+# DECISIONS H13 (the owner, 2026-10-08, on whether P-0.3B's and P-0.1B's 80 % checkpoints with the new recipe would fix
+# them and take on its behaviour: "Build the setup already for both"): THE RECIPE-V4 COOLDOWN RE-RUNS, H1's design
+# again. Each continuation re-runs ONLY its run's cooldown: from its pre_cooldown state (the runs repo's
+# checkpoints/full_step_<from_step>, trainer.json reason pre_cooldown) to the SAME end (the run's own epochs, so its T,
+# and t_c = 0.8 T = from_step: the whole re-run is cooldown) with RECIPE_V4 on - P-0.3B on box full-p (169,376 ->
+# 211,720: 42,344 steps) and P-0.1B on box p01 (86,328 -> 107,910: 21,582 steps). Everything before from_step is the
+# baseline's (data order, batches, LR), so each readout against its baseline record - `revision`: P-0.3B's box full-p
+# final summary (3674d2d7, M4 9.73 %), P-0.1B's box 1 record (c4604304, M4 11.45 %; G4) - isolates what recipe v4's
+# cooldown adds and costs: a paired A/B. No patience set: an early-stop trigger inside a cooldown changes nothing
+# (04_distill early_stop_trigger), so each state's own patience stays. The readouts write new dirs (P-0.3B's state
+# counts no reset yet: -r1; P-0.1B's is A1's re-save, st.resume_resets 1: -r2), the baselines' readouts stay; a re-run
+# overwrites its run's summary, config, final evals, export and its pre_cooldown state's trainer.pt/.json (same
+# weights) at the head of the runs repo - the baselines stay at their revisions -, as A1 did. H9's 8-epoch
+# continuation of P-0.1B is set aside, not lost: it can start later from the same pre_cooldown weights (epochs 8,
+# patience 12, as H9 planned)
+CONTINUATIONS = {
+    "p03": dict(box="full-p", student="p03", run_id="full-p03-20261003T230143Z", from_step=169376, epochs=6,
+                patience=None, augment=RECIPE_V4, revision="3674d2d7ae7480594b079234b1549014fe96f783"),
+    "p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=4,
+                patience=None, augment=RECIPE_V4, revision="c4604304db76e068df7bbe39d00d006b74d6c134"),
+}
 # READOUT_RESERVE. A readout runs right after its training item on the same GPU (Resolution 25) under the same
 # KITSUNE_DEADLINE (kitsune.full_queue item_deadline: the box deadline less deadline_reserve_min). After a run that the
 # deadline cooldown (4d) shortened, 04_distill.fit_epochs_deadline has planned the end phase to finish
@@ -315,8 +337,9 @@ SPEED_FILE = "plan/box2_hours.json"  # under OUT_DIR, next to PLAN_FILE (launch'
 # the boxes whose hours are box_hours of the speed record (DECISIONS G2/G3/H1: box 2 as two 1x RTX 5090 boxes, T and P,
 # and box p01's continuation): their train runs, in queue order, "continuation" for the box's CONTINUATIONS entry. Box
 # P trains P-0.3B only (DECISIONS H1 step 2, with the recipe; P-0.05B was postponed, H2); box p005 trains P-0.05B alone
-# (the P test box, DECISIONS H10); box p01 P-0.1B's 8-epoch continuation (H9, for after the test)
-HOURS_BOXES = {"full-t": ("t06",), "full-p": ("p03",), "p01": ("continuation",), "p005": ("p005",)}
+# (the P test box, DECISIONS H10); boxes full-p and p01 the recipe-v4 cooldown re-runs of P-0.3B's and P-0.1B's runs
+# (DECISIONS H13; box full-p's fresh 6-epoch run is done, its Whisper evals stay done on a reset)
+HOURS_BOXES = {"full-t": ("t06",), "full-p": ("continuation",), "p01": ("continuation",), "p005": ("p005",)}
 # CONCAT'S EXTRA ATTENTION (DECISIONS H1: "add a few % for concat's extra attention"). A joined row holds k utterances
 # (k <= concat_max_n 4, <= 28 s) in the frames its micro-batch had planned, but its self-attention grows with the
 # square of its length: on full.parquet at concat_p 0.5 the attention's elements grow 1.27x over the planned
@@ -351,12 +374,16 @@ STORES_PESS = 1.91 / 1.37  # a box-1 record's measured CTC store: central x 1, p
 #   box p01:    m4-full-p01 and 7 P-0.1B quant readouts, plus resume-pull and check-resume before the stores
 #               (CONT_PULL_H: any box whose runs hold a continuation)
 #   box p005:   m4-full-p005 and 7 P-0.05B quant readouts (box p01's readouts without the pull)
+#   box full-p's cooldown re-run (DECISIONS H13): m4-full-p03 and its 7 quant readouts only - the Whisper evals are
+#               done and verified, so resume-pull keeps them done -, measured on 2026-10-04 at ~7 min for all eight
+#               (21:05-21:12Z: its run dirs' timestamps), so box p01's tail, plus the pull (CONT_PULL_H)
 POST_T_H = (0.6, 1.35)
-POOL_P_H = (0.9, 1.65)
+POOL_P_H = (0.9, 1.65)  # box full-p's fresh run (DECISIONS G2), the record of its hours
 P01_TAIL_H = (0.2, 0.5)
 P005_TAIL_H = (0.2, 0.5)
+P03_CONT_TAIL_H = (0.2, 0.5)
 CONT_PULL_H = (0.1, 0.3)
-BOX_TAIL_H = {"full-t": POST_T_H, "full-p": POOL_P_H, "p01": P01_TAIL_H, "p005": P005_TAIL_H}
+BOX_TAIL_H = {"full-t": POST_T_H, "full-p": P03_CONT_TAIL_H, "p01": P01_TAIL_H, "p005": P005_TAIL_H}
 END_H = 0.35  # calc_v3 end: finish's uploads and the destroy
 # max_hours' host margin: smoke A ran on a Ryzen 9950X (calc_v3's "fast" CPU class); calc_v3's pessimistic T-0.6B
 # epoch is 13.635 / 10.846 = 1.26 x its fast one (box 2's only 2x offer on 2026-10-01, m54650, a Zen2 EPYC, is

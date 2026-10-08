@@ -45,26 +45,28 @@ FULL_SHA, SMOKE_SHA = ("e9a0695ac45b6b325e6c5c3434ed382e46c63782ece0f375a5f6bbeb
                        "93dd422d873c966a1cbd8aacadcd879ad0bab13481394f554ac9e143a0eaf5b2")
 MEASURED_T = {"t06": 71946, "p03": 105861, "p01": 107910, "p005": 107910}  # at SMOKE_EPOCHS 3 / 3 / 4 / 4
 # tools/full_plan.py on full.parquet at the boxes' epochs (the plan record's launch part, measured again 2026-10-05 for
-# DECISIONS H9): T-0.6B 8, P-0.3B 6, P-0.05B 10 and P-0.1B's continuation 8; every epoch's plan as long as the full
-# part's at the same epoch (each run's first 4 epochs are its 4-epoch plan, epoch for epoch)
-LAUNCH_EPOCHS = {"t06": 8, "p03": 6, "p01": 8, "p005": 10}  # P-0.3B 6: DECISIONS H5; T-0.6B 8: H7; P-0.1B 8 and
-LAUNCH_T = {"t06": 191855, "p03": 211720, "p01": 215815, "p005": 269777}  # P-0.05B 10: H9
-# box_hours of the committed speed record (box 1 at c4604304: r 1.0361, o 0.0465); full-p01 = the recipe test's
-# re-run of box 1's cooldown, 21,582 steps, full-p03 = P-0.3B with the recipe and full-t06 = T-0.6B with the AED recipe
-# (DECISIONS H7), all at AUGMENT_STEP_FACTOR 1.05 (concat); full-p005 = P-0.05B from step 0 at 10 epochs on box p005,
-# the P test box (15.76 h, 15.03 without the factor; H9, H10), and full-p01 = box 1's run continued to 8 epochs on box
-# p01, 129,487 steps (H9; after the test), both with RECIPE_V4 (H12)
-RUN_H = {"full-t06": 63.62, "full-p03": 26.53, "full-p01": 11.47, "full-p005": 15.76}
-BOX_H = {"full-t": (66.8, 88), "full-p": (30.0, 42), "p01": (14.3, 22), "p005": (18.5, 27)}
+# DECISIONS H9): T-0.6B 8, P-0.3B 6, P-0.05B 10 and P-0.1B 4 - its cooldown re-run's (DECISIONS H13: the full part's
+# 4-epoch measurement on the same file; H9's continuation had 8); every epoch's plan as long as the full part's at the
+# same epoch (each run's first 4 epochs are its 4-epoch plan, epoch for epoch)
+LAUNCH_EPOCHS = {"t06": 8, "p03": 6, "p01": 4, "p005": 10}  # P-0.3B 6: DECISIONS H5; T-0.6B 8: H7; P-0.05B 10: H9
+LAUNCH_T = {"t06": 191855, "p03": 211720, "p01": 107910, "p005": 269777}  # P-0.1B 4: H13
+# box_hours of the committed speed record (box 1 at c4604304: r 1.0361, o 0.0465), all at AUGMENT_STEP_FACTOR 1.05
+# (concat): full-t06 = T-0.6B with the AED recipe (DECISIONS H7); full-p005 = P-0.05B from step 0 at 10 epochs on box
+# p005, the P test box (15.76 h, 15.03 without the factor; H9, H10); full-p03 and full-p01 = the recipe-v4 cooldown
+# re-runs of P-0.3B's and P-0.1B's runs from their pre_cooldown states, 42,344 and 21,582 steps (DECISIONS H13)
+RUN_H = {"full-t06": 63.62, "full-p03": 5.39, "full-p01": 2.11, "full-p005": 15.76}
+BOX_H = {"full-t": (66.8, 88), "full-p": (8.2, 14), "p01": (5.0, 10), "p005": (18.5, 27)}
 P01_RID = "full-p01-20261001T184145Z"
-# DECISIONS H9, H12: box p01's sets (G3's 8-epoch continuation of box 1's run, its patience 12, with RECIPE_V4;
-# launched after the P test box, H10), as launch puts them in KITSUNE_RESUME_SETS (one spelling each)
-RECIPE_SETS = ["schedule.epochs=8", "early_stop.patience=12", "augment.enabled=true", "augment.truncate_p=0.2",
-               "augment.concat_p=0.5", "augment.mix_p=0.0", "augment.truncate_min_row_s=3.0", "augment.end_trim_p=0.3",
-               "augment.noise_p=0.3", "augment.noise_bank=aug/musan-bg-v2",
-               f"augment.noise_bank_sha256={M.NOISE_BANK_SHA256}", "augment.speech_p=0.15", "augment.reverb_p=0.2",
-               "augment.rir_bank=aug/rirs-v1", f"augment.rir_bank_sha256={M.RIR_BANK_SHA256}", "augment.gain_p=0.3",
-               "augment.codec_p=0.1"]
+P03_RID = "full-p03-20261003T230143Z"
+# DECISIONS H12, H13: the cooldown re-runs' sets as launch puts them in KITSUNE_RESUME_SETS (one spelling each): the
+# run's own epochs (no patience: a trigger inside a cooldown changes nothing), then one per RECIPE_V4 key
+V4_SETS = ["augment.enabled=true", "augment.truncate_p=0.2", "augment.concat_p=0.5", "augment.mix_p=0.0",
+           "augment.truncate_min_row_s=3.0", "augment.end_trim_p=0.3", "augment.noise_p=0.3",
+           "augment.noise_bank=aug/musan-bg-v2", f"augment.noise_bank_sha256={M.NOISE_BANK_SHA256}",
+           "augment.speech_p=0.15", "augment.reverb_p=0.2", "augment.rir_bank=aug/rirs-v1",
+           f"augment.rir_bank_sha256={M.RIR_BANK_SHA256}", "augment.gain_p=0.3", "augment.codec_p=0.1"]
+RECIPE_SETS = ["schedule.epochs=4", *V4_SETS]  # box p01: P-0.1B's (box 1's 4 epochs)
+P03_SETS = ["schedule.epochs=6", *V4_SETS]  # box full-p: P-0.3B's (its 6 epochs)
 
 
 def cfg(name: str) -> dict:
@@ -172,10 +174,10 @@ def test_check_holds_the_plan_numbers_and_the_readout_reserve(tmp_path):
             "boxes.full-smoke.items.smoke-p005: {'plan_total_steps': 107910, 'plan_hours': 9.92}, the plan record "
             "gives {'plan_total_steps': 107910, 'plan_hours': 9.69}",
             "boxes.full-smoke.faults.F4: seconds 140, the plan record gives 150 (bound 151.05 s)",
-            "boxes.p01.items.full-p01: {'max_hours': 13.24}, the speed record gives {'max_hours': 11.47}",
+            "boxes.p01.items.full-p01: {'max_hours': 13.24}, the speed record gives {'max_hours': 2.11}",
             "boxes.full-t.items.full-t06: {'max_hours': 30.5}, the speed record gives {'max_hours': 63.62}",
-            "boxes.full-p: {'est_hours': 30.0, 'max_hours': 90}, the speed record gives {'est_hours': 30.0, "
-            "'max_hours': 42}",
+            "boxes.full-p: {'est_hours': 8.2, 'max_hours': 90}, the speed record gives {'est_hours': 8.2, "
+            "'max_hours': 14}",
             "boxes.full-p.items.m4-full-p03: max_hours 0.4 (24 min) + 10 min of the trainer's end phase exceed "
             "configs/full/full-p03.json's schedule.end_reserve_min 30"]
     assert len(probs) == len(want) and all(any(p.startswith(f"boxes.json: {w}") for p in probs) for w in want), probs
@@ -499,11 +501,14 @@ def test_the_plan_record(plan):
                                                                   M.launch_epochs(x))
         assert s["steps_per_epoch"][:len(f["steps_per_epoch"])] == f["steps_per_epoch"], x
         assert s["worst_shapes"] == f["worst_shapes"], x  # epoch 0's: the smoke's probe shapes do not move
-    # P-0.1B's continuation (DECISIONS G3, H9): from box 1's pre_cooldown state - the step before its 4-epoch plan's
-    # cooldown (the full part: T 107,910, measured again with the launch part) - to the 8-epoch T, whose first 4 epochs
-    # are box 1's plan step for step: the stable phase goes on to 0.8 x 215,815, then the cooldown
+    # the recipe-v4 cooldown re-runs (DECISIONS H13): each from its run's pre_cooldown state - the step before its
+    # plan's cooldown at its own epochs - to the same T, so the whole re-run is the cooldown: P-0.1B 86,328 of 107,910
+    # (the launch part's 4-epoch plan is the full part's, step for step), P-0.3B 169,376 of 211,720
     assert M.CONTINUATIONS["p01"]["from_step"] == plan["full"]["students"]["p01"]["cooldown_start_step"] - 1 == 86328
-    assert plan["launch"]["students"]["p01"]["cooldown_start_step"] == 172653 == math.ceil(0.8 * 215815) + 1
+    assert plan["launch"]["students"]["p01"] == plan["full"]["students"]["p01"]
+    assert plan["launch"]["students"]["p01"]["cooldown_start_step"] == 86329 == math.ceil(0.8 * 107910) + 1
+    assert M.CONTINUATIONS["p03"]["from_step"] == plan["launch"]["students"]["p03"]["cooldown_start_step"] - 1 == 169376
+    assert plan["launch"]["students"]["p03"]["cooldown_start_step"] == math.ceil(0.8 * 211720) + 1
     assert plan["launch"]["students"]["p005"]["cooldown_start_step"] == 215823 == math.ceil(0.8 * 269777) + 1
 
 
@@ -587,15 +592,15 @@ def test_import_launch_plan(tmp_path, plan, capsys):
     src.write_text(json.dumps(rec), encoding="utf-8")
     assert M.main(["--out-dir", str(out), "--import-launch-plan", str(src)]) == 0
     printed = capsys.readouterr().out
-    assert "launch: t06 8 epochs T 191855, p03 6 epochs T 211720, p01 8 epochs T 215815, p005 10 epochs T 269777" \
+    assert "launch: t06 8 epochs T 191855, p03 6 epochs T 211720, p01 4 epochs T 107910, p005 10 epochs T 269777" \
         in printed and "boxes.json: carries the launch record's hours" in printed
     assert json.loads((out / M.PLAN_FILE).read_text(encoding="utf-8")) == json.loads(before) and M.check(out) == []
     for change, want in ((lambda r: r["students"]["t06"].update(epochs=10), "launch.t06: measured with {'epochs': 10}, "
                           "FULL_RUNS / CONTINUATIONS says {'epochs': 8}"),
                          (lambda r: r["students"]["p005"].update(epochs=4), "launch.p005: measured with {'epochs': 4}, "
                           "FULL_RUNS / CONTINUATIONS says {'epochs': 10}"),
-                         (lambda r: r["students"]["p01"].update(epochs=4), "launch.p01: measured with {'epochs': 4}, "
-                          "FULL_RUNS / CONTINUATIONS says {'epochs': 8}"),
+                         (lambda r: r["students"]["p01"].update(epochs=8), "launch.p01: measured with {'epochs': 8}, "
+                          "FULL_RUNS / CONTINUATIONS says {'epochs': 4}"),
                          (lambda r: r["selection"].update(sha256="0" * 64), "launch: measured on a full.parquet of "
                           "sha256"),
                          (lambda r: r["students"].pop("p005"), "launch: no student p005"),
@@ -627,8 +632,10 @@ def test_box_hours_follow_the_record(plan):
     # box 1 by the same model, at its own 4 epochs: 9.16 h against 9.152 h measured
     assert M._run_h(107910, SMOKE_SPS["p01"], r, 0.0465, 837, 40, 8.5) == 9.16
     hs = {b: M.box_hours(plan, rec, b, reserve_min=60 if b in ("full-t", "full-p") else 45) for b in M.HOURS_BOXES}
-    # box P trains P-0.3B only (DECISIONS H1 step 2); box p01 P-0.1B's continuation (H9); box p005 P-0.05B (H10)
-    assert M.HOURS_BOXES == {"full-t": ("t06",), "full-p": ("p03",), "p01": ("continuation",), "p005": ("p005",)}
+    # boxes full-p and p01: the recipe-v4 cooldown re-runs of P-0.3B's and P-0.1B's runs (DECISIONS H13); box p005
+    # P-0.05B (H10)
+    assert M.HOURS_BOXES == {"full-t": ("t06",), "full-p": ("continuation",), "p01": ("continuation",),
+                             "p005": ("p005",)}
     # t06 with the AED recipe, 8 epochs (DECISIONS H7): 191,855 steps x 1.04295 s x r x 1.0465 x 1.05 + 435 s fixed
     # + 80 dev checks x 9.6 s, rounded up to 0.01 h
     assert math.ceil((191855 * SMOKE_SPS["t06"] * 1.05 * r * 1.0465 + 435 + 80 * 9.6) / 36) / 100 == 63.62
@@ -637,33 +644,38 @@ def test_box_hours_follow_the_record(plan):
     assert {b: (h["est_hours"], h["max_hours"]) for b, h in hs.items()} == BOX_H
     assert {b: (h["r"], h["o"], h["setup_h"], h["store_h"], h["tail_h"]) for b, h in hs.items()} == {
         "full-t": (1.0361, 0.0465, (1.6, 3.3), (0.548, 0.76), (0.6, 1.35)),
-        "full-p": (1.0361, 0.0465, (1.6, 3.3), (0.548, 0.76), (0.9, 1.65)),
+        "full-p": (1.0361, 0.0465, (1.6, 3.3), (0.548, 0.76), (0.3, 0.8)),
         "p01": (1.0361, 0.0465, (1.6, 3.3), (0.548, 0.76), (0.3, 0.8)),
         "p005": (1.0361, 0.0465, (1.6, 3.3), (0.548, 0.76), (0.2, 0.5))}
     # est full-t: 1.6 + 0.548 + 63.62 + 0.6 + 0.35 = 66.718 -> 66.8; max: ceil(3.3 + 0.76 + 63.62 x 1.26 + 1.35 + 1 +
     # 1.25) = ceil(87.82) = 88, T-0.6B's pessimistic end leaving 88 - 1 - 55 min - 84.22 = 1.86 h
-    # est full-p: 1.6 + 0.548 + 26.53 + 0.9 + 0.35 = 29.928 -> 30.0; max: ceil(3.3 + 0.76 + 26.53 x 1.26 + 1.65 + 1 +
-    # 1.25) = ceil(41.39) = 42, P-0.3B's pessimistic end leaving 42 - 1 - 30 min - 37.49 = 3.01 h
-    assert {b: h["slack_h"] for b, h in hs.items()} == {"full-t": 1.86, "full-p": 3.01, "p01": 2.24, "p005": 1.83}
-    # P-0.3B with the recipe, 6 epochs (DECISIONS H5): 211,720 steps x 0.3924 s x r x 1.0465 x 1.05 + 348 s fixed
-    # + 60 dev checks x 9.2 s
+    # est full-p: 1.6 + 0.548 + 5.39 + the tail 0.3 + 0.35 = 8.188 -> 8.2; max: ceil(3.3 + 0.76 + 5.39 x 1.26 + 0.8 + 1
+    # + 1.25) = ceil(13.90) = 14, the re-run's pessimistic end leaving 14 - 1 - 30 min - 10.85 = 1.65 h
+    assert {b: h["slack_h"] for b, h in hs.items()} == {"full-t": 1.86, "full-p": 1.65, "p01": 2.03, "p005": 1.83}
+    # P-0.3B's 6-epoch run as it was planned (DECISIONS H5; its box's record): 211,720 steps x 0.3924 s x r x 1.0465 x
+    # 1.05 + 348 s fixed + 60 dev checks x 9.2 s
     assert math.ceil((211720 * SMOKE_SPS["p03"] * 1.05 * r * 1.0465 + 348 + 60 * 9.2) / 36) / 100 == 26.53
     assert M._run_h(211720, SMOKE_SPS["p03"], r, 0.0465, 348, 60, 9.2) == 25.28  # without the recipe
-    # P-0.1B's continuation (DECISIONS G3, H9): box 1's run from its pre_cooldown state to 8 epochs, 215,815 - 86,328 =
-    # 129,487 steps and 8 - 3.2 epochs = 48 dev checks, at box 1's pace x AUGMENT_STEP_FACTOR 1.05 (concat's longer
-    # rows): 11.47 h, 10.94 h without the factor. (The first recipe test's cooldown re-run, 21,582 steps and 8 dev
-    # checks: 2.11 h, 2.02 h without it.)
+    # the recipe-v4 cooldown re-runs (DECISIONS H13), at AUGMENT_STEP_FACTOR 1.05 (concat's longer rows): P-0.1B's,
+    # box 1's run from its pre_cooldown state to the same T, 107,910 - 86,328 = 21,582 steps and 4 - 3.2 epochs = 8 dev
+    # checks at box 1's pace: 2.11 h (2.02 h without the factor, the first recipe test's); P-0.3B's, 211,720 - 169,376 =
+    # 42,344 steps and 6 - 4.8 = 12 dev checks: 5.39 h. (H9's 8-epoch continuation, set aside: 129,487 steps and 48 dev
+    # checks, 11.47 h, 10.94 h without the factor.)
     c = hs["p01"]["continuation"]
     assert (c["total_steps"], c["steps"], round(c["dev_checks"]), c["step_factor"], c["hours"]) == (
-        215815, 129487, 48, 1.05, 11.47)
+        107910, 21582, 8, 1.05, 2.11)
+    c = hs["full-p"]["continuation"]
+    assert (c["student"], c["total_steps"], c["steps"], round(c["dev_checks"]), c["step_factor"], c["hours"]) == (
+        "p03", 211720, 42344, 12, 1.05, 5.39)
+    assert M._run_h(42344, SMOKE_SPS["p03"] * 1.05, r, 0.0465, 348, 12, 9.2) == 5.39
     assert M._run_h(129487, SMOKE_SPS["p01"], r, 0.0465, 837, 48, 8.5) == 10.94
     assert M.AUGMENT_STEP_FACTOR == 1.05 and M.augment_step_factor(M.RECIPE) == M.augment_step_factor(M.RECIPE_AED) == 1.05
     assert M.augment_step_factor(None) == M.augment_step_factor(dict(M.RECIPE, concat_p=0.0)) == 1.0
     assert M.augment_step_factor(dict(M.RECIPE, enabled=False)) == 1.0
     assert M._run_h(21582, SMOKE_SPS["p01"], r, 0.0465, 837, 8, 8.5) == 2.02
     assert M._run_h(21582, SMOKE_SPS["p01"] * 1.05, r, 0.0465, 837, 8, 8.5) == 2.11
-    # est p01: 1.6 + 0.548 + 11.47 + the tail 0.3 + 0.35 = 14.268 -> 14.3; max: ceil(3.3 + 0.76 + 11.47 x 1.26 + 0.8 +
-    # 0.75 + 1.25) = ceil(21.31) = 22, the continuation's pessimistic end leaving 22 - 0.75 - 30 min - 18.51 = 2.24 h;
+    # est p01: 1.6 + 0.548 + 2.11 + the tail 0.3 + 0.35 = 4.908 -> 5.0; max: ceil(3.3 + 0.76 + 2.11 x 1.26 + 0.8 + 0.75
+    # + 1.25) = ceil(9.52) = 10, the re-run's pessimistic end leaving 10 - 0.75 - 30 min - 6.72 = 2.03 h;
     # est p005: 1.6 + 0.548 + 15.76 + the tail 0.2 + 0.35 = 18.458 -> 18.5; max: ceil(3.3 + 0.76 + 15.76 x 1.26 + 0.5 +
     # 0.75 + 1.25) = ceil(26.42) = 27, P-0.05B's pessimistic end leaving 27 - 0.75 - 30 min - 23.92 = 1.83 h
     assert hs["full-t"]["continuation"] is None
@@ -678,6 +690,8 @@ def test_box_hours_follow_the_record(plan):
     assert M.box_hours(plan, rec, "full-t", reserve_min=120)["max_hours"] == 89
     assert M.continuation_flags("p01") == ["--resume-reset", P01_RID, *sum((["--resume-set", f"{P01_RID}:{s}"]
                                                                             for s in RECIPE_SETS), [])]
+    assert M.continuation_flags("p03") == ["--resume-reset", P03_RID, *sum((["--resume-set", f"{P03_RID}:{s}"]
+                                                                            for s in P03_SETS), [])]
     assert M.speed_problems(rec) == []
     bad = copy.deepcopy(rec)
     del bad["smoke"]["sec_per_step"]["p01"]
@@ -709,13 +723,16 @@ def test_import_speed(tmp_path, plan, capsys):
     printed = capsys.readouterr().out
     assert "smoke A and box 1; r 1.0361, o 0.0465" in printed and "boxes.json: carries the speed record's hours" in printed
     assert "  box full-t: full-t06 max_hours 63.62; est_hours 66.8, max_hours 88" in printed
-    assert "  box full-p: full-p03 max_hours 26.53; est_hours 30, max_hours 42" in printed
-    assert "  box p01: full-p01 max_hours 11.47; est_hours 14.3, max_hours 22" in printed
+    assert "  box full-p: full-p03 max_hours 5.39; est_hours 8.2, max_hours 14" in printed
+    assert "  box p01: full-p01 max_hours 2.11; est_hours 5, max_hours 10" in printed
     assert "  box p005: full-p005 max_hours 15.76; est_hours 18.5, max_hours 27" in printed
-    assert "continuation 129487 steps to T 215815, 48 dev checks, s/step x 1.05 (the recipe's concat)" in printed
+    assert "continuation 21582 steps to T 107910, 8 dev checks, s/step x 1.05 (the recipe's concat)" in printed
+    assert "continuation 42344 steps to T 211720, 12 dev checks, s/step x 1.05 (the recipe's concat)" in printed
     assert (f"continuation p01: launch --box p01 --resume-reset {P01_RID} "
             + " ".join(f"--resume-set {P01_RID}:{s}" for s in RECIPE_SETS)) in printed
-    assert "P-0.1B from step 0 at its continuation's epochs projects to 18.08 h (box 1's 4 epochs: 9.152 h measured)" \
+    assert (f"continuation p03: launch --box full-p --resume-reset {P03_RID} "
+            + " ".join(f"--resume-set {P03_RID}:{s}" for s in P03_SETS)) in printed
+    assert "P-0.1B from step 0 at its continuation's epochs projects to 9.16 h (box 1's 4 epochs: 9.152 h measured)" \
         in printed
     assert (out / M.SPEED_FILE).read_bytes().replace(b"\r\n", b"\n") == committed.replace(b"\r\n", b"\n")
     assert M.check(out) == []
@@ -754,7 +771,7 @@ BOX_TABLE = {  # contract 7: gpus, data config, est / max h, max_dph, extra_gb, 
     "full-p": (1, "data-p", *BOX_H["full-p"], 1.10, 60, 60, (3600, "stop"), True, True, False, 96),
     "smoke-b": (1, "data-smoke-b", 1.75, 3, 1.00, 40, 15, (3600, "stop"), False, False, True, None),
 }
-assert BOX_H == {"full-t": (66.8, 88), "full-p": (30.0, 42), "p01": (14.3, 22), "p005": (18.5, 27)}
+assert BOX_H == {"full-t": (66.8, 88), "full-p": (8.2, 14), "p01": (5.0, 10), "p005": (18.5, 27)}
 
 
 def test_the_registry_loads_with_its_boxes(reg, monkeypatch):
@@ -780,7 +797,8 @@ def test_the_registry_loads_with_its_boxes(reg, monkeypatch):
         want += [M.AED_CUTS] if box == "full-t" else []  # T-0.6B's cut table (DECISIONS H7)
         assert fullrun.box_extra_files(box, reg) == want, box
         assert fullrun.box_extra_dirs(box, reg) == ([PARAKEET] if box in ("full-smoke", "smoke-b") else
-                                                    [M.NOISE_BANK, M.RIR_BANK] if box in ("p01", "p005", "full-t")
+                                                    [M.NOISE_BANK, M.RIR_BANK] if box in ("p01", "p005", "full-t",
+                                                                                          "full-p")
                                                     else []), box
     for x in ("p01", "p005"):
         assert fullrun.box_students(x, reg) == fullrun.box_ctc_students(x, reg) == [f"students/study/{x}"]
@@ -829,28 +847,28 @@ def test_box_p005_is_the_p_test_box(reg, trainer):
     assert fullrun.box_extra_dirs("p005", reg) == [M.NOISE_BANK, M.RIR_BANK] and M.HOURS_BOXES["p005"] == ("p005",)
 
 
-def test_box_p01_is_p01s_continuation(reg, plan, trainer):
-    """Box p01 (DECISIONS H9; launched after the P test box, H10): box 1's items - P-0.1B's run at the continuation's
-    hours (box_hours: box 1's run from its pre_cooldown state to 8 epochs, 11.47 h), its readout and the 7 quantised
-    readouts of its weights (never box 1's 4-epoch ones). The continuation (G3's) goes on from box 1's pre_cooldown
-    state to 8 epochs with recipe v3's augment sets and G3's patience 12, and its launch flags parse into the sets the
+def test_box_p01_is_p01s_cooldown_rerun(reg, plan, trainer):
+    """Box p01 (DECISIONS H13; launched after the P test box, H10): box 1's items - P-0.1B's run at the cooldown
+    re-run's hours (box_hours: box 1's run from its pre_cooldown state to its own T, 2.11 h), its readout and the 7
+    quantised readouts of its weights (never box 1's 4-epoch ones). The re-run goes on from box 1's pre_cooldown state
+    to the same 4 epochs with recipe v4's augment sets and no patience, and its launch flags parse into the sets the
     trainer takes on a resume."""
     p_box_items(reg, "p01", "p01")
     # no registry item reads another box's run any more (the of_box code and its tests stay)
     assert not any(x.get("of_box") for b in fullrun.BOX_NAMES if b in reg["boxes"] for x in fullrun.box_items(b, reg))
-    # the continuation: box 1's run id, from its pre_cooldown step to 8 epochs, with recipe v3 and patience 12;
+    # the re-run: box 1's run id, from its pre_cooldown step to its own 4 epochs, with recipe v4 and no patience;
     # full-p01.json (box 1's config) is byte for byte box 1's, so check-resume finds the same planner and store. (The
     # runs repo's pre_cooldown state is the first recipe test's re-save at the same step: model, optimizer and L2-SP
     # byte for byte box 1's, st.resume_resets 1, so this reset counts 2 and its readout writes the -r2 dir)
     import hashlib
     c = M.CONTINUATIONS["p01"]
     assert (c["box"], c["run_id"], c["from_step"], c["epochs"], c["patience"], c["augment"], c["revision"]) == (
-        "p01", P01_RID, 86328, 8, 12, M.RECIPE_V4, "c4604304db76e068df7bbe39d00d006b74d6c134")
+        "p01", P01_RID, 86328, 4, None, M.RECIPE_V4, "c4604304db76e068df7bbe39d00d006b74d6c134")
     assert M.RECIPE_TEST == {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}  # H1, H4: as run
     assert M.RECIPE == {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0,
                         "truncate_min_row_s": 3.0}  # DECISIONS H6: v2, P-0.3B's
-    # box 1's config keeps its 4 epochs: the continuation sets 8 on the resume (launch_epochs: the continuation's)
-    assert M.FULL_RUNS["p01"]["epochs"] == cfg("full-p01")["schedule"]["epochs"] == 4 and M.launch_epochs("p01") == 8
+    # box 1's config keeps its 4 epochs, and so does the re-run (launch_epochs: the continuation's)
+    assert M.FULL_RUNS["p01"]["epochs"] == cfg("full-p01")["schedule"]["epochs"] == 4 == M.launch_epochs("p01")
     raw = (FULL / "full-p01.json").read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(raw).hexdigest() == FULL_P01_SHA256
     # the launch flags: one KITSUNE_RESUME_SETS word in launch's spelling, every key settable on a resume
@@ -859,24 +877,62 @@ def test_box_p01_is_p01s_continuation(reg, plan, trainer):
     word = ",".join(flags[3::2])
     assert re.fullmatch(fullrun._ENV_WORD, word) and fullrun.parse_resume_sets(word) == {P01_RID: RECIPE_SETS}
     keys = [s.partition("=")[0] for s in RECIPE_SETS]
-    assert set(keys) <= set(fullrun.RESUME_SET_KEYS) and keys[:2] == ["schedule.epochs", "early_stop.patience"]
+    assert set(keys) <= set(fullrun.RESUME_SET_KEYS) and keys[0] == "schedule.epochs"
+    assert "early_stop.patience" not in keys
     # ... and the trainer takes them on a resume of box 1's config: none is RESUME_FIXED, the values validate (the
-    # augmentation on a CTC student); schedule.epochs and the patience change too (a resume reset plans the 8-epoch T)
+    # augmentation on a CTC student); the epochs stay box 1's, so only the augmentation changes
     saved = trainer.load_config(str(FULL / "full-p01.json"), [])
     sets = [trainer.apply_set(copy.deepcopy(saved), s) for s in RECIPE_SETS]
     changed, same = trainer.resume_overrides(saved, sets)
-    assert changed == {"schedule.epochs": 8, "early_stop.patience": 12, "augment.enabled": True,
-                       "augment.truncate_p": 0.2, "augment.concat_p": 0.5, "augment.truncate_min_row_s": 3.0,
-                       "augment.end_trim_p": 0.3, "augment.noise_p": 0.3, "augment.noise_bank": M.NOISE_BANK,
+    assert changed == {"augment.enabled": True, "augment.truncate_p": 0.2, "augment.concat_p": 0.5,
+                       "augment.truncate_min_row_s": 3.0, "augment.end_trim_p": 0.3, "augment.noise_p": 0.3,
+                       "augment.noise_bank": M.NOISE_BANK, "augment.noise_bank_sha256": M.NOISE_BANK_SHA256,
+                       "augment.speech_p": 0.15, "augment.reverb_p": 0.2, "augment.rir_bank": M.RIR_BANK,
+                       "augment.rir_bank_sha256": M.RIR_BANK_SHA256, "augment.gain_p": 0.3, "augment.codec_p": 0.1}
+    assert same == {"schedule.epochs": 4, "augment.mix_p": 0.0}  # mixing off: the trainer's default
+    assert trainer.augment_on(trainer.load_config(str(FULL / "full-p01.json"), RECIPE_SETS))
+
+
+def test_box_full_p_is_p03s_cooldown_rerun(reg, plan, trainer):
+    """Box full-p (DECISIONS H13): P-0.3B's run again from its pre_cooldown state to its own 6-epoch T with recipe v4's
+    augment sets and no patience - its items as the fresh box had them (the CTC store, the run at the re-run's hours,
+    its readout, 7 quantised readouts and the 4 Whisper evals, which resume-pull keeps done), both banks pulled, the
+    config the 6-epoch run trained with byte for byte, and launch flags that parse into the sets the trainer takes on
+    a resume of that config."""
+    import hashlib
+    it = items(reg, "full-p")
+    quant = [f"quant-{f}-full-p03" for f in QUANT_FORMATS]
+    assert list(it) == ["stores-ctc", "full-p03", "m4-full-p03", *quant, *WHISPER_KEYS]
+    assert (it["full-p03"]["max_hours"], it["full-p03"]["config"]) == (RUN_H["full-p03"], "configs/full/full-p03.json")
+    assert fullrun.box_extra_dirs("full-p", reg) == [M.NOISE_BANK, M.RIR_BANK]
+    c = M.CONTINUATIONS["p03"]
+    assert (c["box"], c["student"], c["run_id"], c["from_step"], c["epochs"], c["patience"], c["augment"],
+            c["revision"]) == ("full-p", "p03", P03_RID, 169376, 6, None, M.RECIPE_V4,
+                               "3674d2d7ae7480594b079234b1549014fe96f783")
+    assert M.FULL_RUNS["p03"]["epochs"] == cfg("full-p03")["schedule"]["epochs"] == 6 == M.launch_epochs("p03")
+    assert M.FULL_RUNS["p03"]["augment"] is M.RECIPE  # its config keeps recipe v2: the re-run sets v4
+    raw = (FULL / "full-p03.json").read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(raw).hexdigest() == FULL_P03_SHA256
+    flags = M.continuation_flags("p03")
+    assert flags[:2] == ["--resume-reset", P03_RID] and flags[2::2] == ["--resume-set"] * len(P03_SETS)
+    word = ",".join(flags[3::2])
+    assert re.fullmatch(fullrun._ENV_WORD, word) and fullrun.parse_resume_sets(word) == {P03_RID: P03_SETS}
+    assert {s.partition("=")[0] for s in P03_SETS} <= set(fullrun.RESUME_SET_KEYS)
+    saved = trainer.load_config(str(FULL / "full-p03.json"), [])
+    sets = [trainer.apply_set(copy.deepcopy(saved), s) for s in P03_SETS]
+    changed, same = trainer.resume_overrides(saved, sets)
+    assert changed == {"augment.end_trim_p": 0.3, "augment.noise_p": 0.3, "augment.noise_bank": M.NOISE_BANK,
                        "augment.noise_bank_sha256": M.NOISE_BANK_SHA256, "augment.speech_p": 0.15,
                        "augment.reverb_p": 0.2, "augment.rir_bank": M.RIR_BANK,
                        "augment.rir_bank_sha256": M.RIR_BANK_SHA256, "augment.gain_p": 0.3, "augment.codec_p": 0.1}
-    assert same == {"augment.mix_p": 0.0}  # mixing off: the trainer's default
-    assert trainer.augment_on(trainer.load_config(str(FULL / "full-p01.json"), RECIPE_SETS))
+    assert same == {"schedule.epochs": 6, "augment.enabled": True, "augment.truncate_p": 0.2, "augment.concat_p": 0.5,
+                    "augment.mix_p": 0.0, "augment.truncate_min_row_s": 3.0}  # recipe v2's, the run's own
 
 
 # box 1's config as it ran (7715f3f): a continuation needs the very same file (check-resume, the planner)
 FULL_P01_SHA256 = "918d8e020d1ff6c70789297e93963aefa40e3f6431f1c6d7cb9de8b1c5e5ee1d"
+# P-0.3B's config as its 6-epoch run trained with it (box full-p at 30b13f3): its cooldown re-run needs the same file
+FULL_P03_SHA256 = "23d0576681df372226a0a828bc90510b7deac00d9dbd806155b6ad477ba579cf"
 
 
 @pytest.mark.parametrize("box", ["p01", "full-t", "full-p", "p005"])
@@ -1284,7 +1340,7 @@ def test_the_chained_box(reg):
 
 def test_the_chained_box_numbers(reg):
     """The chain's hours, disk and price against its parts (addendum E.1.4 rule 3, E.6, E.9.5), as it ran on
-    2026-10-01 (history now: its part p01 is P-0.1B's continuation box, 14.3 h, with box 1's numbers in E.6's): box
+    2026-10-01 (history now: its part p01 is P-0.1B's cooldown re-run box, 5.0 h, with box 1's numbers in E.6's): box
     p01 fits after stage 1's sub-deadline, the 35 h cap covered the worst case the gate let through, 25.2 h was the
     central wall, the gate part ends by its standalone cap, the extra disk holds box p01's and stage 1's leftovers."""
     from kitsune import full_queue as F
@@ -1293,8 +1349,8 @@ def test_the_chained_box_numbers(reg):
     s1 = spec["chain"][0]
     readout = sum(it["max_hours"] for it in parts["p01"]["items"] if it["kind"] == "readout")  # m4-full-p01 0.3
     assert readout == 0.3
-    assert spec["max_hours"] - s1["max_hours"] >= parts["p01"]["est_hours"]  # rule 3: 35 - 10.5 = 24.5 >= 14.3
-    assert s1["max_hours"] + parts["p01"]["est_hours"] == 24.8  # launch refuses a --max-hours below this
+    assert spec["max_hours"] - s1["max_hours"] >= parts["p01"]["est_hours"]  # rule 3: 35 - 10.5 = 24.5 >= 5.0
+    assert s1["max_hours"] + parts["p01"]["est_hours"] == 15.5  # launch refuses a --max-hours below this
     assert s1["gate_by_hours"] == parts["full-smoke"]["max_hours"] == 9 < s1["max_hours"]
     # E.6: stage 1 + the pessimistic stage-2 setup 6.1 h [X] + smoke check 3's box-1 limit + readout + end 0.35 h +
     # p01's reserve; E.9.5's central wall: smoke A 5.2 + smoke B's items 1.1 + stage-2 setup 4.7 + full-p01 13.56 +
@@ -1317,7 +1373,7 @@ def test_check_holds_the_chain(tmp_path, capsys):
     reg["boxes"]["smoke-b"]["watchdog"]["action"] = "alert"
     (out / "boxes.json").write_text(json.dumps(reg), encoding="utf-8")
     assert sorted(M.check(out)) == sorted([
-        f"boxes.json: boxes.{CHAIN}: max_hours 35 - stage 1's 31 leaves 4 h, below the last stage's est_hours 14.3",
+        f"boxes.json: boxes.{CHAIN}: max_hours 35 - stage 1's 31 leaves 4 h, below the last stage's est_hours 5",
         f"boxes.json: boxes.{CHAIN}.chain[0]: part 'smoke-b''s watchdog action is 'alert': every part but the gate "
         f"part runs with the watchdog in stop mode"])
     assert M.main(["--check", "--out-dir", str(out)]) == 1 and "2 problem(s)" in capsys.readouterr().out
