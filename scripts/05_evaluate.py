@@ -137,7 +137,8 @@ variant dir (python -m kitsune.quant export; its quantization.json) is loaded wi
 scored as it ships: its format, scope and MXFP4 rounding are its recipe's (--quant may repeat the format;
 --quant-scope and --mx-rounding are refused). --quant-impl auto runs torchao's kernels on CUDA (a CUDA box without
 torchao refuses) and emulates on CPU; emulate simulates on any device (recorded as simulated); mxfp4 is always emulated;
-fp16 runs its fp16 weights under fp16 autocast, on CPU too. A quantised eval is a system of its own, <run_name>@<fmt>
+fp16 runs its fp16 weights under fp16 autocast, on CPU too, and its encoder self-attention in fp32 outside it
+(kitsune.quant.FP16_FP32_MODULES). A quantised eval is a system of its own, <run_name>@<fmt>
 (an explicit --system must carry the suffix: a variant's tables must never replace the bf16 ones), with no history and
 no verdict (verdict_skipped: the trends read the training run's history), not with --anchor, --teachers or
 --from-evals; the format, impl, scope and rounding enter the --out identity (only then: other --out dirs keep theirs).
@@ -149,7 +150,10 @@ fallback_risk}, nonfinite {batches, rows, by_module, first}, fp32_fallbacks (the
 why), torchao, weights_bytes (the deployable bytes), bytes {deployable, quantized, kept}, recipe_version and
 recipe_sha256 (the quant code's recipe: kitsune.quant.RECIPE_VERSION, 2 since F1; a variant --ckpt of an older version
 is refused, exit 2, export it again; the --out identity holds the version too). A quantised layer that no
-batch called fails the run. Every --ckpt eval's study.json also records weights {path, file_bytes}, and every
+batch called fails the run, and so does a non-finite value: once every output is written, a quantised eval whose
+monitor counted a non-finite row (in any of the --out's runs) exits 1 with status "nonfinite" - its numbers are an
+overflow, not what the format costs (the fp16 readout of P-0.05B decoded every utterance empty and exited 0). Every
+--ckpt eval's study.json also records weights {path, file_bytes}, and every
 system's metrics gain m4_nostyle, m4_all (M4 with Galgame's whole set, kitsune.evaluate.M4_ALL_STRATA), m4_all_nostyle
 and m3 (the gate sets; with _teacher / _ratio for the raw ones).
 
@@ -1270,6 +1274,18 @@ def finish_quant(ctx: Ctx, inv: dict):
                          "format does not cover the model it claims to")
 
 
+def nonfinite_failure(q: dict | None) -> str | None:
+    """Why a quantised eval fails although it ran, or None: its monitor counted a non-finite row in a run of this --out
+    (the quant block sums them all). main raises it once every output is written: they stay as the evidence, but the
+    numbers are an overflow, not what the format costs."""
+    nf = (q or {}).get("nonfinite") or {}
+    if not nf.get("rows"):
+        return None
+    return (f"quant: {nf['rows']} row(s) held a non-finite value ({nf.get('batches')} of {nf.get('forwards')} "
+            f"forwards, first in {nf.get('first')}): the {q.get('format')} model overflows, so its numbers are not "
+            "the format's cost (the outputs are written: the quant block's nonfinite in summary.json and study.json)")
+
+
 def refuse_frame_mismatch(ctx: Ctx, what: str, mismatch: list[dict], n_rows: int):
     """Decision 15 on a CTC eval (a token store and parakeet_out's targets; the CTC trainer's frame store build, which
     04_distill.build_eval_store runs for a ctc config before it hands 05 the token store, applies it too, to the eval
@@ -2169,6 +2185,9 @@ def main(argv=None) -> int:
                        m4=study["metrics"].get("m4"))
         inv.update(status="tables_refused" if refused else "tables_partial" if partial else "complete",
                    headline=(summary or {}).get("headline"))
+        if (why := nonfinite_failure(ctx.quant)) is not None:
+            inv.update(status="nonfinite")
+            raise SystemExit(why)
         if refused:
             raise SystemExit(f"REFUSED: no table for {sorted(refused)} (the eval itself is complete): "
                              + "; ".join(f"{s}: {why}" for s, why in refused.items()))
