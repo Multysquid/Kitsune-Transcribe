@@ -382,7 +382,9 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
                        "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, "
                        "augment.concat_p, augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, "
-                       "augment.noise_p, augment.noise_bank, augment.noise_bank_sha256 may change on a resume"),
+                       "augment.noise_p, augment.noise_bank, augment.noise_bank_sha256, augment.speech_p, "
+                       "augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, augment.gain_p, augment.codec_p "
+                       "may change on a resume"),
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:augment.noise_bank=../bank"],
                        "augment.noise_bank must be a relative data-repo path"),
@@ -733,6 +735,62 @@ def test_full_preflight_refusals(repo, monkeypatch, devslice):
     (repo.root / "moved.json").rename(repo.root / "configs/full/full-p01.json")
 
 
+def test_full_preflight_holds_the_background_bank_and_the_cut_table_to_their_pins(repo, monkeypatch, devslice):
+    """DECISIONS H11: a run's background bank (its config's augment block, or a continuation's --resume-set) must be
+    one of the box's extra dirs and its index.json the sha256 the run pins, and a cut table its pinned sha256 - checked
+    before renting, since a stale pin fails every train attempt on the box after the paid rebuild."""
+    import hashlib
+
+    bank, index = "aug/bank-v1", b'{"version": 1, "clips": []}'
+    pin = hashlib.sha256(index).hexdigest()
+    f = repo.root / "configs/full/full-p01.json"
+    plain = f.read_text(encoding="utf-8")
+    reg = launch.full_registry(SHA)[0]
+    reg["boxes"]["p01"]["extra_dirs"] = [bank]
+    good = dict(box_data("p01", reg, repo.root), **{f"{bank}/index.json": index})
+
+    def run(augment=None, sets=None, extra_dirs=(bank,), data=good):
+        cfg = json.loads(plain)
+        if augment is not None:
+            cfg["augment"] = augment
+        f.write_text(json.dumps(cfg), encoding="utf-8")
+        reg["boxes"]["p01"]["extra_dirs"] = list(extra_dirs)
+        return preflight(monkeypatch, FullHub(data), reg=reg, sets=sets)
+
+    on = {"enabled": True, "noise_p": 0.3, "noise_bank": bank, "noise_bank_sha256": pin}
+    problems, notes = run(on)
+    assert problems == [] and any(f"bank {bank}, index.json sha256 {pin[:12]}" in n for n in notes), (
+        problems, notes)
+    problems, _ = run(dict(on, noise_bank_sha256="0" * 64))
+    assert any(f"full-p01 pins {bank}/index.json at sha256 000000000000..., {DATA} holds {pin[:12]}" in x
+               for x in problems), problems
+    problems, _ = run(on, extra_dirs=())
+    assert any(f"full-p01 reads the bank {bank}, which box p01 does not pull" in x for x in problems)
+    problems, _ = run(on, data={k: v for k, v in good.items() if k != f"{bank}/index.json"})
+    assert any(f"no {bank}/index.json (full-p01's bank" in x for x in problems), problems
+    assert run(dict(on, enabled=False))[0] == [] and run(dict(on, noise_p=0.0))[0] == []  # no background: no pin
+    # a continuation's sets: its bank and pin are checked as a config's
+    rid = "full-p01-20261001T184145Z"
+    problems, _ = run(sets={rid: ["augment.noise_bank=" + bank, "augment.noise_bank_sha256=" + "1" * 64]})
+    assert any(f"--resume-set {rid} pins {bank}/index.json at sha256 111111111111" in x for x in problems), problems
+    assert run(sets={rid: ["augment.noise_bank=" + bank, "augment.noise_bank_sha256=" + pin]})[0] == []
+    # an RIR bank (DECISIONS H12): its pin and the box's pull checked as a background bank's, from a config and from
+    # a continuation's sets
+    room = {"enabled": True, "reverb_p": 0.2, "rir_bank": bank, "rir_bank_sha256": pin}
+    assert run(room)[0] == [] and run(dict(room, reverb_p=0.0, rir_bank_sha256="2" * 64))[0] == []
+    problems, _ = run(dict(room, rir_bank_sha256="2" * 64))
+    assert any(f"full-p01 pins {bank}/index.json at sha256 222222222222" in x for x in problems), problems
+    problems, _ = run(sets={rid: ["augment.rir_bank=" + bank, "augment.rir_bank_sha256=" + "3" * 64]})
+    assert any(f"--resume-set {rid} pins {bank}/index.json at sha256 333333333333" in x for x in problems), problems
+    # the cut table: its LFS sha256 (FullHub: "5e" x 32 for a .parquet)
+    cuts = fullrun.FULL_DIR + "/aed_cuts.parquet"
+    data = dict(good, **{cuts: b"parquet"})
+    assert run({"enabled": True, "cuts": cuts, "cuts_sha256": "5e" * 32}, data=data)[0] == []
+    problems, _ = run({"enabled": True, "cuts": cuts, "cuts_sha256": "ab" * 32}, data=data)
+    assert any(f"full-p01 pins {cuts} at sha256 abababababab..., {DATA} holds 5e5e5e5e5e5e" in x for x in problems)
+    f.write_text(plain, encoding="utf-8")
+
+
 def test_full_preflight_refuses_a_box_whose_tools_the_sha_lacks(repo, monkeypatch, devslice):
     """The eval and speed items name the CLI they run; a box that needs a tool of a package not merged yet (WP5's
     kitsune.quant, WP6's whisper kind of speed_probe) is refused before renting."""
@@ -1070,7 +1128,7 @@ def test_the_quant_code_and_the_speed_record_exist_in_this_checkout():
         assert (ROOT / rel).is_file(), rel
     rec = json.loads((ROOT / launch.SPEED_RECORD).read_text(encoding="utf-8"))
     assert set(rec) >= {"smoke", "box1"}
-    assert launch.SPEED_RECORD_BOXES == ("p01", "full-t", "full-p") and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
+    assert launch.SPEED_RECORD_BOXES == ("p01", "full-t", "full-p", "p005") and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
     assert set(launch.SPEED_RECORD_BOXES) <= set(fullrun.BOX_NAMES)
 
 
@@ -1357,7 +1415,7 @@ def chain_launch(repo, monkeypatch):
 def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     """E.1.8: KITSUNE_CONFIG is stage 1's rebuild, the watchdog's stage-1 env with its hand-over bound, the disk and
     the gate on box 1's extent (+ the chain's extra_gb), the boot's rebuild bytes and timeout on stage 1's; every part
-    preflighted as a box, each distinct data config's selection checked, the chain's own files; 41 h, 25.2 h, $1.00."""
+    preflighted as a box, each distinct data config's selection checked, the chain's own files; 35 h, 25.2 h, $1.00."""
     rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 0, out
@@ -1370,7 +1428,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
         "KITSUNE_WATCHDOG_ORPHAN_ACTION": "alert", "KITSUNE_CHAIN_STAGE": "1", "KITSUNE_WATCHDOG_HANDOVER_S": "34200",
         "KITSUNE_SCRATCH_REPO": SCRATCH, "KITSUNE_GATE_BYTES": str(int(571.3e9)), "KITSUNE_GATE_MAX_H": "5",
         "KITSUNE_REBUILD_BYTES": str(int(59.2e9)), "KITSUNE_PULL_BYTES": str(int(1e9 * (5.5 + 2))),
-        "KITSUNE_MAX_HOURS": "41", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
+        "KITSUNE_MAX_HOURS": "35", "TZ": "UTC", "KITSUNE_DATA_REVISION": "d" * 40,
         "KITSUNE_REBUILD_TIMEOUT_MIN": "120", "KITSUNE_DPH": "0.8100", "KITSUNE_MACHINE_ID": "70001"}
     assert create[create.index("--disk") + 1] == "1400" and create[create.index("--label") + 1].startswith(
         "kitsune-full-p01-chain-data-smoke-")
@@ -1384,7 +1442,7 @@ def test_the_chain_rents_one_5090_with_its_derived_env(chain_launch, capsys):
     assert parts["smoke-b"][0][7]["selection"] == "labels/full/selections/study_1000h.parquet"
     assert all(not kw.get("resume") for _, kw in parts.values())
     assert len(s["chain"]) == 1 and "chain preflight ok" in out and "part p01: p01 preflight ok" in out
-    assert "x ~25.2 h (box p01-chain; watchdog cap 41 h)" in out
+    assert "x ~25.2 h (box p01-chain; watchdog cap 35 h)" in out
     assert "chain p01-chain: the gate part must end by first boot + 9 h" in out and "+ 9.5 h" in out
     assert "free disk was re-checked just now: the offer search keeps only offers with disk_space >= 1400 GB" in out
     assert "disk_space>=1400" in search_query(fake).split(" "), "the offer search itself filters on the chain's disk"
@@ -1405,7 +1463,7 @@ def test_launch_chain_refusals(chain_launch, capsys, args, err):
 def test_launch_chain_warns_below_its_cap_and_a_parts_problem_refuses(chain_launch, capsys):
     rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--max-hours", "32", "--dry-run")
     out = capsys.readouterr().out
-    assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 41 h" in out
+    assert rc == 0 and "WARNING: --max-hours 32 is below chain p01-chain's 35 h" in out
     assert env_of(created_or_printed(out))["KITSUNE_MAX_HOURS"] == "32"
     chain_launch.seen["part_problems"]["smoke-b"] = ["tools/whisper_eval.py (item whisper-large-v3) does not exist"]
     rc, fake = chain_launch([[offer(1, 70001, 0.81)]], "--scratch-repo", SCRATCH, "--yes")

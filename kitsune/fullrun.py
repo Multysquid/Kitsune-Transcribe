@@ -123,8 +123,9 @@ BOXES_FILE, ENV_REGISTRY = "configs/full/boxes.json", "KITSUNE_FULL_REGISTRY"
 # smoke A, box p01 (box 1, then its recipe test: box 1's cooldown again), "full" (the retired 2x box 2: no longer in
 # the registry, kept for tests/fixtures_full.py's 2-GPU box only), smoke B, and box 2 as two 1x boxes (DECISIONS G2):
 # full-t (T-0.6B) and full-p (P-0.3B with the augmentation recipe, the Whisper models and the quantised readouts;
-# P-0.05B postponed, DECISIONS H2)
-BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p")
+# P-0.05B postponed, DECISIONS H2), and p005: P-0.05B alone, the P test box of recipe v3 (DECISIONS H10; box p01 keeps
+# P-0.1B's run, whose continuation reads box p01's Hub summary)
+BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005")
 # chain boxes (contract addendum E, DECISIONS D): one rental that runs registry boxes one after the other, in two
 # stages with an automatic gate between them (kitsune/full_queue.py ChainController). p01-chain = smoke A and smoke B,
 # then box 1, on one 1x RTX 5090
@@ -200,17 +201,24 @@ ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # bools; validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set).
 # DECISIONS H8 (the P test box after the P-0.3B review): box 1's cooldown re-run with recipe v2 and the review's fixes
 # also sets truncate_min_row_s (seconds >= 0), end_trim_p (a probability) and the background noise - noise_p (a
-# probability), the bank's data-repo path noise_bank and the sha256 of its index.json, noise_bank_sha256
+# probability), the bank's data-repo path noise_bank and the sha256 of its index.json, noise_bank_sha256. DECISIONS
+# H12 adds the other acoustic steps' rates (speech_p, reverb_p, gain_p, codec_p) and the RIR bank (rir_bank, its pin
+# rir_bank_sha256); their ranges (speech_snr_db, gain_db, codecs, ...) stay the trainer's defaults
 RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
                    "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s", "augment.end_trim_p",
-                   "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256")
+                   "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256", "augment.speech_p",
+                   "augment.reverb_p", "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p",
+                   "augment.codec_p")
 RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
 RESUME_SET_KINDS = {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
                     "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
                     "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob", "augment.noise_p": "prob",
-                    "augment.noise_bank": "path", "augment.noise_bank_sha256": "sha256"}
-# a data-repo path a resume set may name: relative, of path segments without "..", no comma (KITSUNE_RESUME_SETS'
-# separator) and nothing JSON would read as another type (04_distill's --set keeps a string that is not JSON)
+                    "augment.noise_bank": "path", "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob",
+                    "augment.reverb_p": "prob", "augment.rir_bank": "path", "augment.rir_bank_sha256": "sha256",
+                    "augment.gain_p": "prob", "augment.codec_p": "prob"}
+# a data-repo path a resume set may name: relative, every segment starting with a letter, digit or _ (so never "." or
+# ".."), no comma (KITSUNE_RESUME_SETS' separator) and nothing JSON would read as another type (04_distill's --set
+# keeps a string that is not JSON)
 _REPO_PATH_RE = r"[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)*"
 # a probability's spelling: a plain decimal (digits, one point, an exponent), no sign, no "inf" / "nan" / "1_0" - the
 # forms float() would also take but JSON (04_distill's --set) would not, or not as a number
@@ -380,7 +388,7 @@ def resume_set_value(key: str, val: str) -> str:
         if re.fullmatch(_DECIMAL_RE, val) and float(val) >= 0.0:
             return repr(float(val))
     elif kind == "path":
-        if re.fullmatch(_REPO_PATH_RE, val) and ".." not in val.split("/") and _not_json_scalar(val):
+        if re.fullmatch(_REPO_PATH_RE, val) and _not_json_scalar(val):
             return val
     elif kind == "sha256":
         if re.fullmatch(r"[0-9a-fA-F]{64}", val) and _not_json_scalar(val.lower()):

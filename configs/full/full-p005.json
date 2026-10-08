@@ -66,7 +66,7 @@
  "perf": {
   "relpos_patch": true,
   "compile": false,
-  "num_workers": "auto",
+  "num_workers": 12,
   "prefetch": 4,
   "tf32": true,
   "peak_tflops": 209.5,
@@ -214,7 +214,13 @@
   "truncate_min_row_s": 3.0,
   "end_trim_p": 0.3,
   "noise_p": 0.3,
-  "noise_bank": "aug/musan-bg-v1",
-  "noise_bank_sha256": "a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803"
+  "noise_bank": "aug/musan-bg-v2",
+  "noise_bank_sha256": "1d56c7bf5cb0f1ad036f551a81c0029360ba821186f3c5abe41d344c381339f0",
+  "speech_p": 0.15,
+  "reverb_p": 0.2,
+  "rir_bank": "aug/rirs-v1",
+  "rir_bank_sha256": "af6d19310210aa2578c902b55d2e8d6f9e67924ede368a86fe5d6f8bce40e588",
+  "gain_p": 0.3,
+  "codec_p": 0.1
  }
 }

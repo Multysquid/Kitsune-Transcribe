@@ -57,6 +57,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
+from kitsune.acoustics import CODECS, DEFAULT_CODECS
 from kitsune.audio import TARGET_SR, decode_audio
 from kitsune.store import fsync_path
 
@@ -485,8 +486,8 @@ def is_frame_store(stores: "Stores") -> bool:
     return (stores.info or {}).get("kind") == "frames"
 
 
-def dataset_for(stores: "Stores", augment: "Augment | None" = None, cuts=None,
-                noise=None) -> "AudioBatchDataset | FrameBatchDataset":
+def dataset_for(stores: "Stores", augment: "Augment | None" = None, cuts=None, noise=None,
+                rirs=None) -> "AudioBatchDataset | FrameBatchDataset":
     """The micro-batch dataset of a store: FrameBatchDataset for a frame store, else AudioBatchDataset. augment: the
     TRAIN loader's augmentation (Augment: a CTC one on a frame store; an AED one - max_tokens set - on a token store,
     with cuts, the cut table's kitsune.aed_cuts.CutIndex over the store's rows, when it cuts). Every other dataset -
@@ -495,8 +496,8 @@ def dataset_for(stores: "Stores", augment: "Augment | None" = None, cuts=None,
     if is_frame_store(stores):
         if cuts is not None:
             raise ValueError("a cut index is an AED store's (kitsune.aed_cuts); a frame store cuts on its own targets")
-        return FrameBatchDataset(stores, augment=augment, noise=noise)
-    return AudioBatchDataset(stores, augment=augment, cuts=cuts, noise=noise)
+        return FrameBatchDataset(stores, augment=augment, noise=noise, rirs=rirs)
+    return AudioBatchDataset(stores, augment=augment, cuts=cuts, noise=noise, rirs=rirs)
 
 
 def _frame_cache_complete(cache_dir: Path) -> bool:
@@ -1021,7 +1022,7 @@ class AudioBatchDataset(torch.utils.data.Dataset):
     first one's. None (the default) returns the stored rows exactly as before the augmentation existed, without `aug`.
     """
 
-    def __init__(self, stores: Stores, augment: "Augment | None" = None, cuts=None, noise=None):
+    def __init__(self, stores: Stores, augment: "Augment | None" = None, cuts=None, noise=None, rirs=None):
         u = stores.utts
         self.cache_dir = str(stores.cache_dir)
         self.prompt = np.array(stores.info.get("prompt", PROMPT), dtype=np.int64)
@@ -1037,6 +1038,7 @@ class AudioBatchDataset(torch.utils.data.Dataset):
         self.n_tok = np.array([x.n_tok for x in u], dtype=np.int64)
         self.augment, self.cuts = _token_augment(augment, cuts)
         self.noise = _noise_of(self.augment, noise)
+        self.rirs = _rir_of(self.augment, rirs)
         self._mm = None
 
     def __len__(self) -> int:
@@ -1047,13 +1049,14 @@ class AudioBatchDataset(torch.utils.data.Dataset):
         state["_mm"] = None  # never pickle memmaps: each process maps the files itself
         return state
 
-    def with_augment(self, augment: "Augment | None", cuts=None, noise=None) -> "AudioBatchDataset":
+    def with_augment(self, augment: "Augment | None", cuts=None, noise=None, rirs=None) -> "AudioBatchDataset":
         """This dataset with another augmentation and cut index (None: none), as a shallow copy sharing the
         per-utterance arrays (FrameBatchDataset.with_augment's reason): the trainer keeps the plain dataset for the
         smoke checks and the memory probe."""
         out = copy.copy(self)
         out.augment, out.cuts = _token_augment(augment, cuts)
         out.noise = _noise_of(out.augment, noise)
+        out.rirs = _rir_of(out.augment, rirs)
         out._mm = None
         return out
 
@@ -1185,7 +1188,7 @@ class AudioBatchDataset(torch.utils.data.Dataset):
                 if got is not None:
                     r.wave = got[0]
                     n_mixed += 1
-        n_noise = mix_background(rows, self.noise, a, rng)
+        acoustic = acoustic_chain(rows, originals, self.noise, self.rirs, a, rng)
         B = len(rows)
         durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None or r.trimmed
                               else self.duration[r.pieces].sum(dtype=np.float32) for r in rows], dtype=np.float32)
@@ -1197,7 +1200,7 @@ class AudioBatchDataset(torch.utils.data.Dataset):
                    sources=[self.sources[r.pieces[0]] for r in rows], dropped=dropped)
         out["aug"] = dict(utts=len(keep), rows=B, concat_groups=groups, concat_utts=len(keep) if groups else 0,
                           truncated=n_cut, mixed=n_mixed, cut_padded=0, end_padded=0, concat_capped=capped,
-                          cut_mismatch=mismatch, end_trimmed=n_trim, noised=n_noise)
+                          cut_mismatch=mismatch, end_trimmed=n_trim, **acoustic)
         return out
 
 
@@ -1229,9 +1232,10 @@ class FrameBatchDataset(torch.utils.data.Dataset):
 
     ARRAYS = ("frames_blank_lp", "dense_frame", "dense_topk_idx", "dense_topk_lp", "ctc_ids")
 
-    def __init__(self, stores: Stores, augment: "Augment | None" = None, noise=None):
+    def __init__(self, stores: Stores, augment: "Augment | None" = None, noise=None, rirs=None):
         self.augment = _frame_augment(augment)
         self.noise = _noise_of(self.augment, noise)
+        self.rirs = _rir_of(self.augment, rirs)
         u = stores.utts
         d = Path(stores.cache_dir)
         self.cache_dir = str(d)
@@ -1256,7 +1260,7 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         state["_mm"] = None  # never pickle memmaps: each process maps the files itself
         return state
 
-    def with_augment(self, augment: "Augment | None", noise=None) -> "FrameBatchDataset":
+    def with_augment(self, augment: "Augment | None", noise=None, rirs=None) -> "FrameBatchDataset":
         """This dataset with another augmentation (None: none), as a shallow copy: the per-utterance arrays (ids,
         offsets, durations; on the full data ~10M rows, most of a GiB) are shared, not built or held a second time, so
         the trainer keeps its plain dataset for the smoke checks and the memory probe next to the augmenting one its
@@ -1264,6 +1268,7 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         out = copy.copy(self)
         out.augment, out._mm = _frame_augment(augment), None
         out.noise = _noise_of(out.augment, noise)
+        out.rirs = _rir_of(out.augment, rirs)
         return out
 
     def _open(self) -> dict:
@@ -1393,7 +1398,7 @@ class FrameBatchDataset(torch.utils.data.Dataset):
                 if got is not None:
                     r.wave = got[0]
                     n_mixed += 1
-        n_noise = mix_background(rows, self.noise, a, rng)
+        acoustic = acoustic_chain(rows, originals, self.noise, self.rirs, a, rng)
         B = len(rows)
         lengths = np.array([len(r.wave) for r in rows], dtype=np.int64)
         wave = np.zeros((B, int(lengths.max()) if B else 0), dtype=np.float32)
@@ -1411,7 +1416,7 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         out["n_tok"] = out["ctc_target_lengths"].clone()
         out["aug"] = dict(utts=len(keep), rows=B, concat_groups=groups, concat_utts=len(keep) if groups else 0,
                           truncated=n_cut, mixed=n_mixed, cut_padded=n_cut_pad, end_padded=n_end_pad,
-                          end_trimmed=n_trim, noised=n_noise)
+                          end_trimmed=n_trim, **acoustic)
         return out
 
 
@@ -1492,6 +1497,22 @@ def _nanmin(x: np.ndarray) -> float:
 # in the worker - a join, a slice, one copy per mixed row -: measured on the laptop, 0.05-0.35 s more per 1600 s
 # micro-batch with all three on (the most for 1 s rows, 1600 of them), next to the ~0.7-1.6 s its MP3/OGG decode takes
 # on one core (default_num_workers' rates).
+# Acoustic steps (DECISIONS H12; acoustic_chain), after the joins, cuts, pads, end trim and mix, for both families,
+# each per row and from the same stream, the targets always the teacher's on the clean row - so the student learns that
+# none of these changes what is said:
+#   speech    background speech (speech_p): 1-4 voices (speech_talkers), each another row of the micro-batch (Japanese)
+#             or the bank's speech (MUSAN: 17 languages), summed - two or more are babble - at speech_snr_db (10-25 dB)
+#             of voiced power below the row, which stays the dominant voice (mix_into's single interferer at 5-20 dB
+#             made two equally loud voices worse in the recipe test: these stay well below)
+#   reverb    room echo (reverb_p): a room impulse response (aug/rirs-v1: OpenSLR 28's simulated and real rooms) over
+#             the whole row, background speech included - one room -, its direct path at sample 0 (frames aligned)
+#   noise     music without vocals, noise and songs with lyrics (noise_p; BACKGROUND_KINDS) under the whole row, dry
+#   gain      volume (gain_p): gain_db (-20..+10 dB), clipped at full scale
+#   codec     a real encoder and back in memory (codec_p; kitsune.acoustics: MP3 at 30-100 kbit/s, GSM 6.10 and
+#             mu-law at 8 kHz), length and alignment kept (measured: lag 0 for each)
+SPEECH_KINDS = ("speech",)  # the bank's kinds the speech step draws
+BACKGROUND_KINDS = ("music", "noise", "song")  # the bank's kinds the background step draws
+SPEECH_MAX_TALKERS = 8  # the most voices speech_talkers may ask for
 
 AUG_PAD_STD = 1e-5  # the noise between joined pieces (~-100 dBFS): never digital zeros, whose LogMel floor is a feature
 # no recording has, which the student would then see at every join and nowhere else
@@ -1529,8 +1550,13 @@ class Augment:
     whose rule already keeps every cut before a word) and no pads (truncate_pad_p and end_pad_p 0). end_trim_p: per
     row that was not cut (nor padded), trim its trailing silence to a short drawn tail, its sentence mark kept (end
     trim: an AED row's tokens as they are, a CTC row's mark frames moved up to its last word; a CTC one needs
-    punct_ids). noise_p: per row, background audio from the bank (kitsune.noise_bank) mixed under the whole row at an
-    SNR drawn from noise_snr_db ((low, high) dB of the row's voiced power over the background's)."""
+    punct_ids). noise_p: per row, background audio from the bank (kitsune.noise_bank: its music, noise and songs)
+    mixed under the whole row at an SNR drawn from noise_snr_db ((low, high) dB of the row's voiced power over the
+    background's). The other acoustic steps (DECISIONS H12; the section comment's "acoustic steps"), each per row:
+    speech_p - background speech, speech_talkers (low, high) voices summed, each another row of the micro-batch with
+    probability speech_batch_p or the bank's speech, at speech_snr_db dB of voiced power below the row; reverb_p - a
+    room impulse response from the RIR bank; gain_p - gain_db dB, clipped at full scale; codec_p - one of codecs
+    (kitsune.acoustics) and back."""
 
     seed: int
     truncate_p: float = 0.0
@@ -1551,18 +1577,36 @@ class Augment:
     end_trim_p: float = 0.0
     noise_p: float = 0.0
     noise_snr_db: tuple = (0.0, 20.0)
+    speech_p: float = 0.0
+    speech_snr_db: tuple = (10.0, 25.0)
+    speech_talkers: tuple = (1, 4)
+    speech_batch_p: float = 0.5
+    reverb_p: float = 0.0
+    gain_p: float = 0.0
+    gain_db: tuple = (-20.0, 10.0)
+    codec_p: float = 0.0
+    codecs: tuple = DEFAULT_CODECS
 
     def __post_init__(self):
         snr = tuple(float(x) for x in self.mix_snr_db)
         object.__setattr__(self, "mix_snr_db", snr)
         nsnr = tuple(float(x) for x in self.noise_snr_db)
         object.__setattr__(self, "noise_snr_db", nsnr)
+        ssnr = tuple(float(x) for x in self.speech_snr_db)
+        object.__setattr__(self, "speech_snr_db", ssnr)
+        gdb = tuple(float(x) for x in self.gain_db)
+        object.__setattr__(self, "gain_db", gdb)
+        st = tuple(self.speech_talkers)
+        st_whole = len(st) == 2 and all(float(x) == int(x) for x in st)
+        object.__setattr__(self, "speech_talkers", tuple(int(x) for x in st) if st_whole else st)
+        object.__setattr__(self, "codecs", tuple(str(c) for c in self.codecs))
         object.__setattr__(self, "punct_ids", tuple(sorted(int(i) for i in self.punct_ids)))
         pf = tuple(self.pad_frames)
         whole = len(pf) == 2 and all(float(x) == int(x) for x in pf)
         object.__setattr__(self, "pad_frames", tuple(int(x) for x in pf) if whole else pf)
         probs = (self.truncate_p, self.truncate_pause_p, self.concat_p, self.mix_p, self.truncate_pad_p,
-                 self.end_pad_p, self.end_trim_p, self.noise_p)
+                 self.end_pad_p, self.end_trim_p, self.noise_p, self.speech_p, self.speech_batch_p, self.reverb_p,
+                 self.gain_p, self.codec_p)
         aed = self.max_tokens is not None
         ok = (int(self.seed) >= 0 and all(0.0 <= float(p) <= 1.0 for p in probs)
               and 0.0 <= float(self.truncate_min_frac) < 1.0 and float(self.truncate_min_s) >= 0.0
@@ -1574,14 +1618,20 @@ class Augment:
               and (not aed or (int(self.max_tokens) >= 2 and not self.punct_ids
                                and float(self.truncate_pad_p) == 0.0 and float(self.end_pad_p) == 0.0))
               and (aed or float(self.end_trim_p) == 0.0 or len(self.punct_ids) > 0)
-              and len(nsnr) == 2 and nsnr[0] <= nsnr[1])
+              and len(nsnr) == 2 and nsnr[0] <= nsnr[1]
+              and len(ssnr) == 2 and all(np.isfinite(ssnr)) and ssnr[0] <= ssnr[1]
+              and len(gdb) == 2 and all(np.isfinite(gdb)) and gdb[0] <= gdb[1]
+              and st_whole and 1 <= self.speech_talkers[0] <= self.speech_talkers[1] <= SPEECH_MAX_TALKERS
+              and all(c in CODECS for c in self.codecs) and (float(self.codec_p) == 0.0 or len(self.codecs) > 0))
         if not ok:
             raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
                              "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high, "
                              "punct_ids token ids below the blank and given whenever truncate_p > 0, pad_frames whole "
                              f"(low, high) with 1 <= low <= high <= {PAD_MAX_FRAMES}, truncate_min_row_s >= 0; an AED "
                              "one (max_tokens set): max_tokens >= 2, no punct_ids, truncate_pad_p and end_pad_p 0; "
-                             "a CTC one's end_trim_p needs punct_ids; noise_snr_db low <= high)")
+                             "a CTC one's end_trim_p needs punct_ids; noise_snr_db, speech_snr_db and gain_db finite "
+                             f"(low, high) with low <= high; speech_talkers whole with 1 <= low <= high <= "
+                             f"{SPEECH_MAX_TALKERS}; codecs among {CODECS}, at least one when codec_p > 0)")
 
     @classmethod
     def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None,
@@ -1603,15 +1653,28 @@ def _augment_spec(augment) -> "Augment | None":
 
 
 def _noise_of(augment, noise):
-    """A dataset's background bank (kitsune.noise_bank.NoiseBank): required when its augmentation's noise_p > 0, none
-    without an augmentation."""
+    """A dataset's background bank (kitsune.noise_bank.NoiseBank): required when its augmentation's noise_p > 0, or its
+    speech_p > 0 with talkers from the bank (speech_batch_p < 1); none without an augmentation."""
     if augment is None:
         if noise is not None:
             raise ValueError("a noise bank without an augmentation")
         return None
     if augment.noise_p > 0 and noise is None:
         raise ValueError("augment.noise_p > 0 needs a noise bank (kitsune.noise_bank: augment.noise_bank)")
+    if augment.speech_p > 0 and augment.speech_batch_p < 1 and (noise is None or not noise.has(SPEECH_KINDS)):
+        raise ValueError("augment.speech_p > 0 with speech_batch_p < 1 needs a noise bank with speech clips")
     return noise
+
+
+def _rir_of(augment, rirs):
+    """A dataset's room impulse responses (a NoiseBank of kind rir): required when its augmentation's reverb_p > 0."""
+    if augment is None:
+        if rirs is not None:
+            raise ValueError("an RIR bank without an augmentation")
+        return None
+    if augment.reverb_p > 0 and rirs is None:
+        raise ValueError("augment.reverb_p > 0 needs an RIR bank (augment.rir_bank)")
+    return rirs
 
 
 def _frame_augment(augment) -> "Augment | None":
@@ -1933,22 +1996,139 @@ def mark_tail(ft: "FrameTargets", punct_ids: Sequence[int]) -> tuple[int, int, i
     return (e_w, s_m, e_m) if s_m > e_w + 1 else None
 
 
-def mix_background(rows, bank, a: Augment, rng: np.random.Generator) -> int:
-    """The background step of either family's rows (noise_p): per row, a stretch of the bank as long as the row mixed
-    under all of it at an SNR drawn from noise_snr_db (kitsune.noise_bank.add_background), its targets unchanged - the
-    teacher's on the clean audio. Returns the rows it changed (a silent row or stretch is left as it is)."""
-    if a.noise_p <= 0 or bank is None:
+def acoustic_chain(rows, originals, noise, rirs, a: Augment, rng: np.random.Generator) -> dict:
+    """The acoustic steps of either family's rows, in this order (the section comment's "acoustic steps"): background
+    speech, room echo, background music / noise / songs, volume, codec - each from the micro-batch's own stream, its
+    targets unchanged. Returns the aug counts {speech_mixed, reverbed, noised, gained, clipped, coded}."""
+    out = dict(speech_mixed=mix_speech(rows, originals, noise, a, rng), reverbed=reverberate(rows, rirs, a, rng),
+               noised=mix_background(rows, noise, a, rng))
+    out.update(vary_gain(rows, a, rng))
+    out["coded"] = apply_codecs(rows, a, rng)
+    return out
+
+
+def _stretch(src: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
+    """n samples of src from a drawn start (src repeated when it is shorter than n)."""
+    src = np.asarray(src, dtype=np.float32)
+    if len(src) >= n:
+        s = int(rng.integers(len(src) - n + 1))
+        return src[s:s + n]
+    return np.resize(np.roll(src, -int(rng.integers(len(src)))), n).astype(np.float32, copy=False)
+
+
+def mix_speech(rows, originals, bank, a: Augment, rng: np.random.Generator) -> int:
+    """The background speech step (speech_p): per row, speech_talkers voices drawn (low, high), each another row of the
+    micro-batch (its audio before any cut: originals) with probability speech_batch_p - Japanese - or else a stretch
+    of the bank's speech (MUSAN: 17 languages), each at unit voiced power and summed (two or more: babble), then added
+    at speech_snr_db dB of voiced power below the row - so the row stays the dominant voice, and its targets, the
+    teacher's on the clean row, say that the voices behind it are not to be written. Returns the rows it changed."""
+    if a.speech_p <= 0:
         return 0
-    from kitsune.noise_bank import add_background
+    from kitsune.noise_bank import background_segment, voiced_power
+
+    bank_ok = bank is not None and bank.has(SPEECH_KINDS)
+    n = 0
+    for p, r in enumerate(rows):
+        if rng.random() >= a.speech_p:
+            continue
+        m = len(r.wave)
+        talkers = []
+        for _ in range(int(rng.integers(a.speech_talkers[0], a.speech_talkers[1] + 1))):
+            if len(originals) > 1 and (not bank_ok or rng.random() < a.speech_batch_p):
+                q = int(rng.integers(len(originals) - 1))
+                t = _stretch(originals[q + (q >= p)], m, rng)
+            elif bank_ok:
+                t = background_segment(bank, m, rng, SPEECH_KINDS)
+            else:
+                t = None
+            pw = voiced_power(t) if t is not None else 0.0
+            if pw > 1e-10:
+                talkers.append(t * np.float32(pw ** -0.5))
+        ps = voiced_power(r.wave)
+        if not talkers or ps < 1e-8:
+            continue
+        voices = np.sum(talkers, axis=0, dtype=np.float32)
+        pv = voiced_power(voices)
+        if pv < 1e-10:
+            continue
+        snr = float(rng.uniform(*a.speech_snr_db))
+        r.wave = np.asarray(r.wave, dtype=np.float32) + np.float32((ps / (pv * 10.0 ** (snr / 10.0))) ** 0.5) * voices
+        n += 1
+    return n
+
+
+def reverberate(rows, rirs, a: Augment, rng: np.random.Generator) -> int:
+    """The room echo step (reverb_p): per row, a room impulse response of the RIR bank drawn uniformly (every room once,
+    not by length) and convolved with the whole row - its voices, background speech included, in one room; the row's
+    length and voiced level kept (kitsune.acoustics.reverb). Returns the rows it changed."""
+    if a.reverb_p <= 0 or rirs is None:
+        return 0
+    from kitsune.acoustics import reverb
+
+    n = 0
+    for r in rows:
+        if rng.random() >= a.reverb_p:
+            continue
+        y = reverb(r.wave, rirs.draw_clip(rng))
+        if y is not None:
+            r.wave = y
+            n += 1
+    return n
+
+
+def mix_background(rows, bank, a: Augment, rng: np.random.Generator) -> int:
+    """The background step of either family's rows (noise_p): per row, a stretch of the bank's music, noise and songs
+    (BACKGROUND_KINDS; never its speech, the speech step's) as long as the row mixed under all of it at an SNR drawn
+    from noise_snr_db (kitsune.noise_bank.add_background) - dry, as a stream mixes its game sound and music in -, its
+    targets unchanged: the teacher's on the clean audio, so a song's lyrics are not to be written. Returns the rows it
+    changed (a silent row or stretch is left as it is)."""
+    if a.noise_p <= 0 or bank is None or not bank.has(BACKGROUND_KINDS):
+        return 0
+    from kitsune.noise_bank import add_background, background_segment
 
     n = 0
     for r in rows:
         if rng.random() >= a.noise_p:
             continue
-        got = add_background(r.wave, bank.segment(len(r.wave), rng), rng, a.noise_snr_db)
+        seg = background_segment(bank, len(r.wave), rng, BACKGROUND_KINDS)  # a near-silent stretch is drawn again
+        got = None if seg is None else add_background(r.wave, seg, rng, a.noise_snr_db)
         if got is not None:
             r.wave = got[0]
             n += 1
+    return n
+
+
+def vary_gain(rows, a: Augment, rng: np.random.Generator) -> dict:
+    """The volume step (gain_p): per row, gain_db dB drawn uniformly, clipped at full scale (a quiet or an overdriven
+    recording). Returns {gained, clipped}."""
+    if a.gain_p <= 0:
+        return dict(gained=0, clipped=0)
+    from kitsune.acoustics import gain
+
+    g = c = 0
+    for r in rows:
+        if rng.random() >= a.gain_p:
+            continue
+        r.wave, clipped = gain(r.wave, float(rng.uniform(*a.gain_db)))
+        g += 1
+        c += int(clipped)
+    return dict(gained=g, clipped=c)
+
+
+def apply_codecs(rows, a: Augment, rng: np.random.Generator) -> int:
+    """The codec step (codec_p): per row, one of codecs drawn uniformly, the row encoded and decoded in memory
+    (kitsune.acoustics.codec: libsndfile's MP3, GSM 6.10, mu-law, ...), as long and as aligned as before. Returns the
+    rows it changed."""
+    if a.codec_p <= 0 or not a.codecs:
+        return 0
+    from kitsune.acoustics import codec
+
+    n = 0
+    for r in rows:
+        if rng.random() >= a.codec_p:
+            continue
+        r.wave = codec(r.wave, a.codecs[int(rng.integers(len(a.codecs)))], rng)
+        n += 1
     return n
 
 

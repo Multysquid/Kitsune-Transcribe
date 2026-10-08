@@ -357,8 +357,9 @@ def tb_layouts(tb_file) -> list[tuple[int, dict]]:
     return out
 
 
-def make_noise_bank(d, seconds: float = 4.0, seed: int = 0) -> Path:
-    """A background bank in kitsune.noise_bank's layout: two clips of band-limited noise (int16, 16 kHz). Returns its
+def make_noise_bank(d, seconds: float = 4.0, seed: int = 0, kinds=("noise", "noise")) -> Path:
+    """A background bank in kitsune.noise_bank's layout: one clip of band-limited noise per entry of kinds (int16, 16
+    kHz, seconds split evenly; a "speech" clip is noise in 0.3 s bursts, so it has pauses as speech does). Returns its
     dir; its index.json's sha256 is what a config pins."""
     from kitsune import noise_bank as NB
 
@@ -367,13 +368,40 @@ def make_noise_bank(d, seconds: float = 4.0, seed: int = 0) -> Path:
     rng = np.random.default_rng(seed)
     n = int(seconds * NB.SR)
     a = np.convolve(rng.standard_normal(n), np.ones(8) / 8, mode="same")
+    k = len(kinds)
+    bounds = [i * n // k for i in range(k + 1)]
+    for kind, lo, hi in zip(kinds, bounds[:-1], bounds[1:]):
+        if kind == "speech":
+            a[lo:hi] *= (np.arange(hi - lo) // int(0.3 * NB.SR)) % 2  # bursts and pauses
     audio = (np.clip(a, -1, 1) * 0.2 * 32767).astype(np.int16)
     np.save(d / NB.AUDIO, audio)
-    half = n // 2
     info = dict(version=NB.VERSION, sr=NB.SR, audio_bytes=(d / NB.AUDIO).stat().st_size,
                 audio_sha256=NB.sha256_file(d / NB.AUDIO), samples=n, source="test", licence="test",
-                clips=[dict(id="noise/t/a", kind="noise", offset=0, length=half),
-                       dict(id="noise/t/b", kind="noise", offset=half, length=n - half)])
+                clips=[dict(id=f"{kind}/t/{i}", kind=kind, offset=lo, length=hi - lo)
+                       for i, (kind, lo, hi) in enumerate(zip(kinds, bounds[:-1], bounds[1:]))])
+    (d / NB.INDEX).write_text(json.dumps(info, indent=1), encoding="utf-8")
+    return d
+
+
+def make_rir_bank(d, n: int = 3, seed: int = 0) -> Path:
+    """An RIR bank in kitsune.noise_bank's layout (float32, kind rir): n room impulse responses, each its direct path
+    (1.0) at sample 0 and an exponentially decaying noise tail of 0.25 s (direct-to-reverberant ratio about 0 to -5 dB)."""
+    from kitsune import noise_bank as NB
+
+    d = Path(d)
+    d.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    m = int(0.25 * NB.SR)
+    rirs = []
+    for i in range(n):
+        h = (0.05 * rng.standard_normal(m) * np.exp(-np.arange(m) / (0.04 * NB.SR * (i + 1)))).astype(np.float32)
+        h[0] = 1.0
+        rirs.append(h)
+    audio = np.concatenate(rirs).astype(np.float32)
+    np.save(d / NB.AUDIO, audio)
+    info = dict(version=NB.VERSION, sr=NB.SR, dtype="float32", audio_bytes=(d / NB.AUDIO).stat().st_size,
+                audio_sha256=NB.sha256_file(d / NB.AUDIO), samples=len(audio), source="test", licence="test",
+                clips=[dict(id=f"rir/t/{i}", kind="rir", offset=i * m, length=m) for i in range(n)])
     (d / NB.INDEX).write_text(json.dumps(info, indent=1), encoding="utf-8")
     return d
 

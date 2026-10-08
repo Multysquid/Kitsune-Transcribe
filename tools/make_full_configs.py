@@ -140,10 +140,9 @@ RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0, "tr
 # the trainer's; no pads (an AED student takes none). end_trim_p 0.3 (DECISIONS H7, fix B; the owner on 2026-10-05,
 # after the P-0.3B review: 7 % of JSUT's complete sentences lost their mark): about a third of the rows that are not
 # cut lose their trailing silence down to a 10-80 ms tail, their mark kept, so a clean tight end is no longer only a
-# cut's
+# cut's. Since DECISIONS H11 also recipe v3's background (below): RECIPE_AED is RECIPE_V3 plus the cut table
 AED_CUTS = "labels/full/selections/full_study/aed_cuts.parquet"
 AED_CUTS_SHA256 = "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb"
-RECIPE_AED = {**RECIPE, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256, "end_trim_p": 0.3}
 # RECIPE V3 (DECISIONS H8, the owner on 2026-10-05: "retrain p0.1 and p0.05 with the changes and see if our changes fixed
 # the problem"): recipe v2 plus the two fixes of the P-0.3B review on the CTC students - B, end_trim_p 0.3 (a third of
 # the rows that are not cut lose their trailing silence, their mark's frames moved up behind their last word:
@@ -152,12 +151,37 @@ RECIPE_AED = {**RECIPE, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256, "end_t
 # index.json and pulled by box p01, boxes.json extra_dirs), mixed under the whole row - a joined row's utterances and
 # the gaps between them alike -, the targets the teacher's on the clean audio. Why: on 30 s windows of stream audio
 # (talk over game sound and music) the Parakeet teacher writes nothing and P-0.3B with it, while both transcribe the
-# same talk alone. Box p01 tests it: box 1's run continued to 8 epochs (CONTINUATIONS p01) and P-0.05B from step 0 at
-# 10 epochs (FULL_RUNS p005; DECISIONS H9)
-NOISE_BANK = "aug/musan-bg-v1"
-NOISE_BANK_SHA256 = "a97459dfd1de3afbff792f52692054a61906f0c12eb9ec61ecac45191dfd3803"
+# same talk alone. Box p005 tests it first: P-0.05B from step 0 at 10 epochs (FULL_RUNS p005; DECISIONS H9, H10); box
+# p01's 8-epoch continuation of P-0.1B with it (CONTINUATIONS p01) waits for that result
+# DECISIONS H12: the bank is v2 since (aug/musan-bg-v1 - music without vocals and noise only - stays on the data repo,
+# never trained with): v1's music and noise plus 10 h of songs with lyrics and 10 h of speech (17 languages)
+NOISE_BANK = "aug/musan-bg-v2"
+NOISE_BANK_SHA256 = "1d56c7bf5cb0f1ad036f551a81c0029360ba821186f3c5abe41d344c381339f0"
 RECIPE_V3 = {**RECIPE, "end_trim_p": 0.3, "noise_p": 0.3, "noise_bank": NOISE_BANK,
              "noise_bank_sha256": NOISE_BANK_SHA256}
+# RECIPE V4 (DECISIONS H12, the owner on 2026-10-07: "Lets do room echo, volume and codec variations and also
+# background speech and songs with lyrics. The actual output should not change, thats still the main model but it
+# should become equivariant to these variables"): recipe v3 plus the other acoustic steps of kitsune.trainset, each
+# per row, the targets always the teacher's on the clean row - the student is to write the main speaker's words
+# whatever the room, level, codec or what plays behind them:
+#   speech_p 0.15  1-4 voices behind the row at 10-25 dB of voiced power below it (half of them other rows of the
+#                  micro-batch, Japanese; half the bank's speech, 17 languages); two or more are babble
+#   noise_p 0.3    (v3's) now draws songs with lyrics too, by duration: music 15 h, noise 6.2 h, songs 10 h
+#   reverb_p 0.2   a room impulse response of RIR_BANK (OpenSLR 28: 600 small and 600 medium simulated rooms and 325
+#                  real ones; RT60 0.12 / 0.41 / 1.17 s at p10 / 50 / 90), one room for the row and its voices
+#   gain_p 0.3     -20..+10 dB, clipped at full scale
+#   codec_p 0.1    MP3 (30-100 kbit/s), GSM 6.10 or mu-law at 8 kHz, encoded and decoded in memory (libsndfile)
+# The loader pays for them (measured on real rows: +45-65 % of its decode's CPU, the codecs most); FULL_RUNS'
+# `workers` gives P-0.05B, whose GPU takes ~7,900 audio-s/s, 12 loader workers instead of the default 8
+RIR_BANK = "aug/rirs-v1"
+RIR_BANK_SHA256 = "af6d19310210aa2578c902b55d2e8d6f9e67924ede368a86fe5d6f8bce40e588"
+RECIPE_V4 = {**RECIPE_V3, "speech_p": 0.15, "reverb_p": 0.2, "rir_bank": RIR_BANK, "rir_bank_sha256": RIR_BANK_SHA256,
+             "gain_p": 0.3, "codec_p": 0.1}
+# DECISIONS H11 (the owner, 2026-10-07: "make sure we have augmentation for noises, music and so on. The last
+# generalisation failures were due to not having those so its extremly important we now add them"): box T's AED
+# recipe takes the background as well - the same bank, rate and SNRs as the CTC students (kitsune.trainset mixes it
+# under an AED row after its join, cut and trim, the Cohere tokens unchanged); box full-t pulls the bank
+RECIPE_AED = {**RECIPE_V4, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}  # recipe v4 since DECISIONS H12
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
@@ -186,7 +210,7 @@ FULL_RUNS = {
     "p01": dict(study_run="study-p01", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
                 pull_parakeet=False, end_reserve=30, augment=None),
     "p005": dict(study_run="study-p005", epochs=10, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,
-                 pull_parakeet=False, end_reserve=30, augment=RECIPE_V3),
+                 pull_parakeet=False, end_reserve=30, augment=RECIPE_V4, workers=12),
 }
 # the epochs smoke A ran (2026-10-01): the smoke configs keep them (the 100 h draw is the smoke's budget), and the plan
 # record's "full" and "smoke" parts are measured at them (smoke A's check 3 projected the full runs at these T; F4's
@@ -220,7 +244,7 @@ SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # paired A/B with box 1 and the first test any more (more epochs and the recipe together):
 # the review's fixes are checked by its probes
 CONTINUATIONS = {"p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=8,
-                             patience=12, augment=RECIPE_V3, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
+                             patience=12, augment=RECIPE_V4, revision="c4604304db76e068df7bbe39d00d006b74d6c134")}
 # READOUT_RESERVE. A readout runs right after its training item on the same GPU (Resolution 25) under the same
 # KITSUNE_DEADLINE (kitsune.full_queue item_deadline: the box deadline less deadline_reserve_min). After a run that the
 # deadline cooldown (4d) shortened, 04_distill.fit_epochs_deadline has planned the end phase to finish
@@ -289,9 +313,10 @@ DEADLINE_FAULT_SHARE, DEADLINE_FAULT_ROUND_S = 0.5, 10  # contract 7: S <= 0.5 x
 # augment_step_factor x the s/step (below).
 SPEED_FILE = "plan/box2_hours.json"  # under OUT_DIR, next to PLAN_FILE (launch's SPEED_RECORD names it)
 # the boxes whose hours are box_hours of the speed record (DECISIONS G2/G3/H1: box 2 as two 1x RTX 5090 boxes, T and P,
-# and box p01's continuation, the recipe test): their train runs, in queue order, or the continuation. Box P trains
-# P-0.3B only (DECISIONS H1 step 2, with the recipe; P-0.05B is postponed, H2: its config stays, its items left the box)
-HOURS_BOXES = {"full-t": ("t06",), "full-p": ("p03",), "p01": ("continuation", "p005")}
+# and box p01's continuation): their train runs, in queue order, "continuation" for the box's CONTINUATIONS entry. Box
+# P trains P-0.3B only (DECISIONS H1 step 2, with the recipe; P-0.05B was postponed, H2); box p005 trains P-0.05B alone
+# (the P test box, DECISIONS H10); box p01 P-0.1B's 8-epoch continuation (H9, for after the test)
+HOURS_BOXES = {"full-t": ("t06",), "full-p": ("p03",), "p01": ("continuation",), "p005": ("p005",)}
 # CONCAT'S EXTRA ATTENTION (DECISIONS H1: "add a few % for concat's extra attention"). A joined row holds k utterances
 # (k <= concat_max_n 4, <= 28 s) in the frames its micro-batch had planned, but its self-attention grows with the
 # square of its length: on full.parquet at concat_p 0.5 the attention's elements grow 1.27x over the planned
@@ -324,10 +349,14 @@ STORES_PESS = 1.91 / 1.37  # a box-1 record's measured CTC store: central x 1, p
 #               is with P-0.05B postponed (H2): its M4 and 7 quant readouts (~0.2 h) left the box and stay in the
 #               tail as margin, so the box need not be re-derived when P-0.05B comes back
 #   box p01:    m4-full-p01 and 7 P-0.1B quant readouts, plus resume-pull and check-resume before the stores
+#               (CONT_PULL_H: any box whose runs hold a continuation)
+#   box p005:   m4-full-p005 and 7 P-0.05B quant readouts (box p01's readouts without the pull)
 POST_T_H = (0.6, 1.35)
 POOL_P_H = (0.9, 1.65)
-P01_TAIL_H = (0.4, 1.0)  # box p01: m4 + 7 quantised readouts of each of its two runs (DECISIONS H8)
+P01_TAIL_H = (0.2, 0.5)
+P005_TAIL_H = (0.2, 0.5)
 CONT_PULL_H = (0.1, 0.3)
+BOX_TAIL_H = {"full-t": POST_T_H, "full-p": POOL_P_H, "p01": P01_TAIL_H, "p005": P005_TAIL_H}
 END_H = 0.35  # calc_v3 end: finish's uploads and the destroy
 # max_hours' host margin: smoke A ran on a Ryzen 9950X (calc_v3's "fast" CPU class); calc_v3's pessimistic T-0.6B
 # epoch is 13.635 / 10.846 = 1.26 x its fast one (box 2's only 2x offer on 2026-10-01, m54650, a Zen2 EPYC, is
@@ -573,10 +602,9 @@ def box_hours(plan: dict, rec: dict, box: str, reserve_min: float = 60) -> dict:
             items[f"full-{cr['student']}"], last = cr["hours"], cr["student"]
         else:
             items[f"full-{x}"], last = run_h[x], x
-    if cr is not None:
-        tail = (P01_TAIL_H[0] + CONT_PULL_H[0], P01_TAIL_H[1] + CONT_PULL_H[1])
-    else:
-        tail = POST_T_H if runs == ("t06",) else POOL_P_H
+    tail = BOX_TAIL_H[box]
+    if cr is not None:  # the continuation's run is pulled and checked before the stores
+        tail = (tail[0] + CONT_PULL_H[0], tail[1] + CONT_PULL_H[1])
     train = sum(items.values())
     est = _up(setup_c + store_c + train + tail[0] + END_H, 0.1)
     pess_end = setup_p + store_p + train * HOST_PESS
@@ -785,6 +813,8 @@ def full_config(x: str, r: dict | None = None, data: dict | None = None, augment
     })
     if augment and run["augment"]:
         cfg = study._merge(cfg, {"augment": dict(run["augment"])})
+    if augment and run.get("workers"):  # the full run's loader (never the smoke configs': smoke A's, byte for byte)
+        cfg = study._merge(cfg, {"perf": {"num_workers": int(run["workers"])}})
     return cfg
 
 

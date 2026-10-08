@@ -34,7 +34,7 @@ import pyarrow.parquet as pq  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-from fixtures import load_script, make_fake_corpus, make_fake_selection, make_noise_bank  # noqa: E402
+from fixtures import load_script, make_fake_corpus, make_fake_selection, make_noise_bank, make_rir_bank  # noqa: E402
 from kitsune import aed_cuts as A  # noqa: E402
 from kitsune import trainset as T  # noqa: E402
 from kitsune.ctc_targets import FrameTargets  # noqa: E402
@@ -268,7 +268,7 @@ def test_off_is_the_plain_dataset(env):
         zero = ds.with_augment(spec(), env["cuts"])[idx]
         assert zero["aug"] == dict(utts=len(idx), rows=len(idx), concat_groups=0, concat_utts=0, truncated=0, mixed=0,
                                    cut_padded=0, end_padded=0, concat_capped=0, cut_mismatch=0, end_trimmed=0,
-                                   noised=0)
+                                   speech_mixed=0, reverbed=0, noised=0, gained=0, clipped=0, coded=0)
         for k, v in got.items():
             assert (torch.equal(v, zero[k]) if isinstance(v, torch.Tensor) else v == zero[k]), k
 
@@ -548,7 +548,9 @@ def test_an_aed_run_with_every_augmentation(env):
         # concat_p 0.5: a joined micro-batch of these 3 s micro-batches is mostly one row, and mix needs two
         "augment": {"enabled": True, "truncate_p": 0.7, "truncate_min_s": 0.3, "concat_p": 0.5, "mix_p": 1.0,
                     "end_trim_p": 0.3, "cuts": str(env["table"]), "cuts_sha256": sha, "noise_p": 0.5,
-                    "noise_bank": str(make_noise_bank(root / "noise_bank"))},
+                    "noise_bank": str(make_noise_bank(root / "noise_bank", kinds=("music", "speech", "song", "noise"))),
+                    "speech_p": 0.5, "reverb_p": 0.5, "rir_bank": str(make_rir_bank(root / "rir_bank")), "gain_p": 0.5,
+                    "codec_p": 0.5},
     }
     path = root / "aed-aug.json"
     path.write_text(json.dumps(config, indent=1), encoding="utf-8")
@@ -570,7 +572,9 @@ def test_an_aed_run_with_every_augmentation(env):
     assert (st["aug/cut_mismatch"] == 0).all() and (st["aug/cut_padded_frac"] == 0).all()
     # the fake rows are a tone to their end: nothing to trim, but the share is logged
     assert ((st["aug/end_trimmed_frac"] >= 0) & (st["aug/end_trimmed_frac"] <= 1)).all() and aug["end_trim_p"] == 0.3
-    assert st["aug/noised_frac"].max() > 0 and aug["noise_p"] == 0.5 and aug["noise_clips"] == 2
+    assert st["aug/noised_frac"].max() > 0 and aug["noise_p"] == 0.5 and aug["noise_clips"] == 4
+    for tag in ("aug/speech_frac", "aug/reverb_frac", "aug/gain_frac", "aug/codec_frac"):  # DECISIONS H12
+        assert ((st[tag] >= 0) & (st[tag] <= 1)).all() and st[tag].max() > 0, tag
     utts = pd.concat([pd.read_parquet(p) for p in sorted((run / "metrics" / "train_utts").glob("part-*.parquet"))])
     ids = {u.id for u in env["store"].utts}
     assert all(x in ids for r in utts["id"] for x in r.split("+")) and (utts["n_tok"] > 0).all()

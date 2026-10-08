@@ -509,12 +509,22 @@ DEFAULTS = {
     # up behind its last word, _AugRow.trim_end). noise_p: per row, background audio from the bank noise_bank (a
     # data-repo dir, tools/build_noise_bank.py; noise_bank_sha256 pins its index.json) mixed under the whole row at an
     # SNR drawn from noise_snr_db ([low, high] dB of the row's voiced power over the background's), its targets the
-    # clean row's (DECISIONS H8: the teachers fall silent on long stretches of talk over game sound and music)
+    # clean row's (DECISIONS H8: the teachers fall silent on long stretches of talk over game sound and music).
+    # DECISIONS H12, the other acoustic steps (kitsune.trainset "acoustic steps"), each per row, the targets the clean
+    # row's: speech_p - background speech, speech_talkers [low, high] voices (another row of the micro-batch with
+    # probability speech_batch_p, else the bank's speech) at speech_snr_db dB of voiced power below the row; reverb_p -
+    # a room impulse response of rir_bank (a data-repo dir, tools/build_rir_bank.py; rir_bank_sha256 pins its
+    # index.json);
+    # gain_p - gain_db dB, clipped at full scale; codec_p - one of codecs (kitsune.acoustics.CODECS: mp3, gsm, ulaw8k,
+    # vorbis, opus), encoded and decoded in memory; a codec this machine's libsndfile lacks is dropped at setup
     "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
                 "truncate_pause_p": 0.5, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0,
                 "mix_snr_db": [5.0, 20.0], "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
                 "truncate_min_row_s": 0.0, "cuts": None, "cuts_sha256": None, "end_trim_p": 0.0, "noise_p": 0.0,
-                "noise_snr_db": [0.0, 20.0], "noise_bank": None, "noise_bank_sha256": None},
+                "noise_snr_db": [0.0, 20.0], "noise_bank": None, "noise_bank_sha256": None, "speech_p": 0.0,
+                "speech_snr_db": [10.0, 25.0], "speech_talkers": [1, 4], "speech_batch_p": 0.5, "reverb_p": 0.0,
+                "rir_bank": None, "rir_bank_sha256": None, "gain_p": 0.0, "gain_db": [-20.0, 10.0], "codec_p": 0.0,
+                "codecs": ["mp3", "gsm", "ulaw8k"]},
     # BatchNorm: mode "frozen" (eval mode, running stats fixed, affine trainable: the pruned students, whose BN holds
     # the teacher's statistics) or "train" (a student trained from scratch: BN trains, its running stats update, eval
     # and greedy decoding use them; gradient checkpointing is never turned on). momentum: null = the modules' own
@@ -983,7 +993,7 @@ def validate_augment(cfg: dict):
     if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0):
         raise SystemExit(f"augment.seed must be null (the run's seed) or an int >= 0, got {seed!r}")
     for key in ("truncate_p", "truncate_pause_p", "concat_p", "mix_p", "truncate_pad_p", "end_pad_p", "end_trim_p",
-                "noise_p"):
+                "noise_p", "speech_p", "speech_batch_p", "reverb_p", "gain_p", "codec_p"):
         if not (_number(a[key]) and 0 <= a[key] <= 1):
             raise SystemExit(f"augment.{key} must be a probability in [0, 1], got {a[key]!r}")
     pf = a["pad_frames"]
@@ -1010,16 +1020,44 @@ def validate_augment(cfg: dict):
         raise SystemExit(f"augment.mix_snr_db must be [low, high] dB with 0 <= low <= high (the interferer below the "
                          f"row: the targets are the row's, so it must stay the dominant voice), got {snr!r}")
     nsnr = a["noise_snr_db"]
-    if not (isinstance(nsnr, (list, tuple)) and len(nsnr) == 2 and all(_number(x) for x in nsnr) and nsnr[0] <= nsnr[1]):
+    if not (isinstance(nsnr, (list, tuple)) and len(nsnr) == 2 and all(_number(x) for x in nsnr)
+            and nsnr[0] <= nsnr[1]):
         raise SystemExit(f"augment.noise_snr_db must be [low, high] dB with low <= high, got {nsnr!r}")
     if a["noise_bank"] is not None and not (isinstance(a["noise_bank"], str) and a["noise_bank"]):
         raise SystemExit(f"augment.noise_bank must be null or the noise bank's dir, got {a['noise_bank']!r}")
     nsha = a["noise_bank_sha256"]
-    if nsha is not None and not (isinstance(nsha, str) and len(nsha) == 64 and all(c in "0123456789abcdef" for c in nsha)):
+    if nsha is not None and not (isinstance(nsha, str) and len(nsha) == 64
+                                 and all(c in "0123456789abcdef" for c in nsha)):
         raise SystemExit(f"augment.noise_bank_sha256 must be null or a sha256 (64 lowercase hex digits), got {nsha!r}")
     if a["enabled"] and a["noise_p"] and a["noise_bank"] is None:
         raise SystemExit(f"augment.noise_p {a['noise_p']} needs augment.noise_bank, the background bank "
                          f"(tools/build_noise_bank.py)")
+    for key in ("speech_snr_db", "gain_db"):
+        v = a[key]
+        if not (isinstance(v, (list, tuple)) and len(v) == 2 and all(_number(x) for x in v) and v[0] <= v[1]):
+            raise SystemExit(f"augment.{key} must be [low, high] dB with low <= high, got {v!r}")
+    st = a["speech_talkers"]
+    if not (isinstance(st, (list, tuple)) and len(st) == 2 and all(_pos_int(x) for x in st)
+            and st[0] <= st[1] <= trainset.SPEECH_MAX_TALKERS):
+        raise SystemExit(f"augment.speech_talkers must be [low, high] voices with 1 <= low <= high <= "
+                         f"{trainset.SPEECH_MAX_TALKERS}, got {st!r}")
+    cs = a["codecs"]
+    if not (isinstance(cs, (list, tuple)) and all(c in trainset.CODECS for c in cs) and len(set(cs)) == len(cs)):
+        raise SystemExit(f"augment.codecs must be a list of distinct codecs of {list(trainset.CODECS)}, got {cs!r}")
+    if a["enabled"] and a["codec_p"] and not cs:
+        raise SystemExit(f"augment.codec_p {a['codec_p']} needs at least one augment.codecs")
+    if a["rir_bank"] is not None and not (isinstance(a["rir_bank"], str) and a["rir_bank"]):
+        raise SystemExit(f"augment.rir_bank must be null or the RIR bank's dir, got {a['rir_bank']!r}")
+    rsha = a["rir_bank_sha256"]
+    if rsha is not None and not (isinstance(rsha, str) and len(rsha) == 64
+                                 and all(c in "0123456789abcdef" for c in rsha)):
+        raise SystemExit(f"augment.rir_bank_sha256 must be null or a sha256 (64 lowercase hex digits), got {rsha!r}")
+    if a["enabled"] and a["reverb_p"] and a["rir_bank"] is None:
+        raise SystemExit(f"augment.reverb_p {a['reverb_p']} needs augment.rir_bank, the room impulse responses "
+                         f"(tools/build_rir_bank.py)")
+    if a["enabled"] and a["speech_p"] and a["speech_batch_p"] < 1 and a["noise_bank"] is None:
+        raise SystemExit(f"augment.speech_p {a['speech_p']} with speech_batch_p {a['speech_batch_p']} < 1 needs "
+                         f"augment.noise_bank with speech clips (tools/build_noise_bank.py --speech-hours)")
     if a["cuts"] is not None and not (isinstance(a["cuts"], str) and a["cuts"]):
         raise SystemExit(f"augment.cuts must be null or the cut table's path, got {a['cuts']!r}")
     sha = a["cuts_sha256"]
@@ -2319,9 +2357,10 @@ def setup_augment(R: Run):
     seed = int(cfg["seed"]) if a["seed"] is None else int(a["seed"])
     longest = float(np.max(R.ds.duration)) if len(R.ds) else 0.0  # the stored durations, as the planner packs them
     used = min(float(a["concat_max_s"]), longest) if longest > 0 else float(a["concat_max_s"])
-    noise = setup_noise_bank(R, a)
+    noise, rirs = setup_noise_bank(R, a), setup_rir_bank(R, a)
+    a = setup_codecs(R, a)  # the configured codecs this machine's libsndfile has
     if not is_ctc(cfg):
-        return setup_aed_augment(R, a, seed, used, longest, noise)
+        return setup_aed_augment(R, a, seed, used, longest, noise, rirs)
     punct = punct_token_ids(R.tokenizer)
     if float(a["truncate_p"]) > 0 and not any(t in SENTENCE_MARKS for t in punct.values()):
         raise SystemExit(f"augment.truncate_p {a['truncate_p']} needs the student tokenizer's sentence marks "
@@ -2335,43 +2374,100 @@ def setup_augment(R: Run):
                 longest_train_s=round(longest, 3), concat_max_s_clamped=used < float(a["concat_max_s"]),
                 mix_p=spec.mix_p, mix_snr_db=list(spec.mix_snr_db), truncate_pad_p=spec.truncate_pad_p,
                 end_pad_p=spec.end_pad_p, pad_frames=list(spec.pad_frames),
-                truncate_min_row_s=spec.truncate_min_row_s, end_trim_p=spec.end_trim_p, **noise_fields(spec, noise))
+                truncate_min_row_s=spec.truncate_min_row_s, end_trim_p=spec.end_trim_p,
+                **noise_fields(spec, noise, rirs))
     print(f"augment: truncate_p {spec.truncate_p:g} (rows >= {spec.truncate_min_row_s:g} s, pause cuts "
           f"{spec.truncate_pause_p:g}, never removing only "
           f"{''.join(punct.values()) or 'punctuation'}), concat_p {spec.concat_p:g} (k <= {spec.concat_max_n}, "
           f"<= {used:g} s{' = the longest train utterance' if used < float(a['concat_max_s']) else ''}), mix_p "
           f"{spec.mix_p:g} at {spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, quiet pads after cuts "
           f"{spec.truncate_pad_p:g} / after whole rows {spec.end_pad_p:g} ({spec.pad_frames[0]}-{spec.pad_frames[1]} "
-          f"frames), end trim {spec.end_trim_p:g}, background {spec.noise_p:g} at {spec.noise_snr_db[0]:g}-"
-          f"{spec.noise_snr_db[1]:g} dB, seed {seed}", flush=True)
-    return R.ds.with_augment(spec, noise=noise)
+          f"frames), end trim {spec.end_trim_p:g}, {acoustic_line(spec)}, seed {seed}", flush=True)
+    return R.ds.with_augment(spec, noise=noise, rirs=rirs)
 
 
 def setup_noise_bank(R: Run, a: dict):
-    """The background bank of augment.noise_p > 0 (kitsune.noise_bank.NoiseBank.load of rpath(noise_bank), its
-    index.json's sha256 checked against noise_bank_sha256), None otherwise."""
-    if not float(a["noise_p"]) > 0:
-        return None
+    """The background bank of augment.noise_p > 0, or of speech_p > 0 with talkers from the bank (speech_batch_p < 1):
+    kitsune.noise_bank.NoiseBank.load of rpath(noise_bank), its index.json's sha256 checked against
+    noise_bank_sha256 and its audio against the index; it must hold the kinds those steps draw. None otherwise."""
     from kitsune.noise_bank import NoiseBank
 
+    bank_speech = float(a["speech_p"]) > 0 and float(a["speech_batch_p"]) < 1
+    if not (float(a["noise_p"]) > 0 or bank_speech):
+        return None
     try:
         bank = NoiseBank.load(rpath(a["noise_bank"]), expect_sha256=a["noise_bank_sha256"])
     except (OSError, ValueError, KeyError) as e:
         raise SystemExit(f"augment.noise_bank {a['noise_bank']}: {type(e).__name__}: {e}") from None
-    print(f"noise bank: {a['noise_bank']} ({len(bank.lengths)} clips, {bank.hours:.1f} h)", flush=True)
+    if float(a["noise_p"]) > 0 and not bank.has(trainset.BACKGROUND_KINDS):
+        raise SystemExit(f"augment.noise_bank {a['noise_bank']}: no {'/'.join(trainset.BACKGROUND_KINDS)} clips")
+    if bank_speech and not bank.has(trainset.SPEECH_KINDS):
+        raise SystemExit(f"augment.noise_bank {a['noise_bank']}: no speech clips for augment.speech_p")
+    kinds = ", ".join(f"{k} {bank.kind_hours(k):.1f} h" for k in sorted(set(bank.kinds.tolist())))
+    print(f"noise bank: {a['noise_bank']} ({len(bank.lengths)} clips: {kinds})", flush=True)
     return bank
 
 
-def noise_fields(spec, bank) -> dict:
-    """The `augment` event's background fields."""
+def setup_rir_bank(R: Run, a: dict):
+    """The room impulse responses of augment.reverb_p > 0 (a NoiseBank of kind rir at rpath(rir_bank), pinned by
+    rir_bank_sha256), None otherwise."""
+    if not float(a["reverb_p"]) > 0:
+        return None
+    from kitsune.noise_bank import NoiseBank
+
+    try:
+        bank = NoiseBank.load(rpath(a["rir_bank"]), expect_sha256=a["rir_bank_sha256"])
+    except (OSError, ValueError, KeyError) as e:
+        raise SystemExit(f"augment.rir_bank {a['rir_bank']}: {type(e).__name__}: {e}") from None
+    if not bank.has(("rir",)):
+        raise SystemExit(f"augment.rir_bank {a['rir_bank']}: no rir clips")
+    print(f"rir bank: {a['rir_bank']} ({len(bank.lengths)} room impulse responses)", flush=True)
+    return bank
+
+
+def setup_codecs(R: Run, a: dict) -> dict:
+    """augment.codecs cut to the ones this machine's libsndfile encodes and decodes (kitsune.acoustics.
+    available_codecs) when codec_p > 0: a missing one is logged (`augment_codecs` event) and dropped, so a box whose
+    soundfile build lacks an encoder still trains with the others; none left refuses the run."""
+    if not float(a["codec_p"]) > 0:
+        return a
+    from kitsune.acoustics import available_codecs
+
+    ok, bad = available_codecs(a["codecs"])
+    R.log.event("augment_codecs", configured=list(a["codecs"]), available=ok, unavailable=bad)
+    if bad:
+        print(f"WARNING: augment.codecs {sorted(bad)} are not available here and are dropped: {bad}", flush=True)
+    if not ok:
+        raise SystemExit(f"augment.codec_p {a['codec_p']}: none of augment.codecs {a['codecs']} works here: {bad}")
+    return dict(a, codecs=ok)
+
+
+def noise_fields(spec, bank, rirs=None) -> dict:
+    """The `augment` event's acoustic fields: the background bank's and the other acoustic steps' settings."""
     return dict(noise_p=spec.noise_p, noise_snr_db=list(spec.noise_snr_db),
                 noise_bank=None if bank is None else bank.path,
                 noise_bank_sha256=None if bank is None else bank.info.get("index_sha256"),
                 noise_clips=None if bank is None else len(bank.lengths),
-                noise_hours=None if bank is None else round(bank.hours, 2))
+                noise_hours=None if bank is None else round(bank.hours, 2),
+                noise_kind_hours=None if bank is None else {k: round(bank.kind_hours(k), 2)
+                                                            for k in sorted(set(bank.kinds.tolist()))},
+                speech_p=spec.speech_p, speech_snr_db=list(spec.speech_snr_db),
+                speech_talkers=list(spec.speech_talkers), speech_batch_p=spec.speech_batch_p, reverb_p=spec.reverb_p,
+                rir_bank=None if rirs is None else rirs.path,
+                rir_bank_sha256=None if rirs is None else rirs.info.get("index_sha256"),
+                rir_clips=None if rirs is None else len(rirs.lengths), gain_p=spec.gain_p,
+                gain_db=list(spec.gain_db), codec_p=spec.codec_p, codecs=list(spec.codecs))
 
 
-def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float, noise=None):
+def acoustic_line(spec) -> str:
+    """The console line's acoustic part."""
+    return (f"background {spec.noise_p:g} at {spec.noise_snr_db[0]:g}-{spec.noise_snr_db[1]:g} dB, speech "
+            f"{spec.speech_p:g} ({spec.speech_talkers[0]}-{spec.speech_talkers[1]} voices at {spec.speech_snr_db[0]:g}-"
+            f"{spec.speech_snr_db[1]:g} dB), reverb {spec.reverb_p:g}, gain {spec.gain_p:g} ({spec.gain_db[0]:g}.."
+            f"{spec.gain_db[1]:g} dB), codec {spec.codec_p:g} ({', '.join(spec.codecs) or 'none'})")
+
+
+def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float, noise=None, rirs=None):
     """setup_augment of an AED student: the cut table joined to the train dataset (when it cuts; kitsune.aed_cuts.
     build_cut_index under <the train store>/aed_cuts, reused across restarts, the table's sha256 checked against
     augment.cuts_sha256) and an Augment with max_tokens = batch.max_dec_len - (prompt length - 1), the most target
@@ -2399,15 +2495,15 @@ def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float, n
                 cuts_sha256=(info or {}).get("table_sha256"), cuts_index=str(cuts.path) if cuts is not None else None,
                 cuts_rows=(info or {}).get("rows"), cuts_rows_in_table=(info or {}).get("rows_in_table"),
                 cuts_rows_with_cuts=(info or {}).get("rows_with_cuts"), cuts_entries=(info or {}).get("entries"),
-                **noise_fields(spec, noise))
+                **noise_fields(spec, noise, rirs))
     clamp = " = the longest train utterance" if used < float(a["concat_max_s"]) else ""
     print(f"augment (aed): truncate_p {spec.truncate_p:g} (rows >= {spec.truncate_min_row_s:g} s, pause cuts "
           f"{spec.truncate_pause_p:g}, at the cut table's frames"
           + (f": {info['rows_with_cuts']} of {info['rows']} rows" if info else "") + f"), concat_p {spec.concat_p:g} "
           f"(k <= {spec.concat_max_n}, <= {used:g} s{clamp}, <= {max_tokens} tokens), mix_p {spec.mix_p:g} at "
-          f"{spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, end trim {spec.end_trim_p:g}, background "
-          f"{spec.noise_p:g} at {spec.noise_snr_db[0]:g}-{spec.noise_snr_db[1]:g} dB, seed {seed}", flush=True)
-    return R.ds.with_augment(spec, cuts, noise=noise)
+          f"{spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, end trim {spec.end_trim_p:g}, {acoustic_line(spec)}, "
+          f"seed {seed}", flush=True)
+    return R.ds.with_augment(spec, cuts, noise=noise, rirs=rirs)
 
 
 # the text of the tokens truncate must never remove alone (punct_token_ids): sentence marks and commas, full- and
@@ -3061,7 +3157,10 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
                     "aug/mixed_frac": a["mixed"] / rows, "aug/cut_padded_frac": a.get("cut_padded", 0) / rows,
                     "aug/end_padded_frac": a.get("end_padded", 0) / rows,
                     "aug/end_trimmed_frac": a.get("end_trimmed", 0) / rows,
-                    "aug/noised_frac": a.get("noised", 0) / rows})
+                    "aug/noised_frac": a.get("noised", 0) / rows,
+                    "aug/speech_frac": a.get("speech_mixed", 0) / rows, "aug/reverb_frac": a.get("reverbed", 0) / rows,
+                    "aug/gain_frac": a.get("gained", 0) / rows, "aug/clipped_frac": a.get("clipped", 0) / rows,
+                    "aug/codec_frac": a.get("coded", 0) / rows})
         if "concat_capped" in a:  # an AED step: micro-batches whose join the decoder cap refused, and cut-table pieces
             # whose frames differ from their decoded audio's (counts; the second is expected to stay 0)
             row.update({"aug/concat_capped": a["concat_capped"], "aug/cut_mismatch": a["cut_mismatch"]})

@@ -61,9 +61,9 @@ item of it ran (a plain --resume of a box whose train items are all done needs -
 a done run without --resume-reset is refused; an augment.* --resume-set on a box without a CTC train item is refused
 before any of it), without --resume a box whose Hub queue summary has a train item done
 (a fresh queue would overwrite that summary, and the run's continuation, --resume-reset, reads it; --fresh-over-done
-for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01) without the quant go
+for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01, p005) without the quant go
 signal: smoke-b's verdict on the Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE;
-DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of boxes p01, full-t and full-p warn while
+DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of boxes p01, full-t, full-p, p005 warn while
 their speed record has no box-1 part. Offers listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped.
 Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate said slow in the last
 GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link
@@ -255,11 +255,11 @@ QUANT_GO_BOX = "smoke-b"
 QUANT_GO_CHECKS = ("12", "13", "14", "15", "16")
 QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.py", "kitsune/whisper.py",
               "tools/whisper_eval.py", "requirements-train.txt", "docker/Dockerfile")
-# the hours of boxes p01 (box 1's cooldown again: the recipe test), full-t and full-p come from make_full_configs' speed
-# record (its SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's; without box 1's part
-# they are provisional (contract 7), and launch says so
+# the hours of boxes p01 (P-0.1B's continuation of box 1's run), full-t, full-p and p005 (P-0.05B) come from
+# make_full_configs' speed record (its SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's;
+# without box 1's part they are provisional (contract 7), and launch says so
 SPEED_RECORD = "configs/full/plan/box2_hours.json"
-SPEED_RECORD_BOXES = ("p01", "full-t", "full-p")
+SPEED_RECORD_BOXES = ("p01", "full-t", "full-p", "p005")
 # offers in a country whose hosts cannot reach the Hugging Face Hub: a full box downloads everything from it, and with
 # no download gate (smoke-b) such a host burns its rebuild attempts up to the cap (2026-10-01: the cheapest 1x 5090,
 # m58555, was listed in CN)
@@ -987,6 +987,36 @@ def _lfs_sha256(info) -> str | None:
     return getattr(lfs, "sha256", None) or (lfs.get("sha256") if isinstance(lfs, dict) else None)
 
 
+NOISE_INDEX = "index.json"  # kitsune.noise_bank.INDEX: the file augment.noise_bank_sha256 pins
+
+
+def augment_pins(spec: dict, reader, sets: dict | None) -> tuple[list[tuple], list[tuple]]:
+    """The banks and cut tables a box's runs read, as (who, data-repo path, pinned sha256 or None): each train
+    item's config with its augmentation on (its background bank when noise_p > 0 or its speech step draws from it,
+    its RIR bank when reverb_p > 0, its cut table), then each --resume-set run's augment.noise_bank /
+    noise_bank_sha256 and rir_bank / rir_bank_sha256 (a continuation sets them on top of its run's config)."""
+    banks, cuts = [], []
+    for it in spec["items"]:
+        if it["kind"] != "train":
+            continue
+        a = reader(it["config"]).get("augment") or {}
+        if not a.get("enabled"):
+            continue
+        bank_speech = float(a.get("speech_p") or 0) > 0 and float(a.get("speech_batch_p", 0.5)) < 1
+        if (float(a.get("noise_p") or 0) > 0 or bank_speech) and a.get("noise_bank"):
+            banks.append((it["name"], a["noise_bank"], a.get("noise_bank_sha256")))
+        if float(a.get("reverb_p") or 0) > 0 and a.get("rir_bank"):
+            banks.append((it["name"], a["rir_bank"], a.get("rir_bank_sha256")))
+        if a.get("cuts"):
+            cuts.append((it["name"], a["cuts"], a.get("cuts_sha256")))
+    for rid, kvs in (sets or {}).items():
+        kv = dict(x.split("=", 1) for x in kvs)
+        for key in ("noise_bank", "rir_bank"):
+            if kv.get(f"augment.{key}"):
+                banks.append((f"--resume-set {rid}", kv[f"augment.{key}"], kv.get(f"augment.{key}_sha256")))
+    return banks, cuts
+
+
 def label_preflight(data_repo: str, sha: str, cfg: dict, label_cfgs: dict[str, dict], *, steal_lease: bool = False,
                     now: float | None = None) -> tuple[str | None, list[str], list[str]]:
     """-> (data repo commit to pin, problems, notes) for --job label, read-only with the laptop's login; it replaces
@@ -1487,6 +1517,9 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
     - without resume: the box's Hub queue summary, when there is one, has no train item done (fresh_preflight) unless
       allow_fresh_over_done: a fresh queue starts new runs and overwrites that summary, the only record of which run
       a later --resume-reset continues (box p01 after box 1: its continuation is --resume-reset, never a fresh launch);
+    - the background banks and cut tables its runs read (augment_pins: their configs', a continuation's
+      --resume-set): each bank one of the box's extra dirs, and each bank's index.json and cut table the sha256 its
+      pin names - a stale pin would fail every train attempt on the box after its paid rebuild (DECISIONS H11);
     - a box with quantised items: the quant go signal (quant_go_problems: a passing smoke-b verdict at this quant code;
       allow_unverified_quant makes it a warning); boxes p01, full-t, full-p: a warning while their hours are provisional
       (speed_record_notes)."""
@@ -1555,6 +1588,37 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
             problems += [f"{data_repo}: {x}" for x in bad]
             if not bad:
                 notes.append(f"box {box}'s {len(students)} student(s) are the registered builds")
+
+            def hub_sha256(path: str) -> str | None:  # the LFS sha256, else (a small file in git) its bytes' hash
+                info = api.get_paths_info(data_repo, [path], repo_type="dataset", revision=data_rev)
+                got = _lfs_sha256(info[0]) if info else None
+                if got is None:
+                    got = hashlib.sha256(Path(download(data_repo, path, repo_type="dataset", revision=data_rev,
+                                                       local_dir=tmp)).read_bytes()).hexdigest()
+                return got
+
+            banks, cuts = augment_pins(spec, reader, sets)
+            for who, d, pin in banks:
+                if d not in spec["extra_dirs"]:
+                    problems.append(f"{who} reads the bank {d}, which box {box} does not pull "
+                                    f"(boxes.json extra_dirs)")
+                idx = f"{d}/{NOISE_INDEX}"
+                if idx not in have:
+                    problems.append(f"{data_repo}: no {idx} ({who}'s bank: tools/build_noise_bank.py or "
+                                    f"build_rir_bank.py, then upload it)")
+                    continue
+                got = hub_sha256(idx)
+                if pin and got != pin:
+                    problems.append(f"{who} pins {idx} at sha256 {pin[:12]}..., {data_repo} holds {got[:12]}...: "
+                                    f"make_full_configs' NOISE_BANK_SHA256 / RIR_BANK_SHA256 must be the uploaded "
+                                    f"bank's (regenerate)")
+                elif pin:
+                    notes.append(f"{who}: bank {d}, index.json sha256 {got[:12]}... as pinned")
+            for who, path, pin in cuts:
+                if path not in have:
+                    problems.append(f"{data_repo}: no {path} ({who}'s cut table)")
+                elif pin and (got := hub_sha256(path)) != pin:
+                    problems.append(f"{who} pins {path} at sha256 {pin[:12]}..., {data_repo} holds {got[:12]}...")
             recipe = (cfg.get("selection_recipe") or {}).get("full_study")
             if recipe is not None:
                 sel = cfg["selection"]

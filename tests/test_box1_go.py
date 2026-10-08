@@ -188,7 +188,7 @@ def test_a_running_box_is_not_decidable_and_projects_its_run(tmp_path, capsys):
     (partial,) = [t for t in line(rec, "G4", "INFO") if t.startswith("partial:")]
     total = M.plan_total_steps("p01", M.load_plan())
     proj = (total * steady_median(600) * 1.08 + 837 + 40 * 8.5) / 3600
-    # its registry need: box p01's full-p01 now (box 1's run continued to 8 epochs on the P test box, DECISIONS H9)
+    # its registry need: box p01's full-p01 now (box 1's run continued to 8 epochs, DECISIONS H9)
     assert partial.startswith(f"partial: step 600 of {total}; at this speed full-p01 runs ~{proj:.2f} h at o 0.08 "
                               f"(its registry need 11.47 h)"), partial
 
