@@ -9,7 +9,8 @@ written here.
 
 Formats (QUANT_FORMATS, in this order; FORMAT_INFO holds weights, acts, block, bits, real_impl, timed, export, label):
 
-  fp16          Linear / Conv / Embedding weights and biases in IEEE fp16, norms and BatchNorm fp32, fp16 autocast. A
+  fp16          Linear / Conv / Embedding weights and biases in IEEE fp16, norms and BatchNorm fp32, fp16 autocast; the
+                encoder self-attention in fp32 outside it (FP16_FP32_MODULES: its rel-pos scores overflow fp16). A
                 portability check of the bf16-trained students (overflow shows in NonFiniteMonitor), not a speed option
   int8-w8a16    int8 weights per output channel (symmetric), bf16 activations            torchao Int8WeightOnlyConfig
   int8-w8a8     the same weights, int8 activations per token (dynamic, symmetric)       Int8DynamicActivationInt8Weight
@@ -94,7 +95,7 @@ Conv1d(k=1), nor the subsampling's Conv2d(k=1)). A layer whose shape the format'
 nvfp4, K % 32 for mxfp4, K or N % 8 for int8/fp8) is `skipped` with the reason and stays 16-bit. Kept as they are: the
 heads (ctc_head is read in fp32 at eval), the embeddings, the subsampling and depthwise convolutions, the norms, the
 BatchNorm (its running statistics never change: fp32 from a master, bf16 after speed_probe's whole-model cast)
-and the attention's rel-pos biases.
+and the attention's rel-pos biases. The fp16 format selects no layers: it casts, and its `kept` lists the fp32 modules.
 
 Variant dir (export; load_quantized reads it back, verify_export checks it):
   model.safetensors   plain tensors (no pickle). Every tensor that is not a quantised layer's weight under its HF key
@@ -102,7 +103,8 @@ Variant dir (export; load_quantized reads it back, verify_export checks it):
                       quantised layer <name>.qweight (int8 / packed fp4 as uint8 / e4m3), <name>.qscale (fp32, int8 and
                       fp8), <name>.qblock_scale (e4m3 for nvfp4; uint8 E8M0 for mxfp4: safetensors 0.8 stores neither
                       float8_e8m0fnu nor float4_e2m1fn_x2), <name>.qtensor_scale (fp32, nvfp4) and <name>.bias. fp16:
-                      the HF keys and shapes, loadable with from_pretrained. The header's metadata holds no time, so
+                      the HF keys and shapes, loadable with from_pretrained (the fp32 modules' tensors in the source
+                      dtype; a plain fp16 forward of them overflows). The header's metadata holds no time, so
                       the bytes are deterministic and the two variants of one format are the same file
   quantization.json   the recipe (schema 1): format, weights, activations, scope, recipe_version, recipe_sha256, recipe
                       constants, source (dir,
@@ -139,6 +141,7 @@ import os
 import shutil
 import sys
 import time
+import types
 from collections import Counter
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -248,6 +251,18 @@ FP8_ACT_LB = 2.0 ** -40
 # load_quantized refuses a variant below it, 05 refuses one as --ckpt, the readout re-exports one, and
 # tools/full_report.py leaves out every quant readout and speed record below it (QUANT_RECIPE_MIN)
 RECIPE_VERSION = 2
+# The fp16 format's fp32 modules: every encoder self-attention keeps its weights out of the fp16 cast (the source's bf16
+# in the variant file, fp32 in memory) and runs in fp32 with autocast off, its output handed back in the dtype its input
+# came in (_fp32_forward). Its relative-position scores overflow fp16: P-0.05B (full-p005, step 80939) learned a hard
+# positional head (layer 3, head 3: its q_proj and relative_k_proj rows 3.5-5x and 8-13x the norm of the other heads',
+# its top attention weight >= 0.997 on every frame of six JSUT clips) whose (q + bias_v) . R_k reaches 8.7e6 before
+# the 1 / sqrt(128) scaling, 7.7e5 after (fp16's largest value is 65504). Every valid score of that head was +inf in
+# fp16, its softmax NaN, and the fp16 readout decoded all 16,746 M4 utterances empty (bf16: M4 16.35 %); P-0.1B
+# (full-p01 A1) has the same head in its last layer at 9.1e4 (16,269 rows non-finite, M4 69.6 %), P-0.3B none (its
+# largest score 3.7e3 before the scaling). Neither clamped (a row of that head spans up to 1.5e5: a clamp flattens its
+# one-hot) nor shifted by the row's maximum (which needs the scores in fp32 first); the module's projections run in
+# fp32 too, so its HF forward is used unchanged. CPU, 96 JSUT clips: fp16 CER = fp32's (P-0.05B 12.02 %, P-0.1B 9.39 %)
+FP16_FP32_MODULES = ("ParakeetEncoderAttention",)
 NVFP4_SCALE_MIN = float(torch.finfo(torch.float8_e4m3fn).tiny)  # torchao nvfp4_quantize clamps the block scale here
 NVFP4_BLOCK, MXFP4_BLOCK = 16, 32
 E8M0_BIAS = 127
@@ -371,8 +386,11 @@ def resolve_impl(fmt: str, impl: str, device) -> str:
 def identity(fmt: str, impl: str, scope: str, mx_rounding: str) -> dict:
     """The block a 05 --out identity gains for a quantised eval (only then: existing --out dirs keep theirs). It holds
     RECIPE_VERSION: a quantised --out that older quant code started (no recipe_version) refuses to resume (05's
-    check_identity), so no set scored by a pre-F1 recipe is completed by a fixed one or the other way round."""
+    check_identity), so no set scored by a pre-F1 recipe is completed by a fixed one or the other way round. fp16's
+    holds FP16_FP32_MODULES too: an fp16 --out scored with its encoder self-attention in fp16 never resumes."""
     rec = dict(fmt=fmt, impl=impl, scope=scope, mx_rounding=mx_rounding, schema=SCHEMA, recipe_version=RECIPE_VERSION)
+    if fmt == "fp16":
+        rec["fp32_modules"] = list(FP16_FP32_MODULES)
     if impl == "torchao":
         rec["torchao"] = torchao_version()
     return rec
@@ -884,14 +902,16 @@ def _swap_in(model: nn.Module, name: str, new: nn.Module):
 
 def _cast_fp16(model: nn.Module) -> list[str]:
     """Linear / Conv1d / Conv2d / Embedding weights and biases to fp16 in place (p.data: the Parameters and their
-    ties stay); norms and BatchNorm stay fp32 (fp16 LayerNorm or BN affine params fail on CPU). Returns the state_dict
-    keys now fp16, a tied tensor under every name."""
+    ties stay), none inside a FP16_FP32_MODULES module (_fp32_modules runs those in fp32); norms and BatchNorm stay fp32
+    (fp16 LayerNorm or BN affine params fail on CPU). Returns the state_dict keys now fp16, a tied tensor under every
+    name."""
     kinds = (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Embedding)
+    fp32 = {id(p) for m in model.modules() if type(m).__name__ in FP16_FP32_MODULES for p in m.parameters()}
     done = set()
     for m in model.modules():
         if isinstance(m, kinds):
             for p in (m.weight, getattr(m, "bias", None)):
-                if p is not None and id(p) not in done and p.is_floating_point():
+                if p is not None and id(p) not in done and id(p) not in fp32 and p.is_floating_point():
                     p.data = p.data.half()
                     done.add(id(p))
     keys = []
@@ -899,6 +919,44 @@ def _cast_fp16(model: nn.Module) -> list[str]:
         if id(p) in done:
             keys.append(n)
     return sorted(keys)
+
+
+def _fp32_forward(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
+    """The forward of a FP16_FP32_MODULES module in the fp16 format: its class's own forward in fp32 with autocast off,
+    on fp32 copies of its inputs (a stride-0 batch of position embeddings, the rel-pos patch's, stays one: its
+    relative_k_proj still projects one row), the output in the dtype its hidden states came in."""
+    dt = hidden_states.dtype
+    pos = position_embeddings
+    if pos is not None and pos.dtype != torch.float32:
+        pos = (pos[:1].float().expand(pos.shape) if pos.dim() == 3 and pos.shape[0] > 1 and pos.stride(0) == 0
+               else pos.float())
+    with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+        out, weights = type(self).forward(self, hidden_states=hidden_states.float(), position_embeddings=pos,
+                                          attention_mask=attention_mask, **kwargs)
+    return out.to(dt), weights
+
+
+def _runs_fp32(m: nn.Module) -> bool:
+    """A FP16_FP32_MODULES module as _fp32_modules leaves it: _fp32_forward its forward, its parameters fp32."""
+    return getattr(m.__dict__.get("forward"), "__func__", None) is _fp32_forward and all(
+        p.dtype == torch.float32 for p in m.parameters() if p.is_floating_point())
+
+
+def _fp32_modules(model: nn.Module) -> dict[str, str]:
+    """The fp16 format's fp32 modules (FP16_FP32_MODULES) set up in place: their parameters fp32 (an upcast of the bf16
+    or fp32 values, exact) and _fp32_forward their forward (an instance attribute, as kitsune.patches' rel-pos patch:
+    names, state_dict keys and hooks stay). Idempotent. Returns {name: why}, the recipe's kept."""
+    kept = {}
+    for name, m in model.named_modules():
+        if type(m).__name__ not in FP16_FP32_MODULES:
+            continue
+        for p in m.parameters():
+            if p.is_floating_point() and p.dtype != torch.float32:
+                p.data = p.data.float()
+        if getattr(m.__dict__.get("forward"), "__func__", None) is not _fp32_forward:
+            m.forward = types.MethodType(_fp32_forward, m)
+        kept[name] = "encoder self-attention: fp32 outside autocast (its rel-pos scores overflow fp16)"
+    return kept
 
 
 def _install(module: nn.Linear, pack: QuantPack, fmt: str, impl: str, sel_name: str, kind: str, *,
@@ -933,8 +991,11 @@ def _recipe_consts(fmt: str, mx_rounding: str) -> dict:
                 bias="outside_gemm" if fmt != "fp16" else "fp16",
                 e2m1_rounding="rne" if wfmt in ("nvfp4", "mxfp4") else None)
     if fmt == "fp16":
-        return dict(base, cast="Linear/Conv/Embedding weights and biases to fp16; norms and BatchNorm fp32",
-                    autocast="float16")
+        return dict(base, cast="Linear/Conv/Embedding weights and biases to fp16 outside the fp32 modules; norms and "
+                               "BatchNorm fp32",
+                    autocast="float16", fp32_modules=list(FP16_FP32_MODULES),
+                    fp32_module_run="its parameters fp32 (the source dtype in the file), its forward in fp32 with "
+                                    "autocast off, its output in its input's dtype")
     rec = dict(base, block=FORMAT_INFO[fmt]["block"])
     if wfmt == "int8":
         rec.update(int8_div=INT8_DIV, int8_eps=INT8_EPS, int8_range=[-128, 127],
@@ -1006,6 +1067,7 @@ def apply(model: nn.Module, fmt: str, *, impl: str = "auto", scope: str = "linea
     layers, kept, skipped, fp16 = {}, {}, {}, []
     if fmt == "fp16":
         fp16 = _cast_fp16(model)
+        kept = _fp32_modules(model)
         params_q = sum(p.numel() for n, p in model.named_parameters() if n in set(fp16))
     else:
         wfmt, _ = _SPLIT[fmt]
@@ -1066,7 +1128,7 @@ def assert_quantized(model: nn.Module, recipe: dict) -> None:
     bitwise unchanged in the dtype they had when apply / load_quantized snapshotted them (fp32 from a master or a
     variant dir; bf16 when speed_probe's runner cast the whole model before quantising, the study's timing
     convention: apply never changes them either way), no in-scope Linear left behind (fp16: the fp16 tensors fp16,
-    norms and BN fp32)."""
+    norms and BN fp32, every FP16_FP32_MODULES module run in fp32)."""
     fmt = recipe["format"]
     problems = []
     state = getattr(model, "_kitsune_quant", None) or {}
@@ -1094,6 +1156,8 @@ def assert_quantized(model: nn.Module, recipe: dict) -> None:
             if isinstance(m, (nn.LayerNorm, nn.modules.batchnorm._BatchNorm)):
                 if any(p.dtype != torch.float32 for p in m.parameters(recurse=False)):
                     problems.append(f"{n}: norms stay fp32 in the fp16 format")
+            if type(m).__name__ in FP16_FP32_MODULES and not _runs_fp32(m):
+                problems.append(f"{n}: not run in fp32 (FP16_FP32_MODULES: fp32 parameters, _fp32_forward)")
     else:
         layers = recipe.get("layers") or {}
         skipped = recipe.get("skipped") or {}
@@ -1412,12 +1476,17 @@ def read_recipe(path) -> dict:
 
 def recipe_version_problem(rec: dict) -> str | None:
     """Why a variant's recipe may not be used (F4), or None: one exported by quant code older than RECIPE_VERSION (no
-    recipe_version: version 1, every export up to 8ff3bd5) holds the pre-F1 numbers, so it is never loaded, scored or
+    recipe_version: version 1, every export up to 8ff3bd5) holds the pre-F1 numbers, and an fp16 one without
+    FP16_FP32_MODULES in its recipe runs its encoder self-attention in fp16, so neither is ever loaded, scored or
     reused - it is exported again from its bf16 checkpoint (about a minute)."""
     v = rec.get("recipe_version") or 1
     if v != RECIPE_VERSION:
         return (f"this {rec.get('format')} variant was exported by quant recipe version {v}, not {RECIPE_VERSION} (the "
                 "pre-F1 fp8 scales, DECISIONS F): export it again from its bf16 checkpoint")
+    if rec.get("format") == "fp16" and (rec.get("recipe") or {}).get("fp32_modules") != list(FP16_FP32_MODULES):
+        return ("this fp16 variant runs every layer in fp16 (exported before FP16_FP32_MODULES: the encoder "
+                "self-attention's rel-pos scores overflow fp16, P-0.05B decoded every utterance empty): export it "
+                "again from its bf16 checkpoint")
     return None
 
 
@@ -1735,8 +1804,9 @@ def load_quantized(path, device, *, impl: str = "auto", dtype=torch.float32) -> 
     """A variant dir as a quantised model: the recipe and config.json; the HF skeleton on CPU (sdpa); the pointwise
     adapters; the file's kept tensors (in `dtype`, BatchNorm statistics fp32, the fp16 variant's fp16 tensors fp16;
     a missing or extra key refuses); the tie; the model to the device; each layer's pack installed for `impl`
-    (emulate, or torchao on its device); eval mode; assert_quantized. The caller applies the rel-pos patch and the
-    BatchNorm freeze as for any student. Returns (model, recipe)."""
+    (emulate, or torchao on its device), the fp16 variant's fp32 modules set up (_fp32_modules); eval mode;
+    assert_quantized. The caller applies the rel-pos patch and the BatchNorm freeze as for any student. Returns
+    (model, recipe)."""
     from safetensors import safe_open
 
     path = Path(path)
@@ -1791,6 +1861,8 @@ def load_quantized(path, device, *, impl: str = "auto", dtype=torch.float32) -> 
                          tensor_scale=p.get("qtensor_scale"),
                          mx_rounding=(rec.get("recipe") or {}).get("mx_rounding") if wfmt == "mxfp4" else None)
         _install(model.get_submodule(name), pack, fmt, impl_r, name, info["kind"], cache=cache)
+    if fmt == "fp16":
+        _fp32_modules(model)
     model.eval()
     model._kitsune_quant = dict(recipe=rec, bn=_bn_snapshot(model))
     assert_quantized(model, rec)

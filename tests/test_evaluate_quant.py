@@ -7,7 +7,8 @@ formats and fp16:
                 summary.json's and evaluator.json's quant block, the quant / quant_counters / nonfinite events, no
                 verdict (verdict_skipped), the quant block in the --out identity; a rerun evaluates nothing and keeps
                 the block; another format into the same --out, a --system without the suffix, --anchor, --teachers or
-                --from-evals with --quant, and the quant flags without --quant are refused
+                --from-evals with --quant, and the quant flags without --quant are refused; an eval with a non-finite
+                row writes its outputs, then fails (exit 1, status nonfinite), the readout CLI too
   from a file   python -m kitsune.quant export, then 05 --ckpt <variant>: exactly the in-memory eval's hypotheses and
                 teacher-forced tables (compare --exact) for int8-w8a8, nvfp4-w4a4 and fp16 (--fp16); a variant with
                 another --quant, or with --quant-scope, is refused; the readout CLI (export + 05) end to end, reusing a
@@ -222,6 +223,44 @@ def test_a_variant_of_older_quant_code_is_refused(ctc_env, prereg, m05, variants
     with pytest.raises(SystemExit, match="REFUSED: .*recipe version 1, not 2.*export it again"):
         run05(m05, ctc_env, prereg, tmp_path / "x", ckpt=old)
     assert not (tmp_path / "x" / "study.json").exists()
+
+
+def test_a_nonfinite_quant_eval_writes_its_outputs_then_fails(ctc_env, prereg, m05, tmp_path, monkeypatch):
+    """A quantised eval whose monitor counted a non-finite row exits 1 (status nonfinite) once its outputs are written:
+    P-0.05B's fp16 readout decoded all 16,746 utterances empty and exited 0. An FFN weight x 1e6 overflows fp16 outside
+    the fp32 attention: the tables and study.json hold the counts, a rerun of the same --out (nothing left to
+    evaluate) fails again, and the readout CLI returns 1."""
+    import shutil
+
+    from safetensors.torch import load_file, save_file
+
+    bad = tmp_path / "bad"
+    shutil.copytree(ctc_env["student"], bad)
+    sd = load_file(str(bad / Q.WEIGHTS_FILE))
+    sd["encoder.layers.0.feed_forward1.linear1.weight"] *= 1e6
+    save_file(sd, str(bad / Q.WEIGHTS_FILE), metadata={"format": "pt"})
+    out, tables = tmp_path / "out", tmp_path / "tables"
+    for _ in range(2):
+        with pytest.raises(SystemExit, match=r"quant: \d+ row\(s\) held a non-finite value .*the fp16 model overflows"):
+            run05(m05, ctc_env, prereg, out, "--fp16", "--tables", str(tables), ckpt=bad)
+    assert events(out, "todo")[-1]["sets"] == []  # the rerun evaluated nothing: the first run's counts failed it
+    st = load(out / "study.json")
+    assert st["quant"]["format"] == "fp16" and st["quant"]["nonfinite"]["rows"] > 0
+    assert sorted(p.name for p in (tables / "study-p01@fp16").glob("*.parquet")) == sorted(
+        f"{s}.parquet" for s in ctc_env["manifest"]["sets"])
+    invs = load(out / "evaluator.json")["invocations"]
+    assert [i["status"] for i in invs] == ["nonfinite", "nonfinite"] and "non-finite" in invs[-1]["error"]
+    real = Q._load_05
+
+    def pending():
+        mod = real()
+        mod.PREREG_JSON = prereg
+        return mod
+
+    monkeypatch.setattr(Q, "_load_05", pending)
+    assert Q.main(["readout", "--config", str(ctc_env["config"]), "--ckpt", str(bad), "--fmt", "fp16", "--out",
+                   str(tmp_path / "readout"), "--cache-dir", str(tmp_path / "cache"), "--manifest",
+                   str(ctc_env["manifest_path"]), "--root", str(ctc_env["root"])]) == 1
 
 
 def test_the_readout_cli(ctc_env, prereg, tmp_path, monkeypatch, capsys):
