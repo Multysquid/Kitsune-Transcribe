@@ -46,7 +46,7 @@ count goes along (KITSUNE_N_GPUS). Boxes A and B may be live at the same time: n
   python vast/launch.py --job study --box A --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs \\
       --image-tag main                                                                        # look only
 
---job full --box full-smoke|p01|full-t|full-p|smoke-b rents a full-data box (kitsune/full_queue.py runs it;
+--job full --box full-smoke|p01|full-t|full-p|p005|p-cool|smoke-b rents a full-data box (kitsune/full_queue.py runs it;
 vast/README.md "Full-data runs"). The box registry configs/full/boxes.json (kitsune/fullrun.py) is read at the commit
 the box runs and is the one source of its GPU count (--gpus may only repeat it), data config (--config), hours
 (--max-hours; planned hours est_hours), price cap (--max-dph), extra disk and watchdog (KITSUNE_N_GPUS,
@@ -61,10 +61,20 @@ item of it ran (a plain --resume of a box whose train items are all done needs -
 a done run without --resume-reset is refused; an augment.* --resume-set on a box without a CTC train item is refused
 before any of it), without --resume a box whose Hub queue summary has a train item done
 (a fresh queue would overwrite that summary, and the run's continuation, --resume-reset, reads it; --fresh-over-done
-for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01, p005) without the quant go
+for a deliberate fresh start), and a box with quantised items (full-t, full-p, p01, p005, p-cool) without the quant go
 signal: smoke-b's verdict on the Hub passed checks 12-16 at an ancestor commit with the same quant code (QUANT_CODE;
-DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of boxes p01, full-t, full-p, p005 warn while
+DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of boxes full-t, p005, p-cool warn while
 their speed record has no box-1 part. Offers listed in a country without Hub access (FULL_AVOID_COUNTRIES) are dropped.
+A box whose train items continue other boxes' runs (the registry's `continues` blocks, DECISIONS H14: box p-cool) is
+always a resume (KITSUNE_RESUME=1 without --resume; the registry carries each reset and its sets, so --fresh-over-done
+and a --resume-reset/--resume-set naming a continued run are refused), and resume_preflight checks each continuation
+before renting: its own summary's record when there is one (the registry's sets and resets_before), else the source
+box's summary (ended, the item done and verified, the run id and resets the registry's), the state
+full_step_<from_step> (complete, pre_cooldown, its resets, its early-stop cooldown record with keep_cooldown, else none
+and the run's end at to_step), one planner n_utts for all of them (one store), and no readout dir m4-<rid>-r<N> on the
+Hub that the box would write into (unless its own summary records that continuation); a live instance of the box or of
+a source box (running, loading, created, or a null actual_status: holds_host) is refused. A --resume of a box whose
+runs another box continues needs --allow-continued-runs (that box's continuation wrote into the same run dirs).
 Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate said slow in the last
 GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link
 first (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
@@ -255,12 +265,17 @@ QUANT_GO_BOX = "smoke-b"
 QUANT_GO_CHECKS = ("12", "13", "14", "15", "16")
 QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.py", "kitsune/whisper.py",
               "tools/whisper_eval.py", "requirements-train.txt", "docker/Dockerfile")
-# the hours of boxes p01 and full-p (the recipe-v4 cooldown re-runs of P-0.1B's and P-0.3B's runs, DECISIONS H13),
-# full-t and p005 (P-0.05B) come from
-# make_full_configs' speed record (its SPEED_FILE under configs/full, box_hours): smoke A's measured s/step and box 1's;
-# without box 1's part they are provisional (contract 7), and launch says so
+# the hours of boxes full-t, p005 (P-0.05B) and p-cool (the three cooldown re-runs of P-0.3B's, P-0.1B's and
+# P-0.05B's runs, DECISIONS H14; boxes p01 and full-p left the record with it) come from make_full_configs' speed
+# record (its SPEED_FILE under configs/full, box_hours; this tuple is its HOURS_BOXES): smoke A's measured s/step and
+# box 1's; without box 1's part they are provisional (contract 7), and launch says so
 SPEED_RECORD = "configs/full/plan/box2_hours.json"
-SPEED_RECORD_BOXES = ("p01", "full-t", "full-p", "p005")
+SPEED_RECORD_BOXES = ("full-t", "p005", "p-cool")
+# a vast instance in one of these states holds (or is about to hold) a host: a second box of a continuation box, or
+# a live source box of its runs, is refused when its actual_status, intended_status or cur_state is one of them or
+# its actual_status is still null (a just-created instance vast is scheduling; holds_host), and only warned about
+# otherwise (exited, stopped, offline: a host-loss relaunch may still list the lost one)
+LIVE_STATUSES = ("running", "loading", "created")
 # offers in a country whose hosts cannot reach the Hugging Face Hub: a full box downloads everything from it, and with
 # no download gate (smoke-b) such a host burns its rebuild attempts up to the cap (2026-10-01: the cheapest 1x 5090,
 # m58555, was listed in CN)
@@ -994,12 +1009,21 @@ NOISE_INDEX = "index.json"  # kitsune.noise_bank.INDEX: the file augment.noise_b
 def augment_pins(spec: dict, reader, sets: dict | None) -> tuple[list[tuple], list[tuple]]:
     """The banks and cut tables a box's runs read, as (who, data-repo path, pinned sha256 or None): each train
     item's config with its augmentation on (its background bank when noise_p > 0 or its speech step draws from it,
-    its RIR bank when reverb_p > 0, its cut table), then each --resume-set run's augment.noise_bank /
+    its RIR bank when reverb_p > 0, its cut table), each train item's registry continuation (DECISIONS H14: its
+    continues block's sets, who "<item> (continues <run_id>)"), then each --resume-set run's augment.noise_bank /
     noise_bank_sha256 and rir_bank / rir_bank_sha256 (a continuation sets them on top of its run's config)."""
     banks, cuts = [], []
     for it in spec["items"]:
         if it["kind"] != "train":
             continue
+        cont = it.get("continues")
+        if isinstance(cont, dict) and isinstance(cont.get("sets"), dict):
+            cs = cont["sets"]
+            for key in ("noise_bank", "rir_bank"):
+                if isinstance(cs.get(f"augment.{key}"), str) and cs[f"augment.{key}"]:
+                    pin = cs.get(f"augment.{key}_sha256")
+                    banks.append((f"{it['name']} (continues {cont.get('run_id')})", cs[f"augment.{key}"],
+                                  pin.lower() if isinstance(pin, str) else None))
         a = reader(it["config"]).get("augment") or {}
         if not a.get("enabled"):
             continue
@@ -1498,7 +1522,8 @@ def speed_record_notes(sha: str, box: str) -> list[str]:
 def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_repo: str | None, sha: str, box: str,
                    reg: dict, cfg: dict, *, reader=None, resume: bool = False, resets=(),
                    sets: dict | None = None, allow_unverified_quant: bool = False,
-                   allow_done_trains: bool = False, allow_fresh_over_done: bool = False) -> tuple[list[str], list[str]]:
+                   allow_done_trains: bool = False, allow_fresh_over_done: bool = False,
+                   allow_continued_runs: bool = False) -> tuple[list[str], list[str]]:
     """-> (problems, notes) for --job full, read-only (local git and the laptop's HF login), on top of hf_preflight and
     extent_preflight:
     - every config the box reads (fullrun.box_configs: its data config, its item configs, the registry) committed at
@@ -1514,7 +1539,8 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
     - with resume: the box's Hub queue summary, and every --resume-reset/--resume-set id the run dir of one of its train
       items; the notes say what will resume, with the newest state step found in the scratch and runs repos; a plain
       resume of a box whose train items are all done needs allow_done_trains, a set-only id of a done run is refused
-      (resume_preflight);
+      (resume_preflight); a box with continues items (DECISIONS H14) is always checked as a resume, its
+      continuations by continuation_preflight, and a box whose runs another box continues needs allow_continued_runs;
     - without resume: the box's Hub queue summary, when there is one, has no train item done (fresh_preflight) unless
       allow_fresh_over_done: a fresh queue starts new runs and overwrites that summary, the only record of which run
       a later --resume-reset continues (box p01 after box 1: its continuation is --resume-reset, never a fresh launch);
@@ -1522,7 +1548,7 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
       --resume-set): each bank one of the box's extra dirs, and each bank's index.json and cut table the sha256 its
       pin names - a stale pin would fail every train attempt on the box after its paid rebuild (DECISIONS H11);
     - a box with quantised items: the quant go signal (quant_go_problems: a passing smoke-b verdict at this quant code;
-      allow_unverified_quant makes it a warning); boxes p01, full-t, full-p: a warning while their hours are provisional
+      allow_unverified_quant makes it a warning); boxes full-t, p005, p-cool: a warning while their hours are provisional
       (speed_record_notes)."""
     import hashlib
     import tempfile
@@ -1664,9 +1690,10 @@ def full_preflight(data_repo: str, data_rev: str | None, out_repo: str, scratch_
             if private is not True:
                 problems.append(f"{scratch_repo} is not private: the timed states are the trainers' full states; "
                                 f"hf repos settings {scratch_repo} --private")
-    if resume:
+    if resume or fullrun.continues_of(box, reg):  # a continuation box is never fresh (DECISIONS H14)
         problems_r, notes_r = resume_preflight(out_repo, scratch_repo, box, resets, sets or {},
-                                               allow_done_trains=allow_done_trains)
+                                               allow_done_trains=allow_done_trains, reg=reg,
+                                               allow_continued_runs=allow_continued_runs)
         problems += problems_r
         notes += notes_r
     else:
@@ -1717,7 +1744,8 @@ def fresh_preflight(out_repo: str, box: str, *, allow_fresh_over_done: bool = Fa
 
 
 def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, sets: dict, *,
-                     allow_done_trains: bool = False) -> tuple[list, list]:
+                     allow_done_trains: bool = False, reg: dict | None = None,
+                     allow_continued_runs: bool = False) -> tuple[list, list]:
     """--resume: the box's Hub queue summary (full/box-<box>/queue_summary.json, the source of truth) must exist, and
     every reset/set id must be fullrun.run_id_of(items[x].run_dir) of one of its train items; the notes list each
     train item (its status, run and the newest full state step in the scratch pointer and the runs repo). Two guards
@@ -1728,18 +1756,31 @@ def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, 
         a continuation is --resume-reset (with its --resume-set). A continuation lost on its way is not refused: the
         summary then shows the run running with its continuation record;
     (b) a --resume-set id without --resume-reset whose train item is done is refused: resume-pull refuses a set-only
-        run past its cooldown after the paid boot."""
+        run past its cooldown after the paid boot.
+    With the registry (reg; DECISIONS H14) two more:
+    (c) a box with continues items (box p-cool) may have no summary yet (its first launch): its continuations are
+        checked by continuation_preflight, each from the box's own summary when that records it, else from its source
+        box's summary;
+    (d) a box whose summary's train runs another registry box continues (box p005 after box p-cool) is refused
+        unless allow_continued_runs (--allow-continued-runs): that box's continuation wrote into the same run dir and
+        over the same final export, so a resume here would adopt (or score, or sync over) the other box's weights."""
     import tempfile
 
     problems, notes = [], []
     path = fullrun.box_summary_path(box)
+    conts = fullrun.continues_of(box, reg) if reg is not None else {}
     try:
         api, download = _hub()
-        if not api.file_exists(out_repo, path):
-            return [f"{out_repo} has no {path}: box {box} never put its queue summary up, so there is nothing to resume "
-                    f"(launch it without --resume)"], notes
         with tempfile.TemporaryDirectory(prefix="kitsune-launch-") as tmp:
-            summary = json.loads(Path(download(out_repo, path, local_dir=tmp)).read_text(encoding="utf-8"))
+            if api.file_exists(out_repo, path):
+                summary = json.loads(Path(download(out_repo, path, local_dir=tmp)).read_text(encoding="utf-8"))
+            elif conts:
+                summary = {}
+                notes.append(f"resume: {out_repo} has no {path} yet (box {box}'s first launch): its continuations "
+                             f"start from their source boxes' runs")
+            else:
+                return [f"{out_repo} has no {path}: box {box} never put its queue summary up, so there is nothing to "
+                        f"resume (launch it without --resume)"], notes
             items = summary.get("items") or {}
             ran = {fullrun.run_id_of(it["run_dir"]): name for name, it in items.items()
                    if isinstance(it, dict) and it.get("kind") == "train" and it.get("run_dir")}
@@ -1763,8 +1804,21 @@ def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, 
                     notes.append(f"{msg} (--allow-done-trains: not refused)")
                 else:
                     problems.append(msg)
+            if reg is not None:  # (d): another box continued one of this box's runs
+                others = {c["run_id"]: (b, name) for b in reg["boxes"] if b != box
+                          for name, c in fullrun.continues_of(b, reg).items()}
+                if hit := sorted(rid for rid in ran if rid in others):
+                    msg = (f"a resume of box {box}: its run(s) " + ", ".join(
+                        f"{rid} ({ran[rid]})" for rid in hit) + " are continued by box " + ", ".join(
+                        sorted({others[rid][0] for rid in hit})) + f" (its registry continues blocks): that "
+                        f"continuation writes into the same run dir and final export, so this box would adopt, score "
+                        f"or sync over its weights; pass --allow-continued-runs only when that is meant")
+                    if allow_continued_runs:
+                        notes.append(f"{msg} (--allow-continued-runs: not refused)")
+                    else:
+                        problems.append(msg)
             for name, it in items.items():
-                if not isinstance(it, dict) or it.get("kind") != "train":
+                if not isinstance(it, dict) or it.get("kind") != "train" or name in conts:
                     continue
                 rid = fullrun.run_id_of(it["run_dir"]) if it.get("run_dir") else None
                 what = ("reset" if rid in resets else "") + (f" sets {sets[rid]}" if rid in sets else "")
@@ -1772,9 +1826,206 @@ def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, 
                              + (f", {what.strip()}" if what else "")
                              + (f"; newest state: {_state_steps(api, download, out_repo, scratch_repo, rid, tmp)}"
                                 if rid else ""))
+            if conts:
+                problems_c, notes_c = continuation_preflight(api, download, out_repo, scratch_repo, box, reg, items,
+                                                             tmp)
+                problems += problems_c
+                notes += notes_c
     except Exception as e:  # noqa: BLE001
         problems.append(f"cannot read {path} in {out_repo}: {type(e).__name__}: {e}")
     return problems, notes
+
+
+def continues_flag_problems(box: str, conts: dict, resets, sets: dict) -> list[str]:
+    """A --resume-reset / --resume-set naming a run that a train item of the box continues (its registry continues
+    block, DECISIONS H14) is refused: the registry carries that run's reset and its sets, a reset flag again on a
+    relaunch would restart the continuation from its pre_cooldown state and throw its progress away, and the box's
+    resume-pull refuses such a flag too (after the paid boot)."""
+    by_rid = {c["run_id"]: name for name, c in conts.items()}
+    return [f"{flag} {rid}: item {by_rid[rid]} of box {box} continues that run (its registry continues block carries "
+            f"the reset from full_step_{conts[by_rid[rid]]['from_step']} and its sets): drop the flag"
+            for flag, ids in (("--resume-reset", list(resets)), ("--resume-set", list(sets))) for rid in ids
+            if rid in by_rid]
+
+
+def _cont_sets(cont: dict) -> list[str]:
+    """The sets a continuation's record carries (kitsune.full_queue resume-pull): the reset, then the registry's."""
+    return ["schedule.resume_reset=true", *fullrun.continue_sets(cont)]
+
+
+def continuation_preflight(api, download, out_repo: str, scratch_repo: str | None, box: str, reg: dict,
+                           own_items: dict, tmp: str) -> tuple[list[str], list[str]]:
+    """-> (problems, notes): the box's continuations (fullrun.continues_of, DECISIONS H14) against the runs repo,
+    mirroring kitsune.full_queue's resume-pull, so whatever it would refuse after the paid boot is refused here. Per
+    continues item, in registry order:
+    - the box's own summary (own_items) records the item's run: its run id must be continues.run_id; done and
+      verified there: adopted (nothing else checked but its readout dir); else its continuation record must be there
+      with the registry's sets (schedule.resume_reset=true, then continue_sets) and resets_before as its
+      resume_resets_before (resume-pull refuses another record): the box goes on from the newest state holding the
+      reset, or applies the continuation again from full_step_<from_step>;
+    - else the source box's summary (full/box-<continues.box>/queue_summary.json, read once per box) must be on the
+      Hub, not "running" (the source box may still write the run dir), its same-name train item done and verified,
+      with continues.run_id as its run and, when its result says, resets_before as its resume_resets;
+    - runs/<rid>/checkpoints/full_step_<from_step>/ holds every fullrun.STATE_FILES_REQUIRED file, its trainer.json
+      says pre_cooldown with st.resume_resets resets_before (resets_before + 1: the continuation already ran from it,
+      and the box resumes it), and with schedule.resume_reset_keep_cooldown true in the sets st.early_stop.cooldown is
+      the cooldown that began there (at_step == t_c == from_step, the state's cfg schedule.clock, T == to_step), else
+      the state has no early-stop cooldown record and its st.total_steps is to_step (the run's own end);
+    - runs/m4-<rid>-r<resets_before + 1>/ (the readout dir the continuation writes) is not on the Hub, unless the own
+      summary records the item as this box's continuation of the run (an earlier rental of this box wrote that dir,
+      and its readout's re-run writes the same one, whatever the readout's status: adopt() sets an unverified one
+      pending with no out) or its readout of the item is done and verified or names that dir as its own;
+    and the states' planner n_utts are one number (the box builds one CTC store; check-resume refuses another's)."""
+    problems, notes = [], []
+
+    def read(path: str):
+        return json.loads(Path(download(out_repo, path, local_dir=tmp)).read_text(encoding="utf-8"))
+
+    files = set(api.list_repo_files(out_repo))
+    readouts = {}
+    for x in fullrun.box_items(box, reg):
+        if x["kind"] == "readout":
+            readouts.setdefault(x.get("of"), []).append(x["name"])
+    sources: dict = {}  # source box -> its Hub summary (None: not there), one download per box
+    n_utts: dict = {}
+    for name, c in fullrun.continues_of(box, reg).items():
+        rid, src, fs, ts, before = c["run_id"], c["box"], c["from_step"], c["to_step"], c["resets_before"]
+        want = _cont_sets(c)
+        keep = "schedule.resume_reset_keep_cooldown=true" in want
+        state = f"runs/{rid}/checkpoints/full_step_{fs}"
+        rdir = f"runs/m4-{rid}-r{before + 1}"
+        where = f"{name} (continues box {src}'s run {rid})"
+        own = own_items.get(name) if isinstance(own_items.get(name), dict) else {}
+        own_rid = fullrun.run_id_of(own["run_dir"]) if own.get("run_dir") else None
+        adopted = False
+        if own_rid is not None:
+            if own_rid != rid:
+                problems.append(f"{where}: box {box}'s Hub summary records run {own_rid} for it, its registry "
+                                f"continues block run {rid}: the summary is another continuation's")
+                continue
+            rec = own.get("continuation") if isinstance(own.get("continuation"), dict) else {}
+            if own.get("status") == "done" and own.get("verified") is True:
+                adopted = True
+                notes.append(f"resume: {name}: done and verified on box {box} (its own summary), run {rid}: adopted, "
+                             f"never continued again")
+            elif rec.get("run_id") != rid:
+                problems.append(f"{where}: box {box}'s Hub summary records the run without its continuation record, "
+                                f"so resume-pull could take the source run's end ({rid}'s complete summary.json) for "
+                                f"this item's: put the summary right by hand before relaunching")
+                continue
+            elif list(rec.get("sets") or []) != want or int(rec.get("resume_resets_before") or 0) != before:
+                # resume-pull's continue_item refuses the same record on the box, after the paid boot
+                problems.append(f"{where}: box {box}'s queue summary records the continuation of {rid} with sets "
+                                f"{rec.get('sets')} after {rec.get('resume_resets_before')} resets; the registry has "
+                                f"{want} after {before}: the registry changed under a started continuation; restore "
+                                f"the registry's continues block (or start the continuation again by hand)")
+                continue
+            else:
+                notes.append(f"resume: {name}: {own.get('status')} on box {box}, run {rid}, its continuation "
+                             f"recorded (resume_resets before {rec.get('resume_resets_before')}): goes on from the "
+                             f"newest state holding its reset, else again from {state}; newest state: "
+                             f"{_state_steps(api, download, out_repo, scratch_repo, rid, tmp)}")
+        else:
+            sp = fullrun.box_summary_path(src)
+            if src not in sources:
+                sources[src] = read(sp) if api.file_exists(out_repo, sp) else None
+            ss = sources[src]
+            if not isinstance(ss, dict):
+                problems.append(f"{where}: {out_repo} has no {sp}: the run's source box never put its queue summary "
+                                f"up, so nothing says the run is done")
+                continue
+            if ss.get("status") == "running":
+                problems.append(f"{where}: {sp} says running: box {src} may still be writing runs/{rid}/ (or died "
+                                f"before its end put the summary up); make sure it is gone and its summary ended "
+                                f"before a continuation writes there")
+                continue
+            s_it = (ss.get("items") or {}).get(name)
+            s_it = s_it if isinstance(s_it, dict) else {}
+            if not (s_it.get("kind") == "train" and s_it.get("status") == "done" and s_it.get("verified") is True):
+                problems.append(f"{where}: {sp} has its train item {name} {s_it.get('status')!r} (kind "
+                                f"{s_it.get('kind')!r}, verified {s_it.get('verified')!r}), not done and verified")
+                continue
+            s_rid = fullrun.run_id_of(s_it["run_dir"]) if s_it.get("run_dir") else None
+            if s_rid != rid:
+                problems.append(f"{where}: {sp} records run {s_rid} for {name}, the registry continues {rid}")
+                continue
+            rr = (s_it.get("result") or {}).get("resume_resets")
+            if rr is not None and rr != before:
+                problems.append(f"{where}: {sp} records resume_resets {rr} for the run, the registry's resets_before "
+                                f"is {before} (its readout dir would be m4-{rid}-r{before + 1})")
+                continue
+            notes.append(f"resume: {name}: continues box {src}'s run {rid} (done and verified in {sp}): reset from "
+                         f"{state} (resume_resets {before}), sets {want[1:]}, readout dir {rdir}")
+        own_rec = own.get("continuation") if isinstance(own.get("continuation"), dict) else {}
+        # this box's own run (its continuation record, or adopted done and verified) owns its -r<N> readout dir
+        if any(f.startswith(rdir + "/") for f in files) and own_rec.get("run_id") != rid and not adopted:
+            mine = [r for r in readouts.get(name, []) if isinstance(own_items.get(r), dict) and (
+                (own_items[r].get("status") == "done" and own_items[r].get("verified") is True)
+                or fullrun.run_id_of(own_items[r].get("out") or "") == rdir.rsplit("/", 1)[1])]
+            if not mine:
+                problems.append(f"{where}: {out_repo} already holds {rdir}/, which its readout would write into "
+                                f"(box {box}'s summary has no readout of it there): the two records would mix; find "
+                                f"out whose readout that is first")
+        if adopted:
+            continue
+        missing = [f for f in fullrun.STATE_FILES_REQUIRED if f"{state}/{f}" not in files]
+        if missing:
+            problems.append(f"{where}: {out_repo} lacks {missing} of {state}/: resume-pull takes exactly that state "
+                            f"and refuses an incomplete one")
+            continue
+        brief = read(f"{state}/trainer.json")
+        st = brief.get("st") if isinstance(brief.get("st"), dict) else {}
+        why = []
+        if brief.get("reason") != "pre_cooldown":
+            why.append(f"its trainer.json reason is {brief.get('reason')!r}, not pre_cooldown")
+        resets_now = st.get("resume_resets") or 0
+        if resets_now not in (before, before + 1):
+            why.append(f"its st.resume_resets is {resets_now}, the registry's resets_before {before} (+ 1 once the "
+                       f"continuation ran from it)")
+        rec = (st.get("early_stop") or {}).get("cooldown") if isinstance(st.get("early_stop"), dict) else None
+        clock = ((brief.get("cfg") or {}).get("schedule") or {}).get("clock")
+        if keep:
+            if not isinstance(rec, dict):
+                why.append("it has no early-stop cooldown record (st.early_stop.cooldown) for "
+                           "schedule.resume_reset_keep_cooldown to keep")
+            else:
+                at, t_c, T = rec.get("at_step"), rec.get("t_c"), rec.get("T")
+                if not (_number(at) and at == fs and _number(t_c) and float(t_c) == float(fs)):
+                    why.append(f"its early-stop cooldown record starts at at_step {at!r}, t_c {t_c!r}, not at the "
+                               f"state's step {fs} (only that state replays the cooldown whole)")
+                if rec.get("clock") != clock:
+                    why.append(f"its early-stop cooldown record is on the {rec.get('clock')!r} clock, the state's "
+                               f"schedule.clock is {clock!r}")
+                if not (_number(T) and float(T) == float(ts)):
+                    why.append(f"its early-stop cooldown ends at T {T!r}, the registry's to_step is {ts}")
+        else:
+            if rec:
+                why.append(f"it has an early-stop cooldown record ({rec}): without "
+                           f"schedule.resume_reset_keep_cooldown the reset drops it and re-plans the run's end")
+            if not (_number(st.get("total_steps")) and float(st["total_steps"]) == float(ts)):
+                why.append(f"its st.total_steps is {st.get('total_steps')!r}, the registry's to_step {ts}")
+        if why:
+            problems.append(f"{where}: {state}: " + "; ".join(why))
+            continue
+        n = (brief.get("planner") or {}).get("n_utts") if isinstance(brief.get("planner"), dict) else None
+        n_utts[name] = n
+        notes.append(f"resume: {name}: {state}: pre_cooldown, resume_resets {resets_now}"
+                     + (" (the continuation already ran from it: the box resumes it)" if resets_now == before + 1
+                        else "")
+                     + (f", early-stop cooldown kept (t_c {rec['t_c']} -> T {rec['T']})" if keep
+                        else f", the run ends at step {ts}") + f", planner n_utts {n}")
+    if len({n for n in n_utts.values() if n is not None}) > 1:
+        problems.append("the continued states' planner n_utts differ (" + ", ".join(
+            f"{k} {v}" for k, v in n_utts.items()) + f"): box {box} builds one CTC store, and check-resume refuses a "
+            f"state of another")
+    elif None in n_utts.values():
+        notes.append("WARNING: the planner n_utts of " + ", ".join(k for k, v in n_utts.items() if v is None)
+                     + "'s state is not in its trainer.json: not compared (check-resume compares it on the box)")
+    return problems, notes
+
+
+def _number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 def chain_preflight(data_repo: str, data_rev: str | None, sha: str, box: str, reg: dict, *,
@@ -1862,16 +2113,33 @@ def _state_steps(api, download, out_repo: str, scratch_repo: str | None, rid: st
     return ", ".join(found)
 
 
-def live_instances(exe: str, prefix: str) -> list[str]:
-    """Labels of this account's instances that start with prefix (vastai show instances), best effort: two boxes of
-    one full box would write the same run dirs."""
+def live_instance_rows(exe: str, prefix: str) -> list[dict]:
+    """This account's instances (vastai show instances rows) whose label starts with prefix, best effort (an
+    unreadable listing: none): two boxes of one full box would write the same run dirs."""
     try:
         rows = parse_json(vastai(exe, ["show", "instances", "--raw"]))
     except LaunchError:
         return []
     rows = rows.get("instances", []) if isinstance(rows, dict) else rows
-    return [f"{r.get('label')} (instance {r.get('id')}, {r.get('actual_status') or r.get('cur_state') or '?'})"
-            for r in rows if isinstance(r, dict) and str(r.get("label") or "").startswith(prefix)]
+    return [r for r in rows if isinstance(r, dict) and str(r.get("label") or "").startswith(prefix)]
+
+
+def holds_host(row: dict) -> bool:
+    """True when a vastai show instances row may hold a host (LIVE_STATUSES): its actual_status is missing or null
+    (vast still schedules a just-created instance: intended_status / cur_state say running before actual_status says
+    anything), or any of actual_status, intended_status, cur_state is live. Only a row that is clearly exited,
+    stopped or offline in all three is not."""
+    return row.get("actual_status") is None or any(
+        row.get(k) in LIVE_STATUSES for k in ("actual_status", "intended_status", "cur_state"))
+
+
+def instance_text(row: dict) -> str:
+    return f"{row.get('label')} (instance {row.get('id')}, {row.get('actual_status') or row.get('cur_state') or '?'})"
+
+
+def live_instances(exe: str, prefix: str) -> list[str]:
+    """Labels of this account's instances that start with prefix, with their id and state (live_instance_rows)."""
+    return [instance_text(r) for r in live_instance_rows(exe, prefix)]
 
 
 def sanitize_tag(branch: str) -> str:
@@ -1889,8 +2157,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="study: A (the Cohere runs, 4 GPUs), B (Parakeet + bridge, 4 GPUs), replicate (1 GPU, after "
                          "A) or shakedown (1 GPU, first); full: full-smoke (smoke A), p01 (box 1, then its recipe "
                          "test: box 1's cooldown again), full-t and full-p (box 2's two 1x boxes; full: the retired 2x "
-                         "box), "
-                         "smoke-b, or the chain p01-chain (smoke A + smoke B, then box 1 on one rental)")
+                         "box), p005 (P-0.05B), p-cool (the three cooldown re-runs of DECISIONS H14, always a "
+                         "resume), smoke-b, or the chain p01-chain (smoke A + smoke B, then box 1 on one rental)")
     ap.add_argument("--data-repo", required=True, help="private HF dataset with the derived data (KITSUNE_DATA_REPO)")
     ap.add_argument("--out-repo", default=None, help="private HF model repo for runs/ (KITSUNE_OUT_REPO; train only)")
     ap.add_argument("--config", default=None,
@@ -1969,8 +2237,13 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"full: drop offers whose expected total (rent for the planned hours + traffic) is above this "
                          f"(default {FULL_TOTAL_FACTOR:g} x the $/h cap x the planned hours + the traffic at the $/GB cap)")
     ap.add_argument("--allow-unverified-quant", action="store_true",
-                    help="full: rent a box with quantised items (full-t, full-p, p01) without a passing smoke-b verdict at its "
-                         "quant code (DECISIONS F2's go signal; the refusal becomes a warning)")
+                    help="full: rent a box with quantised items (full-t, full-p, p01, p005, p-cool) without a passing "
+                         "smoke-b verdict at its quant code (DECISIONS F2's go signal; the refusal becomes a warning)")
+    ap.add_argument("--allow-continued-runs", action="store_true",
+                    help="full: a --resume/--resume-reset/--resume-set of a box whose Hub summary's runs another "
+                         "registry box continues (its `continues` blocks, DECISIONS H14: boxes full-p, p01, p005 after "
+                         "box p-cool); refused without it, because that continuation wrote into the same run dirs and "
+                         "the same final export path")
     ap.add_argument("--no-self-stop", action="store_true",
                     help="debugging: the box does not stop itself when its on-start or bootstrap fails "
                          "(KITSUNE_NO_SELF_STOP=1); the watchdog still stops it once onstart.sh has started it")
@@ -1997,6 +2270,7 @@ def main(argv: list[str] | None = None) -> int:
                                 ("--max-total", args.max_total is not None),
                                 ("--allow-unverified-quant", args.allow_unverified_quant),
                                 ("--allow-done-trains", args.allow_done_trains),
+                                ("--allow-continued-runs", args.allow_continued_runs),
                                 ("--fresh-over-done", args.fresh_over_done)) if v]
     if full_only and not full:
         ap.error(f"{', '.join(full_only)}: for --job full only")
@@ -2030,6 +2304,7 @@ def main(argv: list[str] | None = None) -> int:
         raise LaunchError(f"--sha must be a full 40-hex commit id, got {sha!r}")
 
     reg = reader = spec = chain = None  # chain: a chain box's stages (contract addendum E), else None
+    conts: dict = {}  # a full box's continuations (fullrun.continues_of: item -> continues block), DECISIONS H14
     if full:  # the box registry at the commit the box runs: its GPUs, config, hours, price cap, disk and watchdog
         reg, reader, problems, reg_notes = full_registry(sha, skip_git_checks=args.skip_git_checks)
         errors += problems
@@ -2051,6 +2326,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nproblems:\n  --resume/--resume-reset/--resume-set refused for chain box {args.box}\n"
                   + fullrun.chain_resume_hint(args.box, chain[-1]["parts"][-1]) + "\nnot creating anything")
             return 1
+        # DECISIONS H14: a box whose train items continue other boxes' runs is always a resume - its registry carries
+        # each run's reset and sets, so the box's resume-pull resets the source's pre_cooldown state, and a fresh queue
+        # would train the runs anew from step 0 (the queue fails such an item instead, after the paid rebuild)
+        conts = fullrun.continues_of(args.box, reg) if chain is None else {}
+        if conts:
+            if args.fresh_over_done:
+                errors.append(f"--fresh-over-done is refused for box {args.box}: its train items "
+                              f"({', '.join(conts)}) continue other boxes' runs (the registry's continues blocks), so "
+                              f"every launch of it is a resume")
+            errors += continues_flag_problems(args.box, conts, resets, sets)
+            if not resume:
+                notes.append(f"box {args.box} continues other boxes' runs ({', '.join(conts)}; registry continues): "
+                             f"launched as a resume (KITSUNE_RESUME=1; the registry carries each reset and its sets)")
+            resume = True
         if args.gpus is not None and args.gpus != spec["gpus"]:
             errors.append(f"box {args.box} is planned for {spec['gpus']} GPU(s) ({fullrun.BOXES_FILE}); --gpus "
                           f"{args.gpus} refused")
@@ -2239,7 +2528,8 @@ def main(argv: list[str] | None = None) -> int:
                                                          resets=resets, sets=sets,
                                                          allow_unverified_quant=args.allow_unverified_quant,
                                                          allow_done_trains=args.allow_done_trains,
-                                                         allow_fresh_over_done=args.fresh_over_done)
+                                                         allow_fresh_over_done=args.fresh_over_done,
+                                                         allow_continued_runs=args.allow_continued_runs)
                     errors += problems
                     notes += pre_notes
                     for c in (fullrun.CHAIN_NAMES if resume else ()):  # E.8: a resume of a chain's last part
@@ -2338,9 +2628,27 @@ def main(argv: list[str] | None = None) -> int:
         # a chain whose last stage runs this box writes the same run dirs (addendum E.8): its labels too
         prefixes += [f"kitsune-full-{c}-" for c in fullrun.CHAIN_NAMES
                      if c in reg["boxes"] and args.box in fullrun.chain_stages(c, reg)[-1]["parts"]]
-        for live in [x for p in prefixes for x in live_instances(exe, p)]:
-            print(f"WARNING: a live instance of box {args.box}: {live}: destroy it (it keeps writing the runs this "
-                  f"resume pulls) before renting")
+        if not conts:
+            for live in [x for p in prefixes for x in live_instances(exe, p)]:
+                print(f"WARNING: a live instance of box {args.box}: {live}: destroy it (it keeps writing the runs "
+                      f"this resume pulls) before renting")
+        else:
+            # DECISIONS H14: a continuation box's runs are its source boxes' run dirs, and every launch of it is a
+            # resume. A second box of it (a re-run launch after a create that did rent), or a live source box (which
+            # syncs the same runs/<rid>/ at its end), is refused while it holds a host; an exited or offline one only
+            # warns (a host-loss relaunch may still list the lost instance)
+            owners = [(args.box, p) for p in prefixes]
+            owners += [(src, f"kitsune-full-{src}-{Path(reg['boxes'][src]['data_config']).stem}-")
+                       for src in dict.fromkeys(c["box"] for c in conts.values())]
+            for who, p in owners:
+                for row in live_instance_rows(exe, p):
+                    what = f"box {who}" if who == args.box else f"source box {who} (its runs continue here)"
+                    if holds_host(row):
+                        errors.append(f"a live instance of {what}: {instance_text(row)}: destroy it before renting "
+                                      f"box {args.box} (two boxes would write the same runs/<run_id>/ dirs)")
+                    else:
+                        print(f"WARNING: an instance of {what}: {instance_text(row)}, not {'/'.join(LIVE_STATUSES)}: "
+                              f"destroy it before renting box {args.box}")
 
     if label_job:
         env = {"KITSUNE_JOB": "label", "KITSUNE_SHA": sha, "KITSUNE_CONFIG": config,

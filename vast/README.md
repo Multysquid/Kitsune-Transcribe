@@ -759,16 +759,17 @@ two 1x RTX 5090 boxes (DECISIONS G2): **box T** (`full-t`: T-0.6B with the same 
 speech from `aug/musan-bg-v2`, room echo from `aug/rirs-v1`, volume and codecs; the box pulls both banks as extra dirs)
 -, the Cohere labels only, `data-t`) and **box P**
 (`full-p`: P-0.3B with the CTC train-data augmentation recipe, `full-p03.json`'s `augment` block, the Parakeet labels,
-`data-p`, with the Whisper models and the quantised readouts; done 2026-10-04, M4 9.73 %; now its recipe-v4 cooldown
-re-run, DECISIONS H13, below). T-0.6B trains 8 epochs
+`data-p`, with the Whisper models and the quantised readouts; done 2026-10-04, M4 9.73 %; its run's cooldown re-run is
+box p-cool's, DECISIONS H14, below). T-0.6B trains 8 epochs
 (DECISIONS H7, 2026-10-05) and P-0.3B trained 6 (H5); 3 each under G1 before, with the common early-stop patience 6.
 DECISIONS H2 postponed P-0.05B (its items left box P). It comes back alone on box `p005`, **the P test box**
 (DECISIONS H8-H10, H12, below): P-0.05B from step 0 at 10 epochs (`full-p005.json`) with recipe v4 (recipe v2 plus
 the P-0.3B review's two fixes, the end trim and background audio, and room echo, volume, codecs, background speech and
-songs with lyrics - the targets always the teacher's on the clean row), its M4 and 7 quantised readouts. Boxes
-`full-p` and `p01` (which ran **the recipe test** after box 1, DECISIONS H1) now hold **the recipe-v4 cooldown
-re-runs** of P-0.3B's and P-0.1B's runs (DECISIONS H13, below), and box T waits too: all after the P test box's
-result. The 2x box `full` is retired: its
+songs with lyrics - the targets always the teacher's on the clean row), its M4 and 7 quantised readouts (done: its
+early stop cooled it down). **Box `p-cool`** (DECISIONS H14, below) re-runs **the cooldowns** of P-0.3B's, P-0.1B's and P-0.05B's
+runs on one rental (H13's two re-runs on boxes `full-p` and `p01`, which ran **the recipe test** after box 1,
+DECISIONS H1, moved there; both boxes' entries are the records of their runs again), and box T waits. The 2x box
+`full` is retired: its
 name stays in `fullrun.BOX_NAMES` for the tests' fixtures only, it is not in the registry, and launch refuses it. Each is one `launch.py --job full --box <box>` call; on the box
 `vast/supervise.py` runs `kitsune/full_queue.py` for that box. The box registry `configs/full/boxes.json`
 (`kitsune/fullrun.py`) is the one source of each box's GPU count, data config, hours (`est_hours` planned, `max_hours`
@@ -795,8 +796,7 @@ Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/m
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --machine <smoke A's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box smoke-b --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p005 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p01 --resume-reset full-p01-20261001T184145Z --resume-set full-p01-20261001T184145Z:schedule.epochs=4 --resume-set full-p01-20261001T184145Z:augment.enabled=true --resume-set full-p01-20261001T184145Z:augment.truncate_p=0.2 --resume-set full-p01-20261001T184145Z:augment.concat_p=0.5 --resume-set full-p01-20261001T184145Z:augment.mix_p=0.0 --resume-set full-p01-20261001T184145Z:augment.truncate_min_row_s=3.0 --resume-set full-p01-20261001T184145Z:augment.end_trim_p=0.3 --resume-set full-p01-20261001T184145Z:augment.noise_p=0.3 --resume-set full-p01-20261001T184145Z:augment.noise_bank=aug/musan-bg-v2 --resume-set full-p01-20261001T184145Z:augment.noise_bank_sha256=1d56c7bf5cb0f1ad036f551a81c0029360ba821186f3c5abe41d344c381339f0 --resume-set full-p01-20261001T184145Z:augment.speech_p=0.15 --resume-set full-p01-20261001T184145Z:augment.reverb_p=0.2 --resume-set full-p01-20261001T184145Z:augment.rir_bank=aug/rirs-v1 --resume-set full-p01-20261001T184145Z:augment.rir_bank_sha256=af6d19310210aa2578c902b55d2e8d6f9e67924ede368a86fe5d6f8bce40e588 --resume-set full-p01-20261001T184145Z:augment.gain_p=0.3 --resume-set full-p01-20261001T184145Z:augment.codec_p=0.1 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-p --resume-reset full-p03-20261003T230143Z --resume-set full-p03-20261003T230143Z:schedule.epochs=6 --resume-set full-p03-20261003T230143Z:augment.enabled=true --resume-set full-p03-20261003T230143Z:augment.truncate_p=0.2 --resume-set full-p03-20261003T230143Z:augment.concat_p=0.5 --resume-set full-p03-20261003T230143Z:augment.mix_p=0.0 --resume-set full-p03-20261003T230143Z:augment.truncate_min_row_s=3.0 --resume-set full-p03-20261003T230143Z:augment.end_trim_p=0.3 --resume-set full-p03-20261003T230143Z:augment.noise_p=0.3 --resume-set full-p03-20261003T230143Z:augment.noise_bank=aug/musan-bg-v2 --resume-set full-p03-20261003T230143Z:augment.noise_bank_sha256=1d56c7bf5cb0f1ad036f551a81c0029360ba821186f3c5abe41d344c381339f0 --resume-set full-p03-20261003T230143Z:augment.speech_p=0.15 --resume-set full-p03-20261003T230143Z:augment.reverb_p=0.2 --resume-set full-p03-20261003T230143Z:augment.rir_bank=aug/rirs-v1 --resume-set full-p03-20261003T230143Z:augment.rir_bank_sha256=af6d19310210aa2578c902b55d2e8d6f9e67924ede368a86fe5d6f8bce40e588 --resume-set full-p03-20261003T230143Z:augment.gain_p=0.3 --resume-set full-p03-20261003T230143Z:augment.codec_p=0.1 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p-cool --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch --allow-unverified-quant
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-t --machine <id> --avoid-machine <p01's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-p --machine <id> --avoid-machine <p01's id> --avoid-machine <full-t's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 ```
@@ -814,12 +814,13 @@ recipe helps (H1 step 2: its readout `runs/m4-full-p01-20261001T184145Z-r1` agai
 c4604304); box full-t (T-0.6B, 8 epochs, the AED recipe: DECISIONS H7) needs the cut table uploaded to the data repo
 first (launch refuses a missing extra file). After the P-0.3B review, **box p005, the P test box** (DECISIONS H8-H10,
 the `--box p005` line above, a fresh launch; it needs the banks `aug/musan-bg-v2` and `aug/rirs-v1` in the data repo) comes
-first; the recipe-v4 cooldown re-runs on boxes p01 and full-p (the two `--resume-reset` lines, DECISIONS H13) and
-box full-t wait for its result. The hours of boxes p01, full-t, full-p and p005 (`est_hours`, `max_hours` and the train items' no-start needs)
+first; box p-cool (the `--box p-cool` line, DECISIONS H14: from a main that contains the fp16 fix, PR #52) and box
+full-t come after its result. The hours of boxes full-t, p005 and p-cool (`make_full_configs.py` `HOURS_BOXES`:
+`est_hours`, `max_hours` and the train items' no-start needs)
 come from the speed record `configs/full/plan/box2_hours.json` (smoke A's measured s/step and box 1's, `box1_go.py
 --revision <its 4-epoch record> --json` then `make_full_configs.py --import-speed --box1-go`) at the step counts of
 the plan record's launch part (`--import-launch-plan`), so their lines take no `--max-hours`; launch warns while the
-record has no box-1 part. launch refuses a box with quantised items (full-p 7, full-t 7, p01 7, p005 7) without **the quant go
+record has no box-1 part. launch refuses a box with quantised items (full-p 7, full-t 7, p01 7, p005 7, p-cool 21) without **the quant go
 signal**: smoke-b's verdict on the Hub passed overall and every one of checks 12-16, at a commit that is an ancestor of
 the one the box runs, with `kitsune/quant.py`, `tools/speed_probe.py`, `scripts/05_evaluate.py`, `kitsune/whisper.py`,
 `tools/whisper_eval.py`, `requirements-train.txt` and `docker/Dockerfile` unchanged since (`QUANT_CODE`): a later
@@ -830,7 +831,7 @@ What launch checks and decides, before anything is rented:
 - **Offers:** `--tier 5090` (default) or `a100` (option C, default cap $2.60/h). Per GPU: `cpu_cores_effective >= 16`,
   `cpu_ram >= 60` in the query and 64,000 MB on the client, `inet_up >= 100`; reliability >= 0.98, driver CUDA >= 13.0,
   disk_bw and inet_down >= 500, a direct port, the disk from the extent's sizing plus the registry's `extra_gb`. A box
-  with `min_ram_gb` (boxes p01, full-t, full-p: 96) asks the query for `cpu_ram >= floor(0.94 x it)` (90) and the
+  with `min_ram_gb` (boxes p01, full-t, full-p, p005, p-cool: 96) asks the query for `cpu_ram >= floor(0.94 x it)` (90) and the
   client for `round(0.97 x it x 1000)` MB (93,120: vast lists 96 GB machines at 95,758-96,709 MB). Box 1's real peaks
   were 33 GiB (trainer) and 37 GiB (store build); its queue summary's 164 GB `peak_rss_gb` is VmRSS summed over the
   trainer and its 8 DataLoader workers, the stores' page cache counted once per process, and reads ~150+ on any large
@@ -955,27 +956,51 @@ A dead or stopped box continues elsewhere from what the Hub has:
   codec (0.1: MP3, GSM 6.10, mu-law) - the targets the teacher's on the clean row; 12 loader workers for the chain's
   CPU). Its own box: box p01's Hub summary holds box 1's run, which the
   continuation below resumes, and a fresh queue on box p01 would overwrite it.
-- **The recipe-v4 cooldown re-runs** (DECISIONS H13, the owner on 2026-10-08, after the P test box): H1's design
-  again on both P runs - each `--resume-reset` of a done run from its pre_cooldown state to the SAME end (its own
-  epochs), every step of the cooldown with RECIPE V4 (`make_full_configs.py` `CONTINUATIONS` p03 and p01, no patience;
-  `--import-speed` prints the lines; the two commands above):
-  - box full-p: P-0.3B's run `full-p03-20261003T230143Z` from `checkpoints/full_step_169376` to T 211,720 (42,344
-    steps, est 8.2 h / max 14 h), its readout to `runs/m4-full-p03-20261003T230143Z-r1` (its state counts no reset
-    yet), then its 7 quantised readouts; the box's 4 Whisper evals are done and verified, so resume-pull keeps them
-    done. The baseline, the 6-epoch run (M4 9.73 %), stays citable as runs-repo revision
-    3674d2d7ae7480594b079234b1549014fe96f783 (the box's final summary);
-  - box p01: P-0.1B's run `full-p01-20261001T184145Z` from `checkpoints/full_step_86328` to T 107,910 (21,582 steps,
-    est 5.0 h / max 10 h), its readout to `runs/m4-full-p01-20261001T184145Z-r2`: the runs repo's pre_cooldown state
-    is the first test's re-save at the same step (model, optimizer and L2-SP byte for byte box 1's; st.resume_resets
-    1), so this reset counts 2, and a lost host resumes only from its own states. Box 1's record stays revision
-    c4604304, A1's 41ce1f0.
-  Each is a paired A/B against its baseline: everything before the cooldown is the baseline's. A re-run overwrites its
-  run's summary, config, final evals and export at the runs repo's head (the baselines stay at their revisions). H9's
-  8-epoch continuation of P-0.1B (`schedule.epochs=8`, `early_stop.patience=12`) is set aside; it can start later from
-  the same pre_cooldown weights. Boxes p005, p01, full-p and full-t pull the background bank `aug/musan-bg-v2` (MUSAN:
-  15 h of music without vocals, 6.2 h of noise, 10 h of songs, 10 h of speech; `tools/build_noise_bank.py`) and the RIR
-  bank `aug/rirs-v1` (OpenSLR 28: 1,525 small, medium and real rooms; `tools/build_rir_bank.py`) as extra dirs; launch
-  refuses them until both banks are in the data repo at the pinned sha256s.
+- **Box p-cool, the cooldown re-runs** (DECISIONS H14, the owner on 2026-10-09; it replaces H13's two
+  `--resume-reset` launches of boxes full-p and p01, and P-0.05B's re-run joined them): one 1x RTX 5090 rental
+  (`data-p01`: one rebuild and one CTC store, which the three P configs share) re-runs, IN THIS ORDER, three done runs'
+  cooldowns, each from its runs-repo pre_cooldown state to the run's own end, then that run's M4 readout and its 7
+  quantised readouts:
+  - `full-p03`: box full-p's P-0.3B run `full-p03-20261003T230143Z` from `checkpoints/full_step_169376` to T 211,720
+    (42,344 steps, all of them cooldown), RECIPE_GENTLE; readout `runs/m4-full-p03-20261003T230143Z-r1` (its state
+    counts no reset yet); baseline runs-repo revision 3674d2d7ae7480594b079234b1549014fe96f783 (M4 9.73 %);
+  - `full-p01`: box p01's P-0.1B run `full-p01-20261001T184145Z` from `checkpoints/full_step_86328` to T 107,910
+    (21,582 steps), RECIPE_V4_FULL; readout `runs/m4-full-p01-20261001T184145Z-r2` (the runs repo's pre_cooldown
+    state is A1's re-save at the same step, st.resume_resets 1); baseline c4604304db76e068df7bbe39d00d006b74d6c134
+    (M4 11.45 %; A1's record 41ce1f0);
+  - `full-p005`: box p005's P-0.05B run `full-p005-20261008T160232Z` from `checkpoints/full_step_67449`, the start of
+    the cooldown its early stop began, to that cooldown's T 80,939 (13,490 steps), RECIPE_GENTLE with
+    `schedule.resume_reset_keep_cooldown=true` (the reset keeps the state's early-stop cooldown record, so the same
+    t_c, T and LR replay instead of a new 10-epoch plan); readout `runs/m4-full-p005-20261008T160232Z-r1`; baseline
+    d2caddfc308c10495253c0204c4edf8a6222dac0.
+
+  The registry carries the continuations: each train item's `continues` block (`kitsune.fullrun`: the source box
+  whose Hub summary records the run, the run id, from / to step, the resets before and the trainer sets;
+  `make_full_configs.py` `CONTINUATIONS` / `continues_block`, which `--check` holds the blocks to). So the box is
+  always a resume - launch sets `KITSUNE_RESUME=1` without `--resume`, bootstrap runs resume-pull when `python -m
+  kitsune.fullrun has-continues --box p-cool` prints 1 - and never trains a run from step 0; its line takes no
+  `--resume-reset` / `--resume-set` (launch refuses them for a continues run id, and `--fresh-over-done`). Before
+  renting, launch's resume preflight reads the box's own summary (optional for this box) or each source box's, and
+  checks each pre_cooldown state (its files, reason pre_cooldown, its resets, P-0.05B's kept cooldown record) and that
+  no readout dir already exists. Every continuation sets the run's own epochs, `schedule.deadline_cooldown=false` (4d
+  must never compress a paired cooldown: a box out of time is stopped by the watchdog at its cap and resumed with
+  `--resume`) and every key of its recipe with the ranges written out, so no continuation inherits a range from the
+  state it resumes: RECIPE_V4_FULL = recipe v4 at the trainer's defaults (background 0-20 dB, background speech 10-25
+  dB, volume -20..+10 dB, codecs MP3 / GSM 6.10 / mu-law); RECIPE_GENTLE = recipe v4 with background 5-20 dB,
+  background speech 15-25 dB, volume -10..+10 dB, codecs MP3 / mu-law and no background speech or noise under rows
+  shorter than 3 s (`augment.background_min_row_s=3.0`; reverb, volume and codec still apply). Hours: full-p03 5.39 h,
+  full-p01 2.11 h, full-p005 1.01 h, est 11.8 h / max 19 h (`make_full_configs.py --import-speed` prints them and every
+  continuation's sets). Launch it from a main that contains the fp16 fix (PR #52), with `--allow-unverified-quant`
+  until a smoke-B verifies that commit's quant code (the quant go signal above). Each readout against its baseline
+  revision is a paired A/B of the cooldown's recipe: everything before the cooldown is the baseline's. A re-run
+  overwrites its run's summary, config, final evals and export at the runs repo's head (the baselines stay at their
+  revisions). Boxes full-p and p01 keep their entries as the records of their runs (box p01's: H9's 8-epoch
+  continuation, set aside: it can start later from the same pre_cooldown weights); launch refuses a `--resume` of
+  them, whose runs box p-cool continues, unless `--allow-continued-runs`. Boxes p005, p-cool, p01 and full-t pull
+  the background bank `aug/musan-bg-v2` (MUSAN: 15 h of music without vocals, 6.2 h of noise, 10 h of songs,
+  10 h of speech; `tools/build_noise_bank.py`) and the RIR bank `aug/rirs-v1` (OpenSLR 28: 1,525 small, medium and
+  real rooms; `tools/build_rir_bank.py`) as extra dirs; launch refuses them until both banks are in the data repo at
+  the pinned sha256s.
 - launch refuses a **plain `--resume` of a box whose Hub summary has every train item done** (box p01 before its
   continuation started: it would only adopt box 1's run and score the new quantised items on the 4-epoch weights);
   `--allow-done-trains` lets it through for a box lost in its eval pool (box P after its trainings). A continuation

@@ -460,6 +460,38 @@ def test_background_on_aed_rows(env, tmp_path):
         assert torch.equal(got["lengths"], ref["lengths"]) and torch.equal(got["top_idx"], ref["top_idx"])
 
 
+def test_short_aed_rows_are_spared_the_background(env, tmp_path):
+    """augment.background_min_row_s on a token store (DECISIONS H14): a row whose audio is under the limit gets no
+    background (its wave the plain one), the others do; every micro-batch's aug carries short_rows, speech_spared and
+    noise_spared, 0 included, so the train step's sum over the first micro-batch's keys takes a micro-batch without a
+    short row and one with, in either order; at 0 there are no such keys."""
+    from kitsune.noise_bank import NoiseBank
+
+    bank = NoiseBank.load(make_noise_bank(tmp_path / "bank"))
+    st = env["store"]
+    plain = T.dataset_for(st)
+    mbs = micro_batches(st)[:8]
+    lengths = {tuple(idx): plain[idx]["lengths"].tolist() for idx in mbs}
+    lim_n = max(min(v) for v in lengths.values())  # the micro-batch with the longest shortest row has none under it
+    assert any(min(v) < lim_n for v in lengths.values())
+    ds = T.dataset_for(st, augment=spec(noise_p=1.0, background_min_row_s=lim_n / T.TARGET_SR), noise=bank)
+    augs = []
+    for idx in mbs:
+        got, ref = ds[idx], plain[idx]
+        n_short = sum(n < lim_n for n in lengths[tuple(idx)])
+        a = got["aug"]
+        assert (a["short_rows"], a["noise_spared"], a["speech_spared"]) == (n_short, n_short, 0)
+        assert a["noised"] == len(idx) - n_short and torch.equal(got["lengths"], ref["lengths"])
+        for b, n in enumerate(lengths[tuple(idx)]):
+            assert torch.equal(got["wave"][b, :n], ref["wave"][b, :n]) == (n < lim_n), (idx, b)
+        augs.append(a)
+    some, none = next(a for a in augs if a["short_rows"]), next(a for a in augs if not a["short_rows"])
+    for order in ([some, none], [none, some], augs):
+        step = {k: sum(int(a[k]) for a in order) for k in order[0]}  # train_step's aggregation
+        assert step["short_rows"] == sum(a["short_rows"] for a in order)
+    assert "short_rows" not in T.dataset_for(st, augment=spec(noise_p=1.0), noise=bank)[mbs[0]]["aug"]
+
+
 def test_same_index_list_same_batch(env):
     st = env["store"]
     a = spec(truncate_p=0.6, truncate_min_s=0.2, concat_p=0.7, mix_p=0.5, end_trim_p=0.5)
@@ -575,6 +607,8 @@ def test_an_aed_run_with_every_augmentation(env):
     assert st["aug/noised_frac"].max() > 0 and aug["noise_p"] == 0.5 and aug["noise_clips"] == 4
     for tag in ("aug/speech_frac", "aug/reverb_frac", "aug/gain_frac", "aug/codec_frac"):  # DECISIONS H12
         assert ((st[tag] >= 0) & (st[tag] <= 1)).all() and st[tag].max() > 0, tag
+    assert not {"aug/short_frac", "aug/speech_spared_frac", "aug/noise_spared_frac"} & set(st.columns)  # key at 0
+    assert "background_min_row_s" not in aug
     utts = pd.concat([pd.read_parquet(p) for p in sorted((run / "metrics" / "train_utts").glob("part-*.parquet"))])
     ids = {u.id for u in env["store"].utts}
     assert all(x in ids for r in utts["id"] for x in r.split("+")) and (utts["n_tok"] > 0).all()

@@ -270,7 +270,13 @@ the trainer as it was before them; configs/full/*.json turn them on):
                     (st["schedule_resets"], a `resume_reset` event, summary.json's resume_resets). Refused on a fresh
                     start, on a T/2 branch and with a STOP file; a resume that sets another schedule.epochs without
                     the flag is refused too when it would change nothing (plan_epochs keeps the state's total_steps;
-                    a switch to the epoch clock from a state without a plan still plans it)
+                    a switch to the epoch clock from a state without a plan still plans it).
+                    --set schedule.resume_reset_keep_cooldown=true with it (DECISIONS H14; epochs or steps clock):
+                    from the pre_cooldown state at an early-stop cooldown's start, the reset keeps that cooldown
+                    record and the trigger, so the continuation replays the same cooldown (t_c, T, LR; end_reason
+                    early_stop) under this launch's other sets; refused without such a record, on another clock and
+                    when the re-planned T falls below the record's; cleared with the flag (cooldown_kept {t_c, T} in
+                    the reset's record). schedule.deadline_cooldown may change on a resume (false: no 4d)
   deadline cooldown schedule.deadline_cooldown (clock epochs or steps; the wall clock has fit_budget): at loop start
   (4d)              and every deadline_check_steps steps after the smoke phase, fit_epochs_deadline projects the end
                     phase against $KITSUNE_DEADLINE from the loop-clock s/step over >= deadline_window_steps steps of
@@ -516,7 +522,10 @@ DEFAULTS = {
     # a room impulse response of rir_bank (a data-repo dir, tools/build_rir_bank.py; rir_bank_sha256 pins its
     # index.json);
     # gain_p - gain_db dB, clipped at full scale; codec_p - one of codecs (kitsune.acoustics.CODECS: mp3, gsm, ulaw8k,
-    # vorbis, opus), encoded and decoded in memory; a codec this machine's libsndfile lacks is dropped at setup
+    # vorbis, opus), encoded and decoded in memory; a codec this machine's libsndfile lacks is dropped at setup.
+    # background_min_row_s (DECISIONS H14): rows shorter than this many seconds of audio at the acoustic steps get no
+    # background speech and no background (reverb, gain and codec still apply; aug/short_frac, aug/speech_spared_frac,
+    # aug/noise_spared_frac); 0: every row may
     "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
                 "truncate_pause_p": 0.5, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0,
                 "mix_snr_db": [5.0, 20.0], "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
@@ -524,7 +533,7 @@ DEFAULTS = {
                 "noise_snr_db": [0.0, 20.0], "noise_bank": None, "noise_bank_sha256": None, "speech_p": 0.0,
                 "speech_snr_db": [10.0, 25.0], "speech_talkers": [1, 4], "speech_batch_p": 0.5, "reverb_p": 0.0,
                 "rir_bank": None, "rir_bank_sha256": None, "gain_p": 0.0, "gain_db": [-20.0, 10.0], "codec_p": 0.0,
-                "codecs": ["mp3", "gsm", "ulaw8k"]},
+                "codecs": ["mp3", "gsm", "ulaw8k"], "background_min_row_s": 0.0},
     # BatchNorm: mode "frozen" (eval mode, running stats fixed, affine trainable: the pruned students, whose BN holds
     # the teacher's statistics) or "train" (a student trained from scratch: BN trains, its running stats update, eval
     # and greedy decoding use them; gradient checkpointing is never turned on). momentum: null = the modules' own
@@ -541,10 +550,14 @@ DEFAULTS = {
     # cooldown with a fresh schedule, e.g. more schedule.epochs (resume_reset_start; the module docstring's full-data
     # section). deadline_cooldown (clock epochs or steps): schedule, start or compress the WSD cooldown so the end
     # phase finishes before $KITSUNE_DEADLINE (fit_epochs_deadline), checked at loop start and every
-    # deadline_check_steps steps from the loop-clock s/step over at least deadline_window_steps steps of this launch
+    # deadline_check_steps steps from the loop-clock s/step over at least deadline_window_steps steps of this launch.
+    # resume_reset_keep_cooldown (DECISIONS H14; with resume_reset, one-shot as it): the reset keeps the state's
+    # early-stop cooldown record - from the pre_cooldown state at its start - so the continuation replays that same
+    # cooldown (t_c, T, LR) instead of planning a new schedule (resume_reset_start). deadline_cooldown may change on a
+    # resume: false turns 4d off for a continuation
     "schedule": {"warmup_steps": 300, "cooldown_frac": 0.2, "train_hours": 4.0, "clock": "wall", "max_steps": None,
                  "end_reserve_min": 30, "epochs": None, "resume_reset": False, "deadline_cooldown": False,
-                 "deadline_check_steps": 100, "deadline_window_steps": 1000},
+                 "deadline_check_steps": 100, "deadline_window_steps": 1000, "resume_reset_keep_cooldown": False},
     "batch": {"step_audio_s": 1500, "micro_audio_s": 400, "pool_micro": 50, "max_dec_len": 200},
     # probe_extended: the memory probe also runs the micro-batch with the most rows (and, family ctc, the most CTC
     # targets and the largest CTC lattice); probe_shapes: null or [{"name", "durations"}], synthetic micro-batches of
@@ -943,6 +956,13 @@ def validate_full(cfg: dict):
     for key in ("deadline_check_steps", "deadline_window_steps"):
         if not _pos_int(sch[key]):
             raise SystemExit(f"schedule.{key} must be an int >= 1, got {sch[key]!r}")
+    if sch["resume_reset_keep_cooldown"] and not sch["resume_reset"]:
+        # resume_reset_start clears it with resume_reset before any save, so a saved state never holds it alone
+        raise SystemExit("schedule.resume_reset_keep_cooldown is a resume reset's one-shot flag: pass it with --resume "
+                         "<state> --set schedule.resume_reset=true, never alone, in a config or on a fresh start")
+    if sch["resume_reset_keep_cooldown"] and sch["clock"] == "wall":
+        raise SystemExit("schedule.resume_reset_keep_cooldown needs schedule.clock 'epochs' or 'steps': on the wall "
+                         "clock the kept record's t_c and T are loop seconds, which a continuation would not replay")
     shapes = cfg["memory"]["probe_shapes"]
     if shapes is not None:
         ok = isinstance(shapes, list) and bool(shapes)
@@ -1007,6 +1027,9 @@ def validate_augment(cfg: dict):
     if not (_number(a["truncate_min_row_s"]) and a["truncate_min_row_s"] >= 0):
         raise SystemExit(f"augment.truncate_min_row_s must be a number of seconds >= 0, got "
                          f"{a['truncate_min_row_s']!r}")
+    if not (_number(a["background_min_row_s"]) and a["background_min_row_s"] >= 0):
+        raise SystemExit(f"augment.background_min_row_s must be a number of seconds >= 0, got "
+                         f"{a['background_min_row_s']!r}")
     if not (_number(a["truncate_min_s"]) and a["truncate_min_s"] >= 0):
         raise SystemExit(f"augment.truncate_min_s must be a number of seconds >= 0, got {a['truncate_min_s']!r}")
     if not (_number(a["concat_max_s"]) and a["concat_max_s"] > 0):
@@ -2443,7 +2466,8 @@ def setup_codecs(R: Run, a: dict) -> dict:
 
 
 def noise_fields(spec, bank, rirs=None) -> dict:
-    """The `augment` event's acoustic fields: the background bank's and the other acoustic steps' settings."""
+    """The `augment` event's acoustic fields: the background bank's and the other acoustic steps' settings
+    (background_min_row_s only when > 0: the event as before the key otherwise)."""
     return dict(noise_p=spec.noise_p, noise_snr_db=list(spec.noise_snr_db),
                 noise_bank=None if bank is None else bank.path,
                 noise_bank_sha256=None if bank is None else bank.info.get("index_sha256"),
@@ -2456,7 +2480,8 @@ def noise_fields(spec, bank, rirs=None) -> dict:
                 rir_bank=None if rirs is None else rirs.path,
                 rir_bank_sha256=None if rirs is None else rirs.info.get("index_sha256"),
                 rir_clips=None if rirs is None else len(rirs.lengths), gain_p=spec.gain_p,
-                gain_db=list(spec.gain_db), codec_p=spec.codec_p, codecs=list(spec.codecs))
+                gain_db=list(spec.gain_db), codec_p=spec.codec_p, codecs=list(spec.codecs),
+                **({"background_min_row_s": spec.background_min_row_s} if spec.background_min_row_s > 0 else {}))
 
 
 def acoustic_line(spec) -> str:
@@ -2464,7 +2489,9 @@ def acoustic_line(spec) -> str:
     return (f"background {spec.noise_p:g} at {spec.noise_snr_db[0]:g}-{spec.noise_snr_db[1]:g} dB, speech "
             f"{spec.speech_p:g} ({spec.speech_talkers[0]}-{spec.speech_talkers[1]} voices at {spec.speech_snr_db[0]:g}-"
             f"{spec.speech_snr_db[1]:g} dB), reverb {spec.reverb_p:g}, gain {spec.gain_p:g} ({spec.gain_db[0]:g}.."
-            f"{spec.gain_db[1]:g} dB), codec {spec.codec_p:g} ({', '.join(spec.codecs) or 'none'})")
+            f"{spec.gain_db[1]:g} dB), codec {spec.codec_p:g} ({', '.join(spec.codecs) or 'none'})"
+            + (f", rows under {spec.background_min_row_s:g} s spared speech and background"
+               if spec.background_min_row_s > 0 else ""))
 
 
 def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float, noise=None, rirs=None):
@@ -3161,6 +3188,10 @@ def log_step(R: Run, step: int, lr: float, phase: int, out: dict, wait_s: float,
                     "aug/speech_frac": a.get("speech_mixed", 0) / rows, "aug/reverb_frac": a.get("reverbed", 0) / rows,
                     "aug/gain_frac": a.get("gained", 0) / rows, "aug/clipped_frac": a.get("clipped", 0) / rows,
                     "aug/codec_frac": a.get("coded", 0) / rows})
+        if "short_rows" in a:  # augment.background_min_row_s > 0: rows under it, and those the speech / background
+            # gate picked and the limit spared (aug/speech_frac and aug/noised_frac stay the rows actually changed)
+            row.update({"aug/short_frac": a["short_rows"] / rows, "aug/speech_spared_frac": a["speech_spared"] / rows,
+                        "aug/noise_spared_frac": a["noise_spared"] / rows})
         if "concat_capped" in a:  # an AED step: micro-batches whose join the decoder cap refused, and cut-table pieces
             # whose frames differ from their decoded audio's (counts; the second is expected to stay 0)
             row.update({"aug/concat_capped": a["concat_capped"], "aug/cut_mismatch": a["cut_mismatch"]})
@@ -5008,9 +5039,10 @@ def build(args) -> tuple[Run, dict | None]:
                              "the run's logs on the Hub with this launch's")
     else:
         cfg = load_config(args.config, args.set)
-        if cfg["schedule"]["resume_reset"]:
-            raise SystemExit("schedule.resume_reset is a resume's one-shot flag: pass it with --resume <state> (--set "
-                             "schedule.resume_reset=true), never in a config or a fresh start")
+        if cfg["schedule"]["resume_reset"] or cfg["schedule"]["resume_reset_keep_cooldown"]:
+            raise SystemExit("schedule.resume_reset (and resume_reset_keep_cooldown) is a resume's one-shot flag: pass "
+                             "it with --resume <state> (--set schedule.resume_reset=true), never in a config or a fresh "
+                             "start")
         overrides = repeated = {}
         if cfg["branch"]["parent"]:
             branch_full, state = branch_start_state(cfg)
@@ -5091,13 +5123,37 @@ def resume_reset_start(R: Run) -> dict:
     the fresh early-stop state counts the file as acted on, so a copy pulled back is ignored - and so is a new COOLDOWN
     in this continuation: the event warns); counts st["resume_resets"]; and sets the flag false in R.cfg before
     anything is saved, so every later save and a crash-resume from one do not reset again, while a repeat of the same
-    argv before the first save resets the same state the same way. Returns what resume_reset_finish records."""
+    argv before the first save resets the same state the same way. Returns what resume_reset_finish records.
+    schedule.resume_reset_keep_cooldown (DECISIONS H14): the state's early-stop cooldown record survives the reset, so
+    the continuation replays the cooldown the run began there - the same t_c and T (Run.progress, cooldown_start), the
+    same LR at every step - with whatever else this launch sets (augment.*): taken only from the state at the
+    cooldown's start (the record's at_step == t_c == the state's step: the pre_cooldown state, refused otherwise or
+    without a record) on the same clock; the early-stop state is fresh but for that record and the state's trigger, so
+    early_stop_check stays a no-op as it was after the trigger and the run ends with end_reason early_stop. The flag
+    is cleared with resume_reset (one-shot: a later plain resume of a saved state works); the record joins the reset's
+    as cooldown_kept {t_c, T}."""
     st, cfg = R.st, R.cfg
     if R.branch_start or st.get("branch"):
         raise SystemExit("schedule.resume_reset: a T/2 branch keeps its parent's schedule; it cannot be reset")
     if (R.run_dir / STOP_FILE).exists():
         raise SystemExit(f"schedule.resume_reset with {R.run_dir / STOP_FILE} present: the STOP file would end the "
                          "continued run at once; remove it first")
+    keep = None
+    if cfg["schedule"]["resume_reset_keep_cooldown"]:  # every refusal before anything is changed (COOLDOWN, the Hub)
+        rec, step, clock = st["early_stop"].get("cooldown"), int(st["step"]), cfg["schedule"]["clock"]
+        where = f"{R.run_dir.name} at step {step}"
+        if not rec:
+            raise SystemExit(f"schedule.resume_reset_keep_cooldown: the state of {where} has no early-stop cooldown "
+                             "record (st early_stop.cooldown) to keep; reset without the flag (a new schedule)")
+        if not (rec.get("at_step") is not None and int(rec["at_step"]) == step and float(rec["t_c"]) == float(step)):
+            raise SystemExit(f"schedule.resume_reset_keep_cooldown: the state of {where} is not the pre_cooldown state "
+                             f"at its early-stop cooldown's start (record at_step {rec.get('at_step')!r}, t_c "
+                             f"{rec.get('t_c')!r}): only that state replays the cooldown whole")
+        if rec.get("clock") != clock:
+            raise SystemExit(f"schedule.resume_reset_keep_cooldown: the cooldown record of {where} is on the "
+                             f"{rec.get('clock')!r} clock, schedule.clock is {clock!r}: its t_c and T would mean "
+                             "something else")
+        keep = dict(cooldown=copy.deepcopy(rec), triggered=copy.deepcopy(st["early_stop"].get("triggered")))
     before = dict(at_step=int(st["step"]), time_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                   total_steps_before=st.get("total_steps"), early_stop_before=copy.deepcopy(st["early_stop"]),
                   pre_cooldown_full_before=st.get("pre_cooldown_full"),
@@ -5125,8 +5181,12 @@ def resume_reset_start(R: Run) -> dict:
             before["cooldown_warning"] = (f"the runs repo may still hold runs/{R.run_dir.name}/{COOLDOWN_FILE}: this "
                                           "continuation ignores a COOLDOWN file (use STOP, or delete the Hub copy and "
                                           "reset again)")
+    if keep is not None:  # on the fresh early-stop state (its cooldown_file fallback above kept)
+        st["early_stop"].update(keep)
+        before["cooldown_kept"] = dict(t_c=keep["cooldown"]["t_c"], T=keep["cooldown"]["T"])
     st["resume_resets"] = int(st.get("resume_resets") or 0) + 1
     cfg["schedule"]["resume_reset"] = False
+    cfg["schedule"]["resume_reset_keep_cooldown"] = False
     return before
 
 
@@ -5160,8 +5220,16 @@ def resume_reset_finish(R: Run, before: dict):
     state's step (else the continuation would end at once); a record {at_step, time_utc, total_steps_before,
     total_steps_after, epochs, early_stop_before, pre_cooldown_full_before, lr_phase_before, ...} joins
     st["schedule_resets"] (summary.json's) and goes out as the `resume_reset` event. A state saved inside its cooldown
-    (lr_phase_before "cooldown") puts the LR back at its peak: the event warns."""
+    (lr_phase_before "cooldown") puts the LR back at its peak: the event warns. A kept cooldown (cooldown_kept,
+    resume_reset_keep_cooldown) needs the re-planned schedule to reach its T: a plan T below it would cut the replayed
+    cooldown short (Run.progress takes the smaller), so it is refused."""
     t, T = R.progress()
+    kept = before.get("cooldown_kept")
+    if kept is not None and (plan := R.base_progress()[1]) < float(kept["T"]):
+        raise SystemExit(f"schedule.resume_reset_keep_cooldown: the re-planned schedule ends at {plan:g} (schedule."
+                         f"clock {R.cfg['schedule']['clock']!r}), before the kept cooldown's T {kept['T']:g} of "
+                         f"{R.run_dir.name}: it would cut the replayed cooldown short; raise schedule.epochs (or "
+                         "max_steps) with --set")
     if T <= t:
         raise SystemExit(f"schedule.resume_reset: the new schedule ends at {T:g} (schedule.clock "
                          f"{R.cfg['schedule']['clock']!r}), not after the state's {t:g}: raise schedule.epochs (or "

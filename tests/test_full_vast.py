@@ -383,8 +383,13 @@ def test_launch_full_argument_errors(full_launch, capsys):
                        "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, "
                        "augment.concat_p, augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, "
                        "augment.noise_p, augment.noise_bank, augment.noise_bank_sha256, augment.speech_p, "
-                       "augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, augment.gain_p, augment.codec_p "
-                       "may change on a resume"),
+                       "augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, augment.gain_p, augment.codec_p, "
+                       "augment.background_min_row_s, schedule.deadline_cooldown may change on a resume"),
+                      # DECISIONS H14: only a registry continuation keeps an early-stop cooldown (continuation_preflight
+                      # checks the state's record before renting; no env resume set does)
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:schedule.resume_reset_keep_cooldown=true"],
+                       "augment.background_min_row_s, schedule.deadline_cooldown may change on a resume"),
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:augment.noise_bank=../bank"],
                        "augment.noise_bank must be a relative data-repo path"),
@@ -947,6 +952,453 @@ def test_a_fresh_launch_over_a_done_box_is_refused(repo, monkeypatch, devslice):
                for p in problems), problems
 
 
+
+# ================================================================================ continuations (DECISIONS H14)
+
+
+RID03, RID005 = "full-p03-20261003T230143Z", "full-p005-20261008T160232Z"
+# item -> (run id, source box, from_step, to_step): box p-cool in miniature continues box full's full-p03 (a planned
+# 0.8 T cooldown) and box p005's full-p005 (an early-stop cooldown it keeps)
+COOL = {"full-p03": (RID03, "full", 169376, 211720), "full-p005": (RID005, "p005", 67449, 80939)}
+GENTLE = {"schedule.epochs": 10, "schedule.deadline_cooldown": False, "schedule.resume_reset_keep_cooldown": True,
+          "augment.noise_snr_db": [5.0, 20.0], "augment.codecs": ["mp3", "ulaw8k"],
+          "augment.background_min_row_s": 3.0, "augment.noise_bank": "aug/bank-v1",
+          "augment.noise_bank_sha256": "AB" * 32}
+COOL_SETS = {"full-p03": {"schedule.epochs": 6, "schedule.deadline_cooldown": False}, "full-p005": GENTLE}
+
+
+def cool_registry(root: Path, reg: dict) -> dict:
+    """The tiny registry plus box p005 (P-0.05B alone) and box p-cool, whose train items continue box full's
+    full-p03 and box p005's full-p005 (both on data-full, one CTC store), written to root's boxes.json."""
+    reg = copy.deepcopy(dict(reg))
+    base = copy.deepcopy(reg["boxes"]["p01"])
+
+    def box(items):
+        return dict(base, data_config="configs/full/data-full.json", items=items)
+
+    def train(name, run, h, cont=None):
+        return {"name": name, "kind": "train", "config": f"configs/full/{name}.json", "study_run": run,
+                "family": "ctc", "max_hours": h, "needs": ["stores-ctc"], **({"continues": cont} if cont else {})}
+
+    def readout(name):
+        return {"name": f"m4-{name}", "kind": "readout", "of": name, "max_hours": 0.3}
+
+    def cont(name):
+        rid, src, fs, ts = COOL[name]
+        return {"box": src, "run_id": rid, "from_step": fs, "to_step": ts, "resets_before": 0,
+                "sets": copy.deepcopy(COOL_SETS[name])}
+
+    reg["boxes"]["p005"] = box([{"name": "stores-ctc", "kind": "stores", "config": "configs/full/full-p005.json"},
+                                train("full-p005", "study-p005", 9.92), readout("full-p005")])
+    reg["boxes"]["p-cool"] = box([{"name": "stores-ctc", "kind": "stores", "config": "configs/full/full-p03.json"},
+                                  train("full-p03", "study-p03", 6.0, cont("full-p03")), readout("full-p03"),
+                                  train("full-p005", "study-p005", 1.0, cont("full-p005")), readout("full-p005")])
+    write_reg(root, reg)
+    return reg
+
+
+@pytest.fixture
+def cool(repo, monkeypatch):
+    """The p-cool registry at SHA, and resume_preflight(box, runs, ...) of it against a FullHub with those runs."""
+    cool_registry(repo.root, repo.reg)
+    reg = launch.full_registry(SHA)[0]
+
+    def go(runs, box="p-cool", resets=(), sets=None, scratch=None, **kw):
+        hub = FullHub({}, runs, scratch)
+        monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+        return launch.resume_preflight(RUNS, SCRATCH, box, list(resets), sets or {}, reg=reg, **kw)
+    go.reg = reg
+    return go
+
+
+def cool_brief(name: str, **st) -> dict:
+    """The trainer.json of the item's pre_cooldown state as the source box left it: full-p03 at its planned 0.8 T
+    (no early-stop record, total_steps its end), full-p005 at its early-stop cooldown's start (the record's T its end;
+    total_steps the 10-epoch plan)."""
+    rid, src, fs, ts = COOL[name]
+    es = ({"cooldown": {"t_c": float(fs), "T": float(ts), "clock": "epochs", "at_step": fs},
+           "triggered": {"reason": "patience", "step": fs}} if name == "full-p005" else {"cooldown": None})
+    return {"format": 1, "step": fs, "reason": "pre_cooldown", "run_id": rid, "cfg": {"schedule": {"clock": "epochs"}},
+            "planner": {"n_utts": 4_200_000, "fingerprint": "f" * 16},
+            "st": dict({"step": fs, "resume_resets": 0, "total_steps": 269777 if name == "full-p005" else ts,
+                        "early_stop": es}, **st)}
+
+
+def source_summary(name: str, status="done", **it) -> dict:
+    rid, src, fs, ts = COOL[name]
+    return {"format": 1, "box": src, "status": status, "items": {name: dict(
+        {"kind": "train", "status": "done", "verified": True, "run_dir": f"runs/{rid}",
+         "result": {"steps": ts, "resume_resets": 0}}, **it)}}
+
+
+def cool_runs() -> dict:
+    """The runs repo before box p-cool's first launch: both source summaries, both pre_cooldown states, both ends."""
+    runs = {}
+    for name, (rid, src, fs, ts) in COOL.items():
+        runs[fullrun.box_summary_path(src)] = source_summary(name)
+        for f in fullrun.STATE_FILES_REQUIRED:
+            runs[f"runs/{rid}/checkpoints/full_step_{fs}/{f}"] = cool_brief(name) if f == "trainer.json" else b"x"
+        runs[f"runs/{rid}/checkpoints/step_{ts}/model.safetensors"] = b"w"
+        runs[f"runs/m4-{rid}/summary.json"] = b"{}"  # the source's own readout (r0): never in the way
+    return runs
+
+
+def state_path(name: str, f: str = "trainer.json") -> str:
+    rid, _, fs, _ = COOL[name]
+    return f"runs/{rid}/checkpoints/full_step_{fs}/{f}"
+
+
+def own_summary(**items) -> dict:
+    """Box p-cool's own Hub summary with the given items."""
+    return {fullrun.box_summary_path("p-cool"): {"format": 1, "box": "p-cool", "status": "failed", "items": items}}
+
+
+def record(name: str, **kw) -> dict:
+    """A train item of box p-cool's own summary with the continuation record resume-pull wrote for it."""
+    rid = COOL[name][0]
+    sets = ["schedule.resume_reset=true", *fullrun.continue_sets({"sets": COOL_SETS[name]})]
+    return dict({"kind": "train", "status": "running", "run_dir": f"runs/{rid}", "verified": False,
+                 "continuation": {"run_id": rid, "reset": True, "sets": sets, "resume_resets_before": 0}}, **kw)
+
+
+def test_a_continuation_box_launches_as_a_resume_without_the_flag(full_launch, repo, capsys):
+    """DECISIONS H14: box p-cool's train items continue other boxes' runs, so every launch of it is a resume
+    (KITSUNE_RESUME=1, no --resume needed) and the registry, not the env, carries each reset and its sets: no
+    KITSUNE_RESUME_RESET / KITSUNE_RESUME_SETS; full_preflight checks it as a resume."""
+    cool_registry(repo.root, repo.reg)
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p-cool", "--scratch-repo", SCRATCH, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    env = env_of(created(fake))
+    assert env["KITSUNE_RESUME"] == "1" and "KITSUNE_RESUME_RESET" not in env and "KITSUNE_RESUME_SETS" not in env
+    assert env["KITSUNE_BOX"] == "p-cool"
+    a, kw = full_launch.seen["preflight"]
+    assert a[5] == "p-cool" and kw["resume"] is True and kw["resets"] == [] and kw["sets"] == {}
+    assert kw["allow_continued_runs"] is False
+    assert ("box p-cool continues other boxes' runs (full-p03, full-p005; registry continues): launched as a resume "
+            "(KITSUNE_RESUME=1") in out
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p-cool", "--scratch-repo", SCRATCH, "--resume",
+                           "--dry-run")
+    out = capsys.readouterr().out
+    assert rc == 0 and "launched as a resume" not in out, out  # --resume says it already
+    assert env_of(created_or_printed(out))["KITSUNE_RESUME"] == "1"
+    # a box without continues items keeps its fresh launch
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p005", "--scratch-repo", SCRATCH, "--dry-run")
+    out = capsys.readouterr().out
+    assert rc == 0 and "KITSUNE_RESUME" not in env_of(created_or_printed(out)), out
+    assert full_launch.seen["preflight"][1]["resume"] is False
+
+
+@pytest.mark.parametrize("args, err", [
+    (["--fresh-over-done"], "--fresh-over-done is refused for box p-cool: its train items (full-p03, full-p005) "
+                            "continue other boxes' runs"),
+    (["--resume-reset", RID03], f"--resume-reset {RID03}: item full-p03 of box p-cool continues that run (its "
+                                f"registry continues block carries the reset from full_step_169376 and its sets): "
+                                f"drop the flag"),
+    (["--resume-set", f"{RID005}:schedule.epochs=4"], f"--resume-set {RID005}: item full-p005 of box p-cool "
+                                                      f"continues that run"),
+], ids=["fresh-over-done", "reset", "set"])
+def test_a_continuation_box_refuses_flags_that_would_reset_or_set_its_runs_again(full_launch, repo, capsys, args, err):
+    """The registry carries the continuations' resets and sets: --fresh-over-done (it is never fresh) and a
+    --resume-reset/--resume-set naming a continued run (a relaunch would restart the continuation from its
+    pre_cooldown state and throw its progress away; resume-pull refuses them on the box) are refused before renting."""
+    cool_registry(repo.root, repo.reg)
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p-cool", "--scratch-repo", SCRATCH, *args, "--yes")
+    out = capsys.readouterr().out
+    assert rc == 1 and err in out and created(fake) is None, out
+    assert launch.continues_flag_problems("p-cool", {}, [RID03], {RID03: []}) == []  # a box without continuations
+
+
+@pytest.mark.parametrize("label, row, refused", [
+    ("kitsune-full-p-cool-data-full-0123456", {"actual_status": "running"},
+     "a live instance of box p-cool: kitsune-full-p-cool-"),
+    ("kitsune-full-p005-data-full-0123456", {"actual_status": "loading"},
+     "a live instance of source box p005 (its runs continue here)"),
+    ("kitsune-full-full-data-full-0123456", {"actual_status": "created"},
+     "a live instance of source box full (its runs continue here)"),
+    # a just-created second box p-cool: vast still schedules it, actual_status null, the other two say running
+    ("kitsune-full-p-cool-data-full-0123456", {"actual_status": None, "intended_status": "running",
+                                               "cur_state": "running"}, "a live instance of box p-cool"),
+    ("kitsune-full-p-cool-data-full-0123456", {}, "a live instance of box p-cool"),  # no actual_status at all
+    ("kitsune-full-p005-data-full-0123456", {"actual_status": "exited", "intended_status": "running"},
+     "a live instance of source box p005"),  # vast is starting it again
+    ("kitsune-full-p-cool-data-full-0123456", {"actual_status": "exited"}, None),
+    ("kitsune-full-p-cool-data-full-0123456", {"actual_status": "offline", "intended_status": "stopped",
+                                               "cur_state": "stopped"}, None),
+    ("kitsune-full-p01-data-p01-0123456", {"actual_status": "running"}, None),
+], ids=["own-running", "source-loading", "source-created", "own-null-scheduling", "own-no-status",
+        "source-exited-restarting", "own-exited", "own-offline-stopped", "unrelated"])
+def test_live_instances_of_a_continuation_box_or_its_sources_are_refused(full_launch, repo, capsys, label, row,
+                                                                         refused):
+    """Two boxes must never write one run dir: a second box p-cool (a re-run launch after a create that did rent:
+    vast lists it with a null actual_status while it schedules it) or a live source box (its end syncs the same
+    runs/<rid>/) is refused while it may hold a host (any of actual_status, intended_status, cur_state running,
+    loading or created, or no actual_status yet: launch.holds_host); one clearly exited, stopped or offline is a
+    warning (a host-loss relaunch may still list the lost instance); another box's instance is none of its
+    business."""
+    cool_registry(repo.root, repo.reg)
+    rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p-cool", "--scratch-repo", SCRATCH, "--yes",
+                           instances=[dict({"id": 9, "label": label}, **row)])
+    out = capsys.readouterr().out
+    shown = row.get("actual_status") or row.get("cur_state") or "?"
+    if refused:
+        assert rc == 1 and created(fake) is None and refused in out, out
+        assert f"{label} (instance 9, {shown}): destroy it before renting box p-cool" in out
+    else:
+        assert rc == 0 and created(fake) is not None, out
+        assert ("WARNING: an instance of box p-cool: " in out) == ("p-cool" in label), out
+    assert launch.LIVE_STATUSES == ("running", "loading", "created")
+
+
+def test_a_first_launch_of_a_continuation_box_passes_with_its_sources_checked(cool):
+    """No summary of box p-cool yet: each continuation is checked against its source box's summary (done, verified,
+    the run and its resets the registry's) and its pre_cooldown state (complete, pre_cooldown, resume_resets 0; the
+    kept early-stop cooldown of full-p005 that ends at its to_step; full-p03's end at its to_step); the notes name the
+    source box, the state, the resets and the readout dir."""
+    problems, notes = cool(cool_runs())
+    assert problems == [], problems
+    assert f"resume: {RUNS} has no full/box-p-cool/queue_summary.json yet (box p-cool's first launch)" in notes[0]
+    assert (f"resume: full-p03: continues box full's run {RID03} (done and verified in "
+            f"full/box-full/queue_summary.json): reset from runs/{RID03}/checkpoints/full_step_169376 "
+            f"(resume_resets 0), sets ['schedule.epochs=6', 'schedule.deadline_cooldown=false'], readout dir "
+            f"runs/m4-{RID03}-r1") in notes
+    assert any(n.startswith(f"resume: full-p005: continues box p005's run {RID005}") and f"m4-{RID005}-r1" in n
+               and "'schedule.resume_reset_keep_cooldown=true'" in n for n in notes), notes
+    assert (f"resume: full-p03: runs/{RID03}/checkpoints/full_step_169376: pre_cooldown, resume_resets 0, the run ends "
+            f"at step 211720, planner n_utts 4200000") in notes
+    assert (f"resume: full-p005: runs/{RID005}/checkpoints/full_step_67449: pre_cooldown, resume_resets 0, early-stop "
+            f"cooldown kept (t_c 67449.0 -> T 80939.0), planner n_utts 4200000") in notes
+
+
+def _set(path, **kw):
+    """A change of the runs repo: path's JSON object updated with kw."""
+    def change(runs):
+        runs[path] = dict(runs[path], **kw)
+    return change
+
+
+def _st(name, **kw):
+    def change(runs):
+        b = runs[state_path(name)]
+        b["st"] = dict(b["st"], **kw)
+    return change
+
+
+def _cooldown(**kw):
+    def change(runs):
+        b = runs[state_path("full-p005")]
+        b["st"]["early_stop"]["cooldown"] = dict(b["st"]["early_stop"]["cooldown"], **kw)
+    return change
+
+
+def _drop(path):
+    return lambda runs: runs.pop(path)
+
+
+@pytest.mark.parametrize("change, want", [
+    (_drop("full/box-p005/queue_summary.json"),
+     f"full-p005 (continues box p005's run {RID005}): {RUNS} has no full/box-p005/queue_summary.json"),
+    (lambda r: r.update({"full/box-full/queue_summary.json": source_summary("full-p03", status="running")}),
+     "full/box-full/queue_summary.json says running: box full may still be writing"),
+    (lambda r: r.update({"full/box-full/queue_summary.json": source_summary("full-p03", status="running",
+                                                                            verified=False)}), "says running"),
+    (lambda r: r["full/box-full/queue_summary.json"]["items"]["full-p03"].update(status="failed"),
+     "has its train item full-p03 'failed' (kind 'train', verified True), not done and verified"),
+    (lambda r: r["full/box-p005/queue_summary.json"]["items"]["full-p005"].update(status="running"),
+     "has its train item full-p005 'running' (kind 'train', verified True), not done and verified"),
+    (lambda r: r["full/box-p005/queue_summary.json"]["items"]["full-p005"].update(verified=False),
+     "not done and verified"),
+    (lambda r: r["full/box-p005/queue_summary.json"]["items"].pop("full-p005"), "has its train item full-p005 None"),
+    (lambda r: r["full/box-full/queue_summary.json"]["items"]["full-p03"].update(
+        run_dir="runs/full-p03-20261001T000000Z"),
+     f"records run full-p03-20261001T000000Z for full-p03, the registry continues {RID03}"),
+    (lambda r: r["full/box-full/queue_summary.json"]["items"]["full-p03"]["result"].update(resume_resets=1),
+     "records resume_resets 1 for the run, the registry's resets_before is 0"),
+    (_drop(state_path("full-p03", "trainer.pt")), f"{RUNS} lacks ['trainer.pt'] of runs/{RID03}/checkpoints/"
+                                                  f"full_step_169376/"),
+    (_drop(state_path("full-p005", "optimizer.pt")), "lacks ['optimizer.pt']"),
+    (lambda r: r[state_path("full-p03")].update(reason="timed"), "its trainer.json reason is 'timed', not "
+                                                                 "pre_cooldown"),
+    (_st("full-p03", resume_resets=2), "its st.resume_resets is 2, the registry's resets_before 0"),
+    (_st("full-p005", early_stop={"cooldown": None}), "it has no early-stop cooldown record (st.early_stop.cooldown) "
+                                                     "for schedule.resume_reset_keep_cooldown to keep"),
+    (_cooldown(at_step=60000), "its early-stop cooldown record starts at at_step 60000, t_c 67449.0, not at the "
+                               "state's step 67449"),
+    (_cooldown(t_c=60000.0), "starts at at_step 67449, t_c 60000.0"),
+    (_cooldown(clock="steps"), "its early-stop cooldown record is on the 'steps' clock, the state's schedule.clock "
+                               "is 'epochs'"),
+    (_cooldown(T=269777.0), "its early-stop cooldown ends at T 269777.0, the registry's to_step is 80939"),
+    (_st("full-p03", early_stop={"cooldown": {"t_c": 169376.0, "T": 190000.0, "clock": "epochs",
+                                              "at_step": 169376}}),
+     "without schedule.resume_reset_keep_cooldown the reset drops it"),
+    (_st("full-p03", total_steps=215815), "its st.total_steps is 215815, the registry's to_step 211720"),
+    (lambda r: r[state_path("full-p005")]["planner"].update(n_utts=4_100_000),
+     "the continued states' planner n_utts differ (full-p03 4200000, full-p005 4100000): box p-cool builds one CTC "
+     "store"),
+    (lambda r: r.update({f"runs/m4-{RID005}-r1/tables/cer.csv": b"x"}),
+     f"{RUNS} already holds runs/m4-{RID005}-r1/, which its readout would write into"),
+], ids=["no-source-summary", "source-running", "source-running-unverified", "item-failed",
+        "item-running", "item-unverified", "item-missing", "rid", "resets", "no-trainer.pt", "no-optimizer.pt",
+        "reason", "state-resets", "keep-no-record", "keep-at-step", "keep-t_c", "keep-clock", "keep-T",
+        "plain-has-record", "plain-total-steps", "n_utts", "readout-dir"])
+def test_a_continuation_box_is_refused_before_renting(cool, change, want):
+    """Every check resume-pull (or the trainer's keep_cooldown refusal, or check-resume) would make after the paid
+    boot is made here first."""
+    runs = cool_runs()
+    change(runs)
+    problems, _ = cool(runs)
+    assert any(want in p for p in problems), (want, problems)
+
+
+def test_a_continuation_that_already_ran_from_its_state_resumes(cool):
+    """The continuation re-saves its pre_cooldown state at the same step with its reset (resume_resets + 1): a box
+    lost before its summary went up finds it there, and resume-pull resumes it as a lost continuation."""
+    runs = cool_runs()
+    _st("full-p03", resume_resets=1)(runs)
+    problems, notes = cool(runs)
+    assert problems == [], problems
+    want = (f"resume: full-p03: runs/{RID03}/checkpoints/full_step_169376: pre_cooldown, resume_resets 1 (the "
+            f"continuation already ran from it: the box resumes it)")
+    assert any(n.startswith(want) for n in notes), notes
+
+
+def test_a_relaunch_reads_the_boxs_own_summary_first(cool):
+    """Once box p-cool's summary is up, it decides: a done and verified item is adopted (its state no longer
+    matters), a recorded continuation goes on (its sets must still be the registry's), and the source summaries are
+    not read for them. A run id or a record that does not fit the registry is refused."""
+    runs = cool_runs()
+    del runs["full/box-full/queue_summary.json"], runs["full/box-p005/queue_summary.json"]  # unread now
+    for f in fullrun.STATE_FILES_REQUIRED:
+        del runs[state_path("full-p03", f)]  # the done item's state: unread
+    runs[f"runs/m4-{RID03}-r1/summary.json"] = b"{}"  # its readout, done
+    runs[f"runs/m4-{RID005}-r1/summary.json"] = b"{}"  # full-p005's readout, begun on the lost rental
+    own = dict(record("full-p03", status="done", verified=True),
+               result={"steps": 211720, "resume_resets": 1})
+    runs.update(own_summary(**{"full-p03": own, "m4-full-p03": {"kind": "readout", "status": "done", "verified": True,
+                                                               "out": f"runs/m4-{RID03}-r1"},
+                               "full-p005": record("full-p005"),
+                               "m4-full-p005": {"kind": "readout", "status": "failed", "verified": False,
+                                                "out": f"runs/m4-{RID005}-r1"}}))
+    problems, notes = cool(runs)
+    assert problems == [], problems
+    assert f"resume: full-p03: done and verified on box p-cool (its own summary), run {RID03}: adopted, never " \
+           f"continued again" in notes
+    assert any(n.startswith(f"resume: full-p005: running on box p-cool, run {RID005}, its continuation recorded "
+                            f"(resume_resets before 0): goes on from the newest state holding its reset, else again "
+                            f"from runs/{RID005}/checkpoints/full_step_67449; newest state: ") for n in notes), notes
+    # (all train items done: a plain relaunch of the box is guard (a)'s, as for any box)
+    done = copy.deepcopy(runs)
+    done[fullrun.box_summary_path("p-cool")]["items"]["full-p005"].update(status="done", verified=True)
+    problems, _ = cool(done)
+    assert any("a plain --resume of box p-cool: every train item of its Hub summary is done" in p for p in problems)
+    assert cool(done, allow_done_trains=True)[0] == []
+
+    def refused(item: dict, want: str, name="full-p005"):
+        bad = copy.deepcopy(runs)
+        bad[fullrun.box_summary_path("p-cool")]["items"][name] = item
+        problems, _ = cool(bad)
+        assert any(want in p for p in problems), (want, problems)
+
+    refused(record("full-p005", run_dir="runs/full-p005-20261009T000000Z"),
+            f"box p-cool's Hub summary records run full-p005-20261009T000000Z for it, its registry continues block "
+            f"run {RID005}")
+    refused(dict(record("full-p005"), continuation=None), "box p-cool's Hub summary records the run without its "
+                                                          "continuation record")
+    rec = record("full-p005")
+    rec["continuation"]["sets"] = rec["continuation"]["sets"][:-1]
+    refused(rec, f"box p-cool's queue summary records the continuation of {RID005} with sets ")
+    refused(rec, "the registry changed under a started continuation")
+    # the record's resume_resets_before is the registry's resets_before too (resume-pull's continue_item refuses
+    # either change on the box, after the paid boot); a missing one counts as 0, as there
+    rec = record("full-p005")
+    rec["continuation"]["resume_resets_before"] = 1
+    refused(rec, f"with sets {rec['continuation']['sets']} after 1 resets; the registry has "
+                 f"{rec['continuation']['sets']} after 0: the registry changed under a started continuation")
+    rec["continuation"].pop("resume_resets_before")
+    ok = copy.deepcopy(runs)
+    ok[fullrun.box_summary_path("p-cool")]["items"]["full-p005"] = rec
+    assert cool(ok)[0] == []
+    # an item this box adopted done and verified owns its readout dir, even without its continuation record (resume-
+    # pull keeps the record on a done continuation since the H14 review; an older summary may lack it): the readout's
+    # re-run writes the same -r<N> dir
+    other = copy.deepcopy(runs)
+    items = other[fullrun.box_summary_path("p-cool")]["items"]
+    items["full-p005"] = dict(record("full-p005", status="done", verified=True), continuation=None)
+    items["m4-full-p005"].update(out=None)
+    problems, _ = cool(other)  # (every train item done now: the all-done plain-resume guard may speak, not this one)
+    assert not any("already holds" in p for p in problems), problems
+    # (a readout dir no record ties to this box - a first launch - stays refused: the case near line 1239)
+
+
+@pytest.mark.parametrize("status", ["pending", "fresh", "failed", "running"])
+def test_a_readout_dir_of_the_boxs_own_continuation_is_its_own(cool, status):
+    """Rental 1 uploaded runs/m4-<rid>-r1 and was lost before the summary put that verifies it; rental 2's resume-pull
+    marked that readout fresh, adopt() set it pending with no out, the summary went up, and that host was lost too
+    before the readout ran again. Rental 3 is no other box's readout: the own summary records the train item as this
+    box's continuation of the run, and the readout's re-run writes the same -r<N> dir, whatever its status."""
+    runs = cool_runs()
+    runs[f"runs/m4-{RID005}-r1/summary.json"] = b"{}"
+    runs.update(own_summary(**{"full-p005": record("full-p005"),
+                               "m4-full-p005": {"kind": "readout", "status": status, "verified": False, "out": None}}))
+    problems, _ = cool(runs)
+    assert problems == [], problems
+    # the train item's continuation record decides it: a summary without the readout item passes the same way
+    runs[fullrun.box_summary_path("p-cool")]["items"].pop("m4-full-p005")
+    assert cool(runs)[0] == []
+
+
+def test_a_resume_of_a_box_whose_runs_are_continued_elsewhere_needs_the_flag(cool):
+    """After box p-cool, box p005's run dir holds p-cool's continuation (its final export at the same step): a
+    --resume (or --resume-reset/--resume-set) of box p005 would adopt, score or sync over those weights, so it is
+    refused unless --allow-continued-runs; a box whose runs nobody continues is not concerned."""
+    runs = cool_runs()
+    runs["full/box-p005/queue_summary.json"]["items"]["m4-full-p005"] = {"kind": "readout", "status": "running"}
+    for kw in ({}, {"resets": [RID005]}, {"sets": {RID005: ["schedule.epochs=12"]}, "resets": [RID005]}):
+        problems, _ = cool(runs, box="p005", **kw)
+        assert any(f"a resume of box p005: its run(s) {RID005} (full-p005) are continued by box p-cool" in p
+                   and "--allow-continued-runs" in p for p in problems), (kw, problems)
+    problems, notes = cool(runs, box="p005", resets=[RID005], allow_continued_runs=True)
+    assert problems == [] and any("(--allow-continued-runs: not refused)" in n for n in notes), (problems, notes)
+    runs[fullrun.box_summary_path("p01")] = {"items": {"full-p01": {"kind": "train", "status": "running",
+                                                                    "run_dir": "runs/full-p01-20261001T184145Z"}}}
+    assert cool(runs, box="p01")[0] == []
+
+
+def test_the_allow_continued_runs_flag_reaches_the_preflight_and_is_full_only(full_launch, capsys):
+    rc, _ = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume",
+                        "--allow-continued-runs", "--dry-run")
+    assert rc == 0, capsys.readouterr().out
+    assert full_launch.seen["preflight"][1]["allow_continued_runs"] is True
+    with pytest.raises(SystemExit):
+        launch.main(["--job", "train", "--data-repo", DATA, "--out-repo", RUNS, "--allow-continued-runs"])
+    assert "--allow-continued-runs: for --job full only" in capsys.readouterr().err
+
+
+def test_full_preflight_checks_a_continuation_box_as_a_resume_and_its_banks(cool, repo, monkeypatch, devslice):
+    """full_preflight of box p-cool runs the resume checks even without resume=True (it is never fresh), and the
+    background banks its continuations' registry sets name (augment_pins) are held to the box's pull and their pin
+    as a config's are."""
+    reg = cool.reg
+    reg["boxes"]["p-cool"]["extra_dirs"] = ["aug/bank-v1"]
+    data = dict(box_data("p-cool", reg, repo.root), **{"aug/bank-v1/index.json": b"{}"})
+    problems, notes = preflight(monkeypatch, FullHub(data, {}), box="p-cool", reg=reg)
+    assert any("has no full/box-full/queue_summary.json" in p for p in problems), problems
+    assert not any("a fresh launch" in p for p in problems)
+    assert any(f"full-p005 (continues {RID005}) pins aug/bank-v1/index.json at sha256 {'ab' * 6}..." in p
+               for p in problems), problems  # the registry's pin, lowercased, is not the bank's
+    problems, notes = preflight(monkeypatch, FullHub(data, cool_runs()), box="p-cool", reg=reg)
+    assert [p for p in problems if "bank" not in p] == [], problems
+    spec = fullrun.box_spec("p-cool", reg)
+    banks, cuts = launch.augment_pins(spec, lambda rel: json.loads((repo.root / rel).read_text(encoding="utf-8")),
+                                      None)
+    assert banks == [(f"full-p005 (continues {RID005})", "aug/bank-v1", "ab" * 32)] and cuts == []
+    rir = copy.deepcopy(spec)
+    rir["items"][3]["continues"]["sets"].update({"augment.rir_bank": "aug/rirs-v1"})
+    banks, _ = launch.augment_pins(rir, lambda rel: {}, None)
+    assert (f"full-p005 (continues {RID005})", "aug/rirs-v1", None) in banks
+
+
+
 # ========================================================================================= blocklist and gates
 
 
@@ -1066,8 +1518,8 @@ def test_the_quant_go_signal_only_concerns_boxes_with_quantised_items(quant_go, 
 
 def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, monkeypatch, devslice):
     """full_preflight ends with the quant go signal (allow_unverified_quant passed through) and, for a box whose hours
-    come from the speed record (SPEED_RECORD_BOXES: p01, full-t, full-p; the tiny registry's 2-GPU box full stands in
-    for them here), a warning while that record has no box-1 part (never a refusal)."""
+    come from the speed record (SPEED_RECORD_BOXES: full-t, p005, p-cool; the tiny registry's 2-GPU box full stands
+    in for them here), a warning while that record has no box-1 part (never a refusal)."""
     monkeypatch.setattr(launch, "SPEED_RECORD_BOXES", ("full",))
     monkeypatch.setattr(launch, "git_ancestry", lambda old, new: "ancestor")
     monkeypatch.setattr(launch, "git_blob", lambda sha, p: f"blob:{p}")
@@ -1128,7 +1580,7 @@ def test_the_quant_code_and_the_speed_record_exist_in_this_checkout():
         assert (ROOT / rel).is_file(), rel
     rec = json.loads((ROOT / launch.SPEED_RECORD).read_text(encoding="utf-8"))
     assert set(rec) >= {"smoke", "box1"}
-    assert launch.SPEED_RECORD_BOXES == ("p01", "full-t", "full-p", "p005") and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
+    assert launch.SPEED_RECORD_BOXES == ("full-t", "p005", "p-cool") and launch.QUANT_GO_BOX in fullrun.BOX_NAMES
     assert set(launch.SPEED_RECORD_BOXES) <= set(fullrun.BOX_NAMES)
 
 

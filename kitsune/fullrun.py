@@ -5,7 +5,9 @@ re-runs that run's cooldown with the CTC train-data augmentation on, the recipe 
 --resume-set schedule.epochs and augment.*; G3's 8-epoch continuation is postponed, H2), then T-0.6B on box `full-t`
 (postponed, H2) and P-0.3B with that recipe on box `full-p` if the test shows it helps (H1 step 2; P-0.05B postponed,
 H2), each 1x RTX 5090, one queue (DECISIONS G2: box 2's 2x box `full` is retired, its name kept for the tests'
-fixtures only), after two short smokes (`full-smoke` = smoke A, `smoke-b`).
+fixtures only), after two short smokes (`full-smoke` = smoke A, `smoke-b`). Box `p-cool` (DECISIONS H14) is one
+rental that re-runs three done runs' cooldowns (P-0.3B, P-0.1B, P-0.05B), each from its runs-repo pre_cooldown state:
+its train items carry a `continues` block (below), so the box is always a resume and never trains from step 0.
 The selection (scripts/make_selection.py full mode, kitsune/devslice.py), the trainer (scripts/04_distill.py), the
 box queue (kitsune/full_queue.py), the vast scripts (vast/launch.py, bootstrap.sh, finish.py) and the evaluators all
 import their shared names from here, so a constant cannot drift between them. The binding definitions are the full-run
@@ -19,12 +21,14 @@ build contract (sections 1 and 2); this module is its code.
                recipe block a full selection must carry), seeded_subset (make_selection's seeded draw), dev_pick (the
                scored dev ids: per source a seeded draw of per_source kept dev rows, in selection order), the resume
                flags' parsers (parse_resume_sets with its typed, normalised values - resume_set_value - and
-               parse_resume_reset: launch -> env -> full_queue resume-pull),
+               parse_resume_reset: launch -> env -> full_queue resume-pull), a continuation's sets
+               (continue_set_text, continue_sets: the registry's `continues.sets` as --set words),
                run_id_of, the Hub and scratch paths, pointer_problems (the timed-state pointer, format 1)
   registry     configs/full/boxes.json, hand-written next to the generated configs/full/*.json (make_full_configs.py
                --check validates it with registry_problems). One source of truth: launch reads the hours, price, GPU
                count and watchdog from it, bootstrap the students and extra files, the queue its items.
-               load_registry validates it and fills the defaults; box_* read one box; the CLI serves bootstrap
+               load_registry validates it and fills the defaults; box_* read one box, continues_of its
+               continuations; the CLI serves bootstrap
 
 Registry (contract 2.3). Top level {"version": 1, "boxes": {<box>: <box spec>}} with box names from BOX_NAMES (a chain
 box's from CHAIN_NAMES, below); any key
@@ -50,7 +54,9 @@ Per kind:
 
   stores   config, eval_only (false), sets ([] of "key=value": the build's --set values)
   train    config, study_run (a kitsune.prereg run: the student's registered build), family (aed|ctc, the config's),
-           plan_total_steps / plan_hours (both or neither; the matching full run's plan, for smoke check 3; null)
+           plan_total_steps / plan_hours (both or neither; the matching full run's plan, for smoke check 3; null),
+           continues (null; DECISIONS H14: the item continues a done run of another box instead of training anew -
+           exactly {box, run_id, from_step, to_step, resets_before, sets}, see "Continuations" below)
   readout  of (an earlier train item of the box)
   speed    system, speed_kind (tools/speed_probe.py --kind), args ([]), only_if_new_machine (another registry box, or
            null), and the model source speed_probe needs: aed / ctc exactly one (of, one weights entry or model);
@@ -91,6 +97,18 @@ readers take stage= (a chain: that stage's view, None the union; ignored on a pl
 KITSUNE_CHAIN_STAGE and stage 1's KITSUNE_WATCHDOG_HANDOVER_S, and box_items / train_items refuse a chain: the chain
 controller (kitsune/full_queue.py) runs its parts' queues one after the other.
 
+Continuations (DECISIONS H14). A train item's `continues` block names the run it re-runs from a saved state: box (a
+plain registry box, not a chain and not this box, with a train item of the SAME name and the SAME config: the run's
+source box, whose Hub queue summary records it), run_id (RUN_ID_RE: the run dir runs/<run_id> in the runs repo),
+from_step (an int > 0: the pre_cooldown state full_step_<from_step> the continuation resets from), to_step (an int >
+from_step: the run's own end, the step the continuation trains to), resets_before (an int >= 0: the state's
+resume_resets, so the readout dir comes out m4-<run_id>-r<resets_before + 1>) and sets (an object, CONTINUE_SET_KEYS
+-> a JSON value: the trainer --set values of the continuation; the scalar keys follow resume_set_value's rules on the
+value's text, the CONTINUE_LIST_KINDS keys are a dB range [low, high] or a list of codec names, continue_set_text).
+No two items of a box share a run_id, and no chain has a part with continues items (a continuation box runs alone,
+always as a resume: bootstrap asks has-continues). continues_of(box) lists them; continue_sets(block) spells the sets
+as the --set words the queue passes after schedule.resume_reset=true.
+
 CLI (vast/bootstrap.sh; exit 0 ok, 2 refused - a bad registry, an unknown box, a student that is not the registered
 build):
   python -m kitsune.fullrun students --box p01 [--root R]         # the train items' student dirs, one per line
@@ -99,6 +117,7 @@ build):
   python -m kitsune.fullrun check-students --box p01 --root R     # every pulled student is the registered build
   python -m kitsune.fullrun show --box full-t                     # the box spec with defaults, env and configs (JSON)
   python -m kitsune.fullrun check-students --box p01-chain --stage 2 --root R   # a chain: one stage's view
+  python -m kitsune.fullrun has-continues --box p-cool            # "1": the box has continues items, else "0"
 A chain's --stage defaults to $KITSUNE_CHAIN_STAGE, else 1 (show adds both stage views).
 The registry is $KITSUNE_FULL_REGISTRY when set (tests), else <root>/configs/full/boxes.json.
 
@@ -124,8 +143,10 @@ BOXES_FILE, ENV_REGISTRY = "configs/full/boxes.json", "KITSUNE_FULL_REGISTRY"
 # the registry, kept for tests/fixtures_full.py's 2-GPU box only), smoke B, and box 2 as two 1x boxes (DECISIONS G2):
 # full-t (T-0.6B) and full-p (P-0.3B with the augmentation recipe, the Whisper models and the quantised readouts;
 # P-0.05B postponed, DECISIONS H2), and p005: P-0.05B alone, the P test box of recipe v3 (DECISIONS H10; box p01 keeps
-# P-0.1B's run, whose continuation reads box p01's Hub summary)
-BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005")
+# P-0.1B's run, whose continuation reads box p01's Hub summary), and p-cool: one rental that re-runs the cooldowns of
+# box full-p's P-0.3B, box p01's P-0.1B and box p005's P-0.05B from their pre_cooldown states (DECISIONS H14; its
+# train items' `continues` blocks name the source boxes)
+BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005", "p-cool")
 # chain boxes (contract addendum E, DECISIONS D): one rental that runs registry boxes one after the other, in two
 # stages with an automatic gate between them (kitsune/full_queue.py ChainController). p01-chain = smoke A and smoke B,
 # then box 1, on one 1x RTX 5090
@@ -203,19 +224,38 @@ ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # also sets truncate_min_row_s (seconds >= 0), end_trim_p (a probability) and the background noise - noise_p (a
 # probability), the bank's data-repo path noise_bank and the sha256 of its index.json, noise_bank_sha256. DECISIONS
 # H12 adds the other acoustic steps' rates (speech_p, reverb_p, gain_p, codec_p) and the RIR bank (rir_bank, its pin
-# rir_bank_sha256); their ranges (speech_snr_db, gain_db, codecs, ...) stay the trainer's defaults
+# rir_bank_sha256); their ranges (speech_snr_db, gain_db, codecs, ...) are no resume sets: they are lists, which
+# KITSUNE_RESUME_SETS (comma-separated) cannot carry, and only a registry continuation sets them (CONTINUE_SET_KEYS).
+# DECISIONS H14 (box p-cool) adds background_min_row_s (seconds >= 0: rows shorter than this get no background speech
+# or noise) and schedule.deadline_cooldown (a bool: false turns the deadline's cooldown compression off for a
+# continuation; 04_distill RESUME_FIXED holds neither)
 RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
                    "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s", "augment.end_trim_p",
                    "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256", "augment.speech_p",
                    "augment.reverb_p", "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p",
-                   "augment.codec_p")
+                   "augment.codec_p", "augment.background_min_row_s", "schedule.deadline_cooldown")
 RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
 RESUME_SET_KINDS = {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
                     "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
                     "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob", "augment.noise_p": "prob",
                     "augment.noise_bank": "path", "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob",
                     "augment.reverb_p": "prob", "augment.rir_bank": "path", "augment.rir_bank_sha256": "sha256",
-                    "augment.gain_p": "prob", "augment.codec_p": "prob"}
+                    "augment.gain_p": "prob", "augment.codec_p": "prob", "augment.background_min_row_s": "seconds",
+                    "schedule.deadline_cooldown": "bool"}
+# the codecs a continuation's augment.codecs may name: a copy of kitsune.acoustics.CODECS (numpy at import, so it is
+# not imported here; tests/test_fullrun.py holds the two equal)
+CODEC_NAMES = ("mp3", "gsm", "ulaw8k", "vorbis", "opus")
+# DECISIONS H14: the scalar keys only a registry continuation sets (continues.sets; never KITSUNE_RESUME_SETS), with
+# their kinds (resume_set_value's rules) - schedule.resume_reset_keep_cooldown (a bool: the reset keeps the state's
+# early-stop cooldown, P-0.05B's paired cooldown). It is no resume set: only launch's continuation_preflight checks the
+# state's cooldown record before renting, and the trainer refuses it without schedule.resume_reset ("never alone")
+CONTINUE_ONLY_KINDS = {"schedule.resume_reset_keep_cooldown": "bool"}
+# the list-valued keys only a registry continuation sets - db_range a [low, high] range in dB (04_distill
+# validate_augment: low <= high), codecs a non-empty list of distinct CODEC_NAMES - and every key a continuation may set
+CONTINUE_LIST_KINDS = {"augment.noise_snr_db": "db_range", "augment.speech_snr_db": "db_range",
+                       "augment.gain_db": "db_range", "augment.codecs": "codecs"}
+CONTINUE_SET_KEYS = RESUME_SET_KEYS + tuple(CONTINUE_ONLY_KINDS) + tuple(CONTINUE_LIST_KINDS)
+DB_RANGE_MAX = 100.0  # |low|, |high| of a continuation's dB range: a typo guard (a 1000 dB SNR is no recipe)
 # a data-repo path a resume set may name: relative, every segment starting with a letter, digit or _ (so never "." or
 # ".."), no comma (KITSUNE_RESUME_SETS' separator) and nothing JSON would read as another type (04_distill's --set
 # keeps a string that is not JSON)
@@ -352,10 +392,15 @@ def dev_pick(rows, sources, per_source: int, seed: int) -> list[str]:
     return out
 
 
+def _scalar_kind(key: str) -> str:
+    """The kind of a scalar set's key: RESUME_SET_KINDS, or CONTINUE_ONLY_KINDS for a key only a continuation sets."""
+    return RESUME_SET_KINDS[key] if key in RESUME_SET_KINDS else CONTINUE_ONLY_KINDS[key]
+
+
 def resume_set_rule(key: str) -> str:
-    """The rule a resume set's value must follow (RESUME_SET_KINDS), as launch's --resume-set help and the refusals
-    say it."""
-    kind = RESUME_SET_KINDS[key]
+    """The rule a resume set's value must follow (RESUME_SET_KINDS; a CONTINUE_ONLY_KINDS key's too), as launch's
+    --resume-set help and the refusals say it."""
+    kind = _scalar_kind(key)
     if kind == "int":
         return f"an int >= {RESUME_SET_INT_MIN[key]}"
     return {"bool": "true or false", "prob": "a probability in [0, 1]", "seconds": "a number of seconds >= 0",
@@ -364,8 +409,9 @@ def resume_set_rule(key: str) -> str:
 
 
 def resume_set_value(key: str, val: str) -> str:
-    """A resume set's value of key (one of RESUME_SET_KEYS) in its one normalised spelling - the word launch puts in
-    KITSUNE_RESUME_SETS, resume-pull records in the plan and the queue passes to the trainer as --set key=<it>:
+    """A resume set's value of key (one of RESUME_SET_KEYS, or a CONTINUE_ONLY_KINDS key for continue_set_text) in its
+    one normalised spelling - the word launch puts in KITSUNE_RESUME_SETS, resume-pull records in the plan and the
+    queue passes to the trainer as --set key=<it>:
       int   digits only, at least RESUME_SET_INT_MIN[key], as str(int): "012" -> "12" (no sign, no decimal point)
       bool  true or false in any case, as JSON: "True" -> "true". 04_distill's --set parses JSON, and the string
             "True" it would keep instead fails its bool check - on the box, after the paid boot and the store build
@@ -377,7 +423,7 @@ def resume_set_value(key: str, val: str) -> str:
     One spelling per value is what lets the queue compare launches: adopt() records `resume_sets_differ` when the env's
     sets differ from the resume plan's, and a relaunch of the same continuation spelled ".3" must not look like a
     different one. ValueError naming the rule otherwise."""
-    kind = RESUME_SET_KINDS[key]
+    kind = _scalar_kind(key)
     if kind == "int":
         if re.fullmatch(r"\d+", val) and int(val) >= RESUME_SET_INT_MIN[key]:
             return str(int(val))
@@ -446,6 +492,65 @@ def parse_resume_reset(s: str | None) -> list[str]:
         if rid not in out:
             out.append(rid)
     return out
+
+
+def continue_set_rule(key: str) -> str:
+    """The rule a continuation's set of key (CONTINUE_SET_KEYS) must follow, as the registry's refusals say it."""
+    kind = CONTINUE_LIST_KINDS.get(key)
+    if kind == "db_range":
+        return (f"a list [low, high] of 2 finite numbers of dB (no bools), low <= high, each within "
+                f"+-{DB_RANGE_MAX:g}")
+    if kind == "codecs":
+        return f"a non-empty list of distinct codec names of {list(CODEC_NAMES)}"
+    return resume_set_rule(key)
+
+
+def _scalar_text(v) -> str | None:
+    """A JSON scalar's text as resume_set_value reads it: a bool as true / false, a number as its repr, a string as
+    it is; None for anything else (null, a list, an object), which no scalar rule takes."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    return v if isinstance(v, str) else None
+
+
+def continue_set_text(key: str, value) -> str:
+    """A continuation's set (key one of CONTINUE_SET_KEYS, value the registry's JSON value) in its one normalised
+    spelling - the value of the --set word the queue passes to the trainer (04_distill's apply_set json-parses it):
+      scalar keys (RESUME_SET_KEYS, CONTINUE_ONLY_KINDS)  resume_set_value(key, the value's text): 6 -> "6",
+                                     True -> "true", 0.30 -> "0.3", 3 -> "3.0" (seconds); a string is read as it
+                                     is ("true" -> "true")
+      db_range  "[%r,%r]" of the two floats: [5, 20] -> "[5.0,20.0]", [-10.0, 10] -> "[-10.0,10.0]"
+      codecs    compact JSON: ["mp3", "ulaw8k"] -> '["mp3","ulaw8k"]'
+    ValueError naming the key and its rule (continue_set_rule) otherwise, and for a key outside CONTINUE_SET_KEYS."""
+    if key not in CONTINUE_SET_KEYS:
+        raise ValueError(f"{key!r} is not a key a continuation may set ({', '.join(CONTINUE_SET_KEYS)})")
+    kind = CONTINUE_LIST_KINDS.get(key)
+    if kind is None:
+        text = _scalar_text(value)
+        if text is None:
+            raise ValueError(f"{key} must be {resume_set_rule(key)}, not {value!r}")
+        return resume_set_value(key, text)
+    if kind == "db_range":
+        if isinstance(value, list) and len(value) == 2 and all(_num(x) for x in value) \
+                and value[0] <= value[1] and all(abs(x) <= DB_RANGE_MAX for x in value):
+            return "[%r,%r]" % (float(value[0]), float(value[1]))
+    elif isinstance(value, list) and value and all(isinstance(x, str) and x in CODEC_NAMES for x in value) \
+            and len(set(value)) == len(value):
+        return json.dumps(value, separators=(",", ":"))
+    raise ValueError(f"{key} must be {continue_set_rule(key)}, not {value!r}")
+
+
+def continue_sets(cont: dict) -> list[str]:
+    """A continues block's sets as the trainer's --set words, ["<key>=<continue_set_text>", ...], in the sets object's
+    order (its comment keys, starting with "_", skipped). The queue prepends "schedule.resume_reset=true"; launch and
+    resume-pull compare a recorded continuation's sets with these. ValueError (continue_set_text) on a bad set, or when
+    the block or its sets is not an object."""
+    sets = cont.get("sets") if isinstance(cont, dict) else None
+    if not isinstance(sets, dict):
+        raise ValueError(f"continues block {cont!r}: sets is not an object")
+    return [f"{k}={continue_set_text(k, v)}" for k, v in sets.items() if not str(k).startswith("_")]
 
 
 def run_id_of(run_dir: str) -> str:
@@ -555,7 +660,8 @@ _ITEM_FIELDS = {"name": _REQ, "kind": _REQ, "needs": [], "stall_min": _REQ, "max
 _SOURCE_FIELDS = {"of": None, "of_box": None, "weights": [], "model": None}
 _KIND_FIELDS = {
     "stores": {"config": _REQ, "eval_only": False, "sets": []},
-    "train": {"config": _REQ, "study_run": _REQ, "family": _REQ, "plan_total_steps": None, "plan_hours": None},
+    "train": {"config": _REQ, "study_run": _REQ, "family": _REQ, "plan_total_steps": None, "plan_hours": None,
+              "continues": None},
     "readout": {"of": _REQ},
     "speed": {"system": _REQ, "speed_kind": _REQ, **_SOURCE_FIELDS, "args": [], "only_if_new_machine": None},
     "eval": {"argv": _REQ, **_SOURCE_FIELDS},
@@ -563,6 +669,7 @@ _KIND_FIELDS = {
 _FAULT_FIELDS = {"id": _REQ, "action": _REQ, "item": _REQ, "at_step": None, "after_event": None, "min_attempt": 1,
                  "seconds": None}
 _VERDICT_KEYS = ("check", "json", "path", "min", "max", "equals")
+_CONTINUES_KEYS = ("box", "run_id", "from_step", "to_step", "resets_before", "sets")  # a train item's continues block
 _WATCHDOG_ACTIONS = ("stop", "alert")
 # vast/watchdog.sh's poll (KITSUNE_WATCHDOG_POLL_S, default 60): a stale heartbeat is seen at the first poll past
 # orphan_s, so a freeze_controller_hb window must last orphan_s + this for its alert to fall inside it (box 53693389:
@@ -742,6 +849,88 @@ def _check_sources(where: str, it: dict, bname: str, box: dict, train_names: lis
     return implicit
 
 
+def _check_continues(where: str, c, p: list[str]) -> None:
+    """A train item's continues block on its own (DECISIONS H14): exactly _CONTINUES_KEYS (comments aside), box a
+    name, run_id a run id, from_step an int > 0, to_step an int > from_step, resets_before an int >= 0, sets an object
+    of CONTINUE_SET_KEYS whose values follow their rules (continue_set_text). The checks across boxes (the source box,
+    its same-name same-config item, the run ids of the box) are _check_continuations'."""
+    if not isinstance(c, dict):
+        p.append(f"{where} {c!r} is not null or an object {{{', '.join(_CONTINUES_KEYS)}}}")
+        return
+    missing, unknown = [k for k in _CONTINUES_KEYS if k not in c], sorted(k for k in _keys(c)
+                                                                         if k not in _CONTINUES_KEYS)
+    if missing or unknown:
+        p.append(f"{where}: keys must be exactly {list(_CONTINUES_KEYS)}: missing {missing}, unknown {unknown}")
+    if "box" in c and not (isinstance(c["box"], str) and c["box"]):
+        p.append(f"{where}.box {c['box']!r} is not a registry box name")
+    if "run_id" in c and not (isinstance(c["run_id"], str) and re.fullmatch(RUN_ID_RE, c["run_id"])):
+        p.append(f"{where}.run_id {c['run_id']!r} is not a run id like full-p03-20261003T230143Z")
+    fs, ts, rb = c.get("from_step"), c.get("to_step"), c.get("resets_before")
+    if "from_step" in c and not (_int(fs) and fs > 0):
+        p.append(f"{where}.from_step {fs!r} is not an int > 0 (the pre_cooldown state's step)")
+    if "to_step" in c and not (_int(ts) and ts > (fs if _int(fs) and fs > 0 else 0)):
+        p.append(f"{where}.to_step {ts!r} is not an int > from_step {fs!r} (the run's own end)")
+    if "resets_before" in c and not (_int(rb) and rb >= 0):
+        p.append(f"{where}.resets_before {rb!r} is not an int >= 0 (the state's resume_resets)")
+    if "sets" in c:
+        sets = c["sets"]
+        if not isinstance(sets, dict):
+            p.append(f"{where}.sets {sets!r} is not an object of key -> value")
+            return
+        for k, v in sets.items():
+            if str(k).startswith("_"):
+                continue
+            if k not in CONTINUE_SET_KEYS:
+                p.append(f"{where}.sets: {k!r} is not a key a continuation may set ({', '.join(CONTINUE_SET_KEYS)})")
+                continue
+            try:
+                continue_set_text(k, v)
+            except ValueError as e:
+                p.append(f"{where}.sets: {e}")
+
+
+def _continues_items(box: dict) -> list[dict]:
+    """A filled plain box's train items with a continues block (a malformed item list: none)."""
+    return [it for it in box.get("items") or [] if isinstance(it, dict) and it.get("kind") == "train"
+            and it.get("continues") is not None]
+
+
+def _check_continuations(filled: dict, chains: dict, p: list[str]) -> None:
+    """The continues blocks across boxes (DECISIONS H14): box names a plain registry box that is neither a chain nor
+    the item's own box and has a train item of the same name with the same config (the run's source, whose Hub
+    summary records it); no two items of a box continue the same run id."""
+    for bname, box in filled.items():
+        seen: dict = {}
+        for it in _continues_items(box):
+            c, w = it["continues"], f"boxes.{bname}.items.{it.get('name')}.continues"
+            if not isinstance(c, dict):
+                continue  # a problem already
+            src, rid = c.get("box"), c.get("run_id")
+            if isinstance(src, str) and src:
+                if src == bname:
+                    p.append(f"{w}.box {src!r} is the item's own box: a continuation continues another box's run")
+                elif src in chains:
+                    p.append(f"{w}.box {src!r} is a chain box: name the plain box that ran the run")
+                elif src not in filled:
+                    p.append(f"{w}.box {src!r} is not a registry box")
+                else:
+                    same = [x for x in filled[src].get("items") or [] if isinstance(x, dict)
+                            and x.get("kind") == "train" and x.get("name") == it.get("name")]
+                    if not same:
+                        p.append(f"{w}.box {src!r} has no train item {it.get('name')!r}: the source box must run the "
+                                 f"run under the same item name")
+                    elif same[0].get("config") != it.get("config"):
+                        p.append(f"{w}.box {src!r}: its train item {it.get('name')!r} trains config "
+                                 f"{same[0].get('config')!r}, this one {it.get('config')!r}: a continuation keeps "
+                                 f"the run's config")
+            if isinstance(rid, str):
+                if rid in seen:
+                    p.append(f"{w}.run_id {rid!r} is continued by item {seen[rid]!r} of box {bname} too: one item "
+                             f"per run")
+                else:
+                    seen[rid] = it.get("name")
+
+
 def _check_item(where: str, it: dict, bname: str, box: dict, earlier: list[str], train_names: list[str],
                 reg_boxes: dict, p: list[str]) -> dict:
     kind = it.get("kind")
@@ -793,6 +982,8 @@ def _check_item(where: str, it: dict, bname: str, box: dict, earlier: list[str],
             p.append(f"{where}.plan_hours {ph!r} is not a number > 0")
         if (pts is None) != (ph is None):
             p.append(f"{where}: plan_total_steps and plan_hours go together")
+        if g("continues") is not None:
+            _check_continues(f"{where}.continues", g("continues"), p)
     elif kind == "readout":
         if g("of") in train_names and g("of") in earlier:
             implicit.append(g("of"))
@@ -1067,6 +1258,10 @@ def _check_chain(cname: str, raw: dict, plain: dict, p: list[str]) -> dict:
             else:
                 gpus.add(plain[x].get("gpus"))
         specs = {x: plain[x] for x in parts if x in plain}
+        for x, s in specs.items():  # DECISIONS H14: a continuation box always resumes, so it never runs in a chain
+            if conts := [it.get("name") for it in _continues_items(s)]:
+                p.append(f"{w}: part {x!r} has continues items {conts}: a box that continues other boxes' runs "
+                         f"runs alone, always as a resume, never as a chain part")
         gb = fs.get("gate_box")
         if k == 0:
             mh = fs.get("max_hours")
@@ -1220,6 +1415,7 @@ def _check(reg, root, check_files: bool, read_json=None) -> tuple[list[str], dic
                          + (" with items (it is a chain)" if ob in chains else ""))
             elif ob in filled and of not in [x.get("name") for x in filled[ob]["items"] if x.get("kind") == "train"]:
                 p.append(f"boxes.{bname}.items.{it.get('name')}: of {of!r} is not a train item of box {ob}")
+    _check_continuations(filled, chains, p)
     plain_filled = dict(filled)
     for cname, raw in chains.items():
         filled[cname] = _check_chain(cname, raw, plain_filled, p)
@@ -1489,6 +1685,18 @@ def train_items(box, registry=None) -> list[dict]:
     return [it for it in box_items(box, registry) if it["kind"] == "train"]
 
 
+def continues_of(box, registry=None) -> dict[str, dict]:
+    """The box's continuations (DECISIONS H14): {train item name: its continues block (a copy)}, in registry order;
+    {} for a box without (a chain too: the registry refuses continues items in a chain's parts). RegistryError for a
+    box the registry does not have."""
+    reg, _ = _resolved(registry, None)
+    if box not in reg["boxes"]:
+        raise _no_box(box, reg)
+    if _chain_entry(box, reg) is not None:
+        return {}
+    return {it["name"]: copy.deepcopy(it["continues"]) for it in _continues_items(reg["boxes"][box])}
+
+
 def box_configs(box, registry=None) -> list[str]:
     """Every config the box reads, repo-relative and once each: its data config, its stores and train items' configs,
     and the registry file itself (launch checks they are committed at the sha it rents). A chain: every part's, both
@@ -1626,7 +1834,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m kitsune.fullrun", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("students", "extra-files", "extra-dirs", "check-students", "show"):
+    for c in ("students", "extra-files", "extra-dirs", "check-students", "show", "has-continues"):
         sp = sub.add_parser(c)
         sp.add_argument("--box", default=os.environ.get(ENV_BOX), choices=ALL_BOX_NAMES)
         sp.add_argument("--stage", type=int, default=None,
@@ -1641,6 +1849,9 @@ def main(argv=None) -> int:
     root = Path(args.root) if args.root else None
     try:
         reg, r = _resolved(None, root)
+        if args.cmd == "has-continues":  # vast/bootstrap.sh: such a box always runs resume-pull (DECISIONS H14)
+            print("1" if continues_of(args.box, reg) else "0")
+            return EXIT_OK
         chain = _chain_entry(args.box, reg) is not None
         stage = None
         if chain:

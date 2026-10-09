@@ -49,8 +49,8 @@ Inputs besides the two generators' own: PLAN_FILE (configs/full/plan/full_study.
 configs/full/*.json is a config), the JSON tools/full_plan.py wrote for full.parquet and smoke.parquet at SMOKE_EPOCHS
 (its "full" and "smoke" parts; --import-plan records a new measurement; the local selection paths become the repo
 paths), and its "launch" part: tools/full_plan.py on full.parquet at the epochs the boxes run now (FULL_RUNS; a student
-with a continuation at its CONTINUATIONS epochs: since DECISIONS H13 the cooldown re-runs keep their runs' 6 and 4),
---import-launch-plan:
+with a continuation at its CONTINUATIONS epochs: since DECISIONS H13 the cooldown re-runs keep their runs' own 6, 4
+and, H14, 10), --import-launch-plan:
   python tools/full_plan.py --selection <full.parquet> --student t06=aed:450:1730:<E> --student p03=ctc:600:1350:<E>
       --student p005=ctc:1600:1500:<E> --student p01=ctc:1600:1500:<E> --json plan_launch.json
   python tools/make_full_configs.py --import-launch-plan plan_launch.json
@@ -63,13 +63,16 @@ them), and F4's seconds, the deadline fault of smoke-p005 (deadline_fault_s). Af
 full_plan.py --json on full.parquet and on smoke.parquet, --import-plan with both (it prints what boxes.json must be
 changed in), then those numbers into boxes.json by hand, then --check and the tests.
 
-The boxes' hours (HOURS_BOXES: box full-t, box p005, and boxes full-p and p01, whose continuations are the recipe-v4
-cooldown re-runs of P-0.3B and P-0.1B, DECISIONS H13): SPEED_FILE
+The boxes' hours (HOURS_BOXES: box full-t, box p005, and box p-cool, whose three continuations are the cooldown re-runs
+of P-0.3B, P-0.1B and P-0.05B, DECISIONS H14): SPEED_FILE
 (configs/full/plan/box2_hours.json, --import-speed) records the measured speeds box_hours projects them from: smoke A's
 per-student s/step (smoke verdict check 3) and box 1's s/step, in-run overhead, CTC store and bootstrap hours
 (tools/box1_go.py --json, at the runs-repo revision of box 1's 4-epoch record), a run with the augmentation recipe at
 AUGMENT_STEP_FACTOR x its s/step (concat's longer rows). It prints, and --check holds, each box's train items'
-max_hours and its est_hours / max_hours.
+max_hours and its est_hours / max_hours. A continuation's train item carries a `continues` block (kitsune.fullrun,
+DECISIONS H14: the source box, run id, from / to step, resets before and the trainer sets), which --check holds equal
+to continues_block's of CONTINUATIONS (continues_problems), and CONTINUATIONS to the plan record
+(continuation_plan_problems).
 
 configs/full/boxes.json, the box registry (kitsune/fullrun.py), is hand-written; --check validates it with
 fullrun.registry_problems (every data and item config present, its data keys equal to its box's data config's; the
@@ -78,7 +81,7 @@ stage's rebuild config and stage 1's within stage 2's), checks that every readou
 reserve (readout_reserve_problems; a chain has no items, its parts are checked) and that the numbers bound to the plan
 record equal it (registry_drift: smoke A's plan_total_steps / plan_hours and F4's seconds; the HOURS_BOXES' hours to
 the speed record; the chain's own hours are addendum E.6's and tests/test_full_configs.py checks them against its
-parts).
+parts), and that every continues block is the generator's (continues_problems).
 
 Usage:
   python tools/make_full_configs.py                  # write configs/full/*.json (and remove stale generated ones)
@@ -117,7 +120,8 @@ STUDY_DATA = ROOT / "study" / "data.json"
 # truncate 0.3 (a row cut before a word, never between a sentence's last word and its mark, half of the cuts in a
 # pause), concat 0.5 (a micro-batch's rows joined k at a time inside its planned padded frames, <= 28 s) and weak
 # mixing, mix_p 0.05 (another row 5-20 dB down under the clean row's targets; the owner's launch line). Kept as the
-# record of what ran: the recipe test box's --resume-set flags (CONTINUATIONS p01, continuation_flags)
+# record of what ran: the recipe test box's --resume-set flags (then CONTINUATIONS p01 and continuation_flags, which
+# the registry's continues blocks replaced with DECISIONS H14)
 RECIPE_TEST = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}
 # THE RECIPE (v2, DECISIONS H6, owner 2026-10-03 "Fix, then launch P-0.3B anew with the new recipe"), after the external
 # review of the test's model: truncate 0.2 (0.3 left the final 。 off 3-8 % of complete sentences, JSUT 92 % against the
@@ -153,8 +157,8 @@ AED_CUTS_SHA256 = "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb
 # index.json and pulled by box p01, boxes.json extra_dirs), mixed under the whole row - a joined row's utterances and
 # the gaps between them alike -, the targets the teacher's on the clean audio. Why: on 30 s windows of stream audio
 # (talk over game sound and music) the Parakeet teacher writes nothing and P-0.3B with it, while both transcribe the
-# same talk alone. Box p005 tests it first: P-0.05B from step 0 at 10 epochs (FULL_RUNS p005; DECISIONS H9, H10); the
-# recipe-v4 cooldown re-runs of P-0.3B and P-0.1B (CONTINUATIONS, DECISIONS H13) wait for that result
+# same talk alone. Box p005 tested it first: P-0.05B from step 0 at 10 epochs (FULL_RUNS p005; DECISIONS H9, H10); the
+# cooldown re-runs of P-0.3B, P-0.1B and P-0.05B on box p-cool (CONTINUATIONS, DECISIONS H13, H14) came after
 # DECISIONS H12: the bank is v2 since (aug/musan-bg-v1 - music without vocals and noise only - stays on the data repo,
 # never trained with): v1's music and noise plus 10 h of songs with lyrics and 10 h of speech (17 languages)
 NOISE_BANK = "aug/musan-bg-v2"
@@ -184,6 +188,19 @@ RECIPE_V4 = {**RECIPE_V3, "speech_p": 0.15, "reverb_p": 0.2, "rir_bank": RIR_BAN
 # recipe takes the background as well - the same bank, rate and SNRs as the CTC students (kitsune.trainset mixes it
 # under an AED row after its join, cut and trim, the Cohere tokens unchanged); box full-t pulls the bank
 RECIPE_AED = {**RECIPE_V4, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}  # recipe v4 since DECISIONS H12
+# THE COOLDOWN RE-RUNS' RECIPES (DECISIONS H14, box p-cool; CONTINUATIONS). A continuation resumes a state whose config
+# may hold other ranges (a re-save of an earlier test), and a resume keeps every augment key it does not set, so both
+# spell the acoustic steps' ranges and the short-row guard explicitly:
+#   RECIPE_V4_FULL  recipe v4 with the trainer's defaults written out (04_distill DEFAULTS augment: background noise
+#                   0-20 dB, background speech 10-25 dB, volume -20..+10 dB, codecs MP3 / GSM 6.10 / mu-law,
+#                   background_min_row_s 0: every row may get a background) - P-0.1B's re-run
+#   RECIPE_GENTLE   recipe v4 at milder settings: background noise 5-20 dB, background speech 15-25 dB, volume
+#                   -10..+10 dB, codecs MP3 and mu-law (no GSM), and no background speech or noise under rows shorter
+#                   than 3 s (background_min_row_s 3.0; reverb, volume and codec still apply) - P-0.3B's and P-0.05B's
+RECIPE_V4_FULL = {**RECIPE_V4, "noise_snr_db": [0.0, 20.0], "speech_snr_db": [10.0, 25.0], "gain_db": [-20.0, 10.0],
+                  "codecs": ["mp3", "gsm", "ulaw8k"], "background_min_row_s": 0.0}
+RECIPE_GENTLE = {**RECIPE_V4, "noise_snr_db": [5.0, 20.0], "speech_snr_db": [15.0, 25.0], "gain_db": [-10.0, 10.0],
+                 "codecs": ["mp3", "ulaw8k"], "background_min_row_s": 3.0}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
@@ -198,7 +215,8 @@ RECIPE_AED = {**RECIPE_V4, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}  # 
 # the P test box: "the p-0.05 run needs more epochs as well as the 0.1 run. They are smaller and as p-0.3 has shown more
 # epochs improve the performance of these models"; chose "P-0.1B 8, P-0.05B 10" and "Continue box 1's run"). P-0.1B's
 # config stays box 1's 4-epoch one byte for byte (its run continues: CONTINUATIONS sets its epochs on the resume - 8
-# under H9, 4 again since H13's cooldown re-run), and so does P-0.3B's 6-epoch one (its H13 re-run sets recipe v4).
+# under H9, 4 again since H13's cooldown re-run), and so do P-0.3B's 6-epoch and P-0.05B's 10-epoch ones (their H14
+# re-runs set their recipes on the resume).
 # This is the one epoch parameter: a change here, then --import-launch-plan of a full_plan.py record at the new
 # epochs, then the printed hours (--import-speed) into boxes.json. AUGMENT: the run's augment block (full_config; the
 # smoke configs never take it), None for none. DECISIONS H1 step 2: P-0.3B trains with RECIPE (v2 since H6, after
@@ -225,7 +243,7 @@ SMOKE_EPOCHS = {"t06": 3, "p03": 3, "p01": 4, "p005": 4}
 SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # box p01's continuation, now THE RECIPE TEST (DECISIONS H1; the 8-epoch continuation of G3, patience 12, is postponed:
 # H2), launched with --resume-reset run_id --resume-set run_id:schedule.epochs=<epochs> and one --resume-set
-# run_id:augment.<key>=<value> per RECIPE_TEST key (continuation_flags; fullrun.RESUME_SET_KEYS). It re-runs ONLY the
+# run_id:augment.<key>=<value> per RECIPE_TEST key (fullrun.RESUME_SET_KEYS). It re-runs ONLY the
 # cooldown of box 1's run: from its pre_cooldown state (from_step: checkpoints/full_step_86328, on the Hub) to the SAME
 # end (epochs 4: T 107,910 on full.parquet, so 21,582 steps, ~2 h) with the recipe on. The WSD cooldown starts at
 # t_c = 0.8 T = 86,328 = from_step: the whole re-run is cooldown. Everything before from_step - the data order, the
@@ -261,11 +279,39 @@ SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # weights) at the head of the runs repo - the baselines stay at their revisions -, as A1 did. H9's 8-epoch
 # continuation of P-0.1B is set aside, not lost: it can start later from the same pre_cooldown weights (epochs 8,
 # patience 12, as H9 planned)
+# DECISIONS H14 (the owner, 2026-10-09): ONE BOX, p-cool (1x RTX 5090, data-p01: one rebuild and one CTC store, which
+# the three P runs' configs share - the full data, family ctc), re-runs three done runs' cooldowns, IN THIS ORDER, each
+# from its runs-repo pre_cooldown state (checkpoints/full_step_<from_step>, trainer.json reason pre_cooldown) to the
+# run's own end (to_step), then that run's M4 readout and 7 quantised readouts (H13's two re-runs moved there, box
+# p005's P-0.05B joined them; boxes full-p and p01 hold their runs' records again):
+#   p03-cool   P-0.3B, box full-p's 6-epoch run (baseline revision 3674d2d7, M4 9.73 %): 169,376 -> 211,720 (42,344
+#              steps, all of them cooldown: t_c = 0.8 T = from_step), RECIPE_GENTLE; its state counts no reset: -r1
+#   p01-cool   P-0.1B, box 1's 4-epoch run (c4604304, M4 11.45 %, G4): 86,328 -> 107,910 (21,582 steps), RECIPE_V4_FULL;
+#              the runs repo's state is A1's re-save (st.resume_resets 1): -r2
+#   p005-cool  P-0.05B, box p005's 10-epoch run (d2caddfc), which its early stop cooled down: from that cooldown's start,
+#              67,449, to its T, 80,939 (13,490 steps), RECIPE_GENTLE, keep_cooldown: the reset keeps the state's
+#              early-stop cooldown record (04_distill schedule.resume_reset_keep_cooldown), so the re-run replays the
+#              same t_c, T and LR instead of planning the 10-epoch schedule again; no reset yet: -r1
+# Each sets the run's own epochs (so a re-planned T is the run's), schedule.deadline_cooldown false (4d must never
+# compress a paired cooldown: a box out of time is stopped by the watchdog and resumed), p005-cool
+# schedule.resume_reset_keep_cooldown true, and every key of its recipe, the ranges included (continuation_set_dict).
+# The registry carries them (boxes.json p-cool's train items' continues blocks, continues_block; --check holds them), so
+# the box always resumes and launch --box p-cool takes no reset or set flags. box: where it runs; source_box: the box
+# whose Hub summary records the run (the same item name and config); resets_before: the state's st.resume_resets, so
+# the readout writes runs/m4-<run_id>-r<resets_before + 1>; revision: the baseline record (runs repo) the readout is
+# paired with: everything before from_step is the baseline's, so the readout isolates the cooldown's recipe. A re-run
+# overwrites its run's summary, config, final evals and export at the runs repo's head; the baselines stay at their
+# revisions. Queue order = this dict's order
 CONTINUATIONS = {
-    "p03": dict(box="full-p", student="p03", run_id="full-p03-20261003T230143Z", from_step=169376, epochs=6,
-                patience=None, augment=RECIPE_V4, revision="3674d2d7ae7480594b079234b1549014fe96f783"),
-    "p01": dict(box="p01", student="p01", run_id="full-p01-20261001T184145Z", from_step=86328, epochs=4,
-                patience=None, augment=RECIPE_V4, revision="c4604304db76e068df7bbe39d00d006b74d6c134"),
+    "p03-cool": dict(box="p-cool", source_box="full-p", student="p03", run_id="full-p03-20261003T230143Z",
+                     from_step=169376, to_step=211720, resets_before=0, epochs=6, keep_cooldown=False,
+                     augment=RECIPE_GENTLE, revision="3674d2d7ae7480594b079234b1549014fe96f783"),
+    "p01-cool": dict(box="p-cool", source_box="p01", student="p01", run_id="full-p01-20261001T184145Z",
+                     from_step=86328, to_step=107910, resets_before=1, epochs=4, keep_cooldown=False,
+                     augment=RECIPE_V4_FULL, revision="c4604304db76e068df7bbe39d00d006b74d6c134"),
+    "p005-cool": dict(box="p-cool", source_box="p005", student="p005", run_id="full-p005-20261008T160232Z",
+                      from_step=67449, to_step=80939, resets_before=0, epochs=10, keep_cooldown=True,
+                      augment=RECIPE_GENTLE, revision="d2caddfc308c10495253c0204c4edf8a6222dac0"),
 }
 # READOUT_RESERVE. A readout runs right after its training item on the same GPU (Resolution 25) under the same
 # KITSUNE_DEADLINE (kitsune.full_queue item_deadline: the box deadline less deadline_reserve_min). After a run that the
@@ -335,11 +381,13 @@ DEADLINE_FAULT_SHARE, DEADLINE_FAULT_ROUND_S = 0.5, 10  # contract 7: S <= 0.5 x
 # augment_step_factor x the s/step (below).
 SPEED_FILE = "plan/box2_hours.json"  # under OUT_DIR, next to PLAN_FILE (launch's SPEED_RECORD names it)
 # the boxes whose hours are box_hours of the speed record (DECISIONS G2/G3/H1: box 2 as two 1x RTX 5090 boxes, T and P,
-# and box p01's continuation): their train runs, in queue order, "continuation" for the box's CONTINUATIONS entry. Box
-# P trains P-0.3B only (DECISIONS H1 step 2, with the recipe; P-0.05B was postponed, H2); box p005 trains P-0.05B alone
-# (the P test box, DECISIONS H10); boxes full-p and p01 the recipe-v4 cooldown re-runs of P-0.3B's and P-0.1B's runs
-# (DECISIONS H13; box full-p's fresh 6-epoch run is done, its Whisper evals stay done on a reset)
-HOURS_BOXES = {"full-t": ("t06",), "full-p": ("continuation",), "p01": ("continuation",), "p005": ("p005",)}
+# and the continuation boxes): their train runs, in queue order, a FULL_RUNS student's run from step 0 or
+# "cont:<name>" for CONTINUATIONS[name]. Box full-t trains T-0.6B; box p005 trained P-0.05B alone (the P test box,
+# DECISIONS H10; its fresh run's hours, the record); box p-cool the three cooldown re-runs (DECISIONS H14). Boxes full-p
+# and p01 left it with H14: their runs are done (full-p's 6-epoch run; box 1's 4 epochs and A1's re-run) and their
+# entries are the records of what they ran or had planned (origin/main's, H9's 8-epoch continuation on p01), so their
+# hours are no longer held to the speed record
+HOURS_BOXES = {"full-t": ("t06",), "p005": ("p005",), "p-cool": ("cont:p03-cool", "cont:p01-cool", "cont:p005-cool")}
 # CONCAT'S EXTRA ATTENTION (DECISIONS H1: "add a few % for concat's extra attention"). A joined row holds k utterances
 # (k <= concat_max_n 4, <= 28 s) in the frames its micro-batch had planned, but its self-attention grows with the
 # square of its length: on full.parquet at concat_p 0.5 the attention's elements grow 1.27x over the planned
@@ -377,13 +425,19 @@ STORES_PESS = 1.91 / 1.37  # a box-1 record's measured CTC store: central x 1, p
 #   box full-p's cooldown re-run (DECISIONS H13): m4-full-p03 and its 7 quant readouts only - the Whisper evals are
 #               done and verified, so resume-pull keeps them done -, measured on 2026-10-04 at ~7 min for all eight
 #               (21:05-21:12Z: its run dirs' timestamps), so box p01's tail, plus the pull (CONT_PULL_H)
+#   box p-cool: three M4 readouts and 21 quant readouts (P-0.3B's eight took ~7 min, P-0.1B's and P-0.05B's are
+#               smaller) [X], plus one pull per continuation (CONT_PULL_H: resume-pull downloads each run's
+#               pre_cooldown state, check-resume runs before each)
+# Boxes full-p and p01 are no HOURS_BOXES since DECISIONS H14 (their entries are records): their tails stay as the
+# record of their hours
 POST_T_H = (0.6, 1.35)
 POOL_P_H = (0.9, 1.65)  # box full-p's fresh run (DECISIONS G2), the record of its hours
 P01_TAIL_H = (0.2, 0.5)
 P005_TAIL_H = (0.2, 0.5)
 P03_CONT_TAIL_H = (0.2, 0.5)
-CONT_PULL_H = (0.1, 0.3)
-BOX_TAIL_H = {"full-t": POST_T_H, "full-p": P03_CONT_TAIL_H, "p01": P01_TAIL_H, "p005": P005_TAIL_H}
+PCOOL_TAIL_H = (0.4, 1.0)
+CONT_PULL_H = (0.1, 0.3)  # once per continuation of the box
+BOX_TAIL_H = {"full-t": POST_T_H, "p005": P005_TAIL_H, "p-cool": PCOOL_TAIL_H}
 END_H = 0.35  # calc_v3 end: finish's uploads and the destroy
 # max_hours' host margin: smoke A ran on a Ryzen 9950X (calc_v3's "fast" CPU class); calc_v3's pessimistic T-0.6B
 # epoch is 13.635 / 10.846 = 1.26 x its fast one (box 2's only 2x offer on 2026-10-01, m54650, a Zen2 EPYC, is
@@ -404,7 +458,8 @@ class SpeedError(ValueError):
 
 
 def launch_epochs(x: str) -> int:
-    """The epochs box x's run is planned for now: FULL_RUNS', or its continuation's (P-0.1B: 8)."""
+    """The epochs student x's run is planned for now: its continuation's (CONTINUATIONS: the run's own since DECISIONS
+    H13, P-0.1B 4), else FULL_RUNS'."""
     cont = next((c for c in CONTINUATIONS.values() if c["student"] == x), None)
     return int(cont["epochs"] if cont else FULL_RUNS[x]["epochs"])
 
@@ -585,9 +640,11 @@ def augment_step_factor(augment: dict | None) -> float:
 
 
 def continuation_run(name: str, plan: dict, rec: dict) -> dict:
-    """A continuation's run (CONTINUATIONS[name]): the steps from its pre_cooldown state to its new T on full.parquet
-    (plan["launch"] at its epochs), the dev checks of the epochs left, and its hours by the run model (at
-    augment_step_factor x the s/step when it sets an augmentation recipe)."""
+    """A continuation's run (CONTINUATIONS[name]): the steps from its pre_cooldown state to its end (to_step -
+    from_step), their dev checks (the steps over the run's steps per epoch on full.parquet - plan["launch"] at its epochs - every
+    COMMON eval.dev.every_epochs: P-0.05B's 13,490 steps of 26,977.7 per epoch, 5.0), and its hours by the run model (at
+    augment_step_factor x the s/step when its recipe joins rows). total_steps is the step it trains to (to_step: the
+    run's T, P-0.05B's its early stop's cooldown T), plan_total_steps the launch record's T at its epochs."""
     c = CONTINUATIONS[name]
     x = c["student"]
     sps, b1 = rec["smoke"]["sec_per_step"], rec.get("box1")
@@ -595,19 +652,23 @@ def continuation_run(name: str, plan: dict, rec: dict) -> dict:
     o = b1["overhead"] if b1 and b1.get("overhead") is not None else OVERHEAD_PLAN
     st = plan["launch"]["students"][x]
     T = int(st["total_steps"])
-    done_epochs = c["from_step"] / (T / len(st["steps_per_epoch"]))
-    checks = (c["epochs"] - done_epochs) / COMMON["eval"]["dev"]["every_epochs"]
+    steps = int(c["to_step"]) - int(c["from_step"])
+    checks = steps / (T / len(st["steps_per_epoch"])) / COMMON["eval"]["dev"]["every_epochs"]
     f = augment_step_factor(c.get("augment"))
-    return dict(student=x, total_steps=T, steps=T - c["from_step"], dev_checks=round(checks, 2), step_factor=f,
-                hours=_run_h(T - c["from_step"], sps[x] * f, r, o, FIXED_S[x], checks, DEV_CHECK_S[x]))
+    return dict(name=name, student=x, total_steps=int(c["to_step"]), plan_total_steps=T, steps=steps,
+                dev_checks=round(checks, 2), step_factor=f,
+                hours=_run_h(steps, sps[x] * f, r, o, FIXED_S[x], checks, DEV_CHECK_S[x]))
 
 
 def box_hours(plan: dict, rec: dict, box: str, reserve_min: float = 60) -> dict:
     """Box `box`'s hours (HOURS_BOXES) from the plan record's launch step counts and a SPEED_FILE record (the model
     above; reserve_min: the box's deadline_reserve_min). One GPU, one queue: setup, its one store, its runs in order
-    (a continuation: continuation_run), its tail and the end. Returns r, o, run_h (every FULL_RUNS student's run at
+    (a continuation: continuation_run), its tail (BOX_TAIL_H, plus CONT_PULL_H once per continuation) and the end.
+    Returns r, o, run_h (every FULL_RUNS student's run at
     launch_epochs and augment_step_factor of its augment block, P-0.1B's from step 0 as a cross-check), items (the
-    box's train items' max_hours), setup_h, store_h and tail_h as (central, pessimistic), est_hours (the central path)
+    box's train items' max_hours), continuations (the box's continuation_run results, in queue order; continuation: the
+    first of them, None for a box without), setup_h, store_h and tail_h as (central, pessimistic), est_hours (the
+    central path)
     and max_hours (the pessimistic setup and store, the runs x HOST_PESS, the worst tail, the deadline reserve and one
     stall), and slack_h: what the pessimistic path leaves before the last run's deadline-cooldown point."""
     sps, b1 = rec["smoke"]["sec_per_step"], rec.get("box1")
@@ -622,43 +683,115 @@ def box_hours(plan: dict, rec: dict, box: str, reserve_min: float = 60) -> dict:
     store_c = b1["stores_ctc_h"] if b1 and b1.get("stores_ctc_h") else STORES_H["central"] / (1 + AED_STORE_SHARE)
     store_p = round(store_c * STORES_PESS, 2)
     runs = HOURS_BOXES[box]
-    cr, items, last = None, {}, None
-    for x in runs:  # in queue order; "continuation": the box's CONTINUATIONS entry
-        if x == "continuation":
-            cr = continuation_run(next(n for n, c in CONTINUATIONS.items() if c["box"] == box), plan, rec)
+    conts, items, last = [], {}, None
+    for x in runs:  # in queue order; "cont:<name>": CONTINUATIONS[name]
+        if x.startswith("cont:"):
+            cr = continuation_run(x[len("cont:"):], plan, rec)
+            conts.append(cr)
             items[f"full-{cr['student']}"], last = cr["hours"], cr["student"]
         else:
             items[f"full-{x}"], last = run_h[x], x
-    tail = BOX_TAIL_H[box]
-    if cr is not None:  # the continuation's run is pulled and checked before the stores
-        tail = (tail[0] + CONT_PULL_H[0], tail[1] + CONT_PULL_H[1])
+    # each continuation's run is pulled (its pre_cooldown state) and checked before the stores
+    tail = tuple(t + len(conts) * c for t, c in zip(BOX_TAIL_H[box], CONT_PULL_H))
     train = sum(items.values())
     est = _up(setup_c + store_c + train + tail[0] + END_H, 0.1)
     pess_end = setup_p + store_p + train * HOST_PESS
     mx = _up(pess_end + tail[1] + reserve_min / 60 + STALL_RECOVERY_H, 1)
     # 4d plans the last run's cooldown to end its end_reserve_min before KITSUNE_DEADLINE (the box's less reserve_min)
     slack = mx - reserve_min / 60 - FULL_RUNS[last]["end_reserve"] / 60 - pess_end
-    return dict(box=box, r=round(r, 4), o=o, run_h=run_h, items=items, continuation=cr,
+    return dict(box=box, r=round(r, 4), o=o, run_h=run_h, items=items, continuations=conts,
+                continuation=conts[0] if conts else None,
                 setup_h=(setup_c, setup_p), store_h=(round(store_c, 3), store_p),
                 tail_h=tuple(round(t, 2) for t in tail),
                 est_hours=est, max_hours=int(mx), slack_h=round(slack, 2))
 
 
-def continuation_flags(name: str) -> list[str]:
-    """launch's flags of a continuation (CONTINUATIONS[name]): the reset, then its sets - its epochs, its early-stop
-    patience when it sets one, one per key of its augment block, in that order - each value spelled as launch puts it
-    in KITSUNE_RESUME_SETS (fullrun.resume_set_value: True -> true), so the printed line is the box's env word."""
+def continuation_set_dict(name: str) -> dict:
+    """A continuation's trainer sets (CONTINUATIONS[name]) as the registry's continues block carries them, native JSON
+    values in this order: schedule.epochs (the run's own), schedule.deadline_cooldown false (4d never compresses a paired
+    cooldown), schedule.resume_reset_keep_cooldown true when it keeps the state's early-stop cooldown, then one
+    augment.<key> per key of its recipe. The queue passes them after schedule.resume_reset=true, each spelled by
+    fullrun.continue_set_text."""
     c = CONTINUATIONS[name]
-    rid = c["run_id"]
-    sets = [("schedule.epochs", str(c["epochs"]))]
-    if c.get("patience") is not None:
-        sets.append(("early_stop.patience", str(c["patience"])))
-    # a string (the noise bank's path, its sha256) as it is; a number or bool as JSON spells it
-    sets += [(f"augment.{k}", v if isinstance(v, str) else json.dumps(v)) for k, v in (c.get("augment") or {}).items()]
-    out = ["--resume-reset", rid]
-    for key, val in sets:
-        out += ["--resume-set", f"{rid}:{key}={fullrun.resume_set_value(key, val)}"]
+    out = {"schedule.epochs": int(c["epochs"]), "schedule.deadline_cooldown": False}
+    if c["keep_cooldown"]:
+        out["schedule.resume_reset_keep_cooldown"] = True
+    out.update({f"augment.{k}": copy.deepcopy(v) for k, v in (c.get("augment") or {}).items()})
     return out
+
+
+def continues_block(name: str) -> dict:
+    """The continues block of CONTINUATIONS[name]'s train item in boxes.json (kitsune.fullrun "Continuations"): the
+    source box, the run id, from / to step, the resets before and the sets (continuation_set_dict)."""
+    c = CONTINUATIONS[name]
+    return dict(box=c["source_box"], run_id=c["run_id"], from_step=int(c["from_step"]), to_step=int(c["to_step"]),
+                resets_before=int(c["resets_before"]), sets=continuation_set_dict(name))
+
+
+def _uncommented(d: dict) -> dict:
+    """A continues block without its comment keys ("_..."), at its top and in its sets."""
+    out = {k: v for k, v in d.items() if not str(k).startswith("_")}
+    if isinstance(out.get("sets"), dict):
+        out["sets"] = {k: v for k, v in out["sets"].items() if not str(k).startswith("_")}
+    return out
+
+
+def continues_problems(reg: dict) -> list[str]:
+    """Where a loaded registry's continues blocks differ from the generator's: every CONTINUATIONS entry is the
+    continues block (continues_block) of its box's train item full-<student> - its sets in the same order and spelling
+    (fullrun.continue_sets; JSON's 1 is not true) -, and no train item continues a run CONTINUATIONS does not name."""
+    p, boxes = [], reg.get("boxes") or {}
+    want: dict[str, dict] = {}
+    for n, c in CONTINUATIONS.items():
+        want.setdefault(c["box"], {})[f"full-{c['student']}"] = n
+    for bname in boxes:
+        got, mine = fullrun.continues_of(bname, reg), want.get(bname) or {}
+        for item, n in mine.items():
+            if item not in got:
+                p.append(f"boxes.{bname}: no train item {item} with a continues block (make_full_configs "
+                         f"CONTINUATIONS {n!r})")
+                continue
+            g, w = _uncommented(got[item]), continues_block(n)
+            diff = [k for k in w if k != "sets" and g.get(k, "<absent>") != w[k]]
+            try:
+                same_sets = fullrun.continue_sets(g) == fullrun.continue_sets(w) and g["sets"] == w["sets"]
+            except (ValueError, KeyError):
+                same_sets = False
+            diff += [] if same_sets else ["sets"]
+            if diff:
+                p.append(f"boxes.{bname}.items.{item}.continues differs from make_full_configs "
+                         f"continues_block({n!r}) in {diff}")
+        p += [f"boxes.{bname}.items.{item}.continues: not a make_full_configs CONTINUATIONS entry" for item in got
+              if item not in mine]
+    p += [f"boxes.{b}: not in the registry (make_full_configs CONTINUATIONS)" for b in want if b not in boxes]
+    return p
+
+
+def continuation_plan_problems(plan: dict) -> list[str]:
+    """Where CONTINUATIONS disagree with the plan record's launch part (the student's plan at the run's own epochs): a
+    re-run that plans its schedule anew (no keep_cooldown) goes from the step before the planned cooldown
+    (cooldown_start_step - 1: its pre_cooldown state) to the plan's T; one that keeps its early stop's cooldown ends at
+    or before the plan's T. Every continuation runs at least one step, at FULL_RUNS' epochs (the run's own)."""
+    p = []
+    for n, c in CONTINUATIONS.items():
+        st = plan["launch"]["students"][c["student"]]
+        T, cs = int(st["total_steps"]), st.get("cooldown_start_step")
+        if not 0 < c["from_step"] < c["to_step"]:
+            p.append(f"CONTINUATIONS.{n}: from_step {c['from_step']} .. to_step {c['to_step']} is no run")
+        if c["epochs"] != FULL_RUNS[c["student"]]["epochs"]:
+            p.append(f"CONTINUATIONS.{n}: epochs {c['epochs']}, the run's own are {FULL_RUNS[c['student']]['epochs']} "
+                     f"(FULL_RUNS)")
+        if c["keep_cooldown"]:
+            if c["to_step"] > T:
+                p.append(f"CONTINUATIONS.{n}: to_step {c['to_step']} is past the plan's T {T}: a kept early-stop "
+                         f"cooldown ends before the planned end")
+        else:
+            if c["to_step"] != T:
+                p.append(f"CONTINUATIONS.{n}: to_step {c['to_step']}, the plan record's T at {c['epochs']} epochs is "
+                         f"{T}")
+            if cs is not None and c["from_step"] != cs - 1:
+                p.append(f"CONTINUATIONS.{n}: from_step {c['from_step']}, the plan's pre_cooldown step is {cs - 1}")
+    return p
 
 
 def _smoke_record(verdict: dict, src) -> dict:
@@ -712,8 +845,8 @@ def import_speed(smoke_verdict: Path | None = None, box1_json: Path | None = Non
 
 # the registry's numbers that must always equal the plan record's (registry_drift): smoke A's train items (smoke check
 # 3's projection) and F4's seconds. The HOURS_BOXES' train hours and their est / max hours are held to the speed
-# record instead (SPEED_FILE, box_hours), when there is one: box p01's too, since its continuation (box 1's own hours
-# were plan v3's)
+# record instead (SPEED_FILE, box_hours), when there is one (boxes full-t, p005 and p-cool; boxes full-p and p01, records
+# since DECISIONS H14, are held to neither)
 PLAN_BOUND_BOXES = {"full-smoke": "smoke"}
 
 
@@ -938,8 +1071,8 @@ def write_all(out_dir: Path = OUT_DIR) -> tuple[list[str], list[str]]:
 
 def registry_check(out_dir: Path = OUT_DIR, plan: dict | None = None, speed: dict | None = None) -> list[str]:
     """fullrun.registry_problems of out_dir/boxes.json, its config paths resolved in the checkout out_dir belongs to
-    (<X> for <X>/configs/full); for a valid registry also readout_reserve_problems and, given the plan record,
-    registry_drift (with the speed record, box full's hours too)."""
+    (<X> for <X>/configs/full); for a valid registry also readout_reserve_problems, continues_problems and, given the
+    plan record, registry_drift (with the speed record, the HOURS_BOXES' hours too)."""
     f = Path(out_dir) / BOXES
     if not f.is_file():
         return [f"{BOXES}: missing (the box registry is hand-written next to the generated configs)"]
@@ -951,14 +1084,16 @@ def registry_check(out_dir: Path = OUT_DIR, plan: dict | None = None, speed: dic
     if problems := fullrun.registry_problems(reg, root=root):
         return [f"{BOXES}: {p}" for p in problems]
     reg = fullrun.load_registry(reg, root=root, check_files=False)
-    problems = readout_reserve_problems(reg, root) + (registry_drift(reg, plan, speed) if plan is not None else [])
+    problems = readout_reserve_problems(reg, root) + continues_problems(reg) + (
+        registry_drift(reg, plan, speed) if plan is not None else [])
     return [f"{BOXES}: {p}" for p in problems]
 
 
 def check(out_dir: Path = OUT_DIR) -> list[str]:
     """The differences between the files in out_dir and the generator's output (parsed JSON, so a CRLF checkout
-    compares equal), and every problem of the hand-written registry (registry_check: fullrun.registry_problems, the
-    readouts' end reserve, the numbers bound to the plan record and, with a SPEED_FILE record, box full's hours)."""
+    compares equal), CONTINUATIONS against the plan record (continuation_plan_problems), and every problem of the
+    hand-written registry (registry_check: fullrun.registry_problems, the readouts' end reserve, the continues blocks,
+    the numbers bound to the plan record and, with a SPEED_FILE record, the HOURS_BOXES' hours)."""
     out_dir = Path(out_dir)
     try:
         plan = load_plan(out_dir)
@@ -977,7 +1112,7 @@ def check(out_dir: Path = OUT_DIR) -> list[str]:
         elif json.loads(p.read_text(encoding="utf-8")) != json.loads(render(cfg)):
             problems.append(f"{p.name}: differs from the generator's")
     problems += [f"{p.name}: not made by the generator" for p in _generated(out_dir) if p.stem not in cfgs]
-    return problems + speed_err + registry_check(out_dir, plan, speed)
+    return problems + continuation_plan_problems(plan) + speed_err + registry_check(out_dir, plan, speed)
 
 
 def _plan_json(src, sel: str) -> dict:
@@ -1078,15 +1213,20 @@ def main(argv: list[str] | None = None) -> int:
                   + f"; est_hours {h['est_hours']:g}, max_hours {h['max_hours']} (setup {h['setup_h'][0]:g} / "
                   f"{h['setup_h'][1]:g} h, store {h['store_h'][0]:g} / {h['store_h'][1]:g} h, tail "
                   f"{h['tail_h'][0]:g} / {h['tail_h'][1]:g} h; the pessimistic slack {h['slack_h']:g} h)"
-                  + (f"; continuation {h['continuation']['steps']} steps to T {h['continuation']['total_steps']}, "
-                     f"{h['continuation']['dev_checks']:g} dev checks"
-                     + (f", s/step x {h['continuation']['step_factor']:g} (the recipe's concat)"
-                        if h["continuation"]["step_factor"] != 1 else "") if h["continuation"] else ""))
+                  + "".join(f"; continuation {c['name']} {c['steps']} steps to T {c['total_steps']}, "
+                            f"{c['dev_checks']:g} dev checks"
+                            + (f", s/step x {c['step_factor']:g} (the recipe's concat)" if c["step_factor"] != 1
+                               else "") for c in h["continuations"]))
         print("  P-0.1B from step 0 at its continuation's epochs projects to "
               f"{hs[0]['run_h']['p01']:g} h (box 1's 4 epochs: {box1_wall(rec)})")
-        for name in CONTINUATIONS:
-            print(f"  continuation {name}: launch --box {CONTINUATIONS[name]['box']} "
-                  + " ".join(continuation_flags(name)))
+        for name, c in CONTINUATIONS.items():  # the registry's continues blocks, as the queue passes their sets
+            print(f"  continuation {name} on box {c['box']}: box {c['source_box']}'s run {c['run_id']} from "
+                  f"full_step_{c['from_step']} to step {c['to_step']}"
+                  + (" (its early-stop cooldown kept)" if c["keep_cooldown"] else "")
+                  + f", readout runs/m4-{c['run_id']}-r{c['resets_before'] + 1}, baseline revision "
+                    f"{c['revision'][:8]}; sets " + " ".join(fullrun.continue_sets(continues_block(name))))
+        for b in dict.fromkeys(c["box"] for c in CONTINUATIONS.values()):
+            print(f"  launch --box {b} (the registry carries its continuations)")
         todo = registry_check(out_dir, plan, rec)
         print(f"{BOXES}: " + ("carries the speed record's hours" if not todo else f"{len(todo)} change(s) by hand")
               + "".join(f"\n  {p}" for p in todo))

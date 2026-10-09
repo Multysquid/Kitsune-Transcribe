@@ -2,7 +2,8 @@
 to its last verified upload, on a shared GPU queue; plus the resume of a box on a new host.
 
 A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1 and its recipe test, full-t and full-p = box 2's two
-1x boxes, smoke-b; full = the retired 2x box 2, test fixtures only) is the list of registry items of its spec, in
+1x boxes, smoke-b, p005 = the P test box, p-cool = three runs' cooldowns re-run (DECISIONS H14); full = the
+retired 2x box 2, test fixtures only) is the list of registry items of its spec, in
 registry order. FullQueue(study_queue.Queue) runs them with the study queue's process, state and upload
 machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it never reads prereg.rules()["boxes"].
 
@@ -81,8 +82,8 @@ $KITSUNE_STATE/resume_plan.json. The queue adopts that plan only when it has no 
 started runs resume, the rest start fresh; a reset or set run gets `sets_once` (schedule.resume_reset=true and its
 sets), passed on every attempt until the run has logged its resume_reset and a full state after it. Its readout then
 writes runs/m4-<run_id>-r<N>, so the first one on the Hub stays. Exit 0 plan written, 3 refused (no summary, an unknown
-run id, a state that does not match its checksum, a set-only run that is past its cooldown: use --resume-reset), 1
-anything transient (bootstrap retries it).
+run id, a state that does not match its checksum, a set-only run that is past its cooldown: use --resume-reset; a
+continuation's source that is not done and verified, below), 1 anything transient (bootstrap retries it).
   done       a train item is done when the box summary says so and its export checkpoints/step_<steps>/ is on the
              Hub; also when the run's own summary.json is complete with its export there (the box died between the
              trainer's end and the queue's item-end put), but only when that summary cannot be an earlier run's: no
@@ -97,6 +98,20 @@ anything transient (bootstrap retries it).
   outputs    resume-pull pulls the training runs only; a fresh item that reads an adopted done item's out dir
              ({out:<item>}), or the first speed item after an adoption (the speed dir's speed.json, which its upload
              would otherwise replace), pulls that dir from the runs repo first (a quant variant's weights excepted)
+  continues  a box whose train items carry a registry `continues` block (fullrun.continues_of; DECISIONS H14, box
+             p-cool: three done runs' cooldowns re-run) is always a resume: bootstrap runs resume-pull when fullrun's
+             has-continues says 1, register() refuses a queue that has adopted no resume_plan.json (a restart too),
+             _prepare_train fails such an item without a run dir holding a full state, and resume_point raises
+             rather than start it fresh. Its own summary may be missing (the first launch), and
+             KITSUNE_RESUME_RESET / KITSUNE_RESUME_SETS may not name a continued run id (the registry carries the
+             reset and the sets: fullrun.continue_sets).
+             An item its own summary records goes the continuation's way above (done only when that summary says
+             done AND verified - the run's export and complete summary.json at to_step are the source run's too -
+             and an applied-again reset starts from full_step_<from_step> alone). One it does not record is resolved
+             from full/box-<continues.box>/queue_summary.json (the source item done and verified, its run id and
+             resume_resets the registry's; refused otherwise), then goes on from a Hub state that holds its reset (a
+             continuation that ran without a box summary: never reset twice) or resets from full_step_<from_step>
+             (pull_run step=), which must count resets_before resets
 
 Usage (vast/supervise.py runs `run` for KITSUNE_JOB=full; KITSUNE_BOX, KITSUNE_OUT_REPO, KITSUNE_SCRATCH_REPO,
 KITSUNE_STATE from the env):
@@ -327,13 +342,15 @@ def _states_of(listing: dict[str, dict], run_id: str) -> dict[int, dict[str, dic
 
 def pull_run(run_id: str, root: Path, runs: Hub, scratch: Hub | None, *, pick: str = "newest",
              refuse_past_cooldown: bool = False, with_state: bool = True, weights_step: int | None = None,
-             min_resets: int | None = None) -> dict:
+             min_resets: int | None = None, step: int | None = None) -> dict:
     """A run as a new host needs it (resume-pull, and the smoke's wipe_run_dir fault): runs/<run_id>/* but its
     checkpoints from the runs repo, then (with_state) one full state into runs/<run_id>/checkpoints/full_step_<N>/
     (downloaded into full_step_<N>.tmp/, every file checked, then renamed):
       pick "newest"        the highest step of the scratch repo's timed state (its pointer, fullrun.pointer_problems)
                            and the runs repo's full_step_<N>/ holding trainer.pt
-      pick "pre_cooldown"  the highest runs-repo full_step_<N> whose trainer.json says reason pre_cooldown (a reset)
+      pick "pre_cooldown"  the highest runs-repo full_step_<N> whose trainer.json says reason pre_cooldown (a reset);
+                           with step, full_step_<step> alone (a registry continuation's from_step, DECISIONS H14: the
+                           continuation's own pre_cooldown state, later in the same run dir, is never its start)
     min_resets: only states whose trainer.json counts st.resume_resets >= min_resets (a continuation goes on only from
     a state that holds its reset; none: no state is pulled, the caller applies the continuation again).
     weights_step: also the export checkpoints/step_<N>/ (a done run whose readout or eval is still to run).
@@ -341,7 +358,9 @@ def pull_run(run_id: str, root: Path, runs: Hub, scratch: Hub | None, *, pick: s
     st.early_stop.triggered (a --resume-set run: epochs cannot be extended past a cooldown without the reset flag).
     Returns {state, step, source ("scratch" | "runs" | None), kitsune_sha, resume_resets (the chosen state's
     st.resume_resets)}. ResumeRefused on a malformed pointer, a file that does not match, or pick pre_cooldown without
-    such a state."""
+    such a state. ValueError for a step without pick pre_cooldown."""
+    if step is not None and pick != "pre_cooldown":
+        raise ValueError(f"pull_run({run_id}): step={step} goes with pick='pre_cooldown' only, not {pick!r}")
     root = Path(root)
     prefix = f"runs/{run_id}"
     stage = root / "cache" / "hub_pull" / f"{run_id}-{time.time_ns()}"
@@ -380,12 +399,12 @@ def pull_run(run_id: str, root: Path, runs: Hub, scratch: Hub | None, *, pick: s
                 c["tj"] = c["hub"].read_json(f"{c['base']}/trainer.json", stage) or {}
             return int((c["tj"].get("st") or {}).get("resume_resets") or 0)
 
-        for step in sorted(states, reverse=True):
-            files = states[step]
-            if "trainer.pt" not in files:
+        for n in sorted(states, reverse=True):
+            files = states[n]
+            if "trainer.pt" not in files or (step is not None and n != step):
                 continue
-            base = f"{prefix}/checkpoints/full_step_{step}"
-            c = dict(step=step, source="runs", hub=runs, base=base,
+            base = f"{prefix}/checkpoints/full_step_{n}"
+            c = dict(step=n, source="runs", hub=runs, base=base,
                      files={f"{base}/{f}": m for f, m in files.items()}, kitsune_sha=None)
             if pick == "pre_cooldown":
                 c["tj"] = runs.read_json(f"{base}/trainer.json", stage) or {}
@@ -397,7 +416,8 @@ def pull_run(run_id: str, root: Path, runs: Hub, scratch: Hub | None, *, pick: s
             if pick == "pre_cooldown":
                 break  # the highest one
         if pick == "pre_cooldown" and not cands:
-            raise ResumeRefused(f"{runs.repo}:{prefix}/checkpoints has no pre_cooldown full state to reset from")
+            raise ResumeRefused(f"{runs.repo}:{prefix}/checkpoints has no pre_cooldown full state "
+                                + (f"full_step_{step} " if step is not None else "") + "to reset from")
         if min_resets is not None:
             cands = [c for c in cands if resets(c) >= min_resets]
         if not cands:
@@ -483,6 +503,8 @@ class FullQueue(Q.Queue):
                 raise fullrun.RegistryError(f"box {box} is a chain box: a chain box runs through the chain controller "
                                             f"(ChainController; `python -m kitsune.full_queue run --box {box}`)")
             self.spec = fullrun.box_spec(box, reg)
+            # DECISIONS H14: {train item: its continues block}; such an item never trains from step 0
+            self.continues = fullrun.continues_of(box, reg)
         except fullrun.RegistryError as e:
             raise Q.QueueError(str(e)) from None
         self.registry = reg
@@ -598,7 +620,16 @@ class FullQueue(Q.Queue):
 
     def register(self):
         """Every registry item, once (a restart finds them registered with their status); then, on a new host (no
-        queue.json yet, a resume_plan.json from resume-pull), the plan adopted; then only_if_new_machine."""
+        queue.json yet, a resume_plan.json from resume-pull), the plan adopted; then only_if_new_machine. A box with
+        registry continuations (DECISIONS H14) is always a resume: a queue that has not adopted a plan and has none to
+        adopt is a QueueError (its runs would start from step 0) - also on a restart, since run() saves queue.json
+        (kill_orphans) before it registers."""
+        plan_path = Path(self.s.state_dir) / fullrun.RESUME_PLAN
+        if self.continues and self.state.get("resumed") is None and not (self._fresh and plan_path.is_file()):
+            raise Q.QueueError(f"box {self.box} continues other boxes' runs ({', '.join(self.continues)}: registry "
+                               f"continues) and has adopted no {plan_path}: such a box is always a resume (bootstrap's "
+                               f"resume-pull writes the plan before the queue's first start), it never trains a run "
+                               f"from step 0")
         for name in self.order:
             spec = self.spec_of(name)
             new = name not in self.state["items"]
@@ -608,7 +639,6 @@ class FullQueue(Q.Queue):
                 self.item(name).update(needs=list(spec["needs"]), of=spec.get("of"), out=None, hb_max_gap_s=None,
                                        stalls=0, peak_rss_gb=None, hub_resume=False, sets_once=[], check_resume=None,
                                        check_resume_tries=0, held_until=None, continuation=None, why=None)
-        plan_path = Path(self.s.state_dir) / fullrun.RESUME_PLAN
         if self._fresh and plan_path.is_file() and self.state.get("resumed") is None:
             self.adopt(json.loads(plan_path.read_text(encoding="utf-8")))
         for f in self.spec["faults"]:
@@ -662,7 +692,9 @@ class FullQueue(Q.Queue):
                         run_id=rid, reset=bool(e.get("reset")) or rid in env_reset, sets=sets,
                         resume_resets_before=int(before if before is not None else self._local_resets(it["run_dir"])),
                         adopted_utc=_now_utc())
-                elif (e.get("continuation") or {}).get("run_id") == rid and it["status"] != "done":
+                elif (e.get("continuation") or {}).get("run_id") == rid:
+                    # done too: a done registry continuation keeps its record (resume_pull's adopt_done), so the
+                    # summary keeps saying the run dir and its -r<N> readout are this box's
                     it["continuation"] = dict(e["continuation"])
             if it["kind"] == "speed" and it["status"] == "done" and it["out"] and not self.state["speed_dir"]:
                 self.state["speed_dir"] = dict(run_dir=it["out"], verified=True, adopted=True, pulled=False)
@@ -917,6 +949,13 @@ class FullQueue(Q.Queue):
                 self._fault_failed(name)
                 self._end(name, "failed", "item_failed", reason=f"hub resume: no full state of {rid} on the Hub")
                 return False
+        if name in self.continues and not (it["run_dir"] and self._has_full_state(self.root / it["run_dir"])):
+            c = self.continues[name]
+            self._end(name, "failed", "item_failed",
+                      reason=f"{name} continues box {c['box']}'s run {c['run_id']} (registry continues) but has no run "
+                             f"dir with a full state to go on from (run_dir {it['run_dir']!r}): a continuation never "
+                             f"trains from step 0; its pre_cooldown state comes from resume-pull")
+            return False
         if it.get("check_resume") == "pending" and it["run_dir"]:
             rc = self.check_resume(name)
             if rc == 0:
@@ -1226,18 +1265,32 @@ class FullQueue(Q.Queue):
                 return True
         return False
 
+    @staticmethod
+    def _has_full_state(rd: Path | None) -> bool:
+        """The run dir holds a full state (checkpoints/full_step_<N>/trainer.pt)."""
+        ck = Path(rd) / "checkpoints" if rd is not None else None
+        return ck is not None and ck.is_dir() and any(FULL_STATE_RE.match(p.name) and (p / "trainer.pt").is_file()
+                                                      for p in ck.iterdir())
+
     def resume_point(self, name: str) -> Path | None:
         """A train item that was interrupted or failed goes on from its run dir when that holds a full state
-        (full_step_<N>/trainer.pt); a run dir without one is set aside and the item starts fresh."""
+        (full_step_<N>/trainer.pt); a run dir without one is set aside and the item starts fresh. A registry
+        continuation (DECISIONS H14) never starts fresh: QueueError instead (its run dir is kept as it is;
+        _prepare_train fails such an item before its start, so this is the last guard)."""
         it = self.item(name)
         if it["kind"] != "train" or it["status"] not in ("interrupted", "retry"):
+            if name in self.continues and it["kind"] == "train":
+                raise Q.QueueError(f"{name} continues run {self.continues[name]['run_id']} (registry continues) but "
+                                   f"is {it['status']!r}, not interrupted or retry: a continuation never starts fresh")
             return None
         rd = self.root / it["run_dir"] if it["run_dir"] else (self.find_run_dir(name) if it["attempts"] else None)
+        if name in self.continues and not self._has_full_state(rd):
+            raise Q.QueueError(f"{name} continues run {self.continues[name]['run_id']} (registry continues) but its "
+                               f"run dir {rd} holds no full state: a continuation never starts fresh")
         if rd is None or not rd.is_dir():
             it["run_dir"], it["continuation"] = None, None
             return None
-        ck = rd / "checkpoints"
-        if ck.is_dir() and any(FULL_STATE_RE.match(p.name) and (p / "trainer.pt").is_file() for p in ck.iterdir()):
+        if self._has_full_state(rd):
             return rd
         self.set_aside(rd, "no full state to resume from")
         it["run_dir"] = None
@@ -2982,7 +3035,8 @@ def check_resume(run_dir: str) -> int:
     return EXIT_FAIL if res.get("reason") == "store not built" else EXIT_REFUSED
 
 
-def done_on_hub(rid: str, s_it: dict, runs: Hub, scratch: Hub | None, stage: Path) -> tuple[int, dict] | None:
+def done_on_hub(rid: str, s_it: dict, runs: Hub, scratch: Hub | None, stage: Path, *,
+                own_only: bool = False) -> tuple[int, dict] | None:
     """(steps, result) when a train item's run is done on the Hub, else None:
       - the box summary (the source of truth) says done, and its export checkpoints/step_<steps>/ is on the Hub;
       - or the box died between the trainer's end and the queue's item-end put: the run's own summary.json is complete
@@ -2990,15 +3044,22 @@ def done_on_hub(rid: str, s_it: dict, runs: Hub, scratch: Hub | None, stage: Pat
         --resume-set) runs in the same run dir, which keeps the first run's complete summary.json (on the Hub too)
         until the continuation's own end: so no Hub state may lie past its steps (the scratch pointer, a runs-repo
         full_step_<N>), and when the box summary records a continuation of this run, the summary must count more
-        resume_resets than the run had before it."""
+        resume_resets than the run had before it.
+    own_only (a registry continuation, DECISIONS H14): done only when the box summary says done AND verified, with its
+    export there. A continuation trains to the run's own end (continues.to_step), so the source run's export
+    step_<to_step>/ and complete summary.json are on the Hub from the start: neither can tell the continuation's end
+    from its source's, and only the queue's verified upload does."""
     res = s_it.get("result") or {}
     listing = runs.listing(f"runs/{rid}/checkpoints")
 
     def exported(steps: int) -> bool:
         return any(p.startswith(f"runs/{rid}/checkpoints/step_{steps}/") for p in listing)
 
-    if s_it.get("status") == "done" and res.get("steps") is not None and exported(int(res["steps"])):
+    if s_it.get("status") == "done" and res.get("steps") is not None and exported(int(res["steps"])) and (
+            not own_only or s_it.get("verified") is True):
         return int(res["steps"]), res
+    if own_only:
+        return None
     hub = runs.read_json(f"runs/{rid}/summary.json", stage) or {}
     if hub.get("status") != "complete" or hub.get("steps") is None:
         return None
@@ -3024,26 +3085,43 @@ def resume_pull(box: str, root: Path, *, runs: Hub, scratch: Hub | None, registr
                 reset: list[str] | None = None, sets: dict[str, list[str]] | None = None,
                 sha: str | None = None) -> dict:
     """The new-host pull (the module docstring): reads full/box-<box>/queue_summary.json, pulls every train item's run
-    (pull_run) and writes $KITSUNE_STATE/resume_plan.json. ResumeRefused for what no retry fixes."""
+    (pull_run) and writes $KITSUNE_STATE/resume_plan.json. ResumeRefused for what no retry fixes.
+    A box with registry continuations (fullrun.continues_of, DECISIONS H14) may have no summary of its own yet (its
+    first launch: the plan's summary_sha256 is None), and the env's resets and sets may not name a continued run id
+    (the registry carries its reset and sets); each continues item goes through continue_item."""
     reset, sets = list(reset or []), dict(sets or {})
     root, state_dir = Path(root), Path(state_dir)
+    conts = fullrun.continues_of(box, registry)
     stage = state_dir / "hub_reads" / f"resume-{time.time_ns()}"
     raw = runs.download(fullrun.box_summary_path(box), stage)
-    if raw is None:
+    if raw is None and not conts:
         raise ResumeRefused(f"{runs.repo} has no {fullrun.box_summary_path(box)}: nothing to resume")
-    summary_bytes = raw.read_bytes()
-    summ = json.loads(summary_bytes)
+    summary_bytes = raw.read_bytes() if raw is not None else None
+    summ = json.loads(summary_bytes) if summary_bytes is not None else {}
     shutil.rmtree(stage, ignore_errors=True)
+    if raw is None:
+        log(f"{runs.repo} has no {fullrun.box_summary_path(box)} yet: box {box}'s continuations "
+            f"{list(conts)} are resolved from their source boxes' summaries")
     s_items = summ.get("items") or {}
     spec = fullrun.box_spec(box, registry)
     trains = [it for it in spec["items"] if it["kind"] == "train"]
     rid_of = {it["name"]: fullrun.run_id_of(s_items[it["name"]]["run_dir"]) for it in trains
               if (s_items.get(it["name"]) or {}).get("run_dir")}
+    continued = {c["run_id"]: name for name, c in conts.items()}
+    if named := [x for x in [*reset, *sets] if x in continued]:
+        raise ResumeRefused(f"run id(s) {named} are continued by box {box}'s registry items "
+                            f"{[continued[x] for x in named]}: the registry carries their reset and sets (continues); "
+                            f"launch --box {box} without --resume-reset / --resume-set for them")
+    for name, c in conts.items():
+        if name in rid_of and rid_of[name] != c["run_id"]:
+            raise ResumeRefused(f"box {box}'s queue summary records {name} as run {rid_of[name]}, but its registry "
+                                f"continues.run_id is {c['run_id']}: one item continues one run")
     if unknown := [x for x in [*reset, *sets] if x not in rid_of.values()]:
         raise ResumeRefused(f"run id(s) {unknown} are not a training run of box {box}'s queue summary "
                             f"(it has {sorted(rid_of.values())})")
     special = set(reset) | set(sets)
     entries: dict[str, dict] = {}
+    sources: dict[str, dict | None] = {}  # a source box -> its queue summary (one download per box)
 
     def entry(it, status, **kw):
         base = dict(kind=it["kind"], status=status, run_dir=None, out=None, result=None, state=None, step=None,
@@ -3056,9 +3134,107 @@ def resume_pull(box: str, root: Path, *, runs: Hub, scratch: Hub | None, registr
         entry(it, "resume", run_dir=f"runs/{rid_of[it['name']]}", state=got["state"], step=got["step"],
               source=got["source"], kitsune_sha=got["kitsune_sha"] or summ.get("sha"), **kw)
 
+    def adopt_done(it, rid: str, done: tuple[int, dict], continuation: dict | None = None):
+        """A train item done on the Hub: its logs pulled, and its export when a readout or eval of it is to run. A done
+        registry continuation keeps its continuation record (adopt copies it), so later summaries still say the run
+        dir and its -r<N> readout dir are this box's (launch's readout-dir check reads that)."""
+        steps, result = done
+        dependants = [x for x in spec["items"] if x.get("of") == it["name"] and not x.get("of_box") and not (
+            (s_items.get(x["name"]) or {}).get("status") == "done"
+            and (s_items.get(x["name"]) or {}).get("verified") is True)]
+        pull_run(rid, root, runs, scratch, with_state=False, weights_step=steps if dependants else None)
+        entry(it, "done", run_dir=f"runs/{rid}", result=result, steps=steps, continuation=continuation)
+
+    def source_summary(src: str) -> dict | None:
+        if src not in sources:
+            d = state_dir / "hub_reads" / f"source-{src}-{time.time_ns()}"
+            try:
+                sources[src] = runs.read_json(fullrun.box_summary_path(src), d)
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+        return sources[src]
+
+    def reset_state(name: str, c: dict) -> dict:
+        """The continuation's start: the run's pre_cooldown state full_step_<from_step>, counting resets_before."""
+        rid, before = c["run_id"], int(c["resets_before"])
+        got = pull_run(rid, root, runs, scratch, pick="pre_cooldown", step=int(c["from_step"]))
+        if got["resume_resets"] != before:
+            raise ResumeRefused(f"{name}: {rid}'s {got['state']} counts resume_resets {got['resume_resets']}, but "
+                                f"the registry's continues.resets_before is {before}: not the state the continuation "
+                                f"was planned from")
+        return got
+
+    def continue_item(it, c: dict, s_it: dict):
+        """A registry continuation (DECISIONS H14). (1) The box summary records it (its run id must be continues.
+        run_id): the branches of any recorded continuation, on this item - done (own_only: done AND verified), a lost
+        continuation (on from the newest Hub state counting resets_before + 1 resets), else the continuation applied
+        again from full_step_<from_step> with the registry's sets. (2) Not recorded: the source box's summary must hold
+        the same-name item done and verified, with this run id and resets_before resets (it only resolves and checks
+        the run id); then a Hub state counting resets_before + 1 resets (a continuation that ran without a box summary)
+        goes on as a lost continuation, never reset twice; else the reset from full_step_<from_step>."""
+        name, rid, before = it["name"], c["run_id"], int(c["resets_before"])
+        once = ["schedule.resume_reset=true", *fullrun.continue_sets(c)]
+        record = dict(run_id=rid, reset=True, sets=once, resume_resets_before=before)
+        if name in rid_of:
+            own = s_it.get("continuation") if (s_it.get("continuation") or {}).get("run_id") == rid else None
+            if own is not None and (list(own.get("sets") or []) != once
+                                    or int(own.get("resume_resets_before") or 0) != before):
+                raise ResumeRefused(f"{name}: box {box}'s queue summary records the continuation of {rid} with sets "
+                                    f"{own.get('sets')} after {own.get('resume_resets_before')} resets; the registry "
+                                    f"has {once} after {before}: the registry changed under a started continuation")
+            steps = (s_it.get("result") or {}).get("steps")
+            done = done_on_hub(rid, s_it, runs, scratch, state_dir / "hub_reads", own_only=True)
+            if done is not None:
+                adopt_done(it, rid, done, continuation=own or record)
+                return
+            got = pull_run(rid, root, runs, scratch, min_resets=before + 1)
+            if got["state"] is not None:
+                resume(it, got, steps=steps, continuation=own or record)
+                return
+            log(f"{rid}: no Hub state holds {name}'s continuation reset yet; the continuation starts again from "
+                f"full_step_{c['from_step']} ({once})")
+            got = reset_state(name, c)
+            resume(it, got, reset=True, sets=once, steps=steps, resume_resets_before=before)
+            return
+        src = c["box"]
+        path = fullrun.box_summary_path(src)
+        where = f"{name} continues box {src}'s run {rid}"
+        ssum = source_summary(src)
+        if ssum is None:
+            raise ResumeRefused(f"{where}, but {runs.repo} has no {path}: the source box's summary is the record of "
+                                f"that run")
+        if ssum.get("status") == "running":
+            raise ResumeRefused(f"{where}, but {path} says running: the run may still be training; continue it only "
+                                f"once box {src} has ended")
+        s_src = (ssum.get("items") or {}).get(name) or {}
+        if s_src.get("status") != "done" or s_src.get("verified") is not True:
+            raise ResumeRefused(f"{where}, but its item {name} is {s_src.get('status')!r} (verified "
+                                f"{s_src.get('verified')!r}) in {path}: a continuation goes on only from a done run "
+                                f"verified on the Hub")
+        got_rid = fullrun.run_id_of(s_src["run_dir"]) if s_src.get("run_dir") else None
+        if got_rid != rid:
+            raise ResumeRefused(f"{where}, but {path} records {name} as run {got_rid}: the registry's continues.run_id "
+                                f"is not that box's run")
+        rr = (s_src.get("result") or {}).get("resume_resets")
+        if rr is not None and int(rr) != before:
+            raise ResumeRefused(f"{where}, but {path} says that run ended after {rr} resume resets; the registry's "
+                                f"continues.resets_before is {before}")
+        rid_of[name] = rid
+        got = pull_run(rid, root, runs, scratch, min_resets=before + 1)
+        if got["state"] is not None:
+            log(f"{rid}: a Hub state holds {name}'s continuation reset ({got['state']}, {got['source']}) but box "
+                f"{box}'s summary does not record it: it goes on from there as a lost continuation, never reset again")
+            resume(it, got, continuation=record)
+            return
+        got = reset_state(name, c)
+        resume(it, got, reset=True, sets=once, resume_resets_before=before)
+
     for it in trains:
         name = it["name"]
         s_it = s_items.get(name) or {}
+        if name in conts:
+            continue_item(it, conts[name], s_it)
+            continue
         rid = rid_of.get(name)
         if rid is None:
             entry(it, "fresh")
@@ -3073,12 +3249,7 @@ def resume_pull(box: str, root: Path, *, runs: Hub, scratch: Hub | None, registr
         if rid not in special:
             done = done_on_hub(rid, s_it, runs, scratch, state_dir / "hub_reads")
             if done is not None:
-                steps, result = done
-                dependants = [x for x in spec["items"] if x.get("of") == name and not x.get("of_box") and not (
-                    (s_items.get(x["name"]) or {}).get("status") == "done"
-                    and (s_items.get(x["name"]) or {}).get("verified") is True)]
-                pull_run(rid, root, runs, scratch, with_state=False, weights_step=steps if dependants else None)
-                entry(it, "done", run_dir=f"runs/{rid}", result=result, steps=steps)
+                adopt_done(it, rid, done)
                 continue
         if cont is not None and rid not in special:
             # a continuation the host was lost during: on from the newest Hub state that holds its reset
@@ -3122,7 +3293,8 @@ def resume_pull(box: str, root: Path, *, runs: Hub, scratch: Hub | None, registr
     for name, e in entries.items():
         if sha and e.get("kitsune_sha") and e["kitsune_sha"] != sha:
             log(f"warning: {name} was made at kitsune {e['kitsune_sha']}, this checkout is {sha}")
-    plan = dict(format=1, box=box, created_utc=_now_utc(), summary_sha256=hashlib.sha256(summary_bytes).hexdigest(),
+    plan = dict(format=1, box=box, created_utc=_now_utc(),
+                summary_sha256=hashlib.sha256(summary_bytes).hexdigest() if summary_bytes is not None else None,
                 items=entries)
     Q._atomic_json(state_dir / fullrun.RESUME_PLAN, plan)
     return plan

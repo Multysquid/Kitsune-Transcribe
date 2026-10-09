@@ -1510,6 +1510,12 @@ def _nanmin(x: np.ndarray) -> float:
 #   gain      volume (gain_p): gain_db (-20..+10 dB), clipped at full scale
 #   codec     a real encoder and back in memory (codec_p; kitsune.acoustics: MP3 at 30-100 kbit/s, GSM 6.10 and
 #             mu-law at 8 kHz), length and alignment kept (measured: lag 0 for each)
+# background_min_row_s > 0 (DECISIONS H14's gentle recipe): a row whose audio at the chain's entry - as the student hears
+# it, after the joins, cuts, pads and trim - is shorter than that many seconds is spared the speech and background
+# steps (a short command under a song or babble is mostly the song): their gate is still drawn for it, so the rows
+# before it draw what they drew, then it is skipped; reverb, gain and codec still apply. The chain then counts
+# short_rows, speech_spared and noise_spared (0 included) on every micro-batch; at 0 (the default) it never does, and
+# the stream and counts are the recipe's as before the key
 SPEECH_KINDS = ("speech",)  # the bank's kinds the speech step draws
 BACKGROUND_KINDS = ("music", "noise", "song")  # the bank's kinds the background step draws
 SPEECH_MAX_TALKERS = 8  # the most voices speech_talkers may ask for
@@ -1556,7 +1562,8 @@ class Augment:
     speech_p - background speech, speech_talkers (low, high) voices summed, each another row of the micro-batch with
     probability speech_batch_p or the bank's speech, at speech_snr_db dB of voiced power below the row; reverb_p - a
     room impulse response from the RIR bank; gain_p - gain_db dB, clipped at full scale; codec_p - one of codecs
-    (kitsune.acoustics) and back."""
+    (kitsune.acoustics) and back. background_min_row_s: rows shorter than this (seconds of their audio at the acoustic
+    chain) get no background speech and no background (0: every row may; acoustic_chain)."""
 
     seed: int
     truncate_p: float = 0.0
@@ -1586,6 +1593,7 @@ class Augment:
     gain_db: tuple = (-20.0, 10.0)
     codec_p: float = 0.0
     codecs: tuple = DEFAULT_CODECS
+    background_min_row_s: float = 0.0
 
     def __post_init__(self):
         snr = tuple(float(x) for x in self.mix_snr_db)
@@ -1622,7 +1630,8 @@ class Augment:
               and len(ssnr) == 2 and all(np.isfinite(ssnr)) and ssnr[0] <= ssnr[1]
               and len(gdb) == 2 and all(np.isfinite(gdb)) and gdb[0] <= gdb[1]
               and st_whole and 1 <= self.speech_talkers[0] <= self.speech_talkers[1] <= SPEECH_MAX_TALKERS
-              and all(c in CODECS for c in self.codecs) and (float(self.codec_p) == 0.0 or len(self.codecs) > 0))
+              and all(c in CODECS for c in self.codecs) and (float(self.codec_p) == 0.0 or len(self.codecs) > 0)
+              and math.isfinite(float(self.background_min_row_s)) and float(self.background_min_row_s) >= 0.0)
         if not ok:
             raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
                              "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high, "
@@ -1631,7 +1640,8 @@ class Augment:
                              "one (max_tokens set): max_tokens >= 2, no punct_ids, truncate_pad_p and end_pad_p 0; "
                              "a CTC one's end_trim_p needs punct_ids; noise_snr_db, speech_snr_db and gain_db finite "
                              f"(low, high) with low <= high; speech_talkers whole with 1 <= low <= high <= "
-                             f"{SPEECH_MAX_TALKERS}; codecs among {CODECS}, at least one when codec_p > 0)")
+                             f"{SPEECH_MAX_TALKERS}; codecs among {CODECS}, at least one when codec_p > 0; "
+                             "background_min_row_s finite and >= 0)")
 
     @classmethod
     def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None,
@@ -1999,11 +2009,22 @@ def mark_tail(ft: "FrameTargets", punct_ids: Sequence[int]) -> tuple[int, int, i
 def acoustic_chain(rows, originals, noise, rirs, a: Augment, rng: np.random.Generator) -> dict:
     """The acoustic steps of either family's rows, in this order (the section comment's "acoustic steps"): background
     speech, room echo, background music / noise / songs, volume, codec - each from the micro-batch's own stream, its
-    targets unchanged. Returns the aug counts {speech_mixed, reverbed, noised, gained, clipped, coded}."""
-    out = dict(speech_mixed=mix_speech(rows, originals, noise, a, rng), reverbed=reverberate(rows, rirs, a, rng),
-               noised=mix_background(rows, noise, a, rng))
+    targets unchanged. Returns the aug counts {speech_mixed, reverbed, noised, gained, clipped, coded}; with
+    a.background_min_row_s > 0 also short_rows (rows under it at the chain's entry: no step changes a row's length,
+    so that is the length the student hears), speech_spared and noise_spared (rows the speech / background gate picked
+    and the limit spared) - on every micro-batch, 0 included, since the train step sums every micro-batch's counts under
+    the first one's keys (scripts/04_distill.py train_step). At 0 the keys, the draws and the rows are exactly the
+    chain's before the key existed."""
+    lim = int(round(float(a.background_min_row_s) * TARGET_SR))
+    short = [len(r.wave) < lim for r in rows] if lim > 0 else None
+    sp_s, sp_n = [], []
+    out = dict(speech_mixed=mix_speech(rows, originals, noise, a, rng, short=short, spared=sp_s),
+               reverbed=reverberate(rows, rirs, a, rng),
+               noised=mix_background(rows, noise, a, rng, short=short, spared=sp_n))
     out.update(vary_gain(rows, a, rng))
     out["coded"] = apply_codecs(rows, a, rng)
+    if short is not None:
+        out.update(short_rows=int(sum(short)), speech_spared=len(sp_s), noise_spared=len(sp_n))
     return out
 
 
@@ -2016,12 +2037,14 @@ def _stretch(src: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
     return np.resize(np.roll(src, -int(rng.integers(len(src)))), n).astype(np.float32, copy=False)
 
 
-def mix_speech(rows, originals, bank, a: Augment, rng: np.random.Generator) -> int:
+def mix_speech(rows, originals, bank, a: Augment, rng: np.random.Generator, short=None, spared=None) -> int:
     """The background speech step (speech_p): per row, speech_talkers voices drawn (low, high), each another row of the
     micro-batch (its audio before any cut: originals) with probability speech_batch_p - Japanese - or else a stretch
     of the bank's speech (MUSAN: 17 languages), each at unit voiced power and summed (two or more: babble), then added
     at speech_snr_db dB of voiced power below the row - so the row stays the dominant voice, and its targets, the
-    teacher's on the clean row, say that the voices behind it are not to be written. Returns the rows it changed."""
+    teacher's on the clean row, say that the voices behind it are not to be written. Returns the rows it changed.
+    short (acoustic_chain; None: no row): per row, True spares it after its gate draw (the row's index joins spared,
+    a list, when given), so the other rows' draws do not depend on whether it was short."""
     if a.speech_p <= 0:
         return 0
     from kitsune.noise_bank import background_segment, voiced_power
@@ -2030,6 +2053,10 @@ def mix_speech(rows, originals, bank, a: Augment, rng: np.random.Generator) -> i
     n = 0
     for p, r in enumerate(rows):
         if rng.random() >= a.speech_p:
+            continue
+        if short is not None and short[p]:  # background_min_row_s: picked, spared
+            if spared is not None:
+                spared.append(p)
             continue
         m = len(r.wave)
         talkers = []
@@ -2076,19 +2103,23 @@ def reverberate(rows, rirs, a: Augment, rng: np.random.Generator) -> int:
     return n
 
 
-def mix_background(rows, bank, a: Augment, rng: np.random.Generator) -> int:
+def mix_background(rows, bank, a: Augment, rng: np.random.Generator, short=None, spared=None) -> int:
     """The background step of either family's rows (noise_p): per row, a stretch of the bank's music, noise and songs
     (BACKGROUND_KINDS; never its speech, the speech step's) as long as the row mixed under all of it at an SNR drawn
     from noise_snr_db (kitsune.noise_bank.add_background) - dry, as a stream mixes its game sound and music in -, its
     targets unchanged: the teacher's on the clean audio, so a song's lyrics are not to be written. Returns the rows it
-    changed (a silent row or stretch is left as it is)."""
+    changed (a silent row or stretch is left as it is). short / spared: as mix_speech's."""
     if a.noise_p <= 0 or bank is None or not bank.has(BACKGROUND_KINDS):
         return 0
     from kitsune.noise_bank import add_background, background_segment
 
     n = 0
-    for r in rows:
+    for p, r in enumerate(rows):
         if rng.random() >= a.noise_p:
+            continue
+        if short is not None and short[p]:  # background_min_row_s: picked, spared
+            if spared is not None:
+                spared.append(p)
             continue
         seg = background_segment(bank, len(r.wave), rng, BACKGROUND_KINDS)  # a near-silent stretch is drawn again
         got = None if seg is None else add_background(r.wave, seg, rng, a.noise_snr_db)

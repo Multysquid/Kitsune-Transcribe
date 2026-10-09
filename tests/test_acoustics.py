@@ -173,3 +173,78 @@ def test_an_augmentation_needs_its_banks(tmp_path):
                 dict(reverb_p=1.5)):
         with pytest.raises(ValueError, match="not an augmentation"):
             T.Augment(seed=1, **bad)
+
+
+def test_background_min_row_s_at_0_is_the_chain_as_before(tmp_path):
+    """DECISIONS H14's key off (the default): the chain is the five steps called one after another as before the key -
+    the same draws, byte-identical rows - and returns exactly today's keys; a limit no row is under changes no row
+    either (the spare comes after the gate draw and is never taken) but adds the three counters at 0."""
+    bank = NB.NoiseBank.load(make_noise_bank(tmp_path / "bg", kinds=("music", "speech", "song", "noise")))
+    rirs = NB.NoiseBank.load(make_rir_bank(tmp_path / "rir"))
+    waves = [speechlike(1.0 + 0.5 * i, 40 + i) for i in range(5)]
+    kw = dict(speech_p=0.7, reverb_p=0.7, noise_p=0.7, gain_p=0.7, codec_p=0.7)
+    a = T.Augment(seed=1, **kw)
+    assert a.background_min_row_s == 0.0 and T.Augment.from_config({}, seed=1).background_min_row_s == 0.0
+    for seed in (3, 4, 5):
+        rows = rows_of(waves)
+        got = T.acoustic_chain(rows, waves, bank, rirs, a, np.random.default_rng(seed))
+        ref, rng = rows_of(waves), np.random.default_rng(seed)  # the chain's body before the key
+        want = dict(speech_mixed=T.mix_speech(ref, waves, bank, a, rng), reverbed=T.reverberate(ref, rirs, a, rng),
+                    noised=T.mix_background(ref, bank, a, rng))
+        want.update(T.vary_gain(ref, a, rng))
+        want["coded"] = T.apply_codecs(ref, a, rng)
+        assert got == want and list(got) == ["speech_mixed", "reverbed", "noised", "gained", "clipped", "coded"]
+        assert all(x.wave.tobytes() == y.wave.tobytes() for x, y in zip(rows, ref))
+        under = rows_of(waves)  # 0.5 s: no row is that short
+        got_u = T.acoustic_chain(under, waves, bank, rirs, T.Augment(seed=1, background_min_row_s=0.5, **kw),
+                                 np.random.default_rng(seed))
+        assert got_u == dict(want, short_rows=0, speech_spared=0, noise_spared=0)
+        assert all(x.wave.tobytes() == y.wave.tobytes() for x, y in zip(under, ref))
+    off = T.acoustic_chain(rows_of(waves), waves, bank, rirs, T.Augment(seed=1, background_min_row_s=0.5),
+                           np.random.default_rng(3))  # every step off: the counters still there, all 0
+    assert off == dict(speech_mixed=0, reverbed=0, noised=0, gained=0, clipped=0, coded=0, short_rows=0,
+                       speech_spared=0, noise_spared=0)
+
+
+def test_short_rows_are_spared_speech_and_background_only(tmp_path):
+    """background_min_row_s 3: the 1 s and 2 s rows (under 3 s at the chain's entry) get neither background speech nor
+    background - spared after their gate draw, counted - while the 3 s row (exactly the limit) and the 4 s one get
+    both; reverb, gain and codec still reach every row. The counters come with every micro-batch, 0 included, so the
+    train step's sum over the first micro-batch's keys (scripts/04_distill.py train_step) never misses one."""
+    bank = NB.NoiseBank.load(make_noise_bank(tmp_path / "bg", kinds=("music", "speech", "song", "noise")))
+    rirs = NB.NoiseBank.load(make_rir_bank(tmp_path / "rir"))
+    waves = [speechlike(s, 60 + i) for i, s in enumerate((1.0, 2.0, 3.0, 4.0))]
+    assert len(waves[2]) == round(3.0 * SR)
+    mix = T.Augment(seed=1, speech_p=1.0, noise_p=1.0, speech_batch_p=0.5, background_min_row_s=3.0)
+    rows = rows_of(waves)
+    got = T.acoustic_chain(rows, waves, bank, rirs, mix, np.random.default_rng(0))
+    assert got == dict(speech_mixed=2, reverbed=0, noised=2, gained=0, clipped=0, coded=0, short_rows=2,
+                       speech_spared=2, noise_spared=2)
+    assert [np.array_equal(r.wave, w) for r, w in zip(rows, waves)] == [True, True, False, False]
+    assert T.mix_speech(rows_of(waves), waves, bank, mix, np.random.default_rng(0)) == 4  # no short: as before
+    spared = []
+    assert T.mix_background(rows_of(waves), bank, mix, np.random.default_rng(0), short=[True, False, True, False],
+                            spared=spared) == 2 and spared == [0, 2]
+
+    every = T.Augment(seed=1, speech_p=1.0, noise_p=1.0, reverb_p=1.0, gain_p=1.0, codec_p=1.0, codecs=("ulaw8k",),
+                      background_min_row_s=3.0)
+    rows = rows_of(waves)
+    got = T.acoustic_chain(rows, waves, bank, rirs, every, np.random.default_rng(1))
+    assert (got["speech_mixed"], got["noised"], got["short_rows"], got["speech_spared"], got["noise_spared"]) == (
+        2, 2, 2, 2, 2)
+    assert got["reverbed"] == got["gained"] == got["coded"] == 4  # the short rows too
+    assert all(len(r.wave) == len(w) and not np.array_equal(r.wave, w) for r, w in zip(rows, waves))
+
+    # two micro-batches, a short row in one only: the same keys, so the step sums them in either order
+    long_rows = [speechlike(4.0, 70), speechlike(5.0, 71)]
+    augs = [T.acoustic_chain(rows_of(ws), ws, bank, rirs, mix, np.random.default_rng(s))
+            for s, ws in ((2, waves), (3, long_rows))]
+    assert augs[1]["short_rows"] == augs[1]["speech_spared"] == augs[1]["noise_spared"] == 0
+    assert set(augs[0]) == set(augs[1])
+    for order in (augs, augs[::-1]):
+        step = {k: sum(int(a[k]) for a in order) for k in order[0]}  # train_step's aggregation
+        assert (step["short_rows"], step["speech_spared"], step["noise_spared"]) == (2, 2, 2)
+    with pytest.raises(ValueError, match="background_min_row_s finite and >= 0"):
+        T.Augment(seed=1, background_min_row_s=-1.0)
+    with pytest.raises(ValueError, match="not an augmentation"):
+        T.Augment(seed=1, background_min_row_s=float("inf"))
