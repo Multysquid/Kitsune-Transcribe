@@ -797,7 +797,8 @@ def test_validate_the_augment_block():
                                      "speech_snr_db": [10.0, 25.0], "speech_talkers": [1, 4], "speech_batch_p": 0.5,
                                      "reverb_p": 0.0, "rir_bank": None, "rir_bank_sha256": None, "gain_p": 0.0,
                                      "gain_db": [-20.0, 10.0], "codec_p": 0.0, "codecs": ["mp3", "gsm", "ulaw8k"],
-                                     "background_min_row_s": 0.0}
+                                     "background_min_row_s": 0.0, "cut_keep_word": False, "guard_per_piece": False,
+                                     "end_trim_voiced": False}  # the recipe audit's fixes: tests/test_recipe_v5.py
     assert not m.augment_on(m.load_config(None, [])) and not m.augment_on({})
     ctc = ["family=ctc", "parakeet_root=po"]
     assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.mix_p=0.5"]))
