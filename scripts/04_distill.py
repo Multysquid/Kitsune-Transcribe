@@ -529,11 +529,14 @@ DEFAULTS = {
     # The recipe audit's fixes (2026-10-09, B1-B3; kitsune.trainset's "augmentation" section), each false by default -
     # false, every draw, row, aug count and event is as before the key: cut_keep_word - a cut keeps at least one content
     # token (no mark or comma, no bare start piece "▁": start_token_ids) of the utterance it ends in, so no cut row
-    # keeps only an untranscribed lead-in; guard_per_piece - truncate_min_row_s and background_min_row_s hold for each
-    # utterance of a joined row too, not only for the joined row; end_trim_voiced - the CTC end trim keeps the audio up
-    # to the row's last voiced sound (trainset.voiced_end) and counts no start piece as a word. A resume may turn them
-    # on. An AED student takes guard_per_piece only (its cut table already keeps text before every cut, its end trim
-    # already ends at the voiced audio)
+    # keeps only an untranscribed lead-in; guard_per_piece - truncate_min_row_s, the cut's lower bound
+    # (truncate_min_frac, truncate_min_s) and background_min_row_s hold for each utterance of a joined row too, not
+    # only for the joined row; end_trim_voiced - the end trim keeps the audio up to the last voiced sound of the row's
+    # last utterance, judged at that utterance's own level (trainset.pieces_voiced_end), and a CTC row's counts no start
+    # piece as a word. On, the CTC trim fires far less on the noisy sources, whose trailing audio is within 35 dB of
+    # their peak (train shards: ~79 % of Galgame rows, ~5 % of ReazonSpeech's, ~11-16 % of Emilia's, against ~99-100 %
+    # off), so aug/end_trimmed falls. A resume may turn them on. Either family takes all three (an AED cut keeps
+    # Cohere tokens of its own utterance, and its end trim then measures the voice per utterance too)
     "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
                 "truncate_pause_p": 0.5, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0,
                 "mix_snr_db": [5.0, 20.0], "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
@@ -1109,12 +1112,6 @@ def validate_augment(cfg: dict):
         if a["truncate_p"] and a["cuts"] is None:
             raise SystemExit(f"augment.truncate_p {a['truncate_p']} on an AED student needs augment.cuts, the cut "
                              f"table (tools/aed_cut_table.py): an AED row has no frame targets to say what a cut keeps")
-        for key, why in (("cut_keep_word", "its cuts come from the cut table, whose every entry keeps the Cohere "
-                                           "text before a matched boundary (kitsune.aed_cuts.CTX characters)"),
-                         ("end_trim_voiced", "its end trim already keeps the audio up to the row's last voiced "
-                                             "sound (trainset.voiced_end)")):
-            if a[key]:
-                raise SystemExit(f"augment.{key} is a CTC student's fix and must be false on an AED student: {why}")
 
 
 def augment_on(cfg: dict) -> bool:

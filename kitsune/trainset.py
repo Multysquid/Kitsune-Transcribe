@@ -1170,13 +1170,8 @@ class AudioBatchDataset(torch.utils.data.Dataset):
                     n_cut += 1
         n_trim = 0
         if a.end_trim_p > 0:
-            lo, hi = (int(round(s * TARGET_SR)) for s in END_TRIM_TAIL_S)
             for r in rows:
-                if r.cut is not None or rng.random() >= a.end_trim_p:
-                    continue
-                n = voiced_end(r.wave) + int(rng.integers(lo, hi + 1))
-                if n < len(r.wave):
-                    r.wave, r.trimmed = r.wave[:n], True
+                if r.cut is None and rng.random() < a.end_trim_p and r.trim_end(rng, voiced=a.end_trim_voiced):
                     n_trim += 1
         if a.mix_p > 0 and len(rows) >= 2:
             for p, r in enumerate(rows):
@@ -1469,7 +1464,8 @@ def _nanmin(x: np.ndarray) -> float:
 #             2.8 % false marks on a boundary, 100 % mid-frame; and the natural ends that happen to fill their last
 #             frame lost their real mark). Rows shorter than truncate_min_row_s are never cut (short utterances lost
 #             more words under the first recipe; guard_per_piece: no cut inside a joined row's piece shorter than
-#             that either). cut_keep_word: a cut must also keep a word of the piece it ends in (truncate_frames).
+#             that either, nor inside a longer piece before its own lower bound). cut_keep_word: a cut must also keep
+#             a word of the piece it ends in (truncate_frames).
 #             The teacher made its targets from the WHOLE utterance, so the frames before c carry no final mark:
 #             the input ending is no longer a reason to emit one. A cut between a sentence's last word and its mark
 #             (the Parakeet teacher puts the mark after the trailing silence) would keep a COMPLETE sentence without its
@@ -1525,17 +1521,32 @@ def _nanmin(x: np.ndarray) -> float:
 #                    untranscribed, mostly voiced lead-in before the first word, and the pause draw favours it: ~3.4 %
 #                    of its cuts kept 1-3 s of audio with the target "▁" alone. A cut must keep a CONTENT token - not
 #                    blank, not one of punct_ids, not one of start_ids (the student tokenizer's bare "▁"; a word merged
-#                    into it, "▁お", is content) - whose run starts inside the piece the cut ends in (content_kept)
-#   guard_per_piece  (B2) truncate_min_row_s and background_min_row_s tested the joined row, so a 1-3 s utterance inside
-#                    one was still cut and got background. Per piece instead: no cut strictly inside a piece shorter
-#                    than truncate_min_row_s (one at its first frame drops it whole and stays allowed), and a row is
-#                    short for the background when ANY of its pieces is (piece_samples), in both families - an AED
-#                    row carries its pieces' offsets and frames as a CTC row does. The joined row's own rule still
-#                    holds: the key only takes candidates and backgrounds away, never adds one
+#                    into it, "▁お", is content) - whose run starts inside the piece the cut ends in (content_kept).
+#                    An AED row's cuts (its cut table's entries) each keep Cohere tokens of their own piece - CTX
+#                    matching characters of its text before the boundary -: the key holds them to that
+#                    (aed_cut_candidates)
+#   guard_per_piece  (B2) truncate_min_row_s, the cut's lower bound and background_min_row_s tested the joined row, so a
+#                    1-3 s utterance inside one was still cut and got background, and a cut could keep 80 ms of a
+#                    long later utterance. Per piece instead: no cut strictly inside a piece shorter than
+#                    truncate_min_row_s, nor inside a longer piece before ITS lower bound (max(truncate_min_frac x its
+#                    frames, truncate_min_s, 1 frame), as if it stood alone; piece_guard_frames) - a cut at a piece's
+#                    first frame drops it whole and stays allowed -, and a row is short for the background when ANY
+#                    of its pieces is (piece_samples), in both families: an AED row carries its pieces' offsets and
+#                    frames as a CTC row does. The joined row's own rules still hold: the key only takes candidates
+#                    and backgrounds away, never adds one, and changes nothing on a single-piece row
 #   end_trim_voiced  (B3) the CTC end trim cut at the end of the last word's argmax run, but the teacher fires a token
 #                    near its onset: it removed a median 0.23 s of that word's voiced audio and kept its token, and
 #                    counted "▁" as a word ('▁ ... 。' became a 2-frame '▁ 。' row). The trim then keeps every frame
-#                    up to voiced_end (the AED end trim's rule) and counts no start piece as a word (_AugRow.trim_end)
+#                    up to the row's last voiced sound and counts no start piece as a word (_AugRow.trim_end). Voiced
+#                    is judged on the row's LAST PIECE against its own loudest frame (pieces_voiced_end): a joined
+#                    row's quieter last utterance falls under the END_TRIM_DB line of a louder earlier one, and the
+#                    whole row's voiced_end cut into it (real joined pairs: 30 of 495 voiced trims, up to 0.98 s; per
+#                    piece none). The AED end trim, which ends at the whole row's voiced_end, has the same fault on
+#                    joined rows (85 of 789 trims, up to 1.5 s): with the key it ends at pieces_voiced_end too. On real
+#                    rows the key leaves the CTC trim far fewer rows - on the noisy sources a row's trailing audio is
+#                    within END_TRIM_DB of its peak, so it fires on ~79 % of Galgame rows but ~5 % of ReazonSpeech's
+#                    and ~11-16 % of Emilia's (~99-100 % each without it; train shards, 2026-10-09): a falling
+#                    aug/end_trimmed is the key working, not a fault
 SPEECH_KINDS = ("speech",)  # the bank's kinds the speech step draws
 BACKGROUND_KINDS = ("music", "noise", "song")  # the bank's kinds the background step draws
 SPEECH_MAX_TALKERS = 8  # the most voices speech_talkers may ask for
@@ -1584,14 +1595,15 @@ class Augment:
     room impulse response from the RIR bank; gain_p - gain_db dB, clipped at full scale; codec_p - one of codecs
     (kitsune.acoustics) and back. background_min_row_s: rows shorter than this (seconds of their audio at the acoustic
     chain) get no background speech and no background (0: every row may; acoustic_chain).
-    The audit's fixes (the section comment's B1-B3), each False by default (the steps as before the key):
-    cut_keep_word - a CTC cut keeps a content token of the piece it ends in (truncate_frames); start_ids: the student
-    tokenizer's bare start pieces "▁", no content (scripts/04_distill.py start_token_ids; a CTC one's, like punct_ids);
-    guard_per_piece - truncate_min_row_s and background_min_row_s apply to each piece of a joined row as well (either
-    family); end_trim_voiced - the CTC end trim keeps the audio up to its last voiced sound and counts no start piece
-    as a word (_AugRow.trim_end). An AED augmentation takes no start_ids, cut_keep_word or end_trim_voiced: its cut
-    table already keeps text before every cut (aed_cuts.CTX matching characters) and its end trim already ends at
-    voiced_end."""
+    The audit's fixes (the section comment's B1-B3), each False by default (the steps as before the key), each for
+    either family:
+    cut_keep_word - a cut keeps a content token of the piece it ends in (a CTC row: truncate_frames' content_kept;
+    an AED row: a Cohere token of that piece, aed_cut_candidates); start_ids: the student tokenizer's bare start pieces
+    "▁", no content (scripts/04_distill.py start_token_ids; a CTC one's, like punct_ids - an AED one takes none);
+    guard_per_piece - truncate_min_row_s, the cut's lower bound and background_min_row_s apply to each piece of a
+    joined row as well (piece_guard_frames, piece_samples); end_trim_voiced - the end trim keeps the audio up to the
+    last voiced sound of the row's last piece, judged at that piece's own level (pieces_voiced_end), and a CTC row's
+    counts no start piece as a word (_AugRow.trim_end)."""
 
     seed: int
     truncate_p: float = 0.0
@@ -1667,7 +1679,7 @@ class Augment:
               and all(c in CODECS for c in self.codecs) and (float(self.codec_p) == 0.0 or len(self.codecs) > 0)
               and math.isfinite(float(self.background_min_row_s)) and float(self.background_min_row_s) >= 0.0
               and all(isinstance(x, bool) for x in fixes) and all(0 <= i < CTC_BLANK for i in self.start_ids)
-              and (not aed or (not self.start_ids and not self.cut_keep_word and not self.end_trim_voiced)))
+              and (not aed or not self.start_ids))
         if not ok:
             raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
                              "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high, "
@@ -1678,8 +1690,8 @@ class Augment:
                              f"(low, high) with low <= high; speech_talkers whole with 1 <= low <= high <= "
                              f"{SPEECH_MAX_TALKERS}; codecs among {CODECS}, at least one when codec_p > 0; "
                              "background_min_row_s finite and >= 0; start_ids token ids below the blank; "
-                             "cut_keep_word, guard_per_piece and end_trim_voiced true or false, an AED one with no "
-                             "start_ids, cut_keep_word or end_trim_voiced)")
+                             "cut_keep_word, guard_per_piece and end_trim_voiced true or false; an AED one with no "
+                             "start_ids)")
 
     @classmethod
     def from_config(cls, block: dict, seed: int, concat_max_s: float | None = None,
@@ -1847,8 +1859,9 @@ def truncate_frames(ft: "FrameTargets", min_frac: float, min_s: float, punct_ids
     The audit's fixes (the section comment's B1, B2; off by default, and off the frames are exactly these), on a row
     whose pieces start at frames `offsets` (_AugRow.offsets; None: one piece at 0): keep_word - also keep a content
     token of the piece the cut ends in (content_kept: not a mark or comma, not one of start_ids, the bare "▁"), so a
-    cut never keeps only a lead-in; per_piece - also no frame strictly inside a piece shorter than min_row_s
-    (inside_short_pieces; a cut at such a piece's first frame drops it whole and stays allowed)."""
+    cut never keeps only a lead-in; per_piece - inside a piece, also the rules that piece would have alone: no frame
+    strictly inside a piece shorter than min_row_s, nor one before a longer piece's own lower bound
+    (piece_guard_frames; a cut at a piece's first frame drops it whole and stays allowed)."""
     if ft.n_frames * FRAME_SAMPLES < float(min_row_s) * TARGET_SR - 1e-6:
         return np.zeros(0, np.int64)
     col0 = ft.col0()
@@ -1859,7 +1872,7 @@ def truncate_frames(ft: "FrameTargets", min_frac: float, min_s: float, punct_ids
     ok[:lo] = False
     offs = [0] if offsets is None else offsets
     if per_piece:
-        ok &= ~inside_short_pieces(ft.n_frames, offs, min_row_s)
+        ok &= ~piece_guard_frames(ft.n_frames, offs, min_row_s, min_frac, min_s)
     if keep_word:
         ok &= content_kept(col0, offs, punct_ids, start_ids)
     return np.flatnonzero(ok)
@@ -1885,16 +1898,25 @@ def content_kept(col0: np.ndarray, offsets: Sequence[int], punct_ids: Sequence[i
     return (c >= 1) & (last >= 0) & (st[np.maximum(last, 0)] >= off)
 
 
-def inside_short_pieces(n_frames: int, offsets: Sequence[int], min_row_s: float) -> np.ndarray:
-    """bool (n_frames,): the frames strictly inside a piece shorter than min_row_s seconds (its frames, as
-    truncate_frames measures a row) of a row whose pieces start at frames `offsets` - where guard_per_piece allows no
-    cut, of either family (aed_cut_candidates): it would cut that short utterance. A cut at the piece's first frame
-    keeps the pieces before it whole and drops this one, so it is not inside."""
+def piece_guard_frames(n_frames: int, offsets: Sequence[int], min_row_s: float, min_frac: float = 0.0,
+                       min_s: float = 0.0) -> np.ndarray:
+    """bool (n_frames,): the frames guard_per_piece allows no cut at, of either family (truncate_frames,
+    aed_cut_candidates), on a row whose pieces start at frames `offsets` - inside each piece, the rules it would have
+    as a row of its own: every frame strictly inside a piece shorter than min_row_s seconds (its frames, as
+    truncate_frames measures a row: the cut would cut that short utterance), and in a longer piece of T_j frames the
+    frames before its own lower bound, c - off < max(ceil(min_frac x T_j), the frames of min_s, 1) (the cut would keep
+    a sliver of it: 80 ms of a 4 s utterance, where the joined row's bound only counts the pieces before it). A cut
+    at a piece's first frame keeps the pieces before it whole and drops this one, so it is never refused here; the
+    first piece's bound is never above the row's, so a single-piece row loses nothing."""
     out = np.zeros(int(n_frames), dtype=bool)
     offs = [int(o) for o in offsets] or [0]
+    lo_s = math.ceil(float(min_s) * TARGET_SR / FRAME_SAMPLES - 1e-9)
     for o, e in zip(offs, offs[1:] + [int(n_frames)]):
         if (e - o) * FRAME_SAMPLES < float(min_row_s) * TARGET_SR - 1e-6:
             out[o + 1:e] = True
+        else:
+            lo = max(math.ceil(float(min_frac) * (e - o) - 1e-9), lo_s, 1)
+            out[o + 1:min(o + lo, e)] = True
     return out
 
 
@@ -2064,16 +2086,17 @@ class _AugRow:
         without a final mark or without such a gap.
         voiced (augment.end_trim_voiced; the section comment's B3): the teacher fires a word's token near its onset, so
         the end of its argmax run is not the end of its sound. The frames kept before the marks are then k = max(the
-        word's run end + 1, ceil(voiced_end / FRAME_SAMPLES)) - every frame up to the row's last voiced sound -, False
-        when k reaches the marks (no silent frame left to drop); and a start piece (start_ids, the bare "▁") is no
-        word (mark_tail), so a row without one is not trimmed."""
+        word's run end + 1, ceil(pieces_voiced_end / FRAME_SAMPLES)) - every frame up to the last voiced sound of the
+        row's last piece, judged at that piece's own level -, False when k reaches the marks (no silent frame left to
+        drop); and a start piece (start_ids, the bare "▁") is no word (mark_tail), so a row without one is not
+        trimmed."""
         tail = mark_tail(self.ft, punct_ids, start_ids if voiced else ())
         if tail is None:
             return False
         e_w, s_m, e_m = tail
         k = e_w + 1
         if voiced:
-            k = max(k, -(-voiced_end(self.wave) // FRAME_SAMPLES))
+            k = max(k, -(-pieces_voiced_end(self.wave, self.offsets) // FRAME_SAMPLES))
             if k >= s_m:
                 return False
         ft = join_frame_targets([cut_frame_targets(self.ft, k), slice_frame_targets(self.ft, s_m, e_m + 1)])
@@ -2330,21 +2353,24 @@ def _join_rows(parts: list[_AugRow], rng: np.random.Generator) -> _AugRow:
 #             (kitsune.aed_cuts: where the Parakeet teacher's CTC alignment has a word start whose boundary maps onto
 #             the Cohere text), shifted to the piece's offset, at or after the same lower bound (truncate_min_frac of
 #             the row's frames, truncate_min_s) and never on a row under truncate_min_row_s (guard_per_piece: nor
-#             inside a piece under it, as on a CTC row). The audio ends at a drawn sample (end_samples), as a CTC
-#             row's; the targets keep the Cohere tokens that entry names (the pieces' before it whole, EOS dropped)
-#             and end in EOS, without a sentence mark: the input ending inside a sentence is no reason to emit one.
+#             inside a piece under it or before a longer piece's own lower bound, as on a CTC row; cut_keep_word:
+#             only entries that keep a Cohere token of their own piece, which the table's all do). The audio ends at a
+#             drawn sample (end_samples), as a CTC row's; the targets keep the Cohere tokens that entry names (the
+#             pieces' before it whole, EOS dropped) and end in EOS, without a sentence mark: the input ending inside a
+#             sentence is no reason to emit one.
 #             The EOS position's target is one-hot (top-k row: EOS at log-prob 0, the teacher's next ids at
 #             TOKEN_CUT_FLOOR_LP), so its KL is its CE: the teacher never saw the cut input. A piece whose decoded
 #             audio gives other frames than the table recorded contributes no cuts (cut_mismatch)
 #   end trim  per row that was not cut (end_trim_p): its trailing silence - the audio after its last voiced 10 ms frame
-#             (voiced_end: within END_TRIM_DB of the row's loudest) - trimmed to a tail drawn uniformly in
-#             END_TRIM_TAIL_S, its tokens kept, sentence mark and EOS included (a row whose silence is already shorter
-#             stays as it is). Why (the P-0.3B review's issue B, 2026-10-05): a cut ends tightly before a word with no
-#             mark, and the clean source, Galgame, almost always ends a complete row in a long pause (median 0.28 s;
-#             ReazonSpeech and Emilia end tightly but are noisy or spontaneous), so "clean audio that ends tightly" was
-#             "a cut": P-0.3B left the mark off 7 % of JSUT's complete sentences, whose audio ends within ~0.05 s of the
-#             last word, and kept it on 100 % of Galgame's. Trimmed complete rows make a tight end mean nothing by
-#             itself. Before mix, so the interferer does not hide the row's silence
+#             (voiced_end: within END_TRIM_DB of the row's loudest; end_trim_voiced: of its last piece's loudest,
+#             pieces_voiced_end, so a joined row's quieter last utterance keeps its voice) - trimmed to a tail drawn
+#             uniformly in END_TRIM_TAIL_S, its tokens kept, sentence mark and EOS included (a row whose silence is
+#             already shorter stays as it is). Why (the P-0.3B review's issue B, 2026-10-05): a cut ends tightly before
+#             a word with no mark, and the clean source, Galgame, almost always ends a complete row in a long pause
+#             (median 0.28 s; ReazonSpeech and Emilia end tightly but are noisy or spontaneous), so "clean audio that
+#             ends tightly" was "a cut": P-0.3B left the mark off 7 % of JSUT's complete sentences, whose audio ends
+#             within ~0.05 s of the last word, and kept it on 100 % of Galgame's. Trimmed complete rows make a tight
+#             end mean nothing by itself. Before mix, so the interferer does not hide the row's silence
 #   mix       as above (the targets the clean row's)
 # No pads: a quiet pad would add no token, and the recipe keeps them off for both families.
 END_TRIM_DB = 35.0  # a 10 ms frame is voiced within this many dB of the row's loudest (the review's tail_sil.py rule)
@@ -2363,6 +2389,17 @@ def voiced_end(wave: np.ndarray) -> int:
     db = 10.0 * np.log10(np.einsum("ij,ij->i", fr, fr) / HOP + 1e-12)
     voiced = np.flatnonzero(db > db.max() - END_TRIM_DB)
     return int((voiced[-1] + 1) * HOP) if len(voiced) else len(wave)
+
+
+def pieces_voiced_end(wave: np.ndarray, offsets: Sequence[int]) -> int:
+    """end_trim_voiced's voiced end of a (possibly joined) row whose pieces start at frames `offsets`: the voiced_end of
+    its LAST piece's own audio - 10 ms frames within END_TRIM_DB of that piece's loudest, not the row's -, at the
+    piece's place in the row. A quieter last utterance after a louder one is then still voice, where the whole row's
+    voiced_end would call it silence; nothing before the last piece can end later (join_waves squares every earlier
+    piece to exactly FRAME_SAMPLES x its frames, a whole number of 10 ms frames). A single-piece row's is
+    voiced_end(wave), and it is never below the whole row's voiced_end."""
+    o = FRAME_SAMPLES * int(offsets[-1]) if len(offsets) else 0
+    return o + voiced_end(wave[o:])
 
 
 class _TokRow:
@@ -2405,6 +2442,20 @@ class _TokRow:
                                                                self.before[:m])
         self.cut = int(c)
 
+    def trim_end(self, rng: np.random.Generator, voiced: bool = False) -> bool:
+        """The AED end trim (the section comment's "end trim"): the audio ends a tail drawn uniformly in
+        END_TRIM_TAIL_S after the row's last voiced 10 ms frame (voiced_end), its tokens kept; False (nothing
+        trimmed, the tail still drawn) when the row's silence is already shorter. voiced (augment.end_trim_voiced):
+        the voiced end of its last piece judged at that piece's own level (pieces_voiced_end), so a joined row's quieter
+        last utterance keeps its voice."""
+        lo, hi = (int(round(s * TARGET_SR)) for s in END_TRIM_TAIL_S)
+        ve = pieces_voiced_end(self.wave, self.offsets) if voiced else voiced_end(self.wave)
+        n = ve + int(rng.integers(lo, hi + 1))
+        if n >= len(self.wave):
+            return False
+        self.wave, self.trimmed = self.wave[:n], True
+        return True
+
 
 def _join_tok_rows(parts: list[_TokRow], eos: int, rng: np.random.Generator) -> _TokRow:
     """concat's join of single-utterance AED rows, in the given order: the audio join_waves', the targets the pieces'
@@ -2427,7 +2478,10 @@ def aed_cut_candidates(r: _TokRow, cuts, a: Augment, eos: int) -> tuple[np.ndarr
     each piece's offset): (frames, the tokens each keeps, in a pause, the pieces the table holds whose frames differ
     from their decoded audio's - they add none). None on a row under truncate_min_row_s; never a frame below
     max(truncate_min_frac x its frames, truncate_min_s, 1 frame), nor one that keeps no token or every token; with
-    a.guard_per_piece never one strictly inside a piece under truncate_min_row_s (inside_short_pieces)."""
+    a.guard_per_piece never one the CTC rule refuses inside a piece (piece_guard_frames: strictly inside a piece under
+    truncate_min_row_s, or before a longer piece's own lower bound); with a.cut_keep_word never one that keeps no
+    Cohere token of the piece it ends in (the piece holding frame c - 1) - the table's entries each keep m >= 1 tokens
+    of their piece, CTX matching characters of its text before the boundary, so this only holds them to it."""
     from kitsune import aed_cuts
 
     z = np.zeros(0, np.int64)
@@ -2445,8 +2499,11 @@ def aed_cut_candidates(r: _TokRow, cuts, a: Augment, eos: int) -> tuple[np.ndarr
         pieces.append((cuts.entries(i), off, before))
     frames, kept, pause = aed_cuts.row_candidates(pieces, lo, TRUNCATE_PAUSE_FRAMES)
     ok = (kept >= 1) & (kept < r.body(eos))
-    if a.guard_per_piece:  # no cut inside a piece under truncate_min_row_s (the CTC rule: inside_short_pieces)
-        ok &= ~inside_short_pieces(T, r.offsets, a.truncate_min_row_s)[frames]
+    if a.guard_per_piece:  # inside a piece, the rules it would have alone (the CTC rule: piece_guard_frames)
+        ok &= ~piece_guard_frames(T, r.offsets, a.truncate_min_row_s, a.truncate_min_frac, a.truncate_min_s)[frames]
+    if a.cut_keep_word:  # a token of the piece the cut ends in: more than the pieces' before it
+        j = np.searchsorted(np.asarray(r.offsets, dtype=np.int64), frames - 1, side="right") - 1
+        ok &= kept > np.asarray(r.before, dtype=np.int64)[np.maximum(j, 0)]
     return frames[ok], kept[ok], pause[ok], bad
 
 

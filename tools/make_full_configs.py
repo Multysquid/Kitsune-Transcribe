@@ -205,12 +205,20 @@ RECIPE_GENTLE = {**RECIPE_V4, "noise_snr_db": [5.0, 20.0], "speech_snr_db": [15.
 # 2026-10-09 recipe audit (the lone-。 empties; kitsune.trainset's "augmentation" section, B1-B3) turned on -
 #   cut_keep_word    every cut keeps a content token of the utterance it ends in (never the bare start piece "▁"
 #                    alone: ~3.4 % of ReazonSpeech's cuts kept 1-3 s of an untranscribed lead-in with no word)
-#   guard_per_piece  truncate_min_row_s 3.0 holds for each utterance of a joined row (no cut inside one under 3 s), as
+#   guard_per_piece  truncate_min_row_s 3.0 and the cut's lower bound (30 % of the utterance, 1 s) hold for each
+#                    utterance of a joined row (no cut inside one under 3 s, none keeping a sliver of a longer one), as
 #                    background_min_row_s would (0 here, as in v4: every row may get a background)
-#   end_trim_voiced  the end trim keeps the audio up to the row's last voiced sound (the last word's token sits at its
-#                    onset: the old trim removed a median 0.23 s of its sound) and counts no "▁" as a word
-# A CTC recipe: an AED student takes guard_per_piece only (04_distill validate_augment refuses the other two there)
-RECIPE_V5 = {**RECIPE_V4, "cut_keep_word": True, "guard_per_piece": True, "end_trim_voiced": True}
+#   end_trim_voiced  the end trim keeps the audio up to the last voiced sound of the row's last utterance (the last
+#                    word's token sits at its onset: the old trim removed a median 0.23 s of its sound) and counts no
+#                    "▁" as a word. Expect aug/end_trimmed to fall: on the noisy sources a row's trailing audio is
+#                    within 35 dB of its peak, so the trim fires on ~79 % of Galgame rows but ~5 % of ReazonSpeech's
+#                    and ~11-16 % of Emilia's (~99-100 % each under v4; train shards, 2026-10-09)
+# Recipe v4 with the trainer's defaults written out (RECIPE_V4_FULL), so that as a continuation's recipe it inherits
+# no range or short-row guard from the state it resumes. Either family takes it (an AED recipe adds its cut table, as
+# RECIPE_AED does). RECIPE_V4_FULL and RECIPE_GENTLE do not spell the three fixes, so a continuation with one of them
+# from a state that had a fix on would keep it: spell them (false) when the next box's recipes are written (adding
+# them now would change box p-cool's recorded continues sets)
+RECIPE_V5 = {**RECIPE_V4_FULL, "cut_keep_word": True, "guard_per_piece": True, "end_trim_voiced": True}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
