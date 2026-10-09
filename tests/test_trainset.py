@@ -4,6 +4,7 @@ Everything runs on a synthetic corpus in the repo's exact on-disk formats (tests
 the fixture's ground truth, not against the code under test. Two tests read real files (one teacher shard, one data
 shard) under fixtures.REAL and skip when they are absent (fail under KITSUNE_REQUIRE_REAL_DATA=1). CPU only.
 """
+import io
 import json
 import os
 import pickle
@@ -591,6 +592,36 @@ def test_loader_reports_a_dead_worker_long_before_its_timeout():
         with pytest.raises(RuntimeError, match="exited unexpectedly"):
             next(loader)
         assert time.monotonic() - t0 < 30
+    finally:
+        loader.close()
+
+
+class _SndfileErrorDataset(torch.utils.data.Dataset):
+    """Micro-batch [1] raises soundfile's LibsndfileError in the worker ("Format not recognised")."""
+
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, idx):
+        if list(idx) == [1]:
+            import soundfile as sf
+
+            sf.read(io.BytesIO(b""))
+        return dict(ids=list(idx))
+
+
+def test_loader_raises_a_worker_error_that_cannot_print_itself_as_its_text():
+    """torch rebuilds a worker's exception in the trainer as exc_type(the worker's traceback text); soundfile's
+    LibsndfileError takes that text for its error code, so its str() raised TypeError inside the loader's timeout
+    check and the log showed "<exception str() failed>" (box p-cool's P-0.3B run, step 189,563). The loader raises a
+    RuntimeError holding the worker's traceback text instead."""
+    loader = make_loader(_SndfileErrorDataset(), [[[0]], [[1]], [[2]]], num_workers=1, prefetch=1, timeout_s=90)
+    try:
+        key, mbs = next(loader)
+        assert key == 0 and mbs[0]["ids"] == [0]
+        with pytest.raises(RuntimeError, match="Format not recognised") as got:
+            next(loader)
+        assert type(got.value) is RuntimeError and "Caught LibsndfileError in DataLoader worker" in str(got.value)
     finally:
         loader.close()
 

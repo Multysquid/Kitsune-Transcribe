@@ -87,6 +87,24 @@ def test_codecs_available_here_and_unknown_ones():
         A.codec(speechlike(0.5, 1), "aac", np.random.default_rng(0))
 
 
+def test_a_row_the_codec_cannot_take_stays_as_it_was(capsys):
+    """apply_codecs leaves a row libsndfile refuses (an empty row through MP3) or one with a non-finite sample (soxr
+    and libsndfile crash the process on NaN) as it was, uncounted and named on stderr, and codes the others: one row
+    no longer kills a loader worker (box p-cool's P-0.3B run stopped at step 189,563 on a libsndfile error)."""
+    with pytest.raises(RuntimeError, match="Format not recognised"):
+        A.codec(np.zeros(0, np.float32), "mp3", np.random.default_rng(0))
+    good = speechlike(1.0, 6)
+    nan = good.copy()
+    nan[100] = np.nan
+    rows = rows_of([np.zeros(0, np.float32), nan, good])
+    assert T.apply_codecs(rows, T.Augment(seed=1, codec_p=1.0, codecs=("mp3",)), np.random.default_rng(0)) == 1
+    assert len(rows[0].wave) == 0 and np.array_equal(rows[1].wave, nan, equal_nan=True)
+    assert len(rows[2].wave) == len(good) and not np.allclose(rows[2].wave, good)
+    err = capsys.readouterr().err
+    assert "codec mp3 skipped on a row of 0 samples: LibsndfileError" in err
+    assert f"codec mp3 skipped on a row of {len(good)} samples: a non-finite sample" in err
+
+
 def test_bank_kinds_and_rir_clips(tmp_path):
     """segment draws from the kinds asked for only; an RIR bank is float32 and draw_clip gives each room whole."""
     bank = NB.NoiseBank.load(make_noise_bank(tmp_path / "bg", seconds=4.0, kinds=("music", "speech", "song", "noise")))

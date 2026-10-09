@@ -2149,7 +2149,9 @@ def vary_gain(rows, a: Augment, rng: np.random.Generator) -> dict:
 def apply_codecs(rows, a: Augment, rng: np.random.Generator) -> int:
     """The codec step (codec_p): per row, one of codecs drawn uniformly, the row encoded and decoded in memory
     (kitsune.acoustics.codec: libsndfile's MP3, GSM 6.10, mu-law, ...), as long and as aligned as before. Returns the
-    rows it changed."""
+    rows it changed. A row the codec cannot take stays as it was, named on stderr: one with a non-finite sample (soxr
+    and libsndfile crash the process on NaN) or one libsndfile refuses (an empty row through MP3: "Format not
+    recognised"). A libsndfile error in a loader worker stopped box p-cool's P-0.3B run at step 189,563 (2026-10-09)."""
     if a.codec_p <= 0 or not a.codecs:
         return 0
     from kitsune.acoustics import codec
@@ -2158,9 +2160,31 @@ def apply_codecs(rows, a: Augment, rng: np.random.Generator) -> int:
     for r in rows:
         if rng.random() >= a.codec_p:
             continue
-        r.wave = codec(r.wave, a.codecs[int(rng.integers(len(a.codecs)))], rng)
+        name = a.codecs[int(rng.integers(len(a.codecs)))]
+        if not np.isfinite(r.wave).all():
+            _codec_skipped(name, r.wave, "a non-finite sample")
+            continue
+        try:
+            r.wave = codec(r.wave, name, rng)
+        except Exception as e:  # noqa: BLE001  (libsndfile's errors are RuntimeErrors, soxr's ValueErrors)
+            _codec_skipped(name, r.wave, f"{type(e).__name__}: {_exc_text(e)}")
+            continue
         n += 1
     return n
+
+
+def _codec_skipped(name: str, wave: np.ndarray, why: str):
+    print(f"[augment] codec {name} skipped on a row of {len(wave)} samples: {why[:300]}", file=sys.stderr, flush=True)
+
+
+def _exc_text(e: BaseException) -> str:
+    """str(e), or its first argument when str() itself fails: torch re-raises a loader worker's exception as
+    exc_type(the worker's traceback text), soundfile's LibsndfileError takes that text for its error code, and its
+    str() then raises TypeError."""
+    try:
+        return str(e)
+    except Exception:  # noqa: BLE001
+        return str(e.args[0]) if e.args else type(e).__name__
 
 
 def _join_rows(parts: list[_AugRow], rng: np.random.Generator) -> _AugRow:
@@ -2385,7 +2409,12 @@ def make_loader(dataset: AudioBatchDataset, plan: "list[list[list[int]]] | StepP
             try:
                 return next(it)
             except RuntimeError as e:  # a timed-out wait leaves the iterator's state untouched: next() waits on
-                if not (slice_s and str(e).startswith("DataLoader timed out")):
+                try:
+                    msg = str(e)
+                except Exception:  # noqa: BLE001  a worker's exception rebuilt by torch that cannot print itself
+                    # (_exc_text: soundfile's LibsndfileError): raise the worker's traceback text in its place
+                    raise RuntimeError(_exc_text(e)) from None
+                if not (slice_s and msg.startswith("DataLoader timed out")):
                     raise
                 if time.monotonic() - t0 >= timeout_s:
                     raise RuntimeError(f"DataLoader timed out after {timeout_s:g} s (no micro-batch arrived)") from None
