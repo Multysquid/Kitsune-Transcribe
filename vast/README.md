@@ -760,8 +760,12 @@ speech from `aug/musan-bg-v2`, room echo from `aug/rirs-v1`, volume and codecs; 
 -, the Cohere labels only, `data-t`) and **box P**
 (`full-p`: P-0.3B with the CTC train-data augmentation recipe, `full-p03.json`'s `augment` block, the Parakeet labels,
 `data-p`, with the Whisper models and the quantised readouts; done 2026-10-04, M4 9.73 %; its run's cooldown re-run is
-box p-cool's, DECISIONS H14, below). T-0.6B trains 8 epochs
-(DECISIONS H7, 2026-10-05) and P-0.3B trained 6 (H5); 3 each under G1 before, with the common early-stop patience 6.
+box p-cool's, DECISIONS H14, below). T-0.6B trains 6 epochs with the early stop
+(DECISIONS H15, 2026-10-10; 8 under H7) and P-0.3B trained 6 (H5); 3 each under G1 before, with the common early-stop
+patience 6. Since H15 box T's recipe also turns on two of recipe v5's keys, `augment.guard_per_piece` and
+`augment.end_trim_voiced` (`make_full_configs.py` `RECIPE_AED_H15`; `augment.cut_keep_word` stays off), and box T
+launches from the box branch `t-box` (main with PRs #51, #52 and #53 merged in) with `--allow-unverified-quant` at a
+$1.40/h cap (the registry's `max_dph`).
 DECISIONS H2 postponed P-0.05B (its items left box P). It comes back alone on box `p005`, **the P test box**
 (DECISIONS H8-H10, H12, below): P-0.05B from step 0 at 10 epochs (`full-p005.json`) with recipe v4 (recipe v2 plus
 the P-0.3B review's two fixes, the end trim and background audio, and room echo, volume, codecs, background speech and
@@ -811,7 +815,7 @@ checks say), its verdict `full/box-smoke-b/smoke_verdict.json` passing checks 12
 H1 step 1, the `--resume-reset ... augment.*` line above: box 1's cooldown again with the train-data augmentation, a
 paired A/B against the 4-epoch record), then **box full-p** (P-0.3B with the recipe) only if the test shows that the
 recipe helps (H1 step 2: its readout `runs/m4-full-p01-20261001T184145Z-r1` against the record's at revision
-c4604304); box full-t (T-0.6B, 8 epochs, the AED recipe: DECISIONS H7) needs the cut table uploaded to the data repo
+c4604304); box full-t (T-0.6B, 6 epochs since DECISIONS H15, the AED recipe: H7) needs the cut table uploaded to the data repo
 first (launch refuses a missing extra file). After the P-0.3B review, **box p005, the P test box** (DECISIONS H8-H10,
 the `--box p005` line above, a fresh launch; it needs the banks `aug/musan-bg-v2` and `aug/rirs-v1` in the data repo) comes
 first; box p-cool (the `--box p-cool` line, DECISIONS H14: from a main that contains the fp16 fix, PR #52) and box

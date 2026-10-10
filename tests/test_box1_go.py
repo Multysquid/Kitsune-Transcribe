@@ -146,7 +146,7 @@ def test_go(tmp_path, capsys):
     assert "full-p01 " in printed.split("box p-cool with box 1's speed", 1)[1].splitlines()[0]
     assert "box full-p with" not in printed and "box p01 with" not in printed
     assert "P-0.1B's 4 epochs by the same model " in printed and "vs measured" in printed
-    assert "boxes.json would change: boxes.full-t.items.full-t06: {'max_hours': 63.62}" in printed
+    assert "boxes.json would change: boxes.full-t.items.full-t06: {'max_hours': 47.75}" in printed
 
 
 def test_the_json_round_trips_through_import_speed(tmp_path, capsys):
