@@ -384,12 +384,14 @@ def test_launch_full_argument_errors(full_launch, capsys):
                        "augment.concat_p, augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, "
                        "augment.noise_p, augment.noise_bank, augment.noise_bank_sha256, augment.speech_p, "
                        "augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, augment.gain_p, augment.codec_p, "
-                       "augment.background_min_row_s, schedule.deadline_cooldown may change on a resume"),
+                       "augment.background_min_row_s, schedule.deadline_cooldown, augment.cut_keep_word, "
+                       "augment.guard_per_piece, augment.end_trim_voiced may change on a resume"),
                       # DECISIONS H14: only a registry continuation keeps an early-stop cooldown (continuation_preflight
                       # checks the state's record before renting; no env resume set does)
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:schedule.resume_reset_keep_cooldown=true"],
-                       "augment.background_min_row_s, schedule.deadline_cooldown may change on a resume"),
+                       "augment.background_min_row_s, schedule.deadline_cooldown, augment.cut_keep_word, "
+                       "augment.guard_per_piece, augment.end_trim_voiced may change on a resume"),
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:augment.noise_bank=../bank"],
                        "augment.noise_bank must be a relative data-repo path"),

@@ -525,7 +525,18 @@ DEFAULTS = {
     # vorbis, opus), encoded and decoded in memory; a codec this machine's libsndfile lacks is dropped at setup.
     # background_min_row_s (DECISIONS H14): rows shorter than this many seconds of audio at the acoustic steps get no
     # background speech and no background (reverb, gain and codec still apply; aug/short_frac, aug/speech_spared_frac,
-    # aug/noise_spared_frac); 0: every row may
+    # aug/noise_spared_frac); 0: every row may.
+    # The recipe audit's fixes (2026-10-09, B1-B3; kitsune.trainset's "augmentation" section), each false by default -
+    # false, every draw, row, aug count and event is as before the key: cut_keep_word - a cut keeps at least one content
+    # token (no mark or comma, no bare start piece "▁": start_token_ids) of the utterance it ends in, so no cut row
+    # keeps only an untranscribed lead-in; guard_per_piece - truncate_min_row_s, the cut's lower bound
+    # (truncate_min_frac, truncate_min_s) and background_min_row_s hold for each utterance of a joined row too, not
+    # only for the joined row; end_trim_voiced - the end trim keeps the audio up to the last voiced sound of the row's
+    # last utterance, judged at that utterance's own level (trainset.pieces_voiced_end), and a CTC row's counts no start
+    # piece as a word. On, the CTC trim fires far less on the noisy sources, whose trailing audio is within 35 dB of
+    # their peak (train shards: ~79 % of Galgame rows, ~5 % of ReazonSpeech's, ~11-16 % of Emilia's, against ~99-100 %
+    # off), so aug/end_trimmed falls. A resume may turn them on. Either family takes all three (an AED cut keeps
+    # Cohere tokens of its own utterance, and its end trim then measures the voice per utterance too)
     "augment": {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3, "truncate_min_s": 1.0,
                 "truncate_pause_p": 0.5, "concat_p": 0.0, "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0,
                 "mix_snr_db": [5.0, 20.0], "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
@@ -533,7 +544,8 @@ DEFAULTS = {
                 "noise_snr_db": [0.0, 20.0], "noise_bank": None, "noise_bank_sha256": None, "speech_p": 0.0,
                 "speech_snr_db": [10.0, 25.0], "speech_talkers": [1, 4], "speech_batch_p": 0.5, "reverb_p": 0.0,
                 "rir_bank": None, "rir_bank_sha256": None, "gain_p": 0.0, "gain_db": [-20.0, 10.0], "codec_p": 0.0,
-                "codecs": ["mp3", "gsm", "ulaw8k"], "background_min_row_s": 0.0},
+                "codecs": ["mp3", "gsm", "ulaw8k"], "background_min_row_s": 0.0, "cut_keep_word": False,
+                "guard_per_piece": False, "end_trim_voiced": False},
     # BatchNorm: mode "frozen" (eval mode, running stats fixed, affine trainable: the pruned students, whose BN holds
     # the teacher's statistics) or "train" (a student trained from scratch: BN trains, its running stats update, eval
     # and greedy decoding use them; gradient checkpointing is never turned on). momentum: null = the modules' own
@@ -1030,6 +1042,9 @@ def validate_augment(cfg: dict):
     if not (_number(a["background_min_row_s"]) and a["background_min_row_s"] >= 0):
         raise SystemExit(f"augment.background_min_row_s must be a number of seconds >= 0, got "
                          f"{a['background_min_row_s']!r}")
+    for key in AUDIT_FIX_KEYS:
+        if not isinstance(a[key], bool):
+            raise SystemExit(f"augment.{key} must be true or false, got {a[key]!r}")
     if not (_number(a["truncate_min_s"]) and a["truncate_min_s"] >= 0):
         raise SystemExit(f"augment.truncate_min_s must be a number of seconds >= 0, got {a['truncate_min_s']!r}")
     if not (_number(a["concat_max_s"]) and a["concat_max_s"] > 0):
@@ -2389,7 +2404,12 @@ def setup_augment(R: Run):
         raise SystemExit(f"augment.truncate_p {a['truncate_p']} needs the student tokenizer's sentence marks "
                          f"({''.join(SENTENCE_MARKS)}) to keep every cut inside a sentence, and this tokenizer has none "
                          f"(punctuation found: {punct})")
-    spec = trainset.Augment.from_config(a, seed=seed, concat_max_s=used, punct_ids=sorted(punct))
+    start = start_token_ids(R.tokenizer)
+    if (a["cut_keep_word"] or a["end_trim_voiced"]) and not start:
+        print(f"WARNING: augment.cut_keep_word / end_trim_voiced: the student tokenizer has no bare start piece "
+              f"{START_PIECE!r}, so every token but its punctuation counts as a word", flush=True)
+    spec = trainset.Augment.from_config(a, seed=seed, concat_max_s=used, punct_ids=sorted(punct),
+                                        start_ids=sorted(start))
     R.log.event("augment", seed=seed, truncate_p=spec.truncate_p, truncate_min_frac=spec.truncate_min_frac,
                 truncate_min_s=spec.truncate_min_s, truncate_pause_p=spec.truncate_pause_p,
                 punct_ids={str(i): t for i, t in sorted(punct.items())}, concat_p=spec.concat_p,
@@ -2398,14 +2418,14 @@ def setup_augment(R: Run):
                 mix_p=spec.mix_p, mix_snr_db=list(spec.mix_snr_db), truncate_pad_p=spec.truncate_pad_p,
                 end_pad_p=spec.end_pad_p, pad_frames=list(spec.pad_frames),
                 truncate_min_row_s=spec.truncate_min_row_s, end_trim_p=spec.end_trim_p,
-                **noise_fields(spec, noise, rirs))
+                **noise_fields(spec, noise, rirs), **fix_fields(spec, start))
     print(f"augment: truncate_p {spec.truncate_p:g} (rows >= {spec.truncate_min_row_s:g} s, pause cuts "
           f"{spec.truncate_pause_p:g}, never removing only "
           f"{''.join(punct.values()) or 'punctuation'}), concat_p {spec.concat_p:g} (k <= {spec.concat_max_n}, "
           f"<= {used:g} s{' = the longest train utterance' if used < float(a['concat_max_s']) else ''}), mix_p "
           f"{spec.mix_p:g} at {spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, quiet pads after cuts "
           f"{spec.truncate_pad_p:g} / after whole rows {spec.end_pad_p:g} ({spec.pad_frames[0]}-{spec.pad_frames[1]} "
-          f"frames), end trim {spec.end_trim_p:g}, {acoustic_line(spec)}, seed {seed}", flush=True)
+          f"frames), end trim {spec.end_trim_p:g}, {acoustic_line(spec)}{fix_line(spec)}, seed {seed}", flush=True)
     return R.ds.with_augment(spec, noise=noise, rirs=rirs)
 
 
@@ -2484,6 +2504,24 @@ def noise_fields(spec, bank, rirs=None) -> dict:
                 **({"background_min_row_s": spec.background_min_row_s} if spec.background_min_row_s > 0 else {}))
 
 
+def fix_fields(spec, start: dict | None = None) -> dict:
+    """The `augment` event's fields of the recipe audit's fixes (AUDIT_FIX_KEYS): each key only when it is on, and the
+    student tokenizer's start pieces (start_ids, {id: piece} as punct_ids) when a fix that reads them is (cut_keep_word,
+    end_trim_voiced) - with every fix off, the event as before them."""
+    out = {k: True for k in AUDIT_FIX_KEYS if getattr(spec, k)}
+    if start is not None and (spec.cut_keep_word or spec.end_trim_voiced):
+        out["start_ids"] = {str(i): t for i, t in sorted(start.items())}
+    return out
+
+
+def fix_line(spec) -> str:
+    """The console line's part of the recipe audit's fixes: empty with every fix off (the line as before them)."""
+    on = [text for key, text in (("cut_keep_word", "every cut keeps a word"),
+                                 ("guard_per_piece", "row guards per joined utterance"),
+                                 ("end_trim_voiced", "end trim keeps the voiced audio")) if getattr(spec, key)]
+    return "".join(f", {t}" for t in on)
+
+
 def acoustic_line(spec) -> str:
     """The console line's acoustic part."""
     return (f"background {spec.noise_p:g} at {spec.noise_snr_db[0]:g}-{spec.noise_snr_db[1]:g} dB, speech "
@@ -2522,14 +2560,14 @@ def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float, n
                 cuts_sha256=(info or {}).get("table_sha256"), cuts_index=str(cuts.path) if cuts is not None else None,
                 cuts_rows=(info or {}).get("rows"), cuts_rows_in_table=(info or {}).get("rows_in_table"),
                 cuts_rows_with_cuts=(info or {}).get("rows_with_cuts"), cuts_entries=(info or {}).get("entries"),
-                **noise_fields(spec, noise, rirs))
+                **noise_fields(spec, noise, rirs), **fix_fields(spec))
     clamp = " = the longest train utterance" if used < float(a["concat_max_s"]) else ""
     print(f"augment (aed): truncate_p {spec.truncate_p:g} (rows >= {spec.truncate_min_row_s:g} s, pause cuts "
           f"{spec.truncate_pause_p:g}, at the cut table's frames"
           + (f": {info['rows_with_cuts']} of {info['rows']} rows" if info else "") + f"), concat_p {spec.concat_p:g} "
           f"(k <= {spec.concat_max_n}, <= {used:g} s{clamp}, <= {max_tokens} tokens), mix_p {spec.mix_p:g} at "
-          f"{spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, end trim {spec.end_trim_p:g}, {acoustic_line(spec)}, "
-          f"seed {seed}", flush=True)
+          f"{spec.mix_snr_db[0]:g}-{spec.mix_snr_db[1]:g} dB, end trim {spec.end_trim_p:g}, {acoustic_line(spec)}"
+          f"{fix_line(spec)}, seed {seed}", flush=True)
     return R.ds.with_augment(spec, cuts, noise=noise, rirs=rirs)
 
 
@@ -2537,6 +2575,21 @@ def setup_aed_augment(R: Run, a: dict, seed: int, used: float, longest: float, n
 # half-width (the Parakeet ja vocabulary has 。 ? ! and 、 - ids 1, 25, 27 and 8 in tokenizer.json f604c293...)
 SENTENCE_MARKS = ("。", "?", "!", "？", "！", ".", "．")
 PUNCT_TEXT = (*SENTENCE_MARKS, "、", ",", "，")
+
+
+# the recipe audit's fixes (2026-10-09, B1-B3; DEFAULTS augment, kitsune.trainset.Augment): bool keys, false = the
+# recipe as before them
+AUDIT_FIX_KEYS = ("cut_keep_word", "guard_per_piece", "end_trim_voiced")
+START_PIECE = "▁"  # SentencePiece's word-boundary marker: a piece of exactly this is a bare start piece, no content
+
+
+def start_token_ids(tokenizer) -> dict[int, str]:
+    """{token id: its piece} of the vocabulary's bare start pieces - exactly START_PIECE, no text after it (the
+    Parakeet ja vocabulary's id 2, as the tests' tiny one): the token the Parakeet teacher puts on frame 0 of most rows
+    before any word, which augment.cut_keep_word and end_trim_voiced do not count as one (kitsune.trainset.
+    content_kept, mark_tail). A word merged into it ("▁お", "▁はい") is another piece and stays a word. The
+    `augment` event records them when either fix is on."""
+    return {int(i): t for t, i in tokenizer.get_vocab().items() if t == START_PIECE}
 
 
 def punct_token_ids(tokenizer) -> dict[int, str]:

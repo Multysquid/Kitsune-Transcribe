@@ -228,12 +228,16 @@ ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # KITSUNE_RESUME_SETS (comma-separated) cannot carry, and only a registry continuation sets them (CONTINUE_SET_KEYS).
 # DECISIONS H14 (box p-cool) adds background_min_row_s (seconds >= 0: rows shorter than this get no background speech
 # or noise) and schedule.deadline_cooldown (a bool: false turns the deadline's cooldown compression off for a
-# continuation; 04_distill RESUME_FIXED holds neither)
+# continuation; 04_distill RESUME_FIXED holds neither). The recipe audit of 2026-10-09 (B1-B3; recipe v5,
+# make_full_configs RECIPE_V5) adds its three fixes, bools that are false by default, so a continuation can turn them
+# on: augment.cut_keep_word, augment.guard_per_piece and augment.end_trim_voiced (04_distill AUDIT_FIX_KEYS; not in
+# RESUME_FIXED either)
 RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
                    "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s", "augment.end_trim_p",
                    "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256", "augment.speech_p",
                    "augment.reverb_p", "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p",
-                   "augment.codec_p", "augment.background_min_row_s", "schedule.deadline_cooldown")
+                   "augment.codec_p", "augment.background_min_row_s", "schedule.deadline_cooldown",
+                   "augment.cut_keep_word", "augment.guard_per_piece", "augment.end_trim_voiced")
 RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
 RESUME_SET_KINDS = {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
                     "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
@@ -241,7 +245,8 @@ RESUME_SET_KINDS = {"schedule.epochs": "int", "early_stop.patience": "int", "aug
                     "augment.noise_bank": "path", "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob",
                     "augment.reverb_p": "prob", "augment.rir_bank": "path", "augment.rir_bank_sha256": "sha256",
                     "augment.gain_p": "prob", "augment.codec_p": "prob", "augment.background_min_row_s": "seconds",
-                    "schedule.deadline_cooldown": "bool"}
+                    "schedule.deadline_cooldown": "bool", "augment.cut_keep_word": "bool",
+                    "augment.guard_per_piece": "bool", "augment.end_trim_voiced": "bool"}
 # the codecs a continuation's augment.codecs may name: a copy of kitsune.acoustics.CODECS (numpy at import, so it is
 # not imported here; tests/test_fullrun.py holds the two equal)
 CODEC_NAMES = ("mp3", "gsm", "ulaw8k", "vorbis", "opus")
