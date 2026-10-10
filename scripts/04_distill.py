@@ -369,6 +369,7 @@ no longer reads as a cut
 import argparse
 import concurrent.futures
 import copy
+import faulthandler
 import hashlib
 import json
 import math
@@ -6168,7 +6169,10 @@ def run_script(argv=None):
     """The __main__ entry: exit_process(main()). main() re-raises a failure, which skipped exit_process: one it
     re-raised with an upload still running (_HARD_EXIT) is reported as the interpreter would (the traceback, or a
     SystemExit's message) and leaves by exit_process too, with EXIT_FAIL (a SystemExit's int code); finalizing with
-    the upload's thread in hf_xet aborted the process (rc -6). Any other failure propagates as before."""
+    the upload's thread in hf_xet aborted the process (rc -6). Any other failure propagates as before. A native crash
+    prints every thread's Python stack to stderr first (faulthandler): box T's trainer died twice of SIGSEGV (rc -11,
+    2026-10-10) without a traceback."""
+    faulthandler.enable(all_threads=True)
     try:
         rc = main(argv)
     except BaseException as e:

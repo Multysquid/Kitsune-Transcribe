@@ -146,7 +146,8 @@ RECIPE = {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0, "tr
 # the trainer's; no pads (an AED student takes none). end_trim_p 0.3 (DECISIONS H7, fix B; the owner on 2026-10-05,
 # after the P-0.3B review: 7 % of JSUT's complete sentences lost their mark): about a third of the rows that are not
 # cut lose their trailing silence down to a 10-80 ms tail, their mark kept, so a clean tight end is no longer only a
-# cut's. Since DECISIONS H11 also recipe v3's background (below): RECIPE_AED is RECIPE_V3 plus the cut table
+# cut's. Since DECISIONS H11 also recipe v3's background (below): RECIPE_AED is RECIPE_V3 plus the cut table. Since
+# DECISIONS H15 box T trains RECIPE_AED_H15 (below RECIPE_V5): RECIPE_AED plus two of recipe v5's fixes
 AED_CUTS = "labels/full/selections/full_study/aed_cuts.parquet"
 AED_CUTS_SHA256 = "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb"
 # RECIPE V3 (DECISIONS H8, the owner on 2026-10-05: "retrain p0.1 and p0.05 with the changes and see if our changes fixed
@@ -201,7 +202,8 @@ RECIPE_V4_FULL = {**RECIPE_V4, "noise_snr_db": [0.0, 20.0], "speech_snr_db": [10
                   "codecs": ["mp3", "gsm", "ulaw8k"], "background_min_row_s": 0.0}
 RECIPE_GENTLE = {**RECIPE_V4, "noise_snr_db": [5.0, 20.0], "speech_snr_db": [15.0, 25.0], "gain_db": [-10.0, 10.0],
                  "codecs": ["mp3", "ulaw8k"], "background_min_row_s": 3.0}
-# RECIPE V5 - PROPOSED for the next run, DECISIONS pending; no box uses it: recipe v4 with the three fixes of the
+# RECIPE V5 - PROPOSED for the next run, DECISIONS pending; no box uses it whole (box T takes two of its keys since
+# DECISIONS H15: RECIPE_AED_H15 below): recipe v4 with the three fixes of the
 # 2026-10-09 recipe audit (the lone-。 empties; kitsune.trainset's "augmentation" section, B1-B3) turned on -
 #   cut_keep_word    every cut keeps a content token of the utterance it ends in (never the bare start piece "▁"
 #                    alone: ~3.4 % of ReazonSpeech's cuts kept 1-3 s of an untranscribed lead-in with no word)
@@ -219,6 +221,19 @@ RECIPE_GENTLE = {**RECIPE_V4, "noise_snr_db": [5.0, 20.0], "speech_snr_db": [15.
 # from a state that had a fix on would keep it: spell them (false) when the next box's recipes are written (adding
 # them now would change box p-cool's recorded continues sets)
 RECIPE_V5 = {**RECIPE_V4_FULL, "cut_keep_word": True, "guard_per_piece": True, "end_trim_voiced": True}
+# DECISIONS H15 (the owner, 2026-10-10: "lets do the transcribe run anyway so we have a full checkpoint for transcribe
+# too"; then chose the recipe, 6 epochs with early stop and the t-box branch): BOX T'S RECIPE is the registered AED
+# recipe, RECIPE_AED (recipe v4 plus the cut table, H12), with two of recipe v5's fixes on, which the PR #53 review made
+# valid for an AED student:
+#   guard_per_piece  truncate_min_row_s 3.0 and the cut's lower bound hold for each utterance of a joined row (an AED
+#                    row's cut-table candidates as a CTC row's: kitsune.trainset aed_cut_candidates, piece_guard_frames)
+#   end_trim_voiced  the end trim keeps the audio up to the last voiced sound of the row's last utterance (voiced_end
+#                    of its last piece's loudest, not the row's)
+# cut_keep_word stays off (not named: the trainer's default false): every cut-table entry keeps a Cohere token of the
+# utterance it ends in, so on an AED row the key would only hold the table to what it already does. A fresh run from
+# step 0 (no continuation), so the keys it does not name are the trainer's defaults - recipe v4's ranges, every row may
+# get a background (background_min_row_s 0). full-t06 only; RECIPE_AED stays the record of H7/H11/H12's AED recipe
+RECIPE_AED_H15 = {**RECIPE_AED, "guard_per_piece": True, "end_trim_voiced": True}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),
 # eval.dev.greedy, whether the run pulls both label roots (none does: each box pulls its family's labels, data-t /
@@ -226,8 +241,9 @@ RECIPE_V5 = {**RECIPE_V4_FULL, "cut_keep_word": True, "guard_per_piece": True, "
 # below). EPOCHS: DECISIONS G1, confirmed by the owner on 2026-10-02 (~11:30Z, "3 / 3 / 5" after the epoch analysis,
 # D:/kitsune-tmp/fullbuild/epochs/RECOMMENDATION.md): T-0.6B 3, P-0.3B 3, P-0.05B 5, each with COMMON's early-stop
 # patience; P-0.3B 6 since DECISIONS H5 (the owner, 2026-10-03, after the recipe test: its augmentation varies the
-# data every epoch, and the early stop still cools down early if dev stops improving); T-0.6B 8 since DECISIONS H7 (the
-# owner, 2026-10-05, after P-0.3B's 6-epoch result, with the same recipe). The owner's earlier request
+# data every epoch, and the early stop still cools down early if dev stops improving); T-0.6B 8 under DECISIONS H7 (the
+# owner, 2026-10-05, after P-0.3B's 6-epoch result, with the same recipe), 6 since DECISIONS H15 (the owner,
+# 2026-10-10: "6 epochs with early stop"; COMMON's early stop, patience 6, unchanged). The owner's earlier request
 # of the same day to plan 10 epochs for these runs was WITHDRAWN after that
 # analysis (DECISIONS G "Rejected: 10 epochs"). P-0.05B 10 and P-0.1B 8 since DECISIONS H9 (the owner, 2026-10-05, for
 # the P test box: "the p-0.05 run needs more epochs as well as the 0.1 run. They are smaller and as p-0.3 has shown more
@@ -238,12 +254,13 @@ RECIPE_V5 = {**RECIPE_V4_FULL, "cut_keep_word": True, "guard_per_piece": True, "
 # This is the one epoch parameter: a change here, then --import-launch-plan of a full_plan.py record at the new
 # epochs, then the printed hours (--import-speed) into boxes.json. AUGMENT: the run's augment block (full_config; the
 # smoke configs never take it), None for none. DECISIONS H1 step 2: P-0.3B trains with RECIPE (v2 since H6, after
-# the recipe test on box p01 and its external review); T-0.6B (box full-t) with RECIPE_AED (H7); P-0.05B with RECIPE_V3
-# on box p01 (H8); P-0.1B's 4-epoch run (box 1, done: its config is the one the continuation resumes, byte for byte) has
-# none - its continuation sets RECIPE_V3 (CONTINUATIONS)
+# the recipe test on box p01 and its external review); T-0.6B (box full-t) with RECIPE_AED (H7, H11, H12), since
+# DECISIONS H15 with RECIPE_AED_H15 (RECIPE_AED plus augment.guard_per_piece and augment.end_trim_voiced); P-0.05B with
+# RECIPE_V3 on box p01 (H8); P-0.1B's 4-epoch run (box 1, done: its config is the one the continuation resumes, byte
+# for byte) has none - its continuation sets RECIPE_V3 (CONTINUATIONS)
 FULL_RUNS = {
-    "t06": dict(study_run="study-t06", epochs=8, warmup=300, lr=2e-4, micro=450, step=1730, dev_greedy=False,
-                pull_parakeet=False, end_reserve=55, augment=RECIPE_AED),
+    "t06": dict(study_run="study-t06", epochs=6, warmup=300, lr=2e-4, micro=450, step=1730, dev_greedy=False,
+                pull_parakeet=False, end_reserve=55, augment=RECIPE_AED_H15),
     "p03": dict(study_run="study-p03", epochs=6, warmup=300, lr=2e-4, micro=600, step=1350, dev_greedy=True,
                 pull_parakeet=False, end_reserve=30, augment=RECIPE),
     "p01": dict(study_run="study-p01", epochs=4, warmup=1000, lr=1e-3, micro=1600, step=1500, dev_greedy=True,

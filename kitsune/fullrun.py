@@ -3,11 +3,12 @@
 The full runs (plan v3) trained P-0.1B alone on box `p01` (1x RTX 5090, Parakeet labels only; box 1), which now
 re-runs that run's cooldown with the CTC train-data augmentation on, the recipe test (DECISIONS H1: --resume-reset with
 --resume-set schedule.epochs and augment.*; G3's 8-epoch continuation is postponed, H2), then T-0.6B on box `full-t`
-(postponed, H2) and P-0.3B with that recipe on box `full-p` if the test shows it helps (H1 step 2; P-0.05B postponed,
-H2), each 1x RTX 5090, one queue (DECISIONS G2: box 2's 2x box `full` is retired, its name kept for the tests'
-fixtures only), after two short smokes (`full-smoke` = smoke A, `smoke-b`). Box `p-cool` (DECISIONS H14) is one
-rental that re-runs three done runs' cooldowns (P-0.3B, P-0.1B, P-0.05B), each from its runs-repo pre_cooldown state:
-its train items carry a `continues` block (below), so the box is always a resume and never trains from step 0.
+(postponed under H2; runs since DECISIONS H15, 6 epochs, from the box branch t-box) and P-0.3B with that recipe on box
+`full-p` if the test shows it helps (H1 step 2; P-0.05B postponed, H2), each 1x RTX 5090, one queue (DECISIONS G2:
+box 2's 2x box `full` is retired, its name kept for the tests' fixtures only), after two short smokes (`full-smoke` =
+smoke A, `smoke-b`). Box `p-cool` (DECISIONS H14) is one rental that re-runs three done runs' cooldowns (P-0.3B,
+P-0.1B, P-0.05B), each from its runs-repo pre_cooldown state: its train items carry a `continues` block (below), so the
+box is always a resume and never trains from step 0.
 The selection (scripts/make_selection.py full mode, kitsune/devslice.py), the trainer (scripts/04_distill.py), the
 box queue (kitsune/full_queue.py), the vast scripts (vast/launch.py, bootstrap.sh, finish.py) and the evaluators all
 import their shared names from here, so a constant cannot drift between them. The binding definitions are the full-run

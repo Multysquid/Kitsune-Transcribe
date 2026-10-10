@@ -798,8 +798,10 @@ def test_the_keys_are_resume_sets():
 def test_recipe_v5():
     """RECIPE_V5 = recipe v4 with the trainer's defaults written out (RECIPE_V4_FULL: as a continuation's recipe it
     inherits no range or short-row guard from the state it resumes) and the three fixes on, proposed for the next run
-    (DECISIONS pending): no full run, continuation or generated config uses it; every key is one a continuation may set;
-    it loads on a CTC student's config and on an AED one's (its cut table kept)."""
+    (DECISIONS pending): no full run, continuation or generated config uses it whole - full-t06 alone names two of its
+    keys, guard_per_piece and end_trim_voiced, on (RECIPE_AED_H15, DECISIONS H15), cut_keep_word left at the default
+    false; every key is one a continuation may set; it loads on a CTC student's config and on an AED one's (its cut
+    table kept)."""
     assert M.RECIPE_V5 == dict(M.RECIPE_V4_FULL, cut_keep_word=True, guard_per_piece=True, end_trim_voiced=True)
     assert list(M.RECIPE_V5)[:len(M.RECIPE_V4_FULL)] == list(M.RECIPE_V4_FULL)
     assert {"noise_snr_db", "speech_snr_db", "gain_db", "codecs", "background_min_row_s"} <= set(M.RECIPE_V5)
@@ -814,6 +816,11 @@ def test_recipe_v5():
     assert c["augment"] == dict(m.DEFAULTS["augment"], **M.RECIPE_V5)
     t = m.load_config(str(full / "full-t06.json"), sets)
     assert not m.is_ctc(t) and t["augment"]["cuts"] == M.AED_CUTS and all(t["augment"][k] is True for k in FIXES)
-    for name in ("full-t06", "full-p03", "full-p01", "full-p005"):
-        block = json.loads((full / f"{name}.json").read_text(encoding="utf-8")).get("augment") or {}
-        assert not set(FIXES) & set(block), name
+    blocks = {name: json.loads((full / f"{name}.json").read_text(encoding="utf-8")).get("augment") or {}
+              for name in ("full-t06", "full-p03", "full-p01", "full-p005")}
+    assert {n: {k: b[k] for k in FIXES if k in b} for n, b in blocks.items()} == {
+        "full-t06": {"guard_per_piece": True, "end_trim_voiced": True}, "full-p03": {}, "full-p01": {}, "full-p005": {}}
+    assert M.FULL_RUNS["t06"]["augment"] == dict(M.RECIPE_AED, guard_per_piece=True, end_trim_voiced=True)
+    t = m.load_config(str(full / "full-t06.json"), [])
+    assert (t["augment"]["cut_keep_word"], t["augment"]["guard_per_piece"], t["augment"]["end_trim_voiced"]) == (
+        False, True, True)

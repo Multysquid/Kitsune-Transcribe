@@ -46,7 +46,7 @@
   "clock": "epochs",
   "max_steps": null,
   "end_reserve_min": 55,
-  "epochs": 8,
+  "epochs": 6,
   "deadline_cooldown": true
  },
  "batch": {
@@ -221,6 +221,8 @@
   "gain_p": 0.3,
   "codec_p": 0.1,
   "cuts": "labels/full/selections/full_study/aed_cuts.parquet",
-  "cuts_sha256": "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb"
+  "cuts_sha256": "cde6504ff3c9a1d539385eec745ca9301570b42fc1c182ffdc16ccbf4a9eb4bb",
+  "guard_per_piece": true,
+  "end_trim_voiced": true
  }
 }

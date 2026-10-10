@@ -760,8 +760,14 @@ speech from `aug/musan-bg-v2`, room echo from `aug/rirs-v1`, volume and codecs; 
 -, the Cohere labels only, `data-t`) and **box P**
 (`full-p`: P-0.3B with the CTC train-data augmentation recipe, `full-p03.json`'s `augment` block, the Parakeet labels,
 `data-p`, with the Whisper models and the quantised readouts; done 2026-10-04, M4 9.73 %; its run's cooldown re-run is
-box p-cool's, DECISIONS H14, below). T-0.6B trains 8 epochs
-(DECISIONS H7, 2026-10-05) and P-0.3B trained 6 (H5); 3 each under G1 before, with the common early-stop patience 6.
+box p-cool's, DECISIONS H14, below). T-0.6B trains 6 epochs with the early stop
+(DECISIONS H15, 2026-10-10; 8 under H7) and P-0.3B trained 6 (H5); 3 each under G1 before, with the common early-stop
+patience 6. Since H15 box T's recipe also turns on two of recipe v5's keys, `augment.guard_per_piece` and
+`augment.end_trim_voiced` (`make_full_configs.py` `RECIPE_AED_H15`; `augment.cut_keep_word` stays off), and box T
+launches from the box branch `t-box` (main with PRs #51, #52 and #53 merged in) with `--allow-unverified-quant` at a
+$1.40/h cap (the registry's `max_dph`; its own line under "Commands" below). Its cost: ~$51-71 planned (50.9 h at
+$1.00-1.40/h, plus traffic), ~$103 in the worst case (~$95 of rent for the 68 h watchdog cap at $1.40/h, plus up to
+~$8 of traffic at launch's $0.01/GB cap), which the vast credit must cover before the rent.
 DECISIONS H2 postponed P-0.05B (its items left box P). It comes back alone on box `p005`, **the P test box**
 (DECISIONS H8-H10, H12, below): P-0.05B from step 0 at 10 epochs (`full-p005.json`) with recipe v4 (recipe v2 plus
 the P-0.3B review's two fixes, the end trim and background audio, and room echo, volume, codecs, background speech and
@@ -788,7 +794,7 @@ and keeps no table of its own (`python -m kitsune.fullrun show --box <box>` prin
    registry are committed (`python tools/make_full_configs.py --check` says "up to date").
 3. The image is built for the commit (`--image-tag main` after a merge; launch checks the build commit's pins).
 
-### Commands (PowerShell, from the launch clone at origin/main)
+### Commands (PowerShell, from the launch clone at origin/main; box full-t from origin/t-box, its own block)
 
 ```powershell
 Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/main
@@ -797,8 +803,14 @@ Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/m
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box smoke-b --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p005 --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box p-cool --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch --allow-unverified-quant
-& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-t --machine <id> --avoid-machine <p01's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
 & C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-p --machine <id> --avoid-machine <p01's id> --avoid-machine <full-t's id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch
+```
+Box full-t (DECISIONS H15) launches from the box branch `t-box`, not from main (main before H15 still has H7's 8-epoch
+box T, without the two recipe-v5 keys), with `--allow-unverified-quant` (the owner skips smoke-B; PR #52 changed
+`QUANT_CODE` after the last go signal, so launch refuses its 7 quantised readouts without it):
+```powershell
+Set-Location D:\kitsune-launch; git fetch origin; git checkout --detach origin/t-box
+& C:\Users\multy\AppData\Local\Programs\Python\Python312\python.exe vast\launch.py --job full --box full-t --machine <id> --image-tag main --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --scratch-repo Multy123/kitsune-scratch --allow-unverified-quant
 ```
 Each line first as it is (look-only: the preflight, the offer table, the create command and the cost line), then the
 same line with `--yes` to rent. Without `--machine` the offers are ranked by the estimated total (the planned hours at
@@ -811,7 +823,7 @@ checks say), its verdict `full/box-smoke-b/smoke_verdict.json` passing checks 12
 H1 step 1, the `--resume-reset ... augment.*` line above: box 1's cooldown again with the train-data augmentation, a
 paired A/B against the 4-epoch record), then **box full-p** (P-0.3B with the recipe) only if the test shows that the
 recipe helps (H1 step 2: its readout `runs/m4-full-p01-20261001T184145Z-r1` against the record's at revision
-c4604304); box full-t (T-0.6B, 8 epochs, the AED recipe: DECISIONS H7) needs the cut table uploaded to the data repo
+c4604304); box full-t (T-0.6B, 6 epochs since DECISIONS H15, the AED recipe: H7) needs the cut table uploaded to the data repo
 first (launch refuses a missing extra file). After the P-0.3B review, **box p005, the P test box** (DECISIONS H8-H10,
 the `--box p005` line above, a fresh launch; it needs the banks `aug/musan-bg-v2` and `aug/rirs-v1` in the data repo) comes
 first; box p-cool (the `--box p-cool` line, DECISIONS H14: from a main that contains the fp16 fix, PR #52) and box
