@@ -1309,10 +1309,18 @@ def test_box_t_is_decisions_h15(reg, plan, trainer):
     entry = json.loads((FULL / "boxes.json").read_text(encoding="utf-8"))["boxes"]["full-t"]
     for w in ("DECISIONS H15", "6 epochs", "143,891", "115,114", "47.75", "45.49", "est 50.9", "max 68", "1.86 h",
               "4 d", "RECIPE_AED_H15", "guard_per_piece", "end_trim_voiced", "cut_keep_word", "$1.40", "t-box",
-              "--allow-unverified-quant"):
+              "--allow-unverified-quant", "~$95 of rent", "~$103 in all"):
         assert w in entry["_comment"], w
     for w in ("191,855", "63.62", "60.61", "66.8", "87.82", "4.17"):  # H7's 8-epoch numbers are gone
         assert w not in entry["_comment"], w
+    # the worst case the comment states (the H15 review): rent for the watchdog cap at the price cap, and the traffic
+    # at launch's $/GB cap (~590 GB down, ~230 GB up: the 8.6 GB timed state every 120 min) stays within ~$8
+    sys.path.insert(0, str(ROOT / "vast"))
+    import launch
+
+    assert round(spec["max_hours"] * spec["max_dph"]) == 95 and launch.FULL_MAX_GB_COST == 0.01
+    assert cfg("full-t06")["ckpt"]["upload_full_every_min"] == 120
+    assert (590 + 230) * launch.FULL_MAX_GB_COST <= 8.5 and round(95.2 + 8.2) == 103
     # nothing else moved
     raw = json.loads((FULL / "boxes.json").read_text(encoding="utf-8"))["boxes"]
     assert set(raw) == {"full-t", *H15_OTHER_BOXES_SHA256}
@@ -1324,6 +1332,29 @@ def test_box_t_is_decisions_h15(reg, plan, trainer):
         assert hashlib.sha256((FULL / f"{n}.json").read_bytes().replace(b"\r\n", b"\n")).hexdigest() == h, n
     assert {x: plan["launch"]["students"][x]["total_steps"] for x in ("p03", "p01", "p005")} == {
         "p03": 211720, "p01": 107910, "p005": 269777}
+
+
+def test_the_readme_launches_box_t_from_t_box(reg):
+    """DECISIONS H15 (the review's launch-path finding): vast/README.md's copy-paste line for box full-t is the one a
+    launch of H15's box T takes - from a clone checked out at origin/t-box (main before H15 carries H7's 8-epoch box
+    T), with --allow-unverified-quant (QUANT_CODE changed after smoke-B's go signal: without it launch refuses the 7
+    quantised readouts) and without box 1's --avoid-machine; every flag on it is one launch defines."""
+    text = (ROOT / "vast" / "README.md").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    at = [i for i, x in enumerate(lines) if "vast\\launch.py" in x and "--box full-t " in x + " "]
+    assert len(at) == 1, at
+    toks = lines[at[0]].split()
+    assert toks[toks.index("--job") + 1] == "full" and toks[toks.index("--box") + 1] == "full-t"
+    assert "--allow-unverified-quant" in toks and "--avoid-machine" not in toks and "--max-hours" not in toks
+    checkout = [x for x in lines[:at[0]] if "git checkout --detach" in x][-1]
+    assert checkout.rstrip().endswith("git checkout --detach origin/t-box"), checkout
+    src = (ROOT / "vast" / "launch.py").read_text(encoding="utf-8")
+    defined = set(re.findall(r'ap\.add_argument\("(--[a-z0-9-]+)"', src))
+    assert {t for t in toks if t.startswith("--")} <= defined
+    sys.path.insert(0, str(ROOT / "vast"))
+    import launch
+
+    assert len(launch.quant_items(fullrun.box_spec("full-t", reg))) == 7  # what --allow-unverified-quant is for
 
 
 def test_the_retired_box_2s_pool_lives_on_exactly_one_new_box(reg):
