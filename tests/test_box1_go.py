@@ -138,10 +138,13 @@ def test_go(tmp_path, capsys):
     assert (b["stores_ctc_h"], b["bootstrap_h"], b["rebuild_h"]) == (0.9, 3.0, 4.0)
     assert b["peak_rss_gb"] == {"stores-ctc": 36.8, "full-p01": 25.1, "m4-full-p01": 4.2}
     assert f"(smoke A {smoke}: r {b['sec_per_step'] / smoke:.3f})" in line(rec, "G4", "PASS")[0]
-    # the projection of boxes full-t, full-p and p01 with box 1's measurement, and what boxes.json would change
+    # the projection of the HOURS_BOXES - full-t, p005 and p-cool (its three cooldown re-runs, DECISIONS H14) - with
+    # box 1's measurement, and what boxes.json would change; boxes full-p and p01 are records, never projected
     r = round(b["sec_per_step"] / smoke, 4)
-    for box, run_ in (("full-t", "full-t06"), ("full-p", "full-p03"), ("p01", "full-p01")):
+    for box, run_ in (("full-t", "full-t06"), ("p005", "full-p005"), ("p-cool", "full-p03")):
         assert f"box {box} with box 1's speed (r {r:g}, o {b['overhead']:g}): {run_} " in printed, box
+    assert "full-p01 " in printed.split("box p-cool with box 1's speed", 1)[1].splitlines()[0]
+    assert "box full-p with" not in printed and "box p01 with" not in printed
     assert "P-0.1B's 4 epochs by the same model " in printed and "vs measured" in printed
     assert "boxes.json would change: boxes.full-t.items.full-t06: {'max_hours': 63.62}" in printed
 
@@ -159,6 +162,7 @@ def test_the_json_round_trips_through_import_speed(tmp_path, capsys):
         assert h["r"] == round(rec["box1"]["sec_per_step"] / speed["smoke"]["sec_per_step"]["p01"], 4)
         assert h["o"] == rec["box1"]["overhead"]
         assert h["store_h"] == (0.9, round(0.9 * M.STORES_PESS, 2)) and h["setup_h"] == (1.6, 3.3)
+        assert len(h["continuations"]) == (3 if box == "p-cool" else 0), box  # DECISIONS H14
 
 
 @pytest.mark.parametrize("m4", [0.1390, 0.1382])
@@ -188,7 +192,7 @@ def test_a_running_box_is_not_decidable_and_projects_its_run(tmp_path, capsys):
     (partial,) = [t for t in line(rec, "G4", "INFO") if t.startswith("partial:")]
     total = M.plan_total_steps("p01", M.load_plan())
     proj = (total * steady_median(600) * 1.08 + 837 + 40 * 8.5) / 3600
-    # its registry need: box p01's full-p01 now (box 1's run continued to 8 epochs, DECISIONS H9)
+    # its registry need: box p01's full-p01 now (the record of H9's 8-epoch plan again, DECISIONS H14)
     assert partial.startswith(f"partial: step 600 of {total}; at this speed full-p01 runs ~{proj:.2f} h at o 0.08 "
                               f"(its registry need 11.47 h)"), partial
 

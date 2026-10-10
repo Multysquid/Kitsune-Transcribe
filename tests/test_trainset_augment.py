@@ -796,7 +796,8 @@ def test_validate_the_augment_block():
                                      "noise_bank": None, "noise_bank_sha256": None, "speech_p": 0.0,
                                      "speech_snr_db": [10.0, 25.0], "speech_talkers": [1, 4], "speech_batch_p": 0.5,
                                      "reverb_p": 0.0, "rir_bank": None, "rir_bank_sha256": None, "gain_p": 0.0,
-                                     "gain_db": [-20.0, 10.0], "codec_p": 0.0, "codecs": ["mp3", "gsm", "ulaw8k"]}
+                                     "gain_db": [-20.0, 10.0], "codec_p": 0.0, "codecs": ["mp3", "gsm", "ulaw8k"],
+                                     "background_min_row_s": 0.0}
     assert not m.augment_on(m.load_config(None, [])) and not m.augment_on({})
     ctc = ["family=ctc", "parakeet_root=po"]
     assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.mix_p=0.5"]))
@@ -815,6 +816,10 @@ def test_validate_the_augment_block():
                        (["augment.pad_frames=[3, 2]"], "pad_frames"), (["augment.pad_frames=[1, 26]"], "pad_frames"),
                        (["augment.pad_frames=[1.0, 2]"], "pad_frames"), (["augment.pad_frames=3"], "pad_frames"),
                        (["augment.truncate_min_row_s=-1"], "truncate_min_row_s"),
+                       (["augment.background_min_row_s=-1"], "background_min_row_s"),
+                       (["augment.background_min_row_s=x"], "background_min_row_s"),
+                       (["augment.background_min_row_s=true"], "background_min_row_s"),
+                       (["augment.background_min_row_s=null"], "background_min_row_s"),
                        (["augment.end_trim_p=2"], "augment.end_trim_p"), (["augment.noise_p=-1"], "augment.noise_p"),
                        (["augment.noise_snr_db=[10, 0]"], "noise_snr_db"),
                        (["augment.noise_bank_sha256=xyz"], "noise_bank_sha256"),
@@ -836,6 +841,18 @@ def test_validate_the_augment_block():
     changed, same = m.resume_overrides(saved, [("augment.enabled", True), ("augment.concat_p", 0.5),
                                                ("augment.seed", None)])
     assert changed == {"augment.enabled": True, "augment.concat_p": 0.5} and same == {"augment.seed": None}
+    # DECISIONS H14's gentle recipe on a resume: lists (as JSON, the way the queue passes them) and the new key
+    gentle = ["augment.noise_snr_db=[5.0,20.0]", "augment.speech_snr_db=[15.0,25.0]", "augment.gain_db=[-10.0,10.0]",
+              'augment.codecs=["mp3","ulaw8k"]', "augment.background_min_row_s=3.0"]
+    cfg = copy.deepcopy(saved)
+    changed, same = m.resume_overrides(saved, [m.apply_set(cfg, x) for x in gentle])
+    assert changed == {"augment.noise_snr_db": [5.0, 20.0], "augment.speech_snr_db": [15.0, 25.0],
+                       "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"],
+                       "augment.background_min_row_s": 3.0} and not same
+    m.validate(cfg)
+    assert m.load_config(None, ctc + gentle)["augment"]["background_min_row_s"] == 3.0
+    spec = T.Augment.from_config(cfg["augment"], seed=1)
+    assert (spec.noise_snr_db, spec.codecs, spec.background_min_row_s) == ((5.0, 20.0), ("mp3", "ulaw8k"), 3.0)
     assert not any(f.startswith("augment") for f in m.RESUME_FIXED)
 
 
@@ -999,6 +1016,60 @@ def test_a_resume_reset_takes_the_recipe_sets_of_the_env_word(env, monkeypatch):
     after = st.loc[t_c + 1:, list(tags)]
     assert ((after >= 0) & (after <= 1)).all().all() and after.to_numpy().sum() > 0  # the recipe acted
     assert st.loc[:t_c, list(tags)].isna().all().all()  # the baseline's steps: no augmentation
+
+
+def test_a_continuation_takes_list_sets_and_spares_short_rows(env, monkeypatch):
+    """DECISIONS H14's gentle recipe on the trainer side: a finished CTC run (epochs clock, no augmentation, 4d on) is
+    re-run from its pre_cooldown state to the same T with list-valued sets spelled as the queue passes them (JSON:
+    fullrun.continue_set_text), schedule.deadline_cooldown=false and augment.background_min_row_s 1.5 s. The lists
+    reach the augment event and every state saved after the reset; 4d stays off although the deadline has passed (on,
+    it would end the run at once: no_time_left); the re-run steps log aug/short_frac, aug/speech_spared_frac and
+    aug/noise_spared_frac (the rows under 1.5 s of these 0.4-2.5 s rows: some), the baseline's steps none of them."""
+    m = load_script("04_distill")
+    over = aug_over(env)
+    path = write_config(env, "ctc-gentle", {"schedule": {"clock": "epochs", "epochs": 1, "max_steps": None,
+                                                         "deadline_cooldown": True}})
+    assert m.main(["--config", path]) == 0
+    run = one_run(env, "ctc-gentle")
+    T_ = int(json.loads((run / "summary.json").read_text(encoding="utf-8"))["steps"])
+    (pc_event,) = [e for e in events(run, "checkpoint") if e.get("reason") == "pre_cooldown"]
+    t_c = int(pc_event["name"].rsplit("_", 1)[1])
+    lists = {"augment.noise_snr_db": [5.0, 20.0], "augment.speech_snr_db": [15.0, 25.0],
+             "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"]}
+    sets = ["schedule.resume_reset=true", "schedule.epochs=1", "schedule.deadline_cooldown=false",
+            "augment.enabled=true", "augment.noise_p=1.0", "augment.speech_p=1.0", "augment.speech_batch_p=0.5",
+            f"augment.noise_bank={json.dumps(over['augment']['noise_bank'])}", "augment.gain_p=0.5",
+            "augment.codec_p=0.5", "augment.background_min_row_s=1.5",
+            "augment.noise_snr_db=[5.0,20.0]", "augment.speech_snr_db=[15.0,25.0]", "augment.gain_db=[-10.0,10.0]",
+            'augment.codecs=["mp3","ulaw8k"]']
+    monkeypatch.setenv("KITSUNE_DEADLINE", "1000000000")  # 2001: long past
+    assert m.main(["--resume", str(run / "checkpoints" / pc_event["name"]), *sum((["--set", x] for x in sets), [])
+                   ]) == 0
+    monkeypatch.delenv("KITSUNE_DEADLINE")
+    resume = events(run, "resume")[-1]
+    assert {k: resume["overrides"][k] for k in lists} == lists and resume["overrides"][
+        "schedule.deadline_cooldown"] is False
+    (r,) = events(run, "resume_reset")
+    assert (r["at_step"], r["T"]) == (t_c, T_) and "cooldown_kept" not in r
+    assert not events(run, "deadline_check") and not events(run, "no_time_left") and not events(run, "deadline_cooldown")
+    s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert (s["status"], s["steps"], s["resume_resets"], s["end_reason"]) == ("complete", T_, 1, "schedule")
+    end = json.loads((run / "checkpoints" / f"full_step_{T_}" / "trainer.json").read_text(encoding="utf-8"))["cfg"]
+    assert {k: end["augment"][k.split(".")[1]] for k in lists} == lists and end["augment"]["background_min_row_s"] == 1.5
+    assert end["schedule"]["deadline_cooldown"] is False and end["schedule"]["resume_reset"] is False
+    (aug,) = events(run, "augment")
+    assert (aug["noise_snr_db"], aug["speech_snr_db"], aug["gain_db"], aug["background_min_row_s"]) == (
+        [5.0, 20.0], [15.0, 25.0], [-10.0, 10.0], 1.5)
+    assert aug["codecs"] == ["mp3", "ulaw8k"]
+    st = pd.read_parquet(run / "metrics" / "steps.parquet").drop_duplicates("step", keep="last").set_index("step")
+    tags = ["aug/short_frac", "aug/speech_spared_frac", "aug/noise_spared_frac"]
+    after = st.loc[t_c + 1:, tags]
+    assert ((after >= 0) & (after <= 1)).all().all() and after["aug/short_frac"].max() > 0
+    # speech_p and noise_p 1: every short row is picked and spared, every other row may be mixed
+    assert (after["aug/noise_spared_frac"] == after["aug/short_frac"]).all()
+    assert (after["aug/speech_spared_frac"] == after["aug/short_frac"]).all()
+    assert (st.loc[t_c + 1:, "aug/noised_frac"] <= 1 - after["aug/short_frac"] + 1e-9).all()
+    assert st.loc[:t_c, tags].isna().all().all()
 
 
 def test_a_crash_resumed_with_augmentation_is_the_uninterrupted_run(env, aug_run, monkeypatch):

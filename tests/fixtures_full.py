@@ -22,6 +22,13 @@ needs and changes what it tests:
               item with only_if_new_machine full-smoke
 The configs are minimal: the data keys of fullrun.FULL_DATA / SMOKE_DATA (smoke-b: study/data.json's), the family,
 the student and the run name; no trainer can load them (they are registry fixtures, not training configs).
+
+    reg = cool_registry(tmp_path)                    # DECISIONS H14's continuation box p-cool and its source boxes
+
+cool_registry is another registry (tiny_registry's configs, with full-p03 and full-p005 on box p01's data config): box
+p01 and the source boxes full-p (full-p03) and p005 (full-p005) in miniature, and box p-cool, which continues their
+three runs (COOL_RUNS, cool_continues) in H14's order, each train item followed by its M4 readout; box `full` (whose
+data config the rewritten configs no longer match) is left out, the smoke boxes stay.
 """
 import copy
 import json
@@ -202,6 +209,77 @@ def tiny_registry(root, *, write_boxes: bool = False) -> dict:
     reg = {"_comment": "tests/fixtures_full.tiny_registry: the section 7 boxes in miniature", "version": 1,
            "boxes": {"full-smoke": _box_full_smoke(), "p01": _box_p01(), "full": _box_full(),
                      "smoke-b": _box_smoke_b()}}
+    if write_boxes:
+        (Path(root) / fullrun.BOXES_FILE).write_text(json.dumps(reg, indent=2) + "\n", encoding="utf-8")
+    return fullrun._with_root(reg, root)
+
+
+# DECISIONS H14's box p-cool in miniature: item -> (source box, run id, from_step, to_step, resets_before, epochs,
+# keep_cooldown), in its queue order. The fake trainer's 20 steps per epoch end the run at to_step = epochs x 20 and put
+# its pre_cooldown state at 0.8 of that (from_step); P-0.1B's run had one reset before (its readout dir comes out -r2)
+COOL_RUNS = {"full-p03": ("full-p", "full-p03-20261003T230143Z", 16, 20, 0, 1, False),
+             "full-p01": ("p01", "full-p01-20261001T184145Z", 32, 40, 1, 2, False),
+             "full-p005": ("p005", "full-p005-20261008T160232Z", 16, 20, 0, 1, True)}
+# the two recipes' explicit ranges (tools/make_full_configs.py RECIPE_GENTLE / RECIPE_V4_FULL's continuation sets)
+COOL_GENTLE = {"augment.noise_snr_db": [5.0, 20.0], "augment.speech_snr_db": [15.0, 25.0],
+               "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"],
+               "augment.background_min_row_s": 3.0}
+COOL_V4_FULL = {"augment.noise_snr_db": [0.0, 20.0], "augment.speech_snr_db": [10.0, 25.0],
+                "augment.gain_db": [-20.0, 10.0], "augment.codecs": ["mp3", "gsm", "ulaw8k"],
+                "augment.background_min_row_s": 0.0}
+
+
+def cool_continues(name: str) -> dict:
+    """The continues block of box p-cool's train item `name` (COOL_RUNS): schedule.epochs, schedule.deadline_cooldown
+    false, the keep-cooldown flag where H14 sets it, then the recipe's ranges (make_full_configs'
+    continuation_set_dict order)."""
+    src, rid, from_step, to_step, before, epochs, keep = COOL_RUNS[name]
+    sets = {"schedule.epochs": epochs, "schedule.deadline_cooldown": False}
+    if keep:
+        sets["schedule.resume_reset_keep_cooldown"] = True
+    sets.update(copy.deepcopy(COOL_V4_FULL if name == "full-p01" else COOL_GENTLE))
+    return {"box": src, "run_id": rid, "from_step": from_step, "to_step": to_step, "resets_before": before,
+            "sets": sets}
+
+
+def _box_source(name: str, study_run: str, hours: float) -> dict:
+    """A 1x source box in box p01's shape: stores-ctc -> <name> (train, ctc) -> m4-<name>."""
+    box = _box_p01()
+    box["items"] = [{"name": "stores-ctc", "kind": "stores", "config": _cfg(name)},
+                    {"name": name, "kind": "train", "config": _cfg(name), "study_run": study_run, "family": "ctc",
+                     "max_hours": hours, "needs": ["stores-ctc"]},
+                    {"name": f"m4-{name}", "kind": "readout", "of": name, "max_hours": 0.3}]
+    return box
+
+
+def _box_cool() -> dict:
+    study = {"full-p03": "study-p03", "full-p01": "study-p01", "full-p005": "study-p005"}
+    items = [{"name": "stores-ctc", "kind": "stores", "config": _cfg("full-p03")}]
+    for name in COOL_RUNS:
+        items += [{"name": name, "kind": "train", "config": _cfg(name), "study_run": study[name], "family": "ctc",
+                   "max_hours": 6.0, "needs": ["stores-ctc"], "continues": cool_continues(name)},
+                  {"name": f"m4-{name}", "kind": "readout", "of": name, "max_hours": 0.3}]
+    box = _box_p01()
+    box.update(est_hours=19.0, max_hours=22, max_dph=1.1, extra_gb=70, min_ram_gb=96, items=items)
+    return box
+
+
+def cool_registry(root, *, write_boxes: bool = False) -> dict:
+    """tiny_registry's configs under root, with full-p03 and full-p005 rewritten on box p01's data config, and a valid
+    registry of boxes p01, full-p, p005 (the sources), p-cool (their continuations) and the two smoke boxes (the
+    module docstring). write_boxes: also root/configs/full/boxes.json."""
+    reg = copy.deepcopy(dict(tiny_registry(root)))
+    folder = Path(root) / "configs" / "full"
+    data = _data_configs()["data-p01"]
+    for name, student in (("full-p03", "p03"), ("full-p005", "p005")):
+        cfg = {k: copy.deepcopy(v) for k, v in data.items() if k in fullrun.DATA_KEYS}
+        cfg.update(run_name=name, family="ctc", student=f"students/study/{student}")
+        (folder / f"{name}.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    boxes = {k: v for k, v in reg["boxes"].items() if k != "full"}
+    boxes.update({"full-p": _box_source("full-p03", "study-p03", 22.29),
+                  "p005": _box_source("full-p005", "study-p005", 9.92), "p-cool": _box_cool()})
+    reg = {"_comment": "tests/fixtures_full.cool_registry: DECISIONS H14's box p-cool and its source boxes in miniature",
+           "version": 1, "boxes": boxes}
     if write_boxes:
         (Path(root) / fullrun.BOXES_FILE).write_text(json.dumps(reg, indent=2) + "\n", encoding="utf-8")
     return fullrun._with_root(reg, root)

@@ -50,7 +50,8 @@
 # (kitsune.netgate, with KITSUNE_GATE_BYTES: exit 3 is a slow host, not retried, and it sets the label pull's and the
 # rebuild's per-attempt timeouts KITSUNE_PULL_TIMEOUT_MIN / KITSUNE_REBUILD_TIMEOUT_MIN), plan (HF_TOKEN must also read
 # and write KITSUNE_SCRATCH_REPO; a box with timed states refuses without it), pull_derived (all but the labels),
-# resume_pull (KITSUNE_RESUME=1: python -m kitsune.full_queue resume-pull; exit 3 not retried), check_students (python
+# resume_pull (KITSUNE_RESUME=1, or a box with registry continuations - python -m kitsune.fullrun has-continues prints
+# 1, DECISIONS H14: python -m kitsune.full_queue resume-pull; exit 3 not retried), check_students (python
 # -m kitsune.fullrun check-students), pull_labels in the background while 01 rebuilds the audio (decision 13), the
 # rebuild, pull_labels_wait, coverage. Each phase keeps $STATE/train_hb fresh (vast/watchdog.sh reads it) while it runs,
 # for at most its own worst case (the label pull and the rebuild: their three attempts' timeouts) or else
@@ -655,11 +656,19 @@ if [ "${KITSUNE_JOB:-}" = "study" ]; then
     phase check_students "$PY" -m kitsune.study_queue check-students --box "$KITSUNE_BOX" --root "$KITSUNE_DIR"
 fi
 if [ "${KITSUNE_JOB:-}" = "full" ]; then
-    if [ "${KITSUNE_RESUME:-}" = 1 ]; then
-        # a relaunch on a new host (launch.py --resume): the box's Hub queue summary says what is done and which run
-        # dirs resume; resume-pull pulls them with their newest full state (scratch or runs repo) and writes
-        # $STATE/resume_plan.json, which the queue adopts. Before the paid rebuild, so a refusal (exit 3: no summary,
-        # an unknown or finished run id, a state that does not match its pointer) costs minutes; not retried
+    # DECISIONS H14: a box whose train items continue other boxes' runs (registry `continues`, box p-cool) is always a
+    # resume, KITSUNE_RESUME or not (launch sets it for such a box anyway): its queue refuses to start without the
+    # plan, so a run never trains from step 0. Asked only without KITSUNE_RESUME=1; a registry that cannot answer
+    # prints nothing here (no resume), and check_students below refuses it
+    if [ "${KITSUNE_RESUME:-}" = 1 ] ||
+        [ "$("$PY" -m kitsune.fullrun has-continues --box "$KITSUNE_BOX" --root "$KITSUNE_DIR")" = 1 ]; then
+        # a relaunch on a new host (launch.py --resume), or a continuation box's every launch: the box's Hub queue
+        # summary says what is done and which run dirs resume (a continuation box's first launch has none yet: each
+        # continuation is resolved from its source box's summary and resets from its pre_cooldown state); resume-pull
+        # pulls them with their newest full state (scratch or runs repo) and writes $STATE/resume_plan.json, which
+        # the queue adopts. Before the paid rebuild, so a refusal (exit 3: no summary, an unknown or finished run id,
+        # a state that does not match its pointer, a continuation's source not done and verified) costs minutes; not
+        # retried
         phase resume_pull retry 3 timeout -k 30 60m "$PY" -m kitsune.full_queue resume-pull --box "$KITSUNE_BOX" \
             --root "$KITSUNE_DIR"
     fi

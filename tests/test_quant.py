@@ -6,7 +6,8 @@ both families (and on a model cast to bf16 as a whole, as speed_probe's runners 
 fails assert_quantized), the rel-pos patch routing through the quantised forward, the activation semantics (int8 per
 token, the W4A4 batch-mate trap, the autocast rounding), the row padding, the variant dir (a reloaded variant gives
 the in-memory outputs to the bit, its bytes are deterministic, w8a16 and w8a8 are one file, corruption is caught, fp16
-loads with from_pretrained), the non-finite monitor, the byte formulas, the kernel census (int8 GEMMs counted when they
+loads with from_pretrained), fp16's encoder self-attention in fp32 (a hard positional head like P-0.05B's overflows fp16
+otherwise), the non-finite monitor, the byte formulas, the kernel census (int8 GEMMs counted when they
 return, not when attempted; nothing counted with the counters off), the selftest's autocast evidence (ops, not kernel
 names) and MXFP4 canary, compare, the selftest's refusal off CUDA, the CLI's exit codes and the heartbeat of an export.
 F1 / F4 (DECISIONS F): the fp8 recipe is torchao's arithmetic (bf16 row scales, activation_value_lb), the bf16 scales
@@ -625,15 +626,17 @@ def test_row_padding_logic(fmt):
 # ---------------------------------------------------------------------------------------------- variant dir
 
 
-def save_ctc_dir(d: Path, seed: int = 0) -> Path:
+def save_ctc_dir(d: Path, seed: int = 0, edit=None) -> Path:
     """A trained CTC checkpoint's dir as save_ctc_student writes it (bf16 weights, fp32 BN stats, the processor
-    files, the CC-BY card as README.md and MODEL_CARD.md, student_meta.json)."""
+    files, the CC-BY card as README.md and MODEL_CARD.md, student_meta.json); edit(model) first, when given."""
     from fixtures_ctc import write_processor
 
     from kitsune import ctc_student as CS
 
     src = write_processor(d.parent / f"{d.name}_src")
     m = tiny_ctc(seed)
+    if edit is not None:
+        edit(m)
     CS.save_ctc_student(m, d, src, dict(name="tiny", family="ctc", params_total=CS.param_counts(m)["total"],
                                          enc_layers=[0, 1], ffn=64, trained=dict(step=10, run_id="x")))
     return d
@@ -803,6 +806,87 @@ def test_fp16_cpu_hf_loadable_and_the_nonfinite_monitor(dirs, tmp_path):
             assert torch.equal(hf.state_dict()[k], v), k
     assert Q.merge_nonfinite([r, dict(batches=1, rows=2, by_module={"x": 1}, first="y", forwards=4)]) == dict(
         batches=2, rows=5, by_module={**r["by_module"], "x": 1}, first="encoder.layers.1", forwards=6)
+
+
+def hard_positional_head(m, gain: float = 1e4):
+    """Head 0 of the model's last encoder self-attention made a hard positional head, like P-0.05B's layer 3 head 3
+    (full-p005, step 80939): its q_proj and relative_k_proj rows x gain put its rel-pos scores (q + bias_v) . R_k at
+    up to 5e6 before the 1 / sqrt(d_head) scaling (P-0.05B: 8.7e6), every one past fp16's 65504; fp32 and bf16 hold
+    them, and its softmax is one-hot."""
+    at = [x for x in m.modules() if type(x).__name__ == "ParakeetEncoderAttention"][-1]
+    rows = slice(0, at.head_dim)
+    with torch.no_grad():
+        for w in (at.q_proj.weight, at.q_proj.bias, at.relative_k_proj.weight):
+            w[rows] *= gain
+    return m
+
+
+def all_fp16(m):
+    """The fp16 cast before FP16_FP32_MODULES: every Linear / Conv / Embedding fp16, the encoder attention's too."""
+    for mod in m.modules():
+        if isinstance(mod, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Embedding)):
+            for p in (mod.weight, getattr(mod, "bias", None)):
+                if p is not None:
+                    p.data = p.data.half()
+    return m
+
+
+def test_fp16_runs_the_encoder_attention_in_fp32(tmp_path):
+    """P-0.05B's fp16 readout decoded all 16,746 utterances empty: a hard positional head's rel-pos scores overflowed
+    fp16 (+inf, softmax NaN). With every layer fp16 the same head gives non-finite outputs here too; apply('fp16')
+    keeps every encoder self-attention in fp32 (FP16_FP32_MODULES: kept, out of fp16_tensors, run outside autocast)
+    and the outputs are finite and the fp32 model's (CTC and AED, the monitor seeing nothing), the rest fp16. The
+    variant holds those tensors in the source's bf16 and reloads to the in-memory outputs; assert_quantized catches an
+    attention not run in fp32; the fp16 --out identity names the modules; an fp16 variant exported before them (no
+    fp32_modules in its recipe) is refused: export it again."""
+    import shutil
+
+    from kitsune import ctc_student as CS
+
+    for make, out_fn, enc in ((tiny_ctc, ctc_out, "encoder"), (tiny_aed, aed_out, "model.encoder")):
+        ref = out_fn(patched(hard_positional_head(make())))
+        assert torch.isfinite(ref).all()
+        assert not torch.isfinite(out_fn(all_fp16(patched(hard_positional_head(make()))), amp=torch.float16)).all()
+        m = patched(hard_positional_head(make()))
+        rec = Q.apply(m, "fp16")
+        mon = Q.NonFiniteMonitor(m).attach()
+        y = out_fn(m, amp=torch.float16)
+        assert mon.record()["rows"] == 0 and torch.isfinite(y).all(), make.__name__
+        mon.detach()
+        assert ((y.float() - ref).norm() / ref.norm()).item() < 5e-3, make.__name__
+        attn = [f"{enc}.layers.{i}.self_attn" for i in range(2)]
+        assert sorted(rec["kept"]) == attn and rec["recipe"]["fp32_modules"] == ["ParakeetEncoderAttention"]
+        assert [n for n, x in m.named_modules() if type(x).__name__ == "ParakeetEncoderAttention"] == attn
+        assert not [k for k in rec["fp16_tensors"] if k.startswith(tuple(f"{n}." for n in attn))]
+        assert all(p.dtype == torch.float32 for n in attn for p in m.get_submodule(n).parameters())
+        assert m.get_submodule(f"{enc}.layers.0.feed_forward1.linear1").weight.dtype == torch.float16
+    m.get_submodule(attn[0]).__dict__.pop("forward")  # its class's forward again: fp16 under autocast
+    with pytest.raises(Q.QuantError, match=r"model\.encoder\.layers\.0\.self_attn: not run in fp32"):
+        Q.assert_quantized(m, rec)
+    assert Q.identity("fp16", "native", "linear+pw", "rceil")["fp32_modules"] == ["ParakeetEncoderAttention"]
+    assert "fp32_modules" not in Q.identity("int8-w8a8", "emulate", "linear+pw", "rceil")
+    # the variant: the attention's tensors in the source's bf16, the rest F16; reloaded, the in-memory outputs
+    src = save_ctc_dir(tmp_path / "ctc", edit=hard_positional_head)
+    out = tmp_path / "fp16"
+    Q.export(src, out, "fp16")
+    header, _ = Q._header(out / Q.WEIGHTS_FILE)
+    assert header["encoder.layers.1.self_attn.q_proj.weight"][0] == "BF16"
+    assert header["encoder.layers.1.feed_forward1.linear1.weight"][0] == "F16"
+    back, brec = Q.load_quantized(out, "cpu")
+    assert sorted(brec["kept"]) == ["encoder.layers.0.self_attn", "encoder.layers.1.self_attn"]
+    mem = CS.load_ctc_student(src, "cpu")
+    Q.apply(mem, "fp16")
+    y = ctc_out(patched(back), amp=torch.float16)
+    assert torch.isfinite(y).all() and torch.equal(y, ctc_out(patched(mem), amp=torch.float16))
+    # an fp16 variant of the quant code before FP16_FP32_MODULES is never loaded (the readout exports it again)
+    old = tmp_path / "old"
+    shutil.copytree(out, old)
+    r = json.loads((old / Q.QUANT_FILE).read_text(encoding="utf-8"))
+    del r["recipe"]["fp32_modules"]
+    (old / Q.QUANT_FILE).write_text(json.dumps(r), encoding="utf-8")
+    assert Q.recipe_version_problem(brec) is None and "export it again" in Q.recipe_version_problem(r)
+    with pytest.raises(Q.QuantError, match="runs every layer in fp16"):
+        Q.load_quantized(old, "cpu")
 
 
 def test_the_monitor_flushes_its_record(tmp_path):

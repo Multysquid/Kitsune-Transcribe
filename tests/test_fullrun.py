@@ -28,7 +28,7 @@ RID = "full-p03-20260927T120000Z"
 def test_constants_exact_values():
     assert fr.JOB == "full"
     assert (fr.BOXES_FILE, fr.ENV_REGISTRY) == ("configs/full/boxes.json", "KITSUNE_FULL_REGISTRY")
-    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005")
+    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005", "p-cool")
     assert fr.HUB_DIR == "full" and fr.STATE_DEFAULT == "/workspace/kitsune_state"
     assert (fr.TRAIN_HB, fr.HB_DIR, fr.RESUME_PLAN, fr.VERDICT_FILE, fr.ALERTS_FILE, fr.GATE_FILE, fr.SUMMARY_FILE,
             fr.DEADLINE_FILE) == ("train_hb", "hb", "resume_plan.json", "smoke_verdict.json",
@@ -56,7 +56,8 @@ def test_constants_exact_values():
                                   "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s",
                                   "augment.end_trim_p", "augment.noise_p", "augment.noise_bank",
                                   "augment.noise_bank_sha256", "augment.speech_p", "augment.reverb_p",
-                                  "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p", "augment.codec_p")
+                                  "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p", "augment.codec_p",
+                                  "augment.background_min_row_s", "schedule.deadline_cooldown")
     assert fr.RESUME_SET_INT_MIN == {"schedule.epochs": 1, "early_stop.patience": 1}
     assert fr.RESUME_SET_KINDS == {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
                                    "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
@@ -65,7 +66,15 @@ def test_constants_exact_values():
                                    "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob",
                                    "augment.reverb_p": "prob", "augment.rir_bank": "path",
                                    "augment.rir_bank_sha256": "sha256", "augment.gain_p": "prob",
-                                   "augment.codec_p": "prob"}
+                                   "augment.codec_p": "prob", "augment.background_min_row_s": "seconds",
+                                   "schedule.deadline_cooldown": "bool"}
+    assert fr.CODEC_NAMES == ("mp3", "gsm", "ulaw8k", "vorbis", "opus")
+    assert fr.CONTINUE_LIST_KINDS == {"augment.noise_snr_db": "db_range", "augment.speech_snr_db": "db_range",
+                                      "augment.gain_db": "db_range", "augment.codecs": "codecs"}
+    assert fr.CONTINUE_ONLY_KINDS == {"schedule.resume_reset_keep_cooldown": "bool"}
+    assert fr.CONTINUE_SET_KEYS == fr.RESUME_SET_KEYS + ("schedule.resume_reset_keep_cooldown", "augment.noise_snr_db",
+                                                         "augment.speech_snr_db", "augment.gain_db", "augment.codecs")
+    assert fr.DB_RANGE_MAX == 100.0
     assert fr.STALL_MIN_DEFAULT == {"stores": 360, "train": 45, "readout": 30, "speed": 30, "eval": 60}
     assert fr.ITEM_KINDS == ("stores", "train", "readout", "speed", "eval")
     assert fr.FAULT_ACTIONS == ("sigstop", "kill", "wipe_run_dir", "deadline", "freeze_controller_hb")
@@ -238,7 +247,8 @@ def test_parse_resume_sets():
     only = "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, augment.concat_p, " \
            "augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, augment.noise_p, augment.noise_bank, " \
            "augment.noise_bank_sha256, augment.speech_p, augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, " \
-           "augment.gain_p, augment.codec_p may change on a resume"
+           "augment.gain_p, augment.codec_p, augment.background_min_row_s, schedule.deadline_cooldown may change on " \
+           "a resume"
     for bad in (f"{RID}:early_stop.patience=0", f"{RID}:early_stop.patience=-1", f"{RID}:early_stop.patience=1.5",
                 f"{RID}:early_stop.patience=x", f"{RID}:early_stop.patience=",
                 f"{RID}:early_stop.patience=12,{RID}:early_stop.patience=6",
@@ -305,7 +315,8 @@ def test_parse_resume_sets_types_and_normalises_each_value():
         "augment.speech_p": "a probability in [0, 1]", "augment.reverb_p": "a probability in [0, 1]",
         "augment.rir_bank": "a relative data-repo path (letters, digits, _ . - and /, no ..)",
         "augment.rir_bank_sha256": "a sha256 (64 lowercase hex digits)", "augment.gain_p": "a probability in [0, 1]",
-        "augment.codec_p": "a probability in [0, 1]"}
+        "augment.codec_p": "a probability in [0, 1]", "augment.background_min_row_s": "a number of seconds >= 0",
+        "schedule.deadline_cooldown": "true or false"}
     for bad, msg in ((f"{RID}:augment.enabled=yes", "augment.enabled must be true or false, not 'yes'"),
                      (f"{RID}:augment.enabled=1", "augment.enabled must be true or false"),
                      (f"{RID}:augment.enabled=", "augment.enabled must be true or false"),
@@ -355,6 +366,142 @@ def test_parse_resume_reset():
     for bad in ("full-p03", f"{RID},", f"{RID},,x", "runs/" + RID, f"{RID}:schedule.epochs=4"):
         with pytest.raises(ValueError):
             fr.parse_resume_reset(bad)
+
+
+# ------------------------------------------------------------------------------------------------ continuations (H14)
+
+
+def test_codec_names_are_the_acoustics_codecs():
+    from kitsune import acoustics  # numpy at import: fullrun keeps a copy, this holds the two equal
+    assert fr.CODEC_NAMES == tuple(acoustics.CODECS)
+    assert set(acoustics.DEFAULT_CODECS) <= set(fr.CODEC_NAMES)
+
+
+def test_h14_resume_set_keys():
+    """Two of DECISIONS H14's three scalar keys are resume sets too (launch --resume-set, KITSUNE_RESUME_SETS),
+    normalised like the others. schedule.resume_reset_keep_cooldown is not: only a registry continuation sets it
+    (CONTINUE_ONLY_KINDS; launch's continuation_preflight checks the state's cooldown record before renting), and
+    neither are the list-valued continuation keys (the env word is comma-separated)."""
+    got = fr.parse_resume_sets(f"{RID}:augment.background_min_row_s=3,{RID}:schedule.deadline_cooldown=FALSE")
+    assert got == {RID: ["augment.background_min_row_s=3.0", "schedule.deadline_cooldown=false"]}
+    assert fr.resume_set_value("augment.background_min_row_s", "0") == "0.0"
+    assert "schedule.resume_reset_keep_cooldown" not in fr.RESUME_SET_KEYS + tuple(fr.RESUME_SET_KINDS)
+    assert fr.resume_set_rule("schedule.resume_reset_keep_cooldown") == "true or false"  # a continuation's refusals
+    for bad, msg in ((f"{RID}:augment.background_min_row_s=-1", "background_min_row_s must be a number of seconds"),
+                     (f"{RID}:augment.background_min_row_s=inf", "background_min_row_s must be a number of seconds"),
+                     (f"{RID}:schedule.resume_reset_keep_cooldown=true", "may change on a resume"),
+                     (f"{RID}:schedule.resume_reset_keep_cooldown=1", "may change on a resume"),
+                     (f"{RID}:schedule.deadline_cooldown=no", "deadline_cooldown must be true or false"),
+                     (f"{RID}:augment.noise_snr_db=[0,5]", "may change on a resume"),
+                     (f"{RID}:augment.codecs=mp3", "may change on a resume"),
+                     (f"{RID}:schedule.resume_reset=true", "may change on a resume")):
+        with pytest.raises(ValueError, match=msg):
+            fr.parse_resume_sets(bad)
+
+
+def test_continue_set_text_spells_each_value_once():
+    sha = "0123456789abcdef" * 4
+    for key, value, want in (
+            ("augment.noise_snr_db", [5.0, 20.0], "[5.0,20.0]"), ("augment.noise_snr_db", [5, 20], "[5.0,20.0]"),
+            ("augment.gain_db", [-10.0, 10.0], "[-10.0,10.0]"), ("augment.gain_db", [-20, 10], "[-20.0,10.0]"),
+            ("augment.speech_snr_db", [15.0, 15.0], "[15.0,15.0]"),  # low == high: one fixed SNR
+            ("augment.gain_db", [-100, 100], "[-100.0,100.0]"), ("augment.speech_snr_db", [0.5, 2.25], "[0.5,2.25]"),
+            ("augment.codecs", ["mp3", "ulaw8k"], '["mp3","ulaw8k"]'), ("augment.codecs", ["opus"], '["opus"]'),
+            ("augment.codecs", list(fr.CODEC_NAMES), '["mp3","gsm","ulaw8k","vorbis","opus"]'),
+            ("schedule.deadline_cooldown", False, "false"), ("schedule.resume_reset_keep_cooldown", True, "true"),
+            ("schedule.resume_reset_keep_cooldown", "False", "false"),
+            ("augment.enabled", "true", "true"), ("augment.enabled", "True", "true"),
+            ("schedule.epochs", 6, "6"), ("schedule.epochs", "06", "6"),
+            ("augment.background_min_row_s", 3.0, "3.0"), ("augment.background_min_row_s", 3, "3.0"),
+            ("augment.background_min_row_s", 0, "0.0"), ("augment.background_min_row_s", "3.0", "3.0"),
+            ("augment.noise_p", 0.30, "0.3"), ("augment.noise_p", 1, "1.0"), ("augment.noise_p", 0, "0.0"),
+            ("augment.noise_bank", "aug/musan-bg-v2", "aug/musan-bg-v2"),
+            ("augment.rir_bank_sha256", sha.upper(), sha)):
+        assert fr.continue_set_text(key, value) == want, (key, value)
+        kind = fr.CONTINUE_LIST_KINDS.get(key)
+        if kind == "db_range":  # 04_distill's apply_set json-parses it back to the value
+            assert json.loads(want) == [float(x) for x in value]
+        elif kind == "codecs":
+            assert json.loads(want) == value
+        else:  # the same spelling a resume set of the key has
+            assert fr.resume_set_value(key, want) == want
+    assert fr.continue_set_rule("augment.gain_db") == (
+        "a list [low, high] of 2 finite numbers of dB (no bools), low <= high, each within +-100")
+    assert fr.continue_set_rule("augment.codecs") == (
+        "a non-empty list of distinct codec names of ['mp3', 'gsm', 'ulaw8k', 'vorbis', 'opus']")
+    assert fr.continue_set_rule("schedule.epochs") == "an int >= 1"
+
+
+@pytest.mark.parametrize("key, value, match", [
+    ("augment.noise_snr_db", [5.0], r"augment.noise_snr_db must be a list \[low, high\] of 2 finite numbers"),
+    ("augment.noise_snr_db", [5.0, 10.0, 20.0], r"noise_snr_db must be a list \[low, high\]"),
+    ("augment.noise_snr_db", [], r"noise_snr_db must be a list"),
+    ("augment.noise_snr_db", [20.0, 5.0], r"low <= high, each within \+-100, not \[20.0, 5.0\]"),
+    ("augment.gain_db", [True, 5.0], r"gain_db must be a list"),
+    ("augment.gain_db", [-5.0, False], r"gain_db must be a list"),
+    ("augment.gain_db", [float("nan"), 5.0], r"gain_db must be a list"),
+    ("augment.gain_db", [float("-inf"), 5.0], r"gain_db must be a list"),
+    ("augment.gain_db", [-101, 0], r"each within \+-100"),
+    ("augment.speech_snr_db", [0, 100.5], r"each within \+-100"),
+    ("augment.speech_snr_db", "[5.0,20.0]", r"speech_snr_db must be a list"),
+    ("augment.speech_snr_db", ["5", "20"], r"speech_snr_db must be a list"),
+    ("augment.speech_snr_db", None, r"speech_snr_db must be a list"),
+    ("augment.speech_snr_db", {"low": 5, "high": 20}, r"speech_snr_db must be a list"),
+    ("augment.speech_snr_db", (5.0, 20.0), r"speech_snr_db must be a list"),  # JSON has no tuple
+    ("augment.codecs", [], r"augment.codecs must be a non-empty list of distinct codec names"),
+    ("augment.codecs", ["mp3", "mp3"], r"codecs must be a non-empty list of distinct"),
+    ("augment.codecs", ["mp3", "aac"], r"codecs must be a non-empty list"),
+    ("augment.codecs", ["MP3"], r"codecs must be a non-empty list"),
+    ("augment.codecs", "mp3", r"codecs must be a non-empty list"),
+    ("augment.codecs", [1], r"codecs must be a non-empty list"),
+    ("augment.codecs", None, r"codecs must be a non-empty list"),
+    ("schedule.epochs", 0, r"schedule.epochs must be an int >= 1, not '0'"),
+    ("schedule.epochs", 6.0, r"schedule.epochs must be an int >= 1, not '6.0'"),
+    ("schedule.epochs", True, r"schedule.epochs must be an int >= 1, not 'true'"),
+    ("schedule.epochs", None, r"schedule.epochs must be an int >= 1, not None"),
+    ("schedule.epochs", [6], r"schedule.epochs must be an int >= 1, not \[6\]"),
+    ("augment.enabled", 1, r"augment.enabled must be true or false, not '1'"),
+    ("schedule.deadline_cooldown", "no", r"deadline_cooldown must be true or false"),
+    ("schedule.resume_reset_keep_cooldown", None, r"keep_cooldown must be true or false"),
+    ("schedule.resume_reset_keep_cooldown", 1, r"keep_cooldown must be true or false, not '1'"),
+    ("augment.noise_p", 1.5, r"noise_p must be a probability"),
+    ("augment.noise_p", float("nan"), r"noise_p must be a probability"),
+    ("augment.background_min_row_s", -1, r"background_min_row_s must be a number of seconds >= 0"),
+    ("augment.background_min_row_s", True, r"background_min_row_s must be a number of seconds"),
+    ("augment.background_min_row_s", float("inf"), r"background_min_row_s must be a number of seconds"),
+    ("augment.noise_bank", 12, r"noise_bank must be a relative data-repo path"),
+    ("augment.noise_bank", "12", r"noise_bank must be a relative data-repo path"),  # JSON would read a number
+    ("augment.noise_bank", None, r"noise_bank must be a relative data-repo path"),
+    ("optim.lr", 0.001, r"'optim.lr' is not a key a continuation may set"),
+    ("schedule.resume_reset", True, r"'schedule.resume_reset' is not a key a continuation may set"),
+    ("augment.mix_snr_db", [0.0, 5.0], r"is not a key a continuation may set"),
+])
+def test_continue_set_text_refuses(key, value, match):
+    with pytest.raises(ValueError, match=match):
+        fr.continue_set_text(key, value)
+
+
+def test_continue_sets_in_the_sets_order():
+    cont = {"box": "p005", "run_id": "full-p005-20261008T160232Z", "from_step": 67449, "to_step": 80939,
+            "resets_before": 0,
+            "sets": {"schedule.epochs": 10, "schedule.deadline_cooldown": False,
+                     "schedule.resume_reset_keep_cooldown": True, "_comment": "the gentle recipe",
+                     "augment.noise_snr_db": [5.0, 20.0], "augment.speech_snr_db": [15, 25],
+                     "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"],
+                     "augment.background_min_row_s": 3.0, "augment.speech_p": 0.3}}
+    words = fr.continue_sets(cont)
+    assert words == ["schedule.epochs=10", "schedule.deadline_cooldown=false",
+                     "schedule.resume_reset_keep_cooldown=true", "augment.noise_snr_db=[5.0,20.0]",
+                     "augment.speech_snr_db=[15.0,25.0]", "augment.gain_db=[-10.0,10.0]",
+                     'augment.codecs=["mp3","ulaw8k"]', "augment.background_min_row_s=3.0", "augment.speech_p=0.3"]
+    # 04_distill's apply_set: key=value, the value json-parsed (a list / bool / number)
+    assert [json.loads(w.partition("=")[2]) for w in words][:5] == [10, False, True, [5.0, 20.0], [15.0, 25.0]]
+    assert fr.continue_sets(dict(cont, sets={})) == []
+    for bad, match in ((dict(cont, sets=["schedule.epochs=10"]), "sets is not an object"),
+                       ([], "sets is not an object"), (dict(cont, sets={"schedule.epochs": 0}), "an int >= 1"),
+                       (dict(cont, sets={"augment.codecs": ["aac"]}), "augment.codecs must be")):
+        with pytest.raises(ValueError, match=match):
+            fr.continue_sets(bad)
 
 
 def test_run_id_of():
@@ -465,6 +612,7 @@ def test_defaults_are_filled(tmp_path, reg):
     assert items["stores-ctc"]["max_hours"] is None and items["stores-ctc"]["verdict"] == []
     assert (items["stores-aed"]["eval_only"], items["stores-aed"]["sets"]) == (False, [])
     assert (items["full-t06"]["plan_total_steps"], items["full-t06"]["plan_hours"]) == (None, None)
+    assert items["full-t06"]["continues"] is None  # a run of its own (DECISIONS H14: a continuation names its run)
     assert (items["speed-full-t06"]["args"], items["speed-full-t06"]["only_if_new_machine"]) == ([], None)
     assert items["whisper-small"]["weights"] == [] and items["whisper-small"]["of"] is None
     # implicit needs: a readout's train item, a same-box `of`, never an `of_box`
@@ -766,6 +914,151 @@ def test_speed_sources_that_pass(tmp_path, reg):
     assert _problems(reg, tmp_path) == []
 
 
+# a continuation box built on the tiny registry: box p01's run re-run from its pre_cooldown state (H14's p01 row)
+COOL_RID = "full-p01-20261001T184145Z"
+CONT_P01 = {"box": "p01", "run_id": COOL_RID, "from_step": 86328, "to_step": 107910, "resets_before": 1,
+            "sets": {"schedule.epochs": 4, "schedule.deadline_cooldown": False, "augment.enabled": True,
+                     "augment.noise_snr_db": [0.0, 20.0], "augment.speech_snr_db": [10.0, 25.0],
+                     "augment.gain_db": [-20.0, 10.0], "augment.codecs": ["mp3", "gsm", "ulaw8k"],
+                     "augment.background_min_row_s": 0.0}}
+
+
+def with_cool(reg: dict, **changes) -> dict:
+    """reg (a copy) plus box p-cool: box p01's items, its train item full-p01 continuing box p01's run (CONT_P01 with
+    `changes`)."""
+    reg = copy.deepcopy(reg)
+    box = copy.deepcopy(reg["boxes"]["p01"])
+    next(i for i in box["items"] if i["name"] == "full-p01")["continues"] = dict(copy.deepcopy(CONT_P01), **changes)
+    reg["boxes"]["p-cool"] = box
+    return reg
+
+
+def test_a_continuation_box_validates_and_lists_its_continuations(tmp_path, reg):
+    cool = with_cool(reg)
+    assert fr.registry_problems(cool, root=tmp_path) == []
+    loaded = fr.load_registry(cool, root=tmp_path)
+    assert fr.load_registry(loaded, root=tmp_path) == loaded  # the filled block validates again unchanged
+    assert fr.train_items("p-cool", loaded)[0]["continues"] == CONT_P01
+    assert fr.train_items("p01", loaded)[0]["continues"] is None  # the default: a run of its own
+    assert fr.continues_of("p-cool", loaded) == {"full-p01": CONT_P01}
+    assert fr.continues_of("p01", loaded) == {} and fr.continues_of("full", loaded) == {}
+    fr.continues_of("p-cool", loaded)["full-p01"]["sets"].clear()  # a copy
+    assert fr.continues_of("p-cool", loaded)["full-p01"] == CONT_P01
+    assert fr.continue_sets(fr.continues_of("p-cool", loaded)["full-p01"]) == [
+        "schedule.epochs=4", "schedule.deadline_cooldown=false", "augment.enabled=true",
+        "augment.noise_snr_db=[0.0,20.0]", "augment.speech_snr_db=[10.0,25.0]", "augment.gain_db=[-20.0,10.0]",
+        'augment.codecs=["mp3","gsm","ulaw8k"]', "augment.background_min_row_s=0.0"]
+    from fixtures_chain import CHAIN_BOX, with_chain
+    chained = with_chain(cool)  # p01-chain runs box p01 (the source), never p-cool
+    assert fr.registry_problems(chained, root=tmp_path, check_files=False) == []
+    assert fr.continues_of(CHAIN_BOX, chained) == {}
+    with pytest.raises(fr.RegistryError, match="'full-p' is not in the registry"):
+        fr.continues_of("full-p", loaded)
+    # comments are allowed in the block and in its sets, and the sets' comments are no --set words
+    commented = with_cool(reg, _comment="H14", sets=dict(CONT_P01["sets"], _why="explicit ranges"))
+    assert fr.registry_problems(commented, root=tmp_path) == []
+    assert fr.continue_sets(fr.continues_of("p-cool", commented)["full-p01"]) == fr.continue_sets(CONT_P01)
+
+
+def _set(**sets):
+    return {"sets": dict(CONT_P01["sets"], **sets)}
+
+
+CONT_RULES = {
+    "not an object": ({"_whole": []}, r"continues \[\] is not null or an object"),
+    "a missing key": ("pop:resets_before", r"keys must be exactly .*missing \['resets_before'\], unknown \[\]"),
+    "a missing sets": ("pop:sets", r"missing \['sets'\]"),
+    "an unknown key": ({"keep_cooldown": True}, r"missing \[\], unknown \['keep_cooldown'\]"),
+    "box not a string": ({"box": 5}, r"continues.box 5 is not a registry box name"),
+    "box empty": ({"box": ""}, r"continues.box '' is not a registry box name"),
+    "run_id not a run id": ({"run_id": "full-p01"}, r"continues.run_id 'full-p01' is not a run id"),
+    "run_id a run dir": ({"run_id": f"runs/{COOL_RID}"}, r"continues.run_id 'runs/full-p01-.*' is not a run id"),
+    "run_id not a string": ({"run_id": None}, r"continues.run_id None is not a run id"),
+    "from_step 0": ({"from_step": 0}, r"continues.from_step 0 is not an int > 0"),
+    "from_step negative": ({"from_step": -5}, r"continues.from_step -5 is not an int > 0"),
+    "from_step a float": ({"from_step": 86328.0}, r"continues.from_step 86328.0 is not an int > 0"),
+    "from_step a bool": ({"from_step": True}, r"continues.from_step True is not an int > 0"),
+    "to_step == from_step": ({"to_step": 86328}, r"continues.to_step 86328 is not an int > from_step 86328"),
+    "to_step < from_step": ({"to_step": 100}, r"continues.to_step 100 is not an int > from_step 86328"),
+    "to_step a string": ({"to_step": "107910"}, r"continues.to_step '107910' is not an int > from_step"),
+    "to_step 0 with a bad from_step": ({"from_step": None, "to_step": 0}, r"continues.to_step 0 is not an int"),
+    "resets_before negative": ({"resets_before": -1}, r"continues.resets_before -1 is not an int >= 0"),
+    "resets_before null": ({"resets_before": None}, r"continues.resets_before None is not an int >= 0"),
+    "resets_before a float": ({"resets_before": 1.0}, r"continues.resets_before 1.0 is not an int >= 0"),
+    "sets not an object": ({"sets": ["schedule.epochs=4"]}, r"continues.sets \['schedule.epochs=4'\] is not an "
+                                                             r"object"),
+    "sets an unknown key": (_set(**{"optim.lr": 0.001}), r"continues.sets: 'optim.lr' is not a key a continuation"),
+    "sets the queue's reset": (_set(**{"schedule.resume_reset": True}), r"'schedule.resume_reset' is not a key"),
+    "sets a bad int": (_set(**{"schedule.epochs": 0}), r"continues.sets: schedule.epochs must be an int >= 1, not "
+                                                       r"'0'"),
+    "sets a bad bool": (_set(**{"schedule.deadline_cooldown": "no"}), r"deadline_cooldown must be true or false"),
+    "sets a bad seconds": (_set(**{"augment.background_min_row_s": -3.0}), r"background_min_row_s must be a number"),
+    "sets a bad range": (_set(**{"augment.gain_db": [10.0, -10.0]}), r"continues.sets: augment.gain_db must be a "
+                                                                     r"list \[low, high\]"),
+    "sets a bad codec": (_set(**{"augment.codecs": ["mp3", "aac"]}), r"continues.sets: augment.codecs must be a "
+                                                                     r"non-empty list of distinct codec names"),
+    "box its own": ({"box": "p-cool"}, r"continues.box 'p-cool' is the item's own box"),
+    "box not in the registry": ({"box": "full-p"}, r"continues.box 'full-p' is not a registry box"),
+    "box unknown": ({"box": "box-a"}, r"continues.box 'box-a' is not a registry box"),
+    "box without the item": ({"box": "full"}, r"continues.box 'full' has no train item 'full-p01'"),
+    "box with other train items": ({"box": "smoke-b"}, r"continues.box 'smoke-b' has no train item"),
+}
+
+
+@pytest.mark.parametrize("name", list(CONT_RULES))
+def test_each_continues_rule_is_refused(tmp_path, reg, name):
+    change, match = CONT_RULES[name]
+    cool = with_cool(reg)
+    item = next(i for i in cool["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")
+    if isinstance(change, str):
+        item["continues"].pop(change.partition(":")[2])
+    elif "_whole" in change:
+        item["continues"] = change["_whole"]
+    else:
+        item["continues"].update(copy.deepcopy(change))
+    probs = _refused(cool, tmp_path, match)
+    assert all("p-cool.items.full-p01.continues" in p for p in probs), probs  # nothing else breaks
+
+
+def test_a_continuation_keeps_its_runs_config(tmp_path, reg):
+    cool = with_cool(reg)
+    next(i for i in cool["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")["config"] = \
+        "configs/full/full-p03.json"
+    probs = _refused(cool, tmp_path, r"continues.box 'p01': its train item 'full-p01' trains config "
+                                     r"'configs/full/full-p01.json', this one 'configs/full/full-p03.json'",
+                     check_files=False)
+    assert len(probs) == 1, probs
+
+
+def test_a_continuation_box_continues_each_run_once(tmp_path, reg):
+    cool = with_cool(reg)
+    p03 = {"name": "full-p03", "kind": "train", "config": "configs/full/full-p03.json", "study_run": "study-p03",
+           "family": "ctc", "max_hours": 5.0, "needs": ["stores-ctc"],
+           "continues": dict(copy.deepcopy(CONT_P01), box="full")}  # box full runs a full-p03 with that config
+    cool["boxes"]["p-cool"]["items"].append(p03)
+    probs = _refused(cool, tmp_path, rf"p-cool.items.full-p03.continues.run_id '{COOL_RID}' is continued by item "
+                                     rf"'full-p01' of box p-cool too: one item per run", check_files=False)
+    assert len(probs) == 1, probs
+    p03["continues"]["run_id"] = "full-p03-20261003T230143Z"
+    assert fr.registry_problems(cool, root=tmp_path, check_files=False) == []
+    assert list(fr.continues_of("p-cool", fr.load_registry(cool, root=tmp_path, check_files=False))) == [
+        "full-p01", "full-p03"]  # registry order
+
+
+def test_a_continues_box_is_never_a_chain_part(tmp_path, reg):
+    from fixtures_chain import CHAIN, CHAIN_BOX, with_chain
+    stages = copy.deepcopy(CHAIN["chain"])
+    stages[1]["parts"] = ["p-cool"]
+    chained = with_chain(with_cool(reg), chain=stages)
+    probs = _refused(chained, tmp_path, rf"boxes.{CHAIN_BOX}.chain\[1\]: part 'p-cool' has continues items "
+                                        r"\['full-p01'\]: a box that continues other boxes' runs runs alone",
+                     check_files=False)
+    assert len(probs) == 1, probs
+    # a chain box is no continuation's source either
+    _refused(with_chain(with_cool(reg, box=CHAIN_BOX)), tmp_path, rf"continues.box '{CHAIN_BOX}' is a chain box",
+             check_files=False)
+
+
 def test_malformed_registries_do_not_crash(tmp_path):
     for bad in (None, [], "x", {}, {"version": 1}, {"version": 1, "boxes": []},
                 {"version": 1, "boxes": {"p01": {"items": [None, 3, {"kind": ["train"]}, {"kind": "eval",
@@ -1018,6 +1311,31 @@ def test_cli_refusals(tmp_path, monkeypatch, capsys):
     assert e.value.code == 2
     with pytest.raises(SystemExit) as e:
         fr.main(["students", "--box", "box-a"])  # not a full box
+    assert e.value.code == 2
+
+
+def test_cli_has_continues(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("KITSUNE_FULL_REGISTRY", raising=False)
+    monkeypatch.delenv("KITSUNE_BOX", raising=False)
+    monkeypatch.setenv("KITSUNE_CHAIN_STAGE", "x")  # a chain's stage is no business of has-continues
+    root = ["--root", str(tmp_path)]
+    rc, _, err = _cli(["has-continues", "--box", "p-cool", *root], capsys)
+    assert rc == 2 and "not in this checkout" in err  # no registry
+    reg = with_cool(tiny_registry(tmp_path))
+    (tmp_path / fr.BOXES_FILE).write_text(json.dumps(reg), encoding="utf-8")
+    assert _cli(["has-continues", "--box", "p-cool", *root], capsys) == (0, "1\n", "")
+    assert _cli(["has-continues", "--box", "p01", *root], capsys) == (0, "0\n", "")
+    assert _cli(["has-continues", "--box", "full", *root], capsys) == (0, "0\n", "")
+    monkeypatch.setenv("KITSUNE_BOX", "p-cool")  # bootstrap: --box from the env
+    assert _cli(["has-continues", *root], capsys) == (0, "1\n", "")
+    rc, out, err = _cli(["has-continues", "--box", "full-p", *root], capsys)
+    assert (rc, out) == (2, "") and "'full-p' is not in the registry" in err  # an unknown box
+    next(i for i in reg["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")["continues"]["from_step"] = 0
+    (tmp_path / fr.BOXES_FILE).write_text(json.dumps(reg), encoding="utf-8")
+    rc, out, err = _cli(["has-continues", "--box", "p-cool", *root], capsys)
+    assert (rc, out) == (2, "") and "from_step 0 is not an int > 0" in err  # a bad registry
+    with pytest.raises(SystemExit) as e:
+        fr.main(["has-continues", "--box", "box-a", *root])  # not a full box name
     assert e.value.code == 2
 
 

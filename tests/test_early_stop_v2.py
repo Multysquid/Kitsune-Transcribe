@@ -24,6 +24,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -810,6 +811,111 @@ def test_the_resume_reset_takes_a_new_patience(env, monkeypatch):
     assert len(events(run, "resume_reset")) == 1
 
 
+class FakeScratch:
+    """A ScratchUploader as the trainer's loop sees it, without a Hub: no timed state goes anywhere (the runs here set
+    no ckpt.upload_full_every_min), it only makes the run one with timed states (save_full's pre_cooldown restate)."""
+    repo = "u/scratch"
+
+    def __init__(self):
+        self.pending, self.ok, self.seen, self.skipped_at = {}, [], 0, None
+        self.sync_due, self.submitted = threading.Event(), []
+
+    def busy(self) -> set:
+        return set()
+
+    def running_s(self):
+        return None
+
+    def submit(self, local, name, meta=None):
+        self.submitted.append(name)
+
+    def abandon(self, timeout=None) -> list:
+        return []
+
+
+def test_the_resume_reset_replays_the_kept_cooldown(env, monkeypatch):
+    """DECISIONS H14 (P-0.05B's paired cooldown) end to end: a dev-triggered epochs-clock run (4d on, as the full
+    configs have it) ends early (trigger 3, T 5). Its continuation from the pre_cooldown state full_step_3 with
+    schedule.resume_reset=true, schedule.resume_reset_keep_cooldown=true and schedule.deadline_cooldown=false (past
+    the deadline: with 4d on there would be no step left) replays the same cooldown: steps 4 and 5 only, the same LR
+    at each, end_reason early_stop and the original trigger, one reset (cooldown_kept {3, 5}), the same 2-epoch plan,
+    and both flags false (4d off) in every state saved after it - the pre_cooldown state full_step_3 too, which the
+    continuation (a scratch uploader, as on the box) rewrites in place - so a later plain --resume of that rewritten
+    state (no sets: the queue drops them once the reset is applied) finishes the run at the record's T. Refused: the
+    flag on a fresh start (with or without resume_reset), and on a resume without resume_reset."""
+    m = load_script("04_distill")
+    over = {"subset": {"train_audio_s": 24, "eval_audio_s": 4},
+            "schedule": {"clock": "epochs", "epochs": 2, "warmup_steps": 300, "cooldown_frac": 0.5, "max_steps": None,
+                         "deadline_cooldown": True},
+            "batch": {"step_audio_s": 4, "micro_audio_s": 3, "pool_micro": 4},
+            "eval": {"every_steps": None, "every_min": None, "probe_is_train": True,
+                     "dev": {"every_steps": 1, "per_source": 3}},
+            "early_stop": rule(patience=2, min_delta_abs=FLAT)}
+    path = write_config(env, "keep", over)
+    assert m.main(["--config", path]) == 0
+    run = one_run(env["root"], "keep")
+    s1 = summary(run)
+    assert (s1["steps"], s1["end_reason"], s1["resume_resets"]) == (5, "early_stop", 0)
+    lr1 = steps_of(run).set_index("step")["opt/lr"].to_dict()
+    pc = run / "checkpoints" / "full_step_3"
+    assert trainer_json(run, "full_step_3")["st"]["early_stop"]["cooldown"] == dict(t_c=3.0, T=5.0, clock="epochs",
+                                                                                     at_step=3)
+    keep = ["--set", "schedule.resume_reset=true", "--set", "schedule.resume_reset_keep_cooldown=true"]
+
+    for argv, match in ((["--set", "schedule.resume_reset_keep_cooldown=true"], "never alone"),
+                        (keep, "one-shot flag")):
+        with pytest.raises(SystemExit, match=match):
+            m.main(["--config", path, *argv])
+    with pytest.raises(SystemExit, match="never alone"):
+        m.main(["--config", path, "--resume", str(pc), "--set", "schedule.resume_reset_keep_cooldown=true"])
+    assert len(list((env["root"] / "runs").glob("keep-2*"))) == 1  # no run dir made
+
+    # the continuation's launches run as on the box, with a scratch uploader (timed states): the reset's pre_cooldown
+    # save at t_c then takes save_full's restate path
+    build = m.build
+
+    def with_scratch(args):
+        R, state = build(args)
+        R.scratch = FakeScratch()
+        return R, state
+
+    monkeypatch.setattr(m, "build", with_scratch)
+    monkeypatch.setenv("KITSUNE_DEADLINE", "1000000000")  # 2001: 4d on would leave no step
+    monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "5")
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        m.main(["--config", path, "--resume", str(pc), *keep, "--set", "schedule.deadline_cooldown=false",
+                "--set", "ckpt.full_every_steps=1"])
+    monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
+    (r,) = events(run, "resume_reset")
+    assert r["cooldown_kept"] == dict(t_c=3.0, T=5.0) and (r["at_step"], r["T"], r["resume_resets"]) == (3, 5.0, 1)
+    assert r["total_steps_after"] == r["total_steps_before"]  # the same 2 epochs planned again
+    assert events(run, "resume")[-1]["overrides"]["schedule.deadline_cooldown"] is False
+    assert not events(run, "deadline_check") and not events(run, "no_time_left")
+    # the loop's pre_cooldown save at t_c finds full_step_3 there and rewrites its trainer.pt/.json (the restate): the
+    # runs repo's full_step_3 (the queue's pick for a lost continuation) counts the reset, both one-shot flags false,
+    # the cooldown record kept; the state after it holds the same
+    (rw,) = [e for e in events(run, "checkpoint") if e.get("trainer_only")]
+    assert (rw["name"], rw["reason"]) == ("full_step_3", "pre_cooldown")
+    assert trainer_json(run, "full_step_3")["reason"] == "pre_cooldown"
+    for name in ("full_step_3", "full_step_4"):
+        tj = trainer_json(run, name)
+        sch = tj["cfg"]["schedule"]
+        assert (sch["resume_reset"], sch["resume_reset_keep_cooldown"], sch["deadline_cooldown"]) == (False,) * 3, name
+        assert tj["st"]["early_stop"]["cooldown"] == dict(t_c=3.0, T=5.0, clock="epochs", at_step=3), name
+        assert tj["st"]["pre_cooldown_full"] == "full_step_3" and tj["st"]["resume_resets"] == 1, name
+
+    assert m.main(["--config", path, "--resume", str(pc)]) == 0  # plain (no sets), from the rewritten state
+    monkeypatch.delenv("KITSUNE_DEADLINE")
+    assert len(events(run, "resume_reset")) == 1
+    s = summary(run)
+    assert (s["status"], s["steps"], s["resume_resets"], s["end_reason"]) == ("complete", 5, 1, "early_stop")
+    assert s["stopped_early"] == s1["stopped_early"] and s["schedule_resets"][0]["cooldown_kept"] == r["cooldown_kept"]
+    lr2 = steps_of(run).drop_duplicates("step", keep="last").set_index("step")["opt/lr"].to_dict()
+    assert sorted(lr2) == [1, 2, 3, 4, 5] and all(lr2[k] == lr1[k] for k in (4, 5)) and lr2[5] < lr2[4]
+    end = trainer_json(run, "full_step_5")
+    assert end["cfg"]["schedule"]["resume_reset_keep_cooldown"] is False and end["st"]["resume_resets"] == 1
+
+
 def test_resume_reset_refusals_on_their_own(tmp_path):
     m = load_script("04_distill")
     R, evs, _ = _unit_run(m, tmp_path, ["schedule.clock=steps", "schedule.max_steps=10", "schedule.warmup_steps=2",
@@ -825,6 +931,138 @@ def test_resume_reset_refusals_on_their_own(tmp_path):
     R.cfg["schedule"]["max_steps"] = 30
     m.resume_reset_finish(R, before)
     assert evs[-1]["kind"] == "resume_reset" and evs[-1]["T"] == 30.0 and R.st["schedule_resets"][-1]["at_step"] == 12
+
+
+KEEP = ["schedule.resume_reset=true", "schedule.resume_reset_keep_cooldown=true"]
+
+
+def _lr_at(m, R, step: int) -> tuple[float, int]:
+    """The loop's LR for optimizer step `step` (the state at step - 1), as the training loop computes it."""
+    R.st["step"] = step - 1
+    t, T = R.progress()
+    sch = R.cfg["schedule"]
+    return m.wsd_lr(float(R.cfg["optim"]["lr"]), step, t, T, m.warmup_steps(sch, R.st.get("total_steps")),
+                    float(sch["cooldown_frac"]), t_c=R.cooldown_start(T))
+
+
+def _early_stopped(m, tmp_path, name: str, at: int, sets=()):
+    """A steps-clock run (max_steps 20, cooldown_frac 0.5) whose early stop fired at step `at`: its state there (the
+    pre_cooldown state: es.cooldown {t_c at, T at + ceil(0.5 at)}) and its LR at every step up to max_steps."""
+    run = tmp_path / name
+    run.mkdir()
+    base = ["schedule.clock=steps", "schedule.max_steps=20", "schedule.warmup_steps=2", "schedule.cooldown_frac=0.5",
+            "early_stop.enabled=true", "early_stop.metric=train_loss", *sets]
+    R, _, _ = _unit_run(m, run, base)
+    R.st["step"] = at
+    m.early_stop_trigger(R, "patience", "cooldown")
+    st = copy.deepcopy(R.st)
+    lrs = {k: _lr_at(m, R, k) for k in range(at + 1, 21)}
+    return run, base, st, lrs
+
+
+def _restored(m, run, base, st, sets):
+    """A resume of state `st` with --set sets, as train() restores it (R.st updated from the state's)."""
+    R, evs, sc = _unit_run(m, run, base + list(sets))
+    R.st.update(copy.deepcopy(st))
+    return R, evs, sc
+
+
+def test_the_resume_reset_keeps_the_early_stop_cooldown_on_its_own(tmp_path):
+    """schedule.resume_reset_keep_cooldown (DECISIONS H14, P-0.05B's continuation): a reset from the early-stopped
+    run's pre_cooldown state keeps its cooldown record and trigger, so t_c, T and the LR at every cooldown step are the
+    original's (without the flag the same reset plans a new schedule: t_c 10 of 20), the early-stop check stays a
+    no-op, end_reason stays early_stop, and the reset's record and event carry cooldown_kept; both flags are cleared.
+    Refused before anything changes (COOLDOWN still there, no reset counted): no record, a state past t_c, another
+    clock; at finish: a re-planned T below the record's; in validation: the flag without resume_reset, on the wall
+    clock, not a bool."""
+    m = load_script("04_distill")
+    run, base, st, lrs = _early_stopped(m, tmp_path, "keep", 7)
+    rec = st["early_stop"]["cooldown"]
+    assert rec == dict(t_c=7.0, T=11.0, clock="steps", at_step=7) and lrs[11][1] == 2
+
+    R, evs, sc = _restored(m, run, base, st, KEEP)
+    before = m.resume_reset_start(R)
+    m.resume_reset_finish(R, before)
+    assert R.cfg["schedule"]["resume_reset"] is False and R.cfg["schedule"]["resume_reset_keep_cooldown"] is False
+    assert R.st["early_stop"]["cooldown"] == rec and R.st["early_stop"]["triggered"] == st["early_stop"]["triggered"]
+    assert (R.st["early_stop"]["evals"], R.st["early_stop"]["best"]) == (0, None)  # otherwise fresh
+    assert R.st["pre_cooldown_done"] is False and R.st["resume_resets"] == 1
+    R.st["step"] = 7
+    assert R.progress() == (7.0, 11.0) and R.cooldown_start(11.0) == 7.0
+    assert {k: _lr_at(m, R, k) for k in range(8, 12)} == {k: lrs[k] for k in range(8, 12)}
+    R.st["step"], R.st["early_stop"]["loss_n"], R.st["early_stop"]["loss_sum"] = 9, 1, 5.0
+    sc.clear()
+    assert m.early_stop_check(R, 9) is False and not sc  # the trigger kept: no patience, no scalars
+    assert m.end_reason(R) == "early_stop"
+    assert m.make_summary(R, "complete")["stopped_early"] == st["early_stop"]["triggered"]
+    (ev,) = [e for e in evs if e["kind"] == "resume_reset"]
+    assert ev["cooldown_kept"] == dict(t_c=7.0, T=11.0) == R.st["schedule_resets"][-1]["cooldown_kept"]
+    assert ev["T"] == 11.0 and ev["at_step"] == 7
+
+    plain, _, _ = _restored(m, run, base, st, KEEP[:1])  # the reset without the flag: a new schedule
+    b = m.resume_reset_start(plain)
+    m.resume_reset_finish(plain, b)
+    plain.st["step"] = 7
+    assert "cooldown_kept" not in b and plain.progress() == (7.0, 20.0) and plain.cooldown_start(20.0) == 10.0
+    assert _lr_at(m, plain, 9) != lrs[9] and plain.st["early_stop"]["cooldown"] is None
+
+    # refusals before anything changes: the COOLDOWN file is not consumed, no reset is counted
+    no_rec = copy.deepcopy(st)
+    no_rec["early_stop"] = m.early_stop_state()
+    past = copy.deepcopy(st)
+    past["step"] = 9  # a state inside the cooldown
+    other = copy.deepcopy(st)
+    other["early_stop"]["cooldown"]["clock"] = "epochs"
+    for name, state, match in (("no-rec", no_rec, "has no early-stop cooldown record"),
+                               ("past", past, "not the pre_cooldown state"),
+                               ("clock", other, "on the 'epochs' clock")):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "COOLDOWN").touch()
+        R, evs, _ = _restored(m, d, base, state, KEEP)
+        with pytest.raises(SystemExit, match=match):
+            m.resume_reset_start(R)
+        assert (d / "COOLDOWN").exists() and not list(d.glob("COOLDOWN.consumed-*")) and not evs
+        assert R.st["resume_resets"] == 0 and R.cfg["schedule"]["resume_reset_keep_cooldown"] is True
+    # a re-planned T below the record's would cut the replayed cooldown short
+    R, _, _ = _restored(m, run, base, st, KEEP + ["schedule.max_steps=10"])
+    b = m.resume_reset_start(R)
+    with pytest.raises(SystemExit, match="before the kept cooldown's T 11"):
+        m.resume_reset_finish(R, b)
+    R, _, _ = _restored(m, run, base, st, KEEP + ["schedule.max_steps=11"])  # equal: the replay ends where it did
+    m.resume_reset_finish(R, m.resume_reset_start(R))
+    R.st["step"] = 7
+    assert R.progress() == (7.0, 11.0)
+    # validation: never alone (a saved state never holds it: resume_reset_start clears both), not on the wall clock
+    with pytest.raises(SystemExit, match="never alone"):
+        m.load_config(None, base + ["schedule.resume_reset_keep_cooldown=true"])
+    with pytest.raises(SystemExit, match="on the wall"):
+        m.load_config(None, KEEP)
+    with pytest.raises(SystemExit, match="must be true or false"):
+        m.load_config(None, base + ["schedule.resume_reset=true", "schedule.resume_reset_keep_cooldown=yes"])
+    assert m.load_config(None, [])["schedule"]["resume_reset_keep_cooldown"] is False
+    saved = m.load_config(None, base)
+    assert m.resume_overrides(saved, [("schedule.resume_reset_keep_cooldown", True)])[0] == {
+        "schedule.resume_reset_keep_cooldown": True}
+
+
+def test_deadline_cooldown_false_on_a_resume_turns_4d_off(tmp_path, monkeypatch):
+    """schedule.deadline_cooldown is no RESUME_FIXED key: a resume may set it false (DECISIONS H14: 4d must never
+    compress a paired cooldown), and 4d then does nothing even past the deadline, inside a kept cooldown too."""
+    m = load_script("04_distill")
+    saved = m.load_config(None, ["schedule.clock=steps", "schedule.max_steps=1000", "schedule.warmup_steps=2",
+                                 "schedule.deadline_cooldown=true"])
+    changed, _ = m.resume_overrides(saved, [("schedule.deadline_cooldown", False)])
+    assert changed == {"schedule.deadline_cooldown": False}
+    R, evs, _ = _deadline_run(m, tmp_path, monkeypatch, left_s=-5, step=850,
+                              sets=["schedule.deadline_cooldown=false"])
+    R.st["early_stop"]["cooldown"] = dict(t_c=850.0, T=900.0, clock="steps", at_step=850)
+    assert not m.deadline_on(R.cfg) and m.fit_epochs_deadline(R) is None
+    assert m.fit_epochs_deadline(R, at_start=True) is None
+    assert not evs and R.st["deadline_cooldown"] is None and R.progress() == (850.0, 900.0)
+    R, evs, _ = _deadline_run(m, tmp_path, monkeypatch, left_s=-5, step=850)  # on: it ends the run at once
+    R.st["early_stop"]["cooldown"] = dict(t_c=850.0, T=900.0, clock="steps", at_step=850)
+    assert m.fit_epochs_deadline(R)["action"] == "compress" and R.progress() == (850.0, 850.0)
 
 
 class _RunsRepo:
