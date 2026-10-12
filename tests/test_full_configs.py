@@ -1058,11 +1058,12 @@ def test_box_t_is_decisions_h15(reg, plan, trainer):
         "p03": 211720, "p01": 107910, "p005": 269777}
 
 
-def test_the_readme_launches_box_t_from_t_box(reg):
+def test_the_readme_launches_box_t_from_main(reg):
     """DECISIONS H15 (the review's launch-path finding): vast/README.md's copy-paste line for box full-t is the one a
-    launch of H15's box T takes - from a clone checked out at origin/t-box (main before H15 carries H7's 8-epoch box
-    T), with --allow-unverified-quant (QUANT_CODE changed after smoke-B's go signal: without it launch refuses the 7
-    quantised readouts) and without box 1's --avoid-machine; every flag on it is one launch defines."""
+    launch of H15's box T takes - from a clone checked out at origin/main (box T launched from the box branch t-box,
+    which PR #54 merged into main at 76b28a1), with --allow-unverified-quant (QUANT_CODE changed after smoke-B's go
+    signal: without it launch refuses the 7 quantised readouts) and without box 1's --avoid-machine or a --max-hours;
+    every flag on it is one launch defines."""
     text = (ROOT / "vast" / "README.md").read_text(encoding="utf-8")
     lines = text.splitlines()
     at = [i for i, x in enumerate(lines) if "vast\\launch.py" in x and "--box full-t " in x + " "]
@@ -1071,7 +1072,7 @@ def test_the_readme_launches_box_t_from_t_box(reg):
     assert toks[toks.index("--job") + 1] == "full" and toks[toks.index("--box") + 1] == "full-t"
     assert "--allow-unverified-quant" in toks and "--avoid-machine" not in toks and "--max-hours" not in toks
     checkout = [x for x in lines[:at[0]] if "git checkout --detach" in x][-1]
-    assert checkout.rstrip().endswith("git checkout --detach origin/t-box"), checkout
+    assert checkout.rstrip().endswith("git checkout --detach origin/main"), checkout
     src = (ROOT / "vast" / "launch.py").read_text(encoding="utf-8")
     defined = set(re.findall(r'ap\.add_argument\("(--[a-z0-9-]+)"', src))
     assert {t for t in toks if t.startswith("--")} <= defined
