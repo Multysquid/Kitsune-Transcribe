@@ -382,7 +382,7 @@ class FakeUploader:
         if self.kill_on_sync and run_dir.name.startswith(self.kill_on_sync):
             self.kill_on_sync = None
             raise KeyboardInterrupt("the queue dies mid-wave")
-        self.synced.append((time.time(), run_dir.name, sorted(finish.expected_files(run_dir, False, lean=True))))
+        self.synced.append((time.time(), run_dir.name, sorted(finish.expected_files(run_dir))))
         return []
 
     def put_file(self, local, path_in_repo) -> list[str]:
@@ -553,9 +553,9 @@ def test_box_a_dry_run(box):
         d = by_item[run]["run_dir"]
         files = synced[d]
         n = num["max_steps"][run]
-        small = prereg.RUNS[run]["params_total"] <= 110_000_000
-        want_full = {f"runs/{d}/checkpoints/full_step_{round(0.8 * n)}/model.pt"} if small else set()
-        assert {f for f in files if "/full_step_" in f and f.endswith("model.pt")} == want_full
+        # no full state: finish.py expects only one the trainer marked or its config uploads at the end (a small run's
+        # frac:0.8 state is the trainer's own upload since the study job was retired from vast/finish.py)
+        assert not {f for f in files if "/full_step_" in f and f.endswith("model.pt")}
         assert f"runs/{d}/checkpoints/step_{round(0.4 * n)}/model.safetensors" in files
         assert f"runs/{d}/checkpoints/step_{n}/model.safetensors" in files
     assert all(it["verified"] for it in st["items"].values() if it["status"] == "done" and it["run_dir"]

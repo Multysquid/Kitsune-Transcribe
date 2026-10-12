@@ -57,9 +57,9 @@ start SYNC_OFFSET_S apart. Box B's speed phase times box A's students last, afte
 Loader and /dev/shm: every trainer of a run gets the same perf.num_workers / perf.prefetch (loader_sets): the
 loader-bound retry's workers, cut so its in-flight micro-batches fit its share of the host's /dev/shm (the trainers of
 one box share it; each trainer's own shm_cap measures only the free space it sees when it starts).
-Every finished run dir is uploaded and verified at once (lean: vast/finish.py expected_files(lean=True) - the logs,
-metrics, evals and summary, the exported weights at 0.4 and at the end, the branch's, and the full states the config
-uploads: the 0.8 one of the runs of at most 0.1B). Local full states stay on the box. An item that fails its smoke
+Every finished run dir is uploaded and verified at once (vast/finish.py expected_files: the logs, metrics, evals and
+summary, every exported weights dir, and the full states the trainer marks for the Hub or the config uploads at its
+end). Local full states stay on the box. An item that fails its smoke
 checks (SmokeFailed) fails at once: the same start fails the same way again.
 GPUs: KITSUNE_GPUS (a comma list) or nvidia-smi's; a box that trains its runs in one wave needs a GPU per run, and
 KITSUNE_N_GPUS (vast/launch.py sets the count it rented) must match what the queue found - never a silent serial box.
@@ -480,18 +480,18 @@ class HubUploader:
         return self._api
 
     def sync_run(self, run_dir: Path) -> list[str]:
-        """Upload the run dir (lean) and verify it; the problems (empty: every expected file is on the Hub). The upload
+        """Upload the run dir and verify it; the problems (empty: every expected file is on the Hub). The upload
         backs off (finish.hub_retry: 5 s doubling to 10 min) like every other write of the queue: boxes A and B run at
         the same time, and their eight trainers and two queues commit into the one runs repo, where a 429 or a commit
         that races another writer is the Hub asking for a later try, not a lost run (finish.sync raises after trying
         both of its parts; a re-upload of what is there already costs no commit)."""
         fin = _finish()
         try:
-            fin.hub_retry(lambda: fin.sync(self.api(), self.repo, self.repo_type, run_dir, False, False, lean=True),
+            fin.hub_retry(lambda: fin.sync(self.api(), self.repo, self.repo_type, run_dir, False),
                           f"sync {run_dir.name}")
         except Exception as e:  # noqa: BLE001  the verification below says what is missing
             log(f"sync of {run_dir.name} failed: {type(e).__name__}: {e}")
-        return fin.verify(self.api(), self.repo, self.repo_type, fin.expected_files(run_dir, False, lean=True))
+        return fin.verify(self.api(), self.repo, self.repo_type, fin.expected_files(run_dir))
 
     def put_file(self, local: Path, path_in_repo: str) -> list[str]:
         fin = _finish()

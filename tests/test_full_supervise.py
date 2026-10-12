@@ -1,7 +1,8 @@
 """vast/supervise.py for a full-data runs box (KITSUNE_JOB=full; build contract section 5): the queue command
-(`python -m kitsune.full_queue run --box $KITSUNE_BOX`), the unchanged decide_queue, and the controllers' heartbeat
-$KITSUNE_STATE/train_hb beaten (bounded) while the supervisor's own finish.py calls run - and only then, never for the
-study box. CPU only; the queue and finish.py are scripted stand-ins."""
+(`python -m kitsune.full_queue run --box $KITSUNE_BOX`), the queue's policy (decide_queue: destroy, stop or restart,
+the restart budget, a halt's reason, a restart during the queue), and the controllers' heartbeat $KITSUNE_STATE/train_hb
+beaten (bounded) while the supervisor's own finish.py calls run - and only then. The history file, the lock and the
+bounded final finish are tests/test_infra.py's. CPU only; the queue and finish.py are scripted stand-ins."""
 import importlib
 import json
 import sys
@@ -22,20 +23,75 @@ def test_supervise_main_runs_the_full_queue_for_a_full_box(tmp_path, monkeypatch
     monkeypatch.setenv("KITSUNE_JOB", "full")
     monkeypatch.setenv("KITSUNE_BOX", "p01")
     monkeypatch.setattr(supervise, "supervise_queue",
-                        lambda cmd, state, dry, hb=None: seen.update(cmd=cmd, state=state, hb=hb) or 0)
+                        lambda cmd, state, dry, hb=None: seen.update(cmd=cmd, state=state, dry=dry, hb=hb) or 0)
     assert supervise.main(["--state", str(tmp_path / "state" / "supervise.json")]) == 0
     assert seen["cmd"][1:] == ["-m", "kitsune.full_queue", "run", "--box", "p01"] and seen["cmd"][0] == sys.executable
-    assert seen["hb"] == tmp_path / "state" / "train_hb"
-    # the study box: the study queue, no heartbeat (its call stays the three positional arguments)
-    monkeypatch.setenv("KITSUNE_JOB", "study")
-    monkeypatch.setattr(supervise, "supervise_queue", lambda cmd, state, dry: seen.update(cmd=cmd, hb="none") or 0)
-    assert supervise.main(["--state", str(tmp_path / "s.json")]) == 0
-    assert seen["cmd"][1:] == ["-m", "kitsune.study_queue", "run", "--box", "p01"] and seen["hb"] == "none"
+    assert seen["hb"] == tmp_path / "state" / "train_hb" and seen["dry"] is False
+    assert supervise.main(["--state", str(tmp_path / "s.json"), "--dry-run", "--queue-cmd", "python -c pass"]) == 0
+    assert seen["cmd"] == ["python", "-c", "pass"] and seen["dry"] is True
+    # any other job (the retired train and study jobs; the label box runs vast/label.py): no queue
+    seen.clear()
+    for job in ("study", "train", "label", None):
+        if job is None:
+            monkeypatch.delenv("KITSUNE_JOB")
+        else:
+            monkeypatch.setenv("KITSUNE_JOB", job)
+        assert supervise.main(["--state", str(tmp_path / "s.json")]) == 2 and seen == {}
 
 
-@pytest.mark.parametrize("rc, action", [(0, "destroy"), (4, "stop"), (3, "stop"), (1, "restart")])
-def test_a_full_queues_exits_take_the_queue_policy(rc, action):
-    assert supervise.decide_queue(rc, 1)[0] == action
+@pytest.mark.parametrize("rc, n_fail, action", [(0, 0, "destroy"), (4, 1, "stop"), (3, 1, "stop"), (1, 1, "restart"),
+                                               (None, 2, "restart"), (1, 3, "stop")])
+def test_decide_queue(rc, n_fail, action):
+    assert supervise.decide_queue(rc, n_fail)[0] == action
+
+
+def run_queue_supervisor(tmp_path, monkeypatch, rcs, summary_reason=None, state=None):
+    """supervise_queue with the queue's exits scripted and finish.py recorded."""
+    calls, finishes = [], []
+
+    def queue(argv, env):
+        calls.append(list(argv))
+        return rcs.pop(0)
+
+    monkeypatch.setattr(supervise, "run_queue", queue)
+    monkeypatch.setattr(supervise, "call_finish", lambda args, timeout=None: finishes.append(list(args)) or 0)
+    state_path = tmp_path / "state" / "supervise.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    if state is not None:
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    if summary_reason:
+        (tmp_path / "state" / "queue_summary.json").write_text(json.dumps({"reason": summary_reason}))
+    rc = supervise.supervise_queue(["python", "-m", "kitsune.full_queue", "run", "--box", "p01"], state_path)
+    return rc, calls, finishes, json.loads(state_path.read_text(encoding="utf-8"))
+
+
+def test_supervise_queue_destroys_a_finished_box(tmp_path, monkeypatch):
+    rc, calls, finishes, state = run_queue_supervisor(tmp_path, monkeypatch, [0])
+    assert rc == 0 and len(calls) == 1 and [f[0] for f in finishes] == ["--destroy"]
+    assert state["final"] == {"action": "destroy", "reason": "queue finished (exit 0)", "wall": state["final"]["wall"]}
+
+
+def test_supervise_queue_restarts_a_crashed_queue_then_stops(tmp_path, monkeypatch):
+    rc, calls, finishes, state = run_queue_supervisor(tmp_path, monkeypatch, [1, 1, 1])
+    assert rc == 1 and len(calls) == 1 + supervise.MAX_QUEUE_RESTARTS
+    assert [f[0] for f in finishes] == ["--sync-only"] * 3 + ["--stop"]
+    rc, calls, finishes, state = run_queue_supervisor(tmp_path / "b", monkeypatch, [1, 0])
+    assert rc == 0 and [f[0] for f in finishes] == ["--sync-only", "--destroy"]
+
+
+def test_supervise_queue_stops_on_a_halt_with_its_reason(tmp_path, monkeypatch):
+    rc, calls, finishes, state = run_queue_supervisor(tmp_path, monkeypatch, [4],
+                                                      summary_reason="train item full-p01 failed for good")
+    assert rc == 4 and finishes[-1][0] == "--stop" and "full-p01 failed for good" in state["final"]["reason"]
+
+
+def test_supervise_queue_counts_an_interrupted_queue_and_never_reruns_a_final_box(tmp_path, monkeypatch):
+    rc, calls, finishes, state = run_queue_supervisor(
+        tmp_path, monkeypatch, [0], state={"attempts": [{"t0": 1.0, "queue": True}], "final": None})
+    assert rc == 0 and state["attempts"][0]["interrupted"] is True and len(calls) == 1
+    (tmp_path / "state" / "halt").write_text("{}")
+    rc, calls, finishes, _ = run_queue_supervisor(tmp_path, monkeypatch, [], state=state)
+    assert calls == [] and finishes == []
 
 
 def run_full_supervisor(tmp_path, monkeypatch, rcs, hb=True, finish_s=0.6):
@@ -61,7 +117,7 @@ def run_full_supervisor(tmp_path, monkeypatch, rcs, hb=True, finish_s=0.6):
         return 0
 
     monkeypatch.setattr(supervise, "FINISH_BEAT_EVERY_S", 0.05)
-    monkeypatch.setattr(supervise, "run_trainer", queue)
+    monkeypatch.setattr(supervise, "run_queue", queue)
     monkeypatch.setattr(supervise, "call_finish", slow_finish)
     rc = supervise.supervise_queue(["python", "-m", "kitsune.full_queue", "run", "--box", "p01"],
                                    state / "supervise.json", hb=hb_file if hb else None)
@@ -79,7 +135,7 @@ def test_train_hb_advances_while_a_slow_finish_runs(tmp_path, monkeypatch):
     assert hb.stat().st_mtime == m
 
 
-def test_the_study_box_supervisor_writes_no_train_hb(tmp_path, monkeypatch):
+def test_without_a_heartbeat_file_nothing_is_beaten(tmp_path, monkeypatch):
     rc, calls, finishes, samples, hb = run_full_supervisor(tmp_path, monkeypatch, [0], hb=False, finish_s=0.1)
     assert rc == 0 and not hb.exists() and all(set(seen) == {None} for _, seen in samples)
 
@@ -121,7 +177,7 @@ def chain_supervisor(tmp_path, monkeypatch, attempts):
             p.write_text(json.dumps(summ), encoding="utf-8")
         return rc
 
-    monkeypatch.setattr(supervise, "run_trainer", queue)
+    monkeypatch.setattr(supervise, "run_queue", queue)
     monkeypatch.setattr(supervise, "call_finish", lambda args, timeout=None: finishes.append(list(args)) or 0)
     rc = supervise.supervise_queue(["python", "-m", "kitsune.full_queue", "run", "--box", "p01-chain"],
                                    state / "supervise.json", hb=state / "train_hb")
@@ -165,12 +221,12 @@ def test_a_chains_restart_budget_is_per_stage(tmp_path, monkeypatch):
     assert calls == [1, 1, 1, 1] and st["final"]["action"] == "stop" and "failed 3 times" in st["final"]["reason"]
 
 
-def test_the_study_and_plain_full_paths_count_every_failure_as_before(tmp_path, monkeypatch):
-    """Without a chain summary every attempt's stage is None: one budget, as before (3 failures -> stop)."""
+def test_the_plain_full_path_counts_every_failure_in_one_budget(tmp_path, monkeypatch):
+    """Without a chain summary every attempt's stage is None: one budget (3 failures -> stop)."""
     rc, calls, finishes, st = chain_supervisor(tmp_path, monkeypatch, [(1, None), (1, None), (1, None)])
     assert calls == [1, 1, 1] and st["final"]["action"] == "stop"
     assert [a["stage"] for a in st["attempts"]] == [None, None, None]
-    assert supervise.decide_queue(0, 0) == ("destroy", "study queue finished (exit 0)")
+    assert supervise.decide_queue(0, 0) == ("destroy", "queue finished (exit 0)")
     assert supervise.decide_queue(4, 1)[0] == "stop" and supervise.decide_queue(3, 1)[0] == "stop"
     from kitsune import fullrun
 

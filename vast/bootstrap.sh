@@ -1,48 +1,37 @@
 #!/bin/bash
-# Put the training data on the vast box (run by vast/onstart.sh from the cloned repo, cwd-independent).
+# Put a full-data box's training data on the vast box (run by vast/onstart.sh from the cloned repo, cwd-independent).
 #
 # Why this split: home upload is slow, so only the small DERIVED data is parked in the private HF dataset
-# $KITSUNE_DATA_REPO (teacher_out for the train sources and eval sets, second_out, the selection parquet, the student
-# init; ~2.3 GB). The ~23 GB of audio (reazon_small ~7, Emilia-YODAS 300 h ~8, Galgame's 6 tars ~5, eval sets ~3;
-# sized in vast/launch.py's DISK_GB comment) is REBUILT here from the original public HF datasets by
-# scripts/01_prepare_data.py, which reads every upstream repo at a pinned commit, so the utterance ids match the
-# teacher outputs exactly. If the data repo also holds data/shards/<source>/*.parquet for a source, those parked
-# shards are pulled (and listed in data/manifest.jsonl, which 01 reads) instead of rebuilding that source. The trainer
-# joins everything by utterance id and drops (and logs) rows without audio; this script already fails if coverage is
-# below KITSUNE_MIN_COVERAGE, because a broken join would waste the whole paid run.
+# $KITSUNE_DATA_REPO: the label box's sealed label root (teacher_out, second_out and parakeet_out per name, the
+# selections, extent.json, COMPLETE.json), the students and the registry's extra files and dirs. The audio is REBUILT
+# here from the original public HF datasets by scripts/01_prepare_data.py --extent-config, which reads every upstream
+# repo at a pinned commit, so the utterance ids match the labels exactly. The trainer joins everything by utterance id
+# and drops (and logs) rows without audio; this script already fails short of an exact join, because a broken join
+# would waste the whole paid run.
 #
-# The repo layout mirrors the laptop's repo root: <teacher_root>/..., <second_root>/..., <selection>, <student>/...,
-# optionally <data_root>/shards/... (paths from the run config). Idempotent: snapshot_download and 01 both skip what is
-# already on disk. Phase timings go to $KITSUNE_STATE/bootstrap_timings.jsonl.
+# The repo layout mirrors the laptop's repo root (paths from the run config). Idempotent: snapshot_download and 01 both
+# skip what is already on disk. Phase timings go to $KITSUNE_STATE/bootstrap_timings.jsonl.
 #
 # The plan phase also checks that HF_TOKEN can read and write $KITSUNE_OUT_REPO: launch.py checks the repos with the
 # laptop's own login, and the trainer's first upload comes only after the pull, the audio rebuild and the model load.
 #
-# Env: KITSUNE_DATA_REPO and KITSUNE_OUT_REPO (required), KITSUNE_DATA_REVISION (default main), KITSUNE_CONFIG (default
-# configs/viability.json), KITSUNE_PREP_ARGS (extra args for 01; leave it empty for the viability data: its teacher
-# outputs cover exactly the first 6 Galgame tars and 300 h of Emilia-YODAS, which are 01's defaults, and a larger
-# --galgame-shards/--emilia-hours only downloads audio without teacher output), KITSUNE_MIN_COVERAGE (default 0.99),
-# HF_TOKEN (vast account env; never printed), KITSUNE_REBUILD_TIMEOUT_MIN (extent mode only: the per-attempt timeout
-# of the audio rebuild in minutes, default 60; vast/launch.py sizes it from the extent record's upstream bytes),
+# Env: KITSUNE_DATA_REPO, KITSUNE_OUT_REPO and KITSUNE_CONFIG (required; vast/launch.py passes them),
+# KITSUNE_DATA_REVISION (default main), KITSUNE_MIN_COVERAGE (default 0.99; an extent's join is held to 1.0 whatever it
+# says), HF_TOKEN (vast account env; never printed), KITSUNE_REBUILD_TIMEOUT_MIN (the per-attempt timeout of the audio
+# rebuild in minutes, default 60; vast/launch.py sizes it from the extent record's upstream bytes),
 # KITSUNE_DOWNLOAD_AHEAD (optional, read by 01 itself: how many upstream files download ahead of its ingest, 0..16,
-# default 6, 0 = one at a time; decision F3. Not a flag on the rebuild lines, which the contract keeps byte-identical).
+# default 6, 0 = one at a time; decision F3. Not a flag on the rebuild line, which the contract keeps byte-identical).
 #
-# Extent mode (a run config with an "extent" block, labels from the label box under <extent root>/, e.g. labels/full):
-# the plan requires <root>/COMPLETE.json and <root>/extent.json in the listing (else it refuses, exit 3), downloads the
-# record into $KITSUNE_STATE and asks kitsune.extent.pull_plan for exactly the extent's label files: directory globs for
-# an uncapped source, explicit <stem>.npz/.jsonl files for a capped one (a prefix of a big source), parakeet_out only
-# for a CTC student or with pull_parakeet (the size study pulls both label roots); a CTC run without pull_parakeet (box
-# p01) pulls teacher_out only for its eval sets' eval stems, so its extent and coverage checks read the other stems' ids
-# from parakeet_out (kitsune.extent.label_root_for, fix 9).
-#
-# Study box (KITSUNE_JOB=study, KITSUNE_BOX=A|B|replicate|shakedown; KITSUNE_CONFIG is study/data.json, the data block,
-# which names no student): the students pulled are the box's own (kitsune.study_queue.box_students), each with
-# STUDENT_FILES and, for a Parakeet-derived one, its CC-BY-4.0 MODEL_CARD.md; plus box_extra_dirs (the Parakeet
-# teacher for the speed probes). After the pull, `python -m kitsune.study_queue check-students` refuses (exit 2) a
-# pulled student that is not the registered build (kitsune.prereg.student_problems).
-# The rebuild is `01 --extent-config $KITSUNE_CONFIG`, the canonical ingest sequence the label box ran, so the ids and
-# stems are the labelled ones (KITSUNE_PREP_ARGS is ignored), and coverage is exact: every pulled stem's rebuilt id
-# sidecar hashes to the record's ids_sha256, its teacher ids are a subset of its ids, and every split joins at 1.0.
+# The run config has an "extent" block (labels from the label box under <extent root>/, e.g. labels/full; a config
+# without one is refused, exit 3): the plan requires <root>/COMPLETE.json and <root>/extent.json in the listing (else it
+# refuses, exit 3), downloads the record into $KITSUNE_STATE and asks kitsune.extent.pull_plan for exactly the extent's
+# label files: directory globs for an uncapped source, explicit <stem>.npz/.jsonl files for a capped one (a prefix of a
+# big source), parakeet_out only for a CTC student or with pull_parakeet; a CTC run without pull_parakeet (box p01)
+# pulls teacher_out only for its eval sets' eval stems, so its extent and coverage checks read the other stems' ids from
+# parakeet_out (kitsune.extent.label_root_for, fix 9). The rebuild is `01 --extent-config $KITSUNE_CONFIG`, the
+# canonical ingest sequence the label box ran, so the ids and stems are the labelled ones, and coverage is exact: every
+# pulled stem's rebuilt id sidecar hashes to the record's ids_sha256, its teacher ids are a subset of its ids, and every
+# split joins at 1.0.
 #
 # Full-data box (KITSUNE_JOB=full, KITSUNE_BOX; KITSUNE_CONFIG is the box's data config configs/full/data-*.json, which
 # names no student): the students, extra files (the frozen eval manifest, the selection sidecar) and extra dirs come
@@ -73,7 +62,7 @@ exec 7>&-
 
 KITSUNE_DIR="${KITSUNE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE="${KITSUNE_STATE:-/workspace/kitsune_state}"
-CONFIG="${KITSUNE_CONFIG:-configs/viability.json}"
+CONFIG="${KITSUNE_CONFIG:-}"
 PY="${KITSUNE_PY:-/venv/main/bin/python}"
 [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
 export KITSUNE_DIR CONFIG STATE
@@ -90,6 +79,10 @@ if [ -z "${KITSUNE_DATA_REPO:-}" ]; then
 fi
 if [ -z "${KITSUNE_OUT_REPO:-}" ]; then
     log "KITSUNE_OUT_REPO is not set (vast/launch.py passes it)"
+    exit 2
+fi
+if [ -z "$CONFIG" ]; then
+    log "KITSUNE_CONFIG is not set (vast/launch.py passes it)"
     exit 2
 fi
 if [ -z "${HF_TOKEN:-}" ]; then
@@ -210,7 +203,6 @@ retry() {
 cat > "$HELPER" <<'PYEOF'
 """bootstrap helper: plan / pull / coverage. Reads the run config for sources and paths; a full-data box (KITSUNE_JOB=full)
 also its box registry, and pulls its labels with pull_labels, apart from the rest."""
-import fnmatch
 import json
 import os
 import sys
@@ -235,18 +227,12 @@ selection = cfg["selection"]
 STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json",
                  "student_meta.json", "README.md")
 CTC_CARD = "MODEL_CARD.md"  # a Parakeet-derived student's CC-BY-4.0 attribution (kitsune.ctc_student)
-extra_files, timed_states = [], False  # a full-data box's extra data-repo files; whether it needs the scratch repo
-if os.environ.get("KITSUNE_JOB") == "study":
-    # a size-study box (kitsune/study_queue.py): the data block has no student; the box pulls the student dirs of its
-    # own runs only (box_students), with the Parakeet students' attribution card, and any other dir it needs
-    sys.path.insert(0, str(root))
-    from kitsune import study_queue as _q
-    _box = os.environ["KITSUNE_BOX"]
-    students = _q.box_students(_box)
-    ctc_students = set(_q.box_ctc_students(_box))
-    extra_dirs = _q.box_extra_dirs(_box)
-elif os.environ.get("KITSUNE_JOB") == "full":
-    # a full-data box (kitsune/full_queue.py): the data block has no student either; the box registry (kitsune/fullrun.py,
+# a full-data box's students (each with STUDENT_FILES, and CTC_CARD for a Parakeet-derived one), its extra data-repo
+# files and dirs, and whether it needs the scratch repo; none without KITSUNE_JOB=full (pull_plan pulls the student a
+# config itself names)
+students, ctc_students, extra_dirs, extra_files, timed_states = [], set(), [], [], False
+if os.environ.get("KITSUNE_JOB") == "full":
+    # a full-data box (kitsune/full_queue.py): the data block has no student; the box registry (kitsune/fullrun.py,
     # configs/full/boxes.json of this checkout, which launch.py checked at the same commit) names the train items'
     # students, the extra files (the frozen manifest, the selection sidecar) and dirs. A registry this checkout cannot
     # load is a refusal (exit 3, as refuse() below): a retry would read the same files
@@ -272,9 +258,6 @@ elif os.environ.get("KITSUNE_JOB") == "full":
     except _f.RegistryError as e:
         print(f"box {_box}: {e} (not retried)", file=sys.stderr)
         sys.exit(3)
-else:
-    students, ctc_students, extra_dirs = [cfg["student"].rstrip("/")], set(), []
-student = students[0] if students else ""
 
 
 def student_files(s: str) -> list:
@@ -297,7 +280,6 @@ def refuse(msg: str):
 
 def plan():
     from huggingface_hub import HfApi
-    from huggingface_hub.utils import filter_repo_objects
 
     api = HfApi()
     try:
@@ -334,41 +316,10 @@ def plan():
             refuse(f"HF_TOKEN cannot list {repo}@{rev} ({type(e).__name__}: {e}): check KITSUNE_DATA_REPO, "
                    f"KITSUNE_DATA_REVISION and the token's read access to it (vast/README.md step 2.3)")
         raise
-    if cfg.get("extent"):
-        return plan_extent(files)
-
-    def has(pat: str) -> bool:
-        return any(fnmatch.fnmatch(f, pat) for f in files)
-
-    patterns = [f"{teacher_root}/meta.json", f"{second_root}/meta.json", selection, *(f"{s}/*" for s in students)]
-    required = [f"{selection}", *(f for s in students for f in student_files(s))]
-    for s in names:
-        patterns += [f"{teacher_root}/{s}/*", f"{second_root}/{s}/*"]
-        required.append(f"{teacher_root}/{s}/*.npz")
-    required += [f"{second_root}/{s}/*.jsonl" for s in sources]
-    missing = [p for p in required if not has(p)]
-    # every teacher shard needs its second opinion (the same rule as vast/launch.py data_problems), except for the
-    # sources the run config's selection_recipe.partial_second_opinion trains on their judged shards only
-    partial = set((cfg.get("selection_recipe") or {}).get("partial_second_opinion", []))
-    for s in sources:
-        teacher = {f.rsplit("/", 1)[1][:-4] for f in files if f.startswith(f"{teacher_root}/{s}/") and f.endswith(".npz")}
-        second = {f.rsplit("/", 1)[1][:-6] for f in files if f.startswith(f"{second_root}/{s}/") and f.endswith(".jsonl")}
-        if s in partial:
-            if not teacher & second:
-                missing.append(f"{second_root}/{s}: none of its {len(teacher)} shards has a second opinion")
-        elif teacher - second:
-            missing.append(f"{second_root}/{s}: {len(teacher - second)} of {len(teacher)} shards without a second opinion")
-    if missing:
-        refuse(f"data repo {repo}@{rev} lacks: {missing}")
-    parked = [s for s in names if has(f"{data_root}/shards/{s}/*.parquet")]
-    patterns += [f"{data_root}/shards/{s}/*.parquet" for s in parked]
-    rebuild = [s for s in names if s not in parked]
-    # the files the pull must leave on disk, by snapshot_download's own matcher (pull() checks them)
-    want = list(filter_repo_objects(files, allow_patterns=patterns))
-    out = dict(repo=repo, revision=rev, patterns=patterns, parked=parked, rebuild=rebuild, data_root=data_root,
-               repo_files=len(files), files=want, wall=time.time())
-    plan_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
-    print(f"plan: pull {len(patterns)} patterns; parked audio {parked or 'none'}; rebuild audio {rebuild or 'none'}")
+    if not cfg.get("extent"):
+        refuse(f"{os.environ['CONFIG']} has no extent: a full box rebuilds a sealed label extent (vast/launch.py "
+               f"refuses such a config)")
+    return plan_extent(files)
 
 
 def plan_extent(files: list):
@@ -402,7 +353,8 @@ def plan_extent(files: list):
     problems += [f"no {f}" for f in extra_files if f not in have]
     if problems:
         refuse(f"data repo {repo}@{rev} cannot serve extent {cfg['extent'].get('name')!r}: {problems}")
-    # a study box's students (pull_plan pulls the config's one student, and the data block has none) and other dirs
+    # a full box's students (pull_plan pulls only a student the config itself names, and the data block has none) and
+    # its extra dirs
     p["dir_patterns"] += [f"{d}/*" for d in [*students, *extra_dirs] if f"{d}/*" not in p["dir_patterns"]]
     explicit = [*p["explicit"], *(f for f in extra_files if f not in p["explicit"])]
     labels = None
@@ -416,7 +368,7 @@ def plan_extent(files: list):
     # the files the pull must leave on disk: the globs by snapshot_download's own matcher, plus the explicit files
     want = list(dict.fromkeys([*filter_repo_objects(files, allow_patterns=p["dir_patterns"]), *explicit]))
     rebuild = extent_names(cfg)
-    out = dict(repo=repo, revision=rev, patterns=p["dir_patterns"], parked=[], rebuild=rebuild, data_root=data_root,
+    out = dict(repo=repo, revision=rev, patterns=p["dir_patterns"], rebuild=rebuild, data_root=data_root,
                repo_files=len(files), files=want, wall=time.time(), extent=True, explicit=explicit,
                record=str(Path(path).resolve()))
     if labels is not None:
@@ -434,32 +386,6 @@ def is_label(path: str) -> bool:
     selection, the students and the extra files are not (pull fetches them before the rebuild)."""
     roots = [teacher_root, second_root] + ([cfg["parakeet_root"]] if cfg.get("parakeet_root") else [])
     return any(path.startswith(f"{r}/") and "/" in path[len(r) + 1:] for r in roots)
-
-
-def register_parked(parked: list):
-    """List the pulled shards of the parked sources in <data_root>/manifest.jsonl, as a local ingest would have (the
-    data repo holds no manifest). 01 reads other sources' rows from the manifest - eval_emilia leaves out emilia_yodas's
-    videos ("ingest emilia_yodas first" otherwise), the reazon tiers dedup against the smaller ones - so an unlisted
-    parked source would stop the rebuild. Paths already listed are skipped, so a re-run adds nothing."""
-    if not parked:
-        return
-    import pyarrow.parquet as pq
-
-    sys.path.insert(0, str(root))  # this helper runs from a mktemp path
-    from kitsune.store import ShardInfo, append_manifest, read_manifest
-
-    droot = root / data_root
-    listed = {s.path for s in read_manifest(droot)}
-    new = []
-    for s in parked:
-        for f in sorted((droot / "shards" / s).glob("*.parquet")):
-            rel = f.relative_to(droot).as_posix()
-            if rel not in listed:
-                dur = pq.read_table(f, columns=["duration"]).column("duration").to_pylist()
-                new.append(ShardInfo(rel, s, f.name.rsplit("-", 1)[0], len(dur), sum(dur) / 3600))
-    if new:
-        append_manifest(droot, new)
-    print(f"manifest: listed {len(new)} parked shard(s) of {parked}")
 
 
 def fetch(patterns: list, explicit: list, want: list):
@@ -493,10 +419,9 @@ def pull():
     p = json.loads(plan_path.read_text(encoding="utf-8"))
     t0 = time.time()
     fetch(p["patterns"], p.get("explicit") or [], p["files"])
-    register_parked(p["parked"])
-    dirs = [root / d for d in (teacher_root, second_root, *students, f"{data_root}/shards") if (root / d).is_dir()]
+    dirs = [root / d for d in (teacher_root, second_root, *students) if (root / d).is_dir()]
     size = sum(f.stat().st_size for d in dirs for f in d.rglob("*") if f.is_file())
-    print(f"pulled in {time.time() - t0:.0f} s; derived data + parked shards on disk: {size / 1e9:.2f} GB")
+    print(f"pulled in {time.time() - t0:.0f} s; derived data on disk: {size / 1e9:.2f} GB")
 
 
 def pull_labels():
@@ -582,8 +507,8 @@ def coverage():
         stems_bad = extent_stems(report)
         bad += [f"{len(stems_bad)} extent stem(s) (listed above)"] if stems_bad else []
     # extent mode: each stem's ids come from the one root label_dir names (fix 9: parakeet_out on a CTC box without
-    # pull_parakeet, whose train stems have no teacher_out); an AED or both-roots box, and the legacy pull, read
-    # teacher_out only
+    # pull_parakeet, whose train stems have no teacher_out); an AED or both-roots box, and a config without an extent,
+    # read teacher_out only
     roots = [teacher_root] + ([cfg["parakeet_root"]] if cfg.get("extent") and cfg.get("parakeet_root") else [])
     for s in names:
         # per split (<split>-NNNNN in both trees), as the trainer joins them: pooled over a source's splits,
@@ -648,13 +573,6 @@ fi
 # files renamed when done, and snapshot_download skips what is already on disk (~2.3 GB in all)
 phase plan retry 3 timeout -k 30 10m "$PY" "$HELPER" plan
 phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull
-if [ "${KITSUNE_JOB:-}" = "study" ]; then
-    # every pulled student is the registered build (kitsune.prereg.student_problems through study_queue.student_checks:
-    # stage, family, init class, seed, the exact parameter counts, a pruned student's calibration ids). launch.py
-    # checked the data repo's metas before renting; this checks the files the box will train, before the audio rebuild
-    # it would otherwise pay for. Exit 2 (a refusal) stops the bootstrap
-    phase check_students "$PY" -m kitsune.study_queue check-students --box "$KITSUNE_BOX" --root "$KITSUNE_DIR"
-fi
 if [ "${KITSUNE_JOB:-}" = "full" ]; then
     # DECISIONS H14: a box whose train items continue other boxes' runs (registry `continues`, box p-cool) is always a
     # resume, KITSUNE_RESUME or not (launch sets it for such a box anyway): its queue refuses to start without the
@@ -672,8 +590,10 @@ if [ "${KITSUNE_JOB:-}" = "full" ]; then
         phase resume_pull retry 3 timeout -k 30 60m "$PY" -m kitsune.full_queue resume-pull --box "$KITSUNE_BOX" \
             --root "$KITSUNE_DIR"
     fi
-    # the box registry's students are the registered builds (kitsune.prereg.student_problems), as for a study box;
-    # exit 2 refuses
+    # the box registry's students are the registered builds (kitsune.prereg.student_problems: stage, family, init
+    # class, seed, the exact parameter counts, a pruned student's calibration ids). launch.py checked the data repo's
+    # metas before renting; this checks the files the box will train, before the audio rebuild it would otherwise pay
+    # for. Exit 2 (a refusal) stops the bootstrap
     phase check_students "$PY" -m kitsune.fullrun check-students --box "$KITSUNE_BOX" --root "$KITSUNE_DIR"
     # decision 13: the labels (tens of GB at the full extent) come down while 01 rebuilds the audio, per attempt
     # within the gate's KITSUNE_PULL_TIMEOUT_MIN; pull_labels_wait below fails the bootstrap on a failed pull, and a
@@ -684,35 +604,22 @@ if [ "${KITSUNE_JOB:-}" = "full" ]; then
     phase pull_labels retry 3 timeout -k 30 "${KITSUNE_PULL_TIMEOUT_MIN:-30}m" "$PY" "$HELPER" pull_labels &
     LABELS_PID=$!
     log "pull_labels runs in the background (pid $LABELS_PID)"
-    # the rebuild's toucher lasts its three attempts of KITSUNE_REBUILD_TIMEOUT_MIN (at least the 60 min of the
-    # non-extent line): at the gate's floor rate the full extent's ~481 min per attempt make ~24 h, past the 12 h
-    # default, so the watchdog stops a box only once the rebuild's own timeouts have run out, never a slow healthy one
+    # the rebuild's toucher lasts its three attempts of KITSUNE_REBUILD_TIMEOUT_MIN (at least 60 min, the line's
+    # default): at the gate's floor rate the full extent's ~481 min per attempt make ~24 h, past the 12 h default, so
+    # the watchdog stops a box only once the rebuild's own timeouts have run out, never a slow healthy one
     REBUILD_HB_MIN=${KITSUNE_REBUILD_TIMEOUT_MIN:-60}
     PHASE_HB_MAX_S=$(phase_budget_s 3 "$(( REBUILD_HB_MIN > 60 ? REBUILD_HB_MIN : 60 ))")
 fi
 
 DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["data_root"])' "$STATE/bootstrap_plan.json")"
-mapfile -t REBUILD < <("$PY" -c 'import json, sys; print("\n".join(json.load(open(sys.argv[1]))["rebuild"]))' "$STATE/bootstrap_plan.json" | sed '/^$/d')
-EXTENT="$("$PY" -c 'import json,sys; print("1" if json.load(open(sys.argv[1])).get("extent") else "")' "$STATE/bootstrap_plan.json")"
-if [ "${#REBUILD[@]}" -gt 0 ] && [ -z "$EXTENT" ]; then
-    read -r -a PREP_ARGS <<< "${KITSUNE_PREP_ARGS:-}"
-    # 01 resumes from its progress.json and manifest and its writes are kill-safe, so a retry, or a timeout that proves
-    # too short for a healthy rebuild, only redoes the input in progress; 3 x 60 min caps a stall well before the
-    # 5.5 h watchdog
-    phase rebuild_audio retry 3 timeout -k 60 60m "$PY" scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" \
-        --sources "${REBUILD[@]}" "${PREP_ARGS[@]}"
-elif [ -n "$EXTENT" ]; then
-    # the canonical ingest sequence the label box ran, capped by the config's extent (a retry skips 01's finished
-    # inputs and steps); vast/launch.py sizes the per-attempt timeout from the record's upstream bytes. 01 downloads up
-    # to KITSUNE_DOWNLOAD_AHEAD (default 6) inputs ahead of its ingest (F3; box 1 spent 3.1 h on 571 GB one at a time)
-    # with the same output, retries transient Hub errors itself and exits on a download stuck for 15 min, which this
-    # retry re-runs (the files it fetched ahead are cache hits then). train_hb stays this phase's toucher's job
-    [ -z "${KITSUNE_PREP_ARGS:-}" ] || log "KITSUNE_PREP_ARGS ignored: the config's extent defines the rebuild"
-    phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \
-        scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" --extent-config "$CONFIG"
-else
-    log "every source has parked shards; nothing to rebuild"
-fi
+# the canonical ingest sequence the label box ran, capped by the config's extent. 01 resumes from its progress.json and
+# manifest and its writes are kill-safe, so a retry (or a timeout that proves too short for a healthy rebuild) skips
+# 01's finished inputs and steps; vast/launch.py sizes the per-attempt timeout from the record's upstream bytes. 01
+# downloads up to KITSUNE_DOWNLOAD_AHEAD (default 6) inputs ahead of its ingest (F3; box 1 spent 3.1 h on 571 GB one at
+# a time) with the same output, retries transient Hub errors itself and exits on a download stuck for 15 min, which this
+# retry re-runs (the files it fetched ahead are cache hits then). train_hb stays this phase's toucher's job
+phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \
+    scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" --extent-config "$CONFIG"
 if [ "${KITSUNE_JOB:-}" = "full" ] && [ -n "${LABELS_PID:-}" ]; then
     PHASE_HB_MAX_S=$LABELS_HB_MAX_S  # the wait lasts at most what is left of the pull's own budget
     phase pull_labels_wait wait "$LABELS_PID"  # the label pull's exit: a failed pull fails here, before coverage

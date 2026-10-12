@@ -158,7 +158,7 @@ system's metrics gain m4_nostyle, m4_all (M4 with Galgame's whole set, kitsune.e
 and m3 (the gate sets; with _teacher / _ratio for the raw ones).
 
 Usage:
-  python scripts/05_evaluate.py --root D:/Shizu-ko-distill --config configs/viability.json \
+  python scripts/05_evaluate.py --root D:/Shizu-ko-distill --config runs/<run_id>/config.json \
       --ckpt runs/<run_id>/checkpoints/step_<N> --out <dir> [--probe] [--sets eval_jsut eval_cv8] [--vram-frac 0.95]
   python scripts/05_evaluate.py --config configs/study/study-p01.json --ckpt <step dir> --out <dir> --probe \
       --tables evals/study                                       # a CTC student on the manifest, its tables
@@ -205,7 +205,6 @@ from kitsune import trainset  # noqa: E402
 from kitsune.runlog import _finite, _replace  # noqa: E402
 from kitsune.store import fsync_path  # noqa: E402
 
-DEFAULT_CONFIG = "configs/viability.json"
 # config keys holding paths, resolved against --root when relative (cache_dir is replaced by --cache-dir); a null one
 # (parakeet_root outside the study) stays null
 PATH_KEYS = ("student", "data_root", "teacher_root", "second_root", "selection", "runs_root", "parakeet_root")
@@ -1681,8 +1680,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="no model: the tables of cohere, parakeet-ctc and parakeet-tdt from their stored hypotheses")
     ap.add_argument("--from-evals", default=None, metavar="DIR",
                     help="no model: a system's tables from an eval dir's greedy_<set>.parquet (needs --system)")
-    ap.add_argument("--config", default=DEFAULT_CONFIG,
-                    help="trainer config or a run's config.json (default %(default)s)")
+    ap.add_argument("--config", default=None,
+                    help="trainer config or a run's config.json (required, except for --from-evals with --manifest)")
     ap.add_argument("--root", default=str(ROOT),
                     help="data checkout the config's relative paths resolve against (default: this repo)")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -1745,6 +1744,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         ap.error("--ckpt is required (the weights dir to evaluate)")
     if args.from_evals and not args.system:
         ap.error("--from-evals needs --system (the name its tables go under)")
+    if args.config is None and not args.from_evals:
+        ap.error("--config is required (a trainer config or a run's config.json)")
     if args.anchor and args.probe:
         ap.error("--anchor has no probe: the anchor was trained on another run's data")
     if args.max_temp and not args.resume_temp < args.max_temp:
@@ -1935,7 +1936,7 @@ def main_from_evals(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
     log = EvalLog(out / "events.jsonl")
     cfg = None
-    if not args.manifest or args.config != DEFAULT_CONFIG:
+    if args.config is not None:
         cfg, _ = load_cfg(load_trainer(), args)
     mpath = manifest_path(args, cfg)
     if mpath is None:

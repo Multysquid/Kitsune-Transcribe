@@ -3,11 +3,12 @@ vast/watchdog.sh on train_hb, vast/blocklist.json.
 
 launch: the box registry (kitsune/fullrun.py, tests/fixtures_full.tiny_registry) read at the commit the box runs (a
 fake git serves a temp checkout), the query, env table and label of box p01 and the 2-GPU box full, the client filter
-(verification, max rental, RAM per GPU, avoided machines), the ranking by the estimated total, --machine, --tier a100,
-the flag refusals, full_preflight's refusals (configs, tools and speed_probe kinds or args flags missing at the sha,
+(verification, max rental, RAM per GPU, avoided machines), the ranking by the estimated total, --machine, the flag
+refusals, full_preflight's refusals (configs, tools and speed_probe kinds or args flags missing at the sha,
 students, extra files, the scratch repo, the selection sidecar via a stub kitsune.devslice, --resume's Hub summary and
-run ids), the blocklist and the gate refusals. finish: --job full is lean with its infra under full/box-<box>/, never uploads or expects SCRATCH_MARK,
-and --abort destroys a box without a run dir, stops one with a run dir, and is --stop --no-sync for any other job.
+run ids), the blocklist and the gate refusals. finish: --job full is lean with its infra under full/box-<box>/, never
+uploads or expects SCRATCH_MARK, backs off on what a retry fixes, and --abort destroys a box without a run dir, stops
+one with a run dir, and is --stop --no-sync for the label box.
 watchdog: train_hb stale -> sync and stop with the box reason; alert mode writes watchdog_alerts.jsonl and re-arms.
 No network, no vastai CLI, no GPU; the shell tests need Git Bash.
 """
@@ -208,14 +209,15 @@ def test_min_disk_bw_lowers_only_the_disk_floor(full_launch, capsys):
         with pytest.raises(SystemExit):
             launch.main(["--job", "full", "--box", "p01", "--min-disk-bw", bad, "--dry-run"])
     with pytest.raises(SystemExit):  # a full-only flag
-        launch.main(["--job", "train", "--min-disk-bw", "300", "--dry-run"])
+        launch.main(["--job", "label", "--data-repo", DATA, "--min-disk-bw", "300", "--dry-run"])
+    assert "--min-disk-bw: for --job full only" in capsys.readouterr().err
 
 
 def test_cost_guards_drop_dear_traffic_and_totals_over_the_cap():
     """2026-10-01: with the cheap offers gone, the ranking's winner under the $/h cap charged $0.039/GB both ways (~$53
     expected for a ~$26 run). A full job now drops traffic over FULL_MAX_GB_COST and totals over max_total."""
     from dataclasses import replace
-    job = replace(launch.full_job("p01", {"gpus": 1}, "5090", 20.0, 22.0, 1.0), est_down_gb=600.0, est_up_gb=50.0)
+    job = replace(launch.full_job("p01", {"gpus": 1}, 20.0, 22.0, 1.0), est_down_gb=600.0, est_up_gb=50.0)
     assert job.max_gb_cost == launch.FULL_MAX_GB_COST == 0.01
     dear = offer(1, 11, 0.80, inet_down_cost=0.039, inet_up_cost=0.039)
     fair = offer(2, 12, 0.95)
@@ -244,7 +246,8 @@ def test_cost_guard_flags_are_full_only_and_positive(full_launch, capsys):
         with pytest.raises(SystemExit):
             launch.main(["--job", "full", "--box", "p01", *args, "--dry-run"])
     with pytest.raises(SystemExit):
-        launch.main(["--job", "train", "--max-total", "30", "--dry-run"])
+        launch.main(["--job", "label", "--data-repo", DATA, "--max-total", "30", "--dry-run"])
+    assert "--max-total: for --job full only" in capsys.readouterr().err
 
 
 def test_box_full_rents_two_gpus_under_its_cap_and_ranks_by_the_total(full_launch, capsys):
@@ -260,13 +263,6 @@ def test_box_full_rents_two_gpus_under_its_cap_and_ranks_by_the_total(full_launc
     assert env["KITSUNE_N_GPUS"] == "2" and env["KITSUNE_MAX_HOURS"] == "47" and env["KITSUNE_MACHINE_ID"] == "12"
     assert created(fake)[3] == "2", "the est_total winner, not the cheapest $/h"
     assert "machine" in out and "est$" in out and "verif" in out and "maxd" in out  # the table shows the filter
-    # --tier a100: the A100 terms and option C's cap
-    a100 = [offer(4, 21, 2.50, gpu_name="A100 SXM4", gpu_ram=40960, num_gpus=2, cpu_ram=130000)]
-    rc, fake = full_launch([a100], "--box", "full", "--scratch-repo", SCRATCH, "--tier", "a100", "--dry-run")
-    assert rc == 0, capsys.readouterr().out
-    q = search_query(fake)
-    assert "gpu_name in [A100_SXM4,A100_PCIE]" in q and "gpu_ram<=48" in q and "RTX_5090" not in q
-    assert created(fake) is None
 
 
 def test_the_client_filter_keeps_only_verified_long_rentals_with_the_ram(full_launch, capsys, monkeypatch):
@@ -285,14 +281,14 @@ def test_the_client_filter_keeps_only_verified_long_rentals_with_the_ram(full_la
     assert "avoiding machine 8: its download gate said slow" in out
     assert env_of(created_or_printed(out))["KITSUNE_MACHINE_ID"] == "7"
     spec = {"gpus": 1}
-    j = launch.full_job("p01", spec, "5090", 19.5, 22, 1.0)
+    j = launch.full_job("p01", spec, 19.5, 22, 1.0)
     now = time.time()
     assert launch.offer_problems(offer(1, 1, 0.5, verification="unverified"), j, now)
     assert launch.offer_problems(offer(1, 1, 0.5, duration=None), j, now) == ["max rental unknown < 4 d"]
     assert launch.offer_problems(offer(1, 1, 0.5, duration=None, end_date=now + 5 * DAY), j, now) == []
-    assert launch.offer_problems(offer(1, 1, 0.5, cpu_ram=126367), launch.full_job("full", {"gpus": 2}, "5090", 41.9,
-                                                                                    47, 1.7), now)
-    # the other jobs filter nothing on the client (their JobSpec defaults)
+    assert launch.offer_problems(offer(1, 1, 0.5, cpu_ram=126367), launch.full_job("full", {"gpus": 2}, 41.9, 47, 1.7),
+                                 now)
+    # the label job filters nothing on the client (its JobSpec defaults)
     assert launch.offer_problems(offer(1, 1, 0.5, verification="unverified", duration=0), launch.JOBS["label"]) == []
 
 
@@ -302,17 +298,17 @@ def test_a_registry_min_ram_and_a_long_cap_tighten_the_filter(full_launch, repo,
     filter round(0.97 x it x 1000) MB, so vast's 96 GB machines listed at 95,758 MB stay; None keeps 64,000 MB a GPU
     and the query's 60. A cap past MIN_RENTAL_DAYS raises the rental floor to cap / 24 + 0.5 d."""
     now = time.time()
-    j = launch.full_job("full-t", {"gpus": 1, "min_ram_gb": 96}, "5090", 26.0, 37, 1.1)
+    j = launch.full_job("full-t", {"gpus": 1, "min_ram_gb": 96}, 26.0, 37, 1.1)
     assert "cpu_ram>=90" in j.base_filter and j.ram_mb_min == 93120 and j.min_rental_days == 4
     assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=95758), j, now) == []
     assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=64439), j, now) == ["cpu_ram 64439 MB < 93120 MB"]
-    j0 = launch.full_job("p01", {"gpus": 1, "min_ram_gb": None}, "5090", 19.5, 22, 1.0)
+    j0 = launch.full_job("p01", {"gpus": 1, "min_ram_gb": None}, 19.5, 22, 1.0)
     assert "cpu_ram>=60" in j0.base_filter and j0.ram_mb_min == 0
     assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=64439), j0, now) == []
     assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=63183), j0, now) == ["cpu_ram 63183 MB < 64000 MB"]
     assert "cpu_ram>=120" in launch.full_filter(2, min_ram_gb=96)  # never below 60 a GPU
     # a hypothetical long box (104 h, as a 10-epoch box T would have been): the floor rises past 4 d
-    long = launch.full_job("full-t", {"gpus": 1, "min_ram_gb": 96}, "5090", 78.9, 104, 1.1)
+    long = launch.full_job("full-t", {"gpus": 1, "min_ram_gb": 96}, 78.9, 104, 1.1)
     assert long.min_rental_days == launch.min_rental_days(104) == 4.83
     assert launch.offer_problems(offer(1, 1, 0.6, cpu_ram=96000, duration=4.2 * DAY), long, now) == [
         "max rental 4.2 d < 4.83 d"]
@@ -365,9 +361,8 @@ def test_machine_picks_that_machine_or_refuses(full_launch, capsys):
     (["--box", "p01", "--scratch-repo", SCRATCH, "--disk-gb", "900"], "--disk-gb 900 is below the 1400 GB"),
     (["--box", "p01", "--scratch-repo", SCRATCH, "--config", "configs/full/data-full.json"],
      "data config is configs/full/data-p01.json"),
-    (["--box", "p01", "--scratch-repo", SCRATCH, "--no-hf-check"], "--job full needs the HF preflight"),
     (["--box", "p01", "--scratch-repo", SCRATCH, "--max-dph", "0.5"], "no 1x RTX 5090 offer matches the full-box"),
-], ids=["gpus", "no-scratch", "scratch-is-out", "disk", "config", "no-hf-check", "max-dph"])
+], ids=["gpus", "no-scratch", "scratch-is-out", "disk", "config", "max-dph"])
 def test_launch_full_refusals(full_launch, capsys, args, err):
     rc, fake = full_launch([[offer(1, 70001, 0.81)]], *args, "--yes")
     out = capsys.readouterr().out
@@ -376,9 +371,12 @@ def test_launch_full_refusals(full_launch, capsys, args, err):
 
 def test_launch_full_argument_errors(full_launch, capsys):
     for args, err in ((["--job", "full"], "--job full needs --box"),
-                      (["--job", "full", "--box", "A"], "--box A is not a box of --job full"),
-                      (["--job", "study", "--box", "p01"], "--box p01 is not a box of --job study"),
-                      (["--job", "train", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
+                      (["--box", "p01"], "the following arguments are required: --job"),
+                      (["--job", "full", "--box", "A"], "argument --box: invalid choice: 'A'"),
+                      (["--job", "study", "--box", "p01"], "argument --job: invalid choice: 'study'"),
+                      (["--job", "train"], "argument --job: invalid choice: 'train'"),
+                      (["--job", "label", "--box", "p01"], "--box: for --job full only"),
+                      (["--job", "label", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
                        "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, "
                        "augment.concat_p, augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, "
@@ -406,8 +404,8 @@ def test_launch_full_argument_errors(full_launch, capsys):
                         "full-p01-20260927T120000Z:augment.seed=7"], "may change on a resume"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=8",
                         "--resume-set", "full-p01-20260927T120000Z:schedule.epochs=9"], "given twice"),
-                      (["--job", "train", "--allow-done-trains"], "--allow-done-trains: for --job full only"),
-                      (["--job", "train", "--fresh-over-done"], "--fresh-over-done: for --job full only"),
+                      (["--job", "label", "--allow-done-trains"], "--allow-done-trains: for --job full only"),
+                      (["--job", "label", "--fresh-over-done"], "--fresh-over-done: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume", "--fresh-over-done"],
                        "--fresh-over-done is for a launch without --resume"),
                       (["--job", "full", "--box", "p01", "--fresh-over-done", "--resume-reset",
@@ -1372,7 +1370,7 @@ def test_the_allow_continued_runs_flag_reaches_the_preflight_and_is_full_only(fu
     assert rc == 0, capsys.readouterr().out
     assert full_launch.seen["preflight"][1]["allow_continued_runs"] is True
     with pytest.raises(SystemExit):
-        launch.main(["--job", "train", "--data-repo", DATA, "--out-repo", RUNS, "--allow-continued-runs"])
+        launch.main(["--job", "label", "--data-repo", DATA, "--out-repo", RUNS, "--allow-continued-runs"])
     assert "--allow-continued-runs: for --job full only" in capsys.readouterr().err
 
 
@@ -1556,13 +1554,12 @@ def test_allow_unverified_quant_reaches_the_preflight_and_is_full_only(full_laun
                         SCRATCH)
     assert rc == 0 and full_launch.seen["preflight"][1]["allow_unverified_quant"] is False
     with pytest.raises(SystemExit):
-        launch.main(["--job", "study", "--box", "A", "--data-repo", DATA, "--out-repo", RUNS,
-                     "--allow-unverified-quant"])
+        launch.main(["--job", "label", "--data-repo", DATA, "--allow-unverified-quant"])
     assert "--allow-unverified-quant: for --job full only" in capsys.readouterr().err
 
 
 def test_offers_in_a_country_without_hub_access_are_dropped():
-    job = launch.full_job("smoke-b", {"gpus": 1}, "5090", 1.75, 3, 1.0)
+    job = launch.full_job("smoke-b", {"gpus": 1}, 1.75, 3, 1.0)
     assert job.avoid_countries == ("CN",)
     for geo, bad in ((", CN", True), ("Beijing, CN", True), ("Tokyo, JP", False), ("Hong Kong, HK", False),
                      (None, False)):
@@ -1572,7 +1569,7 @@ def test_offers_in_a_country_without_hub_access_are_dropped():
         if bad:
             assert problems == [f"geolocation {geo!r}: the Hugging Face Hub is not reachable from there"]
     cn = offer(1, 58555, 0.5, cpu_ram=64439, geolocation=", CN")
-    assert launch.offer_problems(cn, launch.JOBS["train"]) == []  # the other jobs keep their filters
+    assert launch.offer_problems(cn, launch.JOBS["label"]) == []  # the label job keeps its filters
     assert [o["id"] for o in launch.rank_offers([cn, offer(2, 149252, 0.72, cpu_ram=64439, geolocation="Japan, JP")],
                                                 job)] == [2]
 
@@ -1626,15 +1623,18 @@ def test_gate_refusals_avoid_slow_hosts_for_30_days(monkeypatch):
 
 
 def test_every_job_avoids_the_blocklist(monkeypatch, capsys):
-    """The train job's ranking skips a blocklisted machine too (vast/blocklist.json is for every job)."""
-    import test_infra as ti
-
-    fake = ti.FakeVastai([[dict(ti.OFFERS_40[1], machine_id=151760), ti.OFFERS_40[0]]])
+    """The label job's ranking skips a blocklisted machine too (vast/blocklist.json is for every job; the full job's:
+    test_box_p01_rents_one_5090_with_the_registrys_numbers)."""
+    monkeypatch.setattr(launch, "config_at", lambda sha, c: {"selection": "labels/full/selections/full.parquet"})
+    monkeypatch.setattr(launch, "label_preflight", lambda *a, **kw: ("d" * 40, [], []))
+    monkeypatch.setattr(launch, "avoided_machines", lambda *a, **kw: (set(), []))
+    fake = FakeVastai([[offer(1, 151760, 0.50), offer(2, 9002, 0.60)]])
     monkeypatch.setattr(launch.shutil, "which", lambda name: "/fake/vastai" if name == "vastai" else None)
     monkeypatch.setattr(launch.subprocess, "run", fake)
-    assert launch.main(ti.launch_args("--dry-run")) == 0
+    assert launch.main(["--job", "label", "--data-repo", DATA, "--sha", SHA, "--image", DIGEST_IMAGE,
+                        "--skip-git-checks", "--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "avoiding machine 151760" in out and "create instance 222" in out
+    assert "avoiding machine 151760" in out and "vastai create instance 2 " in out
 
 
 # ====================================================================================================== finish
@@ -1663,11 +1663,15 @@ def test_finish_names_match_the_full_core():
 
 def test_lean_full_files_never_hold_a_marker_nor_a_timed_state(tmp_path):
     run = full_run(tmp_path)
-    got = {p.split("/", 2)[2] for p in finish.expected_files(run, False, lean=True)}
+    got = {p.split("/", 2)[2] for p in finish.expected_files(run)}
     assert got == {"config.json", "events.jsonl", "summary.json", "checkpoints/step_900/model.safetensors",
                    "checkpoints/step_1000/model.safetensors", "checkpoints/full_step_800/model.pt"}
-    # even a job that expects the newest full state never uploads the scratch marker
-    assert not any(p.endswith(finish.SCRATCH_MARK) for p in finish.expected_files(run))
+    # even a config that uploads its end state (the newest, timed) never uploads the scratch marker
+    cfg = {"schedule": {"clock": "epochs"}, "ckpt": {"upload_full_at": ["pre_cooldown", "end"]}}
+    (run / "config.json").write_text(json.dumps({"config": cfg}), encoding="utf-8")
+    exp = finish.expected_files(run)
+    assert "checkpoints/full_step_1000/model.pt" in {p.split("/", 2)[2] for p in exp}
+    assert not any(p.endswith(finish.SCRATCH_MARK) for p in exp)
 
 
 class FinishHub:
@@ -1682,7 +1686,7 @@ class FinishHub:
         self.sent.update({op.path_in_repo: op.path_or_fileobj for op in kw["operations"]})
 
     def list_repo_tree(self, repo, path_in_repo=None, recursive=False, repo_type=None):
-        exp = finish.expected_files(self.run, False, lean=True)
+        exp = finish.expected_files(self.run)
         return [SimpleNamespace(path=p, size=f.stat().st_size, lfs=None, blob_id=finish.git_blob_id(f))
                 for p, f in exp.items()]
 
@@ -1714,7 +1718,14 @@ def full_finish(tmp_path, monkeypatch):
     return go
 
 
-def test_finish_full_is_lean_with_its_infra_under_the_box(full_finish):
+def test_finish_full_is_lean_with_its_infra_under_the_box(full_finish, monkeypatch):
+    """The checkpoints the run's config and markers send to the Hub, never a timed or resume state; the infra under
+    full/box-<box>/infra/<container>/ with the queue's per-item logs (a big one as its end) and each state a re-arm
+    moved aside; the top level of the state dir only without deep."""
+    (full_finish.state / "logs" / "stores-ctc.log").write_bytes(b"x" * 100 + b"stores: train 12 utts\n")
+    (full_finish.state / "rearm-20261001T000000Z").mkdir()
+    (full_finish.state / "rearm-20261001T000000Z" / "events.jsonl").write_bytes(b'{"kind": "resume_plan"}\n')
+    monkeypatch.setattr(finish, "INFRA_MAX_FILE_BYTES", 30)
     rc, hub, actions, _ = full_finish("--destroy")
     assert rc == 0 and actions == ["destroy"]
     ck = [p for pats in hub.uploads for p in pats if p.startswith("checkpoints/")]
@@ -1722,6 +1733,10 @@ def test_finish_full_is_lean_with_its_infra_under_the_box(full_finish):
     assert not any("full_step_1000" in p or "full_step_600" in p or p.endswith(finish.SCRATCH_MARK) for p in ck)
     infra = [p for c in hub.commits for p in c]
     assert "full/box-p01/infra/C77/queue.json" in infra and "full/box-p01/infra/C77/logs/full-p01.log" in infra
+    sent = {p.split("/infra/C77/", 1)[1]: v for p, v in hub.sent.items() if "/infra/C77/" in p}
+    assert sent["logs/stores-ctc.log"] == (b"x" * 100 + b"stores: train 12 utts\n")[-30:]
+    assert sent["rearm-20261001T000000Z/events.jsonl"].startswith(b'{"kind": "resume_plan"}')
+    assert [n for n, _ in finish.infra_files()] == [n for n, _ in finish.infra_files(deep=True) if "/" not in n]
 
 
 def test_abort_destroys_a_box_without_a_run_dir_with_the_gates_reason(full_finish):
@@ -1746,17 +1761,55 @@ def test_abort_stops_a_box_with_a_run_dir(full_finish):
     assert ab["destroyed"] is False and ab["reason"] == "bootstrap failed"
 
 
-@pytest.mark.parametrize("job", ["study", "train", "label"])
-def test_abort_is_stop_no_sync_for_every_other_job(full_finish, monkeypatch, job):
-    monkeypatch.setenv("KITSUNE_JOB", job)
-    if job == "label":
-        seen = {}
-        monkeypatch.setattr(finish, "label_main", lambda args: seen.update(vars(args)) or 0)
-        assert finish.main(["--abort", "--reason", "x"]) == 0
-        assert seen["stop"] is True and seen["no_sync"] is True and seen["abort"] is False
-        return
-    rc, hub, actions, events = full_finish("--abort", "--reason", "onstart failed", run=False)
-    assert rc == 0 and actions == ["stop"] and not [e for e in events if e["kind"] == "abort"]
+def test_abort_is_stop_no_sync_for_the_label_box(full_finish, monkeypatch):
+    monkeypatch.setenv("KITSUNE_JOB", "label")
+    seen = {}
+    monkeypatch.setattr(finish, "label_main", lambda args: seen.update(vars(args)) or 0)
+    assert finish.main(["--abort", "--reason", "x"]) == 0
+    assert seen["stop"] is True and seen["no_sync"] is True and seen["abort"] is False
+
+
+def test_hub_retry_backs_off_exponentially_and_only_on_what_a_retry_fixes(monkeypatch):
+    waits = []
+    monkeypatch.setattr(finish.time, "sleep", waits.append)
+    assert finish.HUB_RETRY_WAITS[0] == 5 and max(finish.HUB_RETRY_WAITS) == 600
+    assert all(b >= a for a, b in zip(finish.HUB_RETRY_WAITS, finish.HUB_RETRY_WAITS[1:]))
+
+    def err(status):
+        e = RuntimeError(f"HTTP {status}")
+        e.response = SimpleNamespace(status_code=status)
+        return e
+
+    tries = []
+
+    def flaky():
+        tries.append(1)
+        if len(tries) < 4:
+            raise err(429)
+        return "ok"
+
+    assert finish.hub_retry(flaky, "x") == "ok" and len(waits) == 3
+    # each wait is the schedule's plus up to HUB_RETRY_JITTER of it (two racing writers do not retry in lockstep)
+    assert all(w <= got <= w * (1 + finish.HUB_RETRY_JITTER) for w, got in zip(finish.HUB_RETRY_WAITS, waits))
+    waits.clear()
+    with pytest.raises(RuntimeError, match="401"):
+        finish.hub_retry(lambda: (_ for _ in ()).throw(err(401)), "x")
+    assert waits == []  # a refused token is not retried
+    assert finish.retryable(err(503)) and finish.retryable(RuntimeError("connection reset"))
+    assert not finish.retryable(err(404))
+    # a commit that raced another writer (409 "another commit is in progress", 412 "a commit has happened since") is
+    # the Hub asking for a later try: a box's trainers and its queue commit into one runs repo at the same time
+    assert finish.retryable(err(409)) and finish.retryable(err(412)) and finish.retryable(err(408))
+    waits.clear()
+    tries.clear()
+
+    def racing():
+        tries.append(1)
+        if len(tries) < 3:
+            raise err(409 if len(tries) == 1 else 412)
+        return "committed"
+
+    assert finish.hub_retry(racing, "x") == "committed" and len(waits) == 2
 
 
 # ==================================================================================================== watchdog
@@ -2297,7 +2350,7 @@ def test_the_halt_retry(tmp_path, case):
     still up: the stop is requested again (job full only; never with KITSUNE_NO_SELF_STOP=1, nor for a marker older
     than the watchdog)."""
     bash = need_bash()
-    extra = dict(KITSUNE_JOB="full" if case != "not-full" else "study", KITSUNE_WATCHDOG_HALT_RETRY_S="1",
+    extra = dict(KITSUNE_JOB="full" if case != "not-full" else "label", KITSUNE_WATCHDOG_HALT_RETRY_S="1",
                  FAKE_SLEEP_MAX="6")
     env, state, record = box_watchdog(tmp_path, "0", "stop", **extra)
     if case == "no-self-stop":

@@ -68,7 +68,7 @@ without the decoupled L2-SP term (kitsune.evaluate.combined_loss) - as three ser
 They are the first cards of 2_loss_accuracy (00_combined/) and one Custom Scalars chart overlays them
 (kitsune.runlog.TB_LAYOUT); each eval's summary.json keeps the sums under combined_loss.
 
-Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and the full configs): after every
+Early stop (early_stop.enabled; off in DEFAULTS, on in the full configs, as it was in the viability run's): after every
 eval inside the loop (never the step-0 eval, never the final one) the metric - "probe_kl" (teacher-forced KL on the
 train probe), "heldout_kl" (the gate sets' pooled held-out KL, as the verdict reads it) or "train_loss" (the mean
 loss/objective = w_kl * KL + w_ce * CE of the optimizer steps since the previous eval; not loss/total, whose decoupled
@@ -93,9 +93,9 @@ scalars early_stop/{value,best,evals_since_best,triggered} follow every checked 
 the full state: a resumed run continues the patience count, and one that had already triggered "stop" goes straight
 to the end phase (a triggered cooldown carries on to its end).
 
-Exit codes (vast/supervise.py and kitsune/full_queue.py key on them): 0 finished, 3 throughput too low, 1
-anything else. Any exception is logged as an event with its traceback, a partial summary.json is written and the logs
-are force-synced before the exception propagates.
+Exit codes (kitsune/full_queue.py keys on them): 0 finished, 3 throughput too low, 1 anything else. Any exception
+is logged as an event with its traceback, a partial summary.json is written and the logs are force-synced before the
+exception propagates.
 
 Checkpoints under runs/<run_id>/checkpoints/:
   step_<N>/        bf16 weights via kitsune.student.save_student (processor + student_meta.json with a `trained`
@@ -226,9 +226,9 @@ the crash path and --resume; it lives in the environment so a resumed run does n
 Heavy imports (transformers, the eval/student/logging modules) happen inside main(): DataLoader workers are spawned
 and re-import this file as __mp_main__, and should only pay for torch.
 
-Usage:
-  python scripts/04_distill.py --config configs/viability.json --set hf.output_repo=<user>/<repo>
-  python scripts/04_distill.py --config configs/viability.json --resume runs/<run_id>/checkpoints/full_step_<N>
+Usage (a full box's queue runs it for each train item, kitsune/full_queue.py):
+  python scripts/04_distill.py --config configs/full/full-p01.json --set hf.output_repo=<user>/<repo>
+  python scripts/04_distill.py --config configs/full/full-p01.json --resume runs/<run_id>/checkpoints/full_step_<N>
 
 Full-data runs: dev slice, early stopping v2, COOLDOWN, resume reset, deadline cooldown, 4c (every default below is
 the trainer as it was before them; configs/full/*.json turn them on):
@@ -447,8 +447,8 @@ TERM_TAGS = dict(kl="loss/kl", ce="loss/ce", top1_match="tok/top1", student_entr
                  teacher_tail="tok/tail_teacher", teacher_p1="tok/teacher_p1")
 BUCKETS = (("p1_gt_0.99", lambda p1: p1 > 0.99), ("p1_lt_0.9", lambda p1: p1 < 0.9))
 
-# Defaults = the viability run (configs/viability.json spells out the same values, and turns early_stop on). Paths are
-# relative to the repo root.
+# Defaults = the viability run's values (its config, `git show 76b28a1:configs/viability.json`, spelled out the same
+# ones and turned early_stop on). Paths are relative to the repo root.
 DEFAULTS = {
     # family: "aed" (a Cohere-family student, CohereAsr AED) or "ctc" (a Parakeet-family student, ParakeetForCTC, on
     # the frame targets under parakeet_root; the module docstring's "family" entry). A CTC run requires parakeet_root
@@ -632,7 +632,7 @@ DEFAULTS = {
               "pad_min_argmax_agree": None, "require_loss_decrease": True, "decode_per_set": 8,
               "max_dropped_frac": 0.01},
     # checked after every in-loop eval (the module docstring; early_stop_update, early_stop_trigger). Off here, so a
-    # config that does not mention it trains to its budget; viability.json turns it on with these values. A dev_*
+    # config that does not mention it trains to its budget; the viability run turned it on with these values. A dev_*
     # metric is checked after every dev eval instead (eval.dev). smooth: the rule reads the mean of the last `smooth`
     # values (none counted before there are that many); allow_test_sets false refuses a metric that reads the test
     # sets (TEST_SET_METRICS: heldout_kl pools JSUT / CV8 / Reazon-test)
@@ -1304,10 +1304,10 @@ def shm_cap(nw: int, prefetch: int, micro_audio_s: float, shm: str = "/dev/shm")
     shared memory under every sharing strategy (file_system shm_opens too, so KITSUNE_SHARING does not help). An
     overflow (a container left with Docker's 64 MB) does not crash: the worker prints "unable to allocate shared
     memory(shm) ... (28)" and drops that micro-batch, and the loader would wait for it forever; perf.loader_timeout_s
-    turns that stall into a crash vast/supervise.py can resume. Up to num_workers * prefetch micro-batches of up to
-    micro_audio_s padded float32 audio are in flight: keep them within half the free space (measured once, at loop
-    start) by prefetching less, then using fewer workers, then decoding in-process. Returns (workers, prefetch, change
-    or None). A cut below SHM_FEW_WORKERS workers adds a rough decode ceiling to the change
+    turns that stall into a crash the box's queue can resume (kitsune/full_queue.py). Up to num_workers * prefetch
+    micro-batches of up to micro_audio_s padded float32 audio are in flight: keep them within half the free space
+    (measured once, at loop start) by prefetching less, then using fewer workers, then decoding in-process. Returns
+    (workers, prefetch, change or None). A cut below SHM_FEW_WORKERS workers adds a rough decode ceiling to the change
     (DECODE_AUDIO_S_PER_WORKER per worker, one for in-process decoding): the MP3/OGG-heavy train mix then feeds ~1k
     audio-s/s per worker, below what an A100 takes, so the run trains fewer epochs than the GPU allows."""
     if nw <= 0 or not os.path.isdir(shm):
@@ -4034,7 +4034,7 @@ def _sync_dir(p: Path):
 def _flush_dir(tmp: Path):
     """Every file of a just-written checkpoint dir to disk before it is renamed into place. Without it an unclean host
     crash (power loss, kernel panic) soon after a save can leave the rename on disk but not the data: model.pt and
-    the rest empty or full of NUL bytes under the name --resume and vast/supervise.py take as the newest state. A
+    the rest empty or full of NUL bytes under the name --resume and the box's queue take as the newest state. A
     process crash cannot tear it; this costs the write-back of the save (~8.6 GB for a full state)."""
     for f in sorted(tmp.rglob("*")):
         if f.is_file():
@@ -4398,7 +4398,7 @@ def set_aside_newer(ckpt_dir: Path, step: int) -> list[str]:
     deletes the resumed run's states instead, and a later --resume <run dir> (find_full_state)
     silently continues the abandoned attempt; finish.py would upload its step_<M>/ weights next to the resumed run's.
     So every full_step_<M>/ and step_<M>/ with M > step moves to checkpoints/abandoned-<UTC stamp>/ (a rename:
-    nothing is deleted). Every scanner of checkpoints/ (these, finish.py, vast/supervise.py) reads only its top level.
+    nothing is deleted). Every scanner of checkpoints/ (these, finish.py, the box's queue) reads only its top level.
     That includes the weights saved after the newest full state, when the resume is from that one: a crash inside
     the full-state save that follows the same step's weights (periodic or end), or the laptop's minute cadences.
     The resumed run replays the steps but not those saves: on the wall and minute clocks its weights fall due at other
@@ -4964,7 +4964,8 @@ def smoke_end(R: Run):
 
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=None, help="JSON config (keys: DEFAULTS in this file); default = viability")
+    ap.add_argument("--config", default=None,
+                    help="JSON config (keys: DEFAULTS in this file); none: DEFAULTS as they are")
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                     help="override a config key, e.g. --set hf.output_repo=user/repo (repeatable; JSON values)")
     ap.add_argument("--resume", default=None, help="checkpoints/full_step_<N> dir (or a run dir: its newest)")
@@ -6105,7 +6106,7 @@ def uploads_left_running(R: Run) -> bool:
     """A checkpoint upload or log sync still running after the bounded end-phase waits (or an xet commit thread one
     left behind). hf_xet 1.5.1's wait_to_finish re-takes the GIL every 100 ms for its check_signals poll (PyO3 0.26
     detach, then PyEval_RestoreThread); CPython 3.12 calls pthread_exit on a thread that does that while the
-    interpreter finalizes, and the unwind through its Rust frames aborts the process (rc -6), which vast/supervise.py
+    interpreter finalizes, and the unwind through its Rust frames aborts the process (rc -6), which the box's supervisor
     read as a crash of a finished run. A timed state's upload to the scratch repo (R.scratch) counts too."""
     sc = getattr(R, "scratch", None)
     return bool(R.uploader.busy()) or (sc is not None and bool(sc.busy())) or not R.log.wait_sync(0) or any(

@@ -1,5 +1,5 @@
-"""vast/bootstrap.sh in extent mode: the A100 pulls exactly a config's extent of the label box's labels, rebuilds its
-audio with `01 --extent-config` and checks the join exactly (plan §12.2, §3.5). The viability path is unchanged.
+"""vast/bootstrap.sh: a full box pulls exactly a config's extent of the label box's labels, rebuilds its audio with
+`01 --extent-config` and checks the join exactly (plan §12.2, §3.5); a config without an extent is refused.
 
 CPU only, no network: huggingface_hub is replaced by a stub that serves a fake data repo from a local directory (the
 real filter_repo_objects matcher is loaded from the installed package, as snapshot_download filters with it); the
@@ -210,7 +210,7 @@ def test_extent_plan_pulls_exactly_the_subset_files(box):
     r = box.helper("plan")
     assert r.returncode == 0, r.stdout + r.stderr
     plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
-    assert plan["extent"] is True and plan["parked"] == [] and plan["rebuild"] == ["galgame", "eval_jsut"]
+    assert plan["extent"] is True and plan["rebuild"] == ["galgame", "eval_jsut"] and "parked" not in plan
     assert plan["revision"] == "0123abc" and Path(plan["record"]).is_file()
     calls = box.calls()
     assert calls == [["hf_hub_download", f"{LR}/extent.json", "dataset", "0123abc"]], "the record at the pinned rev"
@@ -242,8 +242,8 @@ def test_extent_plan_pulls_exactly_the_subset_files(box):
 
 def test_extent_plan_refuses_an_unsealed_root_or_missing_files(box):
     """Only a sealed label root is consumed: without COMPLETE.json (or extent.json) the plan refuses with exit 3,
-    which bootstrap's retry() does not repeat, before downloading anything. A subset stem, a second opinion or a
-    student file the repo lacks is refused the same way."""
+    which bootstrap's retry() does not repeat, before downloading anything. A subset stem or a second opinion the repo
+    lacks is refused the same way (a full box's student files: test_full_plan_pulls_the_registrys_students_...)."""
     box.config(make_cfg())
     for gone in ("COMPLETE.json", "extent.json"):
         (box.remote_dir / LR / gone).rename(box.remote_dir / f"{gone}.away")
@@ -252,7 +252,7 @@ def test_extent_plan_refuses_an_unsealed_root_or_missing_files(box):
         assert f"lacks ['{LR}/{gone}']" in r.stderr and "has not sealed" in r.stderr
         assert not (box.state_dir / "bootstrap_plan.json").exists() and box.calls() == []
         (box.remote_dir / f"{gone}.away").rename(box.remote_dir / LR / gone)
-    for gone in (f"{LR}/second_out/galgame/train-00000.jsonl", f"{STUDENT}/tokenizer.json"):
+    for gone in (f"{LR}/second_out/galgame/train-00000.jsonl", f"{LR}/teacher_out/eval_jsut/eval-00000.npz"):
         (box.remote_dir / gone).unlink()
         r = box.helper("plan")
         assert r.returncode == 3 and "cannot serve extent 'sub'" in r.stderr, r.stdout + r.stderr
@@ -271,23 +271,17 @@ def test_extent_plan_refuses_an_unsealed_root_or_missing_files(box):
     assert r.returncode == 3 and "extent.inputs.galgame" in r.stderr, r.stdout + r.stderr
 
 
-def test_the_viability_plan_is_unchanged(box):
-    """A config without an extent takes the legacy path: no record download, no extent keys in the plan, and the pull
-    uses snapshot_download alone."""
+def test_a_config_without_an_extent_is_refused(box):
+    """A full box rebuilds the label box's sealed extent: a config without an `extent` is refused (exit 3, not retried)
+    after the token checks, before anything is downloaded."""
     box.config(make_cfg(extent=False))
     for f in ["teacher_out/meta.json", "second_out/meta.json", "teacher_out/galgame/train-00000.npz",
-              "teacher_out/galgame/eval-00000.npz", "teacher_out/eval_jsut/eval-00000.npz",
-              "second_out/galgame/train-00000.jsonl", "second_out/galgame/eval-00000.jsonl"]:
+              "second_out/galgame/train-00000.jsonl"]:
         (box.remote_dir / f).parent.mkdir(parents=True, exist_ok=True)
         (box.remote_dir / f).write_bytes(b"x")
     r = box.helper("plan")
-    assert r.returncode == 0, r.stdout + r.stderr
-    plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
-    assert not {"extent", "explicit", "record"} & set(plan) and plan["rebuild"] == ["galgame", "eval_jsut"]
-    assert box.calls() == []
-    assert box.helper("pull").returncode == 0
-    assert [c[0] for c in box.calls()] == ["snapshot_download"]
-    assert not any(f.startswith("labels/") for f in box.on_disk())
+    assert r.returncode == 3 and "configs/c.json has no extent" in r.stderr and "(not retried)" in r.stderr, r.stderr
+    assert not (box.state_dir / "bootstrap_plan.json").exists() and box.calls() == []
 
 
 def write_rebuilt(kdir: Path, rows: dict):
@@ -347,53 +341,41 @@ def test_extent_coverage_is_exact(box):
     assert r.returncode != 0 and "galgame/train-00000: not rebuilt" in r.stdout, r.stdout + r.stderr
 
 
-def test_the_legacy_rebuild_line_stays_first_and_the_helper_is_the_first_heredoc():
-    """The regexes of tests/test_infra.py find the first `phase rebuild_audio` line and the first heredoc: the legacy
-    rebuild stays first and literally unchanged, the extent line comes after it, and the helper stays the first
-    heredoc."""
+def test_the_rebuild_line_and_the_helper_is_the_first_heredoc():
+    """The regexes of tests/test_infra.py find the first heredoc: the helper stays it. One rebuild line, `01
+    --extent-config $CONFIG` under KITSUNE_REBUILD_TIMEOUT_MIN (the header documents it); KITSUNE_PREP_ARGS and the
+    `--sources` rebuild of a config without an extent are gone."""
     text = BOOTSTRAP.read_text(encoding="utf-8")
     assert helper_source().startswith('"""bootstrap helper: plan / pull / coverage.')
     lines = [ln.strip() for ln in text.splitlines() if ln.lstrip().startswith("phase rebuild_audio")]
-    assert len(lines) == 2
-    assert lines[0] == ('phase rebuild_audio retry 3 timeout -k 60 60m "$PY" scripts/01_prepare_data.py --data '
-                        '"$KITSUNE_DIR/$DATA_ROOT" \\')
-    assert re.search(r"phase rebuild_audio retry \d+ timeout -k \d+ \d+m \"\$PY\" scripts/01_prepare_data\.py",
-                     lines[0])
-    assert lines[1] == 'phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \\'
-    assert '--sources "${REBUILD[@]}" "${PREP_ARGS[@]}"' in text
+    assert lines == ['phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \\']
     assert 'scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" --extent-config "$CONFIG"' in text
     assert "KITSUNE_REBUILD_TIMEOUT_MIN" in text.split("set -euo pipefail", 1)[0], "the header documents it"
+    assert "KITSUNE_PREP_ARGS" not in text and "--sources" not in text
     assert b"\r\n" not in BOOTSTRAP.read_bytes()
 
 
-@pytest.mark.parametrize("extent", [False, True])
-def test_the_rebuild_dispatch(tmp_path, extent):
-    """The shell picks the rebuild from the plan: the legacy `--sources` call with KITSUNE_PREP_ARGS, or in extent mode
-    `01 --extent-config $CONFIG` under KITSUNE_REBUILD_TIMEOUT_MIN, with KITSUNE_PREP_ARGS ignored (and logged)."""
+def test_the_rebuild_runs_01_on_the_extent_under_its_timeout(tmp_path):
+    """The shell rebuilds the audio with `01 --extent-config $CONFIG` under KITSUNE_REBUILD_TIMEOUT_MIN (launch.py sizes
+    it; the download gate may raise it), into the plan's data root."""
     bash = find_bash()
     if bash is None:
         pytest.skip("bash not available")
     text = BOOTSTRAP.read_text(encoding="utf-8")
-    block = re.search(r"^EXTENT=.*?^fi\n", text, re.M | re.S).group(0)
-    plan = dict(rebuild=["galgame", "eval_jsut"], data_root="data", **({"extent": True} if extent else {}))
-    (tmp_path / "bootstrap_plan.json").write_text(json.dumps(plan), encoding="utf-8")
-    script = tmp_path / "dispatch.sh"
+    block = re.search(r"^DATA_ROOT=.*?--extent-config \"\$CONFIG\"\n", text, re.M | re.S).group(0)
+    (tmp_path / "bootstrap_plan.json").write_text(json.dumps(dict(rebuild=["galgame"], data_root="data")),
+                                                  encoding="utf-8")
+    script = tmp_path / "rebuild.sh"
     script.write_text("\n".join([
         "set -euo pipefail", "log() { printf 'LOG %s\\n' \"$*\"; }", "phase() { printf 'PHASE %s\\n' \"$*\"; }",
-        f'PY="{Path(sys.executable).as_posix()}"', f'STATE="{tmp_path.as_posix()}"', 'KITSUNE_DIR=/k', "DATA_ROOT=data",
-        "CONFIG=configs/sub.json", "REBUILD=(galgame eval_jsut)", block, ""]), encoding="utf-8", newline="\n")
-    env = dict(os.environ, KITSUNE_PREP_ARGS="--galgame-shards 8", KITSUNE_REBUILD_TIMEOUT_MIN="95")
-    r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
+        f'PY="{Path(sys.executable).as_posix()}"', f'STATE="{tmp_path.as_posix()}"', 'KITSUNE_DIR=/k',
+        "CONFIG=configs/sub.json", block, ""]), encoding="utf-8", newline="\n")
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True,
+                       env=dict(os.environ, KITSUNE_REBUILD_TIMEOUT_MIN="95"), timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     (phase,) = [ln for ln in r.stdout.splitlines() if ln.startswith("PHASE")]
-    if extent:
-        assert phase == ("PHASE rebuild_audio retry 3 timeout -k 60 95m " + Path(sys.executable).as_posix()
-                         + " scripts/01_prepare_data.py --data /k/data --extent-config configs/sub.json")
-        assert "LOG KITSUNE_PREP_ARGS ignored: the config's extent defines the rebuild" in r.stdout
-    else:
-        assert phase.endswith("scripts/01_prepare_data.py --data /k/data --sources galgame eval_jsut "
-                              "--galgame-shards 8") and " 60m " in phase
-        assert "ignored" not in r.stdout
+    assert phase == ("PHASE rebuild_audio retry 3 timeout -k 60 95m " + Path(sys.executable).as_posix()
+                     + " scripts/01_prepare_data.py --data /k/data --extent-config configs/sub.json")
 
 
 # ======================================================================================= full-data boxes (WP3)
@@ -582,10 +564,13 @@ def test_full_plan_pulls_the_registrys_students_and_extra_files_and_the_labels_a
     assert r.returncode == 0, r.stdout + r.stderr
     assert box.on_disk() == derived | labels
     assert "pulled the labels" in r.stdout
-    # a missing extra file refuses the plan (exit 3), as a missing student file does
-    (box.remote_dir / SIDECAR).unlink()
-    r = box.helper("plan", **env)
-    assert r.returncode == 3 and f"no {SIDECAR}" in r.stderr, r.stdout + r.stderr
+    # a missing extra file refuses the plan (exit 3), and so does a missing file of a registry student
+    for gone in (SIDECAR, f"{P01_STUDENT}/tokenizer.json", f"{P01_STUDENT}/MODEL_CARD.md"):
+        data = (box.remote_dir / gone).read_bytes()
+        (box.remote_dir / gone).unlink()
+        r = box.helper("plan", **env)
+        assert r.returncode == 3 and f"no {gone}" in r.stderr, r.stdout + r.stderr
+        (box.remote_dir / gone).write_bytes(data)
 
 
 def test_full_plan_checks_the_scratch_repo_with_the_box_token(box):
@@ -623,24 +608,21 @@ def test_full_plan_refuses_a_registry_it_cannot_load(box):
 
 
 def test_the_full_phases_are_new_lines_and_the_shared_lines_stay_byte_identical():
-    """Job full reuses the plan, pull_derived, both rebuild and the coverage lines exactly as they were; its own phases
-    are separate lines in `if [ "${KITSUNE_JOB:-}" = "full" ]` blocks, in the contract's order, and the full
-    check_students comes after the study one."""
+    """Job full reuses the plan, pull_derived, rebuild and coverage lines exactly as they were; its own phases are
+    separate lines in `if [ "${KITSUNE_JOB:-}" = "full" ]` blocks, in the contract's order."""
     text = BOOTSTRAP.read_text(encoding="utf-8")
     shared = ['phase plan retry 3 timeout -k 30 10m "$PY" "$HELPER" plan',
               'phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull',
-              'phase rebuild_audio retry 3 timeout -k 60 60m "$PY" scripts/01_prepare_data.py --data '
-              '"$KITSUNE_DIR/$DATA_ROOT" \\',
               'phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \\',
               'phase coverage "$PY" "$HELPER" coverage']
     lines = [ln.strip() for ln in text.splitlines()]
     for s in shared:
         assert lines.count(s) == 1, s
-    for prefix in ("phase plan", "phase pull_derived", "phase rebuild_audio", "phase coverage"):
-        assert len([ln for ln in lines if ln.startswith(prefix)]) == (2 if prefix == "phase rebuild_audio" else 1)
-    order = ["phase download_gate", "phase plan ", "phase pull_derived", "phase check_students \"$PY\" -m "
-             "kitsune.study_queue", "phase resume_pull", "phase check_students \"$PY\" -m kitsune.fullrun",
-             "phase pull_labels retry", "phase rebuild_audio", "phase pull_labels_wait", "phase coverage"]
+    for prefix in ("phase plan", "phase pull_derived", "phase rebuild_audio", "phase coverage", "phase check_students"):
+        assert len([ln for ln in lines if ln.startswith(prefix)]) == 1, prefix
+    order = ["phase download_gate", "phase plan ", "phase pull_derived", "phase resume_pull",
+             "phase check_students \"$PY\" -m kitsune.fullrun", "phase pull_labels retry", "phase rebuild_audio",
+             "phase pull_labels_wait", "phase coverage"]
     at = [text.index(o) for o in order]
     assert at == sorted(at), [o for o, _ in sorted(zip(order, at), key=lambda x: x[1])]
     body = text.split("PYEOF\n")[-1]
@@ -854,9 +836,10 @@ def test_a_toucher_stops_at_its_bound(tmp_path):
     assert 1.0 < time.monotonic() - t0 < 30 and (tmp_path / "train_hb").exists()  # date +%s: whole seconds
 
 
-def test_other_jobs_run_no_full_phase(tmp_path):
-    """Without KITSUNE_JOB=full nothing of the above runs, whatever gate env is set: no gate, no train_hb, no label
-    pull; the plan, pull, rebuild and coverage as before."""
+def test_without_job_full_no_full_phase_runs(tmp_path):
+    """Without KITSUNE_JOB=full (a bootstrap started by hand; onstart refuses any job but full and label, and the label
+    box runs no bootstrap) nothing of the above runs, whatever gate env is set: no gate, no train_hb, no label pull;
+    the plan, pull, rebuild and coverage alone."""
     r, calls, state = run_bootstrap(tmp_path, KITSUNE_JOB=None, KITSUNE_RESUME="1")
     assert r.returncode == 0, r.stdout + r.stderr
     assert [c.split(" ")[0] + " " + c.split(" ")[1] for c in calls] == [

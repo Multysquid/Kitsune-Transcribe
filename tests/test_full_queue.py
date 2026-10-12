@@ -70,7 +70,7 @@ class FakeUploader:
     def sync_run(self, run_dir: Path) -> list[str]:
         import finish
 
-        self.synced.append((time.time(), run_dir.name, sorted(finish.expected_files(run_dir, False, lean=True))))
+        self.synced.append((time.time(), run_dir.name, sorted(finish.expected_files(run_dir))))
         return ["missing"] if run_dir.name in self.fail_sync else []
 
     def put_file(self, local, path_in_repo) -> list[str]:

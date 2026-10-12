@@ -1,7 +1,6 @@
 """The size study's selection (scripts/make_selection.py with a selection_recipe.study block) on a synthetic label root
 with both teachers (tests/fixtures_study.py), and the checks that read it before money is spent:
-kitsune.extent.pull_plan (parakeet_out per family / pull_parakeet) and vast/launch.py selection_problems and
-data_problems.
+kitsune.extent.pull_plan (parakeet_out per family / pull_parakeet) and vast/launch.py selection_problems.
 
 The corpus plants one kind of bad row per rule and a toy extent record spreads galgame over 3 inputs, so every drop
 reason, the extent filter and the reazon_large cap readout are exercised; the expectations come from the ground truth
@@ -608,35 +607,6 @@ def test_selection_problems_know_the_study(tmp_path):
     ctc_have = {f for f in have | pk if "/train-" not in f or "parakeet_out" in f}
     assert launch.selection_problems(path, name, dict(LCFG, family="ctc"), ctc_have) == []
     assert launch.selection_problems(path, name, LCFG, ctc_have)  # an AED run needs the train rows' too
-
-
-def test_data_problems_know_the_parakeet_requirement():
-    """A non-extent config: a CTC student or pull_parakeet needs parakeet_out's meta and npz for every source and eval
-    set; a CTC student needs teacher npz only for the eval sets; configs without either are unchanged."""
-    cfg = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"], "student": "students/s",
-           "selection": "selection/s.parquet", "parakeet_root": "parakeet_out"}
-    base = ["teacher_out/meta.json", "second_out/meta.json", "selection/s.parquet",  # a CTC student: + its CC-BY card
-            *(f"students/s/{n}" for n in launch.STUDENT_FILES + (launch.CTC_CARD,))]
-    teacher = [f"teacher_out/{s}/{st}.npz" for s, st in (("reazon_small", "train-00000"), ("galgame", "train-00000"),
-                                                          ("galgame", "eval-00000"), ("eval_jsut", "eval-00000"))]
-    second = ["second_out/reazon_small/train-00000.jsonl", "second_out/galgame/train-00000.jsonl",
-              "second_out/galgame/eval-00000.jsonl"]
-    pk = [f.replace("teacher_out", "parakeet_out") for f in teacher] + ["parakeet_out/meta.json"]
-    assert launch.data_problems(base + teacher + second, cfg) == []
-    assert launch.data_problems(base + teacher + second, dict(cfg, pull_parakeet=True)) == [
-        "no parakeet_out/meta.json", "no parakeet_out/reazon_small/*.npz", "no parakeet_out/galgame/*.npz",
-        "no parakeet_out/eval_jsut/*.npz"]
-    assert launch.data_problems(base + teacher + second + pk, dict(cfg, pull_parakeet=True)) == []
-    # a CTC student: no train-only teacher npz needed; the eval sets' still are
-    no_train = [f for f in teacher if "reazon_small" not in f]
-    assert launch.data_problems(base + no_train + second + pk, dict(cfg, family="ctc")) == []
-    assert launch.data_problems(base + no_train + second + pk, cfg) == ["no teacher_out/reazon_small/*.npz"]
-    no_jsut = [f for f in teacher if "eval_jsut" not in f]
-    assert launch.data_problems(base + no_jsut + second + pk, dict(cfg, family="ctc")) == [
-        "no teacher_out/eval_jsut/*.npz"]
-    no_root = {k: v for k, v in cfg.items() if k != "parakeet_root"}
-    assert launch.data_problems(base + teacher + second, dict(no_root, family="ctc")) == [
-        "the config needs Parakeet targets (family ctc or pull_parakeet) but has no parakeet_root"]
 
 
 def test_a_real_study_selection_passes_launch(st, built):

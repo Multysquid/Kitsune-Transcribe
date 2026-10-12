@@ -7,32 +7,36 @@ destroys; any problem stops the instance instead, which keeps the disk (storage 
 is lost and a human can look. The vast REST API is called with the per-instance key vast injects
 (CONTAINER_API_KEY can only start/stop/destroy this one instance); the vastai CLI is the fallback.
 
-Expected files for each run dir runs/<run_id>/ (see scripts/04_distill.py):
+Expected files for each run dir runs/<run_id>/ (see scripts/04_distill.py; expected_files):
   every file outside checkpoints/                      -> runs/<run_id>/<same path>   (RunLogger sync)
   every weights dir       checkpoints/step_<N>/        -> runs/<run_id>/checkpoints/step_<N>/
     (all of them, not just the newest: an earlier upload that failed would otherwise go with the destroyed disk; the
     hub skips re-uploads of content it already has, though each byte is still read and hashed on the box, see sync)
-  the newest full state   checkpoints/full_step_<N>/   -> runs/<run_id>/checkpoints/full_step_<N>/  (--expect-full)
+  the full states the run's config uploads (ckpt.upload_full_at "end": the newest one; uploaded_fulls)
   and every full state the trainer meant for the Hub whose upload has not succeeded (UPLOAD_MARK in it: the
     pre_cooldown one, which the trainer keeps from rotation for this; the marker itself is not uploaded)
-The files outside checkpoints/ are uploaded from a snapshot copy: the watchdog's --sync-only runs while the trainer
-still appends to its logs, and a file handed to the Hub by path is sized when it is listed but hashed and read later
-(a growing file would go up as a size/hash/content mismatch). Checkpoint dirs are renamed into place complete and go
-up in place; the one later write, the trainer's end save replacing trainer.pt/.json of an existing full_step_<N> (the
-loop ended at the step of a full state), is over once the trainer has exited.
-Supervisor/watchdog/bootstrap/portal logs are uploaded best-effort to runs/<run_id>/infra/, secrets redacted (scrub),
-but not verified (they are still being written while this runs); on every path, --no-sync included, and once more
-right before the stop/destroy call, so the last lifecycle records (verify, stop/destroy) are off the box before its
-disk goes away or stays behind.
+never the newest full state for its own sake: the box keeps its resume states on its disk (and a trainer's timed full
+states go to the scratch repo). The files outside checkpoints/ are uploaded from a snapshot copy: the watchdog's
+--sync-only runs while the trainer still appends to its logs, and a file handed to the Hub by path is sized when it is
+listed but hashed and read later (a growing file would go up as a size/hash/content mismatch). Checkpoint dirs are
+renamed into place complete and go up in place; the one later write, the trainer's end save replacing trainer.pt/.json
+of an existing full_step_<N> (the loop ended at the step of a full state), is over once the trainer has exited.
+Supervisor/watchdog/bootstrap/portal logs, the queue's state (queue.json, events.jsonl, the per-item logs,
+download_gate.json, resume_plan.json, the watchdog's alerts) and each re-armed state (rearm-<stamp>/) are uploaded
+best-effort to full/box-<KITSUNE_BOX>/infra/<container>/ (infra_files deep), secrets redacted (scrub), but not verified
+(they are still being written while this runs); on every path, --no-sync included, and once more right before the
+stop/destroy call, so the last lifecycle records (verify, stop/destroy) are off the box before its disk goes away or
+stays behind.
 
 Every decision is appended to $KITSUNE_STATE/events.jsonl, and a `halt` marker is written before a stop/destroy so a
 restarted container does not start a second run (vast/onstart.sh checks it).
 
-Usage:
+Usage (--job full, the default unless KITSUNE_JOB says label; kitsune/full_queue.py runs the box):
   python vast/finish.py --destroy                 # upload, verify, destroy (or stop if verification fails)
   python vast/finish.py --stop --reason "..."     # upload best-effort, stop
   python vast/finish.py --sync-only               # upload only (supervisor after a crash, watchdog before the cap)
   python vast/finish.py --verify-only             # print the comparison, exit 1 on problems
+  python vast/finish.py --abort --reason "..."    # a failed boot (onstart): infra up, then destroy or stop (below)
   add --dry-run to any of them to print the actions without uploading, stopping or destroying
 
 Label box (--job label, the default when KITSUNE_JOB=label): the same modes over the config's label root
@@ -41,29 +45,19 @@ under $KITSUNE_STATE/sync.lock. --sync-only exits 1 when an upload failed and 65
 to label_runs/<run_id>/. --no-infra skips the infra upload; --allow-empty lets --destroy go on with no finished label
 file (a host failure before any lane started).
 
-Study box (--job study, the default when KITSUNE_JOB=study; kitsune/study_queue.py runs the box): every mode is lean -
-per run dir the logs, metrics, evals and summary, every exported weights dir and only the full states the run's config
-uploads (ckpt.upload_full_at "frac:<f>" / "end", uploaded_fulls; plus a marked one), never the newest full state for
-its own sake: the box keeps its resume states on its disk and the runs repo gets what the study reports (STUDY.md 5.5).
-The infra logs and the queue's state go to study/box-<KITSUNE_BOX>/infra/<container>/, with the queue's per-item logs
-($KITSUNE_STATE/logs/) and each re-armed state (rearm-<stamp>/) under it (infra_files deep).
-
-Full-data box (--job full, the default when KITSUNE_JOB=full; kitsune/full_queue.py runs the box): lean like the study
-box, the infra (queue.json, events.jsonl, the per-item logs, download_gate.json, resume_plan.json, the watchdog's
-alerts) under full/box-<KITSUNE_BOX>/infra/<container>/ (deep). A trainer's timed full states go to the scratch repo,
-never to the runs repo: their marker (SCRATCH_MARK) is never uploaded nor expected, and a lean verification never
-expects the state it marks. `--abort --reason R` is what onstart runs when the box fails before its supervisor takes
-over (a slow download gate, a refused plan): the infra goes up (bounded), then the box is destroyed while it has no run
-dir (nothing on its disk is unique yet: a failed bootstrap, the gate's refusal) and stopped once it has one (a resume
-pulled run dirs, or training began); a slow download_gate.json gives the reason. For every other job --abort is
---stop --no-sync, resolved before the label dispatch.
+A trainer's timed full states go to the scratch repo, never to the runs repo: their marker (SCRATCH_MARK) is never
+uploaded nor expected, and the verification never expects the state it marks. `--abort --reason R` is what onstart
+runs when the box fails before its supervisor takes over (a slow download gate, a refused plan): the infra goes up
+(bounded), then the box is destroyed while it has no run dir (nothing on its disk is unique yet: a failed bootstrap, the
+gate's refusal) and stopped once it has one (a resume pulled run dirs, or training began); a slow download_gate.json
+gives the reason. For the label box --abort is --stop --no-sync, resolved before the label dispatch.
 
 A chain box (KITSUNE_CHAIN_STAGE set; contract addendum E): the deep infra also holds $KITSUNE_STATE/chain/ (chain.json,
 stage 1's bootstrap records, every part's queue state, events, logs, summaries and verdicts, the JSON copies in its
 hub_reads/; each file its last 32 MB), never a path with a .git or .cache folder (HUB_FORBIDDEN_DIRS: the Hub refuses
 them, and hf_hub_download(local_dir=...) leaves .cache/huggingface/ in every hub_reads dir). Its --destroy - after p01
 completed, or when the chain ended before box 1 trained (a failed gate, a failed stage-2 bootstrap) - does more after
-the lean sync and the run-dir verification: the deep infra upload synchronously (within CHAIN_INFRA_TIMEOUT_S), then the
+the sync and the run-dir verification: the deep infra upload synchronously (within CHAIN_INFRA_TIMEOUT_S), then the
 chain's summary and every part's summary and verdict compared byte for byte with the Hub's (a missing or different one
 is put once and compared again), then the infra listing (the chain's events, chain.json, the gate part's events and
 queue.json, the download gate, the watchdog's alerts). Any problem stops the box instead (exit 2), as a failed
@@ -91,11 +85,12 @@ VAST_API = "https://console.vast.ai/api/v0"
 STATE_DIR = Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state"))
 INFRA_LOGS = ["/workspace/kitsune.log", "/workspace/watchdog.log", "/workspace/portal.log", "/workspace/tensorboard.log"]
 INFRA_TIMEOUT_S = 180  # a hung infra upload must not keep a paid instance up
-INFRA_MAX_FILE_BYTES = 32 << 20  # a study box's per-item log goes up as its last 32 MB (upload_infra deep)
+INFRA_MAX_FILE_BYTES = 32 << 20  # a queue's per-item log goes up as its last 32 MB (upload_infra deep)
 # s before each retry of a hub call the library does not retry itself: exponential back-off from 5 s up to 10 min, ~21
-# min in all (STUDY.md 5.5: the study's runs share one repo, and a 429 needs the Hub's rate window to pass). Only what a
-# retry can fix is retried (retryable). Each wait gets up to HUB_RETRY_JITTER of itself added at random: boxes A and B
-# commit into one runs repo at the same time, and two writers whose commits raced must not retry in lockstep
+# min in all (a box's runs share one repo, and a 429 needs the Hub's rate window to pass). Only what a retry can fix is
+# retried (retryable). Each wait gets up to HUB_RETRY_JITTER of itself added at random: two boxes (or a box's trainers
+# and its queue) commit into one runs repo at the same time, and two writers whose commits raced must not retry in
+# lockstep
 HUB_RETRY_WAITS = (5, 10, 20, 40, 80, 160, 320, 600)
 HUB_RETRY_JITTER = 0.25
 # an env var whose name holds one of these is a secret: a mirror of kitsune/runlog.py's SECRET_MARKERS (finish stays
@@ -179,33 +174,24 @@ def files_under(p: Path) -> list[Path]:
 
 
 def uploaded_fulls(run_dir: Path) -> list[Path]:
-    """The full states a run's config sends to the Hub, which a lean verification expects (the study box's runs keep
-    every other full state on the box): ckpt.upload_full_at "frac:<f>" -> checkpoints/full_step_<round(f x
-    schedule.max_steps)> (none for a T/2 branch, which ignores its fractions) and "end" -> the newest full state; from
-    the run's config.json. A missing or unreadable config.json: none."""
+    """The full states a run's config sends to the Hub at its end, which the verification expects (the box keeps every
+    other full state on its disk): ckpt.upload_full_at "end" -> the newest full state (04_distill.py's DEFAULTS upload
+    it; the pre_cooldown one is the trainer's marked state, expected_files); from the run's config.json. A missing or
+    unreadable config.json: none."""
     try:
         cfg = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))["config"]
     except (OSError, ValueError, KeyError, TypeError):
         return []
-    ckpt, out = run_dir / "checkpoints", []
     ups = (cfg.get("ckpt") or {}).get("upload_full_at") or []
-    m = (cfg.get("schedule") or {}).get("max_steps")
-    for u in ups:
-        if isinstance(u, str) and u.startswith("frac:") and m and not (cfg.get("branch") or {}).get("parent"):
-            try:
-                out.append(ckpt / f"full_step_{int(round(float(u[5:]) * int(m)))}")
-            except ValueError:
-                continue
-        elif u == "end":
-            out.append(newest_checkpoint(ckpt, FULL_RE))
-    return [p for p in out if p is not None and p.exists()]
+    newest = newest_checkpoint(run_dir / "checkpoints", FULL_RE) if "end" in ups else None
+    return [newest] if newest is not None and newest.exists() else []
 
 
-def expected_files(run_dir: Path, expect_full: bool = True, lean: bool = False) -> dict[str, Path]:
-    """repo path -> local file, for one run dir (see the module docstring). lean (the study box, KITSUNE_JOB=study):
-    the logs, every weights dir, the marked full states and the ones the config uploads (uploaded_fulls), never the
-    newest full state for its own sake. Never a path the Hub cannot hold (hub_path_ok): sync's allow_patterns would name
-    a file upload_folder drops, and verify would then miss it on every try (a stop instead of a destroy)."""
+def expected_files(run_dir: Path) -> dict[str, Path]:
+    """repo path -> local file, for one run dir (see the module docstring): the logs, every weights dir, the marked
+    full states and the ones the config uploads (uploaded_fulls), never the newest full state for its own sake. Never a
+    path the Hub cannot hold (hub_path_ok): sync's allow_patterns would name a file upload_folder drops, and verify
+    would then miss it on every try (a stop instead of a destroy)."""
     prefix = f"runs/{run_dir.name}"
     out = {}
     for f in files_under(run_dir):
@@ -219,12 +205,7 @@ def expected_files(run_dir: Path, expect_full: bool = True, lean: bool = False) 
     # a full state whose trainer upload failed (the pre_cooldown one) has no other copy than this disk
     marked = sorted(p for p in ckpt.iterdir()
                     if FULL_RE.match(p.name) and (p / UPLOAD_MARK).is_file()) if ckpt.is_dir() else []
-    picks = weights + (marked + [newest_checkpoint(ckpt, FULL_RE)] if expect_full else [])  # a dir twice: same keys
-    if lean:
-        picks += marked + uploaded_fulls(run_dir)
-    for pick in picks:
-        if pick is None:
-            continue
+    for pick in weights + marked + uploaded_fulls(run_dir):  # a dir twice: same keys
         for f in files_under(pick):
             rel = f.relative_to(ckpt).as_posix()
             if f.name not in MARKERS and hub_path_ok(rel):
@@ -291,8 +272,8 @@ def hf_api():
 
 
 # the 4xx a retry fixes: 408 timeout, 409 "another commit is in progress" (the datasets library retries create_commit on
-# exactly this), 412 "a commit has happened since" (a commit's parent moved under it), 429 rate limit. Boxes A and B
-# commit into one runs repo at once (8 trainers and 2 queues), which is when two commits race
+# exactly this), 412 "a commit has happened since" (a commit's parent moved under it), 429 rate limit. Boxes and their
+# trainers commit into one runs repo at once, which is when two commits race
 RETRYABLE_4XX = (408, 409, 412, 429)
 
 
@@ -362,20 +343,19 @@ def verify(api, repo: str, repo_type: str, expected: dict[str, Path], check_hash
     return problems
 
 
-def sync(api, repo: str, repo_type: str, run_dir: Path, expect_full: bool, dry_run: bool, lean: bool = False):
-    """Upload the run dir (minus local-only checkpoints) plus the checkpoints finish will verify.
+def sync(api, repo: str, repo_type: str, run_dir: Path, dry_run: bool):
+    """Upload the run dir (minus local-only checkpoints) plus the checkpoints finish will verify (expected_files).
 
     Re-uploading files the trainer already pushed costs no network or commit: the hub skips content it already stores.
-    hf_xet still reads and chunks every checkpoint byte locally (about 20 GB for the viability run: every weights dir
-    and the newest full state, a minute or two at the launch filter's disk_bw>=500), and verify() reads them once more
-    for sha256. This mostly repairs a checkpoint upload that failed and captures log lines written after the trainer's
-    last sync. The logs go first: they are small, the watchdog's --sync-only has 10 minutes before the stop, which a
-    ~9 GB full state not yet on the hub can take all of (the final eval and verdict of a trainer still waiting on its
-    end-state upload are on this disk only). Each part gets its own try, logs first: a checkpoint upload that raises
-    must not cost the logs, nor a log upload that raises (the unretried repo_info GET of an unchanged snapshot, say)
-    the checkpoints, which may be the only copy off the box. Raises after both were tried if either failed. lean: the
-    study box's files (expected_files)."""
-    expected = expected_files(run_dir, expect_full, lean)
+    hf_xet still reads and chunks every checkpoint byte locally (every weights dir and the uploaded full states, a
+    minute or two at the full filter's disk_bw>=500), and verify() reads them once more for sha256. This mostly repairs
+    a checkpoint upload that failed and captures log lines written after the trainer's last sync. The logs go first:
+    they are small, the watchdog's --sync-only has 10 minutes before the stop, which a ~9 GB full state not yet on the
+    hub can take all of (the final eval and verdict of a trainer still waiting on its end-state upload are on this disk
+    only). Each part gets its own try, logs first: a checkpoint upload that raises must not cost the logs, nor a log
+    upload that raises (the unretried repo_info GET of an unchanged snapshot, say) the checkpoints, which may be the
+    only copy off the box. Raises after both were tried if either failed."""
+    expected = expected_files(run_dir)
     rels = sorted(p[len(f"runs/{run_dir.name}/"):] for p in expected)
     ckpt = [r for r in rels if r.startswith("checkpoints/")]
     live = [r for r in rels if not r.startswith("checkpoints/")]
@@ -418,9 +398,9 @@ def scrub(data: bytes) -> bytes:
 
 def infra_files(deep: bool = False) -> list[tuple[str, Path]]:
     """(name under the infra folder, local file) of the infra upload: INFRA_LOGS and the top level of STATE_DIR; deep
-    (the study box) also its logs/ (the queue's per-item output: the store build, the anchor, every speed-probe call,
-    a trainer that died before its own logger started) and each rearm-<stamp>/ (the lifecycle state a re-arm moved
-    aside: the queue's events.jsonl with its prereg_numbers record among it). Never a path with a HUB_FORBIDDEN_DIRS
+    (a full box) also its logs/ (the queue's per-item output: the store build, every readout and speed-probe call, a
+    trainer that died before its own logger started) and each rearm-<stamp>/ (the lifecycle state a re-arm moved
+    aside: the queue's events.jsonl among it). Never a path with a HUB_FORBIDDEN_DIRS
     component: a part's hub_reads/ keeps its real files (the JSON copies the queue decided from: E.7.2 item 1, and the
     only record of the scratch pointer check 7 read) but not the .cache/huggingface/ bookkeeping of the downloads."""
     out = [(Path(p).name, Path(p)) for p in INFRA_LOGS]
@@ -445,7 +425,7 @@ def upload_infra(api, repo: str, repo_type: str, dest: str, dry_run: bool, deep:
     """Best effort: supervisor/bootstrap/watchdog logs and state go next to the run for later extraction, scrubbed:
     portal.log (the base image's boot output: its CUDA selection is recorded nowhere else) holds the portal's password
     and tokens as soon as a PORTAL_CONFIG reaches the box, and the runs repo keeps every file in its git history.
-    deep: the study box's subfolders too (infra_files), each file at most INFRA_MAX_FILE_BYTES (its end). A file the
+    deep: a full box's subfolders too (infra_files), each file at most INFRA_MAX_FILE_BYTES (its end). A file the
     Hub refuses (a rule newer than HUB_FORBIDDEN_DIRS) or that went away between the listing and its read (a queue's
     .tmp renamed into place) is left out alone, logged and recorded (event infra_skipped): one bad path used to cost
     the whole commit."""
@@ -583,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--verify-only", action="store_true", help="compare only, no upload and no instance action")
     mode.add_argument("--abort", action="store_true",
                       help="a failed boot (onstart): full job: infra up, then destroy while there is no run dir, else "
-                           "stop; any other job: --stop --no-sync")
+                           "stop; label: --stop --no-sync")
     ap.add_argument("--reason", default="", help="recorded in the halt marker and events")
     ap.add_argument("--repo", default=os.environ.get("KITSUNE_OUT_REPO") or None, help="HF output repo (env KITSUNE_OUT_REPO)")
     ap.add_argument("--repo-type", default=os.environ.get("KITSUNE_OUT_REPO_TYPE", "model"))
@@ -591,30 +571,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--run-dir", action="append", default=None, help="restrict to these run dirs (repeatable)")
     ap.add_argument("--no-sync", action="store_true", help="skip the upload step")
     ap.add_argument("--no-hash", action="store_true", help="compare sizes only")
-    ap.add_argument("--no-full", action="store_true",
-                    help="do not require the full training states in the repo (the newest, and any whose trainer "
-                         "upload failed)")
     ap.add_argument("--dry-run", action="store_true", help="print the actions; no upload, stop or destroy")
-    ap.add_argument("--job", choices=("train", "label", "study", "full"),
-                    default=os.environ.get("KITSUNE_JOB") or "train",
-                    help="train: runs/ in the output repo; label: the label root in the data repo; study and full: "
-                         "runs/ in the output repo, lean (env KITSUNE_JOB)")
-    ap.add_argument("--lean", action="store_true",
-                    help="the study and full boxes' uploads (the default for --job study and full): logs, every weights "
-                         "dir and only the full states the run's config uploads (expected_files lean), not the newest "
-                         "one")
+    ap.add_argument("--job", choices=("label", "full"), default=os.environ.get("KITSUNE_JOB") or "full",
+                    help="full: runs/ in the output repo (the default); label: the label root in the data repo (env "
+                         "KITSUNE_JOB)")
     ap.add_argument("--no-infra", action="store_true", help="label: skip the infra log upload")
     ap.add_argument("--allow-empty", action="store_true",
                     help="label: --destroy with no finished label file (nothing unique on the disk yet)")
     args = ap.parse_args(argv)
-    if args.abort and args.job != "full":  # a failed boot of any other box: what onstart ran before --abort existed
+    if args.job not in ("label", "full"):  # a default from the env is not checked against the choices
+        ap.error(f"KITSUNE_JOB {args.job!r}: --job is full or label")
+    if args.abort and args.job != "full":  # a failed label boot: what onstart ran before --abort existed
         args.stop, args.no_sync, args.abort = True, True, False
     if args.job == "label":
         return label_main(args)
 
     dirs = [Path(d) for d in args.run_dir] if args.run_dir else run_dirs(Path(args.runs_root))
-    lean = args.lean or args.job in ("study", "full")
-    expect_full = not args.no_full and not lean
     api = None
     if args.repo:
         try:
@@ -628,35 +600,30 @@ def main(argv: list[str] | None = None) -> int:
     if api is not None and not args.no_sync and not args.verify_only and not args.abort:
         for d in dirs:
             try:
-                sync(api, args.repo, args.repo_type, d, expect_full, args.dry_run, lean)
+                sync(api, args.repo, args.repo_type, d, args.dry_run)
             except Exception as e:  # a failed upload shows up as a verification problem below
                 log(f"sync of {d.name} failed: {type(e).__name__}: {e}")
                 event("sync_failed", run=d.name, error=f"{type(e).__name__}: {e}")
-    if args.job == "study":  # one box, many run dirs: its logs and queue state under the box's own folder
-        infra_dest = f"study/box-{os.environ.get('KITSUNE_BOX') or 'unknown'}/infra/" \
-                     f"{os.environ.get('CONTAINER_ID', 'local')}"
-    elif args.job == "full":  # kitsune.fullrun.box_infra_dir
-        infra_dest = f"full/box-{os.environ.get('KITSUNE_BOX') or 'unknown'}/infra/" \
-                     f"{os.environ.get('CONTAINER_ID', 'local')}"
-    else:
-        infra_dest = f"runs/{dirs[-1].name}/infra" if dirs else f"infra/{os.environ.get('CONTAINER_ID', 'local')}"
+    # one box, many run dirs: its logs and queue state under the box's own folder (kitsune.fullrun.box_infra_dir)
+    infra_dest = f"full/box-{os.environ.get('KITSUNE_BOX') or 'unknown'}/infra/" \
+                 f"{os.environ.get('CONTAINER_ID', 'local')}"
 
     def push_infra():  # best effort and bounded; --no-sync too (a failed bootstrap's reason is in these files)
         if api is not None and not args.verify_only:
-            best_effort(lambda: upload_infra(api, args.repo, args.repo_type, infra_dest, args.dry_run,
-                                             deep=args.job in ("study", "full")), "infra upload")
+            best_effort(lambda: upload_infra(api, args.repo, args.repo_type, infra_dest, args.dry_run, deep=True),
+                        "infra upload")
 
     if args.sync_only:
         push_infra()
         return 0
-    if args.abort:  # job full (every other job became --stop --no-sync above)
+    if args.abort:  # job full (a label box's became --stop --no-sync above)
         return abort(dirs, args.reason, args.dry_run, push_infra)
     if args.stop:
         return 0 if instance_action("stop", args.reason or "requested", args.dry_run, push_infra) else 1
 
     expected = {}
     for d in dirs:
-        expected.update(expected_files(d, expect_full, lean))
+        expected.update(expected_files(d))
     if api is None:
         problems = ["no HF output repo (KITSUNE_OUT_REPO unset) or huggingface_hub unavailable"]
     else:
@@ -671,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
     if problems:
         why = f"verification failed ({len(problems)} problems); {args.reason}".rstrip("; ")
         return 2 if instance_action("stop", why, args.dry_run, push_infra) else 1
-    if args.job == "full" and is_chain_box():  # addendum E.7.2: what the Hub must hold before the disk goes
+    if is_chain_box():  # addendum E.7.2: what the Hub must hold before the disk goes
         chain_problems = chain_checks(api, args.repo, args.repo_type, infra_dest, args.dry_run)
         if chain_problems:
             why = f"chain verification failed: {'; '.join(chain_problems[:5])}"
@@ -742,7 +709,7 @@ def chain_gate_box() -> str | None:
 
 
 def chain_checks(api, repo: str, repo_type: str, infra_dest: str, dry_run: bool) -> list[str]:
-    """A chain box's --destroy, after the lean sync and the run-dir verification (addendum E.7.2), in order: (a) the
+    """A chain box's --destroy, after the sync and the run-dir verification (addendum E.7.2), in order: (a) the
     deep infra upload, synchronously and within CHAIN_INFRA_TIMEOUT_S (its failure is a problem); (b) verify_chain;
     (c) the infra listing holds the chain's events, chain.json, the gate part's events and queue.json, the download gate
     record and the watchdog's alerts when there are any. On a failed gate this is decision D3's "verify the verdict,
@@ -816,7 +783,7 @@ def label_prefix(config: str) -> str:
 
 def label_main(args) -> int:
     """finish.py --job label (module docstring): sync the label root write-once, verify it per directory, then stop
-    or destroy as the train path does."""
+    or destroy as the full path does."""
     import label_sync  # vast/ is on sys.path: this file's directory (python vast/finish.py), or the importer's
 
     repo = os.environ.get("KITSUNE_DATA_REPO") or args.repo
@@ -840,7 +807,7 @@ def label_main(args) -> int:
             log(f"huggingface_hub unavailable: {e}")
     log(f"mode={mode} job=label repo={repo} root={prefix} run_id={rid} dry_run={args.dry_run}")
 
-    def push_infra():  # best effort and bounded, as in the train path
+    def push_infra():  # best effort and bounded, as in the full path
         if api is not None and not args.verify_only and not args.no_infra:
             best_effort(lambda: upload_infra(api, repo, repo_type, infra_dest, args.dry_run), "infra upload")
 

@@ -1,7 +1,7 @@
 """Tests for vast/launch.py's label job (--job label: RTX 5090 tiers, 250 GB disk, ranking by the estimated total,
-the avoid list, the label env and preflight) and its extent path for the A100 (extent_problems, extent_preflight and
-the sizing it feeds into --disk/--storage/--max-hours and KITSUNE_REBUILD_TIMEOUT_MIN). The train job's own tests stay
-in tests/test_infra.py, untouched. No network, no vastai CLI, no GPU.
+the avoid list, the label env and preflight) and the extent path a full box takes (extent_problems, extent_preflight
+and the sizing it feeds into --disk/--storage and KITSUNE_REBUILD_TIMEOUT_MIN). launch.main's own behaviour is
+tests/test_infra.py's, the full job's tests/test_full_vast.py's. No network, no vastai CLI, no GPU.
 """
 import importlib
 import json
@@ -89,19 +89,13 @@ def label_args(*extra):
 
 @pytest.fixture(autouse=True)
 def passing_label_preflight(monkeypatch, request):
-    """--job label refuses --no-hf-check (it pins KITSUNE_DATA_REVISION), so the HF side is faked as passing; the
-    tests of the preflight and the avoid list themselves keep the real functions."""
+    """--job label always runs its HF preflight (it pins KITSUNE_DATA_REVISION and checks the lease), so the HF side
+    is faked as passing; the tests of the preflight and the avoid list themselves keep the real functions."""
     if "preflight" in request.node.name or "avoided" in request.node.name:
         return
     monkeypatch.setattr(launch, "config_at", lambda sha, c: make_cfg(Path(c).stem))
     monkeypatch.setattr(launch, "label_preflight", lambda *a, **kw: ("d" * 40, [], []))
     monkeypatch.setattr(launch, "avoided_machines", lambda *a, **kw: (set(), []))
-
-
-def test_label_job_refuses_no_hf_check(fake_vastai, capsys):
-    fake_vastai([OFFERS_5090])
-    assert launch.main(label_args("--yes", "--no-hf-check")) == 1
-    assert "needs the HF preflight" in capsys.readouterr().out
 
 
 def test_label_ranking_drops_offers_over_max_dph_before_the_total():
@@ -186,13 +180,17 @@ def test_label_avoids_machines(fake_vastai, capsys):
     assert "all 1 on avoided machines" in capsys.readouterr().out
 
 
-def test_label_needs_no_out_repo_but_train_does(fake_vastai, capsys):
+def test_label_needs_no_out_repo_but_full_does(fake_vastai, capsys):
     fake_vastai([OFFERS_5090])
     assert launch.main(label_args("--dry-run")) == 0
     with pytest.raises(SystemExit) as e:
-        launch.main(["--data-repo", "Multy123/kitsune-data", "--sha", SHA, "--image", DIGEST_IMAGE, "--no-hf-check"])
+        launch.main(["--job", "full", "--box", "p01", "--data-repo", "Multy123/kitsune-data", "--sha", SHA, "--image",
+                     DIGEST_IMAGE])
     assert e.value.code == 2
     assert "the following arguments are required: --out-repo" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as e:  # no default job: the retired train job was one
+        launch.main(["--data-repo", "Multy123/kitsune-data", "--out-repo", "Multy123/kitsune-runs"])
+    assert e.value.code == 2 and "the following arguments are required: --job" in capsys.readouterr().err
 
 
 def test_label_disk_gb_refused_below_the_minimum(fake_vastai, capsys):
@@ -206,10 +204,12 @@ def test_label_disk_gb_refused_below_the_minimum(fake_vastai, capsys):
     assert "disk_space>=300" in next(c for c in fake.calls if c[1:3] == ["search", "offers"])[3]
 
 
-def test_train_job_spec_is_todays_constants():
-    train = launch.JOBS["train"]
-    assert (train.tiers, train.base_filter, train.disk_gb) == (launch.TIERS, launch.HOST_FILTER, launch.DISK_GB)
-    assert launch.job_query(train, launch.TIERS[0][1], launch.DISK_GB) == launch.build_query(launch.TIERS[0][1])
+def test_the_query_helpers():
+    label = launch.JOBS["label"]
+    assert (label.tiers, label.base_filter, label.disk_gb) == (launch.LABEL_TIERS, launch.LABEL_FILTER,
+                                                               launch.LABEL_DISK_GB)
+    assert launch.job_query(label, ["gpu_name=RTX_5090"], 300) == " ".join(
+        ["gpu_name=RTX_5090", *(t for t in launch.LABEL_FILTER if not t.startswith("disk_space")), "disk_space>=300"])
     assert launch.search_args("q") == launch.search_args("q", launch.DISK_GB)
     assert launch.host_filter(["a", "disk_space>=150"], 400) == ["a", "disk_space>=400"]
 
@@ -299,7 +299,6 @@ def test_label_preflight_refusals(hub, parakeet_pins, monkeypatch):
     hub(files, private=False, lfs=bad_lfs)
     outside = make_cfg("sub", sources=["reazon_large"], eval_sets=[], root="labels/other")
     called = []
-    monkeypatch.setattr(launch, "data_problems", lambda *a: called.append(a) or [])
     monkeypatch.setattr(launch, "selection_problems", lambda *a, **k: called.append(a) or [])
     _, problems, _ = launch.label_preflight("r", SHA, full, {"configs/full.json": full, "sub": outside}, now=now)
     text = "\n".join(problems)
@@ -357,7 +356,7 @@ def test_label_main_runs_the_preflight_and_avoid_list(fake_vastai, hub, parakeet
     assert "resume plan" in capsys.readouterr().out
 
 
-# ---------------------------------------------------------------------------------------------------- A100 extent
+# ---------------------------------------------------------------------------------------------------- the extent
 
 
 def stem(name, step, hours, size, split="train"):
@@ -436,9 +435,9 @@ def test_selection_problems_compares_the_extent(tmp_path):
     assert any("built with extent" in p for p in launch.selection_problems(other, "sel", cfg))
     none = selection_parquet(tmp_path / "none.parquet", cfg, None)
     assert any("built with extent None" in p for p in launch.selection_problems(none, "sel", cfg))
-    # the viability path: no extent on either side
-    viab = {k: v for k, v in cfg.items() if k != "extent"}
-    assert launch.selection_problems(none, "sel", viab) == []
+    # no extent on either side: they agree
+    plain = {k: v for k, v in cfg.items() if k != "extent"}
+    assert launch.selection_problems(none, "sel", plain) == []
 
 
 def extent_hub_files(tmp_path, cfg) -> dict[str, bytes]:
@@ -468,45 +467,3 @@ def test_extent_preflight_sizing(tmp_path, hub):
     hub(files)
     assert launch.extent_preflight("r", "d" * 40, cfg) == (
         ["r: no labels/full/extent.json: the label box writes it when it finishes the root"], None)
-
-
-OFFERS_A100 = [{"id": 111, "machine_id": 1, "gpu_name": "A100 SXM4", "gpu_ram": 40960, "dph_total": 0.672,
-                "inet_down_cost": 0.01, "inet_up_cost": 0.02}]
-
-
-def test_train_with_an_extent_config_sizes_the_box(tmp_path, fake_vastai, hub, monkeypatch, capsys):
-    cfg = sub_cfg()
-    monkeypatch.setattr(launch, "config_at", lambda sha, c: cfg)
-    seen = []
-    monkeypatch.setattr(launch, "data_problems", lambda *a: seen.append(a) or ["never"])
-    monkeypatch.setattr(launch, "hf_preflight", lambda data, out, c: ("d" * 40, []))
-    hub(extent_hub_files(tmp_path, cfg))
-    fake = fake_vastai([OFFERS_A100])
-    args = ["--data-repo", "Multy123/kitsune-data", "--out-repo", "Multy123/kitsune-runs", "--sha", SHA,
-            "--image", DIGEST_IMAGE, "--skip-git-checks", "--config", "configs/sub.json", "--yes"]
-    assert launch.main(args) == 0, capsys.readouterr().out
-    search = next(c for c in fake.calls if c[1:3] == ["search", "offers"])
-    assert "disk_space>=250" in search[3] and search[search.index("--storage") + 1] == "250"
-    assert "gpu_name in [A100_SXM4]" in search[3] and "reliability>=0.98" in search[3]
-    create = next(c for c in fake.calls if c[1:3] == ["create", "instance"])
-    assert create[create.index("--disk") + 1] == "250"
-    env = env_of(create)
-    assert env["KITSUNE_REBUILD_TIMEOUT_MIN"] == "57" and env["KITSUNE_MAX_HOURS"] == "6.45"  # 5.5 + 57 / 60
-    assert env["KITSUNE_OUT_REPO"] == "Multy123/kitsune-runs" and "KITSUNE_JOB" not in env
-    assert "~42 GB down" in capsys.readouterr().out
-    # an explicit --disk-gb below the sizing is refused; above it wins
-    fake_vastai([OFFERS_A100])
-    assert launch.main([*args[:-1], "--disk-gb", "200", "--dry-run"]) == 1
-    fake = fake_vastai([OFFERS_A100])
-    assert launch.main([*args[:-1], "--disk-gb", "400", "--max-hours", "7", "--yes"]) == 0
-    create = next(c for c in fake.calls if c[1:3] == ["create", "instance"])
-    assert create[create.index("--disk") + 1] == "400" and env_of(create)["KITSUNE_MAX_HOURS"] == "7"
-
-
-def test_train_extent_config_under_no_hf_check_needs_explicit_sizing(fake_vastai, capsys):
-    """Without the HF preflight there is no extent sizing: the 150 GB default disk cannot hold a full rebuild."""
-    fake_vastai([OFFERS_5090])
-    args = ["--data-repo", "Multy123/kitsune-data", "--out-repo", "Multy123/out", "--sha", SHA, "--image",
-            DIGEST_IMAGE, "--skip-git-checks", "--no-hf-check", "--config", "configs/full.json", "--yes"]
-    assert launch.main(args) == 1
-    assert "pass --disk-gb and --max-hours" in capsys.readouterr().out

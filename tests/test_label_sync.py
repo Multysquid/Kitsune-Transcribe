@@ -373,12 +373,20 @@ def test_finish_busy_sync_lock_skips_the_sync_with_rc_1(box, monkeypatch):
     assert finish.main(["--sync-only", "--no-infra"]) == 1 and box.hub.commits == []
 
 
-def test_finish_train_default_is_unchanged(monkeypatch):
-    """Without --job and KITSUNE_JOB the train path runs (the train finish tests in test_infra stay as they are)."""
+def test_finish_defaults_to_the_full_job(monkeypatch, capsys):
+    """Without --job and KITSUNE_JOB finish.py takes the full box's path (vast/watchdog.sh calls it without --job; the
+    full finish tests are tests/test_infra.py's), and a KITSUNE_JOB that is neither full nor label (the retired train
+    and study jobs) is refused before anything runs."""
     monkeypatch.delenv("KITSUNE_JOB", raising=False)
     monkeypatch.setattr(finish, "label_main", lambda args: pytest.fail("label path taken"))
     with pytest.raises(SystemExit):
         finish.main([])  # a mode is required: argparse exits before anything runs
+    monkeypatch.setattr(finish, "hf_api", lambda: pytest.fail("the hub reached"))
+    for job in ("train", "study"):
+        monkeypatch.setenv("KITSUNE_JOB", job)
+        with pytest.raises(SystemExit) as e:
+            finish.main(["--verify-only"])
+        assert e.value.code == 2 and f"KITSUNE_JOB {job!r}: --job is full or label" in capsys.readouterr().err
 
 
 def test_finish_verify_prefix_of_lists_each_dir_non_recursively(tmp_path):

@@ -616,6 +616,22 @@ def test_sizing_from_a_toy_record():
         386.25)
 
 
+def test_sizing_counts_both_stores_the_parakeet_labels_and_the_extra():
+    """A box that reads both label roots (pull_parakeet) builds two stores and pulls both roots' labels; extra_gb (a
+    registry box's extra disk: its checkpoints) goes onto the disk too."""
+    rec = {"schema": 1, "sources": {"reazon_small": {"hours": 100.0, "bytes": 3e9, "inputs": [
+        {"ordinal": 0, "bytes": 3e9, "stems": [{"stem": "train-00000", "step": "reazon_small", "hours": 100.0,
+                                                 "shard_bytes": 3e9}]}]}}}
+    cfg = {"extent": {"name": "full", "root": "labels/full", "inputs": {}}, "sources": ["reazon_small"],
+           "eval_sets": []}
+    one = extent.sizing(rec, cfg)
+    both = extent.sizing(rec, dict(cfg, pull_parakeet=True), extra_gb=100)
+    assert one["stores"] == 1 and both["stores"] == 2 and both["extra_gb"] == 100
+    assert both["labels_gb"] == pytest.approx(100 * (extent.LABEL_GB_PER_HOUR + extent.PARAKEET_GB_PER_HOUR))
+    need = extent.DISK_MARGIN * (extent.DISK_BASE_GB + 3 + 2 * 3 + both["labels_gb"] + 100)
+    assert both["disk_gb"] == int(-(-need // extent.DISK_STEP_GB) * extent.DISK_STEP_GB) > one["disk_gb"]
+
+
 def test_extent_config_run_writes_progress_and_a_rerun_is_a_noop(full, world, tmp_path, monkeypatch, capsys):
     """01 records every finished step, so a restarted ingest lane or a retried A100 rebuild skips them: no listing, no
     download, nothing on disk changes. Progress recorded for another plan is dropped, and running every step again is

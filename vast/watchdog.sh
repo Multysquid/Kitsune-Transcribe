@@ -1,6 +1,6 @@
 #!/bin/bash
-# Hard cost cap for the vast instance: stop it KITSUNE_MAX_HOURS (default 5.5) after the FIRST boot, whatever the run
-# is doing. Started detached by vast/onstart.sh.
+# Hard cost cap for the vast instance: stop it KITSUNE_MAX_HOURS (vast/launch.py sets it) after the FIRST boot, whatever
+# the run is doing. Started detached by vast/onstart.sh, which fixes the deadline first.
 #
 # Why a separate process: the supervisor can hang (a stuck NCCL/CUDA call, a hung upload) and a forgotten instance bills
 # until someone notices. The deadline is written once to $KITSUNE_STATE/deadline at first boot, so a container restart
@@ -13,21 +13,17 @@
 # nothing would end the box before the cap, so the watchdog runs finish.py --sync-only (the labels on disk get to the
 # Hub) and then stops the instance, retrying the stop like at the deadline. The rule arms only once this boot's
 # controller has touched the file (a heartbeat older than the watchdog's own start is a previous boot's); if it never
-# does, it fires at 2 x ORPHAN_S. A halt marker (finish.py has taken over) disables it. ORPHAN_S=0 (the train job)
-# leaves the watchdog exactly as it was.
+# does, it fires at 2 x ORPHAN_S. A halt marker (finish.py has taken over) disables it. ORPHAN_S=0 (the default) turns
+# the rule off.
 #
-# Study box (KITSUNE_JOB=study): the same cap, per box (vast/launch.py STUDY_HOURS plus the rebuild timeout); its syncs
-# are lean (finish.py reads KITSUNE_JOB: logs, weights and the uploaded full states of every run dir, never the resume
-# states), and the queue's trainers stop with the instance.
-#
-# Full-data box (KITSUNE_JOB=full; vast/launch.py sets the three knobs from the box registry): the same rule on the box
-# controllers' heartbeat, KITSUNE_WATCHDOG_HB_FILE=train_hb under $KITSUNE_STATE (bootstrap's phases, the queue's poll,
-# the supervisor's bounded finish calls touch it; the trainers beat their own item files, which the queue's stall check
-# reads), with KITSUNE_WATCHDOG_ORPHAN_S from the registry. KITSUNE_WATCHDOG_ORPHAN_ACTION=stop (boxes p01 and full) is
-# the label rule with the reason "watchdog: box controller heartbeat stale"; alert (the smoke box, whose fault test
-# freezes the heartbeat on purpose) only appends {"wall", "kind": "orphan_alert", "hb", "age_s", "limit_s"} to
-# $KITSUNE_STATE/watchdog_alerts.jsonl, never syncs or stops, and re-arms once the file is fresh again. The defaults
-# (label_hb, stop) keep the label box exactly as it was.
+# Full-data box (KITSUNE_JOB=full; vast/launch.py sets the cap and the three knobs from the box registry): the same rule
+# on the box controllers' heartbeat, KITSUNE_WATCHDOG_HB_FILE=train_hb under $KITSUNE_STATE (bootstrap's phases, the
+# queue's poll, the supervisor's bounded finish calls touch it; the trainers beat their own item files, which the
+# queue's stall check reads), with KITSUNE_WATCHDOG_ORPHAN_S from the registry. KITSUNE_WATCHDOG_ORPHAN_ACTION=stop
+# (boxes p01 and full) is the label rule with the reason "watchdog: box controller heartbeat stale"; alert (the smoke
+# box, whose fault test freezes the heartbeat on purpose) only appends {"wall", "kind": "orphan_alert", "hb", "age_s",
+# "limit_s"} to $KITSUNE_STATE/watchdog_alerts.jsonl, never syncs or stops, and re-arms once the file is fresh again.
+# The defaults (label_hb, stop) keep the label box exactly as it was.
 #
 # Chain box (contract addendum E.5; p01-chain): the env is stage 1's (alert 600). Every poll also reads the mode file
 # $KITSUNE_STATE/watchdog_mode ("<stop|alert> <orphan_s>"), which the chain controller writes once its gate part has
@@ -43,7 +39,7 @@ set -euo pipefail
 
 KITSUNE_DIR="${KITSUNE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 STATE="${KITSUNE_STATE:-/workspace/kitsune_state}"
-MAX_HOURS="${KITSUNE_MAX_HOURS:-5.5}"
+MAX_HOURS="${KITSUNE_MAX_HOURS:-}"
 SYNC_LEAD_S="${KITSUNE_WATCHDOG_SYNC_LEAD_S:-600}"
 POLL_S="${KITSUNE_WATCHDOG_POLL_S:-60}"
 RETRY_S=300

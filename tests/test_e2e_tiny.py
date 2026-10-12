@@ -427,6 +427,8 @@ def test_a_failed_pre_cooldown_upload_is_kept_for_finish(tmp_path, pre_upload_ok
     assert ("ckpt_upload_failed", "full_step_4") in evs or pre_upload_ok
     assert not (R.ckpt_dir / "full_step_8" / m.UPLOAD_MARK).exists()  # uploaded: nothing to keep it for
     assert all(ign == [m.UPLOAD_MARK] for _, _, ign in hub.folders)  # the marker never leaves the box
+    # the run's config.json (the trainer writes it at start): DEFAULTS upload the pre_cooldown and the end states
+    (run / "config.json").write_text(json.dumps({"config": m.DEFAULTS}), encoding="utf-8")
     spec = importlib.util.spec_from_file_location("finish", ROOT / "vast" / "finish.py")
     finish = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(finish)
@@ -655,22 +657,19 @@ def test_trainer_hub_client_has_a_timeout():
         huggingface_hub.set_client_factory(_http.default_client_factory)
 
 
-def test_configs_resolve():
+def test_the_defaults_resolve():
+    """A config that names nothing is DEFAULTS: early stopping off (a config that does not mention it trains to its
+    budget, as before early stopping existed), the eval cadence the fallback's (every_min) with no full eval per epoch,
+    no mini eval and no greedy probe decode (a config that does not mention them evaluates as before); the full configs
+    and the viability run's (git show 76b28a1:configs/viability.json) turn them on."""
     m = load_script("04_distill")
-    via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
-    # the file spells out the defaults, turns early stopping on (off in DEFAULTS: a config that does not mention it
-    # trains to its budget, as before early stopping existed) and sets the eval cadence: a full eval (complete eval
-    # sets) at every epoch end, a mini eval every 500 steps (the combined_loss/val curve's cadence), a greedy decode of
-    # ~600 s of the probe for the train CER (all off in DEFAULTS: a config that does not mention them evaluates as
-    # before)
-    assert not m.DEFAULTS["early_stop"]["enabled"] and via["early_stop"]["enabled"]
-    ev_via = dict(m.DEFAULTS["eval"], full_every_epochs=1, probe_greedy_audio_s=600,
-                  mini=dict(every_steps=500, val_per_set=32, train_utts=64, greedy=True))
-    assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True), eval=ev_via)
-    assert via["eval"]["every_min"] == 20 and via["eval"]["gate"] is True  # every_min: the fallback cadence only
-    assert m.epoch_cadence(via) == 1 and m.DEFAULTS["eval"]["mini"]["every_steps"] is None
-    for key in ("sources", "eval_sets", "teacher_root", "second_root", "data_root", "selection", "student"):
-        assert key in json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))  # bootstrap.sh
+    assert m.load_config(None, []) == m.DEFAULTS
+    assert not m.DEFAULTS["early_stop"]["enabled"]
+    assert m.DEFAULTS["eval"]["every_min"] == 20 and m.DEFAULTS["eval"]["gate"] is True
+    assert m.DEFAULTS["eval"]["mini"]["every_steps"] is None and m.DEFAULTS["eval"]["probe_greedy_audio_s"] is None
+    assert m.epoch_cadence(m.DEFAULTS) is None
+    on = m.load_config(None, ["early_stop.enabled=true", "eval.full_every_epochs=1", "eval.mini.every_steps=500"])
+    assert on["early_stop"]["enabled"] and m.epoch_cadence(on) == 1 and on["eval"]["mini"]["every_steps"] == 500
 
 
 def test_load_config_applies_sets_over_a_file_and_refuses_bad_ones(tmp_path):
