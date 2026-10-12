@@ -1,14 +1,12 @@
 """The full-data runs' shared core: names, paths, the box registry and the small helpers every full-run package uses.
 
-The full runs (plan v3) trained P-0.1B alone on box `p01` (1x RTX 5090, Parakeet labels only; box 1), which now
-re-runs that run's cooldown with the CTC train-data augmentation on, the recipe test (DECISIONS H1: --resume-reset with
---resume-set schedule.epochs and augment.*; G3's 8-epoch continuation is postponed, H2), then T-0.6B on box `full-t`
-(postponed under H2; runs since DECISIONS H15, 6 epochs, from the box branch t-box) and P-0.3B with that recipe on box
-`full-p` if the test shows it helps (H1 step 2; P-0.05B postponed, H2), each 1x RTX 5090, one queue (DECISIONS G2:
-box 2's 2x box `full` is retired, its name kept for the tests' fixtures only), after two short smokes (`full-smoke` =
-smoke A, `smoke-b`). Box `p-cool` (DECISIONS H14) is one rental that re-runs three done runs' cooldowns (P-0.3B,
-P-0.1B, P-0.05B), each from its runs-repo pre_cooldown state: its train items carry a `continues` block (below), so the
-box is always a resume and never trains from step 0.
+The full runs (plan v3) trained one student per box, each box a 1x RTX 5090 with one queue (DECISIONS G2), after two
+short smokes (`full-smoke` = smoke A, `smoke-b`): P-0.1B on box `p01` (box 1, Parakeet labels only; the same box then
+re-ran that run's cooldown with the CTC train-data augmentation on, the recipe test of DECISIONS H1), P-0.3B with the
+augmentation recipe on box `full-p`, P-0.05B on box `p005` (the P test box, DECISIONS H10) and T-0.6B on box `full-t`
+(DECISIONS H15, 6 epochs). Box `p-cool` (DECISIONS H14) is one rental that re-runs three done runs' cooldowns
+(P-0.3B, P-0.1B, P-0.05B), each from its runs-repo pre_cooldown state: its train items carry a `continues` block
+(below), so the box is always a resume and never trains from step 0.
 The selection (scripts/make_selection.py full mode, kitsune/devslice.py), the trainer (scripts/04_distill.py), the
 box queue (kitsune/full_queue.py), the vast scripts (vast/launch.py, bootstrap.sh, finish.py) and the evaluators all
 import their shared names from here, so a constant cannot drift between them. The binding definitions are the full-run
@@ -110,11 +108,8 @@ No two items of a box share a run_id, and no chain has a part with continues ite
 always as a resume: bootstrap asks has-continues). continues_of(box) lists them; continue_sets(block) spells the sets
 as the --set words the queue passes after schedule.resume_reset=true.
 
-CLI (vast/bootstrap.sh; exit 0 ok, 2 refused - a bad registry, an unknown box, a student that is not the registered
-build):
-  python -m kitsune.fullrun students --box p01 [--root R]         # the train items' student dirs, one per line
-  python -m kitsune.fullrun extra-files --box p01                 # the box's extra data-repo files, one per line
-  python -m kitsune.fullrun extra-dirs --box full-smoke           # its extra data-repo dirs
+CLI (vast/bootstrap.sh runs check-students and has-continues, show is the operator's; exit 0 ok, 2 refused - a bad
+registry, an unknown box, a student that is not the registered build):
   python -m kitsune.fullrun check-students --box p01 --root R     # every pulled student is the registered build
   python -m kitsune.fullrun show --box full-t                     # the box spec with defaults, env and configs (JSON)
   python -m kitsune.fullrun check-students --box p01-chain --stage 2 --root R   # a chain: one stage's view
@@ -140,14 +135,13 @@ REPO = Path(__file__).resolve().parents[1]
 
 JOB = "full"  # KITSUNE_JOB=full
 BOXES_FILE, ENV_REGISTRY = "configs/full/boxes.json", "KITSUNE_FULL_REGISTRY"
-# smoke A, box p01 (box 1, then its recipe test: box 1's cooldown again), "full" (the retired 2x box 2: no longer in
-# the registry, kept for tests/fixtures_full.py's 2-GPU box only), smoke B, and box 2 as two 1x boxes (DECISIONS G2):
-# full-t (T-0.6B) and full-p (P-0.3B with the augmentation recipe, the Whisper models and the quantised readouts;
-# P-0.05B postponed, DECISIONS H2), and p005: P-0.05B alone, the P test box of recipe v3 (DECISIONS H10; box p01 keeps
-# P-0.1B's run, whose continuation reads box p01's Hub summary), and p-cool: one rental that re-runs the cooldowns of
-# box full-p's P-0.3B, box p01's P-0.1B and box p005's P-0.05B from their pre_cooldown states (DECISIONS H14; its
-# train items' `continues` blocks name the source boxes)
-BOX_NAMES = ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005", "p-cool")
+# smoke A, box p01 (box 1, then its recipe test: box 1's cooldown again), smoke B, and one 1x box per student
+# (DECISIONS G2): full-t (T-0.6B), full-p (P-0.3B with the augmentation recipe, the Whisper models and the quantised
+# readouts) and p005 (P-0.05B alone, the P test box of recipe v3, DECISIONS H10; box p01 keeps P-0.1B's run, whose
+# continuation reads box p01's Hub summary), and p-cool: one rental that re-runs the cooldowns of box full-p's P-0.3B,
+# box p01's P-0.1B and box p005's P-0.05B from their pre_cooldown states (DECISIONS H14; its train items' `continues`
+# blocks name the source boxes)
+BOX_NAMES = ("full-smoke", "p01", "smoke-b", "full-t", "full-p", "p005", "p-cool")
 # chain boxes (contract addendum E, DECISIONS D): one rental that runs registry boxes one after the other, in two
 # stages with an automatic gate between them (kitsune/full_queue.py ChainController). p01-chain = smoke A and smoke B,
 # then box 1, on one 1x RTX 5090
@@ -212,27 +206,20 @@ DATA_KEYS = ("data_root", "teacher_root", "second_root", "parakeet_root", "selec
 RUN_ID_RE = r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"  # <item>-<YYYYMMDDTHHMMSSZ>[-n], 04 build's run dir name
 ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # the config keys launch --resume-set may change, and the kind of each one's value (RESUME_SET_KINDS; resume_set_value
-# parses and normalises it). DECISIONS G3: P-0.1B's continuation sets its epochs and its early-stop patience (ints of at
-# least RESUME_SET_INT_MIN[key]). DECISIONS H1: the recipe test box re-runs box 1's cooldown from its pre_cooldown state
-# with the CTC train-data augmentation on - augment.enabled (a bool) and the three probabilities the owner's recipe sets
-# (truncate 0.3, concat 0.5, mix 0.05 since H4: floats in [0, 1]). The augmentation's other keys (its seed, the
-# truncate bounds and pause share, concat_max_s / concat_max_n, mix_snr_db) keep the trainer's defaults on purpose: a resume that moved
-# them would test another recipe than the one P-0.3B is to train with, so they are not settable here. None of these
-# keys shapes the step plan (scripts/04_distill.py RESUME_FIXED holds none of them: augment.* happens inside the train
-# loader), so a resume keeps its epoch position; 04_distill validates every value again on the box (validate: epochs,
-# bools; validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set).
-# DECISIONS H8 (the P test box after the P-0.3B review): box 1's cooldown re-run with recipe v2 and the review's fixes
-# also sets truncate_min_row_s (seconds >= 0), end_trim_p (a probability) and the background noise - noise_p (a
-# probability), the bank's data-repo path noise_bank and the sha256 of its index.json, noise_bank_sha256. DECISIONS
-# H12 adds the other acoustic steps' rates (speech_p, reverb_p, gain_p, codec_p) and the RIR bank (rir_bank, its pin
-# rir_bank_sha256); their ranges (speech_snr_db, gain_db, codecs, ...) are no resume sets: they are lists, which
-# KITSUNE_RESUME_SETS (comma-separated) cannot carry, and only a registry continuation sets them (CONTINUE_SET_KEYS).
-# DECISIONS H14 (box p-cool) adds background_min_row_s (seconds >= 0: rows shorter than this get no background speech
-# or noise) and schedule.deadline_cooldown (a bool: false turns the deadline's cooldown compression off for a
-# continuation; 04_distill RESUME_FIXED holds neither). The recipe audit of 2026-10-09 (B1-B3; recipe v5,
-# make_full_configs RECIPE_V5) adds its three fixes, bools that are false by default, so a continuation can turn them
-# on: augment.cut_keep_word, augment.guard_per_piece and augment.end_trim_voiced (04_distill AUDIT_FIX_KEYS; not in
-# RESUME_FIXED either)
+# parses and normalises it): the run's length and patience (schedule.epochs, early_stop.patience: ints of at least
+# RESUME_SET_INT_MIN[key]); the CTC train-data augmentation's switch (augment.enabled) and its steps' rates (the
+# probabilities truncate_p, concat_p, mix_p, end_trim_p, noise_p, speech_p, reverb_p, gain_p and codec_p, in [0, 1]);
+# its row floors (truncate_min_row_s, and background_min_row_s: rows shorter than this get no background speech or
+# noise; seconds >= 0); its banks (noise_bank and rir_bank: data-repo paths, each pinned by the sha256 of its
+# index.json); schedule.deadline_cooldown (a bool: false turns the deadline's cooldown compression off for a
+# continuation); and the recipe audit's three fixes, bools that are false by default (cut_keep_word, guard_per_piece,
+# end_trim_voiced; 04_distill AUDIT_FIX_KEYS). The augmentation's other keys stay the config's on purpose: a resume
+# that moved its seed, the truncate bounds and pause share, concat_max_s / concat_max_n or mix_snr_db would train
+# another recipe, and its ranges (speech_snr_db, gain_db, codecs, ...) are lists, which KITSUNE_RESUME_SETS
+# (comma-separated) cannot carry: only a registry continuation sets them (CONTINUE_SET_KEYS). None of these keys shapes
+# the step plan (scripts/04_distill.py RESUME_FIXED holds none of them: augment.* happens inside the train loader), so
+# a resume keeps its epoch position; 04_distill validates every value again on the box (validate: epochs, bools;
+# validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set)
 RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
                    "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s", "augment.end_trim_p",
                    "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256", "augment.speech_p",
@@ -1840,7 +1827,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m kitsune.fullrun", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("students", "extra-files", "extra-dirs", "check-students", "show", "has-continues"):
+    for c in ("check-students", "show", "has-continues"):
         sp = sub.add_parser(c)
         sp.add_argument("--box", default=os.environ.get(ENV_BOX), choices=ALL_BOX_NAMES)
         sp.add_argument("--stage", type=int, default=None,
@@ -1865,13 +1852,7 @@ def main(argv=None) -> int:
             if args.stage is None and not re.fullmatch(r"[1-9][0-9]*", env_stage):
                 raise RegistryError(f"{ENV_CHAIN_STAGE} {env_stage!r} is not a stage number")
             stage = args.stage if args.stage is not None else int(env_stage)
-        if args.cmd == "students":
-            lines = box_students(args.box, reg, r, stage=stage)
-        elif args.cmd == "extra-files":
-            lines = box_extra_files(args.box, reg, stage=stage, root=r)
-        elif args.cmd == "extra-dirs":
-            lines = box_extra_dirs(args.box, reg, stage=stage, root=r)
-        elif args.cmd == "show":
+        if args.cmd == "show":
             doc = {"box": args.box, "env": box_env(args.box, reg, stage=stage or 1),
                    "configs": box_configs(args.box, reg), "students": box_students(args.box, reg, r, stage=stage),
                    "spec": box_spec(args.box, reg, root=r)}
@@ -1880,22 +1861,19 @@ def main(argv=None) -> int:
                                  for s in chain_stages(args.box, reg)}
             print(json.dumps(doc, indent=2, ensure_ascii=False))
             return EXIT_OK
-        else:  # check-students: vast/bootstrap.sh after the pull (a chain: only this stage's students are on disk)
-            problems = student_checks(args.box, lambda s: json.loads(
-                (r / s / "student_meta.json").read_text(encoding="utf-8")), reg, r, stage=stage)
-            for x in problems:
-                print(f"student refused: {x}", file=sys.stderr)
-            if not problems:
-                what = f" (stage {stage})" if chain else ""
-                print(f"box {args.box}{what}: {len(box_students(args.box, reg, r, stage=stage))} student(s) are the "
-                      f"registered builds")
-            return EXIT_REFUSED if problems else EXIT_OK
+        # check-students: vast/bootstrap.sh after the pull (a chain: only this stage's students are on disk)
+        problems = student_checks(args.box, lambda s: json.loads(
+            (r / s / "student_meta.json").read_text(encoding="utf-8")), reg, r, stage=stage)
+        for x in problems:
+            print(f"student refused: {x}", file=sys.stderr)
+        if not problems:
+            what = f" (stage {stage})" if chain else ""
+            print(f"box {args.box}{what}: {len(box_students(args.box, reg, r, stage=stage))} student(s) are the "
+                  f"registered builds")
+        return EXIT_REFUSED if problems else EXIT_OK
     except RegistryError as e:
         print(f"refused: {e}", file=sys.stderr)
         return EXIT_REFUSED
-    if lines:
-        print("\n".join(lines))
-    return EXIT_OK
 
 
 if __name__ == "__main__":

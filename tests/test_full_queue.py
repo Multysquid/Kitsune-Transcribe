@@ -3,9 +3,9 @@
 - the order and argv: box p01's stores -> train -> readout with the binding readout argv (and runs/m4-<id>-r1 after a
   continuation), the train argv's hf sets, the per-item heartbeat and deadline env, the queue summary at
   full/box-<box>/queue_summary.json (put when a run dir appears), the item_done line in each readout/eval out dir
-- box full on two fake GPUs: the CTC stores first, full-p03 during stores-aed, no eval-pool item while a training item
-  waits, one process per GPU, a readout on its run's GPU, eval placeholders filled, runs-repo weights fetched and an
-  unresolved of_box skipped
+- box full-p (the tiny registry's 2-GPU box) on two fake GPUs: the CTC stores first, full-p03 during stores-aed, no
+  eval-pool item while a training item waits, one process per GPU, a readout on its run's GPU, eval placeholders
+  filled, runs-repo weights fetched and an unresolved of_box skipped
 - failures: exit 3 on one item (failed alone, rc 4 at the end), a store build that fails for good (its dependants
   skipped, no QueueError), a retried train item resuming in its run dir, a readout that fails (recorded, not retried)
 - the no-start rule (a droppable item skipped, a non-droppable one overridden) and KITSUNE_DEADLINE; a readout is
@@ -296,17 +296,17 @@ def test_a_retried_train_item_resumes_in_its_run_dir_and_a_failed_one_skips_its_
     assert fq.summary()["status"] == "halted" and "full-p01" in fq.summary()["reason"]
 
 
-# ================================================================================================= box full
+# =============================================================================================== box full-p
 
 
-def test_box_full_shares_two_gpus_stores_first_and_the_pool_after_training(fq):
+def test_box_full_p_shares_two_gpus_stores_first_and_the_pool_after_training(fq):
     up = FakeUploader(remote=weights_remote("study-t06"))
     (fq.state).mkdir(parents=True, exist_ok=True)
     deadline = time.time() + 100 * 3600
     (fq.state / "deadline").write_text(f"{deadline}\n")
     env = dict(FAKE_ITEM_S=json.dumps({"stores-aed": 0.8, "speed-": 0.3}),
                FAKE_EPOCH_STEPS=json.dumps({"full-t06": 250}), FAKE_STEP_S="0.004")
-    q = fq.make("full", uploader=up, env=env)
+    q = fq.make("full-p", uploader=up, env=env)
     assert q.run() == F.EXIT_OK
     recs = fq.records()
     it = {x["item"]: x for x in recs}
@@ -371,7 +371,7 @@ def test_an_of_box_item_reads_the_other_boxs_summary_and_fetches_its_weights(fq)
                                                        "result": {"run_id": rid, "steps": 110520}}}}
     remote = {fullrun.box_summary_path("p01"): json.dumps(summ).encode(),
               f"runs/{rid}/config.json": b"{}", f"runs/{rid}/checkpoints/step_110520/model.safetensors": b"w"}
-    q = fq.make("full", uploader=FakeUploader(remote=remote))
+    q = fq.make("full-p", uploader=FakeUploader(remote=remote))
     q.register()
     name = "quant-int8-w8a8-full-p01"
     assert q._prepare(name) is True
@@ -385,7 +385,7 @@ def test_an_of_box_item_reads_the_other_boxs_summary_and_fetches_its_weights(fq)
     # resolved, but its weights are not in the runs repo: a failed readout, recorded
     shutil.rmtree(fq.root / "cache")
     shutil.rmtree(fq.state)
-    q2 = fq.make("full", uploader=FakeUploader(remote={fullrun.box_summary_path("p01"): json.dumps(summ).encode()}))
+    q2 = fq.make("full-p", uploader=FakeUploader(remote={fullrun.box_summary_path("p01"): json.dumps(summ).encode()}))
     q2.register()
     assert q2._prepare(name) is False and q2.item(name)["status"] == "failed"
     assert "step_110520" in q2.state["readouts_failed"][name]
@@ -397,10 +397,10 @@ def test_an_of_box_item_reads_the_other_boxs_summary_and_fetches_its_weights(fq)
 
 
 def test_exit_3_fails_that_item_only_and_the_box_ends_with_rc_4(fq):
-    reg = box_only(fq.reg, "full", keep=["stores-ctc", "stores-aed", "full-t06", "full-p03", "full-p005",
+    reg = box_only(fq.reg, "full-p", keep=["stores-ctc", "stores-aed", "full-t06", "full-p03", "full-p005",
                                          "m4-full-t06", "m4-full-p03", "m4-full-p005"])
     env = dict(FAKE_RC=json.dumps({"full-p005": 3}), FAKE_EPOCH_STEPS=json.dumps({"full-t06": 200}))
-    assert fq.make("full", registry=reg, env=env).run() == F.EXIT_STOP
+    assert fq.make("full-p", registry=reg, env=env).run() == F.EXIT_STOP
     st = fq.st()
     p005 = st["items"]["full-p005"]
     assert p005["status"] == "failed" and len(p005["attempts"]) == 1 and "throughput" in p005["why"]
@@ -411,9 +411,9 @@ def test_exit_3_fails_that_item_only_and_the_box_ends_with_rc_4(fq):
 
 
 def test_a_store_build_that_fails_for_good_skips_its_dependants(fq):
-    reg = box_only(fq.reg, "full", keep=["stores-ctc", "stores-aed", "full-t06", "full-p03", "m4-full-t06",
+    reg = box_only(fq.reg, "full-p", keep=["stores-ctc", "stores-aed", "full-t06", "full-p03", "m4-full-t06",
                                          "m4-full-p03"], max_attempts=3)
-    assert fq.make("full", registry=reg, env=dict(FAKE_FAIL=json.dumps({"stores-aed": 1}))).run() == F.EXIT_STOP
+    assert fq.make("full-p", registry=reg, env=dict(FAKE_FAIL=json.dumps({"stores-aed": 1}))).run() == F.EXIT_STOP
     st = fq.st()
     assert st["items"]["stores-aed"]["status"] == "failed" and len(st["items"]["stores-aed"]["attempts"]) == 3
     assert st["items"]["full-t06"]["status"] == "skipped" and st["items"]["m4-full-t06"]["status"] == "skipped"
@@ -421,7 +421,7 @@ def test_a_store_build_that_fails_for_good_skips_its_dependants(fq):
     assert "full-t06" not in by_item(fq.records())
     # a store build that fails once is retried
     fq.reset()
-    assert fq.make("full", registry=reg, env=dict(FAKE_FAIL=json.dumps({"stores-ctc": [1, 0]}))).run() == F.EXIT_OK
+    assert fq.make("full-p", registry=reg, env=dict(FAKE_FAIL=json.dumps({"stores-ctc": [1, 0]}))).run() == F.EXIT_OK
     assert [x["rc"] for x in by_item(fq.records())["stores-ctc"]] == [1, 0]
 
 
@@ -438,12 +438,12 @@ def test_a_failed_readout_is_recorded_and_never_retried(fq):
 
 
 def test_the_no_start_rule_skips_a_droppable_item_and_overrides_the_others(fq):
-    reg = box_only(fq.reg, "full", keep=["stores-ctc", "stores-aed", "full-t06", "full-p03", "full-p005",
+    reg = box_only(fq.reg, "full-p", keep=["stores-ctc", "stores-aed", "full-t06", "full-p03", "full-p005",
                                          "m4-full-p005"])
     fq.state.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + 5 * 3600  # item deadline = +4 h: full-t06 (35 h) and full-p03 (22 h) do not fit
     (fq.state / "deadline").write_text(f"{deadline}\n")
-    assert fq.make("full", registry=reg).run() == F.EXIT_OK
+    assert fq.make("full-p", registry=reg).run() == F.EXIT_OK
     st = fq.st()
     assert st["items"]["full-p005"]["status"] == "skipped" and st["items"]["m4-full-p005"]["status"] == "skipped"
     assert st["no_start"]["full-p005"]["skipped"] is True
@@ -464,10 +464,10 @@ def test_a_held_item_is_tried_once_per_poll_while_its_gpu_takes_the_next_ready_i
                                                        "early_stop": {"triggered": None}, "resume_resets": 0,
                                                        "end_reason": "schedule"})
     write_plan(fq, {"stores-ctc": {"status": "fresh"}, "full-p03": {"status": "resume", "run_dir": f"runs/{rid}"},
-                    "full-p005": {"status": "fresh"}}, box="full")
+                    "full-p005": {"status": "fresh"}}, box="full-p")
     poll = 0.3
-    q = fq.make("full", registry=box_only(fq.reg, "full", keep=["stores-ctc", "full-p03", "full-p005"]), poll_s=poll,
-                env=dict(FAKE_CHECK_RESUME=json.dumps({"full-p03": 1})))
+    q = fq.make("full-p", registry=box_only(fq.reg, "full-p", keep=["stores-ctc", "full-p03", "full-p005"]),
+                poll_s=poll, env=dict(FAKE_CHECK_RESUME=json.dumps({"full-p03": 1})))
     assert q.run() == F.EXIT_STOP  # full-p03 held max_attempts times, then failed for good
     cr = fq.records("check-resume")
     assert len(cr) == 4 and len(fq.events("item_held")) == 4  # the 4th: held no more, failed
@@ -1673,7 +1673,7 @@ def test_the_queue_never_imports_the_trainer_or_reads_the_study_box_plans(fq, mo
         raise AssertionError("a full box never reads prereg.rules()['boxes']")
 
     monkeypatch.setattr(Q, "box_plan", no_plan)
-    q = fq.make("full")
+    q = fq.make("full-p")
     assert q.plan["shared_queue"] and q.plan["runs"] == ["full-t06", "full-p03", "full-p005"]
 
 
@@ -1710,10 +1710,10 @@ def test_a_readout_is_tested_against_the_box_deadline_not_kitsune_deadline(tmp_p
     # the watchdog's sync lead is read from its env
     monkeypatch.setenv("KITSUNE_WATCHDOG_SYNC_LEAD_S", "1800")
     assert F.readout_margin_s() == 2400
-    # an eval item keeps the item deadline (box full: the box deadline less its 60 min reserve), a readout does not
+    # an eval item keeps the item deadline (box full-p: the box deadline less its 60 min reserve), a readout does not
     (tmp_path / "state2").mkdir()
     (tmp_path / "state2" / "deadline").write_text(f"{now + 3 * 3600}\n")
-    q2 = F.FullQueue("full", F.FullSettings(root=root, state_dir=tmp_path / "state2", gpus=["0", "1"], out_repo=None,
+    q2 = F.FullQueue("full-p", F.FullSettings(root=root, state_dir=tmp_path / "state2", gpus=["0", "1"], out_repo=None,
                                             n_gpus=None, python=PY, uploader=FakeUploader(),
                                             proc_root=tmp_path / "np", cgroup=tmp_path / "nc"), registry=reg)
     q2.register()

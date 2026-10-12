@@ -2,7 +2,7 @@
 vast/watchdog.sh on train_hb, vast/blocklist.json.
 
 launch: the box registry (kitsune/fullrun.py, tests/fixtures_full.tiny_registry) read at the commit the box runs (a
-fake git serves a temp checkout), the query, env table and label of box p01 and the 2-GPU box full, the client filter
+fake git serves a temp checkout), the query, env table and label of box p01 and the 2-GPU box full-p, the client filter
 (verification, max rental, RAM per GPU, avoided machines), the ranking by the estimated total, --machine, the flag
 refusals, full_preflight's refusals (configs, tools and speed_probe kinds or args flags missing at the sha,
 students, extra files, the scratch repo, the selection sidecar via a stub kitsune.devslice, --resume's Hub summary and
@@ -250,11 +250,11 @@ def test_cost_guard_flags_are_full_only_and_positive(full_launch, capsys):
     assert "--max-total: for --job full only" in capsys.readouterr().err
 
 
-def test_box_full_rents_two_gpus_under_its_cap_and_ranks_by_the_total(full_launch, capsys):
+def test_box_full_p_rents_two_gpus_under_its_cap_and_ranks_by_the_total(full_launch, capsys):
     two = [offer(1, 11, 1.60, num_gpus=2, cpu_ram=130000, inet_down_cost=0.05, inet_up_cost=0.05),  # cheap $/h, dear GB
            offer(2, 12, 1.65, num_gpus=2, cpu_ram=130000),
            offer(3, 13, 1.75, num_gpus=2, cpu_ram=130000)]  # over the registry's 1.70 cap
-    rc, fake = full_launch([two], "--box", "full", "--scratch-repo", SCRATCH, "--yes")
+    rc, fake = full_launch([two], "--box", "full-p", "--scratch-repo", SCRATCH, "--yes")
     out = capsys.readouterr().out
     assert rc == 0, out
     q = search_query(fake).split(" ")
@@ -286,8 +286,8 @@ def test_the_client_filter_keeps_only_verified_long_rentals_with_the_ram(full_la
     assert launch.offer_problems(offer(1, 1, 0.5, verification="unverified"), j, now)
     assert launch.offer_problems(offer(1, 1, 0.5, duration=None), j, now) == ["max rental unknown < 4 d"]
     assert launch.offer_problems(offer(1, 1, 0.5, duration=None, end_date=now + 5 * DAY), j, now) == []
-    assert launch.offer_problems(offer(1, 1, 0.5, cpu_ram=126367), launch.full_job("full", {"gpus": 2}, 41.9, 47, 1.7),
-                                 now)
+    assert launch.offer_problems(offer(1, 1, 0.5, cpu_ram=126367),
+                                 launch.full_job("full-p", {"gpus": 2}, 41.9, 47, 1.7), now)
     # the label job filters nothing on the client (its JobSpec defaults)
     assert launch.offer_problems(offer(1, 1, 0.5, verification="unverified", duration=0), launch.JOBS["label"]) == []
 
@@ -359,7 +359,7 @@ def test_machine_picks_that_machine_or_refuses(full_launch, capsys):
     (["--box", "p01"], "--scratch-repo <the private scratch model repo> is required"),
     (["--box", "p01", "--scratch-repo", RUNS], "is the output or the data repo"),
     (["--box", "p01", "--scratch-repo", SCRATCH, "--disk-gb", "900"], "--disk-gb 900 is below the 1400 GB"),
-    (["--box", "p01", "--scratch-repo", SCRATCH, "--config", "configs/full/data-full.json"],
+    (["--box", "p01", "--scratch-repo", SCRATCH, "--config", "configs/full/data-both.json"],
      "data config is configs/full/data-p01.json"),
     (["--box", "p01", "--scratch-repo", SCRATCH, "--max-dph", "0.5"], "no 1x RTX 5090 offer matches the full-box"),
 ], ids=["gpus", "no-scratch", "scratch-is-out", "disk", "config", "max-dph"])
@@ -453,7 +453,7 @@ def test_resume_flags_go_to_the_box_env(full_launch, capsys):
                            rid, "--resume-set", f"{rid}:schedule.epochs=5", "--resume-set",
                            f"{rid2}:schedule.epochs=05", "--yes",
                            instances=[{"id": 5, "label": "kitsune-full-p01-data-p01-abc", "actual_status": "running"},
-                                      {"id": 6, "label": "kitsune-full-full-data-full-abc"}])
+                                      {"id": 6, "label": "kitsune-full-full-p-data-both-abc"}])
     out = capsys.readouterr().out
     assert rc == 0, out
     env = env_of(created(fake))
@@ -539,7 +539,7 @@ def test_augment_sets_are_refused_for_a_box_without_a_ctc_trainer(full_launch, r
     validate_augment would refuse a cut without it only on the box, after the paid boot and the store build, on every
     attempt); a CTC box's sets pass (box p01 above), and so do an AED box's int sets."""
     reg = copy.deepcopy(dict(repo.reg))
-    reg["boxes"]["full-t"] = dict(copy.deepcopy(reg["boxes"]["p01"]), data_config="configs/full/data-full.json", items=[
+    reg["boxes"]["full-t"] = dict(copy.deepcopy(reg["boxes"]["p01"]), data_config="configs/full/data-both.json", items=[
         {"name": "stores-aed", "kind": "stores", "config": "configs/full/full-t06.json"},
         {"name": "full-t06", "kind": "train", "config": "configs/full/full-t06.json", "study_run": "study-t06",
          "family": "aed", "max_hours": 22.81, "needs": ["stores-aed"]}])
@@ -574,12 +574,14 @@ def test_the_fresh_over_done_flag_goes_to_the_preflight(full_launch, capsys):
 
 
 def test_live_instances_are_the_boxs_own(monkeypatch):
-    """Box full's labels start kitsune-full-full-data-full-: the smoke box's (kitsune-full-full-smoke-...) is not one."""
-    fake = FakeVastai([], instances=[{"id": 1, "label": "kitsune-full-full-data-full-0123456", "actual_status": "running"},
+    """Only the labels that start with the box's prefix (kitsune-full-<box>-<data config>-) are its own: box full-p's,
+    not the smoke box's (kitsune-full-full-smoke-...); an instance without a label is none."""
+    fake = FakeVastai([], instances=[{"id": 1, "label": "kitsune-full-full-p-data-both-0123456",
+                                      "actual_status": "running"},
                                      {"id": 2, "label": "kitsune-full-full-smoke-data-smoke-0123456"}, {"id": 3}])
     monkeypatch.setattr(launch.subprocess, "run", fake)
-    assert launch.live_instances("/fake/vastai", "kitsune-full-full-data-full-") == [
-        "kitsune-full-full-data-full-0123456 (instance 1, running)"]
+    assert launch.live_instances("/fake/vastai", "kitsune-full-full-p-data-both-") == [
+        "kitsune-full-full-p-data-both-0123456 (instance 1, running)"]
 
 
 def test_the_gate_follows_the_registry_and_the_flag(full_launch, repo, capsys):
@@ -712,7 +714,7 @@ def test_full_preflight_passes_a_ready_box(repo, monkeypatch, devslice):
     import hashlib
     assert side == {"kind": "full_study"} and sel_sha == "5e" * 32
     assert man_sha == hashlib.sha256(b'{"manifest": 1}').hexdigest(), "a small file in git: hashed"
-    for box in ("full", "full-smoke"):  # the other training boxes of the registry pass too (box full: verified quant)
+    for box in ("full-p", "full-smoke"):  # the registry's other training boxes pass too (box full-p: verified quant)
         problems, _ = preflight(monkeypatch, FullHub(box_data(box, reg, repo.root), runs=go_runs()), box=box)
         assert problems == [], (box, problems)
 
@@ -800,10 +802,10 @@ def test_full_preflight_refuses_a_box_whose_tools_the_sha_lacks(repo, monkeypatc
     """The eval and speed items name the CLI they run; a box that needs a tool of a package not merged yet (WP5's
     kitsune.quant, WP6's whisper kind of speed_probe) is refused before renting."""
     reg = launch.full_registry(SHA)[0]
-    data = box_data("full", reg, repo.root)
-    assert preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")[0] == []
+    data = box_data("full-p", reg, repo.root)
+    assert preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full-p")[0] == []
     (repo.root / "kitsune/quant.py").unlink()
-    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")
+    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full-p")
     assert any("kitsune/quant.py (item quant-int8-w8a8-full-p03) does not exist" in p for p in problems), problems
     (repo.root / "kitsune/full_queue.py").unlink()
     problems, _ = preflight(monkeypatch, FullHub(data), box="p01", reg=reg)
@@ -822,29 +824,29 @@ def test_full_preflight_refuses_speed_args_the_sha_lacks(repo, monkeypatch, devs
     --hf-cache); a sha whose speed_probe has the kind but not a flag is refused on the laptop, not by argparse's exit 2
     on the rented box. Values and placeholders are not flags; --flag=value counts as --flag."""
     reg = copy.deepcopy(dict(repo.reg))
-    speed = {it["name"]: it for it in reg["boxes"]["full"]["items"] if it["kind"] == "speed"}
+    speed = {it["name"]: it for it in reg["boxes"]["full-p"]["items"] if it["kind"] == "speed"}
     speed["speed-full-t06"]["args"] = ["--quant", "int8-w8a8", "--profile-kernels", "--threads=8"]
     speed["speed-study-t06"]["args"] = ["--hf-cache", "{hf_cache}", "--compile"]
     write_reg(repo.root, reg)
     reg = launch.full_registry(SHA)[0]
-    data = box_data("full", reg, repo.root)
+    data = box_data("full-p", reg, repo.root)
     probe = repo.root / "tools/speed_probe.py"
     base = probe.read_text(encoding="utf-8")  # the kinds only: no flag of the args
-    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full", reg=reg)
+    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full-p", reg=reg)
     want = {"--quant": "speed-full-t06", "--profile-kernels": "speed-full-t06", "--threads": "speed-full-t06",
             "--hf-cache": "speed-study-t06", "--compile": "speed-study-t06"}
     for flag, item in want.items():
-        line = f"tools/speed_probe.py at 0123456789ab has no {flag} (in the args of speed item {item} of box full)"
+        line = f"tools/speed_probe.py at 0123456789ab has no {flag} (in the args of speed item {item} of box full-p)"
         assert line in problems, (flag, problems)
     assert not any("int8-w8a8" in p or "{hf_cache}" in p or "--kind" in p for p in problems), problems
     # a sha with every flag but --compile (WP5's, say, before its compile commit): only that one is refused
     flags = [f for f in want if f != "--compile"]
     probe.write_text(base + "".join(f'ap.add_argument("{f}")\n' for f in flags), encoding="utf-8")
-    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full", reg=reg)
-    assert [p for p in problems if "speed_probe" in p] == [
-        "tools/speed_probe.py at 0123456789ab has no --compile (in the args of speed item speed-study-t06 of box full)"]
+    problems, _ = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full-p", reg=reg)
+    assert [p for p in problems if "speed_probe" in p] == ["tools/speed_probe.py at 0123456789ab has no --compile (in "
+                                                           "the args of speed item speed-study-t06 of box full-p)"]
     probe.write_text(base + "".join(f'ap.add_argument("{f}")\n' for f in want), encoding="utf-8")
-    assert preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full", reg=reg)[0] == []
+    assert preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full-p", reg=reg)[0] == []
 
 
 def test_full_preflight_without_devslice_refuses_the_sidecar(repo, monkeypatch):
@@ -957,9 +959,9 @@ def test_a_fresh_launch_over_a_done_box_is_refused(repo, monkeypatch, devslice):
 
 
 RID03, RID005 = "full-p03-20261003T230143Z", "full-p005-20261008T160232Z"
-# item -> (run id, source box, from_step, to_step): box p-cool in miniature continues box full's full-p03 (a planned
+# item -> (run id, source box, from_step, to_step): box p-cool in miniature continues box full-p's full-p03 (a planned
 # 0.8 T cooldown) and box p005's full-p005 (an early-stop cooldown it keeps)
-COOL = {"full-p03": (RID03, "full", 169376, 211720), "full-p005": (RID005, "p005", 67449, 80939)}
+COOL = {"full-p03": (RID03, "full-p", 169376, 211720), "full-p005": (RID005, "p005", 67449, 80939)}
 GENTLE = {"schedule.epochs": 10, "schedule.deadline_cooldown": False, "schedule.resume_reset_keep_cooldown": True,
           "augment.noise_snr_db": [5.0, 20.0], "augment.codecs": ["mp3", "ulaw8k"],
           "augment.background_min_row_s": 3.0, "augment.noise_bank": "aug/bank-v1",
@@ -968,13 +970,13 @@ COOL_SETS = {"full-p03": {"schedule.epochs": 6, "schedule.deadline_cooldown": Fa
 
 
 def cool_registry(root: Path, reg: dict) -> dict:
-    """The tiny registry plus box p005 (P-0.05B alone) and box p-cool, whose train items continue box full's
-    full-p03 and box p005's full-p005 (both on data-full, one CTC store), written to root's boxes.json."""
+    """The tiny registry plus box p005 (P-0.05B alone) and box p-cool, whose train items continue box full-p's
+    full-p03 and box p005's full-p005 (both on data-both, one CTC store), written to root's boxes.json."""
     reg = copy.deepcopy(dict(reg))
     base = copy.deepcopy(reg["boxes"]["p01"])
 
     def box(items):
-        return dict(base, data_config="configs/full/data-full.json", items=items)
+        return dict(base, data_config="configs/full/data-both.json", items=items)
 
     def train(name, run, h, cont=None):
         return {"name": name, "kind": "train", "config": f"configs/full/{name}.json", "study_run": run,
@@ -1110,20 +1112,20 @@ def test_a_continuation_box_refuses_flags_that_would_reset_or_set_its_runs_again
 
 
 @pytest.mark.parametrize("label, row, refused", [
-    ("kitsune-full-p-cool-data-full-0123456", {"actual_status": "running"},
+    ("kitsune-full-p-cool-data-both-0123456", {"actual_status": "running"},
      "a live instance of box p-cool: kitsune-full-p-cool-"),
-    ("kitsune-full-p005-data-full-0123456", {"actual_status": "loading"},
+    ("kitsune-full-p005-data-both-0123456", {"actual_status": "loading"},
      "a live instance of source box p005 (its runs continue here)"),
-    ("kitsune-full-full-data-full-0123456", {"actual_status": "created"},
-     "a live instance of source box full (its runs continue here)"),
+    ("kitsune-full-full-p-data-both-0123456", {"actual_status": "created"},
+     "a live instance of source box full-p (its runs continue here)"),
     # a just-created second box p-cool: vast still schedules it, actual_status null, the other two say running
-    ("kitsune-full-p-cool-data-full-0123456", {"actual_status": None, "intended_status": "running",
+    ("kitsune-full-p-cool-data-both-0123456", {"actual_status": None, "intended_status": "running",
                                                "cur_state": "running"}, "a live instance of box p-cool"),
-    ("kitsune-full-p-cool-data-full-0123456", {}, "a live instance of box p-cool"),  # no actual_status at all
-    ("kitsune-full-p005-data-full-0123456", {"actual_status": "exited", "intended_status": "running"},
+    ("kitsune-full-p-cool-data-both-0123456", {}, "a live instance of box p-cool"),  # no actual_status at all
+    ("kitsune-full-p005-data-both-0123456", {"actual_status": "exited", "intended_status": "running"},
      "a live instance of source box p005"),  # vast is starting it again
-    ("kitsune-full-p-cool-data-full-0123456", {"actual_status": "exited"}, None),
-    ("kitsune-full-p-cool-data-full-0123456", {"actual_status": "offline", "intended_status": "stopped",
+    ("kitsune-full-p-cool-data-both-0123456", {"actual_status": "exited"}, None),
+    ("kitsune-full-p-cool-data-both-0123456", {"actual_status": "offline", "intended_status": "stopped",
                                                "cur_state": "stopped"}, None),
     ("kitsune-full-p01-data-p01-0123456", {"actual_status": "running"}, None),
 ], ids=["own-running", "source-loading", "source-created", "own-null-scheduling", "own-no-status",
@@ -1158,8 +1160,8 @@ def test_a_first_launch_of_a_continuation_box_passes_with_its_sources_checked(co
     problems, notes = cool(cool_runs())
     assert problems == [], problems
     assert f"resume: {RUNS} has no full/box-p-cool/queue_summary.json yet (box p-cool's first launch)" in notes[0]
-    assert (f"resume: full-p03: continues box full's run {RID03} (done and verified in "
-            f"full/box-full/queue_summary.json): reset from runs/{RID03}/checkpoints/full_step_169376 "
+    assert (f"resume: full-p03: continues box full-p's run {RID03} (done and verified in "
+            f"full/box-full-p/queue_summary.json): reset from runs/{RID03}/checkpoints/full_step_169376 "
             f"(resume_resets 0), sets ['schedule.epochs=6', 'schedule.deadline_cooldown=false'], readout dir "
             f"runs/m4-{RID03}-r1") in notes
     assert any(n.startswith(f"resume: full-p005: continues box p005's run {RID005}") and f"m4-{RID005}-r1" in n
@@ -1198,21 +1200,21 @@ def _drop(path):
 @pytest.mark.parametrize("change, want", [
     (_drop("full/box-p005/queue_summary.json"),
      f"full-p005 (continues box p005's run {RID005}): {RUNS} has no full/box-p005/queue_summary.json"),
-    (lambda r: r.update({"full/box-full/queue_summary.json": source_summary("full-p03", status="running")}),
-     "full/box-full/queue_summary.json says running: box full may still be writing"),
-    (lambda r: r.update({"full/box-full/queue_summary.json": source_summary("full-p03", status="running",
+    (lambda r: r.update({"full/box-full-p/queue_summary.json": source_summary("full-p03", status="running")}),
+     "full/box-full-p/queue_summary.json says running: box full-p may still be writing"),
+    (lambda r: r.update({"full/box-full-p/queue_summary.json": source_summary("full-p03", status="running",
                                                                             verified=False)}), "says running"),
-    (lambda r: r["full/box-full/queue_summary.json"]["items"]["full-p03"].update(status="failed"),
+    (lambda r: r["full/box-full-p/queue_summary.json"]["items"]["full-p03"].update(status="failed"),
      "has its train item full-p03 'failed' (kind 'train', verified True), not done and verified"),
     (lambda r: r["full/box-p005/queue_summary.json"]["items"]["full-p005"].update(status="running"),
      "has its train item full-p005 'running' (kind 'train', verified True), not done and verified"),
     (lambda r: r["full/box-p005/queue_summary.json"]["items"]["full-p005"].update(verified=False),
      "not done and verified"),
     (lambda r: r["full/box-p005/queue_summary.json"]["items"].pop("full-p005"), "has its train item full-p005 None"),
-    (lambda r: r["full/box-full/queue_summary.json"]["items"]["full-p03"].update(
+    (lambda r: r["full/box-full-p/queue_summary.json"]["items"]["full-p03"].update(
         run_dir="runs/full-p03-20261001T000000Z"),
      f"records run full-p03-20261001T000000Z for full-p03, the registry continues {RID03}"),
-    (lambda r: r["full/box-full/queue_summary.json"]["items"]["full-p03"]["result"].update(resume_resets=1),
+    (lambda r: r["full/box-full-p/queue_summary.json"]["items"]["full-p03"]["result"].update(resume_resets=1),
      "records resume_resets 1 for the run, the registry's resets_before is 0"),
     (_drop(state_path("full-p03", "trainer.pt")), f"{RUNS} lacks ['trainer.pt'] of runs/{RID03}/checkpoints/"
                                                   f"full_step_169376/"),
@@ -1267,7 +1269,7 @@ def test_a_relaunch_reads_the_boxs_own_summary_first(cool):
     matters), a recorded continuation goes on (its sets must still be the registry's), and the source summaries are
     not read for them. A run id or a record that does not fit the registry is refused."""
     runs = cool_runs()
-    del runs["full/box-full/queue_summary.json"], runs["full/box-p005/queue_summary.json"]  # unread now
+    del runs["full/box-full-p/queue_summary.json"], runs["full/box-p005/queue_summary.json"]  # unread now
     for f in fullrun.STATE_FILES_REQUIRED:
         del runs[state_path("full-p03", f)]  # the done item's state: unread
     runs[f"runs/m4-{RID03}-r1/summary.json"] = b"{}"  # its readout, done
@@ -1382,7 +1384,7 @@ def test_full_preflight_checks_a_continuation_box_as_a_resume_and_its_banks(cool
     reg["boxes"]["p-cool"]["extra_dirs"] = ["aug/bank-v1"]
     data = dict(box_data("p-cool", reg, repo.root), **{"aug/bank-v1/index.json": b"{}"})
     problems, notes = preflight(monkeypatch, FullHub(data, {}), box="p-cool", reg=reg)
-    assert any("has no full/box-full/queue_summary.json" in p for p in problems), problems
+    assert any("has no full/box-full-p/queue_summary.json" in p for p in problems), problems
     assert not any("a fresh launch" in p for p in problems)
     assert any(f"full-p005 (continues {RID005}) pins aug/bank-v1/index.json at sha256 {'ab' * 6}..." in p
                for p in problems), problems  # the registry's pin, lowercased, is not the bank's
@@ -1422,13 +1424,13 @@ def go_runs(verdict=None) -> dict:
 
 @pytest.fixture
 def quant_go(repo, monkeypatch):
-    """quant_go_problems of box full at SHA against a hub with the given verdict (None: none on the Hub); the verdict's
-    commit an ancestor with the same quant code unless .ancestry / .blobs say otherwise."""
+    """quant_go_problems of box full-p at SHA against a hub with the given verdict (None: none on the Hub); the
+    verdict's commit an ancestor with the same quant code unless .ancestry / .blobs say otherwise."""
     st = SimpleNamespace(ancestry="ancestor", blobs={}, asked=[])
     monkeypatch.setattr(launch, "git_ancestry", lambda old, new: st.asked.append((old, new)) or st.ancestry)
     monkeypatch.setattr(launch, "git_blob", lambda sha, p: st.blobs.get((sha, p), f"blob:{p}"))
 
-    def go(verdict="pass", box="full", allow=False, spec=None):
+    def go(verdict="pass", box="full-p", allow=False, spec=None):
         runs = {} if verdict is None else go_runs(None if verdict == "pass" else verdict)
         hub = FullHub({}, runs=runs)
         monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
@@ -1461,7 +1463,7 @@ def test_the_quant_go_signal_passes_a_verified_box(quant_go):
     ("pins", "requirements-train.txt, docker/Dockerfile differ between fedcba987654"),
 ])
 def test_the_quant_go_signal_refusals(quant_go, case, want):
-    """Box full is refused without a verdict, with a failed one or a check of 12-16 not passed, or when the verified
+    """Box full-p is refused without a verdict, with a failed one or a check of 12-16 not passed, or when the verified
     commit is unknown, not an ancestor of the one the box runs, or ran other quant code (QUANT_CODE: the quant path,
     its CLIs and the image's pins)."""
     v = go_verdict()
@@ -1483,13 +1485,13 @@ def test_the_quant_go_signal_refusals(quant_go, case, want):
         quant_go.st.blobs.update({(GO_SHA, "requirements-train.txt"): "old", (GO_SHA, "docker/Dockerfile"): "old"})
     problems, notes = quant_go(None if case == "missing" else v)
     assert len(problems) == 1 and want in problems[0], problems
-    assert problems[0].startswith("box full's 2 quantised item(s) (e.g. quant-int8-w8a8-full-p03) need a passing "
+    assert problems[0].startswith("box full-p's 2 quantised item(s) (e.g. quant-int8-w8a8-full-p03) need a passing "
                                   "smoke-b verdict (checks 12-16) at this quant code (DECISIONS F2): ")
     assert problems[0].endswith("rent the standalone smoke-B first (launch --job full --box smoke-b) or pass "
                                 "--allow-unverified-quant")
     # --allow-unverified-quant: the same text as a warning, nothing refused
     problems, notes = quant_go(None if case == "missing" else v, allow=True)
-    assert problems == [] and any(n.startswith("WARNING: box full's 2 quantised item(s)") and want in n
+    assert problems == [] and any(n.startswith("WARNING: box full-p's 2 quantised item(s)") and want in n
                                   and n.endswith("(--allow-unverified-quant: not refused)") for n in notes), notes
 
 
@@ -1504,7 +1506,7 @@ def test_the_quant_go_signal_only_concerns_boxes_with_quantised_items(quant_go, 
     for box in ("p01", "full-smoke", "smoke-b"):
         monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
         assert launch.quant_go_problems(RUNS, SHA, box, fullrun.box_spec(box, repo.reg)) == ([], []), box
-    assert launch.quant_items(fullrun.box_spec("full", repo.reg)) == ["quant-int8-w8a8-full-p03",
+    assert launch.quant_items(fullrun.box_spec("full-p", repo.reg)) == ["quant-int8-w8a8-full-p03",
                                                                      "quant-int8-w8a8-full-p01"]
     speed_only = {"items": [{"name": "speed-x", "kind": "speed", "args": ["--quant", "int8-w8a8"]},
                             {"name": "speed-y", "kind": "speed", "args": ["--compile"]},
@@ -1518,27 +1520,27 @@ def test_the_quant_go_signal_only_concerns_boxes_with_quantised_items(quant_go, 
 
 def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, monkeypatch, devslice):
     """full_preflight ends with the quant go signal (allow_unverified_quant passed through) and, for a box whose hours
-    come from the speed record (SPEED_RECORD_BOXES: full-t, p005, p-cool; the tiny registry's 2-GPU box full stands
+    come from the speed record (SPEED_RECORD_BOXES: full-t, p005, p-cool; the tiny registry's 2-GPU box full-p stands
     in for them here), a warning while that record has no box-1 part (never a refusal)."""
-    monkeypatch.setattr(launch, "SPEED_RECORD_BOXES", ("full",))
+    monkeypatch.setattr(launch, "SPEED_RECORD_BOXES", ("full-p",))
     monkeypatch.setattr(launch, "git_ancestry", lambda old, new: "ancestor")
     monkeypatch.setattr(launch, "git_blob", lambda sha, p: f"blob:{p}")
     reg = launch.full_registry(SHA)[0]
-    data = box_data("full", reg, repo.root)
-    problems, notes = preflight(monkeypatch, FullHub(data), box="full")
+    data = box_data("full-p", reg, repo.root)
+    problems, notes = preflight(monkeypatch, FullHub(data), box="full-p")
     assert len(problems) == 1 and "need a passing smoke-b verdict" in problems[0], problems
-    want = f"WARNING: no {launch.SPEED_RECORD} at 0123456789ab: box full's hours are not held to measured speeds"
+    want = f"WARNING: no {launch.SPEED_RECORD} at 0123456789ab: box full-p's hours are not held to measured speeds"
     assert want in notes
-    problems, notes = preflight(monkeypatch, FullHub(data), box="full", allow_unverified_quant=True)
-    assert problems == [] and any(n.startswith("WARNING: box full's 2 quantised item(s)") for n in notes)
+    problems, notes = preflight(monkeypatch, FullHub(data), box="full-p", allow_unverified_quant=True)
+    assert problems == [] and any(n.startswith("WARNING: box full-p's 2 quantised item(s)") for n in notes)
     rec = repo.root / launch.SPEED_RECORD
     rec.parent.mkdir(parents=True, exist_ok=True)
     rec.write_text(json.dumps({"smoke": {}, "box1": None}), encoding="utf-8")
-    problems, notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")
+    problems, notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full-p")
     assert problems == [] and any(n.startswith("quant go signal: ") for n in notes)
-    assert any(n.startswith("WARNING: box full's hours are smoke-only") for n in notes), notes
+    assert any(n.startswith("WARNING: box full-p's hours are smoke-only") for n in notes), notes
     rec.write_text(json.dumps({"smoke": {}, "box1": {"sha": "ab" * 20, "sec_per_step": 0.29}}), encoding="utf-8")
-    notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full")[1]
+    notes = preflight(monkeypatch, FullHub(data, runs=go_runs()), box="full-p")[1]
     assert not any("smoke-only" in n for n in notes) and any("box 1 at abababababab, 0.29 s/step" in n for n in notes)
     assert launch.speed_record_notes(SHA, "p01") == []  # not in the patched tuple
     monkeypatch.setattr(launch, "SPEED_RECORD_BOXES", ("p01", "full-t", "full-p"))
@@ -1546,11 +1548,11 @@ def test_full_preflight_carries_the_quant_go_signal_and_the_hours_warning(repo, 
 
 
 def test_allow_unverified_quant_reaches_the_preflight_and_is_full_only(full_launch, capsys):
-    rc, fake = full_launch([[offer(1, 10, 1.40, num_gpus=2, cpu_ram=130000)]], "--box", "full", "--scratch-repo",
+    rc, fake = full_launch([[offer(1, 10, 1.40, num_gpus=2, cpu_ram=130000)]], "--box", "full-p", "--scratch-repo",
                            SCRATCH, "--allow-unverified-quant")
     assert rc == 0, capsys.readouterr().out
     assert full_launch.seen["preflight"][1]["allow_unverified_quant"] is True
-    rc, _ = full_launch([[offer(1, 10, 1.40, num_gpus=2, cpu_ram=130000)]], "--box", "full", "--scratch-repo",
+    rc, _ = full_launch([[offer(1, 10, 1.40, num_gpus=2, cpu_ram=130000)]], "--box", "full-p", "--scratch-repo",
                         SCRATCH)
     assert rc == 0 and full_launch.seen["preflight"][1]["allow_unverified_quant"] is False
     with pytest.raises(SystemExit):
@@ -1603,7 +1605,8 @@ def test_gate_refusals_avoid_slow_hosts_for_30_days(monkeypatch):
     now = 2_000_000_000.0
     runs = {"full/box-p01/infra/C1/download_gate.json": {"verdict": "slow", "machine_id": "151761", "wall": now - DAY,
                                                           "reason": "2.9 MB/s"},
-            "full/box-full/infra/C2/download_gate.json": {"verdict": "slow", "machine_id": "42", "wall": now - 31 * DAY},
+            "full/box-full-p/infra/C2/download_gate.json": {"verdict": "slow", "machine_id": "42",
+                                                             "wall": now - 31 * DAY},
             "full/box-p01/infra/C3/download_gate.json": {"verdict": "pass", "machine_id": "43", "wall": now},
             "full/box-p01/infra/C4/queue.json": {"verdict": "slow", "machine_id": "44", "wall": now},
             "runs/x/download_gate.json": {"verdict": "slow", "machine_id": "45", "wall": now}}

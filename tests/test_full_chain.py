@@ -203,11 +203,11 @@ RULES = {
     "watchdog on a chain": (lambda r, root: r["boxes"][CHAIN_BOX].update(watchdog={"orphan_s": 1, "action": "stop"}),
                             r"\['watchdog'\] are derived"),
     "unequal gpus": (lambda r, root: r["boxes"]["smoke-b"].update(gpus=2), r"its parts have different gpus"),
-    "three stages": (lambda r, root: r["boxes"][CHAIN_BOX]["chain"].append({"parts": ["full"]}),
+    "three stages": (lambda r, root: r["boxes"][CHAIN_BOX]["chain"].append({"parts": ["full-p"]}),
                      r"chain is not a list of exactly 2 stage objects"),
     "gate false": (lambda r, root: r["boxes"][CHAIN_BOX].update(gate=False), r"a chain's gate must be true"),
     "of_box naming a chain": (
-        lambda r, root: next(it for it in r["boxes"]["full"]["items"] if it.get("of_box")).update(of_box=CHAIN_BOX),
+        lambda r, root: next(it for it in r["boxes"]["full-p"]["items"] if it.get("of_box")).update(of_box=CHAIN_BOX),
         r"of_box 'p01-chain' is not a registry box with items \(it is a chain\)"),
     "only_if_new_machine naming a chain": (
         lambda r, root: next(it for it in r["boxes"]["smoke-b"]["items"] if it["kind"] == "speed").update(
@@ -216,8 +216,8 @@ RULES = {
                                    r"is a chain box \(CHAIN_NAMES\): its entry needs `chain`"),
     "a plain name with chain": (lambda r, root: r["boxes"].update(p01=dict(copy.deepcopy(CHAIN))),
                                 r"boxes.p01: a plain box \(BOX_NAMES\) has no `chain`"),
-    "a rebuild that is no part's": (lambda r, root: stage(r, 1).update(rebuild="configs/full/data-full.json"),
-                                    r"rebuild 'configs/full/data-full.json' is not the data config of one"),
+    "a rebuild that is no part's": (lambda r, root: stage(r, 1).update(rebuild="configs/full/data-both.json"),
+                                    r"rebuild 'configs/full/data-both.json' is not the data config of one"),
     "gate_by past stage 1": (lambda r, root: stage(r, 0).update(gate_by_hours=11), r"gate_by_hours 11"),
     "stage 1 as long as the chain": (lambda r, root: stage(r, 0).update(max_hours=35),
                                      r"max_hours 35 must be < the chain's max_hours 35"),
@@ -283,16 +283,14 @@ def test_the_cli_serves_one_stage(tmp_path, monkeypatch, capsys):
     rc, out, _ = cli("check-students", "--box", CHAIN_BOX, "--stage", "1")
     assert rc == 0 and "box p01-chain (stage 1): 4 student(s) are the registered builds" in out
     monkeypatch.setenv(fullrun.ENV_CHAIN_STAGE, "2")  # bootstrap's: the stage comes from the env
-    rc, out, _ = cli("students", "--box", CHAIN_BOX)
-    assert rc == 0 and out.split() == ["students/study/p01"]
-    rc, out, _ = cli("extra-files", "--box", CHAIN_BOX, "--stage", "1")
-    assert "labels/full/selections/study_1000h.parquet" in out.split()
     rc, out, _ = cli("show", "--box", CHAIN_BOX)
     doc = json.loads(out)
     assert rc == 0 and set(doc["stages"]) == {"1", "2"} and doc["spec"]["data_config"] == "configs/full/data-p01.json"
-    assert doc["env"]["KITSUNE_CHAIN_STAGE"] == "2"
-    assert cli("students", "--box", CHAIN_BOX, "--stage", "3")[0] == 2
-    assert cli("students", "--box", "p01", "--stage", "2")[1].split() == ["students/study/p01"]  # ignored: plain box
+    assert doc["env"]["KITSUNE_CHAIN_STAGE"] == "2" and doc["students"] == ["students/study/p01"]
+    assert "labels/full/selections/study_1000h.parquet" in doc["stages"]["1"]["extra_files"]
+    assert cli("show", "--box", CHAIN_BOX, "--stage", "3")[0] == 2
+    assert json.loads(cli("show", "--box", "p01", "--stage", "2")[1])["students"] == [
+        "students/study/p01"]  # ignored: plain box
 
 
 # ====================================================================================================== harness
@@ -1282,6 +1280,7 @@ def test_a_chain_takes_the_largest_min_ram_of_its_parts(tmp_path):
     reg["boxes"]["smoke-b"]["min_ram_gb"] = 48.5
     loaded = fullrun.load_registry(reg, root=tmp_path)
     assert fullrun.box_spec(CHAIN_BOX, loaded)["min_ram_gb"] == 96
-    assert fullrun.box_spec("p01", loaded)["min_ram_gb"] == 96 and fullrun.box_spec("full", loaded)["min_ram_gb"] is None
+    assert fullrun.box_spec("p01", loaded)["min_ram_gb"] == 96
+    assert fullrun.box_spec("full-p", loaded)["min_ram_gb"] is None
     reg["boxes"][CHAIN_BOX]["min_ram_gb"] = 128
     assert any("min_ram_gb" in p for p in fullrun.registry_problems(reg, root=tmp_path))

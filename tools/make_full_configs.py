@@ -22,8 +22,8 @@ study/data.json, the study's settings; the queue fills max_steps, lr and the min
      step, metrics/scalars.parquet at the close only, and the early stop on dev_ce (mean of 5, patience 6, at least 5
      values, action cooldown, the test sets refused). Everything else stays the study's (BN, L2-SP 0, aux-CTC 0, w_ctc
      0.8, SpecAugment, the smoke block, seed 1234, verdict v2);
-  4. the run's augment block, when its FULL_RUNS row names one: full-p03 trains with RECIPE (DECISIONS H1 step 2, the
-     CTC train-data augmentation, v2 since H6; the block names only what it changes, the trainer's defaults the rest).
+  4. the run's augment block, when its FULL_RUNS row names one (full-t06 RECIPE_AED_H15, full-p03 RECIPE, full-p005
+     RECIPE_V4; the block names only what it changes, the trainer's defaults the rest).
   smoke-<x> is full-<x> without its augment block (the configs smoke A ran stay byte for byte as they were) and with
   SMOKE (the smoke data, SMOKE_EPOCHS: the epochs smoke A ran, 3/3/4/4, whatever the full runs' are now - the 100 h
   draw is the budget, and its plan_total_steps are the full runs' at those epochs; no complete
@@ -31,7 +31,7 @@ study/data.json, the study's settings; the queue fills max_steps, lr and the min
   every 5 min and timed states every 10 min (smoke-p01: 3 and 3, so the wipe fault's second attempt uploads one); log
   syncs every 10 min (smoke-p01: 5) with every step row full; a 2 min end reserve and 4d checked every 10 steps over a
   20-step window), memory.probe_shapes = the full data's worst micro-batches of the matching student (PLAN_FILE, so the
-  smoke's memory probe sees box 1's and box 2's worst shapes), and on smoke-t06 and smoke-p03 a forced early stop
+  smoke's memory probe sees the full runs' worst shapes), and on smoke-t06 and smoke-p03 a forced early stop
   (early_stop.min_delta_abs 1e9: no dev eval can improve by that; smoke-t06 with patience 8, so it still ends after 300
   steps or more, smoke check 2's VRAM window).
 
@@ -39,8 +39,6 @@ Data configs (launch's --config and bootstrap's KITSUNE_CONFIG: what a box rebui
   data-p01      FULL_DATA + family ctc (box p01: box 1 and its recipe test, CTC only, no pull_parakeet)
   data-t        FULL_DATA + family aed (box full-t: T-0.6B; teacher_out for every stem, no Parakeet labels)
   data-p        FULL_DATA + family ctc (box full-p: P-0.3B, the Whisper and quant pool; data-p01's content)
-  data-full     FULL_DATA + pull_parakeet true (both families; the retired 2x box 2's, no registry box uses it: kept
-                for scripts/make_selection.py's full mode and a box whose labels need both roots)
   data-smoke    SMOKE_DATA + pull_parakeet true (smoke A)
   data-smoke-b  study/data.json's data keys verbatim (smoke B: the frozen study selection, so every study-weight eval,
                 speed probe and Whisper eval of the box shares one eval store)
@@ -67,11 +65,11 @@ The boxes' hours (HOURS_BOXES: box full-t, box p005, and box p-cool, whose three
 of P-0.3B, P-0.1B and P-0.05B, DECISIONS H14): SPEED_FILE
 (configs/full/plan/box2_hours.json, --import-speed) records the measured speeds box_hours projects them from: smoke A's
 per-student s/step (smoke verdict check 3) and box 1's s/step, in-run overhead, CTC store and bootstrap hours
-(tools/box1_go.py --json, at the runs-repo revision of box 1's 4-epoch record), a run with the augmentation recipe at
-AUGMENT_STEP_FACTOR x its s/step (concat's longer rows). It prints, and --check holds, each box's train items'
-max_hours and its est_hours / max_hours. A continuation's train item carries a `continues` block (kitsune.fullrun,
-DECISIONS H14: the source box, run id, from / to step, resets before and the trainer sets), which --check holds equal
-to continues_block's of CONTINUATIONS (continues_problems), and CONTINUATIONS to the plan record
+(measured once at the runs-repo revision of box 1's 4-epoch record; --import-speed keeps them), a run with the
+augmentation recipe at AUGMENT_STEP_FACTOR x its s/step (concat's longer rows). It prints, and --check holds, each box's
+train items' max_hours and its est_hours / max_hours. A continuation's train item carries a `continues` block
+(kitsune.fullrun, DECISIONS H14: the source box, run id, from / to step, resets before and the trainer sets), which
+--check holds equal to continues_block's of CONTINUATIONS (continues_problems), and CONTINUATIONS to the plan record
 (continuation_plan_problems).
 
 configs/full/boxes.json, the box registry (kitsune/fullrun.py), is hand-written; --check validates it with
@@ -89,7 +87,6 @@ Usage:
   python tools/make_full_configs.py --import-plan full_plan_full.json full_plan_smoke.json   # a new measurement
   python tools/make_full_configs.py --import-launch-plan plan_launch.json                   # the boxes' epochs
   python tools/make_full_configs.py --import-speed --smoke-verdict smoke_verdict.json      # the hours (smoke A)
-  python tools/make_full_configs.py --import-speed --box1-go box1_go.json                  # ... and box 1's
 """
 import argparse
 import copy
@@ -115,14 +112,6 @@ PLAN_FILE = "plan/full_study.json"  # under OUT_DIR: tools/full_plan.py on full.
 RUNS_REPO = study.RUNS_REPO
 STUDY_DATA = ROOT / "study" / "data.json"
 
-# THE RECIPE TEST'S RECIPE (DECISIONS H0/H1/H4; box p01, instance 54012106, 2026-10-03): the CTC train-data
-# augmentation (scripts/04_distill.py augment.*, kitsune/trainset.py) as box 1's cooldown re-run trained with it:
-# truncate 0.3 (a row cut before a word, never between a sentence's last word and its mark, half of the cuts in a
-# pause), concat 0.5 (a micro-batch's rows joined k at a time inside its planned padded frames, <= 28 s) and weak
-# mixing, mix_p 0.05 (another row 5-20 dB down under the clean row's targets; the owner's launch line). Kept as the
-# record of what ran: the recipe test box's --resume-set flags (then CONTINUATIONS p01 and continuation_flags, which
-# the registry's continues blocks replaced with DECISIONS H14)
-RECIPE_TEST = {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}
 # THE RECIPE (v2, DECISIONS H6, owner 2026-10-03 "Fix, then launch P-0.3B anew with the new recipe"), after the external
 # review of the test's model: truncate 0.2 (0.3 left the final 。 off 3-8 % of complete sentences, JSUT 92 % against the
 # gate's 95 %), truncate_min_row_s 3.0 (rows under 3 s are never cut: short utterances lost more words), concat 0.5 as
@@ -256,8 +245,8 @@ RECIPE_AED_H15 = {**RECIPE_AED, "guard_per_piece": True, "end_trim_voiced": True
 # smoke configs never take it), None for none. DECISIONS H1 step 2: P-0.3B trains with RECIPE (v2 since H6, after
 # the recipe test on box p01 and its external review); T-0.6B (box full-t) with RECIPE_AED (H7, H11, H12), since
 # DECISIONS H15 with RECIPE_AED_H15 (RECIPE_AED plus augment.guard_per_piece and augment.end_trim_voiced); P-0.05B with
-# RECIPE_V3 on box p01 (H8); P-0.1B's 4-epoch run (box 1, done: its config is the one the continuation resumes, byte
-# for byte) has none - its continuation sets RECIPE_V3 (CONTINUATIONS)
+# RECIPE_V4 on box p005 (H8, H10, H12); P-0.1B's 4-epoch run (box 1, done: its config is the one the continuation
+# resumes, byte for byte) has none - its continuations set their recipes (CONTINUATIONS)
 FULL_RUNS = {
     "t06": dict(study_run="study-t06", epochs=6, warmup=300, lr=2e-4, micro=450, step=1730, dev_greedy=False,
                 pull_parakeet=False, end_reserve=55, augment=RECIPE_AED_H15),
@@ -277,8 +266,9 @@ SMOKE_EPOCHS = {"t06": 3, "p03": 3, "p01": 4, "p005": 4}
 # the end of smoke-p01; building them from this keeps every smoke config byte-identical (smoke A ran them)
 SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # box p01's continuation, now THE RECIPE TEST (DECISIONS H1; the 8-epoch continuation of G3, patience 12, is postponed:
-# H2), launched with --resume-reset run_id --resume-set run_id:schedule.epochs=<epochs> and one --resume-set
-# run_id:augment.<key>=<value> per RECIPE_TEST key (fullrun.RESUME_SET_KEYS). It re-runs ONLY the
+# H2; instance 54012106, 2026-10-03), launched with --resume-reset run_id --resume-set run_id:schedule.epochs=<epochs>
+# and one --resume-set run_id:augment.<key>=<value> per key of the test's recipe (fullrun.RESUME_SET_KEYS): the CTC
+# train-data augmentation with truncate_p 0.3, concat_p 0.5 and mix_p 0.05. It re-runs ONLY the
 # cooldown of box 1's run: from its pre_cooldown state (from_step: checkpoints/full_step_86328, on the Hub) to the SAME
 # end (epochs 4: T 107,910 on full.parquet, so 21,582 steps, ~2 h) with the recipe on. The WSD cooldown starts at
 # t_c = 0.8 T = 86,328 = from_step: the whole re-run is cooldown. Everything before from_step - the data order, the
@@ -290,7 +280,7 @@ SMOKE_BASE_PULL = ("t06", "p03", "p005")
 # baseline, and the only config difference is augment.*. from_step is the pre_cooldown state the reset goes on from;
 # the 4-epoch record stays runs-repo revision c4604304 (G4): the re-run overwrites the run's summary, config, final
 # evals, export and its pre_cooldown state's trainer.pt/.json (same weights, the recipe in its config) at the head
-# DECISIONS H8: box 1's run again from the same state, now with RECIPE_V3 (RECIPE_TEST stays the record of what the
+# DECISIONS H8: box 1's run again from the same state, now with RECIPE_V3 (the recipe above stays the record of what the
 # first test ran); H9: to 8 EPOCHS - G3's continuation, with its patience 12, after all. The reset plans T for 8 epochs
 # on full.parquet (~215,800 steps; plan["launch"]), so the stable phase at the peak LR goes on from from_step (the
 # state is the end of box 1's stable phase: no LR jump) to t_c = 0.8 T and the cooldown follows: ~129,500 steps, every
@@ -353,12 +343,12 @@ CONTINUATIONS = {
 # deadline cooldown (4d) shortened, 04_distill.fit_epochs_deadline has planned the end phase to finish
 # schedule.end_reserve_min before that deadline (plus the final eval's and the last dev eval's estimates), so the
 # readout gets what the trainer's final saves and uploads leave of the end reserve, and the no-start rule skips a
-# droppable readout whose max_hours need more (item_not_started): box 2 would lose T-0.6B's binding M4 and, through
+# droppable readout whose max_hours need more (item_not_started): box full-t would lose T-0.6B's binding M4 and, through
 # their needs, its 7 quantised readouts and speed-full-t06. So every full run's end reserve holds its readout's
 # max_hours (boxes.json: m4-full-t06 0.75 h, the P readouts 0.3 h) + END_PHASE_SLACK_MIN of its own end phase and the
 # queue's hand-off [X]: t06 45 + 10 = 55 (the default 30 would leave about 28 min), the P runs 18 + 10 <= 30.
-# --check refuses a registry whose readout no longer fits (readout_reserve_problems), e.g. after the PR that refreshes
-# box full's hours from box 1. It costs only when 4d acts: the shortened run then trains 25 min less. Smoke boxes are
+# --check refuses a registry whose readout no longer fits (readout_reserve_problems), e.g. after a PR that refreshes
+# the boxes' hours. It costs only when 4d acts: the shortened run then trains 25 min less. Smoke boxes are
 # exempt: contract 7's 2 min smoke reserve is what lets F4 make 4d act within the smoke, and a smoke run that 4d
 # shortens without a fault is a late smoke.
 END_PHASE_SLACK_MIN = 10
@@ -402,10 +392,10 @@ DEADLINE_FAULT_SHARE, DEADLINE_FAULT_ROUND_S = 0.5, 10  # contract 7: S <= 0.5 x
 # THE BOXES' HOURS (contract 7 "item hours after box 1", 12.5, Resolution 31; DECISIONS G2/G3). The HOURS_BOXES' train
 # items' max_hours and their est_hours / max_hours are projected from MEASURED speeds, recorded in SPEED_FILE (written
 # by --import-speed, never by hand): smoke A's median steady s/step per student (smoke verdict check 3's sec_per_step,
-# the only measurement of T-0.6B, P-0.3B and P-0.05B at the full configs' batches) and box 1's own (tools/box1_go.py
-# --json --revision <its 4-epoch record>). Box 1 trained P-0.1B only, so the refresh is a transfer: every student's
-# smoke s/step x r, r = box 1's steady s/step / smoke A's of P-0.1B (the host and full-data effect, 1.036; 1 without
-# box 1), and box 1's in-run overhead o (0.0465) replaces the plan's 0.08. Without box 1's part the record is
+# the only measurement of T-0.6B, P-0.3B and P-0.05B at the full configs' batches) and box 1's own (measured once at
+# the runs-repo revision of its 4-epoch record). Box 1 trained P-0.1B only, so the refresh is a transfer: every
+# student's smoke s/step x r, r = box 1's steady s/step / smoke A's of P-0.1B (the host and full-data effect, 1.036;
+# 1 without box 1), and box 1's in-run overhead o (0.0465) replaces the plan's 0.08. Without box 1's part the record is
 # smoke-only and launch warns that the hours are provisional.
 # The run model is plan v3's (calc_v3.run_h): steps x s/step x r x (1 + o) + the run's fixed time (start-up, memory
 # probe, first and final complete evals, end phase) + its dev checks (every COMMON eval.dev.every_epochs epoch). It
@@ -450,26 +440,14 @@ STORES_PESS = 1.91 / 1.37  # a box-1 record's measured CTC store: central x 1, p
 # item's whole max_hours (the no-start rule's need):
 #   box full-t: m4-full-t06 (smoke: 1.3 min on the 100 h run's eval sets, which are the full ones), 7 T quant readouts
 #               (smoke-B #1: 0.7-1.5 min each on P-0.3B, T ~3x) and the decision-22 re-time pair (~1 min), one GPU
-#   box full-p: 2 M4 readouts, 14 P quant readouts (smoke-B #1: 0.65-1.0 min each) and the four Whisper models on all
-#               five sets (whisper-large-v3: 5,000 JSUT rows in 3.2 min; ~25 min for all four), one GPU. Kept as it
-#               is with P-0.05B postponed (H2): its M4 and 7 quant readouts (~0.2 h) left the box and stay in the
-#               tail as margin, so the box need not be re-derived when P-0.05B comes back
-#   box p01:    m4-full-p01 and 7 P-0.1B quant readouts, plus resume-pull and check-resume before the stores
-#               (CONT_PULL_H: any box whose runs hold a continuation)
-#   box p005:   m4-full-p005 and 7 P-0.05B quant readouts (box p01's readouts without the pull)
-#   box full-p's cooldown re-run (DECISIONS H13): m4-full-p03 and its 7 quant readouts only - the Whisper evals are
-#               done and verified, so resume-pull keeps them done -, measured on 2026-10-04 at ~7 min for all eight
-#               (21:05-21:12Z: its run dirs' timestamps), so box p01's tail, plus the pull (CONT_PULL_H)
-#   box p-cool: three M4 readouts and 21 quant readouts (P-0.3B's eight took ~7 min, P-0.1B's and P-0.05B's are
-#               smaller) [X], plus one pull per continuation (CONT_PULL_H: resume-pull downloads each run's
-#               pre_cooldown state, check-resume runs before each)
-# Boxes full-p and p01 are no HOURS_BOXES since DECISIONS H14 (their entries are records): their tails stay as the
-# record of their hours
+#   box p005:   m4-full-p005 and 7 P-0.05B quant readouts (smoke-B #1: 0.65-1.0 min each on P-0.3B)
+#   box p-cool: three M4 readouts and 21 quant readouts (P-0.3B's M4 and seven quant readouts after its cooldown
+#               re-run on box full-p took ~7 min on 2026-10-04, P-0.1B's and P-0.05B's are smaller) [X], plus one
+#               pull per continuation (CONT_PULL_H: resume-pull downloads each run's pre_cooldown state, check-resume
+#               runs before each)
+# Boxes full-p and p01 are no HOURS_BOXES since DECISIONS H14 (their entries are records of their hours)
 POST_T_H = (0.6, 1.35)
-POOL_P_H = (0.9, 1.65)  # box full-p's fresh run (DECISIONS G2), the record of its hours
-P01_TAIL_H = (0.2, 0.5)
 P005_TAIL_H = (0.2, 0.5)
-P03_CONT_TAIL_H = (0.2, 0.5)
 PCOOL_TAIL_H = (0.4, 1.0)
 CONT_PULL_H = (0.1, 0.3)  # once per continuation of the box
 BOX_TAIL_H = {"full-t": POST_T_H, "p005": P005_TAIL_H, "p-cool": PCOOL_TAIL_H}
@@ -648,7 +626,7 @@ def speed_problems(rec) -> list[str]:
 
 
 def load_speed(out_dir: Path = OUT_DIR) -> dict | None:
-    """The SPEED_FILE record; None when there is none (box full's hours are then not held); SpeedError when it is
+    """The SPEED_FILE record; None when there is none (the boxes' hours are then not held); SpeedError when it is
     unreadable or speed_problems finds any."""
     f = Path(out_dir) / SPEED_FILE
     if not f.is_file():
@@ -841,10 +819,10 @@ def _smoke_record(verdict: dict, src) -> dict:
                 machine_id=verdict.get("machine_id"), time_utc=verdict.get("time_utc"), sec_per_step=out)
 
 
-def import_speed(smoke_verdict: Path | None = None, box1_json: Path | None = None, out_dir: Path = OUT_DIR) -> dict:
-    """Record SPEED_FILE: its smoke part from a smoke A verdict (else the existing record's) and its box-1 part from
-    tools/box1_go.py --json (its "box1" object; else the existing record's). Refused (SpeedError, nothing written)
-    when the result fails speed_problems."""
+def import_speed(smoke_verdict: Path | None = None, out_dir: Path = OUT_DIR) -> dict:
+    """Record SPEED_FILE: its smoke part from a smoke A verdict (else the existing record's) and its box-1 part, box
+    1's measurement, from the existing record. Refused (SpeedError, nothing written) when the result fails
+    speed_problems."""
     try:
         old = load_speed(out_dir) or {}
     except SpeedError:
@@ -862,14 +840,6 @@ def import_speed(smoke_verdict: Path | None = None, box1_json: Path | None = Non
         except (OSError, ValueError) as e:
             raise SpeedError(f"{smoke_verdict}: not readable ({type(e).__name__}: {e})") from None
         rec["smoke"] = _smoke_record(v, smoke_verdict)
-    if box1_json is not None:
-        try:
-            b = json.loads(Path(box1_json).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            raise SpeedError(f"{box1_json}: not readable ({type(e).__name__}: {e})") from None
-        rec["box1"] = b.get("box1") if isinstance(b, dict) and "box1" in b else b
-        if rec["box1"] is None:
-            raise SpeedError(f"{box1_json}: no box1 measurement (box1_go wrote none: box 1 has not ended)")
     if problems := speed_problems(rec):
         raise SpeedError("; ".join(problems))
     f = Path(out_dir) / SPEED_FILE
@@ -1034,7 +1004,7 @@ def _study_data_keys() -> dict:
 
 
 def data_configs() -> dict[str, dict]:
-    """The data configs (the registry's box data_config values; data-full: no box's, kept)."""
+    """The data configs (the registry's box data_config values)."""
     return {
         "data-p01": {"_comment": "Box p01's data config (box 1, P-0.1B alone; launch --config, bootstrap "
                                  "KITSUNE_CONFIG): the full selection and extent (kitsune.fullrun FULL_DATA), family "
@@ -1053,12 +1023,6 @@ def data_configs() -> dict[str, dict]:
                                "enough for the CTC store and the token eval store the readouts read). Generated by "
                                "tools/make_full_configs.py.",
                    **copy.deepcopy(fullrun.FULL_DATA), "family": "ctc"},
-        "data-full": {"_comment": "Both label roots (pull_parakeet true) on the full selection and extent "
-                                  "(kitsune.fullrun FULL_DATA): the retired 2x box 2's data config; no registry box "
-                                  "uses it since box 2 became boxes full-t and full-p (DECISIONS G2), kept for "
-                                  "scripts/make_selection.py's full mode and a box whose labels need both roots. "
-                                  "Generated by tools/make_full_configs.py.",
-                      **copy.deepcopy(fullrun.FULL_DATA), "pull_parakeet": True},
         "data-smoke": {"_comment": "Box full-smoke's data config (smoke A): the smoke selection (a seeded 100 h train "
                                    "draw with its own dev slice) on the study extent (kitsune.fullrun SMOKE_DATA), "
                                    "pull_parakeet true. Generated by tools/make_full_configs.py.",
@@ -1219,21 +1183,20 @@ def main(argv: list[str] | None = None) -> int:
                     help="record tools/full_plan.py's JSON of full.parquet at the boxes' epochs (FULL_RUNS; a "
                          "continuation's) as " + PLAN_FILE + "'s launch part, then write the configs")
     ap.add_argument("--import-speed", action="store_true",
-                    help="record the full boxes' measured speeds as " + SPEED_FILE + " (--smoke-verdict and/or "
-                         "--box1-go; the part not given is kept) and print the hours boxes.json must carry")
+                    help="record the full boxes' measured speeds as " + SPEED_FILE + " (--smoke-verdict, else "
+                         "the record's smoke part; box 1's part is the record's) and print the hours boxes.json must "
+                         "carry")
     ap.add_argument("--smoke-verdict", default=None, metavar="JSON",
                     help="--import-speed: smoke A's smoke_verdict.json (full/box-full-smoke/smoke_verdict.json)")
-    ap.add_argument("--box1-go", default=None, metavar="JSON", help="--import-speed: tools/box1_go.py --json's file")
     args = ap.parse_args(argv)
     out_dir = Path(args.out_dir)
-    if (args.smoke_verdict or args.box1_go) and not args.import_speed:
-        ap.error("--smoke-verdict / --box1-go go with --import-speed")
+    if args.smoke_verdict and not args.import_speed:
+        ap.error("--smoke-verdict goes with --import-speed")
     if sum(bool(x) for x in (args.import_speed, args.import_plan, args.import_launch_plan, args.check)) > 1:
         ap.error("--check, --import-plan, --import-launch-plan and --import-speed go one at a time")
     if args.import_speed:
         try:
-            rec = import_speed(Path(args.smoke_verdict) if args.smoke_verdict else None,
-                               Path(args.box1_go) if args.box1_go else None, out_dir)
+            rec = import_speed(Path(args.smoke_verdict) if args.smoke_verdict else None, out_dir)
             plan = load_plan(out_dir)
             reg = json.loads((out_dir / BOXES).read_text(encoding="utf-8"))
             hs = [box_hours(plan, rec, b, reserve_min=(reg["boxes"].get(b) or {}).get("deadline_reserve_min") or 60)

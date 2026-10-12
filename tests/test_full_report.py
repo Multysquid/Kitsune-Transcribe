@@ -258,7 +258,7 @@ def world(tmp_path_factory):
                   greedy=greedy_frames(ids, refs, wh, durations=durations, truncated=trunc))
     R["whisper-large-v3"] = text_table(ids, refs, wh, trunc)
 
-    # speed: smoke A and smoke B on one machine (the chart group), box full's re-time pair on another
+    # speed: smoke A and smoke B on one machine (the chart group), box full-t's re-time pair on another
     sp_ids = [ids[s][i] for s in ("eval_jsut", "eval_cv8", "eval_reazon") for i in range(3)]
     speed = [
         write_speed(pull / "speed-full-smoke-20261001T000000Z" / "speed.json", sp_ids, {
@@ -420,7 +420,7 @@ def test_ci_noise_terms(tmp_path):
 
 def test_speed_mapping_and_flags(world):
     """Own record in the chart group; a full-data row falls back to its study weights (S1); a token drift over 5 %
-    re-times T-0.6B from box full's pair (S2); another machine (S3); MXFP4 simulated (S4); none (S5). Three speed-*
+    re-times T-0.6B from box full-t's pair (S2); another machine (S3); MXFP4 simulated (S4); none (S5). Three speed-*
     files are read, two of them one machine."""
     rep = world["rep"]
     sg = rep["speed_groups"]
@@ -437,7 +437,7 @@ def test_speed_mapping_and_flags(world):
     assert sp["whisper-small"]["flags"] == ["S3"] and not sp["whisper-small"]["in_chart_group"]
     assert sp["cohere"]["flags"] == ["S5"]
     # T-0.6B: the readout emits 12 tokens a row, the timed study weights 10: S2, and the chart group's study-t06
-    # record times the full/study ratio box full timed on its own machine
+    # record times the full/study ratio box full-t timed on its own machine
     t = sp["full-t06"]
     assert t["flags"] == ["S1", "S2"] and t["drift"]["drift"] == pytest.approx(0.2)
     assert t["drift"]["n_ids"] == len(world["sp_ids"])
@@ -797,7 +797,7 @@ def test_speed_groups_from_queue_summaries(world, tmp_path, capsys):
 
 
 def test_s2_retime_keeps_variants_on_the_bf16_basis_and_chart_twins(world, tmp_path):
-    """S2: the bf16 full-t06 row AND its variant take box full's bf16 re-time ratio (the variant decodes the same
+    """S2: the bf16 full-t06 row AND its variant take box full-t's bf16 re-time ratio (the variant decodes the same
     tokens), so "x bf16 speed" and the chart's join compare one basis; each keeps its record's own numbers. A study
     row hides behind its full-data twin only when that twin is drawn: an emulated full variant leaves its timed study
     variant on the chart."""
@@ -856,7 +856,7 @@ def test_s2_retime_keeps_variants_on_the_bf16_basis_and_chart_twins(world, tmp_p
 
 
 def test_s2_retime_pair_on_the_chart_machine(world, tmp_path):
-    """Box full rented the chart group's machine: full-t06 has its own record there (no S1, no S2) and box full's
+    """Box full-t rented the chart group's machine: full-t06 has its own record there (no S1, no S2) and box full-t's
     speed-study-t06 re-time, newer and in the same file, stands for study-t06. A full-t06 variant still falls back to
     its study variant (S1) with S2, so it takes that same-file pair's ratio from the chart group: its "x bf16 speed"
     and its join stay on one basis. A pair from two files (two launches) is not a re-time pair."""
@@ -883,7 +883,7 @@ def test_s2_retime_pair_on_the_chart_machine(world, tmp_path):
     assert rc == 0 and list(rep["speed_groups"]["groups"]) == [PRIMARY]
     sp = {s: v["speed"] for s, v in rep["systems"].items()}
     assert sp["full-t06"]["flags"] == [] and sp["full-t06"]["rtf"] == pytest.approx(0.003)
-    assert sp["study-t06"]["file"] == str(full)  # box full's re-time replaces smoke A's record (newer, listed)
+    assert sp["study-t06"]["file"] == str(full)  # box full-t's re-time replaces smoke A's record (newer, listed)
     v = sp["full-t06@int8-w8a8"]
     assert v["flags"] == ["S1", "S2"] and v["retime"]["group"] == PRIMARY
     assert v["rtf"] == pytest.approx(0.0008 * 1.5) and v["unscaled"]["rtf"] == pytest.approx(0.0008)

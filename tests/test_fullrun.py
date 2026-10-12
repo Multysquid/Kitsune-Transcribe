@@ -28,7 +28,7 @@ RID = "full-p03-20260927T120000Z"
 def test_constants_exact_values():
     assert fr.JOB == "full"
     assert (fr.BOXES_FILE, fr.ENV_REGISTRY) == ("configs/full/boxes.json", "KITSUNE_FULL_REGISTRY")
-    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005", "p-cool")
+    assert fr.BOX_NAMES == ("full-smoke", "p01", "smoke-b", "full-t", "full-p", "p005", "p-cool")
     assert fr.HUB_DIR == "full" and fr.STATE_DEFAULT == "/workspace/kitsune_state"
     assert (fr.TRAIN_HB, fr.HB_DIR, fr.RESUME_PLAN, fr.VERDICT_FILE, fr.ALERTS_FILE, fr.GATE_FILE, fr.SUMMARY_FILE,
             fr.DEADLINE_FILE) == ("train_hb", "hb", "resume_plan.json", "smoke_verdict.json",
@@ -515,7 +515,7 @@ def test_run_id_of():
 def test_hub_and_scratch_paths():
     assert fr.box_summary_path("p01") == "full/box-p01/queue_summary.json"
     assert fr.box_verdict_path("full-smoke") == "full/box-full-smoke/smoke_verdict.json"
-    assert fr.box_infra_dir("full", "12345") == "full/box-full/infra/12345"
+    assert fr.box_infra_dir("full-p", "12345") == "full/box-full-p/infra/12345"
     assert fr.scratch_state_dir(RID, 5200) == f"runs/{RID}/checkpoints/full_step_5200"
     assert fr.scratch_pointer(RID) == f"runs/{RID}/timed_state.json"
 
@@ -587,7 +587,7 @@ def test_tiny_registry_validates(tmp_path, reg):
     assert fr.registry_problems(reg, root=tmp_path) == []
     assert (tmp_path / "configs" / "full" / "data-p01.json").is_file()
     loaded = fr.load_registry(reg, root=tmp_path)
-    assert set(loaded["boxes"]) == {"full-smoke", "p01", "full", "smoke-b"} < set(fr.BOX_NAMES)  # the four of section 7
+    assert set(loaded["boxes"]) == {"full-smoke", "p01", "full-p", "smoke-b"} < set(fr.BOX_NAMES)  # tiny_registry's
     assert fr.load_registry(loaded, root=tmp_path) == loaded  # filling the defaults again changes nothing
     # every value a box env or command line carries is one env-string word (launch.env_string's rule)
     for b in loaded["boxes"].values():
@@ -603,7 +603,7 @@ def test_load_registry_does_not_change_its_argument(tmp_path, reg):
 
 def test_defaults_are_filled(tmp_path, reg):
     loaded = fr.load_registry(reg, root=tmp_path)
-    full = loaded["boxes"]["full"]
+    full = loaded["boxes"]["full-p"]
     assert (full["gate"], full["smoke"], full["max_attempts"], full["extra_dirs"], full["faults"]) == (
         True, False, 4, [], [])
     items = {i["name"]: i for i in full["items"]}
@@ -655,12 +655,13 @@ def _refused(reg, root, match, **kw):
 
 RULES = {
     "unknown kind": (lambda r: _item(r, "p01", "stores-ctc").update(kind="calib"), r"kind 'calib'"),
-    "unknown placeholder": (lambda r: _item(r, "full", "whisper-small")["argv"].append("{outdir}"),
+    "unknown placeholder": (lambda r: _item(r, "full-p", "whisper-small")["argv"].append("{outdir}"),
                             r"unknown placeholder \{outdir\}"),
-    "unknown colon placeholder": (lambda r: _item(r, "full", "whisper-small")["argv"].append("{root:x}"),
+    "unknown colon placeholder": (lambda r: _item(r, "full-p", "whisper-small")["argv"].append("{root:x}"),
                                   r"unknown placeholder \{root:x\}"),
-    "unmatched brace": (lambda r: _item(r, "full", "whisper-small")["argv"].append("{out/x"), r"unmatched brace"),
-    "{config} without of": (lambda r: _item(r, "full", "whisper-small")["argv"].append("{config}"), r"needs the item"),
+    "unmatched brace": (lambda r: _item(r, "full-p", "whisper-small")["argv"].append("{out/x"), r"unmatched brace"),
+    "{config} without of": (lambda r: _item(r, "full-p", "whisper-small")["argv"].append("{config}"),
+                            r"needs the item"),
     "{ckpt:<name>} not in weights": (lambda r: _item(r, "smoke-b", "selftest")["argv"].append("{ckpt:study-p01}"),
                                      r"names no entry of the item's weights"),
     "{out:<item>} of a later item": (lambda r: _item(r, "smoke-b", "selftest")["argv"].append("{out:whisper-large-v3}"),
@@ -690,7 +691,7 @@ RULES = {
     "duplicate fault id": (lambda r: _box(r, "full-smoke")["faults"][1].update(id="F1"), r"given twice"),
     "bad family": (lambda r: _item(r, "p01", "full-p01").update(family="rnnt"), r"family 'rnnt'"),
     "non-droppable readout": (lambda r: _item(r, "p01", "m4-full-p01").update(droppable=False), r"always droppable"),
-    "non-droppable eval": (lambda r: _item(r, "full", "whisper-small").update(droppable=False), r"always droppable"),
+    "non-droppable eval": (lambda r: _item(r, "full-p", "whisper-small").update(droppable=False), r"always droppable"),
     "data_config outside configs/full/": (lambda r: _box(r, "p01").update(data_config="configs/study/data.json"),
                                           r"not under configs/full/"),
     "data_config absolute": (lambda r: _box(r, "p01").update(data_config="/configs/full/data-p01.json"),
@@ -728,13 +729,13 @@ RULES = {
                                  r"not a kitsune.prereg run"),
     "plan steps without hours": (lambda r: _item(r, "full-smoke", "smoke-t06").pop("plan_hours"),
                                  r"go together"),
-    "of_box of a missing train item": (lambda r: _item(r, "full", "quant-int8-w8a8-full-p01").update(of="full-p03"),
+    "of_box of a missing train item": (lambda r: _item(r, "full-p", "quant-int8-w8a8-full-p01").update(of="full-p03"),
                                        r"not a train item of box p01"),
-    "of_box of the same box": (lambda r: _item(r, "full", "quant-int8-w8a8-full-p01").update(of_box="full"),
+    "of_box of the same box": (lambda r: _item(r, "full-p", "quant-int8-w8a8-full-p01").update(of_box="full-p"),
                                r"not another registry box"),
     "of_box not in the registry": (lambda r: r["boxes"].pop("p01"), r"of_box 'p01' is not a registry box"),
-    "of_box without of": (lambda r: _item(r, "full", "quant-int8-w8a8-full-p01").pop("of"), r"without of"),
-    "same-box of of a later item": (lambda r: _box(r, "full")["items"].insert(2, {
+    "of_box without of": (lambda r: _item(r, "full-p", "quant-int8-w8a8-full-p01").pop("of"), r"without of"),
+    "same-box of of a later item": (lambda r: _box(r, "full-p")["items"].insert(2, {
         "name": "early-eval", "kind": "eval", "of": "full-t06", "argv": ["x"], "max_hours": 0.3}),
         r"early-eval: of 'full-t06' is not an earlier train item"),
     "model not in extra_dirs": (lambda r: _item(r, "full-smoke", "speed-parakeet-tdt").update(model="models/x"),
@@ -743,12 +744,12 @@ RULES = {
                            r"not a run id"),
     "duplicate weights name": (lambda r: _item(r, "smoke-b", "selftest")["weights"][1].update(name="study-p03"),
                                r"given twice"),
-    "speed with two sources": (lambda r: _item(r, "full", "speed-study-t06").update(of="full-t06"),
+    "speed with two sources": (lambda r: _item(r, "full-p", "speed-study-t06").update(of="full-t06"),
                                r"times one model"),
     "cohere with a model": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
         model="models/parakeet-tdt_ctc-0.6b-ja-hf"), r"cohere"),
     # speed_probe refuses these kinds without --model at once: a dropped source must fail here, not on the rented box
-    "aed speed item without a model source": (lambda r: _item(r, "full", "speed-study-t06").pop("weights"),
+    "aed speed item without a model source": (lambda r: _item(r, "full-p", "speed-study-t06").pop("weights"),
                                               r"speed_kind aed times one student"),
     "ctc speed item without a model source": (lambda r: _item(r, "full-smoke", "speed-study-p01").update(weights=[]),
                                               r"speed_kind ctc times one student"),
@@ -775,13 +776,13 @@ RULES = {
         r"speed_kind whisper needs --model"),
     "whisper speed item with an empty --model=": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
         speed_kind="whisper", system="whisper-small", args=["--model="]), r"speed_kind whisper needs --model"),
-    "unknown speed kind": (lambda r: _item(r, "full", "speed-study-t06").update(speed_kind="tdt"),
+    "unknown speed kind": (lambda r: _item(r, "full-p", "speed-study-t06").update(speed_kind="tdt"),
                            r"speed_kind 'tdt'"),
     "only_if_new_machine unknown": (lambda r: _item(r, "smoke-b", "speed-study-p03").update(
         only_if_new_machine="box-a"), r"only_if_new_machine"),
     "only_if_new_machine itself": (lambda r: _item(r, "smoke-b", "speed-study-p03").update(
         only_if_new_machine="smoke-b"), r"only_if_new_machine"),
-    "verdict on a non-smoke box": (lambda r: _item(r, "full", "whisper-small").update(verdict=[{"check": "15"}]),
+    "verdict on a non-smoke box": (lambda r: _item(r, "full-p", "whisper-small").update(verdict=[{"check": "15"}]),
                                    r"not a smoke box"),
     "verdict check 17": (lambda r: _item(r, "smoke-b", "speed-study-p03").update(verdict=[{"check": "17"}]),
                          r"check '17'"),
@@ -797,8 +798,8 @@ RULES = {
                                  r"not key=value"),
     "a path with a space": (lambda r: _box(r, "p01")["extra_files"].append("labels/full/a b.json"),
                             r"env-string word"),
-    "eval without argv": (lambda r: _item(r, "full", "whisper-small").pop("argv"), r"no argv"),
-    "eval with an empty argv": (lambda r: _item(r, "full", "whisper-small").update(argv=[]), r"argv"),
+    "eval without argv": (lambda r: _item(r, "full-p", "whisper-small").pop("argv"), r"no argv"),
+    "eval with an empty argv": (lambda r: _item(r, "full-p", "whisper-small").update(argv=[]), r"argv"),
     "not an object": (lambda r: r["boxes"].update(p01=[]), r"not an object"),
 }
 
@@ -832,7 +833,7 @@ def test_pull_parakeet_missing_counts_as_false(tmp_path, reg):
 
 
 def test_family_must_be_the_configs(tmp_path, reg):
-    _item(reg, "full", "full-p03").update(family="aed")
+    _item(reg, "full-p", "full-p03").update(family="aed")
     _refused(reg, tmp_path, r"family 'aed', but configs/full/full-p03.json trains 'ctc'")
     reg = tiny_registry(tmp_path)
     p = tmp_path / "configs" / "full" / "full-t06.json"
@@ -859,9 +860,9 @@ def test_family_must_be_the_data_configs_without_pull_parakeet(tmp_path, reg):
     probs = _refused(reg, tmp_path, r"full-p01: configs/full/full-p01.json trains family ctc, but the box data "
                                     r"config configs/full/data-p01.json is family aed")
     assert any(p.startswith("boxes.p01.items.stores-ctc:") for p in probs)
-    # with pull_parakeet both teachers' labels come for every stem, so one box trains both families (box full)
+    # with pull_parakeet both teachers' labels come for every stem, so one box trains both families (box full-p)
     loaded = fr.load_registry(tiny_registry(tmp_path))
-    assert {i["family"] for i in fr.train_items("full", loaded)} == {"aed", "ctc"}
+    assert {i["family"] for i in fr.train_items("full-p", loaded)} == {"aed", "ctc"}
 
 
 def test_missing_configs_are_refused_only_with_check_files(tmp_path, reg):
@@ -944,7 +945,7 @@ def test_a_continuation_box_validates_and_lists_its_continuations(tmp_path, reg)
     assert fr.train_items("p-cool", loaded)[0]["continues"] == CONT_P01
     assert fr.train_items("p01", loaded)[0]["continues"] is None  # the default: a run of its own
     assert fr.continues_of("p-cool", loaded) == {"full-p01": CONT_P01}
-    assert fr.continues_of("p01", loaded) == {} and fr.continues_of("full", loaded) == {}
+    assert fr.continues_of("p01", loaded) == {} and fr.continues_of("full-p", loaded) == {}
     fr.continues_of("p-cool", loaded)["full-p01"]["sets"].clear()  # a copy
     assert fr.continues_of("p-cool", loaded)["full-p01"] == CONT_P01
     assert fr.continue_sets(fr.continues_of("p-cool", loaded)["full-p01"]) == [
@@ -955,8 +956,8 @@ def test_a_continuation_box_validates_and_lists_its_continuations(tmp_path, reg)
     chained = with_chain(cool)  # p01-chain runs box p01 (the source), never p-cool
     assert fr.registry_problems(chained, root=tmp_path, check_files=False) == []
     assert fr.continues_of(CHAIN_BOX, chained) == {}
-    with pytest.raises(fr.RegistryError, match="'full-p' is not in the registry"):
-        fr.continues_of("full-p", loaded)
+    with pytest.raises(fr.RegistryError, match="'full-t' is not in the registry"):
+        fr.continues_of("full-t", loaded)
     # comments are allowed in the block and in its sets, and the sets' comments are no --set words
     commented = with_cool(reg, _comment="H14", sets=dict(CONT_P01["sets"], _why="explicit ranges"))
     assert fr.registry_problems(commented, root=tmp_path) == []
@@ -1001,9 +1002,9 @@ CONT_RULES = {
     "sets a bad codec": (_set(**{"augment.codecs": ["mp3", "aac"]}), r"continues.sets: augment.codecs must be a "
                                                                      r"non-empty list of distinct codec names"),
     "box its own": ({"box": "p-cool"}, r"continues.box 'p-cool' is the item's own box"),
-    "box not in the registry": ({"box": "full-p"}, r"continues.box 'full-p' is not a registry box"),
+    "box not in the registry": ({"box": "full-t"}, r"continues.box 'full-t' is not a registry box"),
     "box unknown": ({"box": "box-a"}, r"continues.box 'box-a' is not a registry box"),
-    "box without the item": ({"box": "full"}, r"continues.box 'full' has no train item 'full-p01'"),
+    "box without the item": ({"box": "full-p"}, r"continues.box 'full-p' has no train item 'full-p01'"),
     "box with other train items": ({"box": "smoke-b"}, r"continues.box 'smoke-b' has no train item"),
 }
 
@@ -1037,7 +1038,7 @@ def test_a_continuation_box_continues_each_run_once(tmp_path, reg):
     cool = with_cool(reg)
     p03 = {"name": "full-p03", "kind": "train", "config": "configs/full/full-p03.json", "study_run": "study-p03",
            "family": "ctc", "max_hours": 5.0, "needs": ["stores-ctc"],
-           "continues": dict(copy.deepcopy(CONT_P01), box="full")}  # box full runs a full-p03 with that config
+           "continues": dict(copy.deepcopy(CONT_P01), box="full-p")}  # box full-p runs a full-p03 with that config
     cool["boxes"]["p-cool"]["items"].append(p03)
     probs = _refused(cool, tmp_path, rf"p-cool.items.full-p03.continues.run_id '{COOL_RID}' is continued by item "
                                      rf"'full-p01' of box p-cool too: one item per run", check_files=False)
@@ -1066,7 +1067,7 @@ def test_malformed_registries_do_not_crash(tmp_path):
     for bad in (None, [], "x", {}, {"version": 1}, {"version": 1, "boxes": []},
                 {"version": 1, "boxes": {"p01": {"items": [None, 3, {"kind": ["train"]}, {"kind": "eval",
                                                                                         "weights": 5}]}}},
-                {"version": 1, "boxes": {"full": {"items": [{"name": "a", "kind": "speed", "system": ["x"],
+                {"version": 1, "boxes": {"full-p": {"items": [{"name": "a", "kind": "speed", "system": ["x"],
                                                              "speed_kind": {}, "only_if_new_machine": ["p01"],
                                                              "weights": [{"name": ["x"]}], "args": "x"}]}}}):
         assert fr.registry_problems(bad, root=tmp_path)
@@ -1122,8 +1123,8 @@ def test_a_loaded_registry_remembers_its_checkout(tmp_path, monkeypatch):
     tiny_registry(tmp_path, write_boxes=True)
     loaded = fr.load_registry(tmp_path / "configs" / "full" / "boxes.json")  # a path, no root=
     assert fr.box_students("p01", loaded) == ["students/study/p01"]
-    assert fr.box_ctc_students("full", loaded) == ["students/study/p03", "students/study/p005"]
-    assert fr.student_checks("full", lambda s: _metas()[s], loaded) == []
+    assert fr.box_ctc_students("full-p", loaded) == ["students/study/p03", "students/study/p005"]
+    assert fr.student_checks("full-p", lambda s: _metas()[s], loaded) == []
     assert fr.registry_problems(loaded) == []
     assert fr.load_registry(loaded) == loaded
     assert fr.box_students("p01", copy.deepcopy(loaded)) == ["students/study/p01"]  # a copy keeps it
@@ -1153,10 +1154,10 @@ def test_read_json_reads_the_configs_instead_of_a_root(tmp_path, reg):
     assert fr.registry_problems(plain, root=nowhere, read_json=read) == []
     assert "configs/full/data-p01.json" in seen and "configs/full/smoke-b-t06.json" in seen
     loaded = fr.load_registry(plain, root=nowhere, read_json=read)
-    assert fr.box_students("full", loaded, read_json=read) == ["students/study/t06", "students/study/p03",
+    assert fr.box_students("full-p", loaded, read_json=read) == ["students/study/t06", "students/study/p03",
                                                                "students/study/p005"]
-    assert fr.box_ctc_students("full", loaded, read_json=read) == ["students/study/p03", "students/study/p005"]
-    assert fr.student_checks("full", lambda s: _metas()[s], loaded, read_json=read) == []
+    assert fr.box_ctc_students("full-p", loaded, read_json=read) == ["students/study/p03", "students/study/p005"]
+    assert fr.student_checks("full-p", lambda s: _metas()[s], loaded, read_json=read) == []
     # what the reader gives is checked like a file: a data-key mismatch at the sha is refused
     files["configs/full/full-p03.json"]["selection"] = fr.SMOKE_SELECTION
     assert any("full-p03.json differs from the box data config" in p
@@ -1166,7 +1167,7 @@ def test_read_json_reads_the_configs_instead_of_a_root(tmp_path, reg):
     probs = fr.registry_problems(plain, root=nowhere, read_json=read)
     assert any("full-p03.json: not readable JSON (KeyError" in p for p in probs), probs
     with pytest.raises(fr.RegistryError, match="full-p03.json: cannot read it with read_json"):
-        fr.box_students("full", loaded, read_json=read)
+        fr.box_students("full-p", loaded, read_json=read)
 
     def missing(rel):
         raise FileNotFoundError(rel)
@@ -1182,17 +1183,17 @@ def test_box_readers(tmp_path, reg):
     with pytest.raises(fr.RegistryError, match="'smoke-c'"):
         fr.box_spec("smoke-c", reg)
     assert [i["name"] for i in fr.box_items("p01", reg)] == ["stores-ctc", "full-p01", "m4-full-p01"]
-    assert [i["name"] for i in fr.train_items("full", reg)] == ["full-t06", "full-p03", "full-p005"]
+    assert [i["name"] for i in fr.train_items("full-p", reg)] == ["full-t06", "full-p03", "full-p005"]
     assert [i["name"] for i in fr.train_items("full-smoke", reg)] == ["smoke-t06", "smoke-p03", "smoke-p01",
                                                                       "smoke-p005", "smoke-nostart"]
-    assert fr.box_configs("full", reg) == ["configs/full/data-full.json", "configs/full/full-p03.json",
+    assert fr.box_configs("full-p", reg) == ["configs/full/data-both.json", "configs/full/full-p03.json",
                                            "configs/full/full-t06.json", "configs/full/full-p005.json",
                                            "configs/full/boxes.json"]
-    assert fr.box_students("full", reg, tmp_path) == ["students/study/t06", "students/study/p03",
+    assert fr.box_students("full-p", reg, tmp_path) == ["students/study/t06", "students/study/p03",
                                                       "students/study/p005"]
     assert fr.box_students("full-smoke", reg, tmp_path) == ["students/study/t06", "students/study/p03",
                                                             "students/study/p01", "students/study/p005"]
-    assert fr.box_ctc_students("full", reg, tmp_path) == ["students/study/p03", "students/study/p005"]
+    assert fr.box_ctc_students("full-p", reg, tmp_path) == ["students/study/p03", "students/study/p005"]
     assert fr.box_ctc_students("smoke-b", reg, tmp_path) == []
     assert fr.box_students("smoke-b", reg, tmp_path) == []
     assert fr.box_extra_files("p01", reg) == [fr.FROZEN_MANIFEST, "labels/full/selections/full_study/full.json"]
@@ -1207,7 +1208,7 @@ def test_box_readers(tmp_path, reg):
 def test_box_env(reg):
     assert fr.box_env("p01", reg) == {"KITSUNE_N_GPUS": "1", "KITSUNE_WATCHDOG_HB_FILE": "train_hb",
                                       "KITSUNE_WATCHDOG_ORPHAN_S": "3600", "KITSUNE_WATCHDOG_ORPHAN_ACTION": "stop"}
-    assert fr.box_env("full", reg)["KITSUNE_N_GPUS"] == "2"
+    assert fr.box_env("full-p", reg)["KITSUNE_N_GPUS"] == "2"
     assert fr.box_env("full-smoke", reg)["KITSUNE_WATCHDOG_ORPHAN_ACTION"] == "alert"
 
 
@@ -1235,7 +1236,7 @@ def test_student_checks(tmp_path, reg):
     assert fr.student_checks("full-smoke", read, reg, tmp_path) == []
     assert seen == ["students/study/t06", "students/study/p03", "students/study/p01", "students/study/p005"]  # once
     metas = _metas(**{"study-p03": {"params_total": 1}})
-    probs = fr.student_checks("full", lambda s: metas[s], reg, tmp_path)
+    probs = fr.student_checks("full-p", lambda s: metas[s], reg, tmp_path)
     assert probs and all(p.startswith("students/study/p03: study-p03: ") for p in probs)
 
     def boom(s):
@@ -1263,19 +1264,18 @@ def test_cli(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("KITSUNE_FULL_REGISTRY", raising=False)
     monkeypatch.delenv("KITSUNE_BOX", raising=False)
     root = ["--root", str(tmp_path)]
-    assert _cli(["students", "--box", "full", *root], capsys)[:2] == (
-        0, "students/study/t06\nstudents/study/p03\nstudents/study/p005\n")
-    assert _cli(["extra-files", "--box", "p01", *root], capsys)[:2] == (
-        0, f"{fr.FROZEN_MANIFEST}\nlabels/full/selections/full_study/full.json\n")
-    assert _cli(["extra-dirs", "--box", "full-smoke", *root], capsys)[:2] == (
-        0, "models/parakeet-tdt_ctc-0.6b-ja-hf\n")
-    assert _cli(["extra-dirs", "--box", "p01", *root], capsys)[:2] == (0, "")
+    rc, out, _ = _cli(["show", "--box", "full-p", *root], capsys)
+    shown = json.loads(out)
+    assert rc == 0 and shown["students"] == ["students/study/t06", "students/study/p03", "students/study/p005"]
+    assert shown["env"]["KITSUNE_N_GPUS"] == "2" and shown["configs"][0] == "configs/full/data-both.json"
     rc, out, _ = _cli(["show", "--box", "p01", *root], capsys)
     shown = json.loads(out)
     assert rc == 0 and shown["box"] == "p01" and shown["env"]["KITSUNE_N_GPUS"] == "1"
     assert shown["spec"]["items"][2]["needs"] == ["full-p01"] and shown["students"] == ["students/study/p01"]
+    assert shown["spec"]["extra_files"] == [fr.FROZEN_MANIFEST, "labels/full/selections/full_study/full.json"]
     monkeypatch.setenv("KITSUNE_BOX", "p01")  # --box defaults to the env
-    assert _cli(["students", *root], capsys)[:2] == (0, "students/study/p01\n")
+    rc, out, _ = _cli(["show", *root], capsys)
+    assert rc == 0 and json.loads(out)["box"] == "p01"
 
 
 def test_cli_check_students(tmp_path, monkeypatch, capsys):
@@ -1284,11 +1284,11 @@ def test_cli_check_students(tmp_path, monkeypatch, capsys):
     for s, m in _metas().items():
         (tmp_path / s).mkdir(parents=True)
         (tmp_path / s / "student_meta.json").write_text(json.dumps(m), encoding="utf-8")
-    rc, out, _ = _cli(["check-students", "--box", "full", "--root", str(tmp_path)], capsys)
+    rc, out, _ = _cli(["check-students", "--box", "full-p", "--root", str(tmp_path)], capsys)
     assert rc == 0 and "3 student(s) are the registered builds" in out
     (tmp_path / "students/study/p005/student_meta.json").write_text(json.dumps(_meta("study-p005", seed=1)),
                                                                      encoding="utf-8")
-    rc, _, err = _cli(["check-students", "--box", "full", "--root", str(tmp_path)], capsys)
+    rc, _, err = _cli(["check-students", "--box", "full-p", "--root", str(tmp_path)], capsys)
     assert rc == 2 and "student refused: students/study/p005: study-p005: seed 1" in err
     (tmp_path / "students/study/p01/student_meta.json").unlink()
     rc, _, err = _cli(["check-students", "--box", "p01", "--root", str(tmp_path)], capsys)
@@ -1298,7 +1298,7 @@ def test_cli_check_students(tmp_path, monkeypatch, capsys):
 def test_cli_refusals(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("KITSUNE_FULL_REGISTRY", raising=False)
     monkeypatch.delenv("KITSUNE_BOX", raising=False)
-    rc, _, err = _cli(["students", "--box", "p01", "--root", str(tmp_path)], capsys)
+    rc, _, err = _cli(["show", "--box", "p01", "--root", str(tmp_path)], capsys)
     assert rc == 2 and "not in this checkout" in err  # no registry
     reg = tiny_registry(tmp_path)
     reg["boxes"].pop("smoke-b")
@@ -1310,10 +1310,10 @@ def test_cli_refusals(tmp_path, monkeypatch, capsys):
     rc, _, err = _cli(["check-students", "--box", "p01", "--root", str(tmp_path)], capsys)
     assert rc == 2 and "gpus 0" in err
     with pytest.raises(SystemExit) as e:
-        fr.main(["students", "--root", str(tmp_path)])  # no --box and no KITSUNE_BOX
+        fr.main(["show", "--root", str(tmp_path)])  # no --box and no KITSUNE_BOX
     assert e.value.code == 2
     with pytest.raises(SystemExit) as e:
-        fr.main(["students", "--box", "box-a"])  # not a full box
+        fr.main(["show", "--box", "box-a"])  # not a full box
     assert e.value.code == 2
 
 
@@ -1328,11 +1328,11 @@ def test_cli_has_continues(tmp_path, monkeypatch, capsys):
     (tmp_path / fr.BOXES_FILE).write_text(json.dumps(reg), encoding="utf-8")
     assert _cli(["has-continues", "--box", "p-cool", *root], capsys) == (0, "1\n", "")
     assert _cli(["has-continues", "--box", "p01", *root], capsys) == (0, "0\n", "")
-    assert _cli(["has-continues", "--box", "full", *root], capsys) == (0, "0\n", "")
+    assert _cli(["has-continues", "--box", "full-p", *root], capsys) == (0, "0\n", "")
     monkeypatch.setenv("KITSUNE_BOX", "p-cool")  # bootstrap: --box from the env
     assert _cli(["has-continues", *root], capsys) == (0, "1\n", "")
-    rc, out, err = _cli(["has-continues", "--box", "full-p", *root], capsys)
-    assert (rc, out) == (2, "") and "'full-p' is not in the registry" in err  # an unknown box
+    rc, out, err = _cli(["has-continues", "--box", "full-t", *root], capsys)
+    assert (rc, out) == (2, "") and "'full-t' is not in the registry" in err  # an unknown box
     next(i for i in reg["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")["continues"]["from_step"] = 0
     (tmp_path / fr.BOXES_FILE).write_text(json.dumps(reg), encoding="utf-8")
     rc, out, err = _cli(["has-continues", "--box", "p-cool", *root], capsys)
@@ -1345,6 +1345,6 @@ def test_cli_has_continues(tmp_path, monkeypatch, capsys):
 def test_cli_as_a_module(tmp_path):
     tiny_registry(tmp_path, write_boxes=True)
     env = {k: v for k, v in __import__("os").environ.items() if k not in ("KITSUNE_FULL_REGISTRY", "KITSUNE_BOX")}
-    out = subprocess.run([sys.executable, "-m", "kitsune.fullrun", "students", "--box", "p01", "--root",
+    out = subprocess.run([sys.executable, "-m", "kitsune.fullrun", "show", "--box", "p01", "--root",
                           str(tmp_path)], cwd=ROOT, capture_output=True, text=True, timeout=120, env=env)
-    assert (out.returncode, out.stdout) == (0, "students/study/p01\n"), out.stderr
+    assert out.returncode == 0 and json.loads(out.stdout)["students"] == ["students/study/p01"], out.stderr

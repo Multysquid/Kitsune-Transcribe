@@ -7,13 +7,14 @@
                                                      # or dict(reg) forgets it, and then root= is needed again)
     tiny_registry(tmp_path, write_boxes=True)        # + tmp_path/configs/full/boxes.json (for KITSUNE_FULL_REGISTRY)
 
-It has the four boxes of section 7 in miniature, and between them every registry feature, so a test takes the box it
-needs and changes what it tests:
+It has four boxes in miniature, and between them every registry feature, so a test takes the box it needs and
+changes what it tests:
   p01         1 GPU, the box-1 shape: stores-ctc -> full-p01 (train, ctc) -> m4-full-p01 (readout)
-  full        2 GPUs, the shared queue: stores-ctc, stores-aed (needs stores-ctc); full-t06 (aed), full-p03, full-p005
-              (droppable); their readouts; an eval of full-p03 (same-box `of`, needs its readout), an eval of box
-              p01's full-p01 (`of_box`), a Whisper eval (no model source); the decision-22 re-time pair (speed: `of` and
-              `weights`)
+  full-p      2 GPUs (every real box has 1; this is the queue's multi-GPU case), the shared queue on data-both
+              (FULL_DATA with pull_parakeet: both label roots, for its two families): stores-ctc, stores-aed (needs
+              stores-ctc); full-t06 (aed), full-p03, full-p005 (droppable); their readouts; an eval of full-p03
+              (same-box `of`, needs its readout), an eval of box p01's full-p01 (`of_box`), a Whisper eval (no model
+              source); the decision-22 re-time pair (speed: `of` and `weights`)
   full-smoke  1 GPU, smoke: the four smoke trainers (stall_min 10, plan_total_steps / plan_hours) + smoke-nostart
               (droppable, max_hours 999), two readouts, speed items with stall_min null (weights, cohere, a
               data-repo `model`), and the five faults F1-F5 (watchdog 600 s / alert)
@@ -27,8 +28,9 @@ the student and the run name; no trainer can load them (they are registry fixtur
 
 cool_registry is another registry (tiny_registry's configs, with full-p03 and full-p005 on box p01's data config): box
 p01 and the source boxes full-p (full-p03) and p005 (full-p005) in miniature, and box p-cool, which continues their
-three runs (COOL_RUNS, cool_continues) in H14's order, each train item followed by its M4 readout; box `full` (whose
-data config the rewritten configs no longer match) is left out, the smoke boxes stay.
+three runs (COOL_RUNS, cool_continues) in H14's order, each train item followed by its M4 readout; tiny_registry's
+2-GPU box full-p (whose data config the rewritten configs no longer match) is replaced by the 1-GPU source box, the
+smoke boxes stay.
 """
 import copy
 import json
@@ -62,14 +64,14 @@ def _study_data() -> dict:
 def _data_configs() -> dict[str, dict]:
     full = copy.deepcopy(fullrun.FULL_DATA)
     smoke = copy.deepcopy(fullrun.SMOKE_DATA)
-    return {"data-p01": dict(full, family="ctc"), "data-full": dict(full, pull_parakeet=True),
+    return {"data-p01": dict(full, family="ctc"), "data-both": dict(full, pull_parakeet=True),
             "data-smoke": dict(smoke, pull_parakeet=True), "data-smoke-b": _study_data()}
 
 
 def _item_configs(data: dict[str, dict]) -> dict[str, dict]:
     """<config name> -> (its data config, family, student)."""
-    spec = {"full-p01": ("data-p01", "ctc", "p01"), "full-t06": ("data-full", "aed", "t06"),
-            "full-p03": ("data-full", "ctc", "p03"), "full-p005": ("data-full", "ctc", "p005"),
+    spec = {"full-p01": ("data-p01", "ctc", "p01"), "full-t06": ("data-both", "aed", "t06"),
+            "full-p03": ("data-both", "ctc", "p03"), "full-p005": ("data-both", "ctc", "p005"),
             "smoke-t06": ("data-smoke", "aed", "t06"), "smoke-p03": ("data-smoke", "ctc", "p03"),
             "smoke-p01": ("data-smoke", "ctc", "p01"), "smoke-p005": ("data-smoke", "ctc", "p005"),
             "smoke-b-t06": ("data-smoke-b", "aed", "t06")}
@@ -107,7 +109,8 @@ def _whisper_argv(key: str, *extra: str) -> list[str]:
             "--max-temp", "0", *extra]
 
 
-def _box_full() -> dict:
+def _box_full_p() -> dict:
+    """tiny_registry's 2-GPU box full-p (the module docstring)."""
     train = [("full-t06", "study-t06", "aed", 35.19, "stores-aed", False),
              ("full-p03", "study-p03", "ctc", 22.29, "stores-ctc", False),
              ("full-p005", "study-p005", "ctc", 9.92, "stores-ctc", True)]
@@ -126,7 +129,7 @@ def _box_full() -> dict:
                "needs": ["m4-full-t06"], "max_hours": 0.2},
               {"name": "speed-study-t06", "kind": "speed", "weights": _weights("study-t06"), "system": "study-t06",
                "speed_kind": "aed", "max_hours": 0.2}]
-    return {"gpus": 2, "data_config": _cfg("data-full"), "est_hours": 41.9, "max_hours": 47, "max_dph": 1.70,
+    return {"gpus": 2, "data_config": _cfg("data-both"), "est_hours": 41.9, "max_hours": 47, "max_dph": 1.70,
             "extra_gb": 110, "deadline_reserve_min": 60, "watchdog": {"orphan_s": 3600, "action": "stop"},
             "timed_states": True, "extra_files": [fullrun.FROZEN_MANIFEST, fullrun.FULL_DIR + "/full.json"],
             "items": items}
@@ -206,8 +209,8 @@ def tiny_registry(root, *, write_boxes: bool = False) -> dict:
     data = _data_configs()
     for name, cfg in {**data, **_item_configs(data)}.items():
         (folder / f"{name}.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    reg = {"_comment": "tests/fixtures_full.tiny_registry: the section 7 boxes in miniature", "version": 1,
-           "boxes": {"full-smoke": _box_full_smoke(), "p01": _box_p01(), "full": _box_full(),
+    reg = {"_comment": "tests/fixtures_full.tiny_registry: the registry's boxes in miniature", "version": 1,
+           "boxes": {"full-smoke": _box_full_smoke(), "p01": _box_p01(), "full-p": _box_full_p(),
                      "smoke-b": _box_smoke_b()}}
     if write_boxes:
         (Path(root) / fullrun.BOXES_FILE).write_text(json.dumps(reg, indent=2) + "\n", encoding="utf-8")
@@ -275,7 +278,7 @@ def cool_registry(root, *, write_boxes: bool = False) -> dict:
         cfg = {k: copy.deepcopy(v) for k, v in data.items() if k in fullrun.DATA_KEYS}
         cfg.update(run_name=name, family="ctc", student=f"students/study/{student}")
         (folder / f"{name}.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    boxes = {k: v for k, v in reg["boxes"].items() if k != "full"}
+    boxes = {k: v for k, v in reg["boxes"].items() if k != "full-p"}
     boxes.update({"full-p": _box_source("full-p03", "study-p03", 22.29),
                   "p005": _box_source("full-p005", "study-p005", 9.92), "p-cool": _box_cool()})
     reg = {"_comment": "tests/fixtures_full.cool_registry: DECISIONS H14's box p-cool and its source boxes in miniature",

@@ -31,7 +31,7 @@ from kitsune import extent, fullrun, prereg  # noqa: E402
 FULL = ROOT / "configs" / "full"
 STUDENTS = ("t06", "p03", "p01", "p005")
 GENERATED = ([f"full-{x}" for x in STUDENTS] + [f"smoke-{x}" for x in STUDENTS]
-             + ["data-p01", "data-t", "data-p", "data-full", "data-smoke", "data-smoke-b"])
+             + ["data-p01", "data-t", "data-p", "data-smoke", "data-smoke-b"])
 QUANT_FORMATS = ("fp16", "int8-w8a16", "int8-w8a8", "nvfp4-w4a16", "nvfp4-w4a4", "mxfp4-w4a4", "fp8-w8a8")
 WHISPER_KEYS = ("whisper-large-v3", "whisper-large-v3-turbo", "kotoba-whisper-v2.0", "whisper-small")
 STUDY_WEIGHTS = {"study-t06": ("study-t06-20260926T174027Z", 9370), "study-t03": ("study-t03-20260926T174113Z", 27510),
@@ -412,8 +412,8 @@ def test_the_section_7_table():
     # other config has one (full-p01 is box 1's own, the smokes are smoke A's)
     assert {x: r["augment"] for x, r in M.FULL_RUNS.items()} == {"t06": M.RECIPE_AED_H15, "p03": M.RECIPE, "p01": None,
                                                                  "p005": M.RECIPE_V4}
-    # P-0.3B trains recipe v2 (DECISIONS H6); P-0.05B recipe v4 (H8, H12); RECIPE_TEST stays the record of what the
-    # first test ran; the cooldown re-runs (H14) recipe v4 with its ranges written out, at the defaults or gentler
+    # P-0.3B trains recipe v2 (DECISIONS H6); P-0.05B recipe v4 (H8, H12); the cooldown re-runs (H14) recipe v4 with
+    # its ranges written out, at the defaults or gentler
     assert M.FULL_RUNS["p03"]["augment"] is M.RECIPE and M.CONTINUATIONS["p01-cool"]["augment"] is M.RECIPE_V4_FULL
     assert [c["augment"] for c in M.CONTINUATIONS.values()] == [M.RECIPE_GENTLE, M.RECIPE_V4_FULL, M.RECIPE_GENTLE]
     assert M.RECIPE_V3 == dict(M.RECIPE, end_trim_p=0.3, noise_p=0.3, noise_bank="aug/musan-bg-v2",
@@ -484,13 +484,12 @@ def test_the_data_configs():
     assert data(cfg("data-p01")) == dict(fullrun.FULL_DATA, family="ctc")
     assert data(cfg("data-t")) == dict(fullrun.FULL_DATA, family="aed")
     assert data(cfg("data-p")) == data(cfg("data-p01"))  # box full-p pulls what box 1 pulled
-    assert data(cfg("data-full")) == dict(fullrun.FULL_DATA, pull_parakeet=True)
     assert data(cfg("data-smoke")) == dict(fullrun.SMOKE_DATA, pull_parakeet=True)
     study = json.loads((ROOT / "study" / "data.json").read_text(encoding="utf-8"))
     assert data(cfg("data-smoke-b")) == {k: study[k] for k in fullrun.DATA_KEYS if k in study}
     for n in ("data-p01", "data-t", "data-p", "full-t06", "full-p03", "full-p01", "full-p005"):
         assert "pull_parakeet" not in cfg(n), n
-    for n in ("data-p01", "data-t", "data-p", "data-full", "data-smoke", "data-smoke-b"):
+    for n in ("data-p01", "data-t", "data-p", "data-smoke", "data-smoke-b"):
         assert "tools/make_full_configs.py" in cfg(n)["_comment"]
     # the train configs carry their box's data keys (the registry checks it too); smoke-p01 pulls both roots, as
     # smoke A does
@@ -530,7 +529,7 @@ def toy_record(cfg_: dict) -> dict:
 def test_box_t_pulls_teacher_labels_only_and_each_box_one_store():
     """data-t (AED, no pull_parakeet): kitsune.extent.pull_plan asks for teacher_out of every stem and no parakeet_out
     (T-0.6B's store, its readouts and the AED eval read only teacher_root); data-p is data-p01. Each box's extent
-    sizing counts one store (extent.stores: 1), not data-full's two."""
+    sizing counts one store (extent.stores: 1), not the two of a config that pulls both roots (pull_parakeet)."""
     t, pp = cfg("data-t"), cfg("data-p")
     rec = toy_record(t)
     assert extent.validate(t) == [] and extent.record_problems(rec, t) == []
@@ -546,14 +545,14 @@ def test_box_t_pulls_teacher_labels_only_and_each_box_one_store():
     assert npz(extent.pull_plan(pp, toy_record(pp), []), "parakeet_out") == npz(
         extent.pull_plan(cfg("data-p01"), toy_record(cfg("data-p01")), []), "parakeet_out")
     assert extent.stores(t) == extent.stores(pp) == extent.stores(cfg("data-p01")) == 1
-    assert extent.stores(cfg("data-full")) == 2
+    assert extent.stores(dict(fullrun.FULL_DATA, pull_parakeet=True)) == 2
 
 
 def test_box_1_pulls_parakeet_for_every_stem_and_teacher_for_the_eval_stems_only():
     """data-p01 (CTC, no pull_parakeet): kitsune.extent.pull_plan asks for parakeet_out of every stem and teacher_out
-    of the eval sets' eval stems only (fix 9), and label_root_for reads the train stems' ids from parakeet_out; box 2's
-    data-full pulls both roots for every stem."""
-    p01, full = cfg("data-p01"), cfg("data-full")
+    of the eval sets' eval stems only (fix 9), and label_root_for reads the train stems' ids from parakeet_out; the
+    full data with pull_parakeet pulls both roots for every stem."""
+    p01, full = cfg("data-p01"), dict(fullrun.FULL_DATA, pull_parakeet=True)
     rec = toy_record(p01)
     assert extent.validate(p01) == [] and extent.record_problems(rec, p01) == []
     stems = {(n, st) for n, sts in extent.subset_stems(rec, p01).items() for st in sts}
@@ -823,11 +822,11 @@ def test_box_hours_follow_the_record(plan):
 
 
 def test_import_speed(tmp_path, plan, capsys):
-    """--import-speed records smoke A's check 3 and box 1's tools/box1_go.py --json as the speed record, byte-stable,
-    prints the hours of every HOURS_BOXES box boxes.json must carry (with each continuation's run and, for box p-cool,
-    every continuation's run, state, readout and sets as the queue passes them), and --check holds boxes.json to them;
-    a verdict without check 3's s/step is refused and nothing is written; without a record
-    the boxes' hours are not held."""
+    """--import-speed records smoke A's check 3 next to the record's box-1 part (box 1's measurement) as the speed
+    record, byte-stable, prints the hours of every HOURS_BOXES box boxes.json must carry (with each continuation's run
+    and, for box p-cool, every continuation's run, state, readout and sets as the queue passes them), and --check holds
+    boxes.json to them; a verdict without check 3's s/step is refused and nothing is written; without a box-1 part the
+    record is provisional; without a record the boxes' hours are not held."""
     out = repo_copy(tmp_path)
     committed = (out / M.SPEED_FILE).read_bytes()
     box1 = json.loads(committed)["box1"]
@@ -835,9 +834,12 @@ def test_import_speed(tmp_path, plan, capsys):
     assert M.check(out) == []  # no record: the boxes' hours are not held
     v = tmp_path / "smoke_verdict.json"
     v.write_text(json.dumps(smoke_verdict()), encoding="utf-8")
-    g = tmp_path / "box1_go.json"
-    g.write_text(json.dumps({"go": False, "exit": 1, "lines": [], "box1": box1}), encoding="utf-8")
-    assert M.main(["--out-dir", str(out), "--import-speed", "--smoke-verdict", str(v), "--box1-go", str(g)]) == 0
+    assert M.main(["--out-dir", str(out), "--import-speed", "--smoke-verdict", str(v)]) == 0
+    assert "smoke A only: provisional" in capsys.readouterr().out and M.load_speed(out)["box1"] is None
+    rec = json.loads(committed)
+    rec["smoke"]["sha"] = "stale"  # the smoke part comes from the verdict again, box 1's is the record's
+    (out / M.SPEED_FILE).write_text(M.render(rec), encoding="utf-8")
+    assert M.main(["--out-dir", str(out), "--import-speed", "--smoke-verdict", str(v)]) == 0
     printed = capsys.readouterr().out
     assert "smoke A and box 1; r 1.0361, o 0.0465" in printed and "boxes.json: carries the speed record's hours" in printed
     assert "  box full-t: full-t06 max_hours 47.75; est_hours 50.9, max_hours 68" in printed
@@ -863,8 +865,9 @@ def test_import_speed(tmp_path, plan, capsys):
     assert (out / M.SPEED_FILE).read_bytes().replace(b"\r\n", b"\n") == committed.replace(b"\r\n", b"\n")
     assert M.check(out) == []
     # a slower box 1: the smoke part is kept, the new hours printed, --check fails until boxes.json carries them
-    g.write_text(json.dumps({"go": True, "box1": dict(box1, sec_per_step=0.2987)}), encoding="utf-8")
-    assert M.main(["--out-dir", str(out), "--import-speed", "--box1-go", str(g)]) == 0
+    rec = json.loads((out / M.SPEED_FILE).read_text(encoding="utf-8"))
+    (out / M.SPEED_FILE).write_text(M.render(dict(rec, box1=dict(box1, sec_per_step=0.2987))), encoding="utf-8")
+    assert M.main(["--out-dir", str(out), "--import-speed"]) == 0
     printed = capsys.readouterr().out
     assert "smoke A and box 1; r 1.1, o 0.0465" in printed and "boxes.json: 8 change(s) by hand" in printed
     assert M.load_speed(out)["smoke"]["sec_per_step"] == SMOKE_SPS
@@ -874,13 +877,10 @@ def test_import_speed(tmp_path, plan, capsys):
     v.write_text(json.dumps(smoke_verdict(checks={"1": {"pass": True}})), encoding="utf-8")
     assert M.main(["--out-dir", str(out), "--import-speed", "--smoke-verdict", str(v)]) == 1
     assert "smoke check 3 has no sec_per_step for ['smoke-t06'" in capsys.readouterr().err
-    g.write_text(json.dumps({"go": None, "box1": None}), encoding="utf-8")
-    assert M.main(["--out-dir", str(out), "--import-speed", "--box1-go", str(g)]) == 1
-    assert "no box1 measurement" in capsys.readouterr().err
     assert (out / M.SPEED_FILE).read_bytes() == before
     with pytest.raises(SystemExit):
         M.main(["--out-dir", str(out), "--smoke-verdict", str(v)])
-    assert "go with --import-speed" in capsys.readouterr().err
+    assert "goes with --import-speed" in capsys.readouterr().err
     (out / M.SPEED_FILE).write_text('{"smoke": {}}', encoding="utf-8")
     assert any("smoke.sec_per_step.t06: None" in x for x in M.check(out))
 
@@ -906,10 +906,9 @@ def test_the_registry_loads_with_its_boxes(reg, monkeypatch):
     monkeypatch.delenv(fullrun.ENV_REGISTRY, raising=False)
     assert fullrun.load_registry() == reg  # this checkout's configs/full/boxes.json, every file checked
     assert fullrun.registry_problems(json.loads((FULL / "boxes.json").read_text(encoding="utf-8")), root=ROOT) == []
-    # every plain box, and the chained box of contract addendum E (test_the_chained_box); the retired 2x box full is a
-    # box name (the tests' fixtures) but not in the registry, so launch --box full is refused
-    assert set(fullrun.BOX_NAMES) == set(BOX_TABLE) | {"full"} and "full" not in reg["boxes"]
-    assert set(reg["boxes"]) == set(fullrun.ALL_BOX_NAMES) - {"full"}
+    # every plain box, and the chained box of contract addendum E (test_the_chained_box)
+    assert set(fullrun.BOX_NAMES) == set(BOX_TABLE)
+    assert set(reg["boxes"]) == set(fullrun.ALL_BOX_NAMES)
     for box, (gpus, dc, est, mx, dph, extra, reserve, wd, timed, gate, smoke, ram) in BOX_TABLE.items():
         b = fullrun.box_spec(box, reg)
         assert (b["gpus"], b["data_config"], b["est_hours"], b["max_hours"], b["max_dph"], b["extra_gb"],
@@ -998,7 +997,6 @@ def test_box_p01_is_box_1s_record(reg):
     raw_entry = json.loads((FULL / "boxes.json").read_text(encoding="utf-8"))["boxes"]["p01"]
     assert "continues on box p-cool" in raw_entry["_comment"] and "DECISIONS H14" in raw_entry["_comment"]
     assert "8-EPOCH CONTINUATION" in raw_entry["_comment"]  # H9's plan, the record
-    assert M.RECIPE_TEST == {"enabled": True, "truncate_p": 0.3, "concat_p": 0.5, "mix_p": 0.05}  # H1, H4: as run
     assert M.RECIPE == {"enabled": True, "truncate_p": 0.2, "concat_p": 0.5, "mix_p": 0.0,
                         "truncate_min_row_s": 3.0}  # DECISIONS H6: v2, P-0.3B's
     # box 1's config keeps its 4 epochs, and so does the re-run (launch_epochs: the continuation's)
@@ -1263,7 +1261,6 @@ H15_OTHER_CONFIGS_SHA256 = {
     "data-p01": "f8ff78dd0724e437420167bf76cf45f032cc1c739594f355ef6a4f172c635ce8",
     "data-t": "47a0d5e8e02d66aa6af69c74f543eef5b8a0beaf12bc4f96d91d9090279dae46",
     "data-p": "5be8cdda70cb7212a6eb2b6b0c5c358b6825405c44900d7f01478bfaa713ed1e",
-    "data-full": "e8cc5b0f3a395516730ed2b632807190c76b6487a9fa8b9a32f9926f415e505b",
     "data-smoke": "be08b2bd4693d0e1a456658016ce4afa274ad76b744e1f09f55502609eb14f19",
     "data-smoke-b": "de1abaa289f690cf6cf0d537f244a4d31bda850b5a5460d57c65d0c45278bdd2",
 }
@@ -1357,10 +1354,10 @@ def test_the_readme_launches_box_t_from_t_box(reg):
     assert len(launch.quant_items(fullrun.box_spec("full-t", reg))) == 7  # what --allow-unverified-quant is for
 
 
-def test_the_retired_box_2s_pool_lives_on_exactly_one_new_box(reg):
-    """The old box full's 28 quantised readouts, 4 Whisper models and 2 speed items: each on exactly one of full-t,
-    full-p and p01 (7 / 7 + 4 / 7, the re-time pair on full-t); P-0.05B's 7, postponed with it (DECISIONS H2), came
-    back with the P test box (H8, H10): on box p005."""
+def test_the_readout_pool_lives_on_exactly_one_box(reg):
+    """The 28 quantised readouts of T-0.6B, P-0.3B and P-0.1B, the 4 Whisper models and the 2 speed items of the
+    decision-22 re-time pair: each on exactly one of full-t, full-p and p01 (7 / 7 + 4 / 7, the re-time pair on
+    full-t); P-0.05B's 7 on box p005 (the P test box, DECISIONS H8, H10)."""
     old = [f"quant-{f}-full-{x}" for x in ("p03", "p01", "t06") for f in QUANT_FORMATS]
     old += [*WHISPER_KEYS, "speed-full-t06", "speed-study-t06"]
     where = {n: [b for b in ("full-t", "full-p", "p01") if n in items(reg, b)] for n in old}
@@ -1720,7 +1717,7 @@ def test_check_holds_the_chain(tmp_path, capsys):
 
 def test_the_cli_shows_the_chained_box(reg, monkeypatch, capsys):
     """python -m kitsune.fullrun show --box p01-chain (this checkout's registry): the derived spec, both stage views and
-    the stage-1 env; students / extra-files of a stage as bootstrap reads them ($KITSUNE_CHAIN_STAGE)."""
+    the stage-1 env; with $KITSUNE_CHAIN_STAGE the students of that stage, as bootstrap reads them."""
     monkeypatch.delenv(fullrun.ENV_REGISTRY, raising=False)
     monkeypatch.delenv(fullrun.ENV_CHAIN_STAGE, raising=False)
     assert fullrun.main(["show", "--box", CHAIN]) == 0
@@ -1729,9 +1726,10 @@ def test_the_cli_shows_the_chained_box(reg, monkeypatch, capsys):
     assert doc["stages"] == {str(s): fullrun.stage_view(CHAIN, s, reg) for s in (1, 2)}
     assert doc["configs"] == fullrun.box_configs(CHAIN, reg) and doc["students"] == doc["stages"]["1"]["students"]
     monkeypatch.setenv(fullrun.ENV_CHAIN_STAGE, "2")
-    assert fullrun.main(["students", "--box", CHAIN]) == 0 and capsys.readouterr().out.split() == [
-        "students/study/p01"]
-    assert fullrun.main(["extra-files", "--box", CHAIN]) == 0 and capsys.readouterr().out.split() == [
+    assert fullrun.main(["show", "--box", CHAIN]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["students"] == ["students/study/p01"] and doc["env"][fullrun.ENV_CHAIN_STAGE] == "2"
+    assert fullrun.box_extra_files(CHAIN, reg, stage=2) == doc["stages"]["2"]["extra_files"] == [
         fullrun.FROZEN_MANIFEST, SIDECAR[fullrun.FULL_SELECTION]]
 
 
@@ -1853,15 +1851,12 @@ def test_the_real_selections_fit_the_configs(plan):
             assert launch.selection_problems(sel, sel.name, c) == [], n
 
 
-def test_launch_rents_the_new_boxes_only_and_gates_their_quant_items(reg):
-    """The retired 2x box full is not in the registry (launch --box full: "not in the registry", so the stale 2x box
-    cannot be rented); boxes p01 and p005 carry quantised items, so smoke-B #2's quant go signal applies to them too,
-    as to full-t and full-p; the boxes' hours come from the speed record (launch's warning while it is provisional)."""
+def test_launch_gates_every_boxs_quant_items(reg):
+    """Boxes p01 and p005 carry quantised items, so smoke-B #2's quant go signal applies to them too, as to full-t and
+    full-p; the boxes' hours come from the speed record (launch's warning while it is provisional)."""
     sys.path.insert(0, str(ROOT / "vast"))
     import launch
 
-    with pytest.raises(fullrun.RegistryError, match="not in the registry"):
-        fullrun.box_spec("full", reg)
     assert {b: len(launch.quant_items(fullrun.box_spec(b, reg))) for b in ("p01", "full-t", "full-p", "p005")} == {
         "p01": 7, "full-t": 7, "full-p": 7, "p005": 7}
     assert len(launch.quant_items(fullrun.box_spec("p-cool", reg))) == 21

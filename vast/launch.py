@@ -179,7 +179,7 @@ MIN_DISK_BW_FLOOR = 150
 # at the $/GB cap (traffic dominates a short box's cost)
 FULL_MAX_GB_COST = 0.01
 FULL_TOTAL_FACTOR = 1.25
-FULL_UP_GB_PER_GPU_HOUR = 3.0  # the cost line's upload: lean syncs plus the timed states, ~250 GB for box 2
+FULL_UP_GB_PER_GPU_HOUR = 3.0  # the cost line's upload: lean syncs plus the timed states (~250 GB: 2 GPUs, 42 h)
 GATE_BLOCK_DAYS = 30  # a machine whose download gate said slow is avoided this long (vast/blocklist.json: for good)
 BLOCKLIST = Path(__file__).resolve().parent / "blocklist.json"
 GATE_RE = re.compile(r"full/box-[^/]+/infra/[^/]+/download_gate\.json")
@@ -1884,9 +1884,9 @@ def main(argv: list[str] | None = None) -> int:
                          "label: the RTX 5090 label box (vast/label.py)")
     ap.add_argument("--box", choices=fullrun.ALL_BOX_NAMES, default=None,
                     help="full: full-smoke (smoke A), p01 (box 1, then its recipe test: box 1's cooldown again), full-t "
-                         "and full-p (box 2's two 1x boxes; full: the retired 2x box), p005 (P-0.05B), p-cool (the "
-                         "three cooldown re-runs of DECISIONS H14, always a resume), smoke-b, or the chain p01-chain "
-                         "(smoke A + smoke B, then box 1 on one rental)")
+                         "(T-0.6B), full-p (P-0.3B), p005 (P-0.05B), p-cool (the three cooldown re-runs of DECISIONS "
+                         "H14, always a resume), smoke-b, or the chain p01-chain (smoke A + smoke B, then box 1 on one "
+                         "rental)")
     ap.add_argument("--data-repo", required=True, help="private HF dataset with the derived data (KITSUNE_DATA_REPO)")
     ap.add_argument("--out-repo", default=None,
                     help="private HF model repo for runs/ (KITSUNE_OUT_REPO; required for --job full)")

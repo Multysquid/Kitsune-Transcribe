@@ -298,7 +298,7 @@ def test_the_readout_cli(ctc_env, prereg, tmp_path, monkeypatch, capsys):
 
 
 def test_aed_variant_equals_in_memory_and_fp16(aed_env, prereg, m05, tmp_path):
-    """The AED paths box full's quant-<fmt>-full-t06 readouts take: 05 --quant int8-w8a8 in memory, and the exported
+    """The AED paths box full-t's quant-<fmt>-full-t06 readouts take: 05 --quant int8-w8a8 in memory, and the exported
     variant as --ckpt (load_quantized, setup_aed_model, the processor from the variant dir), give the same hypotheses
     and teacher-forced tables; --fp16 in memory (smoke B's fp16-study-t06) decodes with no non-finite row."""
     base = ["--root", str(aed_env["root"]), "--config", str(aed_env["relative"]), "--prereg", str(prereg)]
