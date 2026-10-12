@@ -100,12 +100,12 @@ Checkpoints under runs/<run_id>/checkpoints/:
                    <repo>:runs/<run_id>/checkpoints/step_<N>/ when hf.output_repo is set. All are kept locally.
   full_step_<N>/   model.pt (fp32 state_dict), optimizer.pt, l2sp.pt (theta_0), trainer.pt (config, progress
                    counters and clocks, eval history, planner position, RNG states, logger state). Every
-                   ckpt.full_local_every_min, the newest
-                   ckpt.keep_local are kept; uploaded at ckpt.upload_full_at ("pre_cooldown", "end"; one meant for
-                   the Hub carries UPLOAD_MARK from its creation until its upload succeeds: a resume queues the
-                   pre_cooldown one again while it is marked, as a crash may have cut its upload short, and one whose
-                   upload failed is kept past keep_local for vast/finish.py). Written as <name>.tmp/, its
-                   files fsynced, then renamed, so neither a process crash nor a host crash leaves a torn one.
+                   ckpt.full_local_every_min, the newest ckpt.keep_local are kept; uploaded at ckpt.upload_full_at
+                   ("pre_cooldown", "end"; one meant for the Hub carries UPLOAD_MARK from its creation until its
+                   upload succeeds: a resume queues the pre_cooldown one again while it is marked, as a crash may have
+                   cut its upload short, and one whose upload failed is kept past keep_local for vast/finish.py).
+                   Written as <name>.tmp/, its files fsynced, then renamed, so neither a process crash nor a host
+                   crash leaves a torn one.
 `--resume <full_step_N dir | run dir>` restores all of it into the same run dir and continues the same schedule and
 time budget; the config comes from the checkpoint, with this invocation's --set overrides applied on top (--config is
 then ignored). optim.*, loss.* and memory.grad_ckpt among them go on top of the restored optimizer, L2-SP and memory
@@ -236,9 +236,9 @@ the trainer as it was before them; configs/full/*.json turn them on):
                     would pull back) and sets the flag false before any save; plan_epochs plans the new
                     schedule.epochs; resume_reset_finish refuses a new T at or before the step and records the reset
                     (st["schedule_resets"], a `resume_reset` event, summary.json's resume_resets). Refused on a fresh
-                    start and with a STOP file; a resume that sets another schedule.epochs without
-                    the flag is refused too when it would change nothing (plan_epochs keeps the state's total_steps;
-                    a switch to the epoch clock from a state without a plan still plans it).
+                    start and with a STOP file; a resume that sets another schedule.epochs without the flag is refused
+                    too when it would change nothing (plan_epochs keeps the state's total_steps; a switch to the epoch
+                    clock from a state without a plan still plans it).
                     --set schedule.resume_reset_keep_cooldown=true with it (DECISIONS H14; epochs or steps clock):
                     from the pre_cooldown state at an early-stop cooldown's start, the reset keeps that cooldown
                     record and the trigger, so the continuation replays the same cooldown (t_c, T, LR; end_reason
