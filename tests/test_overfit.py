@@ -1,4 +1,4 @@
-"""The overfit-run features of scripts/04_distill.py (configs/overfit_*.json, scripts/run_overfit_tests.cmd).
+"""The overfit-run features of scripts/04_distill.py (the laptop's overfit sanity runs of 2026-09-24).
 
 - audio_subset: seeded subsets of about N seconds (budget respected, greedy fill, closest-single fallback,
   deterministic per seed and independent of input order) and the `subset` events that list them
@@ -6,10 +6,10 @@
   one is the final eval), the probe = the whole train subset (teacher-forced + greedy), SpecAugment off
 - optim.offload "cpu" (CpuOffloadAdamW): bit-for-bit the on-device AdamW (unit level), the same weights and loss
   curves as the on-device optimizer in a full run, and an identical continuation after a crash + --resume
-- the three overfit configs resolve and validate
+- the overfit options are validated
 - the 8 GB laptop: the memory probe holds a step's gradients when steps accumulate micro-batches, histograms
-  concatenate one module at a time, the Windows VRAM cap, checkpoint renames that wait for a scanner and come after
-  the files reach the disk, and scripts/supervise_distill.py (resume after a crash, give up on stalls)
+  concatenate one module at a time, the Windows VRAM cap, and checkpoint renames that wait for a scanner and come
+  after the files reach the disk
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import copy
@@ -231,41 +231,9 @@ def test_cpu_offload_adamw_is_adamw(monkeypatch, fused):
         m.CpuOffloadAdamW([torch.zeros(3, dtype=torch.bfloat16, requires_grad=True)], **hp)
 
 
-def test_overfit_configs_resolve():
+def test_overfit_options_are_validated():
+    """The overfit runs' options refuse values they cannot run with; the viability run sets none of them."""
     m = load_script("04_distill")
-    want = {"overfit_1s": (1, 1, 1000, 60, 60), "overfit_10s": (10, 10, 100, 60, 60),
-            "overfit_1h": (3600, 10, 30, 120, 60)}
-    for name, (tr, ev_s, epochs, step_s, micro_s) in want.items():
-        c = m.load_config(str(ROOT / "configs" / f"{name}.json"), [])
-        assert c["run_name"] == name.replace("_", "-") and c["student"] == "students/b20x2560-d4"
-        assert c["sources"] == ["reazon_small", "emilia_yodas", "galgame"] and c["eval_sets"] == EVAL
-        assert c["subset"] == dict(train_utts=None, eval_utts_per_set=None, train_audio_s=tr, eval_audio_s=ev_s)
-        assert c["schedule"]["clock"] == "epochs" and c["schedule"]["epochs"] == epochs
-        assert c["batch"]["step_audio_s"] == step_s and c["batch"]["micro_audio_s"] == micro_s
-        if tr <= 60:
-            assert c["batch"]["step_audio_s"] >= tr  # one step per epoch
-        assert c["specaug"]["enabled"] is False and c["optim"]["offload"] == "cpu"
-        assert c["optim"]["offload_fused"] is True  # the fused CPU AdamW kernel: ~1 s per step less than foreach
-        # stop once the probe KL (teacher-forced on the whole train subset) is flat: memorised, nothing left to learn
-        patience, min_evals = (3, 3) if name == "overfit_1h" else (20, 10)
-        # smooth / allow_test_sets (the full runs' early-stop keys) at their defaults: no smoothing, any metric
-        assert c["early_stop"] == dict(enabled=True, metric="probe_kl", patience=patience, min_delta_rel=0.02,
-                                       min_delta_abs=0.001, min_evals=min_evals, floor=None, action="stop",
-                                       smooth=1, allow_test_sets=True)
-        assert c["eval"]["every_epochs"] == 1 and c["eval"]["probe"] and c["eval"]["probe_is_train"]
-        # no GO/NO-GO for a sanity run ("N/A" with the numbers); a mini eval every 200 steps (never at an epoch end)
-        assert c["eval"]["gate"] is False and c["eval"]["full_every_epochs"] is None
-        assert c["eval"]["mini"] == dict(every_steps=200, val_per_set=32, train_utts=64, greedy=True)
-        assert c["loss"] == m.DEFAULTS["loss"] == dict(w_kl=1.0, w_ce=0.8, l2sp_lambda=0.05, aux_ctc_weight=0.0,
-                                                       w_ctc=0.8)  # w_ctc: the CTC family's, unread by these runs
-        assert {k: c["optim"][k] for k in ("lr", "betas", "clip")} == dict(lr=1e-4, betas=[0.9, 0.98], clip=1.0)
-        assert c["autocast"] == "bfloat16" and c["perf"]["relpos_patch"] and c["memory"]["grad_ckpt"] == "auto"
-        # a resume point right after the smoke steps and every 10 min: scripts/supervise_distill.py relaunches from
-        # the newest after one of this GPU's intermittent CUDA faults
-        assert c["ckpt"]["weights_every_min"] == 60 and c["ckpt"]["full_local_every_min"] == 10
-        assert c["ckpt"]["keep_local"] == 1 and c["ckpt"]["upload_full_at"] == [] and c["hf"]["output_repo"] is None
-        assert c["perf"]["num_workers"] == 2 and c["smoke"]["min_audio_s_per_s"] == 0
-        assert not c["smoke"]["require_loss_decrease"] and c["ckpt"]["full_after_smoke"]
     for bad in (["schedule.clock=epochs"], ["schedule.clock=epochs", "schedule.epochs=0"], ["optim.offload=gpu"],
                 ["subset.train_audio_s=5", "subset.train_utts=10"], ["subset.eval_audio_s=-1"],
                 ["eval.every_epochs=0"], ["eval.probe=false", "eval.probe_is_train=true"], ["specaug.enabled=0"],
@@ -455,9 +423,9 @@ def test_checkpoints_reach_the_disk_before_their_rename(tmp_path, monkeypatch):
 def test_resume_from_an_older_full_state_sets_the_abandoned_attempt_aside(tmp_path):
     """--resume full_step_4 while the attempt it backs out of left full_step_8: rotation kept the highest-numbered
     states and --resume <run dir> took the newest, so the resumed run's own states were deleted and the next run-dir
-    resume (supervise_distill.py) silently continued the abandoned attempt. Its newer dirs now move under
-    abandoned-*/, where no scanner looks. A resume from the newest state moves only the weights saved after it: the
-    resumed run replays the steps, not those saves, so they would stay next to its own and go up with them."""
+    resume silently continued the abandoned attempt. Its newer dirs now move under abandoned-*/, where no scanner
+    looks. A resume from the newest state moves only the weights saved after it: the resumed run replays the steps,
+    not those saves, so they would stay next to its own and go up with them."""
     m = load_script("04_distill")
 
     def tree(root, names):
@@ -495,84 +463,6 @@ def test_resume_from_an_older_full_state_sets_the_abandoned_attempt_aside(tmp_pa
     m.rotate_full(R)  # the resumed run's first save
     assert evs == [("checkpoint_deleted", "full_step_4")] and m.find_full_state(run) == ck / "full_step_6"
     assert sorted(p.name for p in ck.iterdir()) == [aside.name, "full_step_6", "step_4"]
-
-
-FAKE_TRAINER = r'''
-import argparse, json, os, sys
-from pathlib import Path
-
-ap = argparse.ArgumentParser()
-ap.add_argument("--config")
-ap.add_argument("--resume")
-ap.add_argument("--set", action="append", default=[])
-a = ap.parse_args()
-calls_path = Path(os.environ["FAKE_CALLS"])
-calls = json.loads(calls_path.read_text()) if calls_path.exists() else []
-act = json.loads(os.environ["FAKE_PLAN"])[len(calls)]
-calls.append(dict(config=a.config, resume=a.resume, sets=a.set, blocking=os.environ.get("CUDA_LAUNCH_BLOCKING")))
-calls_path.write_text(json.dumps(calls))
-if a.resume:
-    run = Path(a.resume)
-else:
-    cfg = json.loads(Path(a.config).read_text())
-    run = Path(cfg["runs_root"]) / f"{cfg['run_name']}-20260924T0000{len(calls):02d}Z"
-    run.mkdir(parents=True)
-if act.get("full") is not None:
-    d = run / "checkpoints" / f"full_step_{act['full']}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "trainer.pt").write_bytes(b"x")
-sys.exit(act["rc"])
-'''
-
-
-def test_supervisor_resumes_after_crashes_and_gives_up_on_stalls(tmp_path, monkeypatch):
-    """scripts/supervise_distill.py (run_overfit_tests.cmd runs every overfit config under it): this GPU faults every
-    ~10-40 min under load and a fault kills the trainer, so a crash is followed by --resume of the run's newest full
-    state; attempts without a newer full state escalate to CUDA_LAUNCH_BLOCKING=1 after two and give up after
-    --max-stalls (--max-attempts of them in total; attempts that progressed never count); a crash before the first
-    full state starts over; exits 0 and 3 are final."""
-    sup = load_script("supervise_distill")
-    fake = tmp_path / "fake_trainer.py"
-    fake.write_text(FAKE_TRAINER, encoding="utf-8")
-    monkeypatch.delenv("CUDA_LAUNCH_BLOCKING", raising=False)
-
-    def supervise(name: str, plan: list[dict], *extra) -> tuple[int, list[dict], list[str], Path]:
-        runs = tmp_path / name / "runs"
-        cfg = tmp_path / name / "config.json"
-        cfg.parent.mkdir()
-        cfg.write_text(json.dumps(dict(run_name=name, runs_root=str(runs))), encoding="utf-8")
-        calls, log = tmp_path / name / "calls.json", tmp_path / name / "pipeline.log"
-        monkeypatch.setenv("FAKE_CALLS", str(calls))
-        monkeypatch.setenv("FAKE_PLAN", json.dumps(plan))
-        rc = sup.main(["--config", str(cfg), "--log", str(log), "--script", str(fake), "--set", "seed=7", *extra])
-        return rc, json.loads(calls.read_text()), log.read_text(encoding="utf-8").splitlines(), runs
-
-    # crash after the first full state -> resume; two resumes without progress -> blocking mode; progress -> back
-    rc, calls, lines, runs = supervise("sup-a", [{"full": 2, "rc": 1}, {"rc": 1}, {"rc": -1073741819},
-                                                 {"full": 40, "rc": 1}, {"rc": 0}])
-    (run,) = runs.iterdir()
-    assert rc == 0 and [(c["resume"], c["blocking"]) for c in calls] == [
-        (None, None), (str(run), None), (str(run), None), (str(run), "1"), (str(run), None)]
-    assert calls[0]["config"] and all(c["sets"] == ["seed=7"] for c in calls)
-    assert len(lines) == 10 and "resume" in lines[2] and "full_step_2" in lines[2] and "2 -> 40" in lines[7]
-
-    # no full state ever: every attempt starts over in a new run dir, the third in blocking mode, then it gives up
-    rc, calls, lines, runs = supervise("sup-b", [{"rc": 1}] * 3, "--max-stalls", "3")
-    assert rc == 1 and [(c["resume"], c["blocking"]) for c in calls] == [(None, None), (None, None), (None, "1")]
-    assert len(list(runs.iterdir())) == 3 and "giving up" in lines[-1]
-
-    # ThroughputTooLow is final
-    rc, calls, _, _ = supervise("sup-c", [{"rc": 3}, {"rc": 0}])
-    assert rc == 3 and len(calls) == 1
-
-    # attempts that made progress do not count toward --max-attempts: a long run that keeps moving is never given up
-    rc, calls, lines, _ = supervise("sup-d", [{"full": 10 * (i + 1), "rc": 1} for i in range(21)] + [{"rc": 0}])
-    assert rc == 0 and len(calls) == 22 and not any("giving up" in x for x in lines)
-
-    # ... the ones without progress do, in total, even when they never come --max-stalls in a row
-    rc, calls, lines, _ = supervise("sup-e", [{"full": 2, "rc": 1}, {"rc": 1}, {"full": 4, "rc": 1}, {"rc": 1},
-                                              {"rc": 0}], "--max-attempts", "2")
-    assert rc == 1 and len(calls) == 4 and "giving up after 2 attempts without a newer full state" in lines[-1]
 
 
 # ------------------------------------------------------------------------------------------------ whole runs

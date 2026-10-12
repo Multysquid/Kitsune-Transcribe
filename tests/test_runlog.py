@@ -240,24 +240,6 @@ def test_tag_map_survives_a_restart(tmp_path):
     tag_map = json.loads((run / "metrics" / "tag_map.json").read_text(encoding="utf-8"))
     assert {"odd", "odder", "loss/kl"} <= set(tag_map)
     assert [e["tag"] for e in events(run) if e["kind"] == "tb_tag_unmapped"] == ["odd", "odder"]
-    assert "tb_layout_mixed" not in [e["kind"] for e in events(run)]  # the tag map was there: one layout
-
-
-def test_restart_into_a_run_without_tag_map_warns_once(tmp_path):
-    """A restart into a run logged before the buckets (event files in tb/, no metrics/tag_map.json) mixes both layouts
-    in TensorBoard: one tb_layout_mixed event names the earlier files and tools/regroup_tb.py; the next restart finds
-    the tag map the first one wrote and stays quiet."""
-    run = tmp_path / "old-run"
-    log = RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False)
-    log.scalar("loss/kl", 1.0, 1)
-    log.close()
-    (run / "metrics" / "tag_map.json").unlink()  # as a logger from before the buckets left the run
-    old = sorted(p.name for p in (run / "tb").iterdir())
-    for _ in range(2):
-        RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False).close()
-    mixed = [e for e in events(run) if e["kind"] == "tb_layout_mixed"]
-    assert len(mixed) == 1 and mixed[0]["files"] == old and "tools/regroup_tb.py" in mixed[0]["hint"]
-    assert (run / "metrics" / "tag_map.json").is_file()
 
 
 def test_sync_runs_in_background_and_excludes_checkpoints(tmp_path):
@@ -567,7 +549,7 @@ def test_export_run(run, tmp_path):
             assert f"`{col}`" in readme, (name, col)
     assert "`loss/total`" in readme and "`2_loss_accuracy/train_loss_incl_l2sp/total`" in readme  # the tag list
     for needle in ("## TensorBoard layout", "`1_operational/`", "`2_loss_accuracy/`", "`3_misc/`", "- `tag_map.json`:",
-                   "tools/regroup_tb.py", "| `3_misc` |", "`lr`"):
+                   "`TB_BUCKET_RULES`", "| `3_misc` |", "`lr`"):
         assert needle in readme, needle
 
 

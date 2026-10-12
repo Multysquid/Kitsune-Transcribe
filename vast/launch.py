@@ -1513,8 +1513,8 @@ def speed_record_notes(sha: str, box: str) -> list[str]:
     except (subprocess.CalledProcessError, OSError, ValueError):
         return [f"WARNING: no {SPEED_RECORD} at {sha[:12]}: box {box}'s hours are not held to measured speeds"]
     if not isinstance(rec, dict) or rec.get("box1") is None:
-        return [f"WARNING: box {box}'s hours are smoke-only ({SPEED_RECORD} has no box-1 measurement): contract 7 "
-                f"refreshes them after box 1 (tools/box1_go.py, then make_full_configs --import-speed --box1-go)"]
+        return [f"WARNING: box {box}'s hours are smoke-only ({SPEED_RECORD} has no box-1 measurement): they are "
+                "provisional (contract 7)"]
     b1 = rec["box1"]
     return [f"box {box}'s hours: smoke A's s/step x box 1's ratio ({SPEED_RECORD}: box 1 at "
             f"{str(b1.get('sha') or '?')[:12]}, {b1.get('sec_per_step')} s/step)"]

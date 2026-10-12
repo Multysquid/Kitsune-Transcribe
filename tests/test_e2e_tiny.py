@@ -665,21 +665,31 @@ def test_configs_resolve():
     assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True), eval=ev_via)
     assert via["eval"]["every_min"] == 20 and via["eval"]["gate"] is True  # every_min: the fallback cadence only
     assert m.epoch_cadence(via) == 1 and m.DEFAULTS["eval"]["mini"]["every_steps"] is None
-    smoke = m.load_config(str(ROOT / "configs" / "smoke_laptop.json"), ["hf.output_repo=u/r", "seed=7"])
-    assert smoke["student"] == "students/b4x2560-d2" and smoke["schedule"]["train_hours"] == 0.1
-    assert smoke["batch"]["micro_audio_s"] == 60 and smoke["batch"]["step_audio_s"] == 120
-    assert smoke["eval"]["greedy_subset"] == 20 and smoke["eval"]["every_min"] == 2
-    assert smoke["perf"]["num_workers"] == 2 and smoke["hf"]["output_repo"] == "u/r" and smoke["seed"] == 7
-    assert smoke["loss"] == m.DEFAULTS["loss"]  # untouched sections keep the viability values
-    with pytest.raises(SystemExit):
+    for key in ("sources", "eval_sets", "teacher_root", "second_root", "data_root", "selection", "student"):
+        assert key in json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))  # bootstrap.sh
+
+
+def test_load_config_applies_sets_over_a_file_and_refuses_bad_ones(tmp_path):
+    """A config file overrides DEFAULTS where it says so and --set (JSON values) overrides the file; the sections
+    neither names keep DEFAULTS. An unknown key is refused, and so is a Python-style or quoted boolean."""
+    m = load_script("04_distill")
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"batch": {"micro_audio_s": 60, "step_audio_s": 120}, "perf": {"num_workers": 2},
+                                "seed": 3}), encoding="utf-8")
+    cfg = m.load_config(str(path), ["hf.output_repo=u/r", "seed=7"])
+    assert cfg["batch"]["micro_audio_s"] == 60 and cfg["batch"]["step_audio_s"] == 120
+    assert cfg["perf"]["num_workers"] == 2 and cfg["hf"]["output_repo"] == "u/r" and cfg["seed"] == 7
+    assert cfg["loss"] == m.DEFAULTS["loss"] and cfg["eval"] == m.DEFAULTS["eval"]
+    with pytest.raises(SystemExit, match="unknown config key optim.lrr"):
         m.load_config(None, ["optim.lrr=1"])
+    path.write_text(json.dumps({"optim": {"lrr": 1}}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="unknown config key optim.lrr"):
+        m.load_config(str(path), [])
     # a Python-style or quoted boolean is not JSON true/false: apply_set keeps the truthy string, so validate refuses it
     for bad in ("perf.tf32=False", "eval.probe_is_train=False", 'smoke.enabled="false"'):
         with pytest.raises(SystemExit, match="must be true or false"):
             m.load_config(None, [bad])
     assert m.load_config(None, ["perf.tf32=false"])["perf"]["tf32"] is False
-    for key in ("sources", "eval_sets", "teacher_root", "second_root", "data_root", "selection", "student"):
-        assert key in json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))  # bootstrap.sh
 
 
 def test_throughput_floor_exits_3(env, hub):
@@ -1120,56 +1130,3 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
     np.testing.assert_array_equal(tr["value"].to_numpy(), steps["loss/objective"].to_numpy())
     assert cl.loc[cl["series"] == "val_full", "step"].tolist() == [MAX_STEPS]
 
-
-def _tool(name: str):
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(name, ROOT / "tools" / f"{name}.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def test_regroup_tb_on_a_copy_of_the_run(crash_resume, tmp_path):
-    """tools/regroup_tb.py on a copy of the crash + resume run (the crash_resume fixture, made here if no other test
-    made it yet): TensorBoard shows the same points after the rebuild (the resume's purge replayed from events.jsonl),
-    the original event files are kept under names TensorBoard skips, and a second run rebuilds the same file again
-    instead of adding one."""
-    import shutil
-
-    from kitsune.runlog import TB_BUCKETS, load_tag_map, read_scalars_jsonl
-
-    src = crash_resume["run"]
-    run = tmp_path / "runs" / src.name
-    shutil.copytree(src, run, ignore=shutil.ignore_patterns("checkpoints"))
-    exp, rg = _tool("export_run"), _tool("regroup_tb")
-
-    def view():
-        t = exp.tb_tables(run / "tb", load_tag_map(run / "metrics" / "tag_map.json"))
-        return {k: df.drop(columns=["wall_time", *(["sum", "sum_squares"] if k == "tb_histograms" else [])])
-                .sort_values(["tag", "step"], kind="stable").reset_index(drop=True) for k, df in t.items()}
-
-    before = view()
-    originals = sorted(p.name for p in (run / "tb").iterdir())
-    assert len(originals) == 2  # the crashed launch's event file and the resumed launch's
-    assert rg.live_reason(run) is None
-    res = rg.regroup(run)
-    assert res["records"]["purge"] == 1 and res["unmapped"] == []
-    after = view()
-    for k in before:
-        assert len(before[k]) and before[k].equals(after[k]), k
-    kl = after["tb_scalars"][after["tb_scalars"]["tag"] == "loss/kl"]
-    assert kl["step"].tolist() == list(range(1, MAX_STEPS + 1))  # steps 11-13 of the crashed launch purged
-    logged = set(read_scalars_jsonl(run / "metrics" / "scalars.jsonl").column("tag").to_pylist())
-    assert sum(res["counts"][b]["scalars"] for b in TB_BUCKETS) == len(logged)
-    assert all(res["counts"][b]["scalars"] for b in TB_BUCKETS) and res["counts"]["3_misc"]["histograms"] > 0
-    files = sorted(p.name for p in (run / "tb").iterdir())
-    assert sorted(f for f in files if f.endswith(".bak")) == sorted(rg.backup_name(f) for f in originals)
-    assert len([f for f in files if "tfevents" in f]) == 1
-
-    res2 = rg.regroup(run)
-    files2 = sorted(p.name for p in (run / "tb").iterdir())
-    assert [f for f in files2 if f.endswith(".bak")] == [f for f in files if f.endswith(".bak")]
-    assert len([f for f in files2 if "tfevents" in f]) == 1 and res2["counts"] == res["counts"]
-    again = view()
-    assert all(again[k].equals(after[k]) for k in after)

@@ -68,7 +68,7 @@ without the decoupled L2-SP term (kitsune.evaluate.combined_loss) - as three ser
 They are the first cards of 2_loss_accuracy (00_combined/) and one Custom Scalars chart overlays them
 (kitsune.runlog.TB_LAYOUT); each eval's summary.json keeps the sums under combined_loss.
 
-Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and configs/overfit_*.json): after every
+Early stop (early_stop.enabled; off in DEFAULTS, on in configs/viability.json and the full configs): after every
 eval inside the loop (never the step-0 eval, never the final one) the metric - "probe_kl" (teacher-forced KL on the
 train probe), "heldout_kl" (the gate sets' pooled held-out KL, as the verdict reads it) or "train_loss" (the mean
 loss/objective = w_kl * KL + w_ce * CE of the optimizer steps since the previous eval; not loss/total, whose decoupled
@@ -93,7 +93,7 @@ scalars early_stop/{value,best,evals_since_best,triggered} follow every checked 
 the full state: a resumed run continues the patience count, and one that had already triggered "stop" goes straight
 to the end phase (a triggered cooldown carries on to its end).
 
-Exit codes (vast/supervise.py and scripts/supervise_distill.py key on them): 0 finished, 3 throughput too low, 1
+Exit codes (vast/supervise.py and kitsune/full_queue.py key on them): 0 finished, 3 throughput too low, 1
 anything else. Any exception is logged as an event with its traceback, a partial summary.json is written and the logs
 are force-synced before the exception propagates.
 
@@ -129,12 +129,12 @@ with the warmup capped at ceil(10 %) of them; eval.every_epochs runs the eval at
 minute/step cadence (the last epoch's is the end phase's final eval; on the steps and wall clocks a complete-set
 eval.full_every_epochs eval at the loop's last step is reused as the final eval).
 
-Overfit sanity runs (configs/overfit_*.json, scripts/run_overfit_tests.cmd): subset.train_audio_s / eval_audio_s train
-and evaluate on seeded subsets of about that many seconds (audio_subset; logged as `subset` events with every id),
-eval.probe_is_train makes the whole train subset the teacher-forced probe and eval.probe_greedy_audio_s adds a greedy
-decode of part of it, so memorisation (probe KL and CER vs teacher -> 0) shows next to the held-out eval;
-specaug.enabled false trains un-augmented. optim.offload "cpu" keeps AdamW and fp32 master weights in host memory
-(CpuOffloadAdamW), for a GPU that holds the weights and gradients but not the optimizer state (the 8 GB laptop).
+Overfit sanity runs (the laptop's, 2026-09-24): subset.train_audio_s / eval_audio_s train and evaluate on seeded subsets
+of about that many seconds (audio_subset; logged as `subset` events with every id), eval.probe_is_train makes the whole
+train subset the teacher-forced probe and eval.probe_greedy_audio_s adds a greedy decode of part of it, so memorisation
+(probe KL and CER vs teacher -> 0) shows next to the held-out eval; specaug.enabled false trains un-augmented.
+optim.offload "cpu" keeps AdamW and fp32 master weights in host memory (CpuOffloadAdamW), for a GPU that holds the
+weights and gradients but not the optimizer state (the 8 GB laptop).
 
 The size study (every default below is the trainer as it was before them; the study runs on the steps clock):
   bn.mode           "frozen" (default; the pruned students keep the teacher's BN statistics) or "train" (the students
@@ -228,8 +228,6 @@ and re-import this file as __mp_main__, and should only pay for torch.
 
 Usage:
   python scripts/04_distill.py --config configs/viability.json --set hf.output_repo=<user>/<repo>
-  python scripts/04_distill.py --config configs/smoke_laptop.json
-  python scripts/04_distill.py --config configs/overfit_10s.json
   python scripts/04_distill.py --config configs/viability.json --resume runs/<run_id>/checkpoints/full_step_<N>
 
 Full-data runs: dev slice, early stopping v2, COOLDOWN, resume reset, deadline cooldown, 4c (every default below is
@@ -4397,10 +4395,10 @@ def resume_check(run_dir: Path) -> dict:
 def set_aside_newer(ckpt_dir: Path, step: int) -> list[str]:
     """A resume from an older full state (backing out of a loss spike) abandons the attempt that went past it. Left in
     place, that attempt's newer full_step_<M>/ would outrank the resumed run's own: rotate_full (the newest keep_local)
-    deletes the resumed run's states instead, and a later --resume <run dir> (find_full_state; supervise_distill.py)
+    deletes the resumed run's states instead, and a later --resume <run dir> (find_full_state)
     silently continues the abandoned attempt; finish.py would upload its step_<M>/ weights next to the resumed run's.
     So every full_step_<M>/ and step_<M>/ with M > step moves to checkpoints/abandoned-<UTC stamp>/ (a rename:
-    nothing is deleted). Every scanner of checkpoints/ (these, finish.py, both supervisors) reads only its top level.
+    nothing is deleted). Every scanner of checkpoints/ (these, finish.py, vast/supervise.py) reads only its top level.
     That includes the weights saved after the newest full state, when the resume is from that one: a crash inside
     the full-state save that follows the same step's weights (periodic or end), or the laptop's minute cadences.
     The resumed run replays the steps but not those saves: on the wall and minute clocks its weights fall due at other
@@ -4975,7 +4973,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def resume_overrides(saved: dict, overrides: list[tuple[str, object]]) -> tuple[dict, dict]:
     """A resume's --set overrides split into the ones that change the checkpoint's config and the ones that repeat it
-    (scripts/supervise_distill.py passes the fresh start's --set on every attempt). Compared with the checkpoint's
+    (the box queue passes the fresh start's hf --set on every attempt). Compared with the checkpoint's
     cfg, never with st["memory"]: the memory probe halving micro_audio_s is not a change. A change to a RESUME_FIXED
     key stops here, naming it, rather than as a planner-fingerprint error later or not at all (micro_audio_s: the
     planner is built from the probe's saved choice, so a new value was ignored while the logs said it was applied)."""

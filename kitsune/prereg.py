@@ -253,7 +253,7 @@ OWNER_CHANGES = [
 CHANGED_DECISIONS = {2: "S3: one 4x A100 SXM4 40 GB box, calibration + probes + 2 waves; S3b, then S1p as fallbacks",
                      3: "a: control runs: the bridge and a replicate of T-0.1B with seed 1235 (always run)",
                      17: "a: T-0.3B = B10x2560 + decoder {0,7} (320,752,384 parameters)"}
-# decision -> what the label checks of wave 1 measured on the real labels (tools/label_checks.py, 2026-09-26)
+# decision -> what the label checks of wave 1 measured on the real labels (K1-K12, 2026-09-26)
 WAVE1_FACTS = {
     15: "K4: the stored n_frames equals the ParakeetFeatureExtractor length of the decoded audio on 400 / 400 rows, but "
         "an n_frames computed from the stored duration differs on 11.6 % of CV8 rows: the frame preflight decodes the "

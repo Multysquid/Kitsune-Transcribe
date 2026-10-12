@@ -5,7 +5,6 @@ teacher_out/
 teacher_out_smoke/
 checkpoints/
 runs/
-outputs/
 *.flac
 *.ogg
 *.wav
@@ -24,7 +23,6 @@ outputs/
 # --- HF / experiment caches ---
 .cache/
 hf_cache/
-wandb/
 tensorboard/
 *.log
 

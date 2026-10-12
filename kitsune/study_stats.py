@@ -1432,7 +1432,7 @@ def analyse(corpus: Corpus, settings: Mapping | None = None, *, params: Mapping[
         selection_check(summaries, (prereg_manifest or {}).get("selection_sha256")),
         teacher_baseline_check(st, prereg_baselines),
         check("labels_frames", "not_checked", "K3 / K4 and the frame preflight are the label checks' and the box's "
-                                              "record (tools/label_checks.py, the store build)"),
+                                              "record (wave 1's label checks, the store build)"),
         _timing_check(numbers, summaries),
         check("anchor_regression", "not_checked" if anchor_flag is None else ("fail" if anchor_flag else "pass"),
               "no anchor or T-0.6B table" if anchor_flag is None else

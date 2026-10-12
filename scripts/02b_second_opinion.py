@@ -21,11 +21,8 @@ For each teacher shard  teacher_out/<source>/<stem>.jsonl  this writes  second_o
     hyp2   second-opinion transcript (null if the source row has no precomputed transcript)
     agree  CER(teacher hyp vs hyp2), normalised - the label-quality gate for distillation
     cer2   CER(hyp2 vs dataset text) - for statistics
-Shards are processed in manifest order, output is atomic per shard and existing outputs are skipped, so the
-script is resumable and safe under scripts/run_teacher_pass.py, one source per run (see the --limit-shards note in
-main), e.g. as scripts/start_second_opinion.cmd runs it:
-  python scripts/run_teacher_pass.py --script scripts/02b_second_opinion.py --done-suffix .jsonl --batch 24
-      --watch-dir second_out/galgame --sources galgame
+Shards are processed in manifest order, output is atomic per shard and existing outputs are skipped, so the script
+is resumable.
 
 Usage:
   python scripts/02b_second_opinion.py                     # everything with teacher output
@@ -393,11 +390,7 @@ def main():
             return False
         return parakeet_root is None or (parakeet_root / s.source / f"{stem}{done_suffix}").exists()
 
-    # --limit-shards slices the ELIGIBLE list (shards with teacher output), so the supervisor's blocking-mode
-    # "--limit-shards <done>+1" reaches exactly the stuck shard even when teacher coverage has gaps - but only when the
-    # outputs it counts under --watch-dir are a prefix of this list, i.e. --watch-dir second_out/<source> with
-    # --sources <source>. Counting all of second_out also counts sources finished out of manifest order (emilia_yodas
-    # after galgame), and the "one shard" blocking attempt then runs everything left, serialised.
+    # --limit-shards slices the ELIGIBLE list (the shards with teacher output), not the manifest
     eligible = [s for s in shards if ready(s)]
     no_teacher = len(shards) - len(eligible)
     if args.limit_shards:

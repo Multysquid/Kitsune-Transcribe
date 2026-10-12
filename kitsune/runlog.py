@@ -1,8 +1,8 @@
 """Run logger: everything a training run measures goes to TensorBoard AND to open formats that survive the instance.
 
-This is a proof of concept, so the logs are the deliverable as much as the weights: every number must be extractable
-later without TensorBoard (pandas/pyarrow on the parquet files), and the run dir is mirrored to the HF output repo
-every ~10 min because the vast instance is destroyed at the end of the run.
+The logs are a deliverable as much as the weights: every number must be extractable later without TensorBoard
+(pandas/pyarrow on the parquet files), and the run dir is mirrored to the HF output repo every ~10 min because the vast
+instance is destroyed at the end of the run.
 
 Layout (relative to runs/<run_id>/):
   config.json                 resolved config + argv + student_meta.json (config.<stamp>.json on a restart)
@@ -66,11 +66,7 @@ TensorBoard buckets: TensorBoard groups cards by the first component of a tag, s
   3_misc            per-layer stats, L2-SP distances, optimizer internals, augmentation, token diagnostics (the share
                     of tokens per confidence bucket included), every histogram, and any tag no rule matches (one
                     tb_tag_unmapped event per such tag)
-by TB_BUCKET_RULES. Only TensorBoard sees the new names. tools/regroup_tb.py rebuilds tb/ of an existing run in this
-layout from the open files, the TB_LAYOUT chart included when the run logged one of its curves. A restart into a run
-logged before the buckets (event files in tb/, no metrics/tag_map.json) leaves one tb_layout_mixed event: TensorBoard
-then shows the earlier launches under the flat tags and this one under the buckets until tools/regroup_tb.py is run
-on the finished run.
+by TB_BUCKET_RULES. Only TensorBoard sees the new names.
 """
 import io
 import json
@@ -364,8 +360,7 @@ COMBINED_LOSS_TAGS = ("combined_loss/train", "combined_loss/val", "combined_loss
 # Multiline chart overlaying the three curves. Its entries are regexes that TensorBoard matches (re.match, so from the
 # start of the tag) against the tags in the event files - the bucketed ones (TB_BUCKET_RULES), not the logged ones -
 # hence built from tb_tag and anchored at both ends: ".../val" alone would draw val_full a second time. Written into
-# every event file: RunLogger at each logger start (a resume writes a new file), tools/regroup_tb.py when it rebuilds
-# a run that logged one of the curves (a run logged before the combined loss gets no empty chart)
+# every event file by RunLogger at each logger start (a resume writes a new file)
 TB_LAYOUT = {"combined_loss": {"combined_loss: train vs val": [
     "Multiline", [f"^{re.escape(tb_tag(t)[0])}$" for t in COMBINED_LOSS_TAGS]]}}
 
@@ -808,8 +803,6 @@ class RunLogger:
         self.p_tag_map = m / "tag_map.json"
         self._tags = TagMapper(load_tag_map(self.p_tag_map))  # a restart keeps the tags of the earlier launches
         tb_files = sorted(p.name for p in (self.dir / "tb").iterdir() if p.is_file() and "tfevents" in p.name)
-        # event files but no tag map: the earlier launches logged flat tags (before the buckets), this one will not
-        flat_tb = [] if self.p_tag_map.exists() else tb_files
 
         self._t0 = time.monotonic()
         self._elapsed0 = float(resume["elapsed_s"]) if resume else 0.0
@@ -856,11 +849,6 @@ class RunLogger:
                 self.event("env_capture_error", error=f"{type(e).__name__}: {e}")
         self.text("config", "```json\n" + json.dumps(conf, indent=2, ensure_ascii=False, default=str) + "\n```", self.step)
         self.event("logger_start", run_id=self.run_id, restart=restart, resume=resume, hf_repo=hf_repo)
-        if flat_tb:
-            self.event("tb_layout_mixed", files=flat_tb,
-                       hint=f"TensorBoard shows the earlier launches under their flat tags and this one under "
-                            f"{', '.join(TB_BUCKETS)}; after the run ends, python tools/regroup_tb.py "
-                            f"{self.dir.as_posix()} rebuilds tb/ in the bucketed layout from the open files")
 
     # ------------------------------------------------------------------------------------------ helpers
 

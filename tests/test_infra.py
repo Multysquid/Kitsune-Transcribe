@@ -2141,17 +2141,6 @@ def test_label_passes_read_the_hub_at_a_pin():
                 assert "@" in parts, name
 
 
-def test_second_opinion_launcher_watches_its_one_source():
-    """The supervisor's blocking mode runs --limit-shards <files under --watch-dir>+1, which is the stuck shard only
-    when the watch dir holds exactly the outputs of the --sources being run."""
-    line = next(ln for ln in (ROOT / "scripts" / "start_second_opinion.cmd").read_text(encoding="utf-8").splitlines()
-                if "run_teacher_pass.py" in ln)
-    argv = line.split(">>")[0].split()
-    sources = argv[argv.index("--sources") + 1:]
-    sources = sources[:next((i for i, a in enumerate(sources) if a.startswith("--")), len(sources))]
-    assert len(sources) == 1 and argv[argv.index("--watch-dir") + 1] == f"second_out\\{sources[0]}"
-
-
 def test_teacher_meta_from_before_the_pin_resumes(tmp_path):
     """A teacher_out/meta.json written before the teacher was pinned has no model_revision: it counts as the pin, so the
     pass resumes and the key is back-filled; a meta.json from another teacher commit still stops it."""

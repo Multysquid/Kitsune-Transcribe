@@ -424,8 +424,6 @@ def test_gate_off_reports_na_with_the_numbers():
     assert off == dict(verdict="N/A", reason="gate disabled (sanity/overfit run)",
                        numbers=dict(sets={"eval_jsut": {"ratio": 1.0}}, n_sets_go=3, trunc_rate=0.0,
                                     trend={"overfit": False}, thresholds={"go_ratio": 1.2}))
-    for name in ("overfit_1s", "overfit_10s", "overfit_1h"):  # the sanity runs have no gate; the real run has one
-        assert m.load_config(str(ROOT / "configs" / f"{name}.json"), [])["eval"]["gate"] is False
     assert m.load_config(str(ROOT / "configs" / "viability.json"), [])["eval"]["gate"] is True
 
 
