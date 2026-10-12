@@ -46,11 +46,12 @@ class FakeTokenizer:
 
 @pytest.fixture(autouse=True)
 def offline(monkeypatch):
-    """No Hub: the box's 02b runs under HF_HUB_OFFLINE=1, and only the pinned tokenizer (faked) is loaded."""
+    """No Hub: the box's 02b runs under HF_HUB_OFFLINE=1, and only the pinned tokenizer (faked) is loaded. The stub
+    fails any Hub read: HfApi raises, and any other name of huggingface_hub cannot be imported."""
     def no_hub(*a, **kw):
         raise AssertionError("the Hub was read")
 
-    hub = types.SimpleNamespace(HfApi=no_hub, HfFileSystem=no_hub)
+    hub = types.SimpleNamespace(HfApi=no_hub)
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoTokenizer=FakeTokenizer))
     FakeTokenizer.calls = []

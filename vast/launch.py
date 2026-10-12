@@ -153,8 +153,8 @@ TIERS = [
 ]
 SECRET_RE = re.compile(r"TOKEN|SECRET|PASSWORD|API_KEY", re.I)
 
-# --job label (FINAL.md §11): one RTX 5090 (32 GB; the CLI token verified live), driver CUDA >= 13.0 (GeForce has no
-# forward compatibility), >= 16 effective cores for the prep pools and 01, room for the 250 GB disk
+# --job label: one RTX 5090 (32 GB; the CLI token verified live), driver CUDA >= 13.0 (GeForce has no forward
+# compatibility), >= 16 effective cores for the prep pools and 01, room for the 250 GB disk
 LABEL_DISK_GB = 250
 # the label disk, in GB: image, Cohere + Parakeet models, labels, sidecars/whisper/seeds, 01's unpruned-audio backlog
 # cap (the hold file), in-flight downloads, 01's free-space floor and logs; LABEL_DISK_GB adds headroom

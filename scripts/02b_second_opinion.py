@@ -73,8 +73,9 @@ WHISPER_TOK = "openai/whisper-large-v3"  # tokenizer that produced the precomput
 WHISPER_TOK_REVISION = "06f233fe06e710322aca913c1bc4249a0d71fce1"
 JOIN_SOURCES = {  # sources whose mirror parquets already carry whisper-large-v3 transcripts: (repo, commit), the
     # commits 01_prepare_data.py pins in REVISIONS (tests/test_infra.py checks that the two copies agree). meta.json's
-    # join_revisions lists them: the sealed labels/full/second_out/meta.json also names reazonspeech.medium @ c801154,
-    # a tier no extent ingests (dropped since), so a re-run writes another meta.json there; nothing reads the key
+    # join_revisions lists them. The sealed labels/full/second_out/meta.json also names reazonspeech.medium @ c801154
+    # (a tier no extent ingests, dropped since): a --strict-existing run with a shard left to do on that root exits 65
+    # in write_meta_once, and the label box never reopens a sealed root (vast/label.py step_plan refuses COMPLETE.json)
     "reazon_small": ("japanese-asr/whisper_transcriptions.reazonspeech.small", "c74b52fc164cf7b64936ca62aee4336eac626739"),
     "reazon_large": ("japanese-asr/whisper_transcriptions.reazonspeech.large", "4ad8d64a13594f0ce1f0622627a18ef99b42b5e8"),
 }

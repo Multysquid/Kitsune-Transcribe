@@ -30,7 +30,8 @@ EVAL_SETS = ["eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia", "galgame"]
 
 def make_cfg(name: str = "full", inputs: dict | None = None, sources=FULL_SOURCES, eval_sets=EVAL_SETS,
              root: str = "labels/full") -> dict:
-    """A run config shaped like configs/full.json (as tests/test_extent.py builds it)."""
+    """A training config on an extent: configs/full.json's keys plus a trainer's run_name and student (as
+    tests/test_extent.py builds it)."""
     return {"run_name": f"{name}-b20x2560", "student": "students/b20x2560-d4", "data_root": "data",
             "teacher_root": f"{root}/teacher_out", "second_root": f"{root}/second_out",
             "parakeet_root": f"{root}/parakeet_out", "selection": f"{root}/selections/{name}.parquet",
