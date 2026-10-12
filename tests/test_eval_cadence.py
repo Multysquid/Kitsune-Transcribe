@@ -1,4 +1,4 @@
-"""The eval cadence of scripts/04_distill.py: mini evals, a full eval at every epoch end, the headline numbers, the gate.
+"""The eval cadence of scripts/04_distill.py: mini evals, a full eval at every epoch end, the headline numbers.
 
 - eval.mini: a small eval of its own every mini.every_steps optimizer steps - never at step 0, never at a step with a
   full eval in the loop, skipped when the loop is due to end at its step (the final eval follows there; on the wall
@@ -13,7 +13,6 @@
   per-set numbers, gate sets only; summary/{full,mini}/<name> with <name>_pct copies; one console line per eval
 - the `eval` event's per-set CERs are those of the headline's scope (greedy_scope): the complete sets at a complete
   eval, with the fixed subset's as *_subset next to them; the subset at a subset eval
-- eval.gate false: summary.json's verdict is "N/A" with the numbers
 - the combined loss (w_kl * KL + w_ce * CE): combined_loss/train at every step (= loss/objective), combined_loss/val at
   step 0 and at every mini eval (the mini val subset's gate sets), combined_loss/val_full at every complete-set eval;
   first in 2_loss_accuracy and overlaid in one Custom Scalars chart in every event file
@@ -376,27 +375,25 @@ def test_config_keys_are_validated():
     assert m.verdict_options(m.load_config(None, [])) == {}  # v1: the call the first A100 run was judged with
     assert m.verdict_options(m.load_config(None, ["eval.verdict_version=2", "eval.verdict_min_epoch_gap=0.5"])) == \
         dict(version=2, min_epoch_gap=0.5)
-    ok = m.load_config(None, ['eval.reference={"name": "parakeet", "path": "configs/reference/parakeet.json"}'])
-    assert ok["eval"]["reference"] == dict(name="parakeet", path="configs/reference/parakeet.json")
-    assert m.DEFAULTS["eval"]["reference"] is None and m.reference_model(m.load_config(None, [])) is None
+    # eval.reference: null, the only value (the reference-model bar is retired)
+    assert m.DEFAULTS["eval"]["reference"] is None and m.load_config(None, [])["eval"]["reference"] is None
     for bad in (["eval.verdict_version=3"], ["eval.verdict_version=true"], ["eval.verdict_version=2.0"],
                 ["eval.verdict_min_epoch_gap=-1"], ["eval.verdict_min_epoch_gap=x"],
-                ['eval.reference={"name": "x"}'], ['eval.reference={"path": ""}'], ["eval.reference=parakeet.json"],
-                ['eval.reference={"path": "p.json", "cer": 0.07}'], ['eval.reference={"path": "p.json", "name": 1}']):
+                ['eval.reference={"name": "parakeet", "path": "configs/reference/parakeet.json"}'],
+                ['eval.reference={"name": "x"}'], ["eval.reference=parakeet.json"]):
         with pytest.raises(SystemExit):
             m.load_config(None, bad)
-    ok = m.load_config(None, ["eval.full_every_epochs=2", "eval.mini.every_steps=200", "eval.mini.val_per_set=0",
-                              "eval.gate=false"])
+    ok = m.load_config(None, ["eval.full_every_epochs=2", "eval.mini.every_steps=200", "eval.mini.val_per_set=0"])
     assert ok["eval"]["full_every_epochs"] == 2 and ok["eval"]["mini"]["every_steps"] == 200
     assert m.epoch_cadence(ok) == 2 and m.epoch_mode(ok)
     assert m.epoch_cadence(m.load_config(None, [])) is None and not m.epoch_mode(m.load_config(None, []))
-    # the defaults keep today's behaviour: no minis, no complete-set evals in the loop, the gate on
+    # the defaults keep today's behaviour: no minis, no complete-set evals in the loop
     d = m.DEFAULTS["eval"]
-    assert d["mini"]["every_steps"] is None and d["full_every_epochs"] is None and d["gate"] is True
+    assert d["mini"]["every_steps"] is None and d["full_every_epochs"] is None
     for bad in (["eval.full_every_epochs=0"], ["eval.full_every_epochs=1.5"], ["eval.every_epochs=1",
                                                                                "eval.full_every_epochs=1"],
                 ["eval.mini.every_steps=0"], ["eval.mini.every_steps=true"], ["eval.mini.val_per_set=-1"],
-                ["eval.mini.train_utts=2.5"], ["eval.mini.greedy=1"], ["eval.gate=no"], ["eval.mini.every=2"]):
+                ["eval.mini.train_utts=2.5"], ["eval.mini.greedy=1"], ["eval.mini.every=2"]):
         with pytest.raises(SystemExit):
             m.load_config(None, bad)
 
@@ -422,18 +419,6 @@ def test_mini_due_and_the_console_line():
     assert m.headline_line("mini", 200, 0.18, {}) == (
         "[mini eval] step 200 epoch 0.18 | val CER n/a (vs teacher n/a) | train CER vs teacher n/a (vs ref n/a) | "
         "val KL n/a train KL n/a")
-
-
-def test_gate_off_reports_na_with_the_numbers():
-    m = load_script("04_distill")
-    computed = dict(verdict="GO", reasons=["3/3 sets within 1.2x"], sets={"eval_jsut": {"ratio": 1.0}}, n_sets_go=3,
-                    trunc_rate=0.0, trend={"overfit": False}, thresholds={"go_ratio": 1.2})
-    on = m.load_config(None, [])
-    assert on["eval"]["gate"] is True and m.gate_verdict(on, computed) is computed
-    off = m.gate_verdict(m.load_config(None, ["eval.gate=false"]), computed)
-    assert off == dict(verdict="N/A", reason="gate disabled (sanity/overfit run)",
-                       numbers=dict(sets={"eval_jsut": {"ratio": 1.0}}, n_sets_go=3, trunc_rate=0.0,
-                                    trend={"overfit": False}, thresholds={"go_ratio": 1.2}))
 
 
 # ------------------------------------------------------------------------------------------------ whole runs
@@ -798,23 +783,17 @@ def test_export_keeps_minis_apart(steps_runs, tmp_path):
 
 
 def test_verdict_v2_changes_the_verdict_only(env, steps_runs):
-    """eval.verdict_version 2 and a reference model (eval.reference) on the run `plain` is (the step clock, a complete
-    eval at every epoch end): the same training, evals and history; each record names the LR phase of its last step
-    (the lr_phase events') and a complete eval's carries the complete sets' numbers; only the verdict differs - v2's,
-    whose CER trend reads the pre-cooldown evals on the complete sets, with the reference model's CER next to the
-    teacher gate - and the v1 verdict of `plain` is kitsune.evaluate.verdict v1 of its history."""
+    """eval.verdict_version 2 on the run `plain` is (the step clock, a complete eval at every epoch end): the same
+    training, evals and history; each record names the LR phase of its last step (the lr_phase events') and a complete
+    eval's carries the complete sets' numbers; only the verdict differs - v2's, whose CER trend reads the pre-cooldown
+    evals on the complete sets - and the v1 verdict of `plain` is kitsune.evaluate.verdict v1 of its history."""
     from kitsune import evaluate as ev
     from kitsune.runlog import _finite  # summary.json holds a non-finite float as null
 
     m = load_script("04_distill")
     plain = steps_runs["plain"]
-    ref_file = env["root"] / "reference.json"
-    ref_file.write_text(json.dumps(dict(name="file name", scope="complete gate sets",
-                                        cer=dict(eval_jsut=0.5, eval_cv8=0.6, eval_reazon=0.7))), encoding="utf-8")
-    ref_cfg = dict(name="ref-model", path=str(ref_file))
     assert m.main(["--config", write_config(env, "cad-v2", {"eval": {"mini": {"every_steps": None},
-                                                                     "verdict_version": 2,
-                                                                     "reference": ref_cfg}})]) == 0
+                                                                     "verdict_version": 2}})]) == 0
     run = one_run(env["root"], "cad-v2")
     sa, sb = steps_of(plain), steps_of(run)
     for col in ("loss/total", "opt/lr", "opt/grad_norm", "sched/phase"):
@@ -836,17 +815,11 @@ def test_verdict_v2_changes_the_verdict_only(env, steps_runs):
     v1, v2 = pa_["verdict"], pb["verdict"]
     assert "version" not in v1 and "reference" not in v1
     assert v1 == _finite(ev.verdict(dict(final=final, history=pa_["history"])))
-    ref = ev.load_reference(ref_file, "ref-model")
-    assert v2["version"] == 2 and v2 == _finite(ev.verdict(dict(final=final, history=pb["history"], reference=ref),
-                                                           version=2))
-    assert v2["sets"] == v1["sets"] and v2["thresholds"]["min_epoch_gap"] == 0.25
-    bar = v2["reference"]
-    assert bar["name"] == "ref-model" and bar["gating"] is False and set(bar["sets"]) == set(EVAL)
+    assert v2["version"] == 2 and v2 == _finite(ev.verdict(dict(final=final, history=pb["history"]), version=2))
+    assert v2["sets"] == v1["sets"] and v2["thresholds"]["min_epoch_gap"] == 0.25 and "reference" not in v2
     for x in EVAL:
-        assert bar["sets"][x]["student"] == v2["sets"][x]["student"] == final["sets"][x]["cer_ref_corpus"]
-    assert bar["pooled"]["student"] == pytest.approx(pb["headline"]["val_cer"])  # the final eval's pooled val CER
-    (e,) = events(run, "reference")
-    assert e["name"] == "ref-model" and e["cer"] == ref["cer"] and e["scope"] == "complete gate sets"
+        assert v2["sets"][x]["student"] == final["sets"][x]["cer_ref_corpus"]
+    assert not events(run, "reference")
     stable = [r["step"] for r in pb["history"] if r.get("lr_phase") == "stable"]
     assert v2["trend"]["n_pre_cooldown"] == len(stable)
     if len(stable) >= 3:  # the fixture's data decide how many epochs end before the cooldown
@@ -858,42 +831,23 @@ def test_verdict_v2_changes_the_verdict_only(env, steps_runs):
     assert e["version"] == 2 and e["cooldown_gain"] == v2["cooldown_gain"]
 
 
-def test_a_bad_reference_file_stops_the_run_before_it_trains(env):
-    """eval.reference is read at setup: a CER typed as a percent stops the run there, with the reason, before any
-    step or eval (not 4 h later at the verdict)."""
+def test_the_verdict_results():
     m = load_script("04_distill")
-    bad = env["root"] / "bad_reference.json"
-    bad.write_text(json.dumps(dict(name="x", cer=dict(eval_jsut=7.3))), encoding="utf-8")
-    path = write_config(env, "cad-badref", {"eval": {"reference": {"path": str(bad)}}})
-    with pytest.raises(SystemExit, match=r"eval.reference: .*fraction in \[0, 1\]"):
-        m.main(["--config", path])
-    run = one_run(env["root"], "cad-badref")
-    kinds = [e["kind"] for e in events(run)]
-    assert "exception" in kinds and not {"eval_start", "reference", "model"} & set(kinds)
-    assert [e["name"] for e in events(run, "phase")] == ["setup"] and summary(run)["steps"] == 0
-
-
-def test_the_reference_console_line():
-    m = load_script("04_distill")
-    bar = dict(name="parakeet", sets=dict(eval_jsut=dict(student=0.1265, reference=0.073, ratio=0.1265 / 0.073)),
-               pooled=dict(student=0.1215, reference=0.0744, ratio=0.1215 / 0.0744))
-    assert m.reference_line(bar) == ("[reference] parakeet (not a gate) | eval_jsut 12.65% vs 7.30% (1.73x) | pooled "
-                                     "12.15% vs 7.44% (1.63x)")
-    assert m.reference_line(None) is None
     assert m.verdict_results({"sets": {}}, []) == dict(final={"sets": {}}, history=[])
+    assert m.verdict_results({"sets": {}}, [], teacher={"eval_jsut": 0.07}) == dict(
+        final={"sets": {}}, history=[], teacher={"eval_jsut": 0.07})
 
 
-def test_full_eval_every_other_epoch_on_the_wall_clock_and_gate_off(env, monkeypatch):
+def test_full_eval_every_other_epoch_on_the_wall_clock(env, monkeypatch):
     """The wall clock (T = 1 h, the run cut at 10 steps): evals at the end of every 2nd epoch of the planner's plan
-    (every_min 1e-6, which would fire after every step, is ignored), minis every 3 steps in between; eval.gate false
-    makes the verdict "N/A" with the numbers."""
+    (every_min 1e-6, which would fire after every step, is ignored), minis every 3 steps in between, and the verdict of
+    their history."""
     monkeypatch.delenv("KITSUNE_DEADLINE", raising=False)
     monkeypatch.delenv("KITSUNE_STATE", raising=False)
     m = load_script("04_distill")
     path = write_config(env, "cad-wall", {
         "schedule": {"clock": "wall", "train_hours": 1.0, "max_steps": 10},
-        "eval": {"every_steps": None, "every_min": 1e-6, "full_every_epochs": 2, "gate": False,
-                 "mini": {"every_steps": 3}},
+        "eval": {"every_steps": None, "every_min": 1e-6, "full_every_epochs": 2, "mini": {"every_steps": 3}},
         "ckpt": {"full_every_steps": 1000},
     })
     assert m.main(["--config", path]) == 0
@@ -911,12 +865,11 @@ def test_full_eval_every_other_epoch_on_the_wall_clock_and_gate_off(env, monkeyp
     assert [r["step"] for r in s["mini_history"]] == [k for k in (3, 6, 9) if k not in ends]
 
     v = s["verdict"]
-    assert v["verdict"] == "N/A" and v["reason"] == "gate disabled (sanity/overfit run)"
-    assert set(v["numbers"]) >= {"sets", "n_sets_go", "trunc_rate", "trend", "thresholds"}
-    assert "verdict" not in v["numbers"] and set(v["numbers"]["sets"]) == set(EVAL)
+    assert v["verdict"] in ("GO", "PROMISING", "NO-GO", "INCONCLUSIVE") and set(v["sets"]) == set(EVAL)
+    assert set(v) >= {"reasons", "sets", "n_sets_go", "trunc_rate", "trend", "thresholds"}
     assert json.loads((run / "evals" / "step_10" / "verdict.json").read_text(encoding="utf-8")) == v
     (ev,) = events(run, "verdict")
-    assert ev["verdict"] == "N/A" and ev["numbers"] == v["numbers"]
+    assert ev["verdict"] == v["verdict"] and ev["sets"] == v["sets"]
     assert math.isfinite(s["headline"]["val_cer"])
 
 
@@ -994,9 +947,9 @@ def test_the_next_run_template_is_the_viability_runs_config_with_the_reports_cha
     DEFAULTS with early stopping on and its eval cadence (a greedy decode of 600 s of the probe, a mini eval every 500
     steps; git show 76b28a1:configs/viability.json) - with exactly the changes of the first run's report: micro-batches
     of 600 s as the memory probe's first choice, the epochs clock (8 epochs), a complete eval every 2 epochs with the
-    minis in between, verdict v2, the smoke profile on, the reference model left to be filled in. DEFAULTS keep the
-    first run's values (v1, the wall clock, 400 s, the profile on "auto"). Its schedule leaves verdict v2 the 3
-    pre-cooldown complete evals it needs, and its _comment pre-registers v2."""
+    minis in between, verdict v2, the smoke profile on, eval.reference null (the reference-model bar is retired).
+    DEFAULTS keep the first run's values (v1, the wall clock, 400 s, the profile on "auto"). Its schedule leaves verdict
+    v2 the 3 pre-cooldown complete evals it needs, and its _comment pre-registers v2."""
     m = load_script("04_distill")
 
     def leaves(d, where=""):

@@ -1692,7 +1692,7 @@ def test_step_tail_reads_only_what_was_appended(tmp_path):
     assert list(t.poll()) == [1]
     with open(f, "a", encoding="utf-8") as fh:
         fh.write('ain_s", "value": 2.0}\n')
-    assert t.poll()[2]["train_s"] == 2.0 and Q.read_step_rows(tmp_path)[2]["wall"] == 2.0
+    assert t.poll()[2]["train_s"] == 2.0 and Q.StepTail(tmp_path).poll()[2]["wall"] == 2.0
 
 
 def test_the_gpus_are_the_detected_ones_in_the_rented_count(fq, monkeypatch):

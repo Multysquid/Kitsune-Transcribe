@@ -13,19 +13,16 @@ and kitsune/whisper.py import it):
   state       $KITSUNE_STATE/queue.json (atomic, fsynced; the subclass's _load_state) and events.jsonl (Queue.event)
   uploads     HubUploader: a run dir's lean sync and verification, one file up and verified, a file or a folder down,
               through vast/finish.py (_finish), every write backing off on a 429 or a raced commit (finish.hub_retry)
-  readers     read_events (a run dir's events.jsonl) and StepTail (its metrics/scalars.jsonl, incrementally);
-              read_step_rows and calibration_stats measure the trainer's calibration window (scripts/04_distill.py)
+  readers     read_events (a run dir's events.jsonl) and StepTail (its metrics/scalars.jsonl, incrementally)
 A subclass supplies _load_state, argv_for, child_env, _ready, _next_for, resume_point, finished and drain_uploads.
 Pure Python at import (stdlib + kitsune.prereg); the trainer's modules only through _load_trainer.
 """
 import importlib.util
 import json
-import math
 import os
 import re
 import shutil
 import signal
-import statistics
 import subprocess
 import sys
 import time
@@ -45,9 +42,6 @@ MAX_ATTEMPTS = 2  # per item, unless the subclass sets its own (the full queue t
 ORPHAN_CMDS = ("04_distill", "05_evaluate", "kitsune.full_queue build-stores", "kitsune.full_queue check-resume",
                "speed_probe", "whisper_eval", "kitsune.quant")
 STAMP_RE = r"-\d{8}T\d{6}Z(?:-\d+)?"
-# the calibration barrier (scripts/04_distill.py, calibrate.barrier): a trainer writes READY in its run dir before its
-# first step and waits for GO (or STOP)
-READY_FILE, GO_FILE = "READY", "GO"
 
 
 class QueueError(RuntimeError):
@@ -95,20 +89,11 @@ def _merge_line(rows: dict, line: str):
         row["wall"] = r.get("wall")
 
 
-def read_step_rows(run_dir) -> dict[int, dict]:
-    """step -> {train_s (the loop clock when the step was logged), data_wait_s, step_s, wall} from a run's
-    metrics/scalars.jsonl (flushed at every step; a later line of the same step, a resumed launch's, wins)."""
-    rows: dict[int, dict] = {}
-    p = Path(run_dir) / "metrics" / "scalars.jsonl"
-    if p.is_file():
-        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-            _merge_line(rows, line)
-    return rows
-
-
 class StepTail:
-    """read_step_rows, incrementally: each poll() reads only what was appended since (the full queue polls every
-    running trainer's steps every few seconds, and a small run's file grows by ~7 KB a step)."""
+    """step -> {train_s (the loop clock when the step was logged), data_wait_s, step_s, wall} from a run's
+    metrics/scalars.jsonl (flushed at every step; a later line of the same step, a resumed launch's, wins), read
+    incrementally: each poll() reads only what was appended since (the full queue polls every running trainer's steps
+    every few seconds, and a small run's file grows by ~7 KB a step)."""
 
     def __init__(self, run_dir):
         self.run_dir = Path(run_dir)
@@ -128,29 +113,6 @@ class StepTail:
         for line in lines:
             _merge_line(self.rows, line.decode("utf-8", "replace"))
         return self.rows
-
-
-def calibration_stats(rows: dict[int, dict], a: int, b: int) -> dict:
-    """The step-time table of steps (a, b] (the study's rule: the median step time over the window, logging
-    included): each step's time is the difference of its loop clock and the previous step's (both logged), so it
-    holds the data wait, the forward and backward, the optimizer, the step's logging and anything else between the
-    two; data_wait_frac is the loader's share of the summed time. Steps without their predecessor (a skipped step) are
-    left out."""
-    dts, waits, done = [], [], []
-    for s in range(int(a) + 1, int(b) + 1):
-        cur, prev = rows.get(s), rows.get(s - 1)
-        if not cur or not prev or cur.get("train_s") is None or prev.get("train_s") is None:
-            continue
-        dt = float(cur["train_s"]) - float(prev["train_s"])
-        if not (math.isfinite(dt) and dt > 0):
-            continue
-        dts.append(dt)
-        waits.append(float(cur.get("data_wait_s") or 0.0))
-        done.append(s)
-    if not dts:
-        return dict(t_step_s=None, data_wait_frac=None, steps_measured=0, window=[int(a), int(b)], mean_step_s=None)
-    return dict(t_step_s=round(statistics.median(dts), 6), data_wait_frac=round(sum(waits) / sum(dts), 6),
-                steps_measured=len(dts), window=[int(a), max(done)], mean_step_s=round(sum(dts) / len(dts), 6))
 
 
 # ============================================================================================================ hub

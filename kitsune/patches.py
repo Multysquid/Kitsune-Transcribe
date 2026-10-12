@@ -15,11 +15,8 @@ padded frames, and under gradient checkpointing it would update the running stat
 stats come from 276k batches, so they stay frozen (eval mode) for the whole run. `freeze_batchnorm` overrides each BN
 module's own `train()` so that a later `model.train()` - from our code, HF's, or a library's - cannot unfreeze it.
 `train_mode(model, bn=...)` takes the BN mode of a run (scripts/04_distill.py bn.mode): "frozen" as above (the pruned
-students, whose BN holds the teacher's statistics), or "train" for a student trained from scratch, whose fresh BN has
-no statistics worth keeping: BN then trains with the model (batch statistics in the training forward, padded frames
-included as in NeMo's conformer, running stats updated; eval mode uses the running stats), and the trainer never turns
-gradient checkpointing on for it (the recomputed forward would update the running stats a second time).
-`assert_bn_mode` is the check that goes with each mode.
+students, whose BN holds the teacher's statistics), the one mode in BN_MODES since the size study's "train" (its
+from-scratch students' BN trained with the model) was retired. `assert_bn_mode` is the check that goes with it.
 """
 import types
 import warnings
@@ -121,29 +118,17 @@ def unfreeze_batchnorm(model: nn.Module) -> int:
     return len(bns)
 
 
-BN_MODES = ("frozen", "train")
+BN_MODES = ("frozen",)
 
 
 def train_mode(model: nn.Module, bn: str = "frozen") -> nn.Module:
-    """model.train() with BatchNorm in the run's mode: "frozen" (the default: eval mode, running stats fixed and kept
-    so across later .train() calls; freeze_batchnorm) or "train" (BN trains with the model; a BN frozen before is
-    unfrozen first, so a later call can never re-freeze a training BN, nor the other way round)."""
+    """model.train() with BatchNorm in the run's mode, "frozen" (the only one, BN_MODES): eval mode, running stats fixed
+    and kept so across later .train() calls (freeze_batchnorm)."""
     if bn not in BN_MODES:
         raise ValueError(f"BatchNorm mode must be one of {BN_MODES}, got {bn!r}")
-    if bn == "train":
-        unfreeze_batchnorm(model)
-        model.train()
-    else:
-        model.train()
-        freeze_batchnorm(model)
+    model.train()
+    freeze_batchnorm(model)
     return model
-
-
-def bn_running_stats(model: nn.Module) -> list[torch.Tensor]:
-    """The running statistics of every BatchNorm (running_mean, running_var, num_batches_tracked, those it keeps): the
-    buffers a training forward updates under the "train" mode."""
-    return [b for m in _batchnorms(model) for b in (m.running_mean, m.running_var, m.num_batches_tracked)
-            if b is not None]
 
 
 def assert_bn_frozen(model: nn.Module) -> int:
@@ -156,20 +141,11 @@ def assert_bn_frozen(model: nn.Module) -> int:
 
 
 def assert_bn_mode(model: nn.Module, bn: str = "frozen") -> int:
-    """The BN check of a model in training (between steps, and after an eval gave every module its flag back): "frozen"
-    is assert_bn_frozen; "train" raises if any BatchNorm is out of train mode or pinned frozen (a frozen_eval that did
-    not restore the flags, or a train_mode call that froze it). Returns the number of BN modules checked."""
+    """The BN check of a model in training (between steps, and after an eval gave every module its flag back) in the
+    run's mode: "frozen" (the only one, BN_MODES) is assert_bn_frozen. Returns the number of BN modules checked."""
     if bn not in BN_MODES:
         raise ValueError(f"BatchNorm mode must be one of {BN_MODES}, got {bn!r}")
-    if bn == "frozen":
-        return assert_bn_frozen(model)
-    bns = _batchnorms(model)
-    bad = [name for name, m in model.named_modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)
-           and (not m.training or getattr(m, _BN_ATTR, False))]
-    if bad:
-        raise AssertionError(f"{len(bad)}/{len(bns)} BatchNorm modules not training although bn.mode is 'train', e.g. "
-                             f"{bad[:3]}")
-    return len(bns)
+    return assert_bn_frozen(model)
 
 
 def sdpa_backend_report(device: str | torch.device | None = None, dtype: torch.dtype = torch.bfloat16) -> dict:

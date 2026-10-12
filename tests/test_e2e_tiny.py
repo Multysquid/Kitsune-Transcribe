@@ -665,7 +665,7 @@ def test_the_defaults_resolve():
     m = load_script("04_distill")
     assert m.load_config(None, []) == m.DEFAULTS
     assert not m.DEFAULTS["early_stop"]["enabled"]
-    assert m.DEFAULTS["eval"]["every_min"] == 20 and m.DEFAULTS["eval"]["gate"] is True
+    assert m.DEFAULTS["eval"]["every_min"] == 20
     assert m.DEFAULTS["eval"]["mini"]["every_steps"] is None and m.DEFAULTS["eval"]["probe_greedy_audio_s"] is None
     assert m.epoch_cadence(m.DEFAULTS) is None
     on = m.load_config(None, ["early_stop.enabled=true", "eval.full_every_epochs=1", "eval.mini.every_steps=500"])

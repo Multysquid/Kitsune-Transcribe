@@ -166,7 +166,6 @@ ALERTS_FILE, GATE_FILE, SUMMARY_FILE, DEADLINE_FILE = ("watchdog_alerts.jsonl", 
 # runs-repo UPLOAD_MARK (.upload_pending), which finish.py would treat as a state the runs repo must hold
 TIMED_POINTER, SCRATCH_MARK, TIMED_REASON, POINTER_FORMAT = "timed_state.json", ".scratch_pending", "timed", 1
 STATE_FILES_REQUIRED = ("model.pt", "optimizer.pt", "l2sp.pt", "trainer.pt", "trainer.json")
-STATE_FILES_OPTIONAL = ("aux_ctc.pt",)
 _UPLOAD_MARK = ".upload_pending"  # scripts/04_distill.py UPLOAD_MARK (it imports torch, so it is not imported here)
 
 # the frozen study eval manifest (data repo @ 4b0d801): every full readout scores it (--manifest), and the full and
@@ -208,18 +207,20 @@ ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # the config keys launch --resume-set may change, and the kind of each one's value (RESUME_SET_KINDS; resume_set_value
 # parses and normalises it): the run's length and patience (schedule.epochs, early_stop.patience: ints of at least
 # RESUME_SET_INT_MIN[key]); the CTC train-data augmentation's switch (augment.enabled) and its steps' rates (the
-# probabilities truncate_p, concat_p, mix_p, end_trim_p, noise_p, speech_p, reverb_p, gain_p and codec_p, in [0, 1]);
-# its row floors (truncate_min_row_s, and background_min_row_s: rows shorter than this get no background speech or
-# noise; seconds >= 0); its banks (noise_bank and rir_bank: data-repo paths, each pinned by the sha256 of its
-# index.json); schedule.deadline_cooldown (a bool: false turns the deadline's cooldown compression off for a
-# continuation); and the recipe audit's three fixes, bools that are false by default (cut_keep_word, guard_per_piece,
-# end_trim_voiced; 04_distill AUDIT_FIX_KEYS). The augmentation's other keys stay the config's on purpose: a resume
-# that moved its seed, the truncate bounds and pause share, concat_max_s / concat_max_n or mix_snr_db would train
+# probabilities truncate_p, concat_p, end_trim_p, noise_p, speech_p, reverb_p, gain_p and codec_p, in [0, 1]); its row
+# floor (truncate_min_row_s; seconds >= 0); its banks (noise_bank and rir_bank: data-repo paths, each pinned by the
+# sha256 of its index.json); schedule.deadline_cooldown (a bool: false turns the deadline's cooldown compression off
+# for a continuation); and the recipe audit's three fixes, bools that are false by default (cut_keep_word,
+# guard_per_piece, end_trim_voiced; 04_distill AUDIT_FIX_KEYS). The augmentation's other keys stay the config's on
+# purpose: a resume that moved its seed, the truncate bounds and pause share or concat_max_s / concat_max_n would train
 # another recipe, and its ranges (speech_snr_db, gain_db, codecs, ...) are lists, which KITSUNE_RESUME_SETS
 # (comma-separated) cannot carry: only a registry continuation sets them (CONTINUE_SET_KEYS). None of these keys shapes
 # the step plan (scripts/04_distill.py RESUME_FIXED holds none of them: augment.* happens inside the train loader), so
 # a resume keeps its epoch position; 04_distill validates every value again on the box (validate: epochs, bools;
-# validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set)
+# validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set).
+# augment.mix_p and augment.background_min_row_s are retired (04_distill RETIRED_KEYS: the trainer drops them at 0 and
+# refuses any other value - on the box, after the paid boot); they stay in both tables only while box p-cool's
+# registry continuations spell them, and leave them with that box
 RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
                    "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s", "augment.end_trim_p",
                    "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256", "augment.speech_p",
@@ -585,9 +586,9 @@ _HEX64 = r"[0-9a-f]{64}"
 
 def pointer_problems(ptr: dict) -> list[str]:
     """Why a timed-state pointer (runs/<run_id>/timed_state.json, format 1) is not well formed: every key present with
-    its type, name == full_step_<step>, files = every STATE_FILES_REQUIRED entry plus only STATE_FILES_OPTIONAL ones
-    (never a marker file), each {size: int >= 0, sha256: 64 lowercase hex}, host {hostname, machine_id, container_id}.
-    Empty: resume-pull may trust it (and still checks the files against it)."""
+    its type, name == full_step_<step>, files = exactly the STATE_FILES_REQUIRED entries (never a marker file), each
+    {size: int >= 0, sha256: 64 lowercase hex}, host {hostname, machine_id, container_id}. Empty: resume-pull may trust
+    it (and still checks the files against it)."""
     if not isinstance(ptr, dict):
         return [f"pointer {ptr!r} is not an object"]
     p = []
@@ -611,7 +612,7 @@ def pointer_problems(ptr: dict) -> list[str]:
             p.append(f"pointer: files lists the marker file(s) {markers}")
         if missing := [f for f in STATE_FILES_REQUIRED if f not in files]:
             p.append(f"pointer: files lacks {missing}")
-        allowed = (*STATE_FILES_REQUIRED, *STATE_FILES_OPTIONAL, SCRATCH_MARK, _UPLOAD_MARK)
+        allowed = (*STATE_FILES_REQUIRED, SCRATCH_MARK, _UPLOAD_MARK)
         if extra := [f for f in files if f not in allowed]:
             p.append(f"pointer: files lists {extra}, not state files")
         for f, meta in files.items():

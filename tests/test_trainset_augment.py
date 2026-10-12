@@ -5,21 +5,18 @@ the module docstring's "Train-data augmentation"):
   with no `aug`; on with every probability 0, the same tensors plus zero counts
 - the pieces on hand-made targets: the greedy path without the Python loop, a join that keeps each piece's targets
   (sentence marks included) at its frame offset and merges a token repeated across the join as CTC reads it, a cut
-  that is a prefix and loses the final token, the cut's interval, the group size, the frame-aligned audio join and the
-  mix at the drawn SNR
+  that is a prefix and loses the final token, the cut's interval, the group size and the frame-aligned audio join
 - on a real frame store: every row the loss reads has ctc_frames(samples) == n_frames; truncate keeps the frames
   before its cut and removes the final token; concat puts each piece at its offset, its group size divides the rows and
-  its padded frames never exceed the micro-batch's; mix keeps targets and lengths and hits the SNR; the same index list
-  gives the same batch in any process, another seed another
+  its padded frames never exceed the micro-batch's; the same index list gives the same batch in any process, another
+  seed another
 - the trainer: augment.* validated (an AED student's rules: tests/test_aed_augment.py), changeable on resume; a tiny
-  CTC run with all three augmentations
-  through its smoke phase logs the aug/* shares and the clamp, and a crash resumed from a mid state ends with the
-  uninterrupted run's weights
+  CTC run with every augmentation through its smoke phase logs the aug/* shares and the clamp, and a crash resumed
+  from a mid state ends with the uninterrupted run's weights
 CPU only, tiny models, synthetic data in the real on-disk formats (tests/fixtures.py, tests/fixtures_ctc.py)."""
 import copy
 import dataclasses
 import json
-import math
 import os
 import pickle
 import sys
@@ -47,8 +44,6 @@ from kitsune.parakeet_targets import ctc_greedy  # noqa: E402
 EVAL = ["eval_jsut", "eval_cv8", "eval_reazon"]
 BLANK, MARK, K = 3072, 1, 8  # MARK: "。" in the tiny tokenizer (tests/fixtures_ctc.py)
 FS = T.FRAME_SAMPLES
-FRAME_KEYS = ("frame_mask", "dense_mask", "blank_lp", "topk_idx", "topk_lp", "ctc_targets", "ctc_target_lengths",
-              "n_frames", "n_tok")
 
 
 @pytest.fixture(autouse=True)
@@ -170,31 +165,26 @@ def test_off_is_the_plain_dataset(env):
         z = zero[idx]
         assert set(z) == set(want) | {"aug"}
         assert_same(z, want)
-        assert z["aug"] == dict(utts=len(idx), rows=len(idx), concat_groups=0, concat_utts=0, truncated=0, mixed=0,
-                                cut_padded=0, end_padded=0, end_trimmed=0, speech_mixed=0, reverbed=0, noised=0,
-                                gained=0, clipped=0, coded=0)
+        assert z["aug"] == dict(utts=len(idx), rows=len(idx), concat_groups=0, concat_utts=0, truncated=0,
+                                end_trimmed=0, speech_mixed=0, reverbed=0, noised=0, gained=0, clipped=0, coded=0)
 
 
 def test_augment_spec_and_where_it_applies(env, tmp_path):
     """Augment refuses settings outside its ranges; dataset_for takes a CTC augmentation for a frame store only (a
     token store takes an AED one: tests/test_aed_augment.py) and a frame store no AED one; with_augment shares the plain
     dataset's arrays."""
-    for bad in (dict(truncate_p=1.5), dict(concat_p=-0.1), dict(mix_p=2), dict(truncate_min_frac=1.0),
-                dict(truncate_min_s=-1), dict(concat_max_s=0), dict(concat_max_n=1), dict(mix_snr_db=(10, 5)),
-                dict(mix_snr_db=(-3, 5)), dict(seed=-1), dict(truncate_pause_p=1.5),
+    for bad in (dict(truncate_p=1.5), dict(concat_p=-0.1), dict(truncate_min_frac=1.0), dict(truncate_min_s=-1),
+                dict(concat_max_s=0), dict(concat_max_n=1), dict(seed=-1), dict(truncate_pause_p=1.5),
                 dict(truncate_p=0.5),  # a cut needs the punctuation ids: without them a mark looks like a word
-                dict(truncate_p=0.5, punct_ids=(BLANK,)), dict(truncate_pad_p=1.5), dict(end_pad_p=-0.1),
-                dict(pad_frames=(0, 5)), dict(pad_frames=(3, 2)), dict(pad_frames=(1, T.PAD_MAX_FRAMES + 1)),
-                dict(pad_frames=(1.5, 2)), dict(pad_frames=(1,)), dict(truncate_min_row_s=-1)):
+                dict(truncate_p=0.5, punct_ids=(BLANK,)), dict(truncate_min_row_s=-1)):
         with pytest.raises(ValueError, match="not an augmentation"):
             T.Augment(**{"seed": 1, **bad})
     with pytest.raises(TypeError):
         T.FrameBatchDataset(env["store"], augment={"truncate_p": 1.0})
-    a = T.Augment.from_config(dict(enabled=True, seed=None, truncate_p=0.5, concat_max_s=28.0, mix_snr_db=[5, 20],
-                                   concat_max_n=3, truncate_pause_p=0.25), seed=11, concat_max_s=2.5,
-                              punct_ids=[8, MARK])
-    assert a == T.Augment(seed=11, truncate_p=0.5, concat_max_s=2.5, concat_max_n=3, mix_snr_db=(5.0, 20.0),
-                          truncate_pause_p=0.25, punct_ids=(MARK, 8))
+    a = T.Augment.from_config(dict(enabled=True, seed=None, truncate_p=0.5, concat_max_s=28.0, concat_max_n=3,
+                                   truncate_pause_p=0.25), seed=11, concat_max_s=2.5, punct_ids=[8, MARK])
+    assert a == T.Augment(seed=11, truncate_p=0.5, concat_max_s=2.5, concat_max_n=3, truncate_pause_p=0.25,
+                          punct_ids=(MARK, 8))
     plain = T.dataset_for(env["store"])
     aug = plain.with_augment(a)
     assert aug.augment == a and plain.augment is None and aug.ids is plain.ids and aug.n_frames is plain.n_frames
@@ -332,79 +322,6 @@ def test_join_waves_aligns_every_piece_to_its_frames():
         assert T.ctc_frames(len(jj)) == 13 + T.ctc_frames(n_last)
 
 
-def test_mix_into_hits_the_snr_and_never_writes_its_inputs():
-    """mix_into adds a segment of src (a share in [0.5, 1] of the shorter row) at an offset in dst, scaled so that dst's
-    power over the span over the segment's is the drawn SNR; dst and src are left as they were; a silent span on
-    either side is skipped (no level to scale to, and scaling a silent segment up would only make its noise loud)."""
-    rng = np.random.default_rng(3)
-    t = np.arange(48000) / 16000
-    dst = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
-    src = (0.05 * np.sin(2 * np.pi * 330 * t[:30000]) + 0.01 * rng.standard_normal(30000)).astype(np.float32)
-    d0, s0 = dst.copy(), src.copy()
-    for snr_db in ((10.0, 10.0), (5.0, 20.0)):
-        for _ in range(20):
-            out, info = T.mix_into(dst, src, rng, snr_db)
-            assert np.array_equal(dst, d0) and np.array_equal(src, s0) and out.shape == dst.shape
-            n, off, st = info["n"], info["offset"], info["src_start"]
-            assert 15000 <= n <= 30000 and 0 <= off <= 48000 - n and 0 <= st <= 30000 - n
-            diff = out.astype(np.float64) - dst
-            assert not diff[:off].any() and not diff[off + n:].any()
-            np.testing.assert_allclose(diff[off:off + n], info["gain"] * src[st:st + n], rtol=1e-5, atol=1e-7)
-            got = 10 * np.log10(np.mean(dst[off:off + n].astype(np.float64) ** 2) / np.mean(diff[off:off + n] ** 2))
-            assert snr_db[0] - 1e-3 <= info["snr_db"] <= snr_db[1] + 1e-3 and abs(got - info["snr_db"]) < 1e-3
-    assert T.mix_into(np.zeros(16000, np.float32), src, rng, (10.0, 10.0)) is None  # a silent row
-    assert T.mix_into(dst, np.full(16000, 1e-6, np.float32), rng, (10.0, 10.0)) is None  # a silent interferer
-    assert T.mix_into(dst, src[:1], rng, (10.0, 10.0)) is None
-
-
-def test_a_quiet_pad_after_a_cut_and_after_a_whole_row():
-    """pad_quiet on hand-made rows: after a cut the row keeps its first c frames' audio and targets, then n frames of
-    quiet whose targets are pure blank at the row's most confident blank (at least PAD_MIN_BLANK_LP), and its CTC path
-    is still the cut's - no mark; after a whole row (audio not a whole number of frames: squared to them first, with
-    low noise) the final mark stays, the quiet after it. ctc_frames of the audio is the row's frames either way."""
-    rng = np.random.default_rng(0)
-    col0 = [BLANK, 40, BLANK, BLANK, 41, BLANK, 42, BLANK, MARK]  # a sentence ending in its mark
-    t, T0 = ft(col0, seed=5), len(col0)
-    wave = (0.1 * rng.standard_normal(FS * T0 - 37)).astype(np.float32)  # 37 samples short of whole frames
-    assert T.ctc_frames(len(wave)) == T0
-    r = T._AugRow(wave, t, [0], [0])
-    r.cut_at(5)
-    r.pad_quiet(3, wave, np.random.default_rng(1))
-    assert (r.cut, r.pad, r.ft.n_frames, T.ctc_frames(len(r.wave))) == (5, 3, 8, 8)
-    assert FS * 8 - T.END_BELOW <= len(r.wave) <= FS * 8  # the padded end drawn, as a cut's
-    assert np.array_equal(r.wave[:FS * 5], wave[:FS * 5])
-    assert r.ft.col0().tolist() == col0[:5] + [BLANK] * 3 and r.ft.ctc_ids.tolist() == [40, 41]  # no mark
-    b = np.float16(max(float(t.blank_lp[:5].max()), T.PAD_MIN_BLANK_LP))
-    assert (r.ft.blank_lp[5:] == b).all() and np.array_equal(r.ft.blank_lp[:5], t.blank_lp[:5])
-    assert (r.ft.dense_frame < 5).all() and r.ft.topk_idx.shape[1] == t.k
-    w = T._AugRow(wave, t, [0], [0])
-    w.pad_quiet(4, wave, np.random.default_rng(2))
-    assert (w.cut, w.pad, w.ft.n_frames, T.ctc_frames(len(w.wave))) == (None, 4, T0 + 4, T0 + 4)
-    assert FS * (T0 + 4) - T.END_BELOW <= len(w.wave) <= FS * (T0 + 4)
-    assert np.array_equal(w.wave[:len(wave)], wave) and np.abs(w.wave[len(wave):FS * T0]).max() < 1e-4
-    assert w.ft.col0().tolist() == col0 + [BLANK] * 4 and w.ft.ctc_ids.tolist() == [40, 41, 42, MARK]  # mark kept
-    assert np.array_equal(w.ft.blank_lp[:T0], t.blank_lp) and (w.ft.blank_lp[T0:] == b).all()
-
-
-def test_quiet_pad_is_room_tone_or_near_silence(monkeypatch):
-    """quiet_pad: on the room-tone path every 1280-sample block of the pad is one of the source's whole frames among
-    its PAD_ROOM_FRAMES quietest below PAD_ROOM_MAX_POWER (a voice-detector chunk's own silence); a source without
-    such a frame, and the other path, give AUG_PAD_STD noise (an app's zero pad, without exact zeros)."""
-    rng = np.random.default_rng(3)
-    loud = (0.1 * rng.standard_normal(FS * 20)).astype(np.float32)  # mean square 1e-2: no room tone in it
-    quiet = (0.003 * rng.standard_normal(FS * 3)).astype(np.float32)  # 9e-6, below 1e-4
-    src = np.concatenate([loud[:FS * 10], quiet, loud[FS * 10:]])
-    monkeypatch.setattr(T, "PAD_ROOM_P", 1.0)
-    pad = T.quiet_pad(src, 5, np.random.default_rng(4))
-    blocks = [src[FS * j:FS * (j + 1)] for j in (10, 11, 12)]
-    assert pad.shape == (FS * 5,) and pad.dtype == np.float32
-    assert all(any(np.array_equal(pad[FS * i:FS * (i + 1)], q) for q in blocks) for i in range(5))
-    noise = T.quiet_pad(loud, 4, np.random.default_rng(5))
-    assert noise.shape == (FS * 4,) and np.std(noise) == pytest.approx(T.AUG_PAD_STD, rel=0.1)
-    monkeypatch.setattr(T, "PAD_ROOM_P", 0.0)
-    assert np.std(T.quiet_pad(src, 2, np.random.default_rng(6))) == pytest.approx(T.AUG_PAD_STD, rel=0.1)
-
-
 def test_the_stream_is_a_function_of_seed_and_index_list():
     a, b = T.augment_rng(3, [5, 1, 9]), T.augment_rng(3, np.array([5, 1, 9]))
     assert np.array_equal(a.random(8), b.random(8))
@@ -416,15 +333,14 @@ def test_the_stream_is_a_function_of_seed_and_index_list():
 
 
 def test_every_row_keeps_its_frames(env):
-    """With all three augmentations on, over every micro-batch of an epoch: each row's audio gives exactly its target
+    """With truncate and concat on, over every micro-batch of an epoch: each row's audio gives exactly its target
     frames (ctc_frames(samples) == n_frames), its padding is zero, its CTC targets are the greedy path of its argmax,
     each joined row's ids are store ids and the counts add up."""
     store = env["store"]
     pos = {u.id: i for i, u in enumerate(store.utts)}
     ds = T.FrameBatchDataset(store, augment=T.Augment(seed=1, truncate_p=0.5, truncate_min_s=0.3, concat_p=0.7,
-                                                       concat_max_s=2.5, mix_p=0.5, punct_ids=(MARK,),
-                                                       truncate_pad_p=0.5, end_pad_p=0.5))
-    seen = dict(truncated=0, mixed=0, concat_groups=0, rows=0, utts=0, concat_utts=0, cut_padded=0, end_padded=0)
+                                                       concat_max_s=2.5, punct_ids=(MARK,)))
+    seen = dict(truncated=0, concat_groups=0, rows=0, utts=0, concat_utts=0)
     for idx in micro_batches(store, micro_s=4.0):
         mb = ds[idx]
         a = mb["aug"]
@@ -443,8 +359,7 @@ def test_every_row_keeps_its_frames(env):
             col0 = torch.where(mb["dense_mask"][r, :t], mb["topk_idx"][r, :t, 0], torch.full((t,), BLANK)).tolist()
             assert row_ids(mb, r) == ctc_greedy(col0) and int(mb["n_tok"][r]) == len(row_ids(mb, r))
             assert mb["sources"][r] == store.utts[pos[pieces[r][0]]].source and int(mb["index"][r]) == pos[pieces[r][0]]
-    assert seen["truncated"] and seen["mixed"] and seen["concat_groups"]  # each one happened somewhere
-    assert seen["cut_padded"] and seen["end_padded"]
+    assert seen["truncated"] and seen["concat_groups"]  # each one happened somewhere
 
 
 def test_truncate_keeps_the_frames_before_its_cut(env):
@@ -460,7 +375,7 @@ def test_truncate_keeps_the_frames_before_its_cut(env):
     n_cut, ends = 0, []
     for idx in micro_batches(store)[:20]:
         p, g = plain[idx], ds[idx]
-        assert g["ids"] == p["ids"] and g["aug"]["concat_groups"] == g["aug"]["mixed"] == 0
+        assert g["ids"] == p["ids"] and g["aug"]["concat_groups"] == 0
         cut = 0
         for b, i in enumerate(idx):
             T0, c = int(p["n_frames"][b]), int(g["n_frames"][b])
@@ -565,39 +480,12 @@ def test_concat_puts_each_piece_at_its_offset(env):
     assert joined >= 3
 
 
-def test_mix_keeps_the_targets_and_hits_the_snr(env):
-    """mix alone (p 1, SNR fixed at 10 dB): the targets, lengths and metadata are the plain micro-batch's; each mixed
-    row differs from its plain audio on one contiguous span only, where the added signal is 10 dB below the row."""
-    store = env["store"]
-    plain = T.dataset_for(store)
-    ds = plain.with_augment(T.Augment(seed=4, mix_p=1.0, mix_snr_db=(10.0, 10.0)))
-    mixed = 0
-    for idx in micro_batches(store)[:20]:
-        p, g = plain[idx], ds[idx]
-        assert_same(g, p, FRAME_KEYS + ("lengths", "ids", "sources", "durations", "index"))
-        rows = 0
-        for b in range(len(idx)):
-            diff = (g["wave"][b].double() - p["wave"][b].double()).numpy()
-            nz = np.flatnonzero(diff)
-            if not len(nz):
-                continue
-            rows += 1
-            s, e = int(nz[0]), int(nz[-1]) + 1
-            assert 0 <= s < e <= int(p["lengths"][b])
-            row = p["wave"][b].double().numpy()[s:e]
-            snr = 10 * np.log10(np.mean(row ** 2) / np.mean(diff[s:e] ** 2))
-            assert abs(snr - 10.0) < 0.01, snr
-        assert rows == g["aug"]["mixed"] == (len(idx) if len(idx) >= 2 else 0)  # p 1: every row of 2+, none alone
-        mixed += rows
-    assert mixed > 10
-
-
 def test_same_index_list_same_batch(env):
     """The augmentation of a micro-batch is a function of (seed, its index list): the same list gives the same batch
     from another dataset object (a worker's unpickled copy), another seed or another order of the list another."""
     store = env["store"]
-    a = T.Augment(seed=6, truncate_p=0.5, truncate_min_s=0.3, concat_p=0.5, concat_max_s=2.6, mix_p=0.5,
-                  punct_ids=(MARK,), truncate_pad_p=0.5, end_pad_p=0.5)
+    a = T.Augment(seed=6, truncate_p=0.5, truncate_min_s=0.3, concat_p=0.5, concat_max_s=2.6, gain_p=0.5,
+                  punct_ids=(MARK,))
     ds = T.dataset_for(store, augment=a)
     other = pickle.loads(pickle.dumps(ds))
     assert other.augment == a and other._mm is None
@@ -609,78 +497,6 @@ def test_same_index_list_same_batch(env):
         z = T.dataset_for(store, augment=dataclasses.replace(a, seed=7))[idx]
         differs += not (z["wave"].shape == x["wave"].shape and torch.equal(z["wave"], x["wave"]))
     assert differs >= 5
-
-
-def test_end_pads_never_widen_the_micro_batch(env):
-    """end pads alone (p 1): every whole row but the micro-batch's longest gets 1-5 frames of quiet, within the longest
-    row's frames - the padded frames never grow -; the audio and targets before the pad are the plain row's (the audio
-    squared to its frames), the pad quiet, its targets pure blank, the CTC path unchanged (the final mark kept), and the
-    row's duration grows by the pad."""
-    store = env["store"]
-    plain = T.dataset_for(store)
-    ds = plain.with_augment(T.Augment(seed=8, end_pad_p=1.0, pad_frames=(1, 5)))
-    padded = 0
-    for idx in micro_batches(store)[:25]:
-        p, g = plain[idx], ds[idx]
-        width = int(p["n_frames"].max())
-        assert int(g["n_frames"].max()) == width and g["aug"]["truncated"] == g["aug"]["cut_padded"] == 0
-        n_pad = 0
-        for b in range(len(idx)):
-            T0, t = int(p["n_frames"][b]), int(g["n_frames"][b])
-            if T0 == width:  # the longest row: no room
-                assert t == T0 and int(g["lengths"][b]) == int(p["lengths"][b])
-                continue
-            n_pad += 1
-            assert 1 <= t - T0 <= min(5, width - T0)
-            n = int(p["lengths"][b])
-            L = int(g["lengths"][b])
-            assert FS * t - T.END_BELOW <= L <= FS * t and T.ctc_frames(L) == t
-            keep = min(n, FS * T0)
-            assert torch.equal(g["wave"][b, :keep], p["wave"][b, :keep])
-            if L > FS * T0:  # the pad's audio (its end drawn): quiet, room tone or near-silent noise
-                q = g["wave"][b, FS * T0:L].double()
-                assert float((q ** 2).mean()) < T.PAD_ROOM_MAX_POWER
-            for k in ("blank_lp", "dense_mask", "topk_idx", "topk_lp"):
-                assert torch.equal(g[k][b, :T0], p[k][b, :T0]), k
-            assert not g["dense_mask"][b, T0:t].any() and bool(g["frame_mask"][b, :t].all())
-            assert row_ids(g, b) == row_ids(p, b)
-            assert float(g["durations"][b]) == pytest.approx(L / 16000)
-        assert g["aug"]["end_padded"] == n_pad
-        padded += n_pad
-    assert padded > 10
-
-
-def test_a_cut_pad_keeps_the_cut_and_adds_quiet(env):
-    """truncate and cut pads (p 1 each): a cut row is its cut's first c frames - c one of truncate_frames, the audio,
-    the targets and the CTC path (a prefix that lost its final token) the plain row's - then 1-5 frames of quiet with
-    pure-blank targets, never past the micro-batch's width; every cut row has its pad (a cut leaves room), a row with
-    nothing to cut stays whole (end_pad_p 0)."""
-    store = env["store"]
-    plain = T.dataset_for(store)
-    ds = plain.with_augment(T.Augment(seed=9, truncate_p=1.0, truncate_min_s=0.3, punct_ids=(MARK,),
-                                      truncate_pad_p=1.0, pad_frames=(1, 5)))
-    cut_rows = 0
-    for idx in micro_batches(store)[:20]:
-        p, g = plain[idx], ds[idx]
-        width = int(p["n_frames"].max())
-        for b, i in enumerate(idx):
-            T0, t = int(p["n_frames"][b]), int(g["n_frames"][b])
-            cand = set(T.truncate_frames(store.targets(i), 0.3, 0.3, (MARK,)).tolist())
-            if not cand:
-                assert t == T0 and int(g["lengths"][b]) == int(p["lengths"][b])
-                continue
-            cut_rows += 1
-            L = int(g["lengths"][b])
-            assert t <= width and FS * t - T.END_BELOW <= L <= FS * t and T.ctc_frames(L) == t
-            full = store.targets(i).col0().tolist()
-            fits = [c for c in range(max(t - 5, 1), t) if c in cand
-                    and row_ids(g, b) == ctc_greedy(full[:c]) and len(ctc_greedy(full[:c])) < len(ctc_greedy(full))
-                    and torch.equal(g["blank_lp"][b, :c], p["blank_lp"][b, :c])
-                    and torch.equal(g["wave"][b, :FS * c - T.END_BELOW], p["wave"][b, :FS * c - T.END_BELOW])
-                    and not g["dense_mask"][b, c:t].any()]
-            assert fits, (idx, b)
-        assert g["aug"]["cut_padded"] == g["aug"]["truncated"] and g["aug"]["end_padded"] == 0
-    assert cut_rows > 10
 
 
 # ---------------------------------------------------------------------------------------------------- the trainer
@@ -783,44 +599,33 @@ def test_background_keeps_targets_and_lengths(env, tmp_path):
 
 
 def test_validate_the_augment_block():
-    """augment.* off by default and checked whether or not it is on (an AED student's own rules - the cut table, no
-    pads -: tests/test_aed_augment.py); a resume may change it - it does not shape the step plan -, unlike the
-    RESUME_FIXED keys."""
+    """augment.* off by default and checked whether or not it is on (an AED student's own rules - the cut table -:
+    tests/test_aed_augment.py); a resume may change it - it does not shape the step plan -, unlike the RESUME_FIXED
+    keys."""
     m = load_script("04_distill")
     assert m.DEFAULTS["augment"] == {"enabled": False, "seed": None, "truncate_p": 0.0, "truncate_min_frac": 0.3,
                                      "truncate_min_s": 1.0, "truncate_pause_p": 0.5, "concat_p": 0.0,
-                                     "concat_max_s": 28.0, "concat_max_n": 4, "mix_p": 0.0, "mix_snr_db": [5.0, 20.0],
-                                     "truncate_pad_p": 0.0, "end_pad_p": 0.0, "pad_frames": [1, 5],
+                                     "concat_max_s": 28.0, "concat_max_n": 4,
                                      "truncate_min_row_s": 0.0, "cuts": None, "cuts_sha256": None,
                                      "end_trim_p": 0.0, "noise_p": 0.0, "noise_snr_db": [0.0, 20.0],
                                      "noise_bank": None, "noise_bank_sha256": None, "speech_p": 0.0,
                                      "speech_snr_db": [10.0, 25.0], "speech_talkers": [1, 4], "speech_batch_p": 0.5,
                                      "reverb_p": 0.0, "rir_bank": None, "rir_bank_sha256": None, "gain_p": 0.0,
                                      "gain_db": [-20.0, 10.0], "codec_p": 0.0, "codecs": ["mp3", "gsm", "ulaw8k"],
-                                     "background_min_row_s": 0.0, "cut_keep_word": False, "guard_per_piece": False,
+                                     "cut_keep_word": False, "guard_per_piece": False,
                                      "end_trim_voiced": False}  # the recipe audit's fixes: tests/test_recipe_v5.py
     assert not m.augment_on(m.load_config(None, [])) and not m.augment_on({})
     ctc = ["family=ctc", "parakeet_root=po"]
-    assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.mix_p=0.5"]))
+    assert m.augment_on(m.load_config(None, ctc + ["augment.enabled=true", "augment.concat_p=0.5"]))
     for bad, match in ((["augment.enabled=yes"], "augment.enabled must be true or false"),
                        (["augment.seed=-1"], "augment.seed"), (["augment.seed=1.5"], "augment.seed"),
                        (["augment.truncate_p=1.5"], "augment.truncate_p"),
                        (["augment.concat_p=-0.1"], "augment.concat_p"),
-                       (["augment.mix_p=x"], "augment.mix_p"), (["augment.truncate_min_frac=1"], "truncate_min_frac"),
+                       (["augment.truncate_min_frac=1"], "truncate_min_frac"),
                        (["augment.truncate_pause_p=2"], "augment.truncate_pause_p"),
                        (["augment.truncate_min_s=-1"], "truncate_min_s"), (["augment.concat_max_s=0"], "concat_max_s"),
                        (["augment.concat_max_n=1"], "concat_max_n"), (["augment.concat_max_n=2.0"], "concat_max_n"),
-                       (["augment.mix_snr_db=[20, 5]"], "mix_snr_db"), (["augment.mix_snr_db=[-5, 5]"], "mix_snr_db"),
-                       (["augment.mix_snr_db=[5]"], "mix_snr_db"),
-                       (["augment.truncate_pad_p=1.5"], "augment.truncate_pad_p"),
-                       (["augment.end_pad_p=-0.1"], "augment.end_pad_p"), (["augment.pad_frames=[0, 5]"], "pad_frames"),
-                       (["augment.pad_frames=[3, 2]"], "pad_frames"), (["augment.pad_frames=[1, 26]"], "pad_frames"),
-                       (["augment.pad_frames=[1.0, 2]"], "pad_frames"), (["augment.pad_frames=3"], "pad_frames"),
                        (["augment.truncate_min_row_s=-1"], "truncate_min_row_s"),
-                       (["augment.background_min_row_s=-1"], "background_min_row_s"),
-                       (["augment.background_min_row_s=x"], "background_min_row_s"),
-                       (["augment.background_min_row_s=true"], "background_min_row_s"),
-                       (["augment.background_min_row_s=null"], "background_min_row_s"),
                        (["augment.end_trim_p=2"], "augment.end_trim_p"), (["augment.noise_p=-1"], "augment.noise_p"),
                        (["augment.noise_snr_db=[10, 0]"], "noise_snr_db"),
                        (["augment.noise_bank_sha256=xyz"], "noise_bank_sha256"),
@@ -842,18 +647,16 @@ def test_validate_the_augment_block():
     changed, same = m.resume_overrides(saved, [("augment.enabled", True), ("augment.concat_p", 0.5),
                                                ("augment.seed", None)])
     assert changed == {"augment.enabled": True, "augment.concat_p": 0.5} and same == {"augment.seed": None}
-    # DECISIONS H14's gentle recipe on a resume: lists (as JSON, the way the queue passes them) and the new key
+    # DECISIONS H14's gentle ranges on a resume: lists, as JSON, the way the queue passes them
     gentle = ["augment.noise_snr_db=[5.0,20.0]", "augment.speech_snr_db=[15.0,25.0]", "augment.gain_db=[-10.0,10.0]",
-              'augment.codecs=["mp3","ulaw8k"]', "augment.background_min_row_s=3.0"]
+              'augment.codecs=["mp3","ulaw8k"]']
     cfg = copy.deepcopy(saved)
     changed, same = m.resume_overrides(saved, [m.apply_set(cfg, x) for x in gentle])
     assert changed == {"augment.noise_snr_db": [5.0, 20.0], "augment.speech_snr_db": [15.0, 25.0],
-                       "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"],
-                       "augment.background_min_row_s": 3.0} and not same
+                       "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"]} and not same
     m.validate(cfg)
-    assert m.load_config(None, ctc + gentle)["augment"]["background_min_row_s"] == 3.0
     spec = T.Augment.from_config(cfg["augment"], seed=1)
-    assert (spec.noise_snr_db, spec.codecs, spec.background_min_row_s) == ((5.0, 20.0), ("mp3", "ulaw8k"), 3.0)
+    assert (spec.noise_snr_db, spec.codecs) == ((5.0, 20.0), ("mp3", "ulaw8k"))
     assert not any(f.startswith("augment") for f in m.RESUME_FIXED)
 
 
@@ -884,10 +687,10 @@ def utts_of(run: Path) -> pd.DataFrame:
     return pd.concat([pd.read_parquet(p) for p in sorted((run / "metrics" / "train_utts").glob("part-*.parquet"))])
 
 
-# the end-to-end run: all three augmentations, through a smoke phase of 3 steps, full states every 2 steps
-AUG_OVER = {"augment": {"enabled": True, "truncate_p": 0.7, "truncate_min_s": 0.3, "concat_p": 1.0, "mix_p": 0.7,
-                        "truncate_pad_p": 0.7, "end_pad_p": 0.5, "end_trim_p": 0.5, "noise_p": 0.5, "speech_p": 0.5,
-                        "speech_batch_p": 0.5, "reverb_p": 0.5, "gain_p": 0.5, "codec_p": 0.5},
+# the end-to-end run: every augmentation, through a smoke phase of 3 steps, full states every 2 steps
+AUG_OVER = {"augment": {"enabled": True, "truncate_p": 0.7, "truncate_min_s": 0.3, "concat_p": 1.0, "end_trim_p": 0.5,
+                        "noise_p": 0.5, "speech_p": 0.5, "speech_batch_p": 0.5, "reverb_p": 0.5, "gain_p": 0.5,
+                        "codec_p": 0.5},
             "smoke": {"enabled": True, "steps": 3, "min_audio_s_per_s": 0, "require_loss_decrease": False,
                       "pad_utts": 4, "decode_per_set": 2},
             "ckpt": {"full_every_steps": 2}}
@@ -914,10 +717,10 @@ def aug_over(env) -> dict:
 
 
 def test_a_ctc_run_with_every_augmentation(env, aug_run):
-    """A tiny CTC student trained with all three augmentations: the smoke phase passes (its checks read the plain
-    dataset; its dropped-audio share counts utterances), the clamp of concat_max_s to the longest train utterance is
-    an `augment` event, every step row has aug/concat_frac, aug/truncated_frac and aug/mixed_frac in [0, 1] - each
-    above 0 somewhere -, and the train records carry joined rows' ids."""
+    """A tiny CTC student trained with every augmentation: the smoke phase passes (its checks read the plain dataset;
+    its dropped-audio share counts utterances), the clamp of concat_max_s to the longest train utterance is an
+    `augment` event, every step row has the aug/* shares in [0, 1] - each above 0 somewhere -, and the train records
+    carry joined rows' ids."""
     run = aug_run
     evs = events(run)
     kinds = [e["kind"] for e in evs]
@@ -926,15 +729,15 @@ def test_a_ctc_run_with_every_augmentation(env, aug_run):
     longest = max(u.duration for u in env["store"].utts)
     assert aug["concat_max_s"] == pytest.approx(longest) and aug["concat_max_s_clamped"] is True
     assert aug["concat_max_s_config"] == 28.0 and aug["longest_train_s"] == pytest.approx(longest, abs=1e-3)
-    assert aug["seed"] == 1234 and aug["concat_p"] == 1.0 and aug["mix_snr_db"] == [5.0, 20.0]
+    assert aug["seed"] == 1234 and aug["concat_p"] == 1.0 and not {"mix_p", "mix_snr_db", "pad_frames"} & set(aug)
     assert aug["punct_ids"] == {"1": "。"} and aug["truncate_pause_p"] == 0.5  # the tiny tokenizer's only mark
     smoke = {e["kind"]: e for e in evs if e["kind"].startswith("smoke_")}
     assert smoke["smoke_padded_row"]["ok"] and smoke["smoke_longest_fwd_bwd"]["ok"]
     assert smoke["smoke_steps"]["steps"] == 3 and smoke["smoke_steps"]["dropped"] == 0
     st = pd.read_parquet(run / "metrics" / "steps.parquet")
     assert st["step"].tolist() == [1, 2, 3, 4, 5, 6] and np.isfinite(st["loss/objective"]).all()
-    for tag in ("aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac", "aug/cut_padded_frac", "aug/noised_frac",
-                "aug/speech_frac", "aug/reverb_frac", "aug/gain_frac", "aug/codec_frac"):
+    for tag in ("aug/concat_frac", "aug/truncated_frac", "aug/noised_frac", "aug/speech_frac", "aug/reverb_frac",
+                "aug/gain_frac", "aug/codec_frac"):
         assert ((st[tag] >= 0) & (st[tag] <= 1)).all() and st[tag].max() > 0, tag
     # the acoustic steps' settings and banks (DECISIONS H12), and the codec probe's verdict
     assert (aug["speech_p"], aug["reverb_p"], aug["gain_p"], aug["codec_p"], aug["rir_clips"]) == (0.5, 0.5, 0.5, 0.5, 3)
@@ -942,11 +745,9 @@ def test_a_ctc_run_with_every_augmentation(env, aug_run):
                                                                                        "noise"}
     probe = next(e for e in evs if e["kind"] == "augment_codecs")
     assert probe["available"] == ["mp3", "gsm", "ulaw8k"] and probe["unavailable"] == {}
-    end = st["aug/end_padded_frac"]  # whole rows: in a joined micro-batch most are its longest, so maybe never
-    assert ((end >= 0) & (end <= 1)).all()
-    assert (aug["truncate_pad_p"], aug["end_pad_p"], aug["pad_frames"]) == (0.7, 0.5, [1, 5])
     tags = set(pd.read_parquet(run / "metrics" / "scalars.parquet")["tag"])
-    assert {"aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac", "aug/masked_frac"} <= tags
+    assert {"aug/concat_frac", "aug/truncated_frac", "aug/end_trimmed_frac", "aug/masked_frac"} <= tags
+    assert not {"aug/mixed_frac", "aug/cut_padded_frac", "aug/end_padded_frac", "aug/short_frac"} & tags
     utts = utts_of(run)
     joined = utts[utts["id"].str.contains("+", regex=False)]
     # a joined row's per-utterance record (none when every joined row of this tiny run - about one - was cut inside its
@@ -982,10 +783,10 @@ def test_a_resume_reset_takes_the_recipe_sets_of_the_env_word(env, monkeypatch):
     pc = run / "checkpoints" / pc_event["name"]
     rid = run.name
     word = ",".join(f"{rid}:{s}" for s in ("schedule.epochs=01", "augment.enabled=True", "augment.truncate_p=.3",
-                                           "augment.concat_p=0.50", "augment.mix_p=5e-2"))
+                                           "augment.concat_p=0.50", "augment.end_trim_p=5e-1"))
     sets = ["schedule.resume_reset=true", *fullrun.parse_resume_sets(word)[rid]]
     assert sets == ["schedule.resume_reset=true", "schedule.epochs=1", "augment.enabled=true", "augment.truncate_p=0.3",
-                    "augment.concat_p=0.5", "augment.mix_p=0.05"]
+                    "augment.concat_p=0.5", "augment.end_trim_p=0.5"]
     argv = sum((["--set", s] for s in sets), [])
     # ckpt.full_every_steps is the test's own (a state after the reset for the crash below), not a queue set
     monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", str(T))
@@ -997,35 +798,34 @@ def test_a_resume_reset_takes_the_recipe_sets_of_the_env_word(env, monkeypatch):
         == (t_c, T, T, T, 1, 1)
     newest = run / "checkpoints" / f"full_step_{T - 1}"
     saved = json.loads((newest / "trainer.json").read_text(encoding="utf-8"))["cfg"]
-    want_aug = dict(m.DEFAULTS["augment"], enabled=True, truncate_p=0.3, concat_p=0.5, mix_p=0.05)
+    want_aug = dict(m.DEFAULTS["augment"], enabled=True, truncate_p=0.3, concat_p=0.5, end_trim_p=0.5)
     assert saved["augment"] == want_aug and saved["schedule"]["resume_reset"] is False
     assert m.main(["--resume", str(newest)]) == 0  # no sets: the state's config holds the recipe
     assert len(events(run, "resume_reset")) == 1
     augs = events(run, "augment")
     assert len(augs) == 2  # the reset's start and the crash-resume's, both with the recipe
     for a in augs:
-        assert (a["truncate_p"], a["concat_p"], a["mix_p"], a["truncate_pause_p"], a["truncate_min_s"], a["seed"]) == (
-            0.3, 0.5, 0.05, 0.5, 1.0, 1234)
-        assert a["punct_ids"] == {"1": "。"} and a["mix_snr_db"] == [5.0, 20.0]
+        assert (a["truncate_p"], a["concat_p"], a["end_trim_p"], a["truncate_pause_p"], a["truncate_min_s"],
+                a["seed"]) == (0.3, 0.5, 0.5, 0.5, 1.0, 1234)
+        assert a["punct_ids"] == {"1": "。"}
     s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
     assert (s["status"], s["steps"], s["resume_resets"]) == ("complete", T, 1)
     end = json.loads((run / "checkpoints" / f"full_step_{T}" / "trainer.json").read_text(encoding="utf-8"))
     assert end["cfg"]["augment"] == want_aug and end["st"]["resume_resets"] == 1
     st = pd.read_parquet(run / "metrics" / "steps.parquet").drop_duplicates("step", keep="last").set_index("step")
     assert st.index.tolist() == list(range(1, T + 1))
-    tags = ("aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac")
+    tags = ("aug/concat_frac", "aug/truncated_frac", "aug/end_trimmed_frac")
     after = st.loc[t_c + 1:, list(tags)]
     assert ((after >= 0) & (after <= 1)).all().all() and after.to_numpy().sum() > 0  # the recipe acted
     assert st.loc[:t_c, list(tags)].isna().all().all()  # the baseline's steps: no augmentation
 
 
-def test_a_continuation_takes_list_sets_and_spares_short_rows(env, monkeypatch):
-    """DECISIONS H14's gentle recipe on the trainer side: a finished CTC run (epochs clock, no augmentation, 4d on) is
+def test_a_continuation_takes_list_sets(env, monkeypatch):
+    """DECISIONS H14's gentle ranges on the trainer side: a finished CTC run (epochs clock, no augmentation, 4d on) is
     re-run from its pre_cooldown state to the same T with list-valued sets spelled as the queue passes them (JSON:
-    fullrun.continue_set_text), schedule.deadline_cooldown=false and augment.background_min_row_s 1.5 s. The lists
-    reach the augment event and every state saved after the reset; 4d stays off although the deadline has passed (on,
-    it would end the run at once: no_time_left); the re-run steps log aug/short_frac, aug/speech_spared_frac and
-    aug/noise_spared_frac (the rows under 1.5 s of these 0.4-2.5 s rows: some), the baseline's steps none of them."""
+    fullrun.continue_set_text) and schedule.deadline_cooldown=false. The lists reach the augment event and every state
+    saved after the reset; 4d stays off although the deadline has passed (on, it would end the run at once:
+    no_time_left); the re-run steps log the background and speech shares, the baseline's steps none of them."""
     m = load_script("04_distill")
     over = aug_over(env)
     path = write_config(env, "ctc-gentle", {"schedule": {"clock": "epochs", "epochs": 1, "max_steps": None,
@@ -1040,9 +840,8 @@ def test_a_continuation_takes_list_sets_and_spares_short_rows(env, monkeypatch):
     sets = ["schedule.resume_reset=true", "schedule.epochs=1", "schedule.deadline_cooldown=false",
             "augment.enabled=true", "augment.noise_p=1.0", "augment.speech_p=1.0", "augment.speech_batch_p=0.5",
             f"augment.noise_bank={json.dumps(over['augment']['noise_bank'])}", "augment.gain_p=0.5",
-            "augment.codec_p=0.5", "augment.background_min_row_s=1.5",
-            "augment.noise_snr_db=[5.0,20.0]", "augment.speech_snr_db=[15.0,25.0]", "augment.gain_db=[-10.0,10.0]",
-            'augment.codecs=["mp3","ulaw8k"]']
+            "augment.codec_p=0.5", "augment.noise_snr_db=[5.0,20.0]", "augment.speech_snr_db=[15.0,25.0]",
+            "augment.gain_db=[-10.0,10.0]", 'augment.codecs=["mp3","ulaw8k"]']
     monkeypatch.setenv("KITSUNE_DEADLINE", "1000000000")  # 2001: long past
     assert m.main(["--resume", str(run / "checkpoints" / pc_event["name"]), *sum((["--set", x] for x in sets), [])
                    ]) == 0
@@ -1056,26 +855,22 @@ def test_a_continuation_takes_list_sets_and_spares_short_rows(env, monkeypatch):
     s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
     assert (s["status"], s["steps"], s["resume_resets"], s["end_reason"]) == ("complete", T_, 1, "schedule")
     end = json.loads((run / "checkpoints" / f"full_step_{T_}" / "trainer.json").read_text(encoding="utf-8"))["cfg"]
-    assert {k: end["augment"][k.split(".")[1]] for k in lists} == lists and end["augment"]["background_min_row_s"] == 1.5
+    assert {k: end["augment"][k.split(".")[1]] for k in lists} == lists
     assert end["schedule"]["deadline_cooldown"] is False and end["schedule"]["resume_reset"] is False
     (aug,) = events(run, "augment")
-    assert (aug["noise_snr_db"], aug["speech_snr_db"], aug["gain_db"], aug["background_min_row_s"]) == (
-        [5.0, 20.0], [15.0, 25.0], [-10.0, 10.0], 1.5)
+    assert (aug["noise_snr_db"], aug["speech_snr_db"], aug["gain_db"]) == ([5.0, 20.0], [15.0, 25.0], [-10.0, 10.0])
     assert aug["codecs"] == ["mp3", "ulaw8k"]
     st = pd.read_parquet(run / "metrics" / "steps.parquet").drop_duplicates("step", keep="last").set_index("step")
-    tags = ["aug/short_frac", "aug/speech_spared_frac", "aug/noise_spared_frac"]
+    tags = ["aug/noised_frac", "aug/speech_frac"]
     after = st.loc[t_c + 1:, tags]
-    assert ((after >= 0) & (after <= 1)).all().all() and after["aug/short_frac"].max() > 0
-    # speech_p and noise_p 1: every short row is picked and spared, every other row may be mixed
-    assert (after["aug/noise_spared_frac"] == after["aug/short_frac"]).all()
-    assert (after["aug/speech_spared_frac"] == after["aug/short_frac"]).all()
-    assert (st.loc[t_c + 1:, "aug/noised_frac"] <= 1 - after["aug/short_frac"] + 1e-9).all()
+    assert ((after >= 0) & (after <= 1)).all().all() and after.to_numpy().sum() > 0
     assert st.loc[:t_c, tags].isna().all().all()
 
 
 def test_a_crash_resumed_with_augmentation_is_the_uninterrupted_run(env, aug_run, monkeypatch):
     """A crash before step 5 resumed from full_step_4 ends with exactly the uninterrupted run's weights: the resumed
-    loader augments steps 5 and 6 as the uninterrupted one did (the same rows, cuts and mixes; the same losses)."""
+    loader augments steps 5 and 6 as the uninterrupted one did (the same rows, cuts and backgrounds; the same
+    losses)."""
     m = load_script("04_distill")
     monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "5")
     with pytest.raises(RuntimeError, match="simulated crash"):
@@ -1094,6 +889,6 @@ def test_a_crash_resumed_with_augmentation_is_the_uninterrupted_run(env, aug_run
         assert x["kl"].tolist() == y["kl"].tolist()
     sa = pd.read_parquet(aug_run / "metrics" / "steps.parquet").set_index("step")
     sb = pd.read_parquet(crash / "metrics" / "steps.parquet").drop_duplicates("step", keep="last").set_index("step")
-    for tag in ("loss/objective", "aug/concat_frac", "aug/truncated_frac", "aug/mixed_frac", "aug/cut_padded_frac",
-                "aug/end_padded_frac"):
+    for tag in ("loss/objective", "aug/concat_frac", "aug/truncated_frac", "aug/end_trimmed_frac", "aug/noised_frac",
+                "aug/speech_frac"):
         np.testing.assert_array_equal(sa[tag].to_numpy(), sb[tag].to_numpy())
