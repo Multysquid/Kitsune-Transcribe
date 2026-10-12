@@ -14,8 +14,8 @@ the per-utterance tables (CONTRACT.md 5) whose corpus CER per set is its summary
 from the trainer's own eval dir (and knows its family); a manifest that does not hold the store's rows refuses before
 the model is loaded, and so does an eval that asks for tables without its manifest; a system's tables are one eval's (a
 set missing now loses its older table, and a set missing from --from-evals exits non-zero); the default system is the
-config's run_name; a config with max_steps still null on the steps clock (configs/study/study-t06.json) loads with
---set schedule.max_steps.
+config's run_name; a config with max_steps still null on the steps clock loads with --set schedule.max_steps
+(configs/study/study-t06.json, whose optim.lr is null too, loads with --set optim.lr as well).
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import json
@@ -687,19 +687,16 @@ def test_a_partial_eval_and_stale_tables(env, tmp_path):
 
 
 def test_the_default_system_is_the_run_name():
-    """The tables' default system: the config's run_name (a branch block does not change it); a quantised eval's is
-    <run_name>@<fmt>."""
+    """The tables' default system: the config's run_name; a quantised eval's is <run_name>@<fmt>."""
     m05 = load_script("05_evaluate")
-    args = SimpleNamespace()
-    assert m05.default_system(dict(run_name="full-t06", branch=dict(parent=None)), args, {}) == "full-t06"
-    assert m05.default_system(dict(run_name="full-t06"), args, dict(run_id="other-20260928T101112Z")) == "full-t06"
-    assert m05.default_system(dict(run_name="full-t06"), args, {}, "nvfp4-w4a4") == "full-t06@nvfp4-w4a4"
+    assert m05.default_system(dict(run_name="full-t06")) == "full-t06"
+    assert m05.default_system(dict(run_name="full-t06"), "nvfp4-w4a4") == "full-t06@nvfp4-w4a4"
 
 
 def test_a_config_with_max_steps_unset_loads_with_the_set(env, tmp_path):
-    """A config on the steps clock whose schedule.max_steps is null (configs/study/study-t06.json, whose box filled
-    it) fails the trainer's validate, and loads with --set schedule.max_steps (the eval never reads it); the file's
-    pull_parakeet and DEFAULTS' family and loss.w_ctc are in the merged config."""
+    """A config on the steps clock whose schedule.max_steps is null (as in configs/study/study-t06.json, whose box
+    filled it and its optim.lr) fails the trainer's validate, and loads with --set schedule.max_steps (the eval never
+    reads it); the file's pull_parakeet and DEFAULTS' family and loss.w_ctc are in the merged config."""
     m05 = load_script("05_evaluate")
     cfg = load(env["relative"])
     cfg["schedule"] = dict(cfg["schedule"], max_steps=None)

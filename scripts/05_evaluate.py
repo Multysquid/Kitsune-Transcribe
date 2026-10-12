@@ -120,8 +120,9 @@ the protocol is the size study's, study/PREREG.json):
             with a whisper.json (kitsune.whisper.WHISPER_META) is a Whisper system's whatever --config says: family
             "whisper", no teacher (teacher null, no teacher_cer / *_teacher / *_ratio), and study.json carries its model
             and decode blocks. A teacher table is built only when every set's parquet has the teacher_hyp column
-The configs/study/study-t06.json the study's generator left (schedule.max_steps null: its box filled it) loads with
---set schedule.max_steps=<any>, as the trainer's validate needs one on the steps clock; the eval never reads it.
+The configs/study/study-t06.json the study's generator left (schedule.max_steps and optim.lr null: its box filled
+them) loads with --set schedule.max_steps=<any> --set optim.lr=<any> (as box smoke-b's stores-eval item passes them),
+as the trainer's validate needs both; the eval reads neither.
 
 Quantised variants (the full runs; kitsune.quant, contract section 8). --quant <fmt> (fp16, int8-w8a16, int8-w8a8,
 nvfp4-w4a16, nvfp4-w4a4, mxfp4-w4a4, fp8-w8a8; --fp16 is --quant fp16) scores the checkpoint in that format: the
@@ -155,8 +156,8 @@ Usage:
       --ckpt runs/<run_id>/checkpoints/step_<N> --out <dir> [--probe] [--sets eval_jsut eval_cv8] [--vram-frac 0.95]
   python scripts/05_evaluate.py --config runs/<rd>/config.json --ckpt runs/<rd>/checkpoints/step_<N> --out <dir> \
       --probe --tables evals/study                               # a CTC student on the manifest, its tables
-  python scripts/05_evaluate.py --config configs/study/study-t06.json --set schedule.max_steps=20000 --teachers \
-      --out evals/teachers --tables evals/study
+  python scripts/05_evaluate.py --config configs/study/study-t06.json --set schedule.max_steps=20000 \
+      --set optim.lr=0.0002 --teachers --out evals/teachers --tables evals/study
   python scripts/05_evaluate.py --from-evals runs/<run_id>/evals/step_<N> --system study-t03 \
       --config runs/<run_id>/config.json --out evals/study-t03 --tables evals/study
   python scripts/05_evaluate.py --config runs/<rd>/config.json --ckpt runs/<rd>/checkpoints/step_<N> \
@@ -1675,13 +1676,13 @@ def _tables_dir(args, out: Path) -> Path:
     return Path(args.tables).resolve() if args.tables else out / "tables"
 
 
-def default_system(cfg: dict, args, trained: dict, fmt: str = "none") -> str:
+def default_system(cfg: dict, fmt: str = "none") -> str:
     """The tables' system name without --system: the config's run_name, the run's name as the trainer gave it. A
     quantised eval (fmt) is <that name>@<fmt> (kitsune.quant.system_name)."""
     if fmt != "none":
         from kitsune.quant import system_name
 
-        return system_name(default_system(cfg, args, trained), fmt)
+        return system_name(default_system(cfg), fmt)
     return cfg["run_name"]
 
 
@@ -1695,7 +1696,7 @@ def study_intent(cfg: dict, args) -> str | None:
     if args.manifest and args.manifest.lower() == "none":
         return None
     if family_of(cfg) == "ctc":
-        return "a ctc (Parakeet) student is a study run"
+        return "a ctc (Parakeet) student is scored on the manifest"
     return None
 
 
@@ -1882,10 +1883,10 @@ def main(argv=None) -> int:
         if cfg["perf"]["compile"]:
             raise SystemExit("REFUSED: a quantised eval runs without torch.compile: --set perf.compile=false")
         args.history = "none"  # a variant has no eval history of its own: no verdict
-    system = args.system or default_system(cfg, args, trained, fmt)
+    system = args.system or default_system(cfg, fmt)
     if fmt != "none" and Q.split_system(system)[1] != fmt:
         raise SystemExit(f"REFUSED: --system {system} must end in @{fmt}: a variant's tables must never replace "
-                         f"its base system's (the default is {default_system(cfg, args, trained, fmt)})")
+                         f"its base system's (the default is {default_system(cfg, fmt)})")
     step = int(args.step if args.step is not None else trained.get("step", 0))
     sets = list(dict.fromkeys(args.sets or cfg["eval_sets"]))
     unknown = [s for s in sets if s not in cfg["eval_sets"]]
@@ -1895,7 +1896,7 @@ def main(argv=None) -> int:
     if mpath is None and (why := study_intent(cfg, args)):
         raise SystemExit(f"REFUSED: {why}, and there is no study manifest (--manifest, or {MANIFEST_FILE} next to the "
                          f"config's selection {cfg.get('selection')}): a study eval scores the manifest or does not "
-                         "run (--manifest none evaluates a study config without tables)")
+                         "run (--manifest none evaluates a ctc config without tables)")
     dev = cfg["device"]
     device = torch.device(("cuda" if torch.cuda.is_available() else "cpu") if dev in (None, "auto") else dev)
     impl = None

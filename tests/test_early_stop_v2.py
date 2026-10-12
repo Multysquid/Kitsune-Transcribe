@@ -275,6 +275,25 @@ def test_full_study_recipe_is_the_box_paths_check():
                              f"selection_recipe.study={json.dumps(prereg.STUDY_SELECTION)}"])
 
 
+def test_the_box_paths_other_keys_are_validated():
+    """The box path's other keys and optim.lr: pull_parakeet needs parakeet_root, selection_recipe.study is null or the
+    study's selection block (kitsune.prereg.STUDY_SELECTION, as configs/study/study-t06.json carries it), and optim.lr
+    is a number >= 0 (that config leaves it null)."""
+    from kitsune import prereg
+
+    m = load_script("04_distill")
+    base = m.load_config(None, [])
+    assert base["pull_parakeet"] is False and base["selection_recipe"]["study"] is None
+    for sets, match in ((["pull_parakeet=true"], "parakeet_root"),
+                        (['selection_recipe.study={"f1a_max": 0.5}'], "selection_recipe.study"),
+                        (["optim.lr=null"], "optim.lr")):
+        with pytest.raises(SystemExit, match=match):
+            m.load_config(None, sets)
+    ok = m.load_config(None, ["pull_parakeet=true", "parakeet_root=labels/full/parakeet_out",
+                              f"selection_recipe.study={json.dumps(prereg.STUDY_SELECTION)}"])
+    assert ok["pull_parakeet"] is True and ok["selection_recipe"]["study"] == prereg.STUDY_SELECTION
+
+
 def test_the_dev_pick_is_resume_fixed():
     m = load_script("04_distill")
     saved = m.load_config(None, ["eval.dev.every_steps=5"])

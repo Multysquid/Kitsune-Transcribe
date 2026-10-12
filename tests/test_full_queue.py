@@ -79,9 +79,6 @@ class FakeUploader:
         self.remote[path_in_repo] = data
         return []
 
-    def exists(self, path_in_repo) -> bool:
-        return path_in_repo in self.remote
-
     def download(self, path_in_repo, local_dir) -> Path:
         p = Path(local_dir) / path_in_repo
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -92,10 +89,6 @@ class FakeUploader:
         for k in [k for k in self.remote if k.startswith(prefix.rstrip("/") + "/")]:
             self.download(k, local_dir)
         return Path(local_dir) / prefix
-
-    def list_dir(self, path_in_repo) -> list[str]:
-        pre = path_in_repo.rstrip("/") + "/"
-        return sorted({k[len(pre):].split("/", 1)[0] for k in self.remote if k.startswith(pre)})
 
     def summaries(self, box: str) -> list[dict]:
         return [x for _, p, x in self.put if p == fullrun.box_summary_path(box)]
@@ -1700,6 +1693,68 @@ def test_step_tail_reads_only_what_was_appended(tmp_path):
     with open(f, "a", encoding="utf-8") as fh:
         fh.write('ain_s", "value": 2.0}\n')
     assert t.poll()[2]["train_s"] == 2.0 and Q.read_step_rows(tmp_path)[2]["wall"] == 2.0
+
+
+def test_the_gpus_are_the_detected_ones_in_the_rented_count(fq, monkeypatch):
+    """The queue base's GPUs (Queue.__init__): the settings' list, else detect_gpus (KITSUNE_GPUS, else nvidia-smi's
+    indices, else none). No GPU found refuses, and so does a count other than the one the box was rented with
+    (KITSUNE_N_GPUS), before the full queue's check of its registered count."""
+    detect = Q.detect_gpus
+    with pytest.raises(Q.QueueError, match=r"rented with 2 GPU\(s\) \(KITSUNE_N_GPUS\), the queue found 1"):
+        fq.make("p01", n_gpus=2)
+
+    def settings():
+        return F.FullSettings(root=fq.root, state_dir=fq.state, out_repo=None, python=PY, uploader=FakeUploader(),
+                              proc_root=fq.tmp / "np", cgroup=fq.tmp / "nc")
+
+    monkeypatch.setenv("KITSUNE_N_GPUS", "1")
+    monkeypatch.setattr(Q, "detect_gpus", lambda: ["3"])
+    assert F.FullQueue("p01", settings(), registry=fq.reg).gpus == ["3"]
+    monkeypatch.setenv("KITSUNE_N_GPUS", "2")
+    with pytest.raises(Q.QueueError, match="KITSUNE_N_GPUS"):
+        F.FullQueue("p01", settings(), registry=fq.reg)
+    monkeypatch.setattr(Q, "detect_gpus", lambda: [])
+    with pytest.raises(Q.QueueError, match="no GPU found"):
+        F.FullQueue("p01", settings(), registry=fq.reg)
+
+    def no_smi(*a, **k):
+        raise OSError("nvidia-smi: not found")
+
+    monkeypatch.delenv("KITSUNE_GPUS", raising=False)
+    monkeypatch.setattr(Q.subprocess, "run", no_smi)
+    assert detect() == []
+    monkeypatch.setattr(Q.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="0\n1\nNo devices\n"))
+    assert detect() == ["0", "1"]
+    monkeypatch.setenv("KITSUNE_GPUS", "2, 3,")
+    assert detect() == ["2", "3"]
+
+
+def test_the_uploader_backs_off_a_rate_limited_runs_repo(tmp_path, monkeypatch):
+    """HubUploader's writes go through finish.hub_retry: against a runs repo that answers a 429 over one commit a
+    second (tests/fake_runs_repo.py), a file put and a run dir's sync, each right after another commit, are refused
+    once, get through on a later try and verify; the accepted commits keep the repo's rate."""
+    import finish
+
+    hub = DirHub.create(tmp_path / "hub", limit=1, window_s=1.0)
+    monkeypatch.setattr(finish, "HUB_RETRY_WAITS", (0.1, 0.2, 0.4, 0.8, 1.6))
+    up = Q.HubUploader("u/kitsune-runs")
+    up._api = FakeApi(hub, "p01")
+    summary = tmp_path / "queue_summary.json"
+    summary.write_text("{}", encoding="utf-8")
+    rd = tmp_path / "runs" / "full-p01-20261001T000000Z"
+    (rd / "metrics").mkdir(parents=True)
+    (rd / "events.jsonl").write_text('{"kind": "start"}\n', encoding="utf-8")
+    (rd / "metrics" / "scalars.jsonl").write_text('{"step": 1}\n', encoding="utf-8")
+    assert up.put_file(summary, "full/box-p01/queue_summary.json") == []
+    assert up.put_file(summary, "full/box-p01/smoke_verdict.json") == []
+    assert up.sync_run(rd) == []
+    commits = hub.commits()
+    refused = [c["paths"] for c in commits if not c["accepted"]]
+    assert ["full/box-p01/smoke_verdict.json"] in refused
+    assert [f"runs/{rd.name}/events.jsonl", f"runs/{rd.name}/metrics/scalars.jsonl"] in refused
+    walls = [c["wall"] for c in commits if c["accepted"]]
+    assert len(walls) == 3 and all(b - a >= 1.0 for a, b in zip(walls, walls[1:]))
+    assert hub.path(f"runs/{rd.name}/events.jsonl").read_bytes() == (rd / "events.jsonl").read_bytes()
 
 
 # ================================================================ the readout rule (a readout gets its number)

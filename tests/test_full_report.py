@@ -1131,3 +1131,41 @@ def test_run_summaries_in_the_trainer_layout(tmp_path):
     (root / "study-t01-20261001T030000Z" / "summary.json").write_text("{", encoding="utf-8")
     with pytest.raises(FR.InputError, match="study-t01-20261001T030000Z"):
         FR.load_summaries(root)
+
+
+def test_tables_in_every_layout(tmp_path):
+    """--tables (load_tables): a system as one file with a set column, as one file per set (05 --tables), or as a
+    05_evaluate --out / trainer evals dir of greedy_<set>.parquet, whose other files (tf_*.parquet, a set outside the
+    manifest) are listed as ignored. A one-file table without a set column, a per-set file whose set column names
+    another set and a dir without a system table refuse."""
+    sets = ("eval_jsut", "eval_cv8")
+
+    def table(s: str, n: int = 3) -> pd.DataFrame:
+        return pd.DataFrame(dict(id=[f"{s}/u{i}" for i in range(n)], set=s, ref=["あいう"] * n, hyp=["あいえ"] * n,
+                                 edits=[1] * n, ref_len=[3] * n))
+
+    d = tmp_path / "tables"
+    (d / "per-set").mkdir(parents=True)
+    (d / "out-dir").mkdir()
+    pd.concat([table(s) for s in sets], ignore_index=True).to_parquet(d / "one-file.parquet")
+    for s in sets:
+        table(s).to_parquet(d / "per-set" / f"{s}.parquet")
+        table(s).drop(columns="set").assign(source=s).to_parquet(d / "out-dir" / f"greedy_{s}.parquet")
+    pd.DataFrame(dict(id=["x"])).to_parquet(d / "out-dir" / "tf_eval_jsut.parquet")
+    table("eval_reazon").to_parquet(d / "per-set" / "eval_reazon.parquet")
+    tables, ignored = FR.load_tables(d, sets)
+    assert sorted(tables) == ["one-file", "out-dir", "per-set"]
+    for name, df in tables.items():
+        assert sorted(df["set"].value_counts().items()) == [("eval_cv8", 3), ("eval_jsut", 3)], name
+        assert "source" not in df.columns and (df["edits"] == 1).all(), name
+    assert sorted(ignored) == [str(d / "out-dir" / "tf_eval_jsut.parquet"), str(d / "per-set" / "eval_reazon.parquet")]
+    table("eval_cv8").to_parquet(d / "per-set" / "eval_jsut.parquet")
+    with pytest.raises(SystemExit, match=r"its set column says \['eval_cv8'\], the file name eval_jsut"):
+        FR.load_tables(d, sets)
+    table("eval_jsut").drop(columns="set").to_parquet(d / "no-set.parquet")
+    with pytest.raises(SystemExit, match="a one-file system table needs a set column"):
+        FR.load_tables(d, sets)
+    (tmp_path / "none" / "sys").mkdir(parents=True)
+    pd.DataFrame(dict(id=["x"])).to_parquet(tmp_path / "none" / "sys" / "tf_eval_jsut.parquet")
+    with pytest.raises(SystemExit, match="no system table under"):
+        FR.load_tables(tmp_path / "none", sets)
