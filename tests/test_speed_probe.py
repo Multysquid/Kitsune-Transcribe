@@ -1,10 +1,9 @@
 """tools/speed_probe.py on tiny models on CPU: every kind (a Transcribe student and the Cohere path, a CTC student,
 the Parakeet teacher's CTC and TDT paths) times a batched pass and batch-1 latencies on one fixed id list, writes the
-record tools/study_report.py's Pareto view reads, merges systems into one file and refuses another id list; the id
-draw is reproducible; --require-idle refuses a busy GPU. The decode it times is the evaluator's: the CTC student's
-CER on the list equals kitsune.evaluate.ctc_eval's, a trained-length AED decode greedy_eval's. An untrained Transcribe
-init dir is timed at the teacher's token counts (decode_len); the warm-ups and the allocator's cache never fall inside
-a clock (the order of the passes, on a recording runner); the study box queue's command lines parse. F4: a
+record tools/full_report.py reads, merges systems into one file and refuses another id list; the id draw is
+reproducible; --require-idle refuses a busy GPU. The decode it times is the evaluator's: the CTC student's CER on the
+list equals kitsune.evaluate.ctc_eval's, an AED decode greedy_eval's; the warm-ups and the allocator's cache never fall
+inside a clock (the order of the passes, on a recording runner). F4: a
 --quant / --compile record carries its quant recipe and a CER sanity against the same weights' unquantised decode,
 loaded only after the clocks; an insane one is written and exits 4; a probe that raises is recorded in the file's
 failed block until the system's next good probe.
@@ -29,10 +28,8 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 import speed_probe as sp  # noqa: E402
-import study_report  # noqa: E402
 from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa: E402
 
-from kitsune import study_stats as ss  # noqa: E402
 from kitsune import trainset  # noqa: E402
 from kitsune.patches import patch_relpos_once_per_batch  # noqa: E402
 from kitsune.store import ids_sha256  # noqa: E402
@@ -76,7 +73,7 @@ def check_record(r: dict, n: int):
 
 def test_ctc_and_parakeet_paths_and_the_merged_file(env, tmp_path):
     """A CTC student, then the Parakeet teacher's CTC and TDT paths into the same file: one id list for all (the
-    per-set draw, reused from the file), each a complete record; tools/study_report.py reads it for its Pareto view."""
+    per-set draw, reused from the file), each a complete record."""
     out = tmp_path / "speed.json"
     assert run(env, out, "--kind", "ctc", "--model", str(env["ctc"]), "--system", "study-p01", "--per-set", "3") == 0
     assert run(env, out, "--kind", "parakeet-ctc", "--model", str(env["parakeet"])) == 0
@@ -88,12 +85,6 @@ def test_ctc_and_parakeet_paths_and_the_merged_file(env, tmp_path):
     for name, r in doc["systems"].items():
         check_record(r, 6)
     assert doc["systems"]["parakeet-tdt"]["kind"] == "parakeet-tdt"
-    assert all(r["decode_len"] is None for r in doc["systems"].values())  # no autoregressive decode to pin
-    assert doc["systems"]["study-p01"]["trained"] is False and doc["systems"]["parakeet-ctc"]["trained"] is None
-    speed = study_report.load_speed(out)
-    e = ss.speed_entry(speed["parakeet-ctc"])
-    assert e["rtf"] == doc["systems"]["parakeet-ctc"]["rtf"] and e["vram_gb"] is None
-    assert e["p50_s"] == doc["systems"]["parakeet-ctc"]["p50_s"] and "p95_s" in e
     # a record is replaced by the same system's next one, never duplicated
     assert run(env, out, "--kind", "parakeet-ctc", "--model", str(env["parakeet"]), "--latency-n", "2") == 0
     doc2 = json.loads(out.read_text(encoding="utf-8"))
@@ -212,46 +203,29 @@ def aed_dir(tmp_path_factory):
 
 def test_transcribe_kinds(env, aed_dir, tmp_path):
     """A Transcribe student (and the Cohere path, here on the same tiny weights through --model): the teacher pass's
-    greedy decode timed like the others. The init dir (no trained record) is timed at the teacher's token counts:
-    every batch decodes exactly its longest row's stored n_tok (the queue times the study's init dirs as their shapes);
-    --decode-len greedy decodes freely, and its CER on the list equals kitsune.evaluate.greedy_eval's; the Cohere path
-    (a teacher) decodes freely under auto."""
-    import numpy as np
-
+    greedy decode timed like the others, freely (an untrained one runs to its cap); its CER and tokens on the list
+    equal kitsune.evaluate.greedy_eval's."""
     from kitsune import evaluate as ev
     from kitsune import student as S
     from kitsune.features import LogMel
     from transformers import AutoProcessor
 
     out = tmp_path / "speed.json"
-    assert run(env, out, "--kind", "aed", "--model", str(aed_dir), "--system", "study-t005", "--per-set", "2") == 0
-    assert run(env, out, "--kind", "aed", "--model", str(aed_dir), "--system", "t005-free", "--decode-len",
-               "greedy") == 0
+    assert run(env, out, "--kind", "aed", "--model", str(aed_dir), "--system", "t005-free", "--per-set", "2") == 0
     assert run(env, out, "--kind", "cohere", "--model", str(aed_dir), "--system", "cohere-tiny") == 0
     doc = json.loads(out.read_text(encoding="utf-8"))
     for r in doc["systems"].values():
         check_record(r, 4)
     sysd = doc["systems"]
-    assert sysd["cohere-tiny"]["kind"] == "cohere" and sysd["cohere-tiny"]["decode_len"] == "greedy"
-    assert sysd["cohere-tiny"]["trained"] is None
-    assert sysd["study-t005"]["decode_len"] == "teacher" and sysd["study-t005"]["trained"] is False
-    assert sysd["t005-free"]["decode_len"] == "greedy"
-    # pinned: every batch of the batched plan decodes its longest row's teacher tokens (capped at max_new)
-    store = env["store"]
-    pos = {u.id: i for i, u in enumerate(store.utts)}
-    dur = np.array([store.utts[pos[i]].duration for i in doc["ids"]])
-    ntok = [store.utts[pos[i]].n_tok for i in doc["ids"]]
+    assert sysd["cohere-tiny"]["kind"] == "cohere" and sysd["t005-free"]["kind"] == "aed"
     model = S.load_student(aed_dir, "cpu")
-    cap = model.config.max_position_embeddings - len(store.info.get("prompt", trainset.PROMPT)) - 1
-    plan = trainset.pack_micro_batches(np.argsort(-dur, kind="stable"), dur, 6.0)
-    want = sum(len(b) * min(max(ntok[i] for i in b), int(16 + 10 * dur[b].max()), cap) for b in plan) / len(dur)
-    assert sysd["study-t005"]["tokens_per_utt"] == pytest.approx(want)
     proc = AutoProcessor.from_pretrained(str(aed_dir))
     patch_relpos_once_per_batch(model)
     summ, g = ev.greedy_eval(model, env["store"], doc["ids"], LogMel.from_feature_extractor(proc.feature_extractor),
                              "cpu", 6.0, tokenizer=proc.tokenizer)
-    assert sysd["t005-free"]["cer_ref_corpus"] == ev.corpus_cer(g["hyp"].tolist(), g["ref"].tolist())["cer"]
-    assert sysd["t005-free"]["tokens_per_utt"] == pytest.approx(g["n_tok"].sum() / len(g))
+    for name in ("t005-free", "cohere-tiny"):
+        assert sysd[name]["cer_ref_corpus"] == ev.corpus_cer(g["hyp"].tolist(), g["ref"].tolist())["cer"], name
+        assert sysd[name]["tokens_per_utt"] == pytest.approx(g["n_tok"].sum() / len(g)), name
 
 
 class RecordingRunner:
@@ -267,7 +241,7 @@ class RecordingRunner:
 
         return contextlib.nullcontext()
 
-    def decode(self, waves, durations, n_tok):
+    def decode(self, waves, durations):
         self.events.append(("decode", len(waves), round(max(durations), 3)))
         self.tokens += len(waves)
         return ["" for _ in waves]
@@ -296,34 +270,6 @@ def test_no_warm_up_and_no_allocator_growth_inside_a_clock(monkeypatch):
                       ("decode", 1, 3.0), ("decode", 1, 1.0), "reset_peak",
                       *[x for d in singles for x in ("clock", d, "clock")]]
     assert r["warmup_batches"] == 1 and r["warmup_1"] == 2 and r["n_latency"] == 3 and r["tokens_per_utt"] == 1.0
-
-
-def test_the_decode_length_rule(tmp_path):
-    """auto: an AED student dir without the trainer's trained record is pinned to the teacher's lengths, a trained
-    checkpoint and the Cohere teacher decode freely; CTC and TDT have no length to pin."""
-    init, done = tmp_path / "init", tmp_path / "done"
-    for d, meta in ((init, dict(format=1, stage="complete")), (done, dict(format=1, trained=dict(step=10)))):
-        d.mkdir()
-        (d / "student_meta.json").write_text(json.dumps(meta), encoding="utf-8")
-    assert sp.trained_weights("aed", str(init)) is False and sp.trained_weights("aed", str(done)) is True
-    assert sp.trained_weights("aed", str(tmp_path / "none")) is False and sp.trained_weights("cohere", None) is None
-    assert sp.decode_len_of("aed", "auto", False) == "teacher" and sp.decode_len_of("aed", "auto", True) == "greedy"
-    assert sp.decode_len_of("cohere", "auto", None) == "greedy" and sp.decode_len_of("aed", "greedy", False) == "greedy"
-    assert sp.decode_len_of("cohere", "teacher", None) == "teacher"
-    assert sp.decode_len_of("ctc", "auto", False) is None and sp.decode_len_of("parakeet-tdt", "teacher", None) is None
-
-
-def test_the_study_queues_command_lines_parse():
-    """The command lines kitsune/study_queue.py's phase_speed runs (a student init dir, the Cohere teacher from the HF
-    cache, the Parakeet teacher's two paths), one shared --out: they parse, and the teachers name themselves."""
-    common = ["--store", "cache/eval", "--per-set", "40", "--out", "runs/speed-B/speed.json", "--require-idle"]
-    for kind, model, system in (("aed", "students/study/t06", "study-t06"), ("ctc", "students/study/p03", "study-p03"),
-                                ("cohere", None, "cohere"),
-                                ("parakeet-ctc", "models/parakeet-tdt_ctc-0.6b-ja-hf", "parakeet-ctc"),
-                                ("parakeet-tdt", "models/parakeet-tdt_ctc-0.6b-ja-hf", "parakeet-tdt")):
-        a = sp.parse_args(["--kind", kind, *(["--model", model] if model else []), "--system", system, *common])
-        assert (a.kind, a.model, a.system, a.per_set, a.require_idle, a.decode_len) == (kind, model, system, 40, True,
-                                                                                        "auto")
 
 
 # ------------------------------------------------------------------------------------------------ quantised variants
@@ -377,7 +323,7 @@ def test_quant_records(env, tmp_path):
 
 def test_the_reference_loads_after_the_clocks_unquantised(env, tmp_path, monkeypatch):
     """The sanity's reference is loaded only after the timed probe (it never shares the clocks or the VRAM peaks),
-    with quant None and compile False, the same rel-pos patch and decode length; a bf16 probe loads nothing more."""
+    with quant None and compile False and the same rel-pos patch; a bf16 probe loads nothing more."""
     calls, real_load, real_probe = [], sp.load_runner, sp.probe
     monkeypatch.setattr(sp, "load_runner", lambda *a, **k: calls.append(("load", k.get("quant"), k.get("compile"),
                                                                          k.get("relpos_patch")))
@@ -401,7 +347,7 @@ def test_an_insane_record_is_written_and_exits_4(env, tmp_path, monkeypatch, cap
     def garbage(*a, **k):
         runner, desc = real_load(*a, **k)
         if k.get("quant"):
-            runner.decode = lambda waves, durations, n_tok: ["ン" * 200 for _ in waves]
+            runner.decode = lambda waves, durations: ["ン" * 200 for _ in waves]
         return runner, desc
 
     monkeypatch.setattr(sp, "load_runner", garbage)
@@ -527,7 +473,7 @@ def test_quant_after_the_runners_bf16_cast(env):
         assert runner.quant["format"] == fmt and runner.weights_bytes < base.weights_bytes
         runner.amp = torch.bfloat16  # _amp's CUDA value: autocast casts the fp32 features to the bf16 model's dtype
         with runner.context():
-            hyps = runner.decode([store.wave(0), store.wave(1)], [float(u.duration) for u in store.utts[:2]], [1, 1])
+            hyps = runner.decode([store.wave(0), store.wave(1)], [float(u.duration) for u in store.utts[:2]])
         assert len(hyps) == 2 and Q.uncalled(runner.model) == []
 
 
@@ -561,7 +507,7 @@ def whisper_dir(tmp_path_factory):
 
 def test_whisper_kind(env, whisper_dir, tmp_path, monkeypatch):
     """--kind whisper: the probe's real-seconds batches cut at the row cap (--batch-rows here; the model's max_rows by
-    default), no rel-pos patch (relpos_patch null: Whisper has no FastConformer), the free decode (decode_len greedy),
+    default), no rel-pos patch (relpos_patch null: Whisper has no FastConformer), the free decode,
     versions.machine_id from $KITSUNE_MACHINE_ID and the CPU model, a beat of the item's heartbeat; the decode it times
     is whisper_eval's: greedy_whisper over the same batches gives the record's CER, tokens and truncated rows; the
     fp32 head by default, the model's own with --no-fp32-head, and the record's fp32_head says which."""
@@ -579,7 +525,7 @@ def test_whisper_kind(env, whisper_dir, tmp_path, monkeypatch):
     doc = json.loads(out.read_text(encoding="utf-8"))
     r = doc["systems"]["whisper-tiny"]
     assert r["kind"] == "whisper" and r["model"] == str(whisper_dir) and r["relpos_patch"] is None
-    assert r["decode_len"] == "greedy" and r["trained"] is None and r["max_rows"] == 2 and r["fp32_head"] is True
+    assert "decode_len" not in r and "trained" not in r and r["max_rows"] == 2 and r["fp32_head"] is True
     assert r["versions"]["machine_id"] == "m-31337" and "cpu" in r["versions"]
     assert r["n_timestamp_tokens"] == 0 and r["n_latency"] == r["n_utts"] == 6 and r["rtf"] > 0
     assert r["params_total"] > 0 and r["device"] == "cpu" and r["dtype"] == "fp32" and r["vram_gb"] is None
@@ -628,16 +574,13 @@ def test_whisper_kind(env, whisper_dir, tmp_path, monkeypatch):
 
 
 def test_whisper_command_lines():
-    """--kind whisper needs --model; a key names its own system, a model dir needs --system; --decode-len teacher (an
-    AED decode pinned to Cohere's token counts), a row cap below 1 and --no-fp32-head on another kind are refused;
-    the free decode is its length rule."""
+    """--kind whisper needs --model; a key names its own system, a model dir needs --system; a row cap below 1 and
+    --no-fp32-head on another kind are refused."""
     common = ["--store", "cache/eval", "--per-set", "40", "--out", "runs/speed-smoke-b-x/speed.json", "--require-idle"]
     a = sp.parse_args(["--kind", "whisper", "--model", "whisper-large-v3", "--hf-cache", "cache/hf", *common])
-    assert (a.system, a.hf_cache, a.batch_rows, a.decode_len) == ("whisper-large-v3", "cache/hf", None, "auto")
-    assert sp.decode_len_of("whisper", "auto", None) == "greedy" and "whisper" in sp.KINDS
+    assert (a.system, a.hf_cache, a.batch_rows) == ("whisper-large-v3", "cache/hf", None) and "whisper" in sp.KINDS
     for bad in (["--kind", "whisper", *common],
                 ["--kind", "whisper", "--model", "some/dir", *common],
-                ["--kind", "whisper", "--model", "whisper-small", "--decode-len", "teacher", *common],
                 ["--kind", "ctc", "--model", "m", "--system", "s", "--batch-rows", "0", *common],
                 ["--kind", "aed", "--model", "m", "--system", "s", "--no-fp32-head", *common]):
         with pytest.raises(SystemExit):

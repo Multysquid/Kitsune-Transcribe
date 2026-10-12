@@ -69,8 +69,8 @@ GRAD_FLOOR = 1e-6  # parameters whose max |g| is below this x the global max are
 
 
 def parity_model():
-    """tiny_model with its subsampling convs re-initialised to the PyTorch default (seeded), as
-    kitsune.student.build_scratch_student does: HF's N(0, 0.02) shrinks the subsampling output to ~1e-5, so every
+    """tiny_model with its subsampling convs re-initialised to the PyTorch default (seeded), as the size study's
+    from-scratch builder did: HF's N(0, 0.02) shrinks the subsampling output to ~1e-5, so every
     encoder attention gradient - the part the patch changes - sits at 1e-11..1e-8, at the float32 noise floor of the
     backward pass; with the default init the patched relative_k_proj gets gradients of ~1e-5..1e-4 whose run-to-run
     noise is ~1e-7 relative, so a wrong gradient through the patch shows."""

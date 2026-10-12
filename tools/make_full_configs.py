@@ -1,4 +1,4 @@
-"""Generate the full-data runs' configs, configs/full/<name>.json, from the size study's generator (build contract 7).
+"""Generate the full-data runs' configs, configs/full/<name>.json, from the size study's run configs (build contract 7).
 
 Trainer configs (the four full runs and their smokes). Every one is the study run's config as
 tools/make_study_configs.py makes it (run_config(study_run): the trainer part of configs/next_run_template.json,
@@ -106,7 +106,7 @@ TOOLS = ROOT / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
-import make_study_configs as study  # noqa: E402  (the size study's generator: run_config, _merge, render)
+import make_study_configs as study  # noqa: E402  (the size study's run configs: run_config, _merge, render)
 
 from kitsune import fullrun  # noqa: E402
 
@@ -966,12 +966,12 @@ def smoke_data() -> dict:
     return dict(copy.deepcopy(fullrun.SMOKE_DATA), pull_parakeet=True)
 
 
-def full_config(x: str, r: dict | None = None, data: dict | None = None, augment: bool = True) -> dict:
+def full_config(x: str, data: dict | None = None, augment: bool = True) -> dict:
     """full-<x>: the study run's config with the full data (data: another data block in its place), FULL_RUNS[x],
     COMMON and, unless augment is false, the run's augment block (FULL_RUNS[x]["augment"]: the keys it changes, at the
     config's end; the trainer's DEFAULTS fill the rest)."""
     run = FULL_RUNS[x]
-    cfg = _with_data(study.run_config(run["study_run"], r, RUNS_REPO), full_data(x) if data is None else data)
+    cfg = _with_data(study.run_config(run["study_run"], RUNS_REPO), full_data(x) if data is None else data)
     cfg = study._merge(cfg, COMMON)
     cfg = study._merge(cfg, {
         "run_name": f"full-{x}",
@@ -987,12 +987,12 @@ def full_config(x: str, r: dict | None = None, data: dict | None = None, augment
     return cfg
 
 
-def smoke_config(x: str, plan: dict, r: dict | None = None) -> dict:
+def smoke_config(x: str, plan: dict) -> dict:
     """smoke-<x>: full-<x> without its augment block on the smoke data with SMOKE, SMOKE_EPOCHS, the full data's worst
     shapes and the forced trigger. Never the augment block: the smoke configs are the ones smoke A ran, byte for byte
     (tests/test_full_configs.py SMOKE_SHA256), and the recipe's own test is box p01's (DECISIONS H1), not a smoke."""
     base = dict(copy.deepcopy(fullrun.FULL_DATA), pull_parakeet=True) if x in SMOKE_BASE_PULL else None
-    cfg = _with_data(full_config(x, r, data=base, augment=False), smoke_data())
+    cfg = _with_data(full_config(x, data=base, augment=False), smoke_data())
     cfg = study._merge(cfg, {"schedule": {"epochs": SMOKE_EPOCHS[x]}})
     cfg = study._merge(cfg, SMOKE)
     cfg = study._merge(cfg, SMOKE_OVER.get(x, {}))
@@ -1040,12 +1040,12 @@ def data_configs() -> dict[str, dict]:
     }
 
 
-def all_configs(out_dir: Path = OUT_DIR, r: dict | None = None, plan: dict | None = None) -> dict[str, dict]:
+def all_configs(out_dir: Path = OUT_DIR, plan: dict | None = None) -> dict[str, dict]:
     """name -> config for every generated file under configs/full/ (PlanError without a valid PLAN_FILE; plan: the
     record already loaded)."""
     plan = plan if plan is not None else load_plan(out_dir)
-    out = {f"full-{x}": full_config(x, r) for x in FULL_RUNS}
-    out.update({f"smoke-{x}": smoke_config(x, plan, r) for x in FULL_RUNS})
+    out = {f"full-{x}": full_config(x) for x in FULL_RUNS}
+    out.update({f"smoke-{x}": smoke_config(x, plan) for x in FULL_RUNS})
     out.update(data_configs())
     return out
 

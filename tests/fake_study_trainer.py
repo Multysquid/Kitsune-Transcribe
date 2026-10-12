@@ -1,47 +1,34 @@
-"""A stand-in for every process the study box's queue starts (kitsune/study_queue.py), for its CPU dry runs.
+"""A stand-in for every process the full-data runs' box queue starts (kitsune/full_queue.py), for its CPU dry runs.
 
-It writes what the queue reads, in the trainer's formats, fast: runs/<run_name>-<stamp>/ with config.json
-({"config": ...}), events.jsonl, metrics/scalars.jsonl (sched/train_s, time/data_wait_s, time/step_s with wall times),
-checkpoints (step_<N>/ weights, full_step_<N>/ states) and summary.json (calibrate / lr_probe / branch blocks), and
-exits as the trainer would. One JSON file per invocation goes into the dir $FAKE_LOG (t0, t1, argv,
-CUDA_VISIBLE_DEVICES, run_name, rc), so a test can check the order, the concurrency and the GPU pins; a process killed
-by the queue leaves none.
+It writes what the queue reads, in the trainer's formats, fast, and exits as the trainer would. One JSON file per
+invocation goes into the dir $FAKE_LOG (t0, t1, argv, CUDA_VISIBLE_DEVICES, item, run_name, rc), so a test can check the
+order, the concurrency and the GPU pins; a process killed by the queue leaves none. (The size study's queue had its
+own modes here - calibration, LR probes, T/2 branches, the anchor - removed with it after the study.)
 
 Modes (by argv[1]):
   train      scripts/04_distill.py: --config C / --resume RUN_DIR, --set k=v (JSON values, as the trainer parses them)
-  stores     python -m kitsune.study_queue build-stores --config C
-  anchor     python -m kitsune.study_queue anchor ... --out DIR
-  speed      tools/speed_probe.py --model M --family F --out FILE
-Behaviour knobs (env, JSON): FAKE_SETUP_S {run_name prefix: seconds before the first step}; FAKE_STEP_S (seconds per
-step, default 0.002); FAKE_WAIT {run_name prefix: data-wait fraction; ".w12": the fraction with perf.num_workers 12};
-FAKE_OBJ {probe run name: objective or "nan" (diverges: FloatingPointError)}; FAKE_CRASH {run_name: fraction} (the
-first launch writes its states up to that fraction of max_steps, then exits 1); FAKE_MAIN_S (seconds a main run
-takes after writing its fraction states, or {run_name prefix: seconds}); KITSUNE_CRASH_AT_STEP as the trainer reads it
-(a crash before that step, full states every ckpt.full_every_steps); FAKE_CALIB_CRASH {run_name prefix: step} (a
-calibration run's first try exits 1 at that step); FAKE_FLAT {run_name prefix: true} (the smoke's loss does not fall:
-a calibration run logs it, a run with smoke.require_loss_decrease fails with SmokeFailed); FAKE_FAIL {item prefix: rc}
-(an anchor or speed item exits rc: a failed readout); FAKE_HUB (a tests/fake_runs_repo.py dir: a main run commits its
-log syncs there, FAKE_SYNCS of them, FAKE_BOX its box, retried on a 429 after FAKE_SYNC_WAITS).
+  stores     python -m kitsune.full_queue build-stores --config C
+  speed      tools/speed_probe.py --model M --system S --out FILE (one --out, merged per system)
 
-The full runs (kitsune/full_queue.py; a config on the epochs clock, as configs/full/*.json): train_full writes what the
-queue, its stall check and its smoke verdict read (build contract 4.4) - per step metrics/scalars.jsonl rows
-(sched/train_s, time/step_s, mem/step_peak_reserved_gb, time/data_wait_s) and a beat of $KITSUNE_HEARTBEAT; the setup
-events (threads, smoke_sdpa, memory_probe, dev_store, data.stores_reused, frame_preflight for family ctc); periodic full
-states (full_step_<N>/ with model.pt, optimizer.pt, l2sp.pt, trainer.pt, trainer.json and a `checkpoint` event); the WSD
-cooldown at 0.8 of the steps (phase cooldown, the pre_cooldown full state, ckpt_upload_ok); the export step_<S>/ and
-summary.json (steps, epochs, stopped_early, end_reason, resume_resets, checkpoints.weights, throughput). Knobs (env,
-JSON; {prefix: value} tables keyed by run name unless said otherwise): FAKE_EPOCH_STEPS (steps per epoch, 20; or a
-table), FAKE_STEP_S (seconds per step), FAKE_STEP_VALUE (the logged time/step_s, 1.0; or a table), FAKE_MEM_GB (20.0),
-FAKE_FULL_EVERY (steps between periodic full states, 5), FAKE_HB ("0": no beats), FAKE_HANG {name: step} (the first
-launch stops beating at that step and sleeps until killed), FAKE_RC {name: rc or [rc per launch]} (that launch exits rc
-at step FAKE_RC_AT, 2, after a failed summary; 0 in a list runs through), FAKE_ERROR {name: error} (every launch fails
-at step 1 with that summary error, e.g. "SmokeFailed: ..."), FAKE_ERROR_RESUME (the same for resumed launches only, e.g.
-"ResumeMismatch: ..."), FAKE_EARLY {name: frac} (an early stop at that fraction: early_stop with action cooldown, the
-cooldown over 0.2 of the steps so far, summary stopped_early), FAKE_TIMED {name: every N steps} (timed full states into
-the scratch DirHub FAKE_SCRATCH: one commit of the state and its runs/<id>/timed_state.json pointer that deletes the
-previous state, a squash, a timed_state_upload_ok event), FAKE_DEADLINE_S (a KITSUNE_DEADLINE nearer than this, 3600: a
-deadline_cooldown event with action start), FAKE_THREADS (torch_threads, default KITSUNE_THREADS_PER_GPU or 8),
-FAKE_WAIT_FRAC (the loader's share: every step's time/data_wait_s = it x the step's time/step_s, 0.01; the summary's
+A training run (a config on the epochs clock, as configs/full/*.json): train_full writes what the queue, its stall check
+and its smoke verdict read (build contract 4.4) - per step metrics/scalars.jsonl rows (sched/train_s, time/step_s,
+mem/step_peak_reserved_gb, time/data_wait_s) and a beat of $KITSUNE_HEARTBEAT; the setup events (threads, smoke_sdpa,
+memory_probe, dev_store, data.stores_reused, frame_preflight for family ctc); periodic full states (full_step_<N>/ with
+model.pt, optimizer.pt, l2sp.pt, trainer.pt, trainer.json and a `checkpoint` event); the WSD cooldown at 0.8 of the
+steps (phase cooldown, the pre_cooldown full state, ckpt_upload_ok); the export step_<S>/ and summary.json (steps,
+epochs, stopped_early, end_reason, resume_resets, checkpoints.weights, throughput). Knobs (env, JSON; {prefix: value}
+tables keyed by run name unless said otherwise): FAKE_EPOCH_STEPS (steps per epoch, 20; or a table), FAKE_STEP_S
+(seconds per step), FAKE_STEP_VALUE (the logged time/step_s, 1.0; or a table), FAKE_MEM_GB (20.0), FAKE_FULL_EVERY
+(steps between periodic full states, 5), FAKE_HB ("0": no beats), FAKE_HANG {name: step} (the first launch stops beating
+at that step and sleeps until killed), FAKE_RC {name: rc or [rc per launch]} (that launch exits rc at step FAKE_RC_AT,
+2, after a failed summary; 0 in a list runs through), FAKE_ERROR {name: error} (every launch fails at step 1 with that
+summary error, e.g. "SmokeFailed: ..."), FAKE_ERROR_RESUME (the same for resumed launches only, e.g. "ResumeMismatch:
+..."), FAKE_EARLY {name: frac} (an early stop at that fraction: early_stop with action cooldown, the cooldown over 0.2
+of the steps so far, summary stopped_early), FAKE_TIMED {name: every N steps} (timed full states into the scratch DirHub
+FAKE_SCRATCH: one commit of the state and its runs/<id>/timed_state.json pointer that deletes the previous state, a
+squash, a timed_state_upload_ok event), FAKE_DEADLINE_S (a KITSUNE_DEADLINE nearer than this, 3600: a deadline_cooldown
+event with action start), FAKE_THREADS (torch_threads, default KITSUNE_THREADS_PER_GPU or 8), FAKE_WAIT_FRAC (the
+loader's share: every step's time/data_wait_s = it x the step's time/step_s, 0.01; the summary's
 throughput.data_wait_frac is the whole run's, start-ups included), FAKE_STARTUP_WAIT_S (added to the time/data_wait_s of
 each launch's first step, as a real loader's spawned workers start: 0; each launch logs phase {name: "train", at_step}
 before its first step, as the trainer does). --set schedule.resume_reset=true on a resumed launch: a resume_reset event
@@ -51,8 +38,8 @@ More modes: readout (scripts/05_evaluate.py: --out DIR --ckpt DIR --system S: st
 prefix: value}, 0.12, m4_teacher, m4_ratio, jg, jg_nostyle, gate_pooled and strata.eval_jsut.cer_nostyle; exit 2 when
 --ckpt is missing), eval (a registry eval item: --out DIR; FAKE_WRITES {item: {path under --out: JSON}}), check-resume
 (python -m kitsune.full_queue check-resume --run-dir D: exits FAKE_CHECK_RESUME {run dir name prefix: rc}, 0). FAKE_FAIL
-also fails stores, readout and eval items (rc, or [rc per launch]); FAKE_ITEM_S {item prefix: seconds} is how long a
-stores, readout, eval or speed item takes.
+also fails stores, readout, eval and speed items (rc, or [rc per launch]); FAKE_ITEM_S {item prefix: seconds} is how
+long a stores, readout, eval or speed item takes.
 """
 import json
 import math
@@ -74,11 +61,6 @@ def by_prefix(table: dict, name: str, default=None):
         if name.startswith(k) and (best is None or len(k) > len(best[0])):
             best = (k, v)
     return best[1] if best else default
-
-
-def main_s(name: str) -> float:
-    v = env_json("FAKE_MAIN_S", 0.05)
-    return float(by_prefix(v, name, 0.05) if isinstance(v, dict) else v)
 
 
 def apply_set(cfg: dict, s: str):
@@ -129,35 +111,6 @@ def event(run: Path, kind: str, **f):
         fh.write(json.dumps({"kind": kind, "wall": time.time(), **f}) + "\n")
 
 
-def hub_syncs(run: Path, seconds: float):
-    """A main run's log syncs into the shared fake runs repo (FAKE_HUB: tests/fake_runs_repo.py): FAKE_SYNCS commits of
-    runs/<run id>/events.jsonl spread over `seconds`, each retried on a 429 after the waits FAKE_SYNC_WAITS (JSON list),
-    as kitsune/runlog.py's upload_retries do; a sync whose retries all fail is a sync_failed event (the trainer's next
-    sync uploads the same files again). Without FAKE_HUB: just the time."""
-    if not os.environ.get("FAKE_HUB"):
-        time.sleep(seconds)
-        return
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from fake_runs_repo import DirHub, RateLimited
-
-    hub, n = DirHub(os.environ["FAKE_HUB"]), int(os.environ.get("FAKE_SYNCS", "3"))
-    waits = [0.0, *env_json("FAKE_SYNC_WAITS", [0.05, 0.2, 0.8])]
-    for i in range(n):
-        time.sleep(seconds / n)
-        event(run, "sync", i=i)
-        for attempt, w in enumerate(waits):
-            time.sleep(w)
-            try:
-                hub.commit({f"runs/{run.name}/events.jsonl": (run / "events.jsonl").read_bytes()}, writer=run.name,
-                           box=os.environ.get("FAKE_BOX"))
-                event(run, "sync_ok", i=i, attempt=attempt)
-                break
-            except RateLimited:
-                event(run, "sync_error", i=i, attempt=attempt)
-        else:
-            event(run, "sync_failed", i=i)
-
-
 def train(args: dict, record: dict) -> int:
     root = Path.cwd()
     if args.get("resume"):
@@ -181,140 +134,7 @@ def train(args: dict, record: dict) -> int:
         resumed = False
     name = cfg["run_name"]
     record.update(run_name=name, run_dir=run.name, resumed=resumed)
-    if (cfg.get("schedule") or {}).get("clock") == "epochs":  # a full run (configs/full/*.json)
-        return train_full(run, cfg, name, resumed, record, args["sets"])
-    event(run, "phase", name="setup")
-    br = cfg.get("branch") or {}
-    if br.get("parent"):
-        parent = root / br["parent"]
-        pcfg = json.loads((parent / "config.json").read_text(encoding="utf-8"))["config"]
-        M = int(pcfg["schedule"]["max_steps"])
-        rs, es = round(br["resume_frac"] * M), round(br["end_frac"] * M)
-        if not (parent / "checkpoints" / f"full_step_{rs}").is_dir():
-            write_json(run / "summary.json", {"status": "failed", "error": f"SystemExit: no full state {rs}"})
-            return 2
-        record["parent"] = parent.name
-        time.sleep(float(os.environ.get("FAKE_BRANCH_S", "0.05")))
-        ckpt(run, f"step_{es}")
-        ckpt(run, f"full_step_{es}", full=True)
-        write_json(run / "summary.json", {"status": "complete", "steps": es, "branch": {
-            "parent_run_id": parent.name, "resume_step": rs, "end_step": es, "t_c": float(rs)}})
-        return 0
-    time.sleep(float(by_prefix(env_json("FAKE_SETUP_S", {}), name, 0.0)))
-    M = int(cfg["schedule"]["max_steps"])
-    if (cfg.get("calibrate") or {}).get("enabled"):
-        return calibrate(run, cfg, name, M, record)
-    crash_at = int(os.environ["KITSUNE_CRASH_AT_STEP"]) if os.environ.get("KITSUNE_CRASH_AT_STEP") else None
-    sm = cfg.get("smoke") or {}
-    if not resumed and not (cfg.get("lr_probe") or {}).get("enabled") and sm.get("enabled") and \
-            sm.get("require_loss_decrease") and by_prefix(env_json("FAKE_FLAT", {}), name, False):
-        event(run, "smoke_steps", steps=int(sm.get("steps", 100)), loss_first=9.7, loss_last=9.7,
-              loss_decreasing=False)
-        write_json(run / "summary.json", {"status": "failed",
-                                           "error": "SmokeFailed: loss did not fall over the smoke steps (9.7 -> 9.7)"})
-        return 1
-    every = (cfg.get("ckpt") or {}).get("full_every_steps")
-    if (cfg.get("lr_probe") or {}).get("enabled"):
-        obj = by_prefix(env_json("FAKE_OBJ", {}), name, 1.0)
-        start = 0
-        if resumed:
-            fulls = sorted(int(p.name.rsplit("_", 1)[1]) for p in (run / "checkpoints").glob("full_step_*"))
-            start = fulls[-1] if fulls else 0
-            record["resumed_from"] = start
-        for s in range(start + 1, M + 1):
-            if crash_at is not None and s >= crash_at:
-                write_json(run / "summary.json", {"status": "failed", "error": f"RuntimeError: crash at {s}"})
-                return 1
-            if every and s % int(every) == 0:
-                ckpt(run, f"full_step_{s}", full=True)
-        ckpt(run, f"full_step_{M}", full=True)
-        if obj == "nan":
-            write_json(run / "summary.json", {"status": "failed",
-                                               "error": "FloatingPointError: 4 consecutive steps with a non-finite"})
-            return 1
-        write_json(run / "summary.json", {"status": "complete", "steps": M, "lr_probe": {
-            "objective": float(obj), "lr": cfg["optim"]["lr"], "max_steps": M, "family": cfg.get("family", "aed")}})
-        return 0
-    # a main run: the fraction states and weights, the end ones; a first launch may crash (FAKE_CRASH)
-    ck = cfg.get("ckpt") or {}
-    fracs = ck.get("full_at_fracs") or []
-    crash = by_prefix(env_json("FAKE_CRASH", {}), name) if not resumed else None
-    marks = {round(f * M): f for f in fracs}
-    for f in ck.get("weights_at_fracs") or []:
-        ckpt(run, f"step_{round(f * M)}")
-    for step in sorted(marks):
-        if crash is not None and step > crash * M:
-            break
-        ckpt(run, f"full_step_{step}", full=True)
-    if crash is not None:
-        time.sleep(main_s(name))
-        write_json(run / "summary.json", {"status": "failed", "error": "RuntimeError: fake crash"})
-        return 1
-    if resumed:
-        record["resumed_from"] = max((int(p.name.rsplit("_", 1)[1]) for p in (run / "checkpoints").glob("full_step_*")),
-                                     default=0)
-    hub_syncs(run, main_s(name))
-    ckpt(run, f"step_{M}")
-    ckpt(run, f"full_step_{M}", full=True)
-    write_json(run / "summary.json", {"status": "complete", "steps": M})
-    return 0
-
-
-def calibrate(run: Path, cfg: dict, name: str, M: int, record: dict) -> int:
-    """Steps until the STOP file or max_steps: per step the loop clock, its data wait, the wall time. With
-    calibrate.barrier: READY, then wait for GO (or STOP) before the first step. The smoke checks at smoke.steps: a
-    smoke_steps event (FAKE_FLAT {run_name prefix: true}: the loss did not fall), and with smoke.require_loss_decrease a
-    flat loss fails the run as the trainer's SmokeFailed."""
-    step_s = float(os.environ.get("FAKE_STEP_S", "0.002"))
-    workers = (cfg.get("perf") or {}).get("num_workers")
-    waits = env_json("FAKE_WAIT", {})
-    w12 = {k[: -len(".w12")]: v for k, v in waits.items() if k.endswith(".w12")}
-    plain = {k: v for k, v in waits.items() if not k.endswith(".w12")}
-    frac = by_prefix(w12 if workers == 12 else plain, name, 0.01)
-    sm = cfg.get("smoke") or {}
-    smoke_n = int(sm.get("steps", 100)) if sm.get("enabled") else 0
-    flat = bool(by_prefix(env_json("FAKE_FLAT", {}), name, False))
-    (run / "metrics").mkdir(parents=True, exist_ok=True)
-    if (cfg.get("calibrate") or {}).get("barrier"):
-        (run / "READY").write_text(f"{time.time()}\n", encoding="utf-8")
-        record["ready"] = time.time()
-        while not ((run / "GO").exists() or (run / "STOP").exists()):
-            if time.time() - record["ready"] > 120:
-                write_json(run / "summary.json", {"status": "failed", "error": "RuntimeError: no GO"})
-                return 1
-            time.sleep(0.002)
-        record["released"] = time.time()
-    t, s = 0.0, 0
-    crash = by_prefix(env_json("FAKE_CALIB_CRASH", {}), name) if "-try" not in name else None
-    with open(run / "metrics" / "scalars.jsonl", "a", encoding="utf-8") as f:
-        for s in range(1, M + 1):
-            if (run / "STOP").exists():
-                break
-            if crash is not None and s >= crash:
-                write_json(run / "summary.json", {"status": "failed", "error": "RuntimeError: fake calibration crash"})
-                return 1
-            time.sleep(step_s)
-            dt = 1.0 + 0.001 * (s % 7)
-            t += dt
-            wall = time.time()
-            record.setdefault("first_step", wall)
-            for tag, v in (("sched/train_s", t), ("time/data_wait_s", frac * dt), ("time/step_s", dt)):
-                f.write(json.dumps({"step": s, "wall": wall, "tag": tag, "value": v}) + "\n")
-            f.flush()
-            if s == smoke_n:
-                event(run, "smoke_steps", steps=s, loss_first=9.7, loss_last=9.7 if flat else 8.1,
-                      loss_decreasing=not flat)
-                if flat and sm.get("require_loss_decrease"):
-                    write_json(run / "summary.json", {
-                        "status": "failed", "error": "SmokeFailed: loss did not fall over the smoke steps (9.7 -> 9.7)"})
-                    return 1
-    micro = float(cfg["batch"]["micro_audio_s"])
-    write_json(run / "summary.json", {"status": "complete", "steps": s, "calibrate": {
-        "micro_audio_s": micro, "workers": workers if isinstance(workers, int) else 8}})
-    return 0
-
-
-# ============================================================================================ the full runs' modes
+    return train_full(run, cfg, name, resumed, record, args["sets"])
 
 
 STATE_FILES = ("model.pt", "optimizer.pt", "l2sp.pt", "trainer.pt")  # + trainer.json (fullrun.STATE_FILES_REQUIRED)
@@ -356,7 +176,7 @@ def item_sleep(record: dict):
 def full_state(run: Path, step: int, reason: str, st: dict, mark: str | None = None) -> Path:
     """checkpoints/full_step_<step>/ as save_full writes it (a .tmp dir renamed in), trainer.json with reason and
     st."""
-    import shutil  # here, not at the top: every launch of this fake (the study box's too) starts as fast as the base's
+    import shutil  # here, not at the top: every launch of this fake starts as fast as it can
 
     d = run / "checkpoints" / f"full_step_{step}"
     tmp = d.with_name(d.name + ".tmp")
@@ -587,13 +407,8 @@ def main() -> int:
             rc = eval_item(args, record)
         elif mode == "check-resume":
             rc = int(by_prefix(env_json("FAKE_CHECK_RESUME", {}), Path(args["run-dir"]).name, 0))
-        elif mode in ("anchor", "speed") and by_prefix(env_json("FAKE_FAIL", {}), record["item"] or "", None):
+        elif mode == "speed" and by_prefix(env_json("FAKE_FAIL", {}), record["item"] or "", None):
             rc = int(by_prefix(env_json("FAKE_FAIL", {}), record["item"] or ""))  # a readout that fails
-        elif mode == "anchor":
-            out = Path(args["out"])
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "events.jsonl").write_text(json.dumps({"kind": "summary"}) + "\n", encoding="utf-8")
-            write_json(out / "summary.json", {"status": "complete", "anchor": True})
         elif mode == "speed":  # tools/speed_probe.py: one --out, merged per system
             item_sleep(record)
             out = Path(args["out"])

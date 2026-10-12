@@ -36,7 +36,7 @@ The study's per-utterance tables (CONTRACT.md 5; utterance_table): id, set, ref,
 the normalize_ja strings (the alignment corpus_cer counts), edits, ref_len, hyp_len, sub, del, ins, and the no-style
 count edits_nostyle = edits minus the edits of the error regions that only change the script or the numeral style
 (STYLE_KINDS; region_kind, the first run's error analysis). Summed over the rows with a reference they are corpus_cer's
-edits and reference chars exactly, so tools/study_report.py (kitsune.study_stats) reproduces every corpus CER here.
+edits and reference chars exactly, so tools/full_report.py (kitsune.study_stats) reproduces every corpus CER here.
 """
 import json
 import math
@@ -62,8 +62,8 @@ from kitsune.trainset import EOS, EVAL_SETS, PAD, PROMPT, AudioBatchDataset, dat
 
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 GATE_SETS = tuple(EVAL_SETS)  # the D32a gate: JSUT / CV8 / Reazon-test; eval_emilia and galgame are monitor-only
-# the full runs' extra macro metrics in 05's study.json (not in kitsune.study_stats.METRICS, which drives the frozen
-# pre-registered report): m4_all = M4 with Galgame's whole set in place of its neutral view, m3 = the gate sets
+# the full runs' extra macro metrics in 05's study.json (the size study's pre-registered report had no such metric):
+# m4_all = M4 with Galgame's whole set in place of its neutral view, m3 = the gate sets
 M4_ALL_STRATA = ("eval_jsut", "eval_cv8", "eval_reazon", "galgame_all")
 M3_STRATA = GATE_SETS
 # D32a, pre-registered full-set teacher corpus CER (fractions). teacher_baselines() recomputes them from teacher_out
@@ -138,8 +138,8 @@ def _cer_value(v) -> bool:
 
 def prereg_teacher_cer(system: str, prereg=None) -> dict[str, float] | None:
     """A teacher's pre-registered corpus CER per GATE set from the size study's PREREG.json "baselines" block, which
-    the PREREG fill (python -m kitsune.prereg --write study/ --sidecar ...) copies from the study selection's sidecar:
-    the teacher's stored hypotheses scored on the manifest rows, as fractions. None while the block is pending, and
+    the PREREG fill (the study's generator, removed after the study) copied from the study selection's sidecar: the
+    teacher's stored hypotheses scored on the manifest rows, as fractions. None while the block is pending, and
     when the file is missing or unreadable or lacks a number for a gate set: nothing is registered then, and nothing
     can be checked against it. `prereg`: the parsed PREREG.json or a path to one (default: the committed
     study/PREREG.json). `system` by its CONTRACT.md 5 name (parakeet-ctc; the parakeet_ctc spelling is read too)."""
@@ -460,10 +460,11 @@ def greedy_generate(model, feats: torch.Tensor, fmask: torch.Tensor, max_duratio
     prompt up to and including EOS, and whether the row ended with EOS (not truncated). The caller holds eval mode and
     the fp32 head (greedy_eval; tools/speed_probe.py times this very call).
 
-    pin_new (the speed probe's length-pinned timing only; the evaluator never pins): exactly min(pin_new, max_new)
-    decoder steps for the batch - EOS suppressed until then (min_new_tokens), no RepetitionStop - so the time is the
-    model shape's at that output length whatever the weights emit: an untrained init dir would otherwise run to max_new,
-    or stop at random. Every step is the same KV-cached forward and argmax as the free decode's."""
+    pin_new (a fixed-length decode: kitsune.quant's selftest; the evaluator never pins, and the size study's speed
+    probe timed untrained init dirs this way): exactly min(pin_new, max_new) decoder steps for the batch - EOS
+    suppressed until then (min_new_tokens), no RepetitionStop - so the time is the model shape's at that output length
+    whatever the weights emit: an untrained init dir would otherwise run to max_new, or stop at random. Every step is
+    the same KV-cached forward and argmax as the free decode's."""
     P = len(prompt_ids)
     n = feats.shape[0]
     # identical to 02_teacher_pass: ~3.6 tok/s observed (max ~6.5), 16 + 10 s is a 1.5x margin on the max
@@ -877,7 +878,7 @@ def utterance_scores(refs: Sequence[str], hyps: Sequence[str]) -> pd.DataFrame:
 
 def utterance_table(ids: Sequence[str], sets, refs: Sequence[str], hyps: Sequence[str],
                     truncated: Sequence[bool] | None = None) -> pd.DataFrame:
-    """A system's per-utterance table in CONTRACT.md 5's format, the input of tools/study_report.py: id, set (the eval
+    """A system's per-utterance table in CONTRACT.md 5's format, the input of tools/full_report.py: id, set (the eval
     set; one string for all rows or one per row), ref and hyp as given (raw text), the counts of utterance_scores and
     truncated (False when not given: CTC decoding has no length cut). Row order as given."""
     ids = [str(x) for x in ids]

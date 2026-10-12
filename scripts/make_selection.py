@@ -75,8 +75,9 @@ pre-register):
                         (cer(kotoba-whisper hyp2, ref) <= study.neutral_max_cer and a non-empty reference, from the
                         laptop's second_out/galgame/eval-00000.jsonl: --kotoba-galgame), all, and label_box (the label
                         box's own filter: not truncated, agree <= the galgame threshold)
-python -m kitsune.prereg --write study/ --sidecar <selection>.json then fills the PREREG's pending fields; it takes only
-the pre-registered selection (recipe, seed, sources, eval sets, extent and the rule's reazon_large cap).
+The size study's PREREG fill (kitsune.prereg's generator, removed after the study) took its pending fields from this
+sidecar, of the pre-registered selection only (recipe, seed, sources, eval sets, extent and the rule's reazon_large
+cap): study/PREREG.json holds them, frozen.
 
 The full-data runs (a `selection_recipe.full_study` block, kitsune.fullrun.FULL_STUDY: kitsune.fullrun.FULL_DATA for
 labels/full/selections/full_study/full.parquet, SMOKE_DATA for smoke.parquet) keep every kept hour of the label root

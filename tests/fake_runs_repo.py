@@ -1,5 +1,5 @@
 """A runs repo on disk that several processes commit into at once, with the Hub's commit rate limit (a 429), for the
-test that runs study boxes A and B concurrently (tests/test_study_box.py).
+full queue's tests (tests/test_full_queue.py, tests/test_full_chain.py).
 
     hub = DirHub.create(tmp_path / "hub", limit=6, window_s=0.5)   # at most 6 commits in any 0.5 s, else 429
     hub.commit({"runs/x/a.txt": b"..."}, writer="x", box="A")      # raises RateLimited over the limit
@@ -10,10 +10,9 @@ repo's commits. A commit may also delete folders (delete=[prefix]: CommitOperati
 squash() leaves one commit in the history (super_squash_history). FakeApi is the part of huggingface_hub.HfApi that
 kitsune.study_queue.HubUploader, kitsune/full_queue.py and vast/finish.py call (upload_folder, upload_file, file_exists,
 list_repo_tree, hf_hub_download, snapshot_download, list_repo_commits), over a DirHub; download / snapshot_download
-stand in for huggingface_hub's. The fake trainer (tests/fake_study_trainer.py, FAKE_HUB) commits its log syncs through
-DirHub.commit with the trainer's back-off, as kitsune/runlog.py does, and (FAKE_SCRATCH) its timed full states into a
-scratch DirHub as kitsune/scratch.py does: one commit that adds the new state and its pointer and deletes the previous
-state, then a squash.
+stand in for huggingface_hub's. The fake trainer (tests/fake_study_trainer.py, FAKE_SCRATCH) commits its timed full
+states into a scratch DirHub as kitsune/scratch.py does: one commit that adds the new state and its pointer and deletes
+the previous state, then a squash.
 """
 import fnmatch
 import hashlib

@@ -9,8 +9,8 @@ Inputs (lean pulls of the runs repo; no weights are read)
                          compared with --prereg's manifest block (default study/PREREG.json; "none" skips that); a
                          manifest PREREG did not freeze refuses (exit 2), as 05_evaluate refuses it. "Stacks on the
                          study" = its file sha256 is kitsune.fullrun.FROZEN_MANIFEST_SHA256 and PREREG matches.
-  --tables DIR ...       the study's per-utterance tables, DIR/<system>/<set>.parquet (tools/study_report.load_tables:
-                         the study students, the teachers, the anchor, the T/2 branches)
+  --tables DIR ...       the study's per-utterance tables, DIR/<system>/<set>.parquet (load_tables: the study
+                         students, the teachers, the anchor, the T/2 branches)
   --readouts DIR ...     every study.json under DIR (05_evaluate --out dirs: the M4 readouts runs/m4-<run_id>[-r<N>],
                          the quant readouts, whisper_eval dirs; a quant readout whose quant block's recipe_version is
                          below QUANT_RECIPE_MIN, or absent, is ignored: quant code older than F1). Per hit: study.json
@@ -60,8 +60,8 @@ Inputs (lean pulls of the runs repo; no weights are read)
                          run continued, k = 0), never offered or charted; its dir is left out of the --readouts search
                          (no dedupe against the final readout). report.json's `earlier` block names it with REV. A full
                          run whose -r<N> readout superseded an older one without --earlier gets a warning.
-  --run-summaries DIR ... the trainer's runs roots (tools/study_report.load_summaries): steps, epochs, stopped_early,
-                         early_stop_trigger, end_reason, resume_resets of the full and study runs
+  --run-summaries DIR ... the trainer's runs roots (load_summaries): steps, epochs, stopped_early, early_stop_trigger,
+                         end_reason, resume_resets of the full and study runs
   --params FILE          {system: params_total} (the study's params.json); kitsune.study_stats.PARAMS_TOTAL, a
                          whisper.json or a speed record fill the rest
   --kotoba-jsonl FILE    optional (decision 29; its download was not approved): Kotoba-Whisper v2.0's stored
@@ -71,27 +71,26 @@ Inputs (lean pulls of the runs repo; no weights are read)
   --include-half         also the study's T/2 branches (left out by default: they are budget readouts, not offers)
   --boot-b N, --seed N   the paired bootstrap (default 10,000 replicates, seed 1234: the study's)
 
-Systems and roles (never kitsune.study_stats.is_trained/family_of, which only know "study-" names): teacher (cohere,
+Systems and roles (never kitsune.study_stats.family_of alone, which only knows "study-" names): teacher (cohere,
 parakeet-ctc, parakeet-tdt: fixed models), full (FULL_RUNS), full_earlier (--earlier: <full run>-e<N>), study (the
 study's students and controls), quant (a
 study.json with a quant block; its base is quant.base_system and its format quant.format, never parsed from the
 name), whisper (family "whisper", or a WHISPER_SYSTEMS key), anchor / half / other (listed, never offered).
 
 Numbers. One corpus (kitsune.study_stats.build_corpus: every table must hold exactly the manifest's ids, with equal
-reference lengths in every system, or the report refuses) and one paired, stratified bootstrap over every system.
-Local metrics (FULL_METRICS; never added to study_stats.METRICS, which would change the study report): m4, m4_nostyle,
-m4_all (Galgame-all in place of Galgame-neutral: the Whisper headline, caveat 1), m4_all_nostyle, m3 (JSUT, CV8,
-Reazon: the "3-set mean"), m3_nostyle, jg, jg_nostyle, gate_pooled, and gap_neutral_all = CER(Galgame-all) -
-CER(Galgame-neutral). A ratio's CI is ln r +- 1.96 sqrt(v_boot + k sigma_run^2) with k named per comparison: 1 for a
-trained system against its teacher, 2 for full vs study (two trainings), 0 for a quantised variant against its own
-bf16 weights (the same run: only the bootstrap). sigma_run is the study's (the prior 1.6 % without the replicate).
-Comparisons: vs_teacher (M4 and M4-all, the own teacher: Cohere for T students, Parakeet CTC for P students; none for
-Whisper), vs_study (full-x / study-x), vs_bf16 (a variant / its base). KL to the own teacher, token-weighted over the
-three gate sets, from each readout's summary.json; within a family only (AED per token, CTC per target token).
-Hallucination counts per system over the M4 strata and over M4-all (rows with a reference): empty outputs, runaways
-(edits > reference length, or output > 2x it), truncated decodes, SILENCE_PHRASES (Whisper's subtitle phrases where
-the reference does not hold them; a heuristic), bracketed spans; the same on clips under SHORT_CLIP_S; and non-empty
-outputs on Galgame's empty references. Kana mode: JSUT rows whose reference has >= 3 kanji and whose non-empty
+reference lengths in every system, or the report refuses) and one paired, stratified bootstrap over every system. Local
+metrics (FULL_METRICS): m4, m4_nostyle, m4_all (Galgame-all in place of Galgame-neutral: the Whisper headline, caveat
+1), m4_all_nostyle, m3 (JSUT, CV8, Reazon: the "3-set mean"), m3_nostyle, jg, jg_nostyle, gate_pooled, and
+gap_neutral_all = CER(Galgame-all) - CER(Galgame-neutral). A ratio's CI is ln r +- 1.96 sqrt(v_boot + k sigma_run^2)
+with k named per comparison: 1 for a trained system against its teacher, 2 for full vs study (two trainings), 0 for a
+quantised variant against its own bf16 weights (the same run: only the bootstrap). sigma_run is the study's (the prior
+1.6 % without the replicate). Comparisons: vs_teacher (M4 and M4-all, the own teacher: Cohere for T students, Parakeet
+CTC for P students; none for Whisper), vs_study (full-x / study-x), vs_bf16 (a variant / its base). KL to the own
+teacher, token-weighted over the three gate sets, from each readout's summary.json; within a family only (AED per token,
+CTC per target token). Hallucination counts per system over the M4 strata and over M4-all (rows with a reference): empty
+outputs, runaways (edits > reference length, or output > 2x it), truncated decodes, SILENCE_PHRASES (Whisper's subtitle
+phrases where the reference does not hold them; a heuristic), bracketed spans; the same on clips under SHORT_CLIP_S; and
+non-empty outputs on Galgame's empty references. Kana mode: JSUT rows whose reference has >= 3 kanji and whose non-empty
 output has none (flag K1 over 1 %).
 
 Speed, per system: its own record in the chart group; else a full-data row takes its study weights' record (flag S1:
@@ -123,15 +122,16 @@ Usage (on the laptop, after a lean pull of the runs repo into D:/kitsune-pull):
       --speed D:/kitsune-pull/runs/speed-full-smoke-*/speed.json D:/kitsune-pull/runs/speed-smoke-b-*/speed.json \
       --queue-summaries D:/kitsune-pull/full --run-summaries D:/kitsune-pull/runs D:/kitsune-study/results/runs/runs \
       --params D:/kitsune-study/results/params.json --out D:/kitsune-study/full-report
-CPU only; about a minute (the bootstrap of every system at B = 10,000 and the torch import behind kitsune.evaluate).
+CPU only; about a minute (the bootstrap of every system at B = 10,000 and the torch import behind kitsune.evaluate,
+which scores a readout's greedy tables).
 """
 import argparse
 import csv
 import hashlib
-import importlib.util
 import io
 import json
 import math
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -148,16 +148,6 @@ from kitsune import fullrun  # noqa: E402
 from kitsune import study_stats as ss  # noqa: E402
 from kitsune.text import normalize_ja  # noqa: E402
 
-
-def _load_tool(name: str):
-    """tools/<name>.py as a module (tools/ is not a package): study_report's readers are reused read-only."""
-    spec = importlib.util.spec_from_file_location(f"kitsune_tool_{name}", ROOT / "tools" / f"{name}.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-sr = _load_tool("study_report")
 
 # ------------------------------------------------------------------------------------------------ names
 
@@ -192,7 +182,7 @@ TEACHER_FAMILY = {"cohere": "aed", "parakeet-ctc": "ctc", "parakeet-tdt": "ctc"}
 
 M4_ALL_STRATA = ("eval_jsut", "eval_cv8", "eval_reazon", "galgame_all")
 M3_STRATA = ("eval_jsut", "eval_cv8", "eval_reazon")  # kitsune.evaluate.GATE_SETS
-# name -> (aggregation, strata, on no-style edits), study_stats.METRICS' form
+# name -> (aggregation, strata, on no-style edits)
 FULL_METRICS = {
     "m4": ("macro", ss.M4_SETS, False),
     "m4_nostyle": ("macro", ss.M4_SETS, True),
@@ -281,11 +271,6 @@ def read_json(path):
         raise InputError(f"{path}: {e}") from e
 
 
-# this module's private copy of study_report (_load_tool: not the one in sys.modules) reads its JSON through
-# read_json, so a broken run summary, config.json or params file refuses naming its path (exit 2)
-sr.read_json = read_json
-
-
 def _refusing(what: str, fn, *args):
     """fn(*args), where an unreadable or malformed input (a missing file, broken JSON or parquet, a field of the
     wrong type) refuses with `what` named (InputError, exit 2) instead of a traceback (exit 1)."""
@@ -303,6 +288,119 @@ def _read_parquet(path: Path, columns=None) -> pd.DataFrame:
         cols = columns if columns is None else [c for c in columns if c in set(pq.read_schema(path).names)]
         return pd.read_parquet(path, columns=cols)
     return _refusing(str(path), read)
+
+
+# ------------------------------------------------------------------------------------------------ the study's readers
+
+# the per-utterance table's columns read here (CONTRACT.md 5: 05_evaluate's tables)
+COLUMNS = ("id", "set", "source", "ref", "hyp", "edits", "ref_len", "edits_nostyle", "hyp_nostyle", "sub", "del",
+           "ins", "hyp_len", "truncated")
+
+
+def _set_of_file(stem: str, sets) -> str | None:
+    name = stem[len("greedy_"):] if stem.startswith("greedy_") else stem
+    return name if name in sets else None
+
+
+def load_tables(d: Path, sets) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """system -> one DataFrame of all its sets, plus the files ignored. One system per entry of d, named by its system
+    name, in any of these layouts:
+      d/<system>.parquet                 every set, with a set column
+      d/<system>/<set>.parquet           one file per eval set (05_evaluate --tables)
+      d/<system>/greedy_<set>.parquet    a 05_evaluate --out / trainer evals/step_<N> dir as it is
+    Other files (tf_*.parquet, probe*.parquet, ...) are ignored."""
+    tables, ignored = {}, []
+    for entry in sorted(Path(d).iterdir()):
+        if entry.is_file() and entry.suffix == ".parquet":
+            df = _read_parquet(entry, COLUMNS)
+            if "set" not in df.columns:
+                raise SystemExit(f"{entry}: a one-file system table needs a set column")
+            tables[entry.stem] = df
+        elif entry.is_dir():
+            parts = []
+            for f in sorted(entry.glob("*.parquet")):
+                s = _set_of_file(f.stem, sets)
+                if s is None:
+                    ignored.append(str(f))
+                    continue
+                df = _read_parquet(f, COLUMNS)
+                if "set" in df.columns and set(df["set"].astype(str)) != {s}:
+                    said = sorted(set(df["set"].astype(str)))
+                    raise SystemExit(f"{f}: its set column says {said}, the file name {s}")
+                parts.append(df.drop(columns=["source"], errors="ignore").assign(set=s))
+            if parts:
+                tables[entry.name] = pd.concat(parts, ignore_index=True)
+    if not tables:
+        raise SystemExit(f"no system table under {d}")
+    return tables, ignored
+
+
+# the trainer's run dir: <run_name>-<UTC stamp>, plus -<n> when two start in the same second (04_distill build())
+RUN_DIR_STAMP = re.compile(r"-(\d{8}T\d{6}Z)(?:-(\d+))?$")
+
+
+def load_summaries(d: Path | None) -> tuple[dict, dict]:
+    """(run name -> summary, notes) from DIR, read in any of these layouts:
+         DIR/<run_name>-<stamp>[-n]/summary.json   the trainer's runs root as it is
+         DIR/<run>/summary.json, DIR/<run>.json
+    A summary is keyed by its config.run_name (the trainer writes config=R.cfg; a T/2 branch's is <run>-half), else by
+    the entry's name without the stamp. Several entries of one run name (a run started again from scratch): the newest
+    by stamp counts, the others are listed in notes["superseded"]. started_utc, when the summary has none: the run
+    dir's config.json created_utc (kitsune.runlog), else its stamp; both precede the run's first step. A broken JSON
+    file refuses naming its path (read_json: InputError, exit 2)."""
+    notes = dict(read={}, superseded=[])
+    if d is None:
+        return {}, notes
+    found: dict[str, list] = {}
+    for entry in sorted(Path(d).iterdir()):
+        f = entry / "summary.json" if entry.is_dir() else entry
+        if not (f.is_file() and f.suffix == ".json"):
+            continue
+        summ = read_json(f)
+        if not isinstance(summ, dict):
+            continue
+        stem = entry.name if entry.is_dir() else entry.stem
+        m = RUN_DIR_STAMP.search(stem)
+        name = (summ.get("config") or {}).get("run_name") or (stem[:m.start()] if m else stem)
+        if not summ.get("started_utc"):
+            created = None
+            if entry.is_dir() and (entry / "config.json").is_file():
+                created = read_json(entry / "config.json").get("created_utc")
+            if created or m:
+                summ = dict(summ, started_utc=created or m.group(1),
+                            started_utc_from="config.json created_utc" if created else "the run dir's stamp")
+        order = (m.group(1), int(m.group(2) or 0)) if m else ("", 0)
+        found.setdefault(name, []).append((order, str(f), summ))
+    out = {}
+    for name, cands in found.items():
+        cands.sort(key=lambda c: c[0])
+        out[name] = cands[-1][2]
+        notes["read"][name] = cands[-1][1]
+        notes["superseded"] += [c[1] for c in cands[:-1]]
+    return out, notes
+
+
+def load_params(path) -> dict | None:
+    if path is None:
+        return None
+    raw = read_json(path)
+    return {k: int(v["params_total"] if isinstance(v, dict) else v) for k, v in raw.items()}
+
+
+def write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def md_table(header: list[str], rows: list[list]) -> list[str]:
+    out = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    out += ["| " + " | ".join("" if c is None else str(c) for c in r) + " |" for r in rows]
+    return out
+
+
+def file_sha256(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def _id_problems(have: list[str], want: list[str]) -> str | None:
@@ -347,7 +445,7 @@ def _greedy_frames(d: Path, sets) -> dict[str, pd.DataFrame]:
     """set -> the greedy_<set>.parquet frame of a 05 / whisper_eval --out dir (only the columns read here)."""
     out = {}
     for f in sorted(d.glob("greedy_*.parquet")):
-        s = sr._set_of_file(f.stem, sets)
+        s = _set_of_file(f.stem, sets)
         if s is None:
             continue
         df = _read_parquet(f, ("id", "ref", "hyp", "truncated", "duration", "n_tok"))
@@ -379,13 +477,13 @@ def _table_from_greedy(frames: dict[str, pd.DataFrame], man: ss.Manifest) -> tup
 
 
 def _table_from_dir(d: Path, sets) -> pd.DataFrame | None:
-    """<hit>/tables/<system>/<set>.parquet, as tools/study_report.load_tables reads one system's dir (05 publishes
+    """<hit>/tables/<system>/<set>.parquet, as load_tables reads one system's dir (05 publishes
     only sets it did not refuse, so a mismatch here refuses the report in build_corpus)."""
     parts = []
     for f in sorted(d.glob("*.parquet")):
-        s = sr._set_of_file(f.stem, sets)
+        s = _set_of_file(f.stem, sets)
         if s is not None:
-            parts.append(_read_parquet(f, sr.COLUMNS).drop(columns=["source"], errors="ignore").assign(set=s))
+            parts.append(_read_parquet(f, COLUMNS).drop(columns=["source"], errors="ignore").assign(set=s))
     return pd.concat(parts, ignore_index=True) if parts else None
 
 
@@ -541,7 +639,7 @@ class Stats:
         self.point = ss.point_sums(corpus)
         self.boot = ss.bootstrap_sums(corpus, int(B), int(seed))
         self._cache = {}
-        rep, orig = ss.DEFAULT_SETTINGS["replicate"]
+        rep, orig = ss.REPLICATE
         self.sigma = ss.sigma_run(self.value(rep, "m4"), self.value(orig, "m4"))
         self.s = self.sigma["sigma_run"]
 
@@ -1104,7 +1202,7 @@ def load_all_summaries(dirs) -> tuple[dict, dict]:
     for d in dirs or []:
         if not Path(d).is_dir():
             raise InputError(f"--run-summaries {d}: not a directory")
-        summ, n = _refusing(f"--run-summaries {d}", sr.load_summaries, Path(d))
+        summ, n = _refusing(f"--run-summaries {d}", load_summaries, Path(d))
         for name, s in summ.items():
             if not isinstance(s, dict) or not isinstance(s.get("config"), dict):
                 continue  # a 05 summary.json (readouts, evals): not a trainer's
@@ -1158,7 +1256,7 @@ def superseded_warnings(ro_notes: dict, readouts: dict, earlier: dict) -> list[s
 def build_report(args) -> dict:
     man_obj = read_json(args.manifest)
     man = ss.parse_manifest(man_obj)
-    man_sha = sr.file_sha256(args.manifest)
+    man_sha = file_sha256(args.manifest)
     prereg_path = None if args.prereg is None or str(args.prereg).lower() == "none" else Path(args.prereg)
     prereg = read_json(prereg_path) if prereg_path else None
     pchk = ss.manifest_check(man, _refusing(f"--prereg {prereg_path}", ss.prereg_manifest, prereg), man_sha)
@@ -1171,7 +1269,7 @@ def build_report(args) -> dict:
     tables_from: dict[str, str] = {}
     for d in args.tables or []:
         try:
-            t, _ = _refusing(f"--tables {d}", sr.load_tables, Path(d), man.sets)
+            t, _ = _refusing(f"--tables {d}", load_tables, Path(d), man.sets)
         except SystemExit as e:
             raise InputError(f"--tables {d}: {e.code}") from e
         for name, df in t.items():
@@ -1209,7 +1307,7 @@ def build_report(args) -> dict:
     st = Stats(corpus, args.boot_b, args.seed)
 
     summaries, summ_notes = load_all_summaries(args.run_summaries)
-    params = _refusing(f"--params {args.params}", sr.load_params, args.params) if args.params else {}
+    params = _refusing(f"--params {args.params}", load_params, args.params) if args.params else {}
     qs = load_queue_summaries(args.queue_summaries, args.speed)
     sp = load_speed(args.speed, qs, parse_machine_of(args.machine_of))
     durations = {}
@@ -1814,7 +1912,7 @@ def speed_probes_md(pr: dict) -> list[str]:
     L += ["A probe that failed (a crash, or exit 4: its CER was not sane against the same weights' bf16 decode), a "
           "record left out (timed by quant code older than F1, or without a passing CER sanity), an offered row with "
           "no speed record at all, and a speed item the queue did not finish.", ""]
-    L += sr.table(["system", "what", "why", "file"], rows)
+    L += md_table(["system", "what", "why", "file"], rows)
     if pr.get("failures_resolved"):
         L += ["", "Failures a later good probe of the same system superseded: "
               + "; ".join(f"`{f['system']}` ({f['why']})" for f in pr["failures_resolved"]) + "."]
@@ -1849,7 +1947,7 @@ def render_md(rep: dict) -> str:
     for block, text in BLOCKS:
         rows = [r for r in rep["offer"]["rows"] if r["block"] == block]
         if rows:
-            L += [f"### {text}", ""] + sr.table(OFFER_COLUMNS, [offer_cells(r) for r in rows]) + [""]
+            L += [f"### {text}", ""] + md_table(OFFER_COLUMNS, [offer_cells(r) for r in rows]) + [""]
 
     vs = comp["vs_study"]
     if vs:
@@ -1865,7 +1963,7 @@ def render_md(rep: dict) -> str:
                          "n/a" if run.get("epochs") is None else f"{run['epochs']:.2f}",
                          _stop_text(run), 
                          run.get("end_reason") or "n/a", run.get("resume_resets") or 0])
-        L += sr.table(["model", "study M4", "full M4", "full / study M4 [CI]", "verdict", "M4-all ratio [CI]",
+        L += md_table(["model", "study M4", "full M4", "full / study M4 [CI]", "verdict", "M4-all ratio [CI]",
                        "steps", "epochs", "early stop (trigger)", "end reason", "resets"], rows) + [""]
     vf = comp.get("vs_final") or {}
     if vf:
@@ -1879,7 +1977,7 @@ def render_md(rep: dict) -> str:
             rows.append([sysd[v["base"]]["display"], v["display"], pct(v["metrics"]["m4"]),
                          pct(sysd[v["base"]]["metrics"]["m4"]), _mci(c["m4"], 3), (c["m4"] or {}).get("verdict", "n/a"),
                          _mci(c["m4_all"], 3), e.get("revision") or "n/a"])
-        L += sr.table(["final run", "earlier", "earlier M4", "final M4", "final / earlier M4 [CI]", "verdict",
+        L += md_table(["final run", "earlier", "earlier M4", "final M4", "final / earlier M4 [CI]", "verdict",
                        "M4-all ratio [CI]", "earlier at runs-repo"], rows) + [""]
     for w in rep.get("warnings") or []:
         L += [f"WARNING: {w}", ""]
@@ -1907,7 +2005,7 @@ def render_md(rep: dict) -> str:
                          "n/a" if not (sp.get("rtfx") and bsp.get("rtfx") and sp.get("in_chart_group")
                                        and bsp.get("in_chart_group")) else f"{sp['rtfx'] / bsp['rtfx']:.2f}",
                          ((q.get("nonfinite") or {}).get("rows", "n/a")), " ".join(v["flags"])])
-        L += sr.table(["variant", "bf16", "bf16 M4", "M4", "delta M4 pp", "ratio vs bf16 [CI]", "delta M4-all pp",
+        L += md_table(["variant", "bf16", "bf16 M4", "M4", "delta M4 pp", "ratio vs bf16 [CI]", "delta M4-all pp",
                        "KL", "delta KL", "file MB", "x smaller than bf16", "RTFx", "x bf16 speed",
                        "non-finite rows", "flags"], rows) + [""]
         comp_rows = [(g, n) for g, e in sg["groups"].items() for n in e["compiled"]]
@@ -1941,7 +2039,7 @@ def render_md(rep: dict) -> str:
                                                                          "eval_emilia")]
                         + [_pp(m_[GAP]).lstrip("+") if m_[GAP] is not None else "n/a",
                            tot.get("n_truncated", "n/a"), tot.get("n_repetition", "n/a"), " ".join(v["flags"])])
-        L += sr.table(["model", "M4-all", "3-set mean", "M4", "M4-all no-style", "M4 no-style", "JSUT", "CV8",
+        L += md_table(["model", "M4-all", "3-set mean", "M4", "M4-all no-style", "M4 no-style", "JSUT", "CV8",
                        "Reazon", "Gal-neutral", "Gal-all", "Emilia (W6)", "gap pp", "truncated", "repetition stops",
                        "flags"], rows) + [""]
         L += ["Caveats printed next to every Whisper number (plan v3 section 7):", ""]
@@ -1985,7 +2083,7 @@ def render_md(rep: dict) -> str:
                      "n/a" if not sh else f"{sh['n']}: {sh['n_empty']} / {sh['n_runaway']} / {sh['n_silence']}",
                      "n/a" if not er else f"{er['nonempty_on_empty_ref']} of {er['n']}",
                      "n/a" if km.get("rate") is None else f"{km['n']} of {km['eligible']} ({100 * km['rate']:.2f} %)"])
-    L += sr.table(["system", "M4-all rows", "empty", "runaway", "truncated", "silence", "bracketed",
+    L += md_table(["system", "M4-all rows", "empty", "runaway", "truncated", "silence", "bracketed",
                    "M4 empty / runaway", "short clips: empty / runaway / silence", "output on empty reference",
                    "JSUT kana mode"], rows) + [""]
 
@@ -1998,11 +2096,11 @@ def render_md(rep: dict) -> str:
                     + [f"{pct((v['sets'].get(k) or {}).get('cer'))} / "
                        f"{pct((v['sets'].get(k) or {}).get('cer_nostyle'))}" for k, _ in cols]
                     + [pct(v["metrics"]["m4"]), pct(v["metrics"]["m4_all"]), pct(v["metrics"]["gate_pooled"])])
-    L += sr.table(["system", "role"] + [c for _, c in cols] + ["M4", "M4-all", "gate-pooled"], rows) + [""]
+    L += md_table(["system", "role"] + [c for _, c in cols] + ["M4", "M4-all", "gate-pooled"], rows) + [""]
 
     L += ["## Flags", ""] + [f"- **{k}**: {t}" for k, t in rep["flags_legend"].items()] + [""]
     L += ["## Checks", ""]
-    L += sr.table(["check", "status", "detail"], [[c["rule"], c["status"], c["detail"]] for c in rep["checks"]])
+    L += md_table(["check", "status", "detail"], [[c["rule"], c["status"], c["detail"]] for c in rep["checks"]])
     inp = rep["inputs"]
     L += ["", "## Inputs", "",
           f"- tables: {', '.join(inp['tables']) or 'none'}; readouts: {', '.join(inp['readouts']) or 'none'} "
@@ -2028,17 +2126,17 @@ def write_outputs(rep: dict, out: Path) -> None:
     pts = rep["chart"]["points"]
     prim = rep["speed_groups"]["primary"]
     gpu = (rep["speed_groups"]["groups"].get(prim) or {}).get("gpu") if prim else None
-    sr.write_atomic(out / "report.json", json.dumps(rep, indent=1, ensure_ascii=False))
-    sr.write_atomic(out / "report.md", render_md(rep))
-    sr.write_atomic(out / "offer.csv", offer_csv(rep["offer"]))
-    sr.write_atomic(out / "chart_points.json", json.dumps(dict(group=prim, gpu=gpu, points=pts), indent=1,
+    write_atomic(out / "report.json", json.dumps(rep, indent=1, ensure_ascii=False))
+    write_atomic(out / "report.md", render_md(rep))
+    write_atomic(out / "offer.csv", offer_csv(rep["offer"]))
+    write_atomic(out / "chart_points.json", json.dumps(dict(group=prim, gpu=gpu, points=pts), indent=1,
                                                           ensure_ascii=False))
-    sr.write_atomic(out / "chart_points.csv", points_csv(pts))
+    write_atomic(out / "chart_points.csv", points_csv(pts))
     where = f"Timed on {gpu}." if gpu else ""
-    sr.write_atomic(out / "chart_error_vs_speed.svg", chart_svg(
+    write_atomic(out / "chart_error_vs_speed.svg", chart_svg(
         pts, x_key="rtfx", title="Error vs speed: M4-all CER against batched speed", better="Better: down and right",
         x_label=f"Batched speed, x real time (RTFx, log scale){', ' + gpu if gpu else ''}", gpu=where))
-    sr.write_atomic(out / "chart_error_vs_latency.svg", chart_svg(
+    write_atomic(out / "chart_error_vs_latency.svg", chart_svg(
         pts, x_key="p50_ms", title="Error vs latency: M4-all CER against batch-1 latency",
         better="Better: down and left", x_label=f"Batch-1 median latency, ms (log scale){', ' + gpu if gpu else ''}",
         gpu=where))

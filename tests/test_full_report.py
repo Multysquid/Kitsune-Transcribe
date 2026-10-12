@@ -7,7 +7,7 @@ trainer's summary.json.
 
 Two worlds. The TEXT world scores real ref / hyp strings (kitsune.evaluate.utterance_table), so the metrics, the
 hallucination and kana counts can be checked against sums taken here by hand. The PLANTED world reuses
-test_study_stats.planted: every system's edits are the same base edits times a multiplier, so every ratio is exact and
+fixtures_planted.planted: every system's edits are the same base edits times a multiplier, so every ratio is exact and
 v_boot is 0, and a CI's half-width is 1.96 sqrt(k) sigma_run: that pins the noise term k of each comparison."""
 import hashlib
 import importlib.util
@@ -23,10 +23,10 @@ import pandas as pd
 import pytest
 
 from fixtures import ROOT, no_real_data
+from fixtures_planted import planted
 from kitsune import evaluate as ev
 from kitsune import study_stats as ss
 from kitsune.store import ids_sha256
-from test_study_stats import planted
 
 
 def _load():
@@ -314,8 +314,6 @@ def test_metrics_match_hand_sums(world):
     # the greedy-only readouts were scored here, the others read as written
     assert rep["systems"]["full-t06"]["table_from"] == "greedy"
     assert rep["systems"]["full-p03"]["table_from"] == "tables"
-    # the local metrics never leak into the study's metric table
-    assert "m4_all" not in ss.METRICS and "m3" not in ss.METRICS
 
 
 def test_roles_offer_blocks_and_columns(world):
@@ -1096,3 +1094,78 @@ def test_earlier_keeps_the_4_epoch_p01_next_to_its_continuation(world, tmp_path,
                       (f"full-p03-e3={pull / f'm4-{rid}'}", "not one readout of full-p03")):
         rc, _ = run([*base, "--earlier", bad], tmp_path / "bad")
         assert rc == 2 and want in capsys.readouterr().err, bad
+
+
+# ------------------------------------------------------------------------------------------------ the study's readers
+
+
+def test_run_summaries_in_the_trainer_layout(tmp_path):
+    """--run-summaries on the trainer's runs root as it is (load_summaries): stamped run dirs keyed by config.run_name,
+    the newest start of a run name counting, the start time from config.json or the stamp; a broken summary.json
+    refuses naming its path (InputError, exit 2)."""
+    root = tmp_path / "runs"
+    sel = "labels/full/selections/study_1000h.parquet"
+
+    def put(dirname, run_name, steps, created=None, resumes=0):
+        d = root / dirname
+        d.mkdir(parents=True)
+        cfg = {"run_name": run_name, "selection": sel}
+        summ = {"run_id": dirname, "status": "complete", "steps": steps, "resumes": resumes, "config": cfg}
+        (d / "summary.json").write_text(json.dumps(summ), encoding="utf-8")
+        if created:
+            (d / "config.json").write_text(json.dumps({"run_id": dirname, "created_utc": created, "config": cfg}),
+                                           encoding="utf-8")
+
+    put("study-t06-20261001T010203Z", "study-t06", 900)  # an earlier start that died: superseded
+    put("study-t06-20261001T030000Z", "study-t06", 9366, created="2026-10-01T03:00:00.123+00:00")
+    put("study-t06-half-20261001T080000Z", "study-t06-half", 4683)  # no config.json: the stamp is its start
+    put("study-t03-20261001T030000Z-1", "study-t03", 5000, resumes=1)
+    summ, notes = FR.load_summaries(root)
+    assert set(summ) == {"study-t06", "study-t06-half", "study-t03"}
+    assert summ["study-t06"]["steps"] == 9366 and len(notes["superseded"]) == 1
+    assert "20261001T010203Z" in notes["superseded"][0]
+    assert summ["study-t06"]["started_utc"] == "2026-10-01T03:00:00.123+00:00"
+    assert summ["study-t06-half"]["started_utc"] == "20261001T080000Z"
+    assert FR.load_summaries(None) == ({}, dict(read={}, superseded=[]))
+    (root / "study-t01-20261001T030000Z").mkdir()
+    (root / "study-t01-20261001T030000Z" / "summary.json").write_text("{", encoding="utf-8")
+    with pytest.raises(FR.InputError, match="study-t01-20261001T030000Z"):
+        FR.load_summaries(root)
+
+
+def test_tables_in_every_layout(tmp_path):
+    """--tables (load_tables): a system as one file with a set column, as one file per set (05 --tables), or as a
+    05_evaluate --out / trainer evals dir of greedy_<set>.parquet, whose other files (tf_*.parquet, a set outside the
+    manifest) are listed as ignored. A one-file table without a set column, a per-set file whose set column names
+    another set and a dir without a system table refuse."""
+    sets = ("eval_jsut", "eval_cv8")
+
+    def table(s: str, n: int = 3) -> pd.DataFrame:
+        return pd.DataFrame(dict(id=[f"{s}/u{i}" for i in range(n)], set=s, ref=["あいう"] * n, hyp=["あいえ"] * n,
+                                 edits=[1] * n, ref_len=[3] * n))
+
+    d = tmp_path / "tables"
+    (d / "per-set").mkdir(parents=True)
+    (d / "out-dir").mkdir()
+    pd.concat([table(s) for s in sets], ignore_index=True).to_parquet(d / "one-file.parquet")
+    for s in sets:
+        table(s).to_parquet(d / "per-set" / f"{s}.parquet")
+        table(s).drop(columns="set").assign(source=s).to_parquet(d / "out-dir" / f"greedy_{s}.parquet")
+    pd.DataFrame(dict(id=["x"])).to_parquet(d / "out-dir" / "tf_eval_jsut.parquet")
+    table("eval_reazon").to_parquet(d / "per-set" / "eval_reazon.parquet")
+    tables, ignored = FR.load_tables(d, sets)
+    assert sorted(tables) == ["one-file", "out-dir", "per-set"]
+    for name, df in tables.items():
+        assert sorted(df["set"].value_counts().items()) == [("eval_cv8", 3), ("eval_jsut", 3)], name
+        assert "source" not in df.columns and (df["edits"] == 1).all(), name
+    assert sorted(ignored) == [str(d / "out-dir" / "tf_eval_jsut.parquet"), str(d / "per-set" / "eval_reazon.parquet")]
+    table("eval_cv8").to_parquet(d / "per-set" / "eval_jsut.parquet")
+    with pytest.raises(SystemExit, match=r"its set column says \['eval_cv8'\], the file name eval_jsut"):
+        FR.load_tables(d, sets)
+    table("eval_jsut").drop(columns="set").to_parquet(d / "no-set.parquet")
+    with pytest.raises(SystemExit, match="a one-file system table needs a set column"):
+        FR.load_tables(d, sets)
+    (tmp_path / "none" / "sys").mkdir(parents=True)
+    pd.DataFrame(dict(id=["x"])).to_parquet(tmp_path / "none" / "sys" / "tf_eval_jsut.parquet")
+    with pytest.raises(SystemExit, match="no system table under"):
+        FR.load_tables(tmp_path / "none", sets)

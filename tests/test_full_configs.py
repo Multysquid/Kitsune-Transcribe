@@ -382,7 +382,7 @@ def test_the_section_7_table():
         assert "pull_parakeet" not in c, x
         assert (c["schedule"]["epochs"], c["schedule"]["warmup_steps"], c["optim"]["lr"], c["batch"]["micro_audio_s"],
                 c["batch"]["step_audio_s"], c["eval"]["dev"]["greedy"]) == (epochs, warmup, lr, micro, step, greedy), x
-        assert warmup == prereg.rules()["runs"][f"study-{x}"]["warmup_steps"]  # the study's warm-up
+        assert warmup == prereg.RUNS[f"study-{x}"]["warmup_steps"]  # the study's warm-up
         assert c["schedule"] | {"epochs": 0, "warmup_steps": 0} == {
             "warmup_steps": 0, "cooldown_frac": 0.2, "train_hours": 4.0, "clock": "epochs", "max_steps": None,
             "end_reserve_min": reserve, "epochs": 0, "deadline_cooldown": True}

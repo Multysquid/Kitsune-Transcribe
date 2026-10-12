@@ -9,13 +9,13 @@ host crash tore a file of its resume state. Also: sets already done are skipped,
 of other eval settings is refused, no verdict without the probe the config has, the resume state is fsynced, and the
 thermal guard runs before every batch, waits for the GPU to cool and stops when it can no longer read it.
 
-The size study's AED side (tests/test_evaluate_study.py has the CTC family): on a study manifest the same eval writes
-the per-utterance tables (CONTRACT.md 5) whose corpus CER per set is its summary's; --anchor re-scores a checkpoint as
-anchor-b20 without a verdict, and so does a config named anchor-b20 without the flag; --from-evals makes the same
-tables from the trainer's own eval dir (and knows its family); a manifest that does not hold the store's rows refuses
-before the model is loaded, and so does a study eval without its manifest; a system's tables are one eval's (a set
-missing now loses its older table, and a set missing from --from-evals exits non-zero); a T/2 branch's tables get the
-branch's name; a generated study config with max_steps still null loads.
+The M4 readouts' AED side (tests/test_evaluate_study.py has the CTC family): on a study manifest the same eval writes
+the per-utterance tables (CONTRACT.md 5) whose corpus CER per set is its summary's; --from-evals makes the same tables
+from the trainer's own eval dir (and knows its family); a manifest that does not hold the store's rows refuses before
+the model is loaded, and so does an eval that asks for tables without its manifest; a system's tables are one eval's (a
+set missing now loses its older table, and a set missing from --from-evals exits non-zero); the default system is the
+config's run_name; a config with max_steps still null on the steps clock loads with --set schedule.max_steps
+(configs/study/study-t06.json, whose optim.lr is null too, loads with --set optim.lr as well).
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import json
@@ -38,18 +38,17 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from fixtures import load_script, make_fake_corpus, make_fake_selection  # noqa: E402
+from fixtures_whisper import pending_prereg as write_pending_prereg  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
 def pending_prereg(tmp_path_factory):
     """The toy corpora here are not the study's selection: 05_evaluate's default --prereg (the committed
     study/PREREG.json, filled from the uploaded selection) would refuse their manifests and teachers. Every 05 loaded
-    by this module defaults to the rules with their sidecar fields pending instead."""
+    by this module defaults to a PREREG.json whose manifest and baselines blocks are pending instead."""
     from kitsune import evaluate as ev
-    from kitsune import prereg
 
-    path = tmp_path_factory.mktemp("prereg") / "PREREG.json"
-    path.write_bytes(prereg.rules_json(prereg.rules()))
+    path = write_pending_prereg(tmp_path_factory.mktemp("prereg") / "PREREG.json")
     real = load_script
 
     def load_pending(name: str):
@@ -562,20 +561,18 @@ def write_manifest(env, path: Path, drop: str | None = None) -> dict:
     return man
 
 
-def test_the_anchor_on_the_manifest_and_its_tables(env, tmp_path):
-    """--anchor on a study manifest: the eval is the trainer's (its greedy tables to the bit), no verdict (the anchor's
-    history is another run's), and the tables of anchor-b20 in CONTRACT.md 5's format, one per set in manifest order,
-    whose corpus CER per set is the summary's and whose gate-pooled CER is its headline val_cer. --from-evals makes the
-    same tables from the trainer's own eval dir; --anchor takes no probe."""
+def test_an_eval_on_the_manifest_and_its_tables(env, tmp_path):
+    """An eval on a study manifest: the trainer's eval (its greedy tables to the bit) and the system's tables in
+    CONTRACT.md 5's format, one per set in manifest order, whose corpus CER per set is the summary's and whose
+    gate-pooled CER is its headline val_cer. --from-evals makes the same tables from the trainer's own eval dir."""
     from kitsune import evaluate as ev
 
     m05 = load_script("05_evaluate")
     man = write_manifest(env, tmp_path / "study_manifest.json")
-    out, tables = tmp_path / "anchor", tmp_path / "tables"
+    out, tables = tmp_path / "eval", tmp_path / "tables"
     argv = ["--root", str(env["root"]), "--config", str(env["relative"]), "--ckpt", str(env["ckpt"]), "--manifest",
             str(tmp_path / "study_manifest.json"), "--tables", str(tables)]
-    assert m05.main([*argv, "--anchor", "--out", str(out)]) == 0
-    assert not (out / "verdict.json").exists() and events(out, "verdict_skipped")[-1]["note"].startswith("anchor")
+    assert m05.main([*argv, "--system", "eval-a", "--out", str(out)]) == 0
     ref = env["run"] / "evals" / "step_1"
     s = load(out / "summary.json")
     for e in SETS:
@@ -583,35 +580,33 @@ def test_the_anchor_on_the_manifest_and_its_tables(env, tmp_path):
         a, b = pd.read_parquet(ref / f"greedy_{e}.parquet"), g.copy()
         assert [list(x) for x in a.pop("hyp_ids")] == [list(x) for x in b.pop("hyp_ids")]
         pd.testing.assert_frame_equal(a, b, check_exact=True)
-        t = pd.read_parquet(tables / "anchor-b20" / f"{e}.parquet")
+        t = pd.read_parquet(tables / "eval-a" / f"{e}.parquet")
         assert tuple(t.columns) == ev.TABLE_COLUMNS and t["id"].tolist() == man["sets"][e]["ids"]
         c = ev.table_cer(t)
         d = s["greedy_full"]["sets"][e]
         assert (c["edits"], c["ref_chars"], c["cer"]) == (d["ref_edits"], d["ref_chars"], d["cer_ref_corpus"])
         assert int(t["truncated"].sum()) == d["n_truncated"]
     st = load(out / "study.json")
-    assert st["system"] == "anchor-b20" and st["family"] == "aed" and st["teacher"] == "cohere" and not st["refused"]
+    assert st["system"] == "eval-a" and st["family"] == "aed" and st["teacher"] == "cohere" and not st["refused"]
     assert st["metrics"]["gate_pooled"] == pytest.approx(s["headline"]["val_cer"])
     assert set(st["strata"]) == set(SETS) and "m4" not in st["metrics"]  # no Galgame set: no M4
     assert all(st["strata"][e]["ratio_vs_teacher"] == pytest.approx(s["greedy_full"]["sets"][e]["ratio_vs_teacher"])
                for e in SETS)
     (inv,) = load(out / "evaluator.json")["invocations"]
-    assert inv["status"] == "complete" and inv["anchor"] and inv["system"] == "anchor-b20" and inv["family"] == "aed"
+    assert inv["status"] == "complete" and inv["system"] == "eval-a" and inv["family"] == "aed"
     # the trainer's own eval dir gives the same tables
     assert m05.main(["--from-evals", str(ref), "--system", "tiny-eval", "--manifest",
                      str(tmp_path / "study_manifest.json"), "--out", str(tmp_path / "from"), "--tables",
                      str(tables)]) == 0
     for e in SETS:
         pd.testing.assert_frame_equal(pd.read_parquet(tables / "tiny-eval" / f"{e}.parquet"),
-                                      pd.read_parquet(tables / "anchor-b20" / f"{e}.parquet"))
+                                      pd.read_parquet(tables / "eval-a" / f"{e}.parquet"))
     assert load(tmp_path / "from" / "study.json")["family"] == "aed"  # from the run's config.json
-    with pytest.raises(SystemExit):
-        m05.main([*argv, "--anchor", "--probe", "--out", str(tmp_path / "x")])
 
 
 def test_a_manifest_without_the_stores_rows_is_refused(env, tmp_path, monkeypatch):
     """A manifest that lacks one of the eval store's rows refuses the eval before the model is loaded; so does
-    --anchor without a manifest."""
+    --system without a manifest."""
     m05 = load_script("05_evaluate")
     real = m05.load_trainer
 
@@ -627,19 +622,13 @@ def test_a_manifest_without_the_stores_rows_is_refused(env, tmp_path, monkeypatc
     argv = ["--root", str(env["root"]), "--config", str(env["relative"]), "--ckpt", str(env["ckpt"])]
     with pytest.raises(SystemExit, match="does not match the study manifest.*eval_cv8"):
         m05.main([*argv, "--manifest", str(tmp_path / "m.json"), "--out", str(tmp_path / "o1")])
-    with pytest.raises(SystemExit, match="--anchor write the study's tables, and there is no study manifest"):
-        m05.main([*argv, "--anchor", "--out", str(tmp_path / "o2")])
+    with pytest.raises(SystemExit, match="--system write the study's tables, and there is no study manifest"):
+        m05.main([*argv, "--system", "x", "--out", str(tmp_path / "o2")])
 
 
-# a study selection's recipe block (configs/study/*.json; the box path validates its keys once it is merged)
-STUDY_BLOCK = {"f1a_max": 0.5, "dedup_min_chars": 15, "draw_audio_s": 3600000, "probe_n": 300, "neutral_max_cer": 0.5}
-
-
-def test_a_study_eval_without_its_manifest_is_refused(env, tmp_path, monkeypatch):
-    """Without a manifest (none next to the selection, no --manifest) an eval that would be the study's refuses before
-    the model is loaded: --tables or --system ask for tables, a study run name, the anchor's config name (its mode
-    without the flag), a study selection; --manifest none evaluates such a config without tables, but not with
-    --tables."""
+def test_an_eval_that_asks_for_tables_without_its_manifest_is_refused(env, tmp_path, monkeypatch):
+    """Without a manifest (none next to the selection, no --manifest) an eval that asks for tables (--tables or
+    --system) refuses before the model is loaded, with --manifest none too; an aed eval without tables runs."""
     m05 = load_script("05_evaluate")
     real = m05.load_trainer
 
@@ -653,12 +642,6 @@ def test_a_study_eval_without_its_manifest_is_refused(env, tmp_path, monkeypatch
             str(tmp_path / "o")]
     for extra, why in ((["--tables", str(tmp_path / "t")], "--tables write the study's tables"),
                        (["--system", "study-t06"], "--system write the study's tables"),
-                       (["--set", "run_name=study-t06"], "run_name study-t06 is a study run"),
-                       (["--set", "run_name=study-t06-half"], "run_name study-t06-half is a study run"),
-                       (["--set", "run_name=anchor-b20"], "--anchor write the study's tables"),
-                       (["--set", "selection_recipe.study=" + json.dumps(STUDY_BLOCK)] if "study" in
-                        m05.load_trainer().DEFAULTS["selection_recipe"] else ["--set", "run_name=study-p01"],
-                        "the config's selection is the study's|run_name study-p01"),
                        (["--manifest", "none", "--tables", str(tmp_path / "t")], "--tables write the study's tables")):
         with pytest.raises(SystemExit, match=f"REFUSED: ({why})"):
             m05.main([*argv, *extra])
@@ -667,27 +650,27 @@ def test_a_study_eval_without_its_manifest_is_refused(env, tmp_path, monkeypatch
     assert not (tmp_path / "o" / "tables").exists() and not (tmp_path / "o" / "study.json").exists()
 
 
-def test_the_anchor_config_a_partial_eval_and_stale_tables(env, tmp_path):
-    """A config named anchor-b20 is the anchor re-score without --anchor: its system, no history, no verdict. A --sets
-    eval on the manifest tables the sets it has and exits 0 (tables_partial), the rest listed as missing; an older
-    table of a set without one now goes. --from-evals of that dir without --sets exits non-zero for the missing sets
-    (their older tables go too), with --sets it tables them; its study.json knows the family from the dir."""
+def test_a_partial_eval_and_stale_tables(env, tmp_path):
+    """A --sets eval on the manifest tables the sets it has and exits 0 (tables_partial), the rest listed as missing;
+    an older table of a set without one now goes. --from-evals of that dir without --sets exits non-zero for the
+    missing sets (their older tables go too), with --sets it tables them; its study.json knows the family from the
+    dir."""
     m05 = load_script("05_evaluate")
     write_manifest(env, tmp_path / "m.json")
     tables = tmp_path / "tables"
-    (tables / "anchor-b20").mkdir(parents=True)
-    pd.DataFrame({"id": ["stale"]}).to_parquet(tables / "anchor-b20" / "eval_cv8.parquet")  # another eval's table
+    (tables / "part").mkdir(parents=True)
+    pd.DataFrame({"id": ["stale"]}).to_parquet(tables / "part" / "eval_cv8.parquet")  # another eval's table
     out = tmp_path / "a"
     assert m05.main(["--root", str(env["root"]), "--config", str(env["relative"]), "--ckpt", str(env["ckpt"]),
-                     "--set", "run_name=anchor-b20", "--manifest", str(tmp_path / "m.json"), "--tables", str(tables),
+                     "--system", "part", "--manifest", str(tmp_path / "m.json"), "--tables", str(tables),
                      "--sets", "eval_jsut", "--out", str(out)]) == 0
     (inv,) = load(out / "evaluator.json")["invocations"]
-    assert inv["status"] == "tables_partial" and inv["anchor"] and inv["system"] == "anchor-b20"
+    assert inv["status"] == "tables_partial" and inv["system"] == "part"
     assert inv["missing_sets"] == ["eval_cv8", "eval_reazon", "eval_emilia"] and not inv["refused"]
-    assert events(out, "evaluate_start")[0]["anchor_implied"] is True and not (out / "verdict.json").exists()
-    assert sorted(p.name for p in (tables / "anchor-b20").iterdir()) == ["eval_jsut.parquet"]
+    assert not (out / "verdict.json").exists()  # the gate sets are not all there
+    assert sorted(p.name for p in (tables / "part").iterdir()) == ["eval_jsut.parquet"]
     st = load(out / "study.json")
-    assert st["system"] == "anchor-b20" and st["stale_removed"] == ["eval_cv8"] and list(st["tables"]) == ["eval_jsut"]
+    assert st["system"] == "part" and st["stale_removed"] == ["eval_cv8"] and list(st["tables"]) == ["eval_jsut"]
     # --from-evals: every manifest set, or the --sets named
     (tables / "copy").mkdir()
     pd.DataFrame({"id": ["stale"]}).to_parquet(tables / "copy" / "eval_reazon.parquet")
@@ -700,29 +683,20 @@ def test_the_anchor_config_a_partial_eval_and_stale_tables(env, tmp_path):
     assert m05.main(["--from-evals", str(out), "--system", "copy", "--manifest", str(tmp_path / "m.json"), "--out",
                      str(tmp_path / "f2"), "--tables", str(tables), "--sets", "eval_jsut"]) == 0
     pd.testing.assert_frame_equal(pd.read_parquet(tables / "copy" / "eval_jsut.parquet"),
-                                  pd.read_parquet(tables / "anchor-b20" / "eval_jsut.parquet"))
+                                  pd.read_parquet(tables / "part" / "eval_jsut.parquet"))
 
 
-def test_a_branch_checkpoint_gets_the_branchs_system_name():
-    """The tables' default system: the config's run_name; a T/2 branch config's (branch.parent) is its checkpoint's run
-    name (the trainer's run id less its stamp: <parent>-half when the config kept the parent's run_name), or its own
-    -half run_name without a run id, else --system is needed; --anchor: anchor-b20."""
+def test_the_default_system_is_the_run_name():
+    """The tables' default system: the config's run_name; a quantised eval's is <run_name>@<fmt>."""
     m05 = load_script("05_evaluate")
-    args = SimpleNamespace(anchor=False)
-    branch = dict(run_name="study-t06", branch=dict(parent="runs/study-t06-20260927T010203Z"))
-    assert m05.default_system(dict(run_name="study-t06", branch=dict(parent=None)), args, {}) == "study-t06"
-    assert m05.default_system(branch, args, dict(run_id="study-t06-half-20260928T101112Z")) == "study-t06-half"
-    assert m05.default_system(branch, args, dict(run_id="study-t06-half-20260928T101112Z-2")) == "study-t06-half"
-    assert m05.default_system(dict(branch, run_name="study-t06-half"), args, {}) == "study-t06-half"
-    with pytest.raises(SystemExit, match="--system"):
-        m05.default_system(branch, args, {})
-    assert m05.default_system(branch, SimpleNamespace(anchor=True), {}) == "anchor-b20"
+    assert m05.default_system(dict(run_name="full-t06")) == "full-t06"
+    assert m05.default_system(dict(run_name="full-t06"), "nvfp4-w4a4") == "full-t06@nvfp4-w4a4"
 
 
-def test_a_generated_study_config_with_max_steps_unset_loads(env, tmp_path):
-    """tools/make_study_configs.py leaves schedule.max_steps null for the box to fill: 05 validates such a config with
-    a stand-in and keeps it null (the eval never reads it); the file's pull_parakeet and DEFAULTS' family and
-    loss.w_ctc are in the merged config."""
+def test_a_config_with_max_steps_unset_loads_with_the_set(env, tmp_path):
+    """A config on the steps clock whose schedule.max_steps is null (as in configs/study/study-t06.json, whose box
+    filled it and its optim.lr) fails the trainer's validate, and loads with --set schedule.max_steps (the eval never
+    reads it); the file's pull_parakeet and DEFAULTS' family and loss.w_ctc are in the merged config."""
     m05 = load_script("05_evaluate")
     cfg = load(env["relative"])
     cfg["schedule"] = dict(cfg["schedule"], max_steps=None)
@@ -730,8 +704,11 @@ def test_a_generated_study_config_with_max_steps_unset_loads(env, tmp_path):
     p = tmp_path / "gen.json"
     p.write_text(json.dumps(cfg), encoding="utf-8")
     args = SimpleNamespace(config=str(p), set=[], batch_s=None, root=str(env["root"]))
+    with pytest.raises(SystemExit, match="max_steps"):
+        m05.load_cfg(m05.load_trainer(), args)
+    args.set = ["schedule.max_steps=20000"]
     got, path = m05.load_cfg(m05.load_trainer(), args)
-    assert got["schedule"]["max_steps"] is None and got["schedule"]["clock"] == "steps" and path == p
+    assert got["schedule"]["max_steps"] == 20000 and got["schedule"]["clock"] == "steps" and path == p
     assert got["pull_parakeet"] is True and got["family"] == "aed" and got["loss"]["w_ctc"] == 0.8
 
 

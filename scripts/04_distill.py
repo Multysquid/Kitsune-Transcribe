@@ -2156,7 +2156,7 @@ def build_train_store(cfg: dict, log) -> trainset.Stores:
 
 def build_eval_store(cfg: dict, log, frames: bool | None = None) -> trainset.Stores:
     """The eval store of cfg["eval_sets"] (cached under cache_dir, shared with 03's eval cache): eval_store_spec's rows.
-      frames None  (the default: scripts/05_evaluate.py's and the box's store step, kitsune/study_queue.py) the TOKEN
+      frames None  (the default: scripts/05_evaluate.py's and the box's store step, kitsune/full_queue.py) the TOKEN
                    store (teacher_root), the one the evaluator scores every system on, of either family and in either
                    evaluator path (its CTC eval takes the frame targets from parakeet_out itself), and the speed
                    probe's cache/eval. For a family-ctc config the trainer's frame store of the same rows is built (or
@@ -6075,7 +6075,7 @@ def make_summary(R: Run, status: str, **extra) -> dict:
         extra.setdefault("branch", {k: br[k] for k in ("parent_run_id", "resume_step", "end_step", "t_c")})
     return dict(
         status=status, run_id=R.run_dir.name, family=family(R.cfg),
-        # the study's checks (kitsune.study_stats): one selection for every run, PREREG_numbers before the first start
+        # what the size study's report checked: one selection for every run, its numbers files before the first start
         selection_sha256=selection_sha256(R), started_utc=st.get("started_utc"),
         steps=st["step"], epochs=st["epoch_progress"],
         train_s=round(st["train_s"], 1), elapsed_s_total=round(elapsed, 1), resumes=st["resumes"],
