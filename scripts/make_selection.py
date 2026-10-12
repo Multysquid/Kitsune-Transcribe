@@ -110,7 +110,6 @@ sidecar_problems checks it at launch). Exit 0 written, 3 K5 over the limit, 1 re
 problems included), 2 bad arguments.
 
 Usage:
-  python scripts/make_selection.py --config configs/viability.json       # the viability run's selection
   python scripts/make_selection.py --sources reazon_small --agree-max 0.5 --out selection/reazon_only.parquet
   python scripts/make_selection.py --config configs/full.json            # the label box's selection
   python scripts/make_selection.py --config SUB.json --from-selection labels/full/selections/full.parquet   # a subset
@@ -694,7 +693,7 @@ def write_selection(sel: pd.DataFrame, out: Path, meta: dict):
 def main(argv: list[str] | None = None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=None,
-                    help="run config (e.g. configs/viability.json): --sources, --eval-sets and its selection_recipe "
+                    help="run config (e.g. configs/full.json): --sources, --eval-sets and its selection_recipe "
                          "(--agree-max, --agree-max-source, --filter-eval-sets) come from it, --out defaults to its "
                          "selection; none of those flags may be given too")
     ap.add_argument("--sources", nargs="+", default=None,
@@ -776,7 +775,7 @@ def main(argv: list[str] | None = None):
     elif given := [f"--{k.replace('_', '-')}" for k in ("labels_root", "manifest", "manifest_sha256", "study_selection")
                    if getattr(args, k) is not None]:
         ap.error(f"{' '.join(given)}: only for a config with selection_recipe.full_study")
-    # the roots: explicit flags win, then the config's (the viability config's are these defaults)
+    # the roots: explicit flags win, then the config's, then the laptop's defaults (the trainer's DEFAULTS too)
     for flag, key, default in (("teacher_out", "teacher_root", "teacher_out"),
                                ("second_out", "second_root", "second_out"), ("data", "data_root", "data"),
                                ("parakeet_out", "parakeet_root", "parakeet_out")):

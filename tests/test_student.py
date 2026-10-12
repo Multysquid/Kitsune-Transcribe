@@ -500,12 +500,14 @@ def test_build_script_help_is_light():
 
 
 def test_build_script_calibrates_on_the_viability_sources_by_default():
-    """The documented plain command rebuilds students/b20x2560-d4, which was calibrated on every viability source."""
+    """The documented plain command rebuilds students/b20x2560-d4, which was calibrated on every source the viability
+    run trained on, from its selection."""
     from fixtures import load_script
 
-    viability = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
     args = load_script("03_build_student").parse_args([])
-    assert args.sources == viability["sources"] and args.out == ROOT / viability["student"]
+    assert args.sources == ["reazon_small", "emilia_yodas", "galgame"]
+    assert args.out == ROOT / "students" / "b20x2560-d4"
+    assert Path(args.selection) == ROOT / "selection" / "viability.parquet"
 
 
 def test_build_script_end_to_end_tiny(tmp_path):

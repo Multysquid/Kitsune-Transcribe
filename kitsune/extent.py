@@ -90,7 +90,7 @@ REBUILD_BYTES_PER_S, REBUILD_SLACK, REBUILD_BASE_MIN = 40e6, 1.5, 30
 
 
 def extent_block(cfg: dict) -> dict | None:
-    """The config's extent block, or None (the viability config has none)."""
+    """The config's extent block, or None (a config without one: the trainer's DEFAULTS, the template)."""
     return cfg.get("extent") or None
 
 

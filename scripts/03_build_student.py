@@ -89,7 +89,7 @@ TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 # MODEL_CARD.md names); without a pin every hub read silently follows `main`
 TEACHER_REVISION = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
 EVAL_SETS = ["eval_jsut", "eval_cv8", "eval_reazon"]
-SOURCES = ["reazon_small", "emilia_yodas", "galgame"]  # configs/viability.json "sources": calibrate on what it trains on
+SOURCES = ["reazon_small", "emilia_yodas", "galgame"]  # the viability run's sources: calibrate on what it trained on
 MAX_SECONDS = 30.0  # LogMel / HF fast path; the teacher pass skipped longer utterances anyway
 IMPORTANCE_FORMAT = 1
 # the teacher dtype of an importance cache whose key and info do not record one: every build before --teacher-dtype
@@ -513,7 +513,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--teacher", default=TEACHER_ID, help="HF repo id or local dir of the teacher")
     ap.add_argument("--teacher-revision", default=TEACHER_REVISION,
                     help="commit of --teacher to read (default: the pin 02_teacher_pass read); ignored for a local dir")
-    ap.add_argument("--selection", default=str(ROOT / "selection" / "viability.parquet"))
+    ap.add_argument("--selection", default=str(ROOT / "selection" / "viability.parquet"),
+                    help="the selection the calibration draws its kept train rows from (default: the viability run's, "
+                         "selection/viability.parquet of the HF data repo, which students/b20x2560-d4 was built on)")
     ap.add_argument("--data", default=str(ROOT / "data"))
     ap.add_argument("--teacher-root", default=str(ROOT / "teacher_out"))
     ap.add_argument("--eval-cache", default=str(ROOT / "cache" / "eval"), help="kitsune.trainset eval store cache")

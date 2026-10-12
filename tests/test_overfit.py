@@ -232,7 +232,8 @@ def test_cpu_offload_adamw_is_adamw(monkeypatch, fused):
 
 
 def test_overfit_options_are_validated():
-    """The overfit runs' options refuse values they cannot run with; the viability run sets none of them."""
+    """The overfit runs' options refuse values they cannot run with; DEFAULTS (and so the viability run, which only
+    turned early stopping on) set none of them."""
     m = load_script("04_distill")
     for bad in (["schedule.clock=epochs"], ["schedule.clock=epochs", "schedule.epochs=0"], ["optim.offload=gpu"],
                 ["subset.train_audio_s=5", "subset.train_utts=10"], ["subset.eval_audio_s=-1"],
@@ -240,12 +241,12 @@ def test_overfit_options_are_validated():
                 ["perf.loader_timeout_s=-1"], ["perf.loader_timeout_s=10m"]):
         with pytest.raises(SystemExit):
             m.load_config(None, bad)
-    via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
-    assert via["optim"]["offload"] == "none" and via["specaug"]["enabled"] and via["schedule"]["clock"] == "wall"
-    assert via["subset"]["train_audio_s"] is None and via["eval"]["every_epochs"] is None
-    assert via["early_stop"] == dict(enabled=True, metric="heldout_kl", patience=3, min_delta_rel=0.005,
-                                     min_delta_abs=0.0, min_evals=3, floor=None, action="cooldown", smooth=1,
-                                     allow_test_sets=True)
+    d = m.load_config(None, [])
+    assert d["optim"]["offload"] == "none" and d["specaug"]["enabled"] and d["schedule"]["clock"] == "wall"
+    assert d["subset"]["train_audio_s"] is None and d["eval"]["every_epochs"] is None
+    assert d["early_stop"] == dict(enabled=False, metric="heldout_kl", patience=3, min_delta_rel=0.005,
+                                   min_delta_abs=0.0, min_evals=3, floor=None, action="cooldown", smooth=1,
+                                   allow_test_sets=True)
 
 
 # --------------------------------------------------------------------------------------------- the 8 GB laptop

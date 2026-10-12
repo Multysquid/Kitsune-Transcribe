@@ -363,7 +363,6 @@ def test_config_keys_are_validated():
     m = load_script("04_distill")
     assert m.DEFAULTS["eval"]["verdict_version"] == 1 and m.DEFAULTS["eval"]["verdict_min_epoch_gap"] == 0.25
     assert m.verdict_options(m.load_config(None, [])) == {}  # v1: the call the first A100 run was judged with
-    assert m.verdict_options(m.load_config(str(ROOT / "configs" / "viability.json"), [])) == {}
     assert m.verdict_options(m.load_config(None, ["eval.verdict_version=2", "eval.verdict_min_epoch_gap=0.5"])) == \
         dict(version=2, min_epoch_gap=0.5)
     ok = m.load_config(None, ['eval.reference={"name": "parakeet", "path": "configs/reference/parakeet.json"}'])
@@ -419,12 +418,11 @@ def test_gate_off_reports_na_with_the_numbers():
     computed = dict(verdict="GO", reasons=["3/3 sets within 1.2x"], sets={"eval_jsut": {"ratio": 1.0}}, n_sets_go=3,
                     trunc_rate=0.0, trend={"overfit": False}, thresholds={"go_ratio": 1.2})
     on = m.load_config(None, [])
-    assert m.gate_verdict(on, computed) is computed
+    assert on["eval"]["gate"] is True and m.gate_verdict(on, computed) is computed
     off = m.gate_verdict(m.load_config(None, ["eval.gate=false"]), computed)
     assert off == dict(verdict="N/A", reason="gate disabled (sanity/overfit run)",
                        numbers=dict(sets={"eval_jsut": {"ratio": 1.0}}, n_sets_go=3, trunc_rate=0.0,
                                     trend={"overfit": False}, thresholds={"go_ratio": 1.2}))
-    assert m.load_config(str(ROOT / "configs" / "viability.json"), [])["eval"]["gate"] is True
 
 
 # ------------------------------------------------------------------------------------------------ whole runs
@@ -980,13 +978,14 @@ def test_no_mini_that_would_run_past_T(env, monkeypatch):
 # ------------------------------------------------------------------------------------------- the next-run template
 
 
-def test_the_next_run_template_is_viability_with_the_reports_changes():
-    """configs/next_run_template.json (the scaling study's template) is configs/viability.json with exactly the
-    changes of the first run's report: micro-batches of 600 s as the memory probe's first choice, the epochs clock (8
-    epochs), a complete eval every 2 epochs with the minis in between, verdict v2, the smoke profile on, the reference
-    model left to be filled in. viability.json itself keeps the first run's values (v1, the wall clock, 400 s, a
-    complete eval every epoch, the profile on "auto"). Its schedule leaves verdict v2 the 3 pre-cooldown complete
-    evals it needs, and its _comment pre-registers v2."""
+def test_the_next_run_template_is_the_viability_runs_config_with_the_reports_changes():
+    """configs/next_run_template.json (the scaling study's template) is the viability run's config - the trainer's
+    DEFAULTS with early stopping on and its eval cadence (a greedy decode of 600 s of the probe, a mini eval every 500
+    steps; git show 76b28a1:configs/viability.json) - with exactly the changes of the first run's report: micro-batches
+    of 600 s as the memory probe's first choice, the epochs clock (8 epochs), a complete eval every 2 epochs with the
+    minis in between, verdict v2, the smoke profile on, the reference model left to be filled in. DEFAULTS keep the
+    first run's values (v1, the wall clock, 400 s, the profile on "auto"). Its schedule leaves verdict v2 the 3
+    pre-cooldown complete evals it needs, and its _comment pre-registers v2."""
     m = load_script("04_distill")
 
     def leaves(d, where=""):
@@ -996,17 +995,20 @@ def test_the_next_run_template_is_viability_with_the_reports_changes():
             else:
                 yield f"{where}{k}", v
 
-    via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
+    defaults = m.load_config(None, [])
     tpl = m.load_config(str(ROOT / "configs" / "next_run_template.json"), [])
-    a, b = dict(leaves(via)), dict(leaves(tpl))
+    a, b = dict(leaves(defaults)), dict(leaves(tpl))
     assert {k: (a[k], b[k]) for k in a if a[k] != b[k]} == {
+        # the viability run's own changes to DEFAULTS
+        "early_stop.enabled": (False, True), "eval.probe_greedy_audio_s": (None, 600),
+        "eval.mini.every_steps": (None, 500),
+        # the report's
         "run_name": ("viability-b20x2560", "next-run"), "batch.micro_audio_s": (400, 600),
-        "schedule.clock": ("wall", "epochs"), "schedule.epochs": (None, 8), "eval.full_every_epochs": (1, 2),
+        "schedule.clock": ("wall", "epochs"), "schedule.epochs": (None, 8), "eval.full_every_epochs": (None, 2),
         "eval.verdict_version": (1, 2), "perf.profile_smoke": ("auto", True)}
     assert tpl["eval"]["reference"] is None and tpl["eval"]["mini"]["every_steps"] == 500
-    assert m.verdict_options(tpl) == dict(version=2, min_epoch_gap=0.25) and m.verdict_options(via) == {}
+    assert m.verdict_options(tpl) == dict(version=2, min_epoch_gap=0.25) and m.verdict_options(defaults) == {}
     raw = json.loads((ROOT / "configs" / "next_run_template.json").read_text(encoding="utf-8"))
-    assert set(raw) == set(json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8")))
     c = raw["_comment"]
     for words in ("template for the scaling study", "TRAINER PART", "RUNS UNDER 8 EPOCHS", "eval.verdict_version 2", "lr_phase stable",
                   "trend: insufficient pre-cooldown evals", "cooldown_gain", "pre_cooldown_slope",

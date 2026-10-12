@@ -12,7 +12,7 @@ torch.compile), the run records the evidence itself, in the smoke phase, for a f
            observes, so the weights, losses and RNG streams are those of a run without it (tests/test_smoke_profile.py
            on CPU). On the steps and epochs clocks the run is bitwise the same (the epochs clock pays the cost in box
            time); on the wall clock the cost comes out of the loop time, as an eval's or a checkpoint's does, so a
-           wall-clock config (configs/viability.json under "auto") trains fewer steps than it did without the
+           wall-clock config (the viability run's, under "auto") trains fewer steps than it did without the
            profiler. The profiled steps are left out of the smoke throughput check
   cycles   the recorded steps in profiler cycles (TRACE_STEPS first, then up to CYCLE_STEPS each): each cycle's events
            are aggregated when it ends and then dropped, which bounds host memory and CUPTI's buffers

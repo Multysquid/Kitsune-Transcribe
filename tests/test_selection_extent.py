@@ -214,16 +214,16 @@ def test_the_label_config_resolves():
     by_source = {s.partition("=")[0] for s in recipe["agree_max_source"]}
     assert by_source <= set(cfg["sources"]) | set(recipe["filter_eval_sets"])
     assert not set(recipe["filter_eval_sets"]) & set(ms.EVAL_SETS) and recipe["partial_second_opinion"] == []
-    viability = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
-    assert kextent.extent_block(viability) is None
+    assert kextent.extent_block({k: v for k, v in cfg.items() if k != "extent"}) is None
     assert "labels/" in (ROOT / ".gitignore").read_text(encoding="utf-8").split()
 
 
-def test_viability_roots_equal_the_old_defaults():
-    """--config configs/viability.json resolves the roots it always used (teacher_out, second_out, data)."""
-    cfg = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
-    assert (cfg["teacher_root"], cfg["second_root"], cfg["data_root"]) == ("teacher_out", "second_out", "data")
-    assert ms._repo_path(cfg["teacher_root"]) == ROOT / "teacher_out"
+def test_the_default_roots_are_the_laptops():
+    """A config that names no roots resolves the ones the laptop always used (teacher_out, second_out, data), the
+    trainer's DEFAULTS as the viability run's config spelled them out."""
+    d = load_script("04_distill").DEFAULTS
+    assert (d["teacher_root"], d["second_root"], d["data_root"]) == ("teacher_out", "second_out", "data")
+    assert ms._repo_path(d["teacher_root"]) == ROOT / "teacher_out"
 
 
 def test_a_missing_subset_npz_or_base_stem_is_refused(corpus, tmp_path):
