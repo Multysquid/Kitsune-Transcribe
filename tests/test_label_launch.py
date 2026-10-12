@@ -138,7 +138,7 @@ def test_label_job_query_disk_env_and_label(fake_vastai, capsys):
     env = env_of(create)
     assert env["KITSUNE_JOB"] == "label" and env["KITSUNE_SHA"] == SHA
     assert env["KITSUNE_CONFIG"] == "configs/full.json"
-    assert env["KITSUNE_LABEL_CONFIGS"] == "configs/full.json,configs/full_sub3k.json"
+    assert env["KITSUNE_LABEL_CONFIGS"] == "configs/full.json"
     assert env["KITSUNE_DATA_REPO"] == "Multy123/kitsune-data" and env["KITSUNE_MAX_HOURS"] == "30"
     assert env["KITSUNE_WATCHDOG_SYNC_LEAD_S"] == "1800" and env["KITSUNE_WATCHDOG_ORPHAN_S"] == "900"
     assert env["KITSUNE_IMAGE"] == DIGEST_IMAGE and env["KITSUNE_MACHINE_ID"] == "9002"
@@ -275,12 +275,11 @@ def label_lfs():
 
 
 def test_label_preflight_clean_and_resume_plan(hub, parakeet_pins):
-    full, sub = make_cfg("full"), make_cfg("full_sub3k", {"reazon_large": 2, "galgame": 3})
+    full, sub = make_cfg("full"), make_cfg("sub", {"reazon_large": 2, "galgame": 3})
     hub(label_repo(**{"labels/full/teacher_out/galgame/train-00000.npz": b"x",
                       "labels/full/teacher_out/galgame/train-00001.npz": b"x",
                       "labels/full/parakeet_out/galgame/train-00000.npz": b"x"}), lfs=label_lfs())
-    rev, problems, notes = launch.label_preflight("r", SHA, full, {"configs/full.json": full,
-                                                                    "configs/full_sub3k.json": sub})
+    rev, problems, notes = launch.label_preflight("r", SHA, full, {"configs/full.json": full, "configs/sub.json": sub})
     assert rev == "d" * 40 and problems == [], problems
     resume = next(n for n in notes if n.startswith("resume plan"))
     assert "parakeet_out/galgame 1 stems" in resume and "teacher_out/galgame 2 stems" in resume
@@ -297,7 +296,7 @@ def test_label_preflight_refusals(hub, parakeet_pins, monkeypatch):
     del files["teacher_out/eval_cv8/eval-00000.jsonl"]
     del files["models/parakeet-tdt_ctc-0.6b-ja-hf/config.json"]
     hub(files, private=False, lfs=bad_lfs)
-    outside = make_cfg("full_sub3k", sources=["reazon_large"], eval_sets=[], root="labels/other")
+    outside = make_cfg("sub", sources=["reazon_large"], eval_sets=[], root="labels/other")
     called = []
     monkeypatch.setattr(launch, "data_problems", lambda *a: called.append(a) or [])
     monkeypatch.setattr(launch, "selection_problems", lambda *a, **k: called.append(a) or [])
@@ -338,21 +337,22 @@ def test_avoided_machines_from_label_end(hub):
 
 
 def test_label_main_runs_the_preflight_and_avoid_list(fake_vastai, hub, parakeet_pins, monkeypatch, capsys):
-    full, sub = make_cfg("full"), make_cfg("full_sub3k", {"reazon_large": 2})
-    cfgs = {"configs/full.json": full, "configs/full_sub3k.json": sub}
+    full, sub = make_cfg("full"), make_cfg("sub", {"reazon_large": 2})
+    cfgs = {"configs/full.json": full, "configs/sub.json": sub}
     monkeypatch.setattr(launch, "config_at", lambda sha, c: cfgs[c])
     called = []
     monkeypatch.setattr(launch, "hf_preflight", lambda *a: called.append(a) or (None, []))
     hub(label_repo(**{"label_runs/a/label_end.json": json.dumps({"class": "host_failure",
                                                                  "machine_id": 9002}).encode()}), lfs=label_lfs())
     fake = fake_vastai([OFFERS_5090])
-    args = label_args("--yes")
+    args = label_args("--yes", "--label-configs", "configs/full.json,configs/sub.json")
     assert launch.main(args) == 0, capsys.readouterr().out
     assert called == []
     create = next(c for c in fake.calls if c[1:3] == ["create", "instance"])
     assert create[3] == "503", "9002 ended as host_failure"
     env = env_of(create)
     assert env["KITSUNE_DATA_REVISION"] == "d" * 40 and env["KITSUNE_MACHINE_ID"] == "9003"
+    assert env["KITSUNE_LABEL_CONFIGS"] == "configs/full.json,configs/sub.json"
     assert "resume plan" in capsys.readouterr().out
 
 
@@ -482,7 +482,7 @@ def test_train_with_an_extent_config_sizes_the_box(tmp_path, fake_vastai, hub, m
     hub(extent_hub_files(tmp_path, cfg))
     fake = fake_vastai([OFFERS_A100])
     args = ["--data-repo", "Multy123/kitsune-data", "--out-repo", "Multy123/kitsune-runs", "--sha", SHA,
-            "--image", DIGEST_IMAGE, "--skip-git-checks", "--config", "configs/full_sub3k.json", "--yes"]
+            "--image", DIGEST_IMAGE, "--skip-git-checks", "--config", "configs/sub.json", "--yes"]
     assert launch.main(args) == 0, capsys.readouterr().out
     search = next(c for c in fake.calls if c[1:3] == ["search", "offers"])
     assert "disk_space>=250" in search[3] and search[search.index("--storage") + 1] == "250"
@@ -506,6 +506,6 @@ def test_train_extent_config_under_no_hf_check_needs_explicit_sizing(fake_vastai
     """Without the HF preflight there is no extent sizing: the 150 GB default disk cannot hold a full rebuild."""
     fake_vastai([OFFERS_5090])
     args = ["--data-repo", "Multy123/kitsune-data", "--out-repo", "Multy123/out", "--sha", SHA, "--image",
-            DIGEST_IMAGE, "--skip-git-checks", "--no-hf-check", "--config", "configs/full_sub3k.json", "--yes"]
+            DIGEST_IMAGE, "--skip-git-checks", "--no-hf-check", "--config", "configs/full.json", "--yes"]
     assert launch.main(args) == 1
     assert "pass --disk-gb and --max-hours" in capsys.readouterr().out

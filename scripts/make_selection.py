@@ -112,7 +112,8 @@ problems included), 2 bad arguments.
 Usage:
   python scripts/make_selection.py --config configs/viability.json       # the viability run's selection
   python scripts/make_selection.py --sources reazon_small --agree-max 0.5 --out selection/reazon_only.parquet
-  python scripts/make_selection.py --config configs/full_sub3k.json --from-selection labels/full/selections/full.parquet
+  python scripts/make_selection.py --config configs/full.json            # the label box's selection
+  python scripts/make_selection.py --config SUB.json --from-selection labels/full/selections/full.parquet   # a subset
   python scripts/make_selection.py --config study/data.json --skip-audio-check     # the study (labels/full pulled)
   python scripts/make_selection.py --config data-full.json --labels-root D:/kitsune-labels/full \\
       --manifest D:/kitsune-study/selections/study_manifest.json --skip-audio-check \\

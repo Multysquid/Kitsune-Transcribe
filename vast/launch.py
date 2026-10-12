@@ -25,7 +25,7 @@ Usage:
   python vast/launch.py --data-repo Multy123/kitsune-data --out-repo Multy123/kitsune-runs --yes  # rent the cheapest
 Add --no-self-stop to debug a fresh box: a failed on-start or bootstrap then leaves it running (KITSUNE_NO_SELF_STOP=1).
 
-A config with an `extent` (configs/full.json, configs/full_sub3k.json) trains on the label box's labels: the HF check
+A config with an `extent` (configs/full.json or a subset of its extent) trains on the label box's labels: the HF check
 then reads <extent.root>/extent.json at the pinned revision, requires COMPLETE.json and every file of the subset
 (extent_problems), and sizes the disk, the rebuild timeout (KITSUNE_REBUILD_TIMEOUT_MIN) and --max-hours from it.
 
@@ -172,7 +172,7 @@ LABEL_TIERS = [
 # ranking: a missing $/GB counts as this; label_end.json classes whose machine is avoided on the next launch
 DEFAULT_GB_COST = 0.01
 AVOID_CLASSES = ("host_failure", "slow_host")
-LABEL_CONFIGS = "configs/full.json,configs/full_sub3k.json"
+LABEL_CONFIGS = "configs/full.json"
 LABEL_WATCHDOG_ENV = {"KITSUNE_WATCHDOG_SYNC_LEAD_S": "1800", "KITSUNE_WATCHDOG_ORPHAN_S": "900"}
 MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"  # kitsune.features.HF_MODEL_ID (that module imports torch)
 LEASE_MAX_AGE_S = 2700  # a lease heartbeat younger than this is a live box (label_sync.lease_live)
@@ -2180,7 +2180,9 @@ def main(argv: list[str] | None = None) -> int:
                          "computed minimum")
     ap.add_argument("--label-configs", default=LABEL_CONFIGS,
                     help="label: comma list of the configs the label box's consumer check serves "
-                         "(KITSUNE_LABEL_CONFIGS); each extent must lie inside --config's")
+                         "(KITSUNE_LABEL_CONFIGS; default %(default)s); each extent must lie inside --config's, and "
+                         "each other config's selection is derived from --config's (make_selection.py "
+                         "--from-selection)")
     ap.add_argument("--steal-lease", action="store_true",
                     help="label: take over a live LEASE.json (only when that box is surely gone; "
                          "KITSUNE_STEAL_LEASE=1)")

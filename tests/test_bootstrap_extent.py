@@ -44,8 +44,8 @@ def helper_source() -> str:
 
 
 def make_cfg(inputs: dict | None = None, extent: bool = True) -> dict:
-    """A small extent config shaped like configs/full_sub3k.json: galgame (train and hold-out, capped) and a gate
-    set."""
+    """A small extent config, a capped subset of configs/full.json's extent: galgame (train and hold-out, capped) and
+    a gate set."""
     cfg = {"run_name": "sub", "student": STUDENT, "data_root": "data",
            "teacher_root": f"{LR}/teacher_out", "second_root": f"{LR}/second_out",
            "parakeet_root": f"{LR}/parakeet_out", "selection": f"{LR}/selections/sub.parquet",

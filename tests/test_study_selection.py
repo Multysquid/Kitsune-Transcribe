@@ -522,10 +522,9 @@ def test_pull_plan_parakeet_per_family(st):
 
 
 def test_pull_plan_of_the_full_configs_is_unchanged():
-    """configs/full.json and full_sub3k.json have neither family nor pull_parakeet: never parakeet_out."""
-    for name in ("full", "full_sub3k"):
-        cfg = json.loads((ROOT / "configs" / f"{name}.json").read_text(encoding="utf-8"))
-        assert "family" not in cfg and "pull_parakeet" not in cfg
+    """configs/full.json has neither family nor pull_parakeet: never parakeet_out."""
+    cfg = json.loads((ROOT / "configs" / "full.json").read_text(encoding="utf-8"))
+    assert "family" not in cfg and "pull_parakeet" not in cfg
     cfg = json.loads((ROOT / "study" / "data.json").read_text(encoding="utf-8"))
     assert cfg["pull_parakeet"] is True and kextent.validate(cfg) == []
 
