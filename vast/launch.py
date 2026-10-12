@@ -18,8 +18,8 @@ pinned revision, an extent whose root is not sealed (COMPLETE.json) or lacks a f
 sizes the box's disk and the rebuild timeout (KITSUNE_REBUILD_TIMEOUT_MIN).
 
 HF_TOKEN is never an argument and never part of the command: the box gets it from the vast ACCOUNT-level environment
-variables (D48a), so it does not appear in shell history, the process list or the instance config. The instance runs
-the code at a pinned commit (KITSUNE_SHA), so this script refuses to rent for a commit GitHub does not have.
+variables, so it does not appear in shell history, the process list or the instance config. The instance runs the code
+at a pinned commit (KITSUNE_SHA), so this script refuses to rent for a commit GitHub does not have.
 Add --no-self-stop to debug a fresh box: a failed on-start or bootstrap then leaves it running (KITSUNE_NO_SELF_STOP=1).
 
 --job label rents one RTX 5090 for the label box (vast/label.py, docs in vast/README.md): its own tiers and host
@@ -43,20 +43,20 @@ an augment.* --resume-set on a box without a CTC train item is refused before an
 Hub queue summary has a train item done (a fresh queue would overwrite that summary, and the run's continuation,
 --resume-reset, reads it; --fresh-over-done for a deliberate fresh start), and a box with quantised items (full-t,
 full-p, p01, p005) without the quant go signal: smoke-b's verdict on the Hub passed checks 12-16 at an ancestor commit
-with the same quant code (QUANT_CODE; DECISIONS F2), which --allow-unverified-quant turns into a warning. The hours of
-boxes full-t and p005 warn while their speed record has no box-1 part. Offers listed in a country without Hub access
+with the same quant code (QUANT_CODE), which --allow-unverified-quant turns into a warning. The hours of boxes full-t
+and p005 warn while their speed record has no box-1 part. Offers listed in a country without Hub access
 (FULL_AVOID_COUNTRIES) are dropped.
-A box whose train items continue other boxes' runs (the registry's `continues` blocks, DECISIONS H14) is always a
-resume (KITSUNE_RESUME=1 without --resume; the registry carries each reset and its sets, so --fresh-over-done
-and a --resume-reset/--resume-set naming a continued run are refused), and resume_preflight checks each continuation
-before renting: its own summary's record when there is one (the registry's sets and resets_before), else the source
-box's summary (ended, the item done and verified, the run id and resets the registry's), the state
+A box whose train items continue other boxes' runs (the registry's `continues` blocks, as the retired box p-cool's did)
+is always a resume (KITSUNE_RESUME=1 without --resume; the registry carries each reset and its sets, so
+--fresh-over-done and a --resume-reset/--resume-set naming a continued run are refused), and resume_preflight checks
+each continuation before renting: its own summary's record when there is one (the registry's sets and resets_before),
+else the source box's summary (ended, the item done and verified, the run id and resets the registry's), the state
 full_step_<from_step> (complete, pre_cooldown, its resets, its early-stop cooldown record with keep_cooldown, else none
 and the run's end at to_step), one planner n_utts for all of them (one store), and no readout dir m4-<rid>-r<N> on the
-Hub that the box would write into (unless its own summary records that continuation); a live instance of the box or of
-a source box (running, loading, created, or a null actual_status: holds_host) is refused. A --resume of a box whose
-runs another box continues, or a retired one did (RETIRED_CONTINUATIONS: the H14 re-runs at the heads of boxes
-full-p's, p01's and p005's runs), needs --allow-continued-runs (that box's continuation wrote into the same run dirs).
+Hub that the box would write into (unless its own summary records that continuation); a live instance of the box or of a
+source box (running, loading, created, or a null actual_status: holds_host) is refused. A --resume of a box whose runs
+another box continues, or a retired one did (RETIRED_CONTINUATIONS: box p-cool's re-runs at the heads of boxes full-p's,
+p01's and p005's runs), needs --allow-continued-runs (that box's continuation wrote into the same run dirs).
 Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate said slow in the last
 GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link
 first (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
@@ -1823,8 +1823,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="full: a full-data box (--box; kitsune/full_queue.py, the registry configs/full/boxes.json); "
                          "label: the RTX 5090 label box (vast/label.py)")
     ap.add_argument("--box", choices=fullrun.BOX_NAMES, default=None,
-                    help="full: full-smoke (smoke A), p01 (box 1, then its recipe test: box 1's cooldown again), full-t "
-                         "(T-0.6B), full-p (P-0.3B), p005 (P-0.05B) or smoke-b")
+                    help="full: full-smoke (smoke A), p01 (box 1: P-0.1B), full-t (T-0.6B), full-p (P-0.3B), p005 "
+                         "(P-0.05B) or smoke-b (smoke B)")
     ap.add_argument("--data-repo", required=True, help="private HF dataset with the derived data (KITSUNE_DATA_REPO)")
     ap.add_argument("--out-repo", default=None,
                     help="private HF model repo for runs/ (KITSUNE_OUT_REPO; required for --job full)")
@@ -1853,8 +1853,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="label: take over a live LEASE.json (only when that box is surely gone; "
                          "KITSUNE_STEAL_LEASE=1)")
     ap.add_argument("--avoid-machine", action="append", default=[], metavar="ID",
-                    help="label: never rent this vast machine_id (repeatable); label_runs/*/label_end.json with class "
-                         "host_failure/slow_host adds its machine by itself")
+                    help="never rent this vast machine_id (repeatable); every job also avoids the label runs' failed "
+                         "hosts (label_runs/*/label_end.json with class host_failure/slow_host) by itself")
     ap.add_argument("--cohere-procs", type=int, default=None,
                     help="label: Cohere processes on the GPU (KITSUNE_COHERE_PROCS; default: the config's)")
     ap.add_argument("--machine", default=None, metavar="ID",
@@ -1877,10 +1877,10 @@ def main(argv: list[str] | None = None) -> int:
                          + " (repeatable, one KEY once per run; implies --resume; KITSUNE_RESUME_SETS carries each "
                          "value in one spelling: True -> true, .30 -> 0.3, 012 -> 12). With --resume-reset of the same "
                          "run: a continuation from its pre_cooldown state, e.g. --resume-reset <rid> --resume-set "
-                         "<rid>:schedule.epochs=8 --resume-set <rid>:early_stop.patience=12, or the recipe test "
-                         "(DECISIONS H1) --resume-reset <rid> --resume-set <rid>:schedule.epochs=4 --resume-set "
-                         "<rid>:augment.enabled=true --resume-set <rid>:augment.truncate_p=0.3 ... (augment.*: a box "
-                         "with a CTC train item only)")
+                         "<rid>:schedule.epochs=8 --resume-set <rid>:early_stop.patience=12, or a recipe test (the "
+                         "cooldown again with augmentation on, as box 1's was) --resume-reset <rid> --resume-set "
+                         "<rid>:schedule.epochs=4 --resume-set <rid>:augment.enabled=true --resume-set "
+                         "<rid>:augment.truncate_p=0.3 ... (augment.*: a box with a CTC train item only)")
     ap.add_argument("--allow-done-trains", action="store_true",
                     help="full: a plain --resume of a box whose Hub summary has every train item done (a box lost "
                          "in its eval pool); refused without it, because a plain --resume never continues a done run "
@@ -1905,13 +1905,13 @@ def main(argv: list[str] | None = None) -> int:
                          f"(default {FULL_TOTAL_FACTOR:g} x the $/h cap x the planned hours + the traffic at the $/GB cap)")
     ap.add_argument("--allow-unverified-quant", action="store_true",
                     help="full: rent a box with quantised items (full-t, full-p, p01, p005) without a passing "
-                         "smoke-b verdict at its quant code (DECISIONS F2's go signal; the refusal becomes a warning)")
+                         "smoke-b verdict at its quant code (the quant go signal; the refusal becomes a warning)")
     ap.add_argument("--allow-continued-runs", action="store_true",
                     help="full: a --resume/--resume-reset/--resume-set of a box whose Hub summary's runs another "
-                         "registry box continues (its `continues` blocks, DECISIONS H14) or a retired box continued "
-                         "(RETIRED_CONTINUATIONS: H14's re-runs of boxes full-p's, p01's and p005's runs); refused "
-                         "without it, because that continuation wrote into the same run dirs and the same final export "
-                         "path")
+                         "registry box continues (its `continues` blocks) or a retired box continued "
+                         "(RETIRED_CONTINUATIONS: box p-cool's re-runs of boxes full-p's, p01's and p005's runs); "
+                         "refused without it, because that continuation wrote into the same run dirs and the same "
+                         "final export path")
     ap.add_argument("--no-self-stop", action="store_true",
                     help="debugging: the box does not stop itself when its on-start or bootstrap fails "
                          "(KITSUNE_NO_SELF_STOP=1); the watchdog still stops it once onstart.sh has started it")
