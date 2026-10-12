@@ -18,8 +18,10 @@ files); analysis wants one table per kind. This folds everything into export/:
     mini evals' evals/step_<N>_mini/ likewise (eval_mini_tf, eval_mini_greedy, ...), summary.json files flattened to
     eval_summaries (a `mini` column; the eval's final and complete flags and its val-CER scope as columns),
     samples/*.jsonl -> samples, events.jsonl -> events
-  - infra/ (box logs and state that vast/finish.py uploads: kitsune.log, supervise.json, bootstrap timings, the
-    lifecycle events of the stop/destroy scripts) copied, its events and bootstrap timings also as tables
+  - infra/ (the viability run's box logs and state, which the retired train job's vast/finish.py put under
+    runs/<run_id>/infra/: kitsune.log, supervise.json, bootstrap timings, the lifecycle events of the stop/destroy
+    scripts; a full box's are under full/box-<box>/infra/<container>/ in the runs repo) copied, its events and
+    bootstrap timings also as tables
   - config.json (config.<stamp>.json of each restart), summary.json and env/ copied as they are
 The open files are append-only, so after a crash and resume they keep the rows of the steps the resumed launch
 replaced, and of those it never reached (a clipped time budget): a `discarded` column marks them (the resumes are read

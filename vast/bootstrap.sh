@@ -15,12 +15,13 @@
 # The plan phase also checks that HF_TOKEN can read and write $KITSUNE_OUT_REPO: launch.py checks the repos with the
 # laptop's own login, and the trainer's first upload comes only after the pull, the audio rebuild and the model load.
 #
-# Env: KITSUNE_DATA_REPO, KITSUNE_OUT_REPO and KITSUNE_CONFIG (required; vast/launch.py passes them),
-# KITSUNE_DATA_REVISION (default main), KITSUNE_MIN_COVERAGE (default 0.99; an extent's join is held to 1.0 whatever it
-# says), HF_TOKEN (vast account env; never printed), KITSUNE_REBUILD_TIMEOUT_MIN (the per-attempt timeout of the audio
-# rebuild in minutes, default 60; vast/launch.py sizes it from the extent record's upstream bytes),
-# KITSUNE_DOWNLOAD_AHEAD (optional, read by 01 itself: how many upstream files download ahead of its ingest, 0..16,
-# default 6, 0 = one at a time; decision F3. Not a flag on the rebuild line, which the contract keeps byte-identical).
+# Env: KITSUNE_JOB=full, KITSUNE_BOX, KITSUNE_DATA_REPO, KITSUNE_OUT_REPO and KITSUNE_CONFIG (required; vast/launch.py
+# --job full passes them: any other job is refused, exit 2, as onstart.sh, supervise.py and finish.py refuse it),
+# KITSUNE_DATA_REVISION (default main), HF_TOKEN (vast account env; never printed), KITSUNE_REBUILD_TIMEOUT_MIN (the
+# per-attempt timeout of the audio rebuild in minutes, default 60; vast/launch.py sizes it from the extent record's
+# upstream bytes), KITSUNE_DOWNLOAD_AHEAD (optional, read by 01 itself: how many upstream files download ahead of its
+# ingest, 0..16, default 6, 0 = one at a time; decision F3. Not a flag on the rebuild line, which the contract keeps
+# byte-identical).
 #
 # The run config has an "extent" block (labels from the label box under <extent root>/, e.g. labels/full; a config
 # without one is refused, exit 3): the plan requires <root>/COMPLETE.json and <root>/extent.json in the listing (else it
@@ -33,17 +34,17 @@
 # pulled stem's rebuilt id sidecar hashes to the record's ids_sha256, its teacher ids are a subset of its ids, and every
 # split joins at 1.0.
 #
-# Full-data box (KITSUNE_JOB=full, KITSUNE_BOX; KITSUNE_CONFIG is the box's data config configs/full/data-*.json, which
-# names no student): the students, extra files (the frozen eval manifest, the selection sidecar) and extra dirs come
-# from the box registry (kitsune/fullrun.py, configs/full/boxes.json of this checkout). Phases: download_gate
-# (kitsune.netgate, with KITSUNE_GATE_BYTES: exit 3 is a slow host, not retried, and it sets the label pull's and the
-# rebuild's per-attempt timeouts KITSUNE_PULL_TIMEOUT_MIN / KITSUNE_REBUILD_TIMEOUT_MIN), plan (HF_TOKEN must also read
-# and write KITSUNE_SCRATCH_REPO; a box with timed states refuses without it), pull_derived (all but the labels),
-# resume_pull (KITSUNE_RESUME=1, or a box with registry continuations - python -m kitsune.fullrun has-continues prints
-# 1, DECISIONS H14: python -m kitsune.full_queue resume-pull; exit 3 not retried), check_students (python
-# -m kitsune.fullrun check-students), pull_labels in the background while 01 rebuilds the audio (decision 13), the
-# rebuild, pull_labels_wait, coverage. Each phase keeps $STATE/train_hb fresh (vast/watchdog.sh reads it) while it runs,
-# for at most its own worst case (the label pull and the rebuild: their three attempts' timeouts) or else
+# The box (KITSUNE_BOX; KITSUNE_CONFIG is its data config configs/full/data-*.json, which names no student): the
+# students, extra files (the frozen eval manifest, the selection sidecar) and extra dirs come from the box registry
+# (kitsune/fullrun.py, configs/full/boxes.json of this checkout). Phases: download_gate (kitsune.netgate, with
+# KITSUNE_GATE_BYTES: exit 3 is a slow host, not retried, and it sets the label pull's and the rebuild's per-attempt
+# timeouts KITSUNE_PULL_TIMEOUT_MIN / KITSUNE_REBUILD_TIMEOUT_MIN), plan (HF_TOKEN must also read and write
+# KITSUNE_SCRATCH_REPO; a box with timed states refuses without it), pull_derived (all but the labels), resume_pull
+# (KITSUNE_RESUME=1, or a box with registry continuations - python -m kitsune.fullrun has-continues prints 1, DECISIONS
+# H14: python -m kitsune.full_queue resume-pull; exit 3 not retried), check_students (python -m kitsune.fullrun
+# check-students), pull_labels in the background while 01 rebuilds the audio (decision 13), the rebuild,
+# pull_labels_wait, coverage. Each phase keeps $STATE/train_hb fresh (vast/watchdog.sh reads it) while it runs, for at
+# most its own worst case (the label pull and the rebuild: their three attempts' timeouts) or else
 # KITSUNE_PHASE_HB_MAX_S (12 h), and never after bootstrap has exited. vast/README.md "Full-data runs" has the box's
 # whole life.
 #
@@ -67,12 +68,19 @@ PY="${KITSUNE_PY:-/venv/main/bin/python}"
 [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
 export KITSUNE_DIR CONFIG STATE
 export KITSUNE_DATA_REVISION="${KITSUNE_DATA_REVISION:-main}"
-export KITSUNE_MIN_COVERAGE="${KITSUNE_MIN_COVERAGE:-0.99}"
 export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 export TQDM_MININTERVAL="${TQDM_MININTERVAL:-30}"  # 01's progress bars go to a log file, not a terminal
 
 log() { printf '%s [bootstrap] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
+if [ "${KITSUNE_JOB:-}" != full ]; then
+    log "KITSUNE_JOB is '${KITSUNE_JOB:-}', not full: bootstrap prepares a full-data box (vast/launch.py --job full)"
+    exit 2
+fi
+if [ -z "${KITSUNE_BOX:-}" ]; then
+    log "KITSUNE_BOX is not set (vast/launch.py passes it)"
+    exit 2
+fi
 if [ -z "${KITSUNE_DATA_REPO:-}" ]; then
     log "KITSUNE_DATA_REPO is not set"
     exit 2
@@ -97,11 +105,11 @@ TIMINGS="$STATE/bootstrap_timings.jsonl"
 # (one destroyed itself): the EXIT trap below ran in a phase's train_hb toucher (see on_exit)
 HELPER="$STATE/bootstrap_helper.py"
 
-stop_label_pull() {  # job full, at exit: the background label pull and everything it started. Killing its subshell
-    # alone leaves its children running: the pull's timeout (SIGTERM reaches its python through timeout) and the
-    # phase's train_hb toucher (which also ends by itself once bootstrap is gone). The children are listed first: once
-    # the subshell is dead they belong to init. ps -ef has PID in column 2 and PPID in column 3, with procps and Git
-    # Bash alike
+stop_label_pull() {  # at exit: the background label pull and everything it started. Killing its subshell alone
+    # leaves its children running: the pull's timeout (SIGTERM reaches its python through timeout) and the phase's
+    # train_hb toucher (which also ends by itself once bootstrap is gone). The children are listed first: once the
+    # subshell is dead they belong to init. ps -ef has PID in column 2 and PPID in column 3, with procps and Git Bash
+    # alike
     [ -n "${LABELS_PID:-}" ] || return 0
     local kids
     kids=$(ps -ef 2>/dev/null | awk -v p="$LABELS_PID" '$3 == p { print $2 }') || true
@@ -159,21 +167,17 @@ phase() {  # phase <name> <command...>: run it and append its wall time
     ensure_helper
     t0=$(date +%s.%N)
     log "phase $name ..."
-    if [ "${KITSUNE_JOB:-}" = full ]; then
-        # the box controller's heartbeat while the phase runs. Every phase is bounded by its own timeout, and so is
-        # its toucher: by PHASE_HB_MAX_S, the budget of a phase that may run long (the label pull, the rebuild), else
-        # by KITSUNE_PHASE_HB_MAX_S (12 h, far above the other phases' timeouts). A hung bootstrap still goes stale
-        max_s=${PHASE_HB_MAX_S:-${KITSUNE_PHASE_HB_MAX_S:-43200}}
-        log "phase $name keeps train_hb fresh for at most $max_s s"
-        beat_train_hb "$max_s" &
-        hb=$!
-        "$@" || rc=$?
-        kill "$hb" 2>/dev/null || true
-        wait "$hb" 2>/dev/null || true
-        [ "$rc" -eq 0 ] || return "$rc"
-    else
-        "$@"
-    fi
+    # the box controller's heartbeat while the phase runs. Every phase is bounded by its own timeout, and so is its
+    # toucher: by PHASE_HB_MAX_S, the budget of a phase that may run long (the label pull, the rebuild), else by
+    # KITSUNE_PHASE_HB_MAX_S (12 h, far above the other phases' timeouts). A hung bootstrap still goes stale
+    max_s=${PHASE_HB_MAX_S:-${KITSUNE_PHASE_HB_MAX_S:-43200}}
+    log "phase $name keeps train_hb fresh for at most $max_s s"
+    beat_train_hb "$max_s" &
+    hb=$!
+    "$@" || rc=$?
+    kill "$hb" 2>/dev/null || true
+    wait "$hb" 2>/dev/null || true
+    [ "$rc" -eq 0 ] || return "$rc"
     t1=$(date +%s.%N)
     printf '{"phase": "%s", "seconds": %s, "end": %s%s}\n' "$name" \
         "$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')" "${t1%.*}" \
@@ -201,8 +205,9 @@ retry() {
 }
 
 cat > "$HELPER" <<'PYEOF'
-"""bootstrap helper: plan / pull / coverage. Reads the run config for sources and paths; a full-data box (KITSUNE_JOB=full)
-also its box registry, and pulls its labels with pull_labels, apart from the rest."""
+"""bootstrap helper: plan / pull / coverage. Reads the run config for sources and paths and, with KITSUNE_JOB=full
+(bootstrap requires it), the box registry, and pulls the box's labels with pull_labels, apart from the rest. Run on its
+own without KITSUNE_JOB=full (tests/test_bootstrap_extent.py) it serves the config alone."""
 import json
 import os
 import sys
@@ -221,15 +226,14 @@ names = list(dict.fromkeys(sources + evals))
 teacher_root = cfg.get("teacher_root", "teacher_out")
 second_root = cfg.get("second_root", "second_out")
 data_root = cfg.get("data_root", "data")
-selection = cfg["selection"]
 # the student dir files the trainer loads (it has no processor fallback; it reads student_meta.json, and README.md is
 # the model card with the modification notice): the same list as vast/launch.py STUDENT_FILES
 STUDENT_FILES = ("config.json", "model.safetensors", "processor_config.json", "tokenizer.json", "tokenizer_config.json",
                  "student_meta.json", "README.md")
 CTC_CARD = "MODEL_CARD.md"  # a Parakeet-derived student's CC-BY-4.0 attribution (kitsune.ctc_student)
 # a full-data box's students (each with STUDENT_FILES, and CTC_CARD for a Parakeet-derived one), its extra data-repo
-# files and dirs, and whether it needs the scratch repo; none without KITSUNE_JOB=full (pull_plan pulls the student a
-# config itself names)
+# files and dirs, and whether it needs the scratch repo; none for the helper run on its own (pull_plan pulls only a
+# student the config itself names)
 students, ctc_students, extra_dirs, extra_files, timed_states = [], set(), [], [], False
 if os.environ.get("KITSUNE_JOB") == "full":
     # a full-data box (kitsune/full_queue.py): the data block has no student; the box registry (kitsune/fullrun.py,
@@ -448,10 +452,10 @@ def label_dir(s: str, stem: str) -> tuple:
 
 
 def extent_stems(report: dict) -> list:
-    """Extent mode: every pulled stem (kitsune.extent subset_stems) must have been rebuilt with the labelled ids. The
-    rebuilt id sidecar's ids must hash to the record's ids_sha256 (same ids, same order, same stem), and the label ids
-    of the stem (teacher_out's, or parakeet_out's where label_dir says so) must be a subset of them. Returns the
-    failures; report["extent_stems"] gets the counts."""
+    """Every pulled stem (kitsune.extent subset_stems) must have been rebuilt with the labelled ids. The rebuilt id
+    sidecar's ids must hash to the record's ids_sha256 (same ids, same order, same stem), and the label ids of the stem
+    (teacher_out's, or parakeet_out's where label_dir says so) must be a subset of them. Returns the failures;
+    report["extent_stems"] gets the counts."""
     import numpy as np
 
     sys.path.insert(0, str(root))  # this helper runs from a mktemp path
@@ -500,19 +504,17 @@ def coverage():
     import numpy as np
     import pyarrow.parquet as pq
 
-    floor = float(os.environ.get("KITSUNE_MIN_COVERAGE", "0.99"))
-    report, bad = {}, []
-    if cfg.get("extent"):  # the rebuild replayed the label box's ingest: short of an exact join, it is another extent
-        floor = 1.0
-        stems_bad = extent_stems(report)
-        bad += [f"{len(stems_bad)} extent stem(s) (listed above)"] if stems_bad else []
-    # extent mode: each stem's ids come from the one root label_dir names (fix 9: parakeet_out on a CTC box without
-    # pull_parakeet, whose train stems have no teacher_out); an AED or both-roots box, and a config without an extent,
-    # read teacher_out only
-    roots = [teacher_root] + ([cfg["parakeet_root"]] if cfg.get("extent") and cfg.get("parakeet_root") else [])
+    # the rebuild replayed the label box's ingest: every stem as labelled and every split joined at 1.0, as anything
+    # less is another extent
+    report = {}
+    stems_bad = extent_stems(report)
+    bad = [f"{len(stems_bad)} extent stem(s) (listed above)"] if stems_bad else []
+    # each stem's ids come from the one root label_dir names (fix 9: parakeet_out on a CTC box without pull_parakeet,
+    # whose train stems have no teacher_out); an AED or both-roots box reads teacher_out only
+    roots = [teacher_root] + ([cfg["parakeet_root"]] if cfg.get("parakeet_root") else [])
     for s in names:
         # per split (<split>-NNNNN in both trees), as the trainer joins them: pooled over a source's splits,
-        # galgame's 1,000-row hold-out is 0.5 % of its ids and could vanish (or trade rows with train) above the floor
+        # galgame's 1,000-row hold-out is 0.5 % of its ids and could vanish (or trade rows with train) in a pooled join
         tids, aids, from_parakeet, picked = {}, {}, set(), {}
         for r in roots:
             for npz in sorted((root / r / s).glob("*.npz")):
@@ -536,11 +538,11 @@ def coverage():
                 report[name]["root"] = "parakeet"
             who = "parakeet" if sp in from_parakeet else "teacher"
             print(f"  {name:20s} {who} {len(t):7d}  audio {len(a):7d}  joined {hit:7d}  coverage {cov:.4f}")
-            if cov < floor:
+            if cov < 1.0:
                 bad.append(name)
     (state / "bootstrap_coverage.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
     if bad:
-        sys.exit(f"coverage below {floor} for {bad}: the audio does not match the teacher outputs")
+        sys.exit(f"coverage below 1.0 for {bad}: the audio does not match the teacher outputs")
 
 
 {"plan": plan, "pull": pull, "pull_labels": pull_labels, "coverage": coverage}[sys.argv[1]]()
@@ -549,12 +551,10 @@ HELPER_SRC=$(<"$HELPER")  # the source ensure_helper writes again
 
 log "repo $KITSUNE_DIR at $(git -C "$KITSUNE_DIR" rev-parse --short HEAD 2>/dev/null || echo '?'), config $CONFIG, data $KITSUNE_DATA_REPO@$KITSUNE_DATA_REVISION"
 log "disk free before: $(df -h --output=avail "$KITSUNE_DIR" | tail -1 | tr -d ' ')"
-if [ "${KITSUNE_JOB:-}" = "full" ]; then
-    # the box controller's heartbeat (vast/watchdog.sh reads $STATE/train_hb on a full box): fresh from the first
-    # minute, then every phase keeps it so (phase)
-    touch "$STATE/train_hb"
-fi
-if [ "${KITSUNE_JOB:-}" = "full" ] && [ -n "${KITSUNE_GATE_BYTES:-}" ]; then
+# the box controller's heartbeat (vast/watchdog.sh reads $STATE/train_hb): fresh from the first minute, then every
+# phase keeps it so (phase)
+touch "$STATE/train_hb"
+if [ -n "${KITSUNE_GATE_BYTES:-}" ]; then
     # fix 1, the download gate: time three pinned upstream files the way 01 downloads them before anything is pulled
     # or rebuilt. Exit 3 is a host too slow for the reference 571 GB within KITSUNE_GATE_MAX_H (not retried): the
     # bootstrap fails, and onstart's finish.py --abort destroys the box, which has no run dir yet, after its infra
@@ -573,43 +573,40 @@ fi
 # files renamed when done, and snapshot_download skips what is already on disk (~2.3 GB in all)
 phase plan retry 3 timeout -k 30 10m "$PY" "$HELPER" plan
 phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull
-if [ "${KITSUNE_JOB:-}" = "full" ]; then
-    # DECISIONS H14: a box whose train items continue other boxes' runs (registry `continues`, box p-cool) is always a
-    # resume, KITSUNE_RESUME or not (launch sets it for such a box anyway): its queue refuses to start without the
-    # plan, so a run never trains from step 0. Asked only without KITSUNE_RESUME=1; a registry that cannot answer
-    # prints nothing here (no resume), and check_students below refuses it
-    if [ "${KITSUNE_RESUME:-}" = 1 ] ||
-        [ "$("$PY" -m kitsune.fullrun has-continues --box "$KITSUNE_BOX" --root "$KITSUNE_DIR")" = 1 ]; then
-        # a relaunch on a new host (launch.py --resume), or a continuation box's every launch: the box's Hub queue
-        # summary says what is done and which run dirs resume (a continuation box's first launch has none yet: each
-        # continuation is resolved from its source box's summary and resets from its pre_cooldown state); resume-pull
-        # pulls them with their newest full state (scratch or runs repo) and writes $STATE/resume_plan.json, which
-        # the queue adopts. Before the paid rebuild, so a refusal (exit 3: no summary, an unknown or finished run id,
-        # a state that does not match its pointer, a continuation's source not done and verified) costs minutes; not
-        # retried
-        phase resume_pull retry 3 timeout -k 30 60m "$PY" -m kitsune.full_queue resume-pull --box "$KITSUNE_BOX" \
-            --root "$KITSUNE_DIR"
-    fi
-    # the box registry's students are the registered builds (kitsune.prereg.student_problems: stage, family, init
-    # class, seed, the exact parameter counts, a pruned student's calibration ids). launch.py checked the data repo's
-    # metas before renting; this checks the files the box will train, before the audio rebuild it would otherwise pay
-    # for. Exit 2 (a refusal) stops the bootstrap
-    phase check_students "$PY" -m kitsune.fullrun check-students --box "$KITSUNE_BOX" --root "$KITSUNE_DIR"
-    # decision 13: the labels (tens of GB at the full extent) come down while 01 rebuilds the audio, per attempt
-    # within the gate's KITSUNE_PULL_TIMEOUT_MIN; pull_labels_wait below fails the bootstrap on a failed pull, and a
-    # bootstrap that fails first stops the pull (stop_label_pull). Its toucher, and pull_labels_wait's, last as long
-    # as its three attempts may
-    LABELS_HB_MAX_S=$(phase_budget_s 3 "${KITSUNE_PULL_TIMEOUT_MIN:-30}")
-    PHASE_HB_MAX_S=$LABELS_HB_MAX_S
-    phase pull_labels retry 3 timeout -k 30 "${KITSUNE_PULL_TIMEOUT_MIN:-30}m" "$PY" "$HELPER" pull_labels &
-    LABELS_PID=$!
-    log "pull_labels runs in the background (pid $LABELS_PID)"
-    # the rebuild's toucher lasts its three attempts of KITSUNE_REBUILD_TIMEOUT_MIN (at least 60 min, the line's
-    # default): at the gate's floor rate the full extent's ~481 min per attempt make ~24 h, past the 12 h default, so
-    # the watchdog stops a box only once the rebuild's own timeouts have run out, never a slow healthy one
-    REBUILD_HB_MIN=${KITSUNE_REBUILD_TIMEOUT_MIN:-60}
-    PHASE_HB_MAX_S=$(phase_budget_s 3 "$(( REBUILD_HB_MIN > 60 ? REBUILD_HB_MIN : 60 ))")
+# DECISIONS H14: a box whose train items continue other boxes' runs (registry `continues`, box p-cool) is always a
+# resume, KITSUNE_RESUME or not (launch sets it for such a box anyway): its queue refuses to start without the plan, so
+# a run never trains from step 0. Asked only without KITSUNE_RESUME=1; a registry that cannot answer prints nothing here
+# (no resume), and check_students below refuses it
+if [ "${KITSUNE_RESUME:-}" = 1 ] ||
+    [ "$("$PY" -m kitsune.fullrun has-continues --box "$KITSUNE_BOX" --root "$KITSUNE_DIR")" = 1 ]; then
+    # a relaunch on a new host (launch.py --resume), or a continuation box's every launch: the box's Hub queue summary
+    # says what is done and which run dirs resume (a continuation box's first launch has none yet: each continuation is
+    # resolved from its source box's summary and resets from its pre_cooldown state); resume-pull pulls them with their
+    # newest full state (scratch or runs repo) and writes $STATE/resume_plan.json, which the queue adopts. Before the
+    # paid rebuild, so a refusal (exit 3: no summary, an unknown or finished run id, a state that does not match its
+    # pointer, a continuation's source not done and verified) costs minutes; not retried
+    phase resume_pull retry 3 timeout -k 30 60m "$PY" -m kitsune.full_queue resume-pull --box "$KITSUNE_BOX" \
+        --root "$KITSUNE_DIR"
 fi
+# the box registry's students are the registered builds (kitsune.prereg.student_problems: stage, family, init class,
+# seed, the exact parameter counts, a pruned student's calibration ids). launch.py checked the data repo's metas before
+# renting; this checks the files the box will train, before the audio rebuild it would otherwise pay for. Exit 2 (a
+# refusal) stops the bootstrap
+phase check_students "$PY" -m kitsune.fullrun check-students --box "$KITSUNE_BOX" --root "$KITSUNE_DIR"
+# decision 13: the labels (tens of GB at the full extent) come down while 01 rebuilds the audio, per attempt within the
+# gate's KITSUNE_PULL_TIMEOUT_MIN; pull_labels_wait below fails the bootstrap on a failed pull, and a bootstrap that
+# fails first stops the pull (stop_label_pull). Its toucher, and pull_labels_wait's, last as long as its three attempts
+# may
+LABELS_HB_MAX_S=$(phase_budget_s 3 "${KITSUNE_PULL_TIMEOUT_MIN:-30}")
+PHASE_HB_MAX_S=$LABELS_HB_MAX_S
+phase pull_labels retry 3 timeout -k 30 "${KITSUNE_PULL_TIMEOUT_MIN:-30}m" "$PY" "$HELPER" pull_labels &
+LABELS_PID=$!
+log "pull_labels runs in the background (pid $LABELS_PID)"
+# the rebuild's toucher lasts its three attempts of KITSUNE_REBUILD_TIMEOUT_MIN (at least 60 min, the line's default):
+# at the gate's floor rate the full extent's ~481 min per attempt make ~24 h, past the 12 h default, so the watchdog
+# stops a box only once the rebuild's own timeouts have run out, never a slow healthy one
+REBUILD_HB_MIN=${KITSUNE_REBUILD_TIMEOUT_MIN:-60}
+PHASE_HB_MAX_S=$(phase_budget_s 3 "$(( REBUILD_HB_MIN > 60 ? REBUILD_HB_MIN : 60 ))")
 
 DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["data_root"])' "$STATE/bootstrap_plan.json")"
 # the canonical ingest sequence the label box ran, capped by the config's extent. 01 resumes from its progress.json and
@@ -620,14 +617,10 @@ DATA_ROOT="$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["dat
 # retry re-runs (the files it fetched ahead are cache hits then). train_hb stays this phase's toucher's job
 phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \
     scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" --extent-config "$CONFIG"
-if [ "${KITSUNE_JOB:-}" = "full" ] && [ -n "${LABELS_PID:-}" ]; then
-    PHASE_HB_MAX_S=$LABELS_HB_MAX_S  # the wait lasts at most what is left of the pull's own budget
-    phase pull_labels_wait wait "$LABELS_PID"  # the label pull's exit: a failed pull fails here, before coverage
-    LABELS_PID=""
-fi
-if [ "${KITSUNE_JOB:-}" = "full" ]; then
-    PHASE_HB_MAX_S=""  # coverage: the default bound
-fi
+PHASE_HB_MAX_S=$LABELS_HB_MAX_S  # the wait lasts at most what is left of the pull's own budget
+phase pull_labels_wait wait "$LABELS_PID"  # the label pull's exit: a failed pull fails here, before coverage
+LABELS_PID=""
+PHASE_HB_MAX_S=""  # coverage: the default bound
 phase coverage "$PY" "$HELPER" coverage
 log "disk free after: $(df -h --output=avail "$KITSUNE_DIR" | tail -1 | tr -d ' ')"
 log "bootstrap complete"

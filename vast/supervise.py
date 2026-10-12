@@ -342,7 +342,6 @@ def wait_for_lock(path: Path, wait_s: float | None = None, poll_s: float | None 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out-repo", default=os.environ.get("KITSUNE_OUT_REPO") or None)
     ap.add_argument("--state", default=str(Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state")) / "supervise.json"))
     ap.add_argument("--queue-cmd", default=None,
                     help="override the queue command (default: python -m kitsune.full_queue run --box $KITSUNE_BOX)")
@@ -357,7 +356,8 @@ def main(argv: list[str] | None = None) -> int:
     queue_cmd = shlex.split(args.queue_cmd) if args.queue_cmd else [sys.executable, "-m", "kitsune.full_queue", "run",
                                                                      "--box", box]
     hb = Path(args.state).parent / "train_hb"  # kitsune.fullrun.TRAIN_HB in $KITSUNE_STATE
-    log(f"full queue: box={box} out_repo={args.out_repo} state={args.state} dry_run={args.dry_run}")
+    log(f"full queue: box={box} out_repo={os.environ.get('KITSUNE_OUT_REPO')} state={args.state} "
+        f"dry_run={args.dry_run}")
     return supervise_queue(queue_cmd, Path(args.state), args.dry_run, hb=hb)
 
 

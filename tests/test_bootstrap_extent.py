@@ -302,16 +302,15 @@ def write_teacher(kdir: Path, stems: dict):
 
 
 def test_extent_coverage_is_exact(box):
-    """In extent mode every pulled stem's rebuilt ids must hash to the record's ids_sha256 and hold its teacher ids,
-    and every split must join at 1.0 whatever KITSUNE_MIN_COVERAGE says: the rebuild replays the label box's ingest,
-    so anything less is another extent (an upstream that changed, another canonical sequence) and would train on
-    rows the trainer silently drops."""
+    """Every pulled stem's rebuilt ids must hash to the record's ids_sha256 and hold its teacher ids, and every split
+    must join at 1.0: the rebuild replays the label box's ingest, so anything less is another extent (an upstream that
+    changed, another canonical sequence) and would train on rows the trainer silently drops."""
     box.config(make_cfg())
     assert box.helper("plan").returncode == 0
     subset = {k: v for k, v in ROWS.items() if k != ("galgame", "train-00001")}  # the capped subset: tar 0 only
     write_rebuilt(box.root, ROWS)  # 01 --extent-config rebuilt tar 0 of galgame (and more) plus eval_jsut
     write_teacher(box.root, {k: v[:-1] if k[1] == "train-00000" else v for k, v in subset.items()})  # a skipped row
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode == 0, r.stdout + r.stderr
     report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
     assert report["extent_stems"] == {"checked": 3, "failed": 0, "failures": []}
@@ -321,24 +320,49 @@ def test_extent_coverage_is_exact(box):
     rec = make_record({**ROWS, ("galgame", "eval-00000"): ["galgame/e0_1", "galgame/e0_0"]})
     plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
     Path(plan["record"]).write_text(json.dumps(rec), encoding="utf-8")
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "galgame/eval-00000: rebuilt ids_sha256" in r.stdout, r.stdout + r.stderr
     assert "1 extent stem(s)" in r.stderr and "coverage below 1.0" in r.stderr
     Path(plan["record"]).write_text(json.dumps(make_record()), encoding="utf-8")
 
     # a teacher id the rebuilt stem lacks: refused per stem, and the split's join is below the exact floor
     write_teacher(box.root, {("eval_jsut", "eval-00000"): ROWS[("eval_jsut", "eval-00000")] + ["eval_jsut/X"]})
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "eval_jsut/eval-00000: 1 teacher ids not in the rebuilt stem" in r.stdout
-    assert "eval_jsut/eval" in r.stderr, "0.667 joined passes the env floor but not the extent's 1.0"
+    assert "eval_jsut/eval" in r.stderr, "0.667 joined: below the exact floor"
     write_teacher(box.root, {("eval_jsut", "eval-00000"): ROWS[("eval_jsut", "eval-00000")]})
 
     # a pulled stem 01 never rebuilt
     lines = (box.root / "data" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
     (box.root / "data" / "manifest.jsonl").write_text(
         "".join(ln + "\n" for ln in lines if "galgame/train-00000" not in ln), encoding="utf-8")
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "galgame/train-00000: not rebuilt" in r.stdout, r.stdout + r.stderr
+
+
+def test_extent_coverage_is_held_per_split(box):
+    """The trainer joins a split's label ids only against that split's audio shards (<split>-*.parquet). Pooled over
+    a source's splits, galgame's 1,000-row hold-out is 0.5 % of its ids: all of it moved into a train shard (by a
+    rebuild that split the rows differently) once passed the pooled check, and the eval store then dropped the hold-out
+    with one printed line. Every split is held to 1.0 on its own, here while every stem's id sidecar still matches the
+    record."""
+    box.config(make_cfg())
+    assert box.helper("plan").returncode == 0
+    write_rebuilt(box.root, ROWS)
+    write_teacher(box.root, {k: v for k, v in ROWS.items() if k != ("galgame", "train-00001")})
+    shards = box.root / "data" / "shards" / "galgame"
+    (shards / "eval-00000.parquet").rename(shards / "train-00009.parquet")  # the hold-out's audio in a train shard
+    r = box.helper("coverage")
+    assert r.returncode != 0 and "coverage below 1.0 for ['galgame/eval']" in r.stderr, r.stdout + r.stderr
+    report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
+    assert report["extent_stems"]["failed"] == 0, "the id sidecars still match the record"
+    assert report["galgame/train"]["coverage"] == 1.0 and report["galgame/eval"]["joined"] == 0
+    (shards / "train-00009.parquet").rename(shards / "eval-00000.parquet")
+    r = box.helper("coverage")
+    assert r.returncode == 0, r.stdout + r.stderr
+    report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
+    assert {"galgame/train", "galgame/eval", "eval_jsut/eval"} <= set(report)
+    assert report["galgame/eval"]["coverage"] == 1.0
 
 
 def test_the_rebuild_line_and_the_helper_is_the_first_heredoc():
@@ -452,7 +476,7 @@ def test_ctc_only_extent_plan_and_coverage_read_the_parakeet_ids(box):
     write_rebuilt(box.root, ROWS)
     write_teacher(box.root, {k: v for k, v in subset.items() if k[1].startswith("eval-")})  # no train npz at all
     write_parakeet(box.root, subset)
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.99")
+    r = box.helper("coverage")
     assert r.returncode == 0, r.stdout + r.stderr
     report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
     assert report["extent_stems"] == {"checked": 3, "failed": 0, "failures": []}
@@ -462,11 +486,11 @@ def test_ctc_only_extent_plan_and_coverage_read_the_parakeet_ids(box):
     assert re.search(r"galgame/train +parakeet ", r.stdout), r.stdout
     # a Parakeet id the rebuilt stem lacks is refused per stem, like a teacher id
     write_parakeet(box.root, {("galgame", "train-00000"): ROWS[("galgame", "train-00000")] + ["galgame/X"]})
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "galgame/train-00000: 1 parakeet ids not in the rebuilt stem" in r.stdout
     # a stem whose labels are not on disk is a failure, not a crash
     (box.root / LR / "parakeet_out" / "galgame" / "train-00000.npz").unlink()
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "galgame/train-00000: no parakeet labels" in r.stdout, r.stdout + r.stderr
     assert "Traceback" not in r.stderr
 
@@ -481,7 +505,7 @@ def test_both_roots_and_aed_coverage_read_teacher_ids_as_before(box, cfg):
     write_rebuilt(box.root, ROWS)
     write_teacher(box.root, subset)
     write_parakeet(box.root, {k: v + ["not/rebuilt"] for k, v in subset.items()})
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.99")
+    r = box.helper("coverage")
     assert r.returncode == 0, r.stdout + r.stderr
     report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
     assert all("root" not in v for k, v in report.items() if k != "extent_stems")
@@ -609,7 +633,7 @@ def test_full_plan_refuses_a_registry_it_cannot_load(box):
 
 def test_the_full_phases_are_new_lines_and_the_shared_lines_stay_byte_identical():
     """Job full reuses the plan, pull_derived, rebuild and coverage lines exactly as they were; its own phases are
-    separate lines in `if [ "${KITSUNE_JOB:-}" = "full" ]` blocks, in the contract's order."""
+    separate lines, in the contract's order (the gate only with KITSUNE_GATE_BYTES, resume_pull only on a resume)."""
     text = BOOTSTRAP.read_text(encoding="utf-8")
     shared = ['phase plan retry 3 timeout -k 30 10m "$PY" "$HELPER" plan',
               'phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull',
@@ -626,10 +650,10 @@ def test_the_full_phases_are_new_lines_and_the_shared_lines_stay_byte_identical(
     at = [text.index(o) for o in order]
     assert at == sorted(at), [o for o, _ in sorted(zip(order, at), key=lambda x: x[1])]
     body = text.split("PYEOF\n")[-1]
-    for name in ("download_gate", "resume_pull", "check_students \"$PY\" -m kitsune.fullrun", "pull_labels retry",
-                 "pull_labels_wait"):
+    for name, cond in (("download_gate", 'if [ -n "${KITSUNE_GATE_BYTES:-}" ]; then'),
+                       ("resume_pull", 'if [ "${KITSUNE_RESUME:-}" = 1 ] ||')):
         i = body.index(f"phase {name}")
-        assert 'if [ "${KITSUNE_JOB:-}" = "full" ]' in body[max(0, body.rfind("\nif ", 0, i)):i], name
+        assert body[body.rfind("\nif ", 0, i) + 1:].startswith(cond), name
     assert 'retry 3 timeout -k 30 "${KITSUNE_PULL_TIMEOUT_MIN:-30}m" "$PY" "$HELPER" pull_labels &' in text
     assert 'retry 3 timeout -k 30 60m "$PY" -m kitsune.full_queue resume-pull --box "$KITSUNE_BOX"' in text
     assert 'retry 2 timeout -k 30 30m "$PY" -m kitsune.netgate --out "$STATE/download_gate.json"' in text
@@ -657,8 +681,8 @@ case "$*" in
                                  exit "${FAKE_REBUILD_RC:-0}" ;;
 esac
 case "${2:-}" in
-    plan) printf '{"data_root": "data", "rebuild": ["galgame"], "extent": %s}\n' "${FAKE_EXTENT:-true}" \
-              > "$STATE/bootstrap_plan.json"; exit 0 ;;
+    plan) printf '{"data_root": "data", "rebuild": ["galgame"], "extent": true}\n' > "$STATE/bootstrap_plan.json"
+          exit 0 ;;
     pull) exit 0 ;;
     pull_labels) echo $$ > "$STATE/labels_pid"; command sleep "${FAKE_LABELS_S:-1}"
                  [ "${FAKE_LABELS_RC:-0}" = 0 ] && touch "$STATE/labels_done"; exit "${FAKE_LABELS_RC:-0}" ;;
@@ -792,7 +816,7 @@ def test_each_phase_keeps_train_hb_fresh_for_its_own_worst_case(tmp_path):
     assert got["rebuild_audio"] == budget_s(3, 481) == 87540 > 43200 and got["pull_labels"] == budget_s(3, 77)
     assert got["plan"] == got["coverage"] == 600  # the default is the operator's to set
     r, _, _ = run_bootstrap(tmp_path / "short", FAKE_TIMEOUTS="30 45")
-    assert hb_bounds(r.stdout)["rebuild_audio"] == budget_s(3, 60), "never below the non-extent line's 60 min"
+    assert hb_bounds(r.stdout)["rebuild_audio"] == budget_s(3, 60), "never below the rebuild line's 60 min default"
 
 
 def test_a_failed_bootstrap_stops_the_background_label_pull_and_its_toucher(tmp_path):
@@ -836,15 +860,17 @@ def test_a_toucher_stops_at_its_bound(tmp_path):
     assert 1.0 < time.monotonic() - t0 < 30 and (tmp_path / "train_hb").exists()  # date +%s: whole seconds
 
 
-def test_without_job_full_no_full_phase_runs(tmp_path):
-    """Without KITSUNE_JOB=full (a bootstrap started by hand; onstart refuses any job but full and label, and the label
-    box runs no bootstrap) nothing of the above runs, whatever gate env is set: no gate, no train_hb, no label pull;
-    the plan, pull, rebuild and coverage alone."""
-    r, calls, state = run_bootstrap(tmp_path, KITSUNE_JOB=None, KITSUNE_RESUME="1")
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert [c.split(" ")[0] + " " + c.split(" ")[1] for c in calls] == [
-        "HELPER plan", "HELPER pull", "scripts/01_prepare_data.py --data", "HELPER coverage"], calls
-    assert not (state / "train_hb").exists()
+def test_bootstrap_refuses_any_job_but_full(tmp_path):
+    """bootstrap prepares a full-data box only, as onstart.sh, supervise.py and finish.py run one (the label box runs no
+    bootstrap): without KITSUNE_JOB=full, or without its KITSUNE_BOX, it exits 2 before any phase, whatever gate or
+    resume env is set; no train_hb, no timings."""
+    for env, says in ((dict(KITSUNE_JOB=None), "KITSUNE_JOB is '', not full"),
+                      (dict(KITSUNE_JOB="train"), "KITSUNE_JOB is 'train', not full"),
+                      (dict(KITSUNE_BOX=None), "KITSUNE_BOX is not set")):
+        r, calls, state = run_bootstrap(tmp_path, KITSUNE_RESUME="1", **env)
+        assert r.returncode == 2 and says in r.stdout, (env, r.stdout + r.stderr)
+        assert calls == [] and not (state / "train_hb").exists(), (env, calls)
+        assert not (state / "bootstrap_timings.jsonl").exists()
 
 
 # ------------------------------------------------------------------------------------- a chain box (addendum E)

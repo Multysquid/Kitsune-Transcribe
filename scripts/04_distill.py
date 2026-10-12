@@ -420,8 +420,8 @@ EXIT_OK, EXIT_THROUGHPUT, EXIT_FAIL = 0, 3, 1
 UPLOAD_WAIT_S = 600
 # the end phase's wait for a running log sync before its own one (the final eval and verdict, ahead of the uploads)
 END_SYNC_JOIN_S = 120
-# the failure path's wait for them, after the logs are closed: a crashed trainer should get to the supervisor's resume.
-# What it cuts off goes up anyway (Uploader.abandon)
+# the failure path's wait for them, after the logs are closed: a crashed trainer should get to the queue's resume
+# (kitsune/full_queue.py). What it cuts off goes up anyway (Uploader.abandon)
 FAILED_UPLOAD_WAIT_S = 120
 SR = 16000
 # shm_cap's warning: below this many loader workers the train mix (mostly MP3/OGG, ~1k audio-s/s per worker on a slow
@@ -5135,11 +5135,12 @@ def build(args) -> tuple[Run, dict | None]:
     elif state is not None:
         R.resumed_from = full
         moved = set_aside_newer(R.ckpt_dir, int(state["step"]))  # before anything is saved or rotated
-        # the pre_cooldown full state goes up only from the process that saved it (finish.py's syncs take the newest
-        # full state, the post-crash one none): one whose upload has not succeeded (UPLOAD_MARK: a crash cut it short,
-        # or every retry failed) goes again, in the background (busy() keeps it from rotation meanwhile). One already
-        # on the Hub does not: the hub dedups only the wire, hf_xet still reads and hashes all ~8.6 GB on the box. The
-        # same for the ckpt.full_at_fracs states meant for the Hub ("frac:<f>"; only those carry the mark)
+        # the pre_cooldown full state goes up from the process that saved it (finish.py's syncs take it only while it is
+        # marked, and never the newest full state for its own sake): one whose upload has not succeeded (UPLOAD_MARK: a
+        # crash cut it short, or every retry failed) goes again, in the background (busy() keeps it from rotation
+        # meanwhile). One already on the Hub does not: the hub dedups only the wire, hf_xet still reads and hashes all
+        # ~8.6 GB on the box. The same for the ckpt.full_at_fracs states meant for the Hub ("frac:<f>"; only those carry
+        # the mark)
         pc = state["st"].get("pre_cooldown_full")
         again = pc if (pc and out_repo(cfg) and "pre_cooldown" in cfg["ckpt"]["upload_full_at"]
                        and (R.ckpt_dir / pc / UPLOAD_MARK).is_file()) else None
@@ -5653,13 +5654,13 @@ def final_eval_estimate(R: Run) -> float:
 
 def fit_budget(R: Run):
     """Clock "wall": clip T so the end phase ends before the instance's deadline (deadline_unix). train_hours counts
-    loop time only, while vast/watchdog.sh counts 5.5 h from first boot: bootstrap, setup, the smoke phase, the step-0
-    eval and, after a crash, the restart and the steps replayed since the last full state all come out of the same
-    budget. Reserved at the end: the final-eval estimate + schedule.end_reserve_min (final saves, uploads, finish.py's
-    verification and the watchdog's own sync lead). Runs at every loop start, so a resume re-fits T to the time
-    actually left, and after each eval before the cooldown (the step-0 eval of an untrained student decodes slowly and
-    overstates the final eval); the WSD cooldown moves with T, so the run still ends annealed (or goes straight to the
-    end phase if no time is left)."""
+    loop time only, while vast/watchdog.sh counts KITSUNE_MAX_HOURS from first boot: bootstrap, setup, the smoke phase,
+    the step-0 eval and, after a crash, the restart and the steps replayed since the last full state all come out of the
+    same budget. Reserved at the end: the final-eval estimate + schedule.end_reserve_min (final saves, uploads,
+    finish.py's verification and the watchdog's own sync lead). Runs at every loop start, so a resume re-fits T to the
+    time actually left, and after each eval before the cooldown (the step-0 eval of an untrained student decodes slowly
+    and overstates the final eval); the WSD cooldown moves with T, so the run still ends annealed (or goes straight to
+    the end phase if no time is left)."""
     sch = R.cfg["schedule"]
     R.budget_s = None
     deadline = deadline_unix()

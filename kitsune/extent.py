@@ -520,7 +520,8 @@ def sizing(record: dict, cfg: dict, kept_hours: dict[str, float | dict] | None =
       subset stem. stores: how many stores hold it (stores(): two when both label roots are pulled);
     - hours: the audio of the subset stems; labels_gb: their label files, LABEL_GB_PER_HOUR each, plus
       PARAKEET_GB_PER_HOUR when parakeet_out is pulled (a CTC run or pull_parakeet);
-    - extra_gb: what the caller adds beyond one run's states (the study box: its concurrent runs' checkpoints);
+    - extra_gb: what the caller adds beyond one run's states (vast/launch.py: the registry box's extra_gb, its other
+      states, exports and extra dirs);
     - disk_gb = DISK_MARGIN x (DISK_BASE_GB + shard + stores x sel + labels + extra_gb), up to a multiple of
       DISK_STEP_GB;
     - rebuild_timeout_min = REBUILD_BASE_MIN + REBUILD_SLACK x the download time at REBUILD_BYTES_PER_S."""

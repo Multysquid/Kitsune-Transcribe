@@ -78,7 +78,7 @@ def test_onstart_subshell_dispatches_on_kitsune_job(tmp_path, job, history, expe
     for name in ("bootstrap.sh", "supervise.py", "label.py"):  # run by bash (PY=bash below): each notes that it ran
         (repo / "vast" / name).write_text(f'echo {name} >> "$KITSUNE_STATE/ran"\n', encoding="utf-8", newline="\n")
     if history:
-        (state / "supervise.json").write_text('{"attempts": [{"t0": 1.0, "resume": null}]}', encoding="utf-8")
+        (state / "supervise.json").write_text('{"attempts": [{"t0": 1.0, "queue": true}]}', encoding="utf-8")
     script = tmp_path / "subshell.sh"
     script.write_text("\n".join(["set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }", "PY=bash", subshell_body()]),
                       encoding="utf-8", newline="\n")
