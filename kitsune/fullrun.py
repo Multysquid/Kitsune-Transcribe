@@ -4,9 +4,9 @@ The full runs (plan v3) trained one student per box, each box a 1x RTX 5090 with
 short smokes (`full-smoke` = smoke A, `smoke-b`): P-0.1B on box `p01` (box 1, Parakeet labels only; the same box then
 re-ran that run's cooldown with the CTC train-data augmentation on, the recipe test of DECISIONS H1), P-0.3B with the
 augmentation recipe on box `full-p`, P-0.05B on box `p005` (the P test box, DECISIONS H10) and T-0.6B on box `full-t`
-(DECISIONS H15, 6 epochs). Box `p-cool` (DECISIONS H14) is one rental that re-runs three done runs' cooldowns
-(P-0.3B, P-0.1B, P-0.05B), each from its runs-repo pre_cooldown state: its train items carry a `continues` block
-(below), so the box is always a resume and never trains from step 0.
+(DECISIONS H15, 6 epochs). A box whose train items carry a `continues` block (below; DECISIONS H14's cooldown
+re-runs) re-runs done runs of other boxes, each from its runs-repo pre_cooldown state, so it is always a resume and
+never trains from step 0.
 The selection (scripts/make_selection.py full mode, kitsune/devslice.py), the trainer (scripts/04_distill.py), the
 box queue (kitsune/full_queue.py), the vast scripts (vast/launch.py, bootstrap.sh, finish.py) and the evaluators all
 import their shared names from here, so a constant cannot drift between them. The binding definitions are the full-run
@@ -29,8 +29,7 @@ build contract (sections 1 and 2); this module is its code.
                load_registry validates it and fills the defaults; box_* read one box, continues_of its
                continuations; the CLI serves bootstrap
 
-Registry (contract 2.3). Top level {"version": 1, "boxes": {<box>: <box spec>}} with box names from BOX_NAMES (a chain
-box's from CHAIN_NAMES, below); any key
+Registry (contract 2.3). Top level {"version": 1, "boxes": {<box>: <box spec>}} with box names from BOX_NAMES; any key
 starting with "_" is a comment, anywhere (in the watchdog block and a weights entry too). Paths (data_config, item
 config) are repo-relative POSIX paths resolved against `root` (the checkout; default the one the registry file is in,
 else this one), or read with a `read_json(rel)` callable instead (launch: the file at the sha it rents). A registry
@@ -42,7 +41,7 @@ load_registry returns remembers its root, so the box readers given it read the c
   (true: the download gate); smoke (false: writes smoke_verdict.json, allows faults and verdict specs);
   max_attempts >= 1 (4); extra_files, extra_dirs (data-repo paths the box pulls, []); faults ([]); items (non-empty);
   min_ram_gb (null: launch's 64 GB a GPU; a number > 0: the host RAM launch's offer filter asks for instead, vast/
-  launch.py full_job; a chain takes the largest of its parts')
+  launch.py full_job)
 
 Items run in registry order where the queue allows. Every item: name (ITEM_RE, unique in its box), kind (ITEM_KINDS),
 needs (EARLIER items of the box; filled with the implicit ones below), stall_min (absent: STALL_MIN_DEFAULT[kind];
@@ -72,49 +71,30 @@ item's own weights; {config}, {ckpt}, {run_id} and {run_name} need `of`. The que
 full_queue.py). Verdict spec {check "1".."16", json, path "a.b.c", min, max, equals}: json and path go together, a
 condition needs a path. Fault {id, action (FAULT_ACTIONS), item (a train item of the box), at_step, after_event,
 min_attempt (1), seconds}: only on smoke boxes; sigstop/kill need at_step, wipe_run_dir after_event, deadline seconds,
-freeze_controller_hb at_step and seconds >= watchdog.orphan_s + WATCHDOG_POLL_S on a box whose watchdog only alerts
-(on a chain: under the last stage's stop orphan_s). Item configs must
-exist (check_files) and carry the box data config's DATA_KEYS values (a missing pull_parakeet counts as false); a train
-item's family is its config's (default aed). Without pull_parakeet, every stores and train item config has the data
-config's family (default aed): bootstrap pulls the labels the data config's pull plan names (kitsune/extent.py
-pull_plan), which then hold the train labels of that family only (ctc: parakeet_out, plus teacher_out for the eval
-stems; aed: teacher_out). Every name and path the box env or a command line carries is one env-string word
-(vast/launch.py env_string).
-
-Chain boxes (contract addendum E; CHAIN_NAMES, p01-chain): an entry with the key `chain` names existing boxes as
-parts, in two stages, and has no items of its own: {chain: [stage 1, stage 2], est_hours <= max_hours, max_dph,
-extra_gb (>= the last stage's parts'), gate (must be true)}. Stage 1 {parts (parts[0] = gate_box), gate_box (a smoke
-box with train items: its verdict checks 1-11 gate stage 2), gate_by_hours (default the gate box's max_hours; <= the
-stage's max_hours), max_hours (first boot to stage 1's sub-deadline; < the chain's), rebuild (the extent its bootstrap
-rebuilds; default parts[0]'s data config)}; stage 2 {parts, rebuild}. Each box is a part once, every part has the same
-gpus, only the gate part may carry faults or an alert watchdog, and the chain's max_hours - stage 1's must hold the
-last stage's est_hours. With check_files, each part's extent lies within its stage's rebuild (the same roots; parakeet
-pulled when a part needs it) and stage 1's rebuild within stage 2's, whose bootstrap reuses its shards. The filled
-registry keeps a chain in this normalised raw form; box_spec derives its spec (the parts' GPU count, the last stage's
-rebuild as data config, stage 1's watchdog, the union of the stage views' extra files) and never stores it. The
-readers take stage= (a chain: that stage's view, None the union; ignored on a plain box), box_env(stage=) adds
-KITSUNE_CHAIN_STAGE and stage 1's KITSUNE_WATCHDOG_HANDOVER_S, and box_items / train_items refuse a chain: the chain
-controller (kitsune/full_queue.py) runs its parts' queues one after the other.
+freeze_controller_hb at_step and seconds >= watchdog.orphan_s + WATCHDOG_POLL_S on a box whose watchdog only alerts.
+Item configs must exist (check_files) and carry the box data config's DATA_KEYS values (a missing pull_parakeet counts
+as false); a train item's family is its config's (default aed). Without pull_parakeet, every stores and train item
+config has the data config's family (default aed): bootstrap pulls the labels the data config's pull plan names
+(kitsune/extent.py pull_plan), which then hold the train labels of that family only (ctc: parakeet_out, plus
+teacher_out for the eval stems; aed: teacher_out). Every name and path the box env or a command line carries is one
+env-string word (vast/launch.py env_string).
 
 Continuations (DECISIONS H14). A train item's `continues` block names the run it re-runs from a saved state: box (a
-plain registry box, not a chain and not this box, with a train item of the SAME name and the SAME config: the run's
-source box, whose Hub queue summary records it), run_id (RUN_ID_RE: the run dir runs/<run_id> in the runs repo),
-from_step (an int > 0: the pre_cooldown state full_step_<from_step> the continuation resets from), to_step (an int >
-from_step: the run's own end, the step the continuation trains to), resets_before (an int >= 0: the state's
-resume_resets, so the readout dir comes out m4-<run_id>-r<resets_before + 1>) and sets (an object, CONTINUE_SET_KEYS
--> a JSON value: the trainer --set values of the continuation; the scalar keys follow resume_set_value's rules on the
-value's text, the CONTINUE_LIST_KINDS keys are a dB range [low, high] or a list of codec names, continue_set_text).
-No two items of a box share a run_id, and no chain has a part with continues items (a continuation box runs alone,
-always as a resume: bootstrap asks has-continues). continues_of(box) lists them; continue_sets(block) spells the sets
-as the --set words the queue passes after schedule.resume_reset=true.
+registry box other than this one, with a train item of the SAME name and the SAME config: the run's source box, whose
+Hub queue summary records it), run_id (RUN_ID_RE: the run dir runs/<run_id> in the runs repo), from_step (an int > 0:
+the pre_cooldown state full_step_<from_step> the continuation resets from), to_step (an int > from_step: the run's own
+end, the step the continuation trains to), resets_before (an int >= 0: the state's resume_resets, so the readout dir
+comes out m4-<run_id>-r<resets_before + 1>) and sets (an object, CONTINUE_SET_KEYS -> a JSON value: the trainer --set
+values of the continuation; the scalar keys follow resume_set_value's rules on the value's text, the
+CONTINUE_LIST_KINDS keys are a dB range [low, high] or a list of codec names, continue_set_text). No two items of a box
+share a run_id, and a box with continues items is always a resume (bootstrap asks has-continues). continues_of(box)
+lists them; continue_sets(block) spells the sets as the --set words the queue passes after schedule.resume_reset=true.
 
 CLI (vast/bootstrap.sh runs check-students and has-continues, show is the operator's; exit 0 ok, 2 refused - a bad
 registry, an unknown box, a student that is not the registered build):
   python -m kitsune.fullrun check-students --box p01 --root R     # every pulled student is the registered build
   python -m kitsune.fullrun show --box full-t                     # the box spec with defaults, env and configs (JSON)
-  python -m kitsune.fullrun check-students --box p01-chain --stage 2 --root R   # a chain: one stage's view
-  python -m kitsune.fullrun has-continues --box p-cool            # "1": the box has continues items, else "0"
-A chain's --stage defaults to $KITSUNE_CHAIN_STAGE, else 1 (show adds both stage views).
+  python -m kitsune.fullrun has-continues --box p005              # "1": the box has continues items, else "0"
 The registry is $KITSUNE_FULL_REGISTRY when set (tests), else <root>/configs/full/boxes.json.
 
 Stdlib only at import: numpy (seeded_subset) and kitsune.prereg (the registered study runs: study_run, the student
@@ -137,24 +117,11 @@ JOB = "full"  # KITSUNE_JOB=full
 BOXES_FILE, ENV_REGISTRY = "configs/full/boxes.json", "KITSUNE_FULL_REGISTRY"
 # smoke A, box p01 (box 1, then its recipe test: box 1's cooldown again), smoke B, and one 1x box per student
 # (DECISIONS G2): full-t (T-0.6B), full-p (P-0.3B with the augmentation recipe, the Whisper models and the quantised
-# readouts) and p005 (P-0.05B alone, the P test box of recipe v3, DECISIONS H10; box p01 keeps P-0.1B's run, whose
-# continuation reads box p01's Hub summary), and p-cool: one rental that re-runs the cooldowns of box full-p's P-0.3B,
-# box p01's P-0.1B and box p005's P-0.05B from their pre_cooldown states (DECISIONS H14; its train items' `continues`
-# blocks name the source boxes)
-BOX_NAMES = ("full-smoke", "p01", "smoke-b", "full-t", "full-p", "p005", "p-cool")
-# chain boxes (contract addendum E, DECISIONS D): one rental that runs registry boxes one after the other, in two
-# stages with an automatic gate between them (kitsune/full_queue.py ChainController). p01-chain = smoke A and smoke B,
-# then box 1, on one 1x RTX 5090
-CHAIN_NAMES = ("p01-chain",)
-ALL_BOX_NAMES = BOX_NAMES + CHAIN_NAMES  # the registry's box-name check; --box of the fullrun, full_queue, launch CLIs
+# readouts) and p005 (P-0.05B alone, the P test box of recipe v3, DECISIONS H10); the registry's box-name check and the
+# --box choices of the fullrun, full_queue and launch CLIs
+BOX_NAMES = ("full-smoke", "p01", "smoke-b", "full-t", "full-p", "p005")
 HUB_DIR = "full"  # runs repo: full/box-<box>/{queue_summary.json, smoke_verdict.json, infra/<container id>/}
 STATE_DEFAULT = "/workspace/kitsune_state"  # $KITSUNE_STATE on a box
-# a chain's controller state under $KITSUNE_STATE: chain/chain.json, chain/<part>/ (each part's queue state dir) and
-# chain/stage1/ (stage 1's bootstrap records); the watchdog's mode file $KITSUNE_STATE/watchdog_mode ("<stop|alert>
-# <orphan_s>"), which the controller writes when the gate part has ended
-CHAIN_DIR, CHAIN_STATE, WATCHDOG_MODE_FILE = "chain", "chain.json", "watchdog_mode"
-CHAIN_KIND = "chain"  # the `kind` of a chain's queue summary
-GATE_CHECKS = tuple(str(n) for n in range(1, 12))  # smoke A's built-in checks: all must pass for stage 2 to start
 
 # the box state files under $KITSUNE_STATE (train_hb: the controllers only; hb/<item>: the child, via KITSUNE_HEARTBEAT)
 TRAIN_HB, HB_DIR, RESUME_PLAN, VERDICT_FILE = "train_hb", "hb", "resume_plan.json", "smoke_verdict.json"
@@ -280,10 +247,6 @@ ENV_THREAD_POOLS = (ENV_OMP_NUM_THREADS, ENV_OPENBLAS_NUM_THREADS, ENV_MKL_NUM_T
 ENV_CGROUP, ENV_HEARTBEAT, ENV_DEADLINE = "KITSUNE_CGROUP", "KITSUNE_HEARTBEAT", "KITSUNE_DEADLINE"
 ENV_QUEUE_ITEM, ENV_CUDA_VISIBLE_DEVICES = "KITSUNE_QUEUE_ITEM", "CUDA_VISIBLE_DEVICES"
 ENV_STATE = "KITSUNE_STATE"
-# a chain box (addendum E): the stage bootstrap and the CLIs serve (launch: 1; the controller's stage-2 bootstrap: 2),
-# the watchdog's stage-1 hand-over bound (first boot + this many seconds), and the bootstrap phases' toucher bound
-ENV_CHAIN_STAGE, ENV_WATCHDOG_HANDOVER_S = "KITSUNE_CHAIN_STAGE", "KITSUNE_WATCHDOG_HANDOVER_S"
-ENV_PHASE_HB_MAX_S = "KITSUNE_PHASE_HB_MAX_S"
 
 # ------------------------------------------------------------------------------------------------ items
 
@@ -669,15 +632,6 @@ _WATCHDOG_ACTIONS = ("stop", "alert")
 # orphan_s, so a freeze_controller_hb window must last orphan_s + this for its alert to fall inside it (box 53693389:
 # the queue cut F5's window at 480 s of its 900; the full window, held by the queue's hold_freeze, covers 600 + 60)
 WATCHDOG_POLL_S = 60
-# a chain box (addendum E.1.2-E.1.3): its own fields, and each stage's (the gated first stage, then the last one); a
-# stage's rebuild and the first stage's gate_by_hours are filled (a stored filled chain validates again unchanged)
-_CHAIN_FIELDS = {"chain": _REQ, "est_hours": _REQ, "max_hours": _REQ, "max_dph": _REQ, "extra_gb": 0, "gate": True}
-_STAGE_FIELDS = ({"parts": _REQ, "gate_box": _REQ, "gate_by_hours": None, "max_hours": _REQ, "rebuild": None},
-                 {"parts": _REQ, "rebuild": None})
-# a plain box's fields that a chain derives from its parts (E.1.5): never written on a chain
-_CHAIN_DERIVED = ("items", "data_config", "watchdog", "faults", "smoke", "timed_states", "extra_files", "extra_dirs",
-                  "max_attempts", "gpus", "deadline_reserve_min", "min_ram_gb")
-_ROOT_KEYS = ("data_root", "teacher_root", "second_root", "parakeet_root")  # a chain stage shares one data root
 
 
 def _keys(d: dict) -> set:
@@ -884,15 +838,15 @@ def _check_continues(where: str, c, p: list[str]) -> None:
 
 
 def _continues_items(box: dict) -> list[dict]:
-    """A filled plain box's train items with a continues block (a malformed item list: none)."""
+    """A filled box's train items with a continues block (a malformed item list: none)."""
     return [it for it in box.get("items") or [] if isinstance(it, dict) and it.get("kind") == "train"
             and it.get("continues") is not None]
 
 
-def _check_continuations(filled: dict, chains: dict, p: list[str]) -> None:
-    """The continues blocks across boxes (DECISIONS H14): box names a plain registry box that is neither a chain nor
-    the item's own box and has a train item of the same name with the same config (the run's source, whose Hub
-    summary records it); no two items of a box continue the same run id."""
+def _check_continuations(filled: dict, p: list[str]) -> None:
+    """The continues blocks across boxes (DECISIONS H14): box names a registry box other than the item's own that has
+    a train item of the same name with the same config (the run's source, whose Hub summary records it); no two items
+    of a box continue the same run id."""
     for bname, box in filled.items():
         seen: dict = {}
         for it in _continues_items(box):
@@ -903,8 +857,6 @@ def _check_continuations(filled: dict, chains: dict, p: list[str]) -> None:
             if isinstance(src, str) and src:
                 if src == bname:
                     p.append(f"{w}.box {src!r} is the item's own box: a continuation continues another box's run")
-                elif src in chains:
-                    p.append(f"{w}.box {src!r} is a chain box: name the plain box that ran the run")
                 elif src not in filled:
                     p.append(f"{w}.box {src!r} is not a registry box")
                 else:
@@ -1206,170 +1158,8 @@ def _check_files(boxes: dict, root: Path, p: list[str], read_json=None):
                 p.append(f"{w}: family {it.get('family')!r}, but {cfg_path} trains {family!r}")
 
 
-def _check_chain(cname: str, raw: dict, plain: dict, p: list[str]) -> dict:
-    """A chain box (addendum E.1.2-E.1.4 rules 1-3): its normalised raw form (its own keys and the stages' keys, with
-    rebuild and gate_by_hours filled) - never the derived spec, which box_spec computes. plain: the filled plain
-    boxes."""
-    where = f"boxes.{cname}"
-    if derived := [k for k in raw if k in _CHAIN_DERIVED]:
-        p.append(f"{where}: {derived} are derived from the chain's parts (addendum E.1.5), never written on a chain")
-    out = _fill(where, {k: v for k, v in raw.items() if k not in _CHAIN_DERIVED}, _CHAIN_FIELDS, p)
-    for k in ("est_hours", "max_hours", "max_dph"):
-        if k in out and not (_num(out[k]) and out[k] > 0):
-            p.append(f"{where}.{k} {out[k]!r} is not a number > 0")
-    if _num(out.get("est_hours")) and _num(out.get("max_hours")) and out["max_hours"] < out["est_hours"]:
-        p.append(f"{where}: max_hours {out['max_hours']} < est_hours {out['est_hours']}")
-    if not (_num(out.get("extra_gb")) and out["extra_gb"] >= 0):
-        p.append(f"{where}.extra_gb {out.get('extra_gb')!r} is not a number >= 0")
-    if out.get("gate") is not True:
-        p.append(f"{where}.gate {out.get('gate')!r}: a chain's gate must be true (the gate part's check 4 reads the "
-                 f"boot's download_gate.json)")
-    stages = out.get("chain")
-    if not isinstance(stages, list) or len(stages) != 2 or not all(isinstance(s, dict) for s in stages):
-        if "chain" in out:
-            p.append(f"{where}.chain is not a list of exactly 2 stage objects (the gated stage, then the last one)")
-        return out
-    filled, seen, gpus = [], [], set()
-    for k, st in enumerate(stages):
-        w = f"{where}.chain[{k}]"
-        if k and (first_only := [x for x in ("gate_box", "gate_by_hours", "max_hours") if x in st]):
-            p.append(f"{w}: {first_only} belong to the gated first stage only")
-            st = {x: v for x, v in st.items() if x not in first_only}
-        fs = _fill(w, st, _STAGE_FIELDS[k], p)
-        parts = fs.get("parts")
-        if not isinstance(parts, list) or not parts or not all(isinstance(x, str) for x in parts):
-            if "parts" in fs:
-                p.append(f"{w}.parts {parts!r} is not a non-empty list of registry box names")
-            parts = []
-        for x in parts:
-            if x in seen:
-                p.append(f"{w}: box {x!r} is a part twice in the chain (each box runs once)")
-            seen.append(x)
-            if x in CHAIN_NAMES:
-                p.append(f"{w}: part {x!r} is a chain box: a chain's parts are plain registry boxes")
-            elif x not in plain:
-                p.append(f"{w}: part {x!r} is not a registry box")
-            else:
-                gpus.add(plain[x].get("gpus"))
-        specs = {x: plain[x] for x in parts if x in plain}
-        for x, s in specs.items():  # DECISIONS H14: a continuation box always resumes, so it never runs in a chain
-            if conts := [it.get("name") for it in _continues_items(s)]:
-                p.append(f"{w}: part {x!r} has continues items {conts}: a box that continues other boxes' runs "
-                         f"runs alone, always as a resume, never as a chain part")
-        gb = fs.get("gate_box")
-        if k == 0:
-            mh = fs.get("max_hours")
-            if "max_hours" in fs and not (_num(mh) and mh > 0):
-                p.append(f"{w}.max_hours {mh!r} is not a number > 0 (hours from first boot to stage 1's end)")
-            elif _num(mh) and _num(out.get("max_hours")) and not mh < out["max_hours"]:
-                p.append(f"{w}.max_hours {mh} must be < the chain's max_hours {out['max_hours']}")
-            if "gate_box" in fs and (not parts or gb != parts[0]):
-                p.append(f"{w}.gate_box {gb!r} must be the stage's first part ({parts[0] if parts else None!r})")
-            gspec = specs.get(gb)
-            if gspec is not None and not (gspec["smoke"] and any(it.get("kind") == "train" for it in gspec["items"])):
-                p.append(f"{w}.gate_box {gb!r} must be a smoke box with >= 1 train item: the gate is its built-in "
-                         f"checks {GATE_CHECKS[0]}-{GATE_CHECKS[-1]}")
-            if fs.get("gate_by_hours") is None and gspec is not None:
-                fs["gate_by_hours"] = gspec["max_hours"]
-            gbh = fs.get("gate_by_hours")
-            if gbh is not None and not (_num(gbh) and gbh > 0 and (not _num(mh) or gbh <= mh)):
-                p.append(f"{w}.gate_by_hours {gbh!r}: a number of hours > 0 and <= the stage's max_hours {mh!r}")
-        if fs.get("rebuild") is None and parts and parts[0] in specs:
-            fs["rebuild"] = specs[parts[0]]["data_config"]
-        rb = fs.get("rebuild")
-        if specs and rb not in [s["data_config"] for s in specs.values()]:
-            p.append(f"{w}.rebuild {rb!r} is not the data config of one of the stage's parts")
-        for x, s in specs.items():  # rule 2: only the gate part may inject faults or merely alert
-            if k == 0 and x == gb:
-                continue
-            if s["faults"]:
-                p.append(f"{w}: part {x!r} has faults: only the gate part ({gb!r}) may")
-            action = (s.get("watchdog") or {}).get("action")
-            if action != "stop":
-                p.append(f"{w}: part {x!r}'s watchdog action is {action!r}: every part but the gate part runs with "
-                         f"the watchdog in stop mode")
-        filled.append(fs)
-    gb, last_parts = (filled[0].get("gate_box"), filled[1].get("parts") or []) if len(filled) == 2 else (None, [])
-    stop_s = [plain[x]["watchdog"].get("orphan_s") for x in last_parts if x in plain
-              and isinstance(plain[x].get("watchdog"), dict)]
-    if gb in plain and stop_s and all(_int(x) for x in stop_s):  # the mode set_mode switches to once the gate part
-        for f in plain[gb].get("faults") or []:  # has returned: never one in which a freeze could stop the box
-            if isinstance(f, dict) and f.get("action") == "freeze_controller_hb" and _num(f.get("seconds")) and \
-                    not f["seconds"] < max(stop_s):
-                p.append(f"{where}: the gate part's freeze {f.get('id')!r} ({f['seconds']} s) must be shorter than the "
-                         f"last stage's stop orphan_s {max(stop_s)}: stop mode must never fire on a freeze")
-    if len(gpus) > 1:
-        p.append(f"{where}: its parts have different gpus {sorted(gpus, key=str)}: one rental has one GPU count")
-    last = [plain[x] for x in filled[1].get("parts") or [] if x in plain]
-    most = max((s["extra_gb"] for s in last), default=0)
-    if last and _num(out.get("extra_gb")) and out["extra_gb"] < most:
-        p.append(f"{where}.extra_gb {out['extra_gb']} is below its last stage's parts' ({most})")
-    s1 = filled[0].get("max_hours")
-    if _num(out.get("max_hours")) and _num(s1) and last:  # rule 3: the last stage fits after stage 1's end
-        need = sum(float(s["est_hours"]) for s in last)
-        if out["max_hours"] - s1 < need:
-            p.append(f"{where}: max_hours {out['max_hours']} - stage 1's {s1} leaves {out['max_hours'] - s1:g} h, "
-                     f"below the last stage's est_hours {need:g}")
-    out["chain"] = filled
-    return out
-
-
-def _pulls_parakeet(cfg: dict) -> bool:
-    """A data config pulls parakeet_out (kitsune.extent pull_plan): family ctc, or pull_parakeet."""
-    return (cfg.get("family") or "aed") == "ctc" or bool(cfg.get("pull_parakeet"))
-
-
-def _check_chain_files(cname: str, spec: dict, plain: dict, root: Path, p: list[str], read_json=None):
-    """E.1.4 rule 4: each stage's rebuild config holds every part of the stage (kitsune.extent within, the same data
-    and label roots, parakeet_out when a part pulls it), and stage 1's rebuild lies within the last stage's, so the
-    last stage's rebuild reuses stage 1's shards."""
-    from kitsune import extent  # pyarrow (kitsune.store): only when the files are checked
-
-    cache: dict = {}
-    where = f"boxes.{cname}"
-
-    def read(rel):
-        cfg = _read_json(root, rel, cache, read_json) if _is_rel_path(rel) else None
-        return cfg if isinstance(cfg, dict) else None
-
-    rebuilds = []
-    for k, st in enumerate(spec.get("chain") or []):
-        rb = st.get("rebuild")
-        rcfg = read(rb)
-        rebuilds.append(rcfg)
-        if rcfg is None:
-            p.append(f"{where}.chain[{k}].rebuild {rb!r}: not a readable JSON object")
-            continue
-        for part in st.get("parts") or []:
-            pcfg = read((plain.get(part) or {}).get("data_config"))
-            if pcfg is None:  # a missing part data config is the plain box's problem already
-                continue
-            dc = plain[part]["data_config"]
-            try:
-                within = extent.within(rcfg, pcfg)
-            except Exception as e:  # noqa: BLE001  a malformed extent block is a problem, not a crash
-                within = [f"{type(e).__name__}: {e}"]
-            if within:
-                p.append(f"{where}: part {part}'s extent ({dc}) is not within stage {k + 1}'s rebuild {rb}: {within}")
-            if diff := [x for x in _ROOT_KEYS if pcfg.get(x) != rcfg.get(x)]:
-                p.append(f"{where}: part {part}'s {dc} differs from stage {k + 1}'s rebuild {rb} in {diff}")
-            if _pulls_parakeet(pcfg) and not _pulls_parakeet(rcfg):
-                p.append(f"{where}: part {part} needs parakeet_out ({dc}), but stage {k + 1}'s rebuild {rb} does not "
-                         f"pull it (family ctc or pull_parakeet)")
-    if len(rebuilds) == 2 and all(c is not None for c in rebuilds):
-        try:
-            within = extent.within(rebuilds[1], rebuilds[0])
-        except Exception as e:  # noqa: BLE001
-            within = [f"{type(e).__name__}: {e}"]
-        if within:
-            p.append(f"{where}: stage 1's rebuild is not within the last stage's (whose rebuild reuses its shards): "
-                     f"{within}")
-
-
 def _check(reg, root, check_files: bool, read_json=None) -> tuple[list[str], dict | None]:
-    """(problems, the registry with its defaults filled). Chain boxes are split off before the plain boxes are
-    checked and are checked against the filled plain boxes; a plain box's of_box / only_if_new_machine never names a
-    chain (it has no items and no queue summary of its own items)."""
+    """(problems, the registry with its defaults filled)."""
     if not isinstance(reg, dict):
         return [f"the registry {type(reg).__name__} is not an object"], None
     p: list[str] = []
@@ -1383,19 +1173,11 @@ def _check(reg, root, check_files: bool, read_json=None) -> tuple[list[str], dic
     if not isinstance(boxes, dict) or not boxes:
         p.append(f"registry: boxes {boxes!r} is not a non-empty object")
         boxes = {}
-    if unknown := [b for b in boxes if b not in ALL_BOX_NAMES]:
-        p.append(f"registry: box(es) {unknown} are not in BOX_NAMES {BOX_NAMES} (or CHAIN_NAMES {CHAIN_NAMES})")
-    chains = {b: x for b, x in boxes.items() if isinstance(x, dict) and "chain" in x}
-    plain = {b: x for b, x in boxes.items() if b not in chains}
-    for b in chains:
-        if b in BOX_NAMES:
-            p.append(f"boxes.{b}: a plain box (BOX_NAMES) has no `chain`; a chain box's name is one of {CHAIN_NAMES}")
-    for b in plain:
-        if b in CHAIN_NAMES:
-            p.append(f"boxes.{b}: {b} is a chain box (CHAIN_NAMES): its entry needs `chain` (addendum E.1.2)")
+    if unknown := [b for b in boxes if b not in BOX_NAMES]:
+        p.append(f"registry: box(es) {unknown} are not in BOX_NAMES {BOX_NAMES}")
     filled: dict = {}
-    for bname, box in plain.items():
-        f = _check_box(bname, box, plain, p)
+    for bname, box in boxes.items():
+        f = _check_box(bname, box, boxes, p)
         if f is not None:
             filled[bname] = f
     # of_box: a train item of another registry box (a box that is not an object is a problem already)
@@ -1404,21 +1186,14 @@ def _check(reg, root, check_files: bool, read_json=None) -> tuple[list[str], dic
             ob, of = it.get("of_box"), it.get("of")
             if it.get("kind") not in ("speed", "eval") or not isinstance(ob, str) or ob == bname or of is None:
                 continue
-            if ob not in plain:
-                p.append(f"boxes.{bname}.items.{it.get('name')}: of_box {ob!r} is not a registry box"
-                         + (" with items (it is a chain)" if ob in chains else ""))
+            if ob not in boxes:
+                p.append(f"boxes.{bname}.items.{it.get('name')}: of_box {ob!r} is not a registry box")
             elif ob in filled and of not in [x.get("name") for x in filled[ob]["items"] if x.get("kind") == "train"]:
                 p.append(f"boxes.{bname}.items.{it.get('name')}: of {of!r} is not a train item of box {ob}")
-    _check_continuations(filled, chains, p)
-    plain_filled = dict(filled)
-    for cname, raw in chains.items():
-        filled[cname] = _check_chain(cname, raw, plain_filled, p)
-    out["boxes"] = {b: filled[b] for b in boxes if b in filled}
+    _check_continuations(filled, p)
+    out["boxes"] = filled
     if check_files:
-        r = Path(root) if root is not None else REPO
-        _check_files(plain_filled, r, p, read_json)
-        for cname in chains:
-            _check_chain_files(cname, filled[cname], plain_filled, r, p, read_json)
+        _check_files(filled, Path(root) if root is not None else REPO, p, read_json)
     return p, out
 
 
@@ -1502,177 +1277,25 @@ def _resolved(registry, root, read_json=None) -> tuple[dict, Path]:
     return _load(registry, root, False)
 
 
-def _chain_entry(box, reg: dict) -> dict | None:
-    """The chain box's normalised entry in a filled registry, or None (a plain box, or no such box)."""
-    b = reg["boxes"].get(box)
-    return b if isinstance(b, dict) and "chain" in b else None
-
-
 def _no_box(box, reg: dict) -> RegistryError:
     return RegistryError(f"box {box!r} is not in the registry (it has {', '.join(reg['boxes']) or 'none'})")
-
-
-def is_chain(box, registry=None) -> bool:
-    """box is a chain box of the registry (its entry has `chain`: addendum E.1.2)."""
-    reg, _ = _resolved(registry, None)
-    return _chain_entry(box, reg) is not None
 
 
 def _uniq(xs) -> list:
     return list(dict.fromkeys(xs))
 
 
-def chain_stages(box, registry=None) -> list[dict]:
-    """A chain's filled stages (E.1.5 `chain`): {stage (1, 2), parts, gate_box (stage 1; else None), gate_by_hours,
-    max_hours (stage 1's sub-deadline in hours from first boot; else None), rebuild (the extent the stage's bootstrap
-    rebuilds), data_configs {part: its data config}, watchdog}. The watchdog of stage 1 is its gate part's (smoke A:
-    600 s, alert, so its heartbeat fault is seen); every later part runs in stop mode (E.1.4 rule 2), so stage 2's is
-    {orphan_s: the largest of its parts', action: stop} - also the mode the controller switches the watchdog to once the
-    gate part has ended. RegistryError for a box that is not a chain."""
+def box_spec(box, registry=None) -> dict:
+    """The box's spec with its defaults filled. RegistryError for a box the registry does not have."""
     reg, _ = _resolved(registry, None)
-    c = _chain_entry(box, reg)
-    if c is None:
-        if box not in reg["boxes"]:
-            raise _no_box(box, reg)
-        raise RegistryError(f"box {box!r} is not a chain box")
-    out = []
-    for k, st in enumerate(c["chain"]):
-        parts = list(st["parts"])
-        specs = {x: reg["boxes"][x] for x in parts}
-        if k == 0:
-            wd = dict(specs[st["gate_box"]]["watchdog"])
-        else:
-            wd = {"orphan_s": max(int(s["watchdog"]["orphan_s"]) for s in specs.values()), "action": "stop"}
-        out.append(dict(stage=k + 1, parts=parts, gate_box=st.get("gate_box"), gate_by_hours=st.get("gate_by_hours"),
-                        max_hours=st.get("max_hours"), rebuild=st["rebuild"],
-                        data_configs={x: specs[x]["data_config"] for x in parts}, watchdog=wd))
-    return out
-
-
-def chain_resume_hint(box: str, last_part: str = "p01") -> str:
-    """Why a chain is not resumed as a chain, and what the owner runs instead (addendum E.8): launch --resume and
-    full_queue resume-pull print it when they refuse a chain box."""
-    return "\n".join([
-        f"a chain box ({box}) is not resumed as a chain. What to run, by where it died "
-        f"({box_summary_path(box)} in the runs repo says: gate, stage, parts.{last_part}):",
-        "  - in stage 1 (gate null or failed): the chain again, fresh (a smoke is cheap; new stamps, the same Hub "
-        "paths)",
-        f"  - in stage 2 after the {last_part} part started on that rental (parts.{last_part}.status not pending, and "
-        f"{box_summary_path(last_part)} has the chain's container_id and started == parts.{last_part}.queue_started): "
-        f"vast/launch.py --job full --box {last_part} --resume [--resume-reset ...] --machine <new id> --max-hours "
-        f"<left + setup> --scratch-repo ... (the unchanged box-{last_part} resume)",
-        f"  - in stage 2 before {last_part} started (during the stage-2 bootstrap): --box {last_part} fresh, or the "
-        f"chain fresh (the owner decides: the gate passed on the old machine only)"])
-
-
-def part_state_dir(part, state=None) -> Path:
-    """<state>/chain/<part>: a chain part's queue state dir (its queue.json, summary, verdict, logs, events, hb/)."""
-    if not isinstance(part, str) or not re.fullmatch(ITEM_RE, part):
-        raise ValueError(f"part name {part!r} does not match {ITEM_RE}")
-    return Path(state if state is not None else state_dir()) / CHAIN_DIR / part
-
-
-def _selection_files(root: Path, rel: str, read_json=None) -> list[str]:
-    """The data-repo files a part whose data config is not its stage's rebuild needs for its own selection: the
-    selection, its sidecar, and kitsune.devslice.selection_files (the frozen manifest of a full_study one,
-    kitsune.prereg.study_files of a study one)."""
-    import importlib
-
-    try:
-        cfg = _read_config(root, rel, read_json)
-    except Exception as e:  # noqa: BLE001  a git read may raise anything
-        raise RegistryError(f"{rel}: cannot read it ({type(e).__name__}: {e})") from None
-    sel = cfg.get("selection") if isinstance(cfg, dict) else None
-    if not isinstance(sel, str) or not sel:
-        raise RegistryError(f"{rel} names no selection")
-    devslice = importlib.import_module("kitsune.devslice")  # stdlib only; imported once it is needed
-    return _uniq([sel, devslice.sidecar_path(sel), *devslice.selection_files(cfg)])
-
-
-def stage_view(box, stage: int, registry=None, root=None, *, read_json=None) -> dict:
-    """What one stage of a chain pulls and runs (E.1.6): {stage, parts, gate_box, rebuild, data_configs, students and
-    ctc_students (the union over its parts, in part order), extra_files (the parts' extra files, plus the selection
-    files of every part whose data config is not the stage's rebuild: stage 1's smoke-b adds study_1000h.parquet and
-    its sidecar), extra_dirs (the union), timed_states (any part's), watchdog}. The item configs are read as
-    box_students reads them (root, or read_json)."""
-    reg, r = _resolved(registry, root, read_json)
-    stages = chain_stages(box, reg)
-    if not (_int(stage) and 1 <= stage <= len(stages)):
-        raise RegistryError(f"chain {box} has stages 1..{len(stages)}, not {stage!r}")
-    st = stages[stage - 1]
-    students, ctc, files, dirs, timed = [], [], [], [], False
-    for part in st["parts"]:
-        spec = reg["boxes"][part]
-        students += box_students(part, reg, r, read_json=read_json)
-        ctc += box_ctc_students(part, reg, r, read_json=read_json)
-        files += spec["extra_files"]
-        dirs += spec["extra_dirs"]
-        timed = timed or bool(spec["timed_states"])
-        if spec["data_config"] != st["rebuild"]:
-            files += _selection_files(r, spec["data_config"], read_json)
-    return dict(stage=stage, parts=list(st["parts"]), gate_box=st["gate_box"], rebuild=st["rebuild"],
-                data_configs=dict(st["data_configs"]), students=_uniq(students), ctc_students=_uniq(ctc),
-                extra_files=_uniq(files), extra_dirs=_uniq(dirs), timed_states=timed, watchdog=dict(st["watchdog"]))
-
-
-def _stages_of(box, reg: dict, stage) -> list[int]:
-    """The stages a chain reader serves: stage N alone, or (None) every stage (launch checks the union)."""
-    n = len(_chain_entry(box, reg)["chain"])
-    if stage is None:
-        return list(range(1, n + 1))
-    if not (_int(stage) and 1 <= stage <= n):
-        raise RegistryError(f"chain {box} has stages 1..{n}, not {stage!r}")
-    return [stage]
-
-
-def _chain_spec(box, reg: dict, r: Path, read_json=None) -> dict:
-    """A chain's derived box spec (E.1.5), computed and never stored: the parts' GPU count, the last stage's rebuild
-    as the data config (launch sizes the disk and the gate on it), the chain's own hours, price, extra disk and gate,
-    stage 1's watchdog (launch's env), the largest deadline reserve of the last stage, timed states if any part keeps
-    them, the union of both stage views' extra files and dirs, the largest min_ram_gb of its parts (None when none
-    sets one), no items (the controller runs its parts' queues)."""
-    c = _chain_entry(box, reg)
-    stages = chain_stages(box, reg)
-    views = [stage_view(box, s["stage"], reg, r, read_json=read_json) for s in stages]
-    last = [reg["boxes"][x] for x in stages[-1]["parts"]]
-    return dict(gpus=reg["boxes"][stages[0]["parts"][0]]["gpus"], data_config=stages[-1]["rebuild"],
-                est_hours=c["est_hours"], max_hours=c["max_hours"], max_dph=c["max_dph"], extra_gb=c["extra_gb"],
-                gate=c["gate"], watchdog=dict(stages[0]["watchdog"]),
-                deadline_reserve_min=max(s["deadline_reserve_min"] for s in last),
-                min_ram_gb=max((reg["boxes"][x].get("min_ram_gb") for st in stages for x in st["parts"]
-                                if reg["boxes"][x].get("min_ram_gb") is not None), default=None),
-                timed_states=any(v["timed_states"] for v in views),
-                extra_files=_uniq(f for v in views for f in v["extra_files"]),
-                extra_dirs=_uniq(d for v in views for d in v["extra_dirs"]), smoke=False, faults=[], items=[],
-                max_attempts=4, chain=stages)
-
-
-def box_spec(box, registry=None, *, root=None, read_json=None) -> dict:
-    """The box's spec with its defaults filled; a chain's derived spec (_chain_spec: it reads the parts' configs under
-    root, or with read_json). RegistryError for a box the registry does not have."""
-    reg, r = _resolved(registry, root, read_json)
-    if box not in reg["boxes"]:
-        raise _no_box(box, reg)
-    if _chain_entry(box, reg) is not None:
-        return _chain_spec(box, reg, r, read_json)
-    return copy.deepcopy(reg["boxes"][box])
-
-
-def _plain_spec(box, reg: dict, what: str) -> dict:
-    """A plain box's spec; RegistryError for a chain (its parts' queues run its items: the chain controller)."""
-    if _chain_entry(box, reg) is not None:
-        raise RegistryError(f"box {box} is a chain box: {what} - a chain box runs through the chain controller "
-                            f"(kitsune/full_queue.py ChainController)")
     if box not in reg["boxes"]:
         raise _no_box(box, reg)
     return copy.deepcopy(reg["boxes"][box])
 
 
 def box_items(box, registry=None) -> list[dict]:
-    """The box's items, in registry order, with their defaults (and implicit needs) filled. RegistryError for a chain:
-    a chain box runs through the chain controller."""
-    reg, _ = _resolved(registry, None)
-    return _plain_spec(box, reg, "it has no items of its own")["items"]
+    """The box's items, in registry order, with their defaults (and implicit needs) filled."""
+    return box_spec(box, registry)["items"]
 
 
 def train_items(box, registry=None) -> list[dict]:
@@ -1681,30 +1304,16 @@ def train_items(box, registry=None) -> list[dict]:
 
 def continues_of(box, registry=None) -> dict[str, dict]:
     """The box's continuations (DECISIONS H14): {train item name: its continues block (a copy)}, in registry order;
-    {} for a box without (a chain too: the registry refuses continues items in a chain's parts). RegistryError for a
-    box the registry does not have."""
-    reg, _ = _resolved(registry, None)
-    if box not in reg["boxes"]:
-        raise _no_box(box, reg)
-    if _chain_entry(box, reg) is not None:
-        return {}
-    return {it["name"]: copy.deepcopy(it["continues"]) for it in _continues_items(reg["boxes"][box])}
+    {} for a box without. RegistryError for a box the registry does not have."""
+    return {it["name"]: copy.deepcopy(it["continues"]) for it in _continues_items(box_spec(box, registry))}
 
 
 def box_configs(box, registry=None) -> list[str]:
     """Every config the box reads, repo-relative and once each: its data config, its stores and train items' configs,
-    and the registry file itself (launch checks they are committed at the sha it rents). A chain: every part's, both
-    stages' rebuild configs and the registry."""
-    reg, _ = _resolved(registry, None)
-    c = _chain_entry(box, reg)
-    if c is not None:
-        parts = [x for st in c["chain"] for x in st["parts"]]
-        return _uniq([*(cfg for x in parts for cfg in box_configs(x, reg)), *(st["rebuild"] for st in c["chain"]),
-                      BOXES_FILE])
-    spec = _plain_spec(box, reg, "")
-    out = [spec["data_config"], *(it["config"] for it in spec["items"] if it["kind"] in ("stores", "train")),
-           BOXES_FILE]
-    return _uniq(out)
+    and the registry file itself (launch checks they are committed at the sha it rents)."""
+    spec = box_spec(box, registry)
+    return _uniq([spec["data_config"], *(it["config"] for it in spec["items"] if it["kind"] in ("stores", "train")),
+                  BOXES_FILE])
 
 
 def _config_student(root: Path, rel: str, read_json=None) -> str:
@@ -1719,68 +1328,44 @@ def _config_student(root: Path, rel: str, read_json=None) -> str:
     return s.rstrip("/")
 
 
-def _chain_view_union(box, reg: dict, r: Path, read_json, stage, key: str) -> list:
-    """The union of a chain's stage views' `key` (stage None: every stage; else that one)."""
-    return _uniq(x for s in _stages_of(box, reg, stage) for x in stage_view(box, s, reg, r, read_json=read_json)[key])
-
-
-def box_students(box, registry=None, root=None, *, read_json=None, stage=None) -> list[str]:
+def box_students(box, registry=None, root=None, *, read_json=None) -> list[str]:
     """The student dirs (repo paths) of the box's train items' configs, in item order, once each: what bootstrap pulls
     and check-students checks. The configs are read under root (default: the root a loaded registry remembers, else
-    this repo), or with read_json(rel) when given (launch: at its sha). A chain: stage N's view (bootstrap and
-    check-students of that stage), or with stage None the union of its stages (launch); stage is ignored on a plain
-    box."""
+    this repo), or with read_json(rel) when given (launch: at its sha)."""
     reg, r = _resolved(registry, root, read_json)
-    if _chain_entry(box, reg) is not None:
-        return _chain_view_union(box, reg, r, read_json, stage, "students")
-    items = _plain_spec(box, reg, "")["items"]
+    items = box_spec(box, reg)["items"]
     return _uniq(_config_student(r, it["config"], read_json) for it in items if it["kind"] == "train")
 
 
-def box_ctc_students(box, registry=None, root=None, *, read_json=None, stage=None) -> list[str]:
-    """The Parakeet-family ones among box_students (family ctc): they carry the CC-BY-4.0 attribution card. A chain's
-    stage as box_students'."""
+def box_ctc_students(box, registry=None, root=None, *, read_json=None) -> list[str]:
+    """The Parakeet-family ones among box_students (family ctc): they carry the CC-BY-4.0 attribution card."""
     reg, r = _resolved(registry, root, read_json)
-    if _chain_entry(box, reg) is not None:
-        return _chain_view_union(box, reg, r, read_json, stage, "ctc_students")
-    items = _plain_spec(box, reg, "")["items"]
+    items = box_spec(box, reg)["items"]
     return _uniq(_config_student(r, it["config"], read_json) for it in items
                  if it["kind"] == "train" and it["family"] == "ctc")
 
 
-def box_extra_files(box, registry=None, *, stage=None, root=None, read_json=None) -> list[str]:
+def box_extra_files(box, registry=None) -> list[str]:
     """The data-repo files the box pulls and requires besides the labels and students (e.g. the frozen manifest and the
-    selection sidecar). A chain's stage as box_students' (its view adds the selection files of a part whose data
-    config is not its stage's rebuild)."""
-    reg, r = _resolved(registry, root, read_json)
-    if _chain_entry(box, reg) is not None:
-        return _chain_view_union(box, reg, r, read_json, stage, "extra_files")
-    return list(_plain_spec(box, reg, "")["extra_files"])
+    selection sidecar)."""
+    return list(box_spec(box, registry)["extra_files"])
 
 
-def box_extra_dirs(box, registry=None, *, stage=None, root=None, read_json=None) -> list[str]:
-    """The data-repo dirs the box pulls and requires (e.g. the Parakeet teacher for its speed probe). A chain's stage
-    as box_students'."""
-    reg, r = _resolved(registry, root, read_json)
-    if _chain_entry(box, reg) is not None:
-        return _chain_view_union(box, reg, r, read_json, stage, "extra_dirs")
-    return list(_plain_spec(box, reg, "")["extra_dirs"])
+def box_extra_dirs(box, registry=None) -> list[str]:
+    """The data-repo dirs the box pulls and requires (e.g. the Parakeet teacher for its speed probe)."""
+    return list(box_spec(box, registry)["extra_dirs"])
 
 
-def student_checks(box, read_meta, registry=None, root=None, *, read_json=None, stage=None) -> list[str]:
+def student_checks(box, read_meta, registry=None, root=None, *, read_json=None) -> list[str]:
     """Why the students the box trains are not the registered builds: each train item's config must train its
     study_run's registered student dir, and read_meta(student dir) -> its student_meta.json (a dict) must pass
     kitsune.prereg.student_problems(study_run, meta). A meta it cannot read is a problem too. Empty: every student is
     the registered build (launch checks the data repo's copies, bootstrap the pulled ones). The item configs are read
-    as box_students reads them (root, or read_json at launch's sha). A chain: its stage's parts (stage None: all)."""
+    as box_students reads them (root, or read_json at launch's sha)."""
     from kitsune import prereg
     reg, r = _resolved(registry, root, read_json)
-    c = _chain_entry(box, reg)
-    if c is not None:
-        parts = [x for s in _stages_of(box, reg, stage) for x in c["chain"][s - 1]["parts"]]
-        return _uniq(x for part in parts for x in student_checks(part, read_meta, reg, r, read_json=read_json))
     problems, metas = [], {}
-    for it in _plain_spec(box, reg, "")["items"]:
+    for it in box_spec(box, reg)["items"]:
         if it["kind"] != "train":
             continue
         run = it["study_run"]
@@ -1795,28 +1380,16 @@ def student_checks(box, read_meta, registry=None, root=None, *, read_json=None, 
                 problems.append(f"{s}/student_meta.json: cannot read it ({type(e).__name__}: {e})")
         if metas[s] is not None:
             problems += [f"{s}: {x}" for x in prereg.student_problems(run, metas[s])]
-    return list(dict.fromkeys(problems))
+    return _uniq(problems)
 
 
-def box_env(box, registry=None, stage: int = 1) -> dict[str, str]:
+def box_env(box, registry=None) -> dict[str, str]:
     """The registry's part of the box env (launch): KITSUNE_N_GPUS and the watchdog's heartbeat file (train_hb), orphan
-    limit and action. A chain: that stage's watchdog, KITSUNE_CHAIN_STAGE, and in stage 1 the watchdog's hand-over
-    bound KITSUNE_WATCHDOG_HANDOVER_S = 3600 x (gate_by_hours + 0.5): with no mode file from the controller by first
-    boot + that, the watchdog syncs and stops the box (vast/watchdog.sh). stage is ignored on a plain box."""
-    reg, _ = _resolved(registry, None)
-    if _chain_entry(box, reg) is None:
-        spec = _plain_spec(box, reg, "")
-        return {ENV_N_GPUS: str(spec["gpus"]), ENV_WATCHDOG_HB_FILE: TRAIN_HB,
-                ENV_WATCHDOG_ORPHAN_S: str(spec["watchdog"]["orphan_s"]),
-                ENV_WATCHDOG_ORPHAN_ACTION: spec["watchdog"]["action"]}
-    (s,) = _stages_of(box, reg, 1 if stage is None else stage)
-    st = chain_stages(box, reg)[s - 1]
-    env = {ENV_N_GPUS: str(reg["boxes"][st["parts"][0]]["gpus"]), ENV_WATCHDOG_HB_FILE: TRAIN_HB,
-           ENV_WATCHDOG_ORPHAN_S: str(st["watchdog"]["orphan_s"]),
-           ENV_WATCHDOG_ORPHAN_ACTION: st["watchdog"]["action"], ENV_CHAIN_STAGE: str(s)}
-    if s == 1:
-        env[ENV_WATCHDOG_HANDOVER_S] = str(int(3600 * (float(st["gate_by_hours"]) + 0.5)))
-    return env
+    limit and action."""
+    spec = box_spec(box, registry)
+    return {ENV_N_GPUS: str(spec["gpus"]), ENV_WATCHDOG_HB_FILE: TRAIN_HB,
+            ENV_WATCHDOG_ORPHAN_S: str(spec["watchdog"]["orphan_s"]),
+            ENV_WATCHDOG_ORPHAN_ACTION: spec["watchdog"]["action"]}
 
 
 # ================================================================================================ CLI
@@ -1830,10 +1403,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     for c in ("check-students", "show", "has-continues"):
         sp = sub.add_parser(c)
-        sp.add_argument("--box", default=os.environ.get(ENV_BOX), choices=ALL_BOX_NAMES)
-        sp.add_argument("--stage", type=int, default=None,
-                        help=f"a chain box's stage (default ${ENV_CHAIN_STAGE}, else 1): its stage view (ignored on a "
-                             f"plain box)")
+        sp.add_argument("--box", default=os.environ.get(ENV_BOX), choices=BOX_NAMES)
         sp.add_argument("--root", default=None,
                         help="the checkout: the registry and configs are read there, and check-students reads the "
                              "pulled student dirs there (default: this repo)")
@@ -1846,31 +1416,18 @@ def main(argv=None) -> int:
         if args.cmd == "has-continues":  # vast/bootstrap.sh: such a box always runs resume-pull (DECISIONS H14)
             print("1" if continues_of(args.box, reg) else "0")
             return EXIT_OK
-        chain = _chain_entry(args.box, reg) is not None
-        stage = None
-        if chain:
-            env_stage = os.environ.get(ENV_CHAIN_STAGE) or "1"
-            if args.stage is None and not re.fullmatch(r"[1-9][0-9]*", env_stage):
-                raise RegistryError(f"{ENV_CHAIN_STAGE} {env_stage!r} is not a stage number")
-            stage = args.stage if args.stage is not None else int(env_stage)
         if args.cmd == "show":
-            doc = {"box": args.box, "env": box_env(args.box, reg, stage=stage or 1),
-                   "configs": box_configs(args.box, reg), "students": box_students(args.box, reg, r, stage=stage),
-                   "spec": box_spec(args.box, reg, root=r)}
-            if chain:  # the derived spec plus both stage views
-                doc["stages"] = {str(s["stage"]): stage_view(args.box, s["stage"], reg, r)
-                                 for s in chain_stages(args.box, reg)}
-            print(json.dumps(doc, indent=2, ensure_ascii=False))
+            print(json.dumps({"box": args.box, "env": box_env(args.box, reg), "configs": box_configs(args.box, reg),
+                              "students": box_students(args.box, reg, r), "spec": box_spec(args.box, reg)},
+                             indent=2, ensure_ascii=False))
             return EXIT_OK
-        # check-students: vast/bootstrap.sh after the pull (a chain: only this stage's students are on disk)
+        # check-students: vast/bootstrap.sh after the pull
         problems = student_checks(args.box, lambda s: json.loads(
-            (r / s / "student_meta.json").read_text(encoding="utf-8")), reg, r, stage=stage)
+            (r / s / "student_meta.json").read_text(encoding="utf-8")), reg, r)
         for x in problems:
             print(f"student refused: {x}", file=sys.stderr)
         if not problems:
-            what = f" (stage {stage})" if chain else ""
-            print(f"box {args.box}{what}: {len(box_students(args.box, reg, r, stage=stage))} student(s) are the "
-                  f"registered builds")
+            print(f"box {args.box}: {len(box_students(args.box, reg, r))} student(s) are the registered builds")
         return EXIT_REFUSED if problems else EXIT_OK
     except RegistryError as e:
         print(f"refused: {e}", file=sys.stderr)

@@ -47,16 +47,10 @@
 # most its own worst case (the label pull and the rebuild: their three attempts' timeouts) or else
 # KITSUNE_PHASE_HB_MAX_S (12 h), and never after bootstrap has exited. vast/README.md "Full-data runs" has the box's
 # whole life.
-#
-# Chain box (KITSUNE_BOX=p01-chain, contract addendum E): the helper serves the view of stage KITSUNE_CHAIN_STAGE (its
-# parts' students, extra files and dirs, timed states) and refuses (exit 3) a KITSUNE_CONFIG that is not that stage's
-# rebuild config; each timing record carries "stage". Stage 1 is the boot's (onstart); stage 2 is run by the chain
-# controller on the full extent with the same data root (01 skips stage 1's finished inputs; coverage checks every
-# stem), without the gate (its record stays) and with the controller's timeouts and a 3 h KITSUNE_PHASE_HB_MAX_S.
 set -euo pipefail
 # fd 7 is onstart's supervise.lock (flock), which its subshell holds while bootstrap runs and closes right before it
 # execs vast/supervise.py, which takes the lock itself. Nothing of bootstrap's may hold it: on 2026-10-01 (box
-# p01-chain) the train_hb touchers' `sleep 60`s, inherited fd 7 and all, outlived bootstrap, supervise.py found the lock
+# 53693389) the train_hb touchers' `sleep 60`s, inherited fd 7 and all, outlived bootstrap, supervise.py found the lock
 # held and exited, and the box idled with no supervisor. onstart runs bootstrap with fd 7 closed; this closes it for
 # a bootstrap started any other way, so no phase, toucher or label pull (nor what they start) ever has it
 exec 7>&-
@@ -179,9 +173,8 @@ phase() {  # phase <name> <command...>: run it and append its wall time
     wait "$hb" 2>/dev/null || true
     [ "$rc" -eq 0 ] || return "$rc"
     t1=$(date +%s.%N)
-    printf '{"phase": "%s", "seconds": %s, "end": %s%s}\n' "$name" \
-        "$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')" "${t1%.*}" \
-        "${KITSUNE_CHAIN_STAGE:+, \"stage\": $KITSUNE_CHAIN_STAGE}" >> "$TIMINGS"
+    printf '{"phase": "%s", "seconds": %s, "end": %s}\n' "$name" \
+        "$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')" "${t1%.*}" >> "$TIMINGS"
     log "phase $name done in $(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }') s"
 }
 
@@ -245,20 +238,9 @@ if os.environ.get("KITSUNE_JOB") == "full":
     _box = os.environ["KITSUNE_BOX"]
     try:
         _reg = _f.load_registry(root=root)
-        if _f.is_chain(_box, _reg):
-            # a chain box (contract addendum E): this stage's view of its parts (KITSUNE_CHAIN_STAGE: launch 1, the
-            # chain controller's stage-2 bootstrap 2), which rebuilds exactly the stage's rebuild config
-            _stage = os.environ.get("KITSUNE_CHAIN_STAGE") or "1"
-            _v = _f.stage_view(_box, int(_stage) if _stage.isdigit() else -1, _reg, root)
-            if os.environ["CONFIG"] != _v["rebuild"]:
-                raise _f.RegistryError(f"chain stage {_v['stage']} rebuilds {_v['rebuild']}, not KITSUNE_CONFIG "
-                                       f"{os.environ['CONFIG']}")
-            students, ctc_students = _v["students"], set(_v["ctc_students"])
-            extra_dirs, extra_files, timed_states = _v["extra_dirs"], _v["extra_files"], _v["timed_states"]
-        else:
-            students, ctc_students = _f.box_students(_box, _reg), set(_f.box_ctc_students(_box, _reg))
-            extra_dirs, extra_files = _f.box_extra_dirs(_box, _reg), _f.box_extra_files(_box, _reg)
-            timed_states = _f.box_spec(_box, _reg)["timed_states"]
+        students, ctc_students = _f.box_students(_box, _reg), set(_f.box_ctc_students(_box, _reg))
+        extra_dirs, extra_files = _f.box_extra_dirs(_box, _reg), _f.box_extra_files(_box, _reg)
+        timed_states = _f.box_spec(_box, _reg)["timed_states"]
     except _f.RegistryError as e:
         print(f"box {_box}: {e} (not retried)", file=sys.stderr)
         sys.exit(3)
@@ -573,10 +555,10 @@ fi
 # files renamed when done, and snapshot_download skips what is already on disk (~2.3 GB in all)
 phase plan retry 3 timeout -k 30 10m "$PY" "$HELPER" plan
 phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull
-# DECISIONS H14: a box whose train items continue other boxes' runs (registry `continues`, box p-cool) is always a
-# resume, KITSUNE_RESUME or not (launch sets it for such a box anyway): its queue refuses to start without the plan, so
-# a run never trains from step 0. Asked only without KITSUNE_RESUME=1; a registry that cannot answer prints nothing here
-# (no resume), and check_students below refuses it
+# DECISIONS H14: a box whose train items continue other boxes' runs (registry `continues`) is always a resume,
+# KITSUNE_RESUME or not (launch sets it for such a box anyway): its queue refuses to start without the plan, so a run
+# never trains from step 0. Asked only without KITSUNE_RESUME=1; a registry that cannot answer prints nothing here (no
+# resume), and check_students below refuses it
 if [ "${KITSUNE_RESUME:-}" = 1 ] ||
     [ "$("$PY" -m kitsune.fullrun has-continues --box "$KITSUNE_BOX" --root "$KITSUNE_DIR")" = 1 ]; then
     # a relaunch on a new host (launch.py --resume), or a continuation box's every launch: the box's Hub queue summary

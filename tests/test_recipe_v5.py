@@ -802,17 +802,17 @@ def test_the_keys_are_resume_sets():
 
 
 def test_recipe_v5():
-    """RECIPE_V5 = recipe v4 with the trainer's defaults written out (RECIPE_V4_FULL: as a continuation's recipe it
-    inherits no range or short-row guard from the state it resumes) and the three fixes on, proposed for the next run
-    (DECISIONS pending): no full run, continuation or generated config uses it whole - full-t06 alone names two of its
-    keys, guard_per_piece and end_trim_voiced, on (RECIPE_AED_H15, DECISIONS H15), cut_keep_word left at the default
-    false; every key is one a continuation may set; it loads on a CTC student's config and on an AED one's (its cut
-    table kept), its retired keys (mix_p and background_min_row_s at 0: RETIRED_KEYS) dropped."""
-    assert M.RECIPE_V5 == dict(M.RECIPE_V4_FULL, cut_keep_word=True, guard_per_piece=True, end_trim_voiced=True)
-    assert list(M.RECIPE_V5)[:len(M.RECIPE_V4_FULL)] == list(M.RECIPE_V4_FULL)
-    assert {"noise_snr_db", "speech_snr_db", "gain_db", "codecs", "background_min_row_s"} <= set(M.RECIPE_V5)
+    """RECIPE_V5 = recipe v4 with the trainer's defaults of its ranges and short-row guard written out (as a
+    continuation's recipe it inherits none from the state it resumes) and the three fixes on, proposed for the next run
+    (DECISIONS pending): no full run or generated config uses it whole - full-t06 alone names two of its keys,
+    guard_per_piece and end_trim_voiced, on (RECIPE_AED_H15, DECISIONS H15), cut_keep_word left at the default false;
+    every key is one a continuation may set; it loads on a CTC student's config and on an AED one's (its cut table
+    kept), its retired keys (mix_p and background_min_row_s at 0: RETIRED_KEYS) dropped."""
+    ranges = {"noise_snr_db": [0.0, 20.0], "speech_snr_db": [10.0, 25.0], "gain_db": [-20.0, 10.0],
+              "codecs": ["mp3", "gsm", "ulaw8k"], "background_min_row_s": 0.0}
+    assert M.RECIPE_V5 == dict(M.RECIPE_V4, **ranges, cut_keep_word=True, guard_per_piece=True, end_trim_voiced=True)
+    assert list(M.RECIPE_V5) == [*M.RECIPE_V4, *ranges, *FIXES]  # recipe v4's keys first, in its order
     assert all(r["augment"] is not M.RECIPE_V5 for r in M.FULL_RUNS.values())
-    assert all(c["augment"] is not M.RECIPE_V5 for c in M.CONTINUATIONS.values())
     sets = {f"augment.{k}": v for k, v in M.RECIPE_V5.items()}
     assert set(sets) <= set(fr.CONTINUE_SET_KEYS) and len(fr.continue_sets({"sets": sets})) == len(sets)
     m = load_script("04_distill")

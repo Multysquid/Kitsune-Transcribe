@@ -18,10 +18,10 @@
   runs repo's pre_cooldown state, a set-only run past its cooldown, an unknown id) and the adoption of its plan (only
   without queue.json, done items not run again, a reset's readout into -r1, sets_once until the first state after the
   reset), only_if_new_machine, the resource peaks from a fake /proc, and the CLI's build-stores / check-resume / plan
-- DECISIONS H14's continuation box p-cool (fixtures_full.cool_registry): the first launch without a summary of its own
-  (each run resolved from its source box and reset from full_step_<from_step> with the registry's sets, readouts into
-  -r1 / -r2 / -r1), every source refusal, a continuation that ran without a box summary (never reset twice), the own
-  summary's paths (done only when done AND verified), the env refused on a continued run, the never-fresh guards,
+- DECISIONS H14's continuation box (fixtures_full.cool_registry: box full-t): the first launch without a summary of its
+  own (each run resolved from its source box and reset from full_step_<from_step> with the registry's sets, readouts
+  into -r1 / -r2 / -r1), every source refusal, a continuation that ran without a box summary (never reset twice), the
+  own summary's paths (done only when done AND verified), the env refused on a continued run, the never-fresh guards,
   pull_run's step filter, and bootstrap's has-continues trigger (test_bootstrap_extent's shell harness)
 Every process is tests/fake_study_trainer.py (fake GPUs = distinct CUDA_VISIBLE_DEVICES values); the Hub is a recording
 fake uploader or tests/fake_runs_repo.py's DirHub.
@@ -539,7 +539,7 @@ def test_summary_puts_are_coalesced_but_never_lost(fq):
 
 def smoke_registry(reg: dict, *, sigstop: bool, stall_min: float | None = None) -> dict:
     """box full-smoke of tiny_registry, sized for the fakes: the freeze fault 60 s (orphan_s + fullrun.WATCHDOG_POLL_S)
-    on a watchdog of 0 s, released at the stand-in watchdog's alert if the part ends first (hold_freeze); without SIGSTOP
+    on a watchdog of 0 s, released at the stand-in watchdog's alert if the box ends first (hold_freeze); without SIGSTOP
     (Windows) F1 is dropped and the wipe fires on the first attempt. stall_min: the smoke trainers' stall limit (the
     registry's 10 min otherwise; the SIGSTOP run needs seconds, as its stopped trainer is recovered by the stall
     check)."""
@@ -647,7 +647,7 @@ def check_smoke(fq, rc, runs_hub, scratch_hub, seen):
     p005_rec = next(x for x in fq.records("train") if x["item"] == "smoke-p005")
     assert float(p005_rec["deadline"]) == pytest.approx(p005_rec["t0"] + 600, abs=5)
     # F5 freeze: train_hb unchanged from the fault until its release (its window's end, or the watchdog's alert while
-    # the part held it open: hold_freeze, never end_faults' cut), across an item end and its summary put
+    # the box held it open: hold_freeze, never end_faults' cut), across an item end and its summary put
     f5 = st["faults"]["F5"]
     fired, until = f5["fired_at"]["wall"], f5["released"]
     assert f5["release"] in ("alert", "window") and until <= f5["window_end"]
@@ -657,7 +657,7 @@ def check_smoke(fq, rc, runs_hub, scratch_hub, seen):
     assert any(e["item"] == "smoke-p005" for e in ends), "smoke-p005 did not end inside the freeze"
     alerts = [json.loads(x) for x in (fq.state / fullrun.ALERTS_FILE).read_text(encoding="utf-8").splitlines()]
     first = min(a["wall"] for a in alerts if a["wall"] >= fired)
-    assert fq.events("queue_end")[0]["wall"] >= first  # the part did not end before the freeze's alert
+    assert fq.events("queue_end")[0]["wall"] >= first  # the box did not end before the freeze's alert
     assert v["checks"]["7"]["evidence"]["F5"]["window"] == [fired, until]
     # smoke-nostart: skipped by the no-start rule; check 3's math on the fakes' step times
     assert st["items"]["smoke-nostart"]["status"] == "skipped" and "smoke-nostart" in st["no_start"]
@@ -695,7 +695,7 @@ def test_smoke_a_faults_and_verdict(fq, monkeypatch):
 
 
 
-# the end-of-part freeze hold (box 53693389: F5's window cut at 480 s by end_faults, before the watchdog's 600 s
+# the end-of-box freeze hold (box 53693389: F5's window cut at 480 s by end_faults, before the watchdog's 600 s
 # orphan_s and its poll, so check 7 had no alert)
 
 
@@ -705,7 +705,7 @@ FREEZE_ENV = dict(FAKE_EPOCH_STEPS="100", FAKE_STEP_S="0.01")  # smoke-p005: ~1 
 def freeze_box(fq, monkeypatch, seconds: float, orphan_s: int = 1, **changes):
     """box full-smoke reduced to stores-ctc and smoke-p005 with F4 dropped and F5 at step 5 for `seconds` on an
     alert watchdog of orphan_s (fullrun.WATCHDOG_POLL_S 0, so seconds > orphan_s validates): under FREEZE_ENV,
-    smoke-p005 ends ~1 s after the fire, so the part's work is over long before the window."""
+    smoke-p005 ends ~1 s after the fire, so the box's work is over long before the window."""
     monkeypatch.setattr(fullrun, "WATCHDOG_POLL_S", 0)
     reg = box_only(fq.reg, "full-smoke", keep=["stores-ctc", "smoke-p005"],
                    watchdog={"orphan_s": orphan_s, "action": "alert"}, **changes)
@@ -742,10 +742,10 @@ def stand_in_watchdog(hb: Path, alerts: Path, stale_s: float):
     return stop, th, seen
 
 
-def test_the_part_holds_an_open_freeze_until_the_watchdog_alerts(fq, monkeypatch):
+def test_the_box_holds_an_open_freeze_until_the_watchdog_alerts(fq, monkeypatch):
     """The regression test of box 53693389: the freeze's item ends long before its window, nothing else is left, and
-    the part holds - no items, no beats - until the watchdog's alert is recorded, then releases at once; check 7
-    passes. Before the fix, end_faults cut the window as the part ended and the alert never came."""
+    the box holds - no items, no beats - until the watchdog's alert is recorded, then releases at once; check 7
+    passes. Before the fix, end_faults cut the window as the box ended and the alert never came."""
     reg = freeze_box(fq, monkeypatch, seconds=60.0, orphan_s=3)
     hb, alerts = fq.state / fullrun.TRAIN_HB, fq.state / fullrun.ALERTS_FILE
     fq.state.mkdir(parents=True, exist_ok=True)
@@ -771,7 +771,7 @@ def test_the_part_holds_an_open_freeze_until_the_watchdog_alerts(fq, monkeypatch
     window = [m for t, m in seen if fired + 0.05 < t < f5["released"] - 0.05]
     assert window and len(set(window)) == 1
     item_end = next(e["wall"] for e in fq.events("item_end") if e["item"] == "smoke-p005")
-    assert fired < item_end < hold["wall"] < alert_wall  # the item ended inside the window, then the part held
+    assert fired < item_end < hold["wall"] < alert_wall  # the item ended inside the window, then the box held
     c7 = json.loads((fq.state / fullrun.VERDICT_FILE).read_text(encoding="utf-8"))["checks"]["7"]
     assert c7["pass"] is True and c7["evidence"]["F5"]["alerts_during"] == 1, c7
     assert c7["evidence"]["F5"]["release"] == "alert" and c7["evidence"]["F5"]["window"] == [fired, f5["released"]]
@@ -779,7 +779,7 @@ def test_the_part_holds_an_open_freeze_until_the_watchdog_alerts(fq, monkeypatch
 
 
 def test_a_freeze_hold_without_a_watchdog_ends_with_its_window(fq, monkeypatch):
-    """No alert ever comes: the part holds to the window's end (release "window"), and check 7 fails honestly."""
+    """No alert ever comes: the box holds to the window's end (release "window"), and check 7 fails honestly."""
     q = fq.make("full-smoke", registry=freeze_box(fq, monkeypatch, seconds=3.0), env=FREEZE_ENV)
     assert q.run() == F.EXIT_OK
     f5 = fq.st()["faults"]["F5"]
@@ -789,9 +789,8 @@ def test_a_freeze_hold_without_a_watchdog_ends_with_its_window(fq, monkeypatch):
     assert c7["pass"] is False and c7["evidence"]["F5"]["alerts_during"] == 0
 
 
-def test_a_freeze_hold_stops_at_the_box_deadline_reserve_and_halts_at_a_parts_stop_at(fq, monkeypatch):
-    """The hold never outlasts the box deadline less deadline_reserve_min (release "deadline"), and a chain part's
-    stop_at halts it (rc 4, the verdict written, no hang)."""
+def test_a_freeze_hold_stops_at_the_box_deadline_reserve(fq, monkeypatch):
+    """The hold never outlasts the box deadline less deadline_reserve_min (release "deadline")."""
     reg = freeze_box(fq, monkeypatch, seconds=600.0, deadline_reserve_min=0)
     fq.state.mkdir(parents=True, exist_ok=True)
     (fq.state / "deadline").write_text(f"{time.time() + 8}\n")
@@ -799,16 +798,6 @@ def test_a_freeze_hold_stops_at_the_box_deadline_reserve_and_halts_at_a_parts_st
     assert q.run() == F.EXIT_OK
     f5 = fq.st()["faults"]["F5"]
     assert f5["release"] == "deadline" and f5["released"] < f5["window_end"] and f5["held_s"] < 30
-    fq.reset()
-    q = fq.make("full-smoke", registry=freeze_box(fq, monkeypatch, seconds=600.0), env=FREEZE_ENV,
-                stop_at=time.time() + 8)
-    t0 = time.time()
-    assert q.run() == F.EXIT_STOP
-    assert time.time() - t0 < 60
-    st = fq.st()
-    assert st["final"]["status"] == "halted" and "stage deadline" in st["final"]["reason"]
-    assert fq.events("stage_deadline") and fq.events("freeze_hold")
-    assert (fq.state / fullrun.VERDICT_FILE).is_file()
 
 
 def test_a_queue_restart_inside_a_freeze_keeps_it(fq, monkeypatch):
@@ -1802,14 +1791,14 @@ def test_a_readout_is_tested_against_the_box_deadline_not_kitsune_deadline(tmp_p
     assert q2.start_deadline("m4-full-p03") == pytest.approx(now + 3 * 3600 - 2400, abs=1)  # the 1800 s sync lead
 
 
-# ================================================================== continuations (DECISIONS H14, box p-cool)
+# ============================================================ continuations (DECISIONS H14; here on box full-t)
 
 
-COOL_SUMMARY = fullrun.box_summary_path("p-cool")
+COOL_SUMMARY = fullrun.box_summary_path("full-t")
 
 
 def cool_once(name: str) -> list[str]:
-    """The sets_once of box p-cool's continuation `name`: the reset flag, then the registry's sets as --set words."""
+    """The sets_once of box full-t's continuation `name`: the reset flag, then the registry's sets as --set words."""
     return ["schedule.resume_reset=true", *fullrun.continue_sets(cool_continues(name))]
 
 
@@ -1820,7 +1809,7 @@ def cool_record(name: str) -> dict:
 
 @pytest.fixture
 def cool(fq):
-    """Box p-cool (fixtures_full.cool_registry) in fq's checkout, made fake-loadable, and a runs and a scratch DirHub:
+    """Box full-t (fixtures_full.cool_registry) in fq's checkout, made fake-loadable, and a runs and a scratch DirHub:
     sources() puts the source boxes' summaries (each run done and verified), runs_up() the three runs as their source
     boxes left them (full_step_<from_step> pre_cooldown and full_step_<to_step> end, both counting resets_before, the
     export step_<to_step>, a complete summary.json) and the source run's last timed state in the scratch repo."""
@@ -1837,7 +1826,7 @@ def cool(fq):
             return super().hf_hub_download(repo_id, filename, **kw)
 
     def pull(reset=(), sets=None, root=None):
-        return F.resume_pull("p-cool", root or fq.root, runs=F.Hub("u/runs", api=CountingApi(runs, "r")),
+        return F.resume_pull("full-t", root or fq.root, runs=F.Hub("u/runs", api=CountingApi(runs, "r")),
                              scratch=F.Hub("u/scratch", api=FakeApi(scratch, "s")), registry=loaded,
                              state_dir=fq.state, reset=list(reset), sets=dict(sets or {}), sha="abc")
 
@@ -1869,7 +1858,7 @@ def cool(fq):
 
 
 def test_a_continuation_boxs_first_launch_resets_each_run_from_its_source_and_reads_out_into_r_n(fq, cool):
-    """DECISIONS H14 end to end on the queue side: box p-cool has no summary of its own yet; resume-pull resolves each
+    """DECISIONS H14 end to end on the queue side: box full-t has no summary of its own yet; resume-pull resolves each
     continues item from its source box's summary (one download per box) and resets it from full_step_<from_step> with
     the registry's sets (never the source run's later timed state); the queue adopts the plan (three separate
     sets_once and continuation records), each reset runs with its sets until applied, and the readouts come out
@@ -1877,7 +1866,7 @@ def test_a_continuation_boxs_first_launch_resets_each_run_from_its_source_and_re
     cool.sources()
     cool.runs_up()
     plan = cool.pull()
-    assert plan["box"] == "p-cool" and plan["summary_sha256"] is None  # no summary of its own
+    assert plan["box"] == "full-t" and plan["summary_sha256"] is None  # no summary of its own
     for name, (src, rid, from_step, _, before, *_) in COOL_RUNS.items():
         e = plan["items"][name]
         assert (e["status"], e["run_dir"], e["state"], e["step"], e["source"], e["reset"]) == (
@@ -1892,7 +1881,7 @@ def test_a_continuation_boxs_first_launch_resets_each_run_from_its_source_and_re
     summaries = [f for f in cool.fetched if f.endswith("/queue_summary.json")]
     assert sorted(summaries) == sorted([COOL_SUMMARY, *map(fullrun.box_summary_path, ("full-p", "p01", "p005"))])
     env = dict(FAKE_RC=json.dumps({"full-p01": [1, 0]}))  # P-0.1B's first attempt dies right after its reset
-    assert fq.make("p-cool", registry=cool.reg, env=env).run() == F.EXIT_OK
+    assert fq.make("full-t", registry=cool.reg, env=env).run() == F.EXIT_OK
     tr = fq.records("train")
     assert [x["run_dir"] for x in tr] == [COOL_RUNS[n][1] for n in ("full-p03", "full-p01", "full-p01", "full-p005")]
     for x in tr:
@@ -1930,7 +1919,7 @@ def test_a_continuation_boxs_first_launch_resets_each_run_from_its_source_and_re
     ("no_from_step", "no pre_cooldown full state full_step_32"),
 ])
 def test_a_continuations_source_must_hold_the_run_done_verified_and_as_registered(fq, cool, case, match):
-    """Without a summary of its own, box p-cool resolves P-0.1B's run from box p01's summary, and refuses (exit 3) a
+    """Without a summary of its own, box full-t resolves P-0.1B's run from box p01's summary, and refuses (exit 3) a
     missing summary, a source box still running, a source item not done or not verified, another run id, another
     resets count; and a pull_run state at from_step that does not count resets_before resets or is missing."""
     skip = ("p01",) if case == "missing" else ()
@@ -1954,7 +1943,7 @@ def test_a_continuations_source_must_hold_the_run_done_verified_and_as_registere
 
 
 def test_a_continuation_that_ran_without_a_box_summary_goes_on_and_is_never_reset_twice(fq, cool):
-    """The host was lost before box p-cool's first summary put, after P-0.3B's continuation had reset and saved a
+    """The host was lost before box full-t's first summary put, after P-0.3B's continuation had reset and saved a
     timed state (counting resets_before + 1 resets): it goes on from that state as a lost continuation (no reset, no
     sets, its continuation record), and the adopted queue never applies the reset again."""
     cool.sources()
@@ -1967,7 +1956,7 @@ def test_a_continuation_that_ran_without_a_box_summary_goes_on_and_is_never_rese
                                                                              False, [])
     assert e["continuation"] == cool_record("full-p03")
     assert plan["items"]["full-p01"]["reset"] is True  # the others still reset from their pre_cooldown states
-    q = fq.make("p-cool", registry=cool.reg)
+    q = fq.make("full-t", registry=cool.reg)
     q.register()
     it = q.item("full-p03")
     assert it["sets_once"] == [] and it["continuation"] == cool_record("full-p03") and it["status"] == "interrupted"
@@ -1977,7 +1966,7 @@ def test_a_continuation_that_ran_without_a_box_summary_goes_on_and_is_never_rese
 
 @pytest.mark.parametrize("name", list(COOL_RUNS))
 def test_a_continuation_whose_reset_only_its_rewritten_pre_cooldown_state_holds_is_never_reset_twice(fq, cool, name):
-    """The host was lost right after a continuation's reset, before box p-cool's first summary put and before any
+    """The host was lost right after a continuation's reset, before box full-t's first summary put and before any
     timed state: the only Hub state holding the reset is full_step_<from_step> itself, which the reset's pre_cooldown
     save rewrote in place (the restate of a run with timed states: trainer.pt/.json at the same step, counting
     resets_before + 1, the continuation's sets in its config, both one-shot flags false) and uploaded over the source
@@ -2013,7 +2002,7 @@ def test_a_continuation_whose_reset_only_its_rewritten_pre_cooldown_state_holds_
     assert json.loads((local / f"full_step_{from_step}" / "trainer.json").read_text(encoding="utf-8"))["st"] == st
     assert plan["items"][f"m4-{name}"]["status"] == "fresh"
     assert all(plan["items"][n]["reset"] is True for n in COOL_RUNS if n != name)  # the others reset from theirs
-    q = fq.make("p-cool", registry=cool.reg)
+    q = fq.make("full-t", registry=cool.reg)
     q.register()
     it = q.item(name)
     assert it["sets_once"] == [] and it["continuation"] == cool_record(name) and it["status"] == "interrupted"
@@ -2029,7 +2018,7 @@ def test_a_done_continuation_keeps_its_record_through_resume_pull_and_adoption(f
     _, rid, from_step, to_step, *_ = COOL_RUNS["full-p03"]
     rec = dict(cool_record("full-p03"), adopted_utc="2026-10-10T00:00:00+00:00")
     result = {"run_id": rid, "steps": to_step, "status": "complete", "resume_resets": 1}
-    cool.summary_of(cool.runs, "p-cool", {"stores-ctc": {"status": "done"},
+    cool.summary_of(cool.runs, "full-t", {"stores-ctc": {"status": "done"},
                                           "m4-full-p03": {"status": "pending", "out": None},
                                           "full-p03": {"run_dir": f"runs/{rid}", "continuation": rec,
                                                        "status": "done", "verified": True, "result": result}},
@@ -2038,14 +2027,14 @@ def test_a_done_continuation_keeps_its_record_through_resume_pull_and_adoption(f
     e = plan["items"]["full-p03"]
     assert (e["status"], e["steps"], e["continuation"]) == ("done", to_step, rec)
     assert plan["items"]["m4-full-p03"]["status"] == "fresh"
-    q = fq.make("p-cool", registry=cool.reg)
+    q = fq.make("full-t", registry=cool.reg)
     q.register()
     assert (q.item("full-p03")["status"], q.item("full-p03")["continuation"]) == ("done", rec)
     assert q.item("m4-full-p03")["status"] == "pending"
 
 
 def test_a_continuation_its_own_summary_records_is_done_only_when_done_and_verified(fq, cool):
-    """Box p-cool's own summary records P-0.3B's continuation: done only when that item is done AND verified (the
+    """Box full-t's own summary records P-0.3B's continuation: done only when that item is done AND verified (the
     run's export step_<to_step> and its complete summary.json counting the reset do not prove the continuation's
     upload: the source run left an export at the same step); else a lost continuation goes on from the newest Hub state
     holding its reset, and with none the continuation is applied again from full_step_<from_step> with the registry's
@@ -2058,7 +2047,7 @@ def test_a_continuation_its_own_summary_records_is_done_only_when_done_and_verif
     m4 = {"status": "done", "verified": True, "out": f"runs/m4-{rid}-r1", "result": {"m4": 0.1}}
 
     def own(**item):
-        cool.summary_of(cool.runs, "p-cool", {"stores-ctc": {"status": "done"}, "m4-full-p03": dict(m4),
+        cool.summary_of(cool.runs, "full-t", {"stores-ctc": {"status": "done"}, "m4-full-p03": dict(m4),
                                               "full-p03": dict({"run_dir": f"runs/{rid}", "continuation": rec},
                                                                **item)}, status="running")
 
@@ -2093,7 +2082,7 @@ def test_a_continuation_its_own_summary_records_is_done_only_when_done_and_verif
     assert (e["status"], e["state"], e["reset"], e["sets"], e["continuation"]) == (
         "resume", "full_step_18", False, [], rec)
     # the summary records the item as another run, or its continuation with other sets: refused
-    cool.summary_of(cool.runs, "p-cool", {"full-p03": {"status": "running", "run_dir": f"runs/{RID}"}})
+    cool.summary_of(cool.runs, "full-t", {"full-p03": {"status": "running", "run_dir": f"runs/{RID}"}})
     with pytest.raises(F.ResumeRefused, match="one item continues one run"):
         cool.pull()
     own(status="running", continuation=dict(rec, sets=["schedule.resume_reset=true", "schedule.epochs=1"]))
@@ -2111,8 +2100,8 @@ def test_the_env_may_not_reset_or_set_a_continued_run(fq, cool, how):
     kw = dict(reset=[rid]) if how == "reset" else dict(sets={rid: ["schedule.epochs=3"]})
     with pytest.raises(F.ResumeRefused, match="the registry carries their reset and sets"):
         cool.pull(**kw)
-    cool.summary_of(cool.runs, "p-cool", {"full-p01": {"status": "running", "run_dir": f"runs/{rid}"}})
-    with pytest.raises(F.ResumeRefused, match=r"continued by box p-cool's registry items \['full-p01'\]"):
+    cool.summary_of(cool.runs, "full-t", {"full-p01": {"status": "running", "run_dir": f"runs/{rid}"}})
+    with pytest.raises(F.ResumeRefused, match=r"continued by box full-t's registry items \['full-p01'\]"):
         cool.pull(**kw)
 
 
@@ -2123,24 +2112,24 @@ def test_a_box_without_continuations_still_needs_its_summary(fq, cool):
 
 
 def test_a_continuation_box_never_trains_a_run_from_step_0(fq, cool):
-    """The never-fresh guards: register() refuses a fresh queue of box p-cool without a resume_plan.json; a continues
+    """The never-fresh guards: register() refuses a fresh queue of box full-t without a resume_plan.json; a continues
     item without a run dir holding a full state fails before its start (_prepare_train); resume_point raises instead
     of setting the run dir aside or starting fresh."""
     with pytest.raises(Q.QueueError, match="always a resume"):
-        fq.make("p-cool", registry=cool.reg).register()
+        fq.make("full-t", registry=cool.reg).register()
     with pytest.raises(Q.QueueError, match="always a resume"):
-        fq.make("p-cool", registry=cool.reg).run()
+        fq.make("full-t", registry=cool.reg).run()
     assert (fq.state / "queue.json").is_file()  # run() saved it (kill_orphans) before register refused
     with pytest.raises(Q.QueueError, match="has adopted no"):  # so a restart refuses too (and a plan written now is
-        fq.make("p-cool", registry=cool.reg).run()  # never adopted by that queue.json: the box needs a new host)
+        fq.make("full-t", registry=cool.reg).run()  # never adopted by that queue.json: the box needs a new host)
     assert fq.records() == []
     shutil.rmtree(fq.state)
     # a plan whose continues items are fresh, or resumed in a run dir with no full state: failed before any start
     rid = COOL_RUNS["full-p03"][1]
     (fq.root / "runs" / rid / "metrics").mkdir(parents=True)
     write_plan(fq, {"stores-ctc": {"status": "fresh"}, "full-p03": {"status": "resume", "run_dir": f"runs/{rid}"},
-                    "full-p01": {"status": "fresh"}, "full-p005": {"status": "fresh"}}, box="p-cool")
-    assert fq.make("p-cool", registry=cool.reg).run() == F.EXIT_STOP
+                    "full-p01": {"status": "fresh"}, "full-p005": {"status": "fresh"}}, box="full-t")
+    assert fq.make("full-t", registry=cool.reg).run() == F.EXIT_STOP
     assert [x["mode"] for x in fq.records()] == ["stores"]
     st = fq.st()
     for name in COOL_RUNS:
@@ -2149,9 +2138,9 @@ def test_a_continuation_box_never_trains_a_run_from_step_0(fq, cool):
     assert (fq.root / "runs" / rid).is_dir()  # kept as it is
     # resume_point: a continues item is never started fresh, whatever its state
     fq.reset()
-    write_plan(fq, {"full-p03": {"status": "resume", "run_dir": f"runs/{rid}"}}, box="p-cool")
+    write_plan(fq, {"full-p03": {"status": "resume", "run_dir": f"runs/{rid}"}}, box="full-t")
     (fq.root / "runs" / rid / "checkpoints").mkdir(parents=True)
-    q = fq.make("p-cool", registry=cool.reg)
+    q = fq.make("full-t", registry=cool.reg)
     q.register()
     with pytest.raises(Q.QueueError, match="holds no full state: a continuation never starts fresh"):
         q.resume_point("full-p03")
@@ -2195,7 +2184,7 @@ def test_resume_pull_cli_takes_a_continuation_box_without_its_summary(fq, cool, 
     apis = {"u/runs": FakeApi(cool.runs, "r")}
     real = F.Hub
     monkeypatch.setattr(F, "Hub", lambda repo, repo_type="model", api=None: real(repo, api=apis[repo]))
-    argv = ["resume-pull", "--box", "p-cool", "--root", str(fq.root)]
+    argv = ["resume-pull", "--box", "full-t", "--root", str(fq.root)]
     assert F.main(argv) == F.EXIT_REFUSED  # no source summaries
     cool.sources()
     cool.runs_up()
@@ -2216,7 +2205,7 @@ def _cool_fake_py(TB) -> str:
 
 
 @pytest.mark.parametrize("env,asked,pulled", [
-    (dict(FAKE_CONT="1"), True, True),  # box p-cool: always a resume, KITSUNE_RESUME or not
+    (dict(FAKE_CONT="1"), True, True),  # a continuation box: always a resume, KITSUNE_RESUME or not
     (dict(FAKE_CONT="0"), True, False),  # a box without continuations: no resume_pull
     (dict(KITSUNE_RESUME="1", FAKE_CONT="0"), False, True),  # --resume: not even asked
     (dict(FAKE_CONT_RC="2"), True, False),  # a registry that cannot answer: no resume (check_students refuses it)
@@ -2225,12 +2214,12 @@ def test_bootstrap_runs_resume_pull_for_a_box_with_continuations(tmp_path, monke
     import test_bootstrap_extent as TB
 
     monkeypatch.setattr(TB, "FAKE_PY", _cool_fake_py(TB))
-    r, calls, _ = TB.run_bootstrap(tmp_path, KITSUNE_BOX="p-cool", **env)
+    r, calls, _ = TB.run_bootstrap(tmp_path, KITSUNE_BOX="full-t", **env)
     assert r.returncode == 0, r.stdout + r.stderr
     kdir = (tmp_path / "box").as_posix()
-    ask = f"-m kitsune.fullrun has-continues --box p-cool --root {kdir}"
-    pull = f"-m kitsune.full_queue resume-pull --box p-cool --root {kdir}"
+    ask = f"-m kitsune.fullrun has-continues --box full-t --root {kdir}"
+    pull = f"-m kitsune.full_queue resume-pull --box full-t --root {kdir}"
     assert (ask in calls, pull in calls) == (asked, pulled), calls
     if asked and pulled:
-        assert calls.index(ask) < calls.index(pull) < calls.index(f"-m kitsune.fullrun check-students --box p-cool "
+        assert calls.index(ask) < calls.index(pull) < calls.index(f"-m kitsune.fullrun check-students --box full-t "
                                                                   f"--root {kdir}")
