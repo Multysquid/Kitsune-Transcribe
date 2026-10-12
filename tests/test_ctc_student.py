@@ -158,8 +158,6 @@ def test_pruned_build_tensors_and_count(tmp_path):
     assert c["total"] == c["closed_form"] == CS.closed_form_ctc_params(3, 40, d=32, channels=8)
     assert st.config.encoder_config.num_hidden_layers == 3 and st.config.encoder_config.intermediate_size == 40
     assert all(p.dtype == torch.float32 for p in st.parameters()) and not st.training
-    kept = CS.kept_neurons(imp, layers, 40, 64)
-    assert sorted(kept) == [f"{l}.{n}" for l in layers for n in S.FFN_NAMES]
 
 
 def test_build_rejects_bad_requests(tmp_path):
@@ -275,7 +273,7 @@ def test_save_load_roundtrip(tmp_path):
     with torch.no_grad():
         ids = back.generate(input_features=inp["input_features"], attention_mask=inp["attention_mask"])
         lp, n = CS.ctc_log_probs(back, f, CS.lengths_to_mask(fl, f.shape[1]))
-    ours = CS.decode_batch(proc.tokenizer, CS.greedy_ctc_ids(lp, n))
+    ours = [CS.decode_ids(proc.tokenizer, x) for x in CS.greedy_ctc_ids(lp, n)]
     assert proc.batch_decode(ids, skip_special_tokens=True) == ours
 
 

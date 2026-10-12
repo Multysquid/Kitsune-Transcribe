@@ -9,10 +9,11 @@ Models (WHISPER_MODELS; the system name is the key, the tables' and the speed re
                           Galgame-neutral rows, so its M4 is biased low by construction; the report prints M4-all)
   whisper-small           openai/whisper-small @ 973afd24 (pinned from the Hub when this module was written; 80 mel
                           bins: the loader takes the feature extractor of each model's own snapshot, never 128)
-Every Hub read is pinned, like the datasets and the teachers: a repo that moves between smoke B and box 2 would score a
-different model under the same name. fetch downloads only ALLOW_PATTERNS (the single fp16/bf16 model.safetensors and
-the processor files): the large-v3 repo also holds fp32 shards, flax and .bin copies, several GB nobody reads. It
-retries a transient Hub error with the box's back-off (vast/finish.py hub_retry): it is the item's only download.
+Every Hub read is pinned, like the datasets and the teachers: a repo that moves between smoke B and a full box would
+score a different model under the same name. fetch downloads only ALLOW_PATTERNS (the single fp16/bf16
+model.safetensors and the processor files): the large-v3 repo also holds fp32 shards, flax and .bin copies, several GB
+nobody reads. It retries a transient Hub error with the box's back-off (vast/finish.py hub_retry): it is the item's
+only download.
 
 The decode is the AED students' (kitsune.evaluate.greedy_generate), transposed to Whisper's generate:
   prompt     SOT, <|ja|>, <|transcribe|>, <|notimestamps|> (PROMPT_LEN 4): language forced (no language-ID errors on
@@ -34,8 +35,8 @@ The decode is the AED students' (kitsune.evaluate.greedy_generate), transposed t
              decision C15, --no-fp32-head in the tools turns it off)
   features   WhisperFeatureExtractor on the device: every clip padded to 30 s (the encoder refuses any other length and
              ignores its attention mask, so a batch's make-up changes only bf16 numerics)
-  batches    whisper_batches: the eval's own duration-sorted batches (kitsune.trainset.eval_batches, batch_s padded
-             seconds), each cut into consecutive pieces of at most max_rows rows. Every clip costs a 30 s encoder
+  batches    the eval's own duration-sorted batches (kitsune.trainset.eval_batches, batch_s padded seconds), each cut
+             into consecutive pieces of at most max_rows rows (split_rows). Every clip costs a 30 s encoder
              window, so 400 s of short clips (a 273-row JSUT batch) would not fit: the row cap (64 for large-v3, 128 for
              the others) keeps the batches the students' while bounding the memory
 
@@ -84,7 +85,7 @@ class WhisperSpec:
     system: str  # the system name in the tables, whisper.json and the speed records (= the WHISPER_MODELS key)
     repo: str
     revision: str  # a 40-hex commit: every read is pinned
-    max_rows: int  # the row cap of a CER / speed batch (whisper_batches, speed_probe's batched pass)
+    max_rows: int  # the row cap of a CER / speed batch (split_rows, speed_probe's batched pass)
     licence: str  # the model card's licence metadata
     display: str
 
@@ -372,18 +373,9 @@ def model_record(wm: WhisperModel, fp32_head: bool) -> dict:
 # ------------------------------------------------------------------------------------------------ batching
 
 
-def whisper_batches(utts, batch_s: float, max_rows: int | None, indices: Sequence[int] | None = None
-                    ) -> list[list[int]]:
-    """The eval's own batches (kitsune.trainset.eval_batches: duration-sorted, at most batch_s padded seconds) over
-    `indices`, each cut into consecutive pieces of at most max_rows rows (None or 0: uncut). A 273-row batch at cap 64
-    becomes 64, 64, 64, 64, 17 in the same order."""
-    from kitsune.trainset import eval_batches
-
-    return split_rows(eval_batches(utts, batch_s, indices), max_rows)
-
-
 def split_rows(batches: list[list[int]], max_rows: int | None) -> list[list[int]]:
-    """Each batch cut into consecutive pieces of at most max_rows rows (None or 0: as they are)."""
+    """Each batch cut into consecutive pieces of at most max_rows rows (None or 0: as they are), in the same order: a
+    273-row eval batch at cap 64 becomes 64, 64, 64, 64, 17."""
     if not max_rows:
         return [list(b) for b in batches]
     m = int(max_rows)

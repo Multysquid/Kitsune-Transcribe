@@ -75,6 +75,11 @@ def rand_importance(layers, width, seed=0) -> dict:
     return {(l, n): torch.rand(width, generator=g) for l in layers for n in S.FFN_NAMES}
 
 
+def b20_spec() -> S.StudentSpec:
+    """B20x2560 / dec4, the first run's T-0.6B shape (S.EXPECTED_DEFAULT_PARAMS)."""
+    return S.StudentSpec(enc_layers=S.evenly_spaced(20, S.TEACHER_ENC_LAYERS), ffn_dim=2560, dec_layers=[0, 2, 5, 7])
+
+
 def expected_tensor(teacher_sd: dict, key: str, spec: S.StudentSpec, keep: dict) -> torch.Tensor:
     """What the student tensor `key` must equal, spelled out case by case."""
     parts = key.split(".")
@@ -124,8 +129,8 @@ def test_evenly_spaced():
         S.evenly_spaced(0, 48)
 
 
-def test_default_spec_and_real_param_count_on_meta():
-    spec = S.default_spec()
+def test_b20_spec_and_real_param_count_on_meta():
+    spec = b20_spec()
     assert spec.enc_layers == S.evenly_spaced(20, 48) and spec.ffn_dim == 2560
     assert spec.dec_layers == [0, 2, 5, 7] and spec.tie_head
     cfg = S.student_config(CohereAsrConfig(), spec)  # CohereAsrConfig() defaults are the teacher's dims
@@ -955,7 +960,7 @@ def test_build_default_student_from_real_teacher():
     teacher = CohereAsrForConditionalGeneration.from_pretrained(S.TEACHER_ID, dtype=torch.bfloat16,
                                                                 attn_implementation="sdpa")
     t_load = time.time() - t0
-    spec = S.default_spec()
+    spec = b20_spec()
     imp = rand_importance(spec.enc_layers, 5120, seed=7)
     student = S.build_student(teacher, spec, imp)  # strict=True inside: raises on any missing/unexpected key
     t_build = time.time() - t0 - t_load

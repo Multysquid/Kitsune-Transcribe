@@ -19,8 +19,8 @@ from fixtures_ctc import (make_fake_parakeet_out, synthetic_frame_targets, synth
 
 from kitsune import ctc_student as CS  # noqa: E402
 from kitsune import parakeet_targets as pt  # noqa: E402
-from kitsune.ctc_targets import (FrameTargets, collate_frame_targets, frame_targets, infeasible,  # noqa: E402
-                                 load_ctc_targets, targets_from_log_probs)
+from kitsune.ctc_targets import (FrameTargets, collate_frame_targets, frame_targets, load_ctc_targets,  # noqa: E402
+                                 targets_from_log_probs)
 from kitsune.parakeet import ctc_collapse, ctc_targets  # noqa: E402
 
 BLANK = CS.CTC_BLANK
@@ -158,11 +158,6 @@ def test_frame_targets_validates_lengths():
     ft = frame_targets(0, [], [], np.zeros((0, 8)), np.zeros((0, 8)))
     assert ft.n_frames == 0 and ft.ctc_ids.tolist() == [] and ft.k == 8
     assert collate_frame_targets([ft, ft])["frame_mask"].shape == (2, 0)
-
-
-def test_infeasible():
-    assert not infeasible([1, 2, 3], 3) and infeasible([1, 1], 2) and not infeasible([1, 1], 3)
-    assert not infeasible([], 0)
 
 
 # ------------------------------------------------------------------------------------------------ real shards

@@ -832,25 +832,9 @@ def test_05_refuses_frames_that_do_not_align(ctc_env, tmp_path, monkeypatch):
     assert all((out2 / f"greedy_{e}.parquet").exists() for e in EVAL_SETS)  # the sets were done first
 
 
-def test_later_keys_are_set_aside_only_while_the_trainer_lacks_them():
-    """A study config's family / loss.w_ctc / pull_parakeet / selection_recipe.study pass the trainer's merge before
-    04_distill.DEFAULTS has them, and come back with their values; a key DEFAULTS knows is merged as usual."""
-    m05 = load_script("05_evaluate")
-
-    class FakeD:
-        DEFAULTS = {"loss": {"w_kl": 1.0}, "selection_recipe": {"agree_max": 0.5}, "family": "aed"}
-
-    raw = {"family": "ctc", "loss": {"w_kl": 1.0, "w_ctc": 0.5}, "selection_recipe": {"study": {"x": 1}},
-           "pull_parakeet": True}
-    later = m05.set_aside_later_keys(FakeD, raw)
-    assert later == {"loss.w_ctc": 0.5, "pull_parakeet": True, "selection_recipe.study": {"x": 1}}
-    assert raw == {"family": "ctc", "loss": {"w_kl": 1.0}, "selection_recipe": {}}
-
-
 # ------------------------------------------------------------------------------------------------ real data
 
 LABELS = Path(os.environ.get("KITSUNE_LABELS_ROOT") or "D:/kitsune-labels/full")
-FIRST_RUN = REAL / "cache" / "hf_runs" / "runs" / "viability-b20x2560-20260925T071746Z"
 
 
 def test_the_label_boxs_stored_hyps_score_to_their_stored_cers_and_the_measured_baselines():
@@ -918,30 +902,6 @@ def test_the_real_parakeet_ctc_teacher_through_ctc_eval(tmp_path):
     a = ev.summarise_ctc_tf(res["tf"])[0]["all"]
     assert a["top1"] > 0.99 and a["kl_per_frame"] < 0.05 and abs(a["argmax_blank"] - a["teacher_blank"]) < 0.01
     assert 0.5 < a["teacher_blank"] < 0.8
-
-
-def test_the_first_a100_runs_per_set_cer_from_its_eval_parquets():
-    """The first A100 run's final eval (its downloaded run dir, read only): the tables made from its
-    greedy_<set>.parquet give its summary.json's per-set corpus CER to the edit (cer_ref_corpus, ref_edits, ref_chars)
-    and the teacher's on the same rows, and load in the study report's corpus (manifest = its own ids)."""
-    step = FIRST_RUN / "evals" / "step_9774"
-    need_real(step / "summary.json", *(step / f"greedy_{s}.parquet" for s in ev.GATE_SETS))
-    summ = load(step / "summary.json")["greedy_full"]["sets"]
-    tables, teach, man = {}, {}, {"sets": {}}
-    for s in summ:
-        g = pd.read_parquet(step / f"greedy_{s}.parquet")
-        tables[s] = ev.utterance_table(g["id"], s, g["ref"], g["hyp"], g["truncated"])
-        teach[s] = ev.utterance_table(g["id"], s, g["ref"], g["teacher_hyp"], g["teacher_truncated"])
-        c, d = ev.table_cer(tables[s]), summ[s]
-        assert (c["edits"], c["ref_chars"]) == (d["ref_edits"], d["ref_chars"]) and c["cer"] == d["cer_ref_corpus"]
-        assert ev.table_cer(teach[s])["cer"] == d["teacher_cer_ref_corpus"]
-        assert int(tables[s]["truncated"].sum()) == d["n_truncated"]
-        man["sets"][s] = {"ids": g["id"].tolist(), "ids_sha256": ids_sha256(g["id"].tolist())}
-    assert round(100 * summ["eval_jsut"]["cer_ref_corpus"], 2) == 12.65
-    corpus = ss.build_corpus({"anchor-b20": pd.concat(tables.values(), ignore_index=True),
-                              "cohere": pd.concat(teach.values(), ignore_index=True)}, man)
-    pooled = ss.metric_values(ss.point_sums(corpus), "gate_pooled")
-    assert float(pooled[corpus.index("anchor-b20")]) == pytest.approx(0.1215, abs=5e-5)  # the run's val_cer 12.15 %
 
 
 def test_05_from_evals_without_a_teacher_column(ctc_env, ctc_run, tmp_path):

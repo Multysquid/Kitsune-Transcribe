@@ -93,10 +93,6 @@ def patch_relpos_once_per_batch(model: nn.Module) -> Callable[[], None]:
     return unpatch
 
 
-def is_relpos_patched(model: nn.Module) -> bool:
-    return getattr(model, _RELPOS_ATTR, None) is not None
-
-
 def _batchnorms(model: nn.Module) -> list[nn.modules.batchnorm._BatchNorm]:
     return [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
 

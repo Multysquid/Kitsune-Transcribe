@@ -1,4 +1,5 @@
-"""Shared generation utilities for the teacher/second-opinion passes."""
+"""The repetition stop of every greedy decode: the teacher pass, the evaluator (kitsune.evaluate.greedy_generate), the
+Whisper yardsticks, the speed probe and the released models' inference (their cards import RepetitionStop from here)."""
 import torch
 from transformers.generation import StoppingCriteria
 

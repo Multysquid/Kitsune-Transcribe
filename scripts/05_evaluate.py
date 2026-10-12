@@ -34,9 +34,7 @@ Output (--out; the layout of runs/<run_id>/evals/step_<N>/):
                   final = the checkpoint is the run's end one. It covers every set in --out
   verdict.json    when the three gate sets are in --out and so is the train probe, if the config has one (eval.probe:
                   pass --probe): gate_verdict of kitsune.evaluate.verdict, the trends read from the run's history
-                  before this step (--history: default the summary.json of the run the checkpoint sits in; one written
-                  before the trainer recorded the LR phase and the complete sets' numbers gets them from the run's
-                  events.jsonl and evals/, backfill_history) and this
+                  before this step (--history: default the summary.json of the run the checkpoint sits in) and this
                   eval. The trainer's record of this eval holds the probe's KL, which the probe-KL and gap trends read,
                   so without the probe the verdict would not be the trainer's: none is written (a verdict_skipped
                   event says why) and an older one goes
@@ -72,7 +70,8 @@ does not fit from shared system memory, several times slower, instead of failing
 fraction of the card, on any OS. An out-of-memory error stops with a pointer to --batch-s (a smaller one needs a new
 --out; its batches are no longer the trainer's).
 
-The size study (study/STUDY.md 4.1-4.3; CONTRACT.md 1, 5):
+The M4 readouts on the frozen eval manifest (every full run's readout items, the quantised readouts and smoke-b;
+the protocol is the size study's, study/PREREG.json):
   families  the config's `family` (default "aed"; 04_distill reads it too) picks the student's path. aed: everything
             above, unchanged (the first run's numbers reproduce). ctc: a Parakeet CTC student (a ParakeetForCTC dir,
             kitsune.ctc_student.load_ctc_student) with its own features (ctc_features: Parakeet's 80-mel LogMel, no
@@ -86,12 +85,12 @@ The size study (study/STUDY.md 4.1-4.3; CONTRACT.md 1, 5):
             (decision 15: any eval row; the probe's train rows above 0.1 %). kitsune.evaluate.ctc_eval reads a frame
             store's batches too, as the trainer does. The CTC student's teacher is Parakeet's stored CTC path
             (parakeet_out ctc_hyp): the greedy tables' teacher_hyp, the baselines (kitsune.evaluate.parakeet_baselines,
-            checked against PARAKEET_CTC_CER_PREREG from study/PREREG.json once it is filled, not while it is pending)
+            checked against PARAKEET_CTC_CER_PREREG from study/PREREG.json)
             and the verdict's ratios (verdict(family="ctc")). The student is scored against the eval store's
             reference, which must equal parakeet_out's
   manifest  with --manifest (default: study_manifest.json next to the config's selection, when it exists; "none":
             none) the eval is checked against the study's frozen eval manifest (kitsune.study_stats.parse_manifest:
-            every set's ids hash to its sha256; against study/PREREG.json's manifest block once filled): the config's
+            every set's ids hash to its sha256; against study/PREREG.json's manifest block): the config's
             eval_sets hold every manifest set (unless --sets names a part), and each evaluated set's rows in the eval
             store must be exactly the manifest's ids, else the eval refuses before any model is loaded. A study eval
             without a manifest refuses too (study_intent: --tables / --system / --anchor, a ctc student, a study
@@ -116,7 +115,7 @@ The size study (study/STUDY.md 4.1-4.3; CONTRACT.md 1, 5):
             hyp), parakeet-ctc (parakeet_out ctc_hyp), parakeet-tdt (parakeet_out hyp) - after checking that both roots
             hold every manifest row with the same reference, that the stored per-utterance cer / ctc_cer are this
             scorer's (counted), and the baselines (Cohere's D32a numbers on the full gate sets as the trainer checks
-            them; every teacher and stratum against PREREG.json's baselines once filled, 0.05 pp): a drift refuses,
+            them; every teacher and stratum against PREREG.json's baselines, 0.05 pp): a drift refuses,
             unless eval.check_baselines is false. Writes tables/<teacher>/<set>.parquet and teachers.json
   --from-evals DIR  no model: the tables of a system from an eval dir that already holds its greedy_<set>.parquet
             (the trainer's runs/<run_id>/evals/step_<N>/, a 05 --out, or a tools/whisper_eval.py --out), checked
@@ -125,8 +124,6 @@ The size study (study/STUDY.md 4.1-4.3; CONTRACT.md 1, 5):
             with a whisper.json (kitsune.whisper.WHISPER_META) is a Whisper system's whatever --config says: family
             "whisper", no teacher (teacher null, no teacher_cer / *_teacher / *_ratio), and study.json carries its model
             and decode blocks. A teacher table is built only when every set's parquet has the teacher_hyp column
-Wave-2 config keys that another package adds to 04_distill.DEFAULTS (family, loss.w_ctc, pull_parakeet,
-selection_recipe.study) are accepted here before that package lands: they are set aside for the merge (LATER_KEYS).
 A generated study config whose schedule.max_steps is still null (its box fills it) is validated with a stand-in; the
 eval never reads it.
 
@@ -208,10 +205,6 @@ from kitsune.store import fsync_path  # noqa: E402
 # config keys holding paths, resolved against --root when relative (cache_dir is replaced by --cache-dir); a null one
 # (parakeet_root outside the study) stays null
 PATH_KEYS = ("student", "data_root", "teacher_root", "second_root", "selection", "runs_root", "parakeet_root")
-# the size study's config keys (wave 2) that 04_distill.DEFAULTS gains in another package (family and loss.w_ctc: the
-# CTC trainer; pull_parakeet and selection_recipe.study: the box path), with their defaults. Until DEFAULTS has one,
-# load_cfg sets it aside so the trainer's merge (unknown keys are an error) accepts a study config
-LATER_KEYS = {"family": "aed", "loss.w_ctc": 0.8, "pull_parakeet": False, "selection_recipe.study": None}
 ANCHOR = "anchor-b20"  # the first run's 0.6B re-scored on the manifest (decision 29; kitsune.study_stats.ANCHOR)
 MANIFEST_FILE = "study_manifest.json"  # next to the study selection (kitsune.prereg.MANIFEST_FILE)
 PREREG_JSON = ROOT / "study" / "PREREG.json"
@@ -488,49 +481,19 @@ def make_guard(device: torch.device, args, log) -> ThermalGuard | None:
 # ------------------------------------------------------------------------------------------------------ config
 
 
-def _has_key(d: dict, dotted: str) -> bool:
-    for part in dotted.split("."):
-        if not isinstance(d, dict) or part not in d:
-            return False
-        d = d[part]
-    return True
-
-
-def set_aside_later_keys(D, raw: dict) -> dict:
-    """LATER_KEYS that 04_distill.DEFAULTS does not know yet, popped from `raw` (a copy of the file's config) so the
-    trainer's merge accepts it: {dotted key: the file's value}. A key DEFAULTS knows stays for the merge."""
-    later = {}
-    for key in LATER_KEYS:
-        if _has_key(D.DEFAULTS, key) or not _has_key(raw, key):
-            continue
-        *path, last = key.split(".")
-        node = raw
-        for part in path:
-            node[part] = dict(node[part])  # never modify the caller's nested dicts
-            node = node[part]
-        later[key] = node.pop(last)
-    return later
-
-
 def family_of(cfg: dict) -> str:
     return str(cfg.get("family") or "aed")
 
 
-def w_ctc(cfg: dict) -> float:
-    return float(cfg["loss"].get("w_ctc", LATER_KEYS["loss.w_ctc"]))
-
-
 def load_cfg(D, args) -> tuple[dict, Path]:
-    """The trainer's config (DEFAULTS merged with the file, --set on top, validated as the trainer does, the LATER_KEYS
-    set aside for the merge and put back), relative paths resolved against --root. Returns (cfg, the config file)."""
+    """The trainer's config (DEFAULTS merged with the file, --set on top, validated as the trainer does), relative paths
+    resolved against --root. Returns (cfg, the config file)."""
     p = Path(args.config)
     if not p.is_absolute():  # as 04_distill.load_config: the working directory first, then this repo
         p = Path.cwd() / p if (Path.cwd() / p).exists() else ROOT / p
     raw = _read_json(p)
     if isinstance(raw.get("config"), dict) and "eval_sets" in raw["config"]:
         raw = raw["config"]  # a run's config.json: {run_id, argv, config, student_meta, ...}
-    raw = dict(raw)
-    later = set_aside_later_keys(D, raw)
     cfg = D._merge(D.DEFAULTS, raw)
     for s in args.set:
         D.apply_set(cfg, s)
@@ -548,12 +511,6 @@ def load_cfg(D, args) -> tuple[dict, Path]:
     finally:
         if unset:
             sch["max_steps"] = None
-    for key, default in LATER_KEYS.items():  # back in, with their values (the file's, or the default)
-        *path, last = key.split(".")
-        node = cfg
-        for part in path:
-            node = node.setdefault(part, {})
-        node.setdefault(last, later.get(key, default))
     if family_of(cfg) not in ("aed", "ctc"):
         raise SystemExit(f"family must be 'aed' or 'ctc', got {cfg['family']!r}")
     root = Path(args.root).resolve()
@@ -635,36 +592,6 @@ def load_history(spec: str, ckpt: Path, trained: dict) -> tuple[list[dict], str 
     p = Path(spec)
     p = p / "summary.json" if p.is_dir() else p
     return list(_read_json(p).get("history") or []), str(p)
-
-
-def backfill_history(hist: list[dict], summary_path: str | None) -> list[dict]:
-    """A history written before the trainer recorded what verdict v2 reads, completed from the run's own files next to
-    its summary.json, with the numbers the trainer now records (kitsune.evaluate.eval_record): lr_phase from the
-    `lr_phase` events of events.jsonl (kitsune.evaluate.lr_phase_at) and, for an eval that decoded the complete sets,
-    greedy_full from its evals/step_<N>/summary.json. A record that has them keeps its own; without the files the
-    records stay as they are (v2 then leaves them out of the CER trend, or reads their subset numbers, and says so).
-    Verdict v1 reads neither."""
-    if not summary_path:
-        return list(hist)
-    from kitsune import evaluate as ev
-
-    run = Path(summary_path).parent
-    phases = []
-    if (run / "events.jsonl").is_file():
-        with open(run / "events.jsonl", encoding="utf-8") as fh:
-            phases = [e for e in (json.loads(x) for x in fh if x.strip()) if e.get("kind") == "lr_phase"]
-    out = []
-    for r in hist:
-        r = dict(r)
-        if "lr_phase" not in r and (ph := ev.lr_phase_at(int(r["step"]), phases)) is not None:
-            r["lr_phase"] = ph
-        s = run / "evals" / f"step_{int(r['step'])}" / "summary.json"
-        if "greedy_full" not in r and s.is_file():
-            full = (_load_json(s) or {}).get("greedy_full")
-            if full and full.get("sets"):
-                r["greedy_full"] = ev.eval_record(int(r["step"]), 0.0, greedy_full=full)["greedy_full"]
-        out.append(r)
-    return out
 
 
 # ------------------------------------------------------------------------------------------------ the eval pass
@@ -1605,8 +1532,8 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
     epoch = float(trained.get("epoch") or 0.0) if D.epoch_mode(cfg) else None
     combined = {}
     if ctx.family == "ctc":  # the CTC objective: (w_kl KL + w_ctc CTC) / target tokens over the gate sets
-        if c := ev.combined_loss(tf_sum, cfg["loss"]["w_kl"], w_ctc(cfg)):
-            combined["val_full"] = dict(c, scope="complete", family="ctc", w_ctc=w_ctc(cfg))
+        if c := ev.combined_loss(tf_sum, cfg["loss"]["w_kl"], cfg["loss"]["w_ctc"]):
+            combined["val_full"] = dict(c, scope="complete", family="ctc", w_ctc=float(cfg["loss"]["w_ctc"]))
     elif c := D.combined_val_full(cfg, tf_sum):
         combined["val_full"] = c
     summary = D.eval_summary(step, train_s, trained.get("reason") == "end", True, tf_sum, probe_sum, gr_sum, full_sum,
@@ -1634,12 +1561,9 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
                          if no_probe else {}))
         return summary
     hist, src = load_history(ctx.args.history, ckpt, trained)
-    hist = backfill_history(hist, src)
-    # this eval's record as the trainer writes it: the LR phase of the checkpoint's last step (its trained block, or
-    # the run's lr_phase events for a checkpoint saved before it was recorded) and, under verdict v2, the epoch
+    # this eval's record as the trainer writes it: the LR phase of the checkpoint's last step (its trained block) and,
+    # under verdict v2, the epoch
     lr_phase = trained.get("lr_phase")
-    if lr_phase is None and src:
-        lr_phase = next((r.get("lr_phase") for r in backfill_history([dict(step=step)], src)), None)
     rec_epoch = epoch if epoch is not None or not D.verdict_options(cfg) else trained.get("epoch")
     rec = D.eval_history_record(step, train_s, tf_sum, gr_sum, probe_sum, pg_sum, summary["headline"], epoch=rec_epoch,
                                 full_sum=full_sum, lr_phase=lr_phase)

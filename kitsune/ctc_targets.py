@@ -121,14 +121,5 @@ def collate_frame_targets(targets: list[FrameTargets], t_max: int | None = None)
     )
 
 
-def infeasible(ids, n_frames: int) -> bool:
-    """CTC cannot align U tokens with r adjacent repeats in fewer than U + r frames. The greedy path of the stored
-    frames is feasible by construction (it came from those frames); another target sequence (a TDT hyp, a reference)
-    may not be."""
-    ids = np.asarray(ids)
-    repeats = int(np.sum(ids[1:] == ids[:-1])) if len(ids) > 1 else 0
-    return len(ids) + repeats > int(n_frames)
-
-
-__all__ = ["BLANK", "FrameTargets", "collate_frame_targets", "frame_targets", "infeasible", "load_ctc_targets",
+__all__ = ["BLANK", "FrameTargets", "collate_frame_targets", "frame_targets", "load_ctc_targets",
            "targets_from_log_probs"]

@@ -286,32 +286,6 @@ def summary_history(run: Path) -> list[dict]:
     return load(run / "summary.json")["history"]
 
 
-def test_backfill_history_completes_an_older_runs_records(tmp_path):
-    """A history written before the trainer recorded the LR phase and the complete sets' numbers gets them from the
-    run's own files: the lr_phase events of events.jsonl, and each complete eval's evals/step_<N>/summary.json
-    greedy_full (never a subset eval's). What a record has, it keeps; without the files nothing changes."""
-    m05 = load_script("05_evaluate")
-    run = tmp_path / "run"
-    lines = [dict(kind="lr_phase", at_step=1, phase="warmup"), dict(kind="eval", at_step=4),
-             dict(kind="lr_phase", at_step=3, phase="stable"), dict(kind="lr_phase", at_step=8, phase="cooldown")]
-    (run / "evals").mkdir(parents=True)
-    (run / "events.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
-    full = dict(sets={"eval_jsut": dict(cer_ref_corpus=0.1, teacher_cer_ref_corpus=0.08, trunc_rate=0.0, n=9,
-                                        ref_edits=3, ref_chars=30)})
-    for step, gf in ((0, None), (5, full), (6, None), (9, full)):
-        (run / "evals" / f"step_{step}").mkdir()
-        (run / "evals" / f"step_{step}" / "summary.json").write_text(json.dumps(dict(greedy_full=gf)),
-                                                                     encoding="utf-8")
-    hist = [dict(step=0), dict(step=5), dict(step=6), dict(step=9, lr_phase="own", greedy_full={"x": 1})]
-    got = m05.backfill_history(hist, str(run / "summary.json"))
-    assert [r.get("lr_phase") for r in got] == [None, "stable", "stable", "own"]
-    brief = dict(eval_jsut=dict(cer_ref_corpus=0.1, teacher_cer_ref_corpus=0.08, trunc_rate=0.0, n=9))
-    assert [r.get("greedy_full") for r in got] == [None, brief, None, {"x": 1}]
-    assert hist[1] == dict(step=5)  # the input records are not changed
-    assert m05.backfill_history(hist, None) == hist
-    assert m05.backfill_history(hist, str(tmp_path / "elsewhere" / "summary.json")) == hist
-
-
 def fault_at(fn, n: int):
     """fn, raising a GPU fault on its n-th call."""
     calls = []
@@ -747,7 +721,8 @@ def test_a_branch_checkpoint_gets_the_branchs_system_name():
 
 def test_a_generated_study_config_with_max_steps_unset_loads(env, tmp_path):
     """tools/make_study_configs.py leaves schedule.max_steps null for the box to fill: 05 validates such a config with
-    a stand-in and keeps it null (the eval never reads it); the wave-2 keys come back with their values."""
+    a stand-in and keeps it null (the eval never reads it); the file's pull_parakeet and DEFAULTS' family and
+    loss.w_ctc are in the merged config."""
     m05 = load_script("05_evaluate")
     cfg = load(env["relative"])
     cfg["schedule"] = dict(cfg["schedule"], max_steps=None)

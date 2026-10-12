@@ -55,6 +55,17 @@ def events(run: Path, kind: str | None = None) -> list[dict]:
     return [r for r in rows if kind is None or r["kind"] == kind]
 
 
+def phase_at(step: int, lr_phase_events: list[dict]) -> str | None:
+    """The LR phase of optimizer step `step` by the run's own `lr_phase` events (each names the phase that begins at
+    its at_step; the largest at_step <= step holds), None for step 0: what the history's lr_phase must equal."""
+    best = None
+    for e in lr_phase_events:
+        at = int(e["at_step"])
+        if at <= step and (best is None or at >= best[0]):
+            best = (at, str(e["phase"]))
+    return best[1] if best is not None and step > 0 else None
+
+
 def merged(base: dict, over: dict) -> dict:
     out = copy.deepcopy(base)
     for k, v in over.items():
@@ -813,7 +824,7 @@ def test_verdict_v2_changes_the_verdict_only(env, steps_runs):
         [{k: v for k, v in r.items() if k != "elapsed_s"} for r in pb["history"]]
     phases = events(run, "lr_phase")
     for r in pb["history"]:
-        assert r.get("lr_phase") == ev.lr_phase_at(r["step"], phases)
+        assert r.get("lr_phase") == phase_at(r["step"], phases)
         d = json.loads((run / "evals" / f"step_{r['step']}" / "summary.json").read_text(encoding="utf-8"))
         if d["complete"]:
             assert r["greedy_full"] == ev.eval_record(0, 0.0, greedy_full=d["greedy_full"])["greedy_full"]
@@ -1029,8 +1040,6 @@ def test_the_templates_schedule_on_the_tiny_corpus(env):
     complete eval at the ends of epochs 2, 4 and 6 (the end of epoch 8 is the final eval), the cooldown from 80 % of
     the steps; verdict v2 reads its CER trend on those 3 pre-cooldown evals, on the complete sets, and reports the
     cooldown gain from epoch 6 to the final eval."""
-    from kitsune import evaluate as ev
-
     m = load_script("04_distill")
     tpl = json.loads((ROOT / "configs" / "next_run_template.json").read_text(encoding="utf-8"))
     sch, e = tpl["schedule"], tpl["eval"]
@@ -1062,4 +1071,4 @@ def test_the_templates_schedule_on_the_tiny_corpus(env):
     assert [x["at_step"] for x in events(run, "lr_phase") if x["phase"] == "cooldown"] == [
         plan["first_cooldown_step"]]
     assert ends[6] < plan["first_cooldown_step"] <= ends[8]
-    assert ev.lr_phase_at(ends[6], events(run, "lr_phase")) == "stable"
+    assert phase_at(ends[6], events(run, "lr_phase")) == "stable"

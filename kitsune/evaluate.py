@@ -58,7 +58,7 @@ from transformers.generation import StoppingCriteriaList
 from kitsune.generation import RepetitionStop
 from kitsune.text import cer as utt_cer
 from kitsune.text import normalize_ja
-from kitsune.trainset import EOS, EVAL_SETS, PAD, PROMPT, AudioBatchDataset, eval_batches
+from kitsune.trainset import EOS, EVAL_SETS, PAD, PROMPT, AudioBatchDataset, dataset_for, eval_batches
 
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 GATE_SETS = tuple(EVAL_SETS)  # the D32a gate: JSUT / CV8 / Reazon-test; eval_emilia and galgame are monitor-only
@@ -585,14 +585,10 @@ FRAME_BATCH_KEYS = ("frame_mask", "dense_mask", "blank_lp", "topk_idx", "topk_lp
 
 
 def batch_dataset(store):
-    """The micro-batch dataset of a store as the trainer reads it: kitsune.trainset.dataset_for (the CTC trainer's: a
-    FrameBatchDataset for a frame store, its rows' stored Parakeet frame targets collated into every batch, else an
-    AudioBatchDataset) where kitsune.trainset has it, else an AudioBatchDataset (a token store: the only kind before
-    the CTC trainer's frame stores). ctc_eval reads either."""
-    from kitsune import trainset
-
-    make = getattr(trainset, "dataset_for", None)
-    return make(store) if make is not None else AudioBatchDataset(store)
+    """The micro-batch dataset of a store as the trainer reads it, kitsune.trainset.dataset_for: a FrameBatchDataset
+    for a frame store (the CTC trainer's; its rows' stored Parakeet frame targets collated into every batch), else an
+    AudioBatchDataset. ctc_eval reads either."""
+    return dataset_for(store)
 
 
 def _greedy_frame(recs: list[dict], store, teacher_rows: dict | None, decode) -> pd.DataFrame:
@@ -1054,20 +1050,6 @@ def eval_record(step: int, elapsed_s: float, tf: dict | None = None, greedy: dic
 LR_PHASES = ("warmup", "stable", "cooldown")
 
 
-def lr_phase_at(step: int, lr_phase_events: Iterable[dict]) -> str | None:
-    """The LR phase of optimizer step `step`, from the trainer's `lr_phase` events (each names the phase that begins at
-    its at_step): the phase of the event with the largest at_step <= step. A resume that replays steps logs the same
-    boundaries again, so the largest at_step, not the last event in the file, is the one that holds. None for step 0
-    (no step taken) and before the first event. It gives the lr_phase of history records written before the trainer
-    recorded one (the first A100 run's), exactly as the trainer now records it."""
-    best = None
-    for e in lr_phase_events:
-        at = int(e["at_step"])
-        if at <= step and (best is None or at >= best[0]):
-            best = (at, str(e["phase"]))
-    return best[1] if best is not None and step > 0 else None
-
-
 # ---------------------------------------------------------------------------------------------------- verdict
 
 
@@ -1205,8 +1187,8 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
          cooldown's start, which with evals closer than min_epoch_gap can be one the trend in 3 left out), on the
          complete sets when both have them: the measure before and after, its relative change, and each gate set's
          CER before and after (null without an eval on each side)
-    A record's lr_phase is the trainer's (eval_record); lr_phase_at gives it for a history written before the trainer
-    recorded one. Records without it never count as pre-cooldown (a reason counts them).
+    A record's lr_phase is the trainer's (eval_record). Records without it never count as pre-cooldown (a reason
+    counts them).
 
     family: whose teacher the ratios are to (the size study). "aed" (default) is everything above, with Cohere: its
     output is unchanged by this option. "ctc" judges a Parakeet CTC student against ITS teacher, Parakeet's stored CTC

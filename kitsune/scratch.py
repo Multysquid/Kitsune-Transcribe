@@ -21,9 +21,9 @@ that repo is enough. Layout (kitsune.fullrun, contract 1.2 / 2.4), exactly one s
                                           atomic: the pointer and the files it names change together. Retried on the
                                           Hub's transient answers
                                           (RETRY_STATUS and 5xx, and errors without a status: a dropped connection)
-                                          after RETRY_S; box 2's two trainers commit and squash the same repo, so a
-                                          409/412 from a squash racing a commit is expected. A failed squash is
-                                          recorded, not a failure: the next upload squashes again
+                                          after RETRY_S; a 409/412 from a squash racing another commit to the repo
+                                          is one of them. A failed squash is recorded, not a failure: the next upload
+                                          squashes again
   host_info(), code_sha(root)             the saving host ({hostname, machine_id, container_id}) and the code's git
                                           sha ($KITSUNE_SHA on a box), for the pointer and trainer.pt
 

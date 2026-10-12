@@ -105,13 +105,6 @@ class LogMel(nn.Module):
                    preemphasis=fe.preemphasis, dither=getattr(fe, "dither", 0.0), sampling_rate=fe.sampling_rate,
                    n_mels=fe.feature_size, **kw)
 
-    @classmethod
-    def from_pretrained(cls, path_or_repo: str = HF_MODEL_ID, **kw) -> "LogMel":
-        """From a saved processor (the teacher repo or a student dir written by save_student)."""
-        from transformers import AutoFeatureExtractor
-
-        return cls.from_feature_extractor(AutoFeatureExtractor.from_pretrained(path_or_repo), **kw)
-
     def _dither(self, wave: torch.Tensor, lengths: list[int], valid: torch.Tensor) -> torch.Tensor:
         S = wave.shape[1]
         ns = [min(n, S) for n in lengths]

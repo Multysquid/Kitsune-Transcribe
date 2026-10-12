@@ -2,7 +2,7 @@
 
   pins       WHISPER_MODELS: the four keys of the build contract, large-v3 at 02b's tokenizer pin, Kotoba at the Galgame
              judge's commit, turbo's and small's 40-hex revisions, the row caps 64 / 128
-  rules      max_new_tokens is the students' rule (443 at 448) and generate takes one more, never two; whisper_batches
+  rules      max_new_tokens is the students' rule (443 at 448) and generate takes one more, never two; split_rows
              cuts the eval's own batches at the row cap in order (a 273-row batch -> 64, 64, 64, 64, 17);
              split_generated tells an EOS end from a repetition stop that pad == EOS hides, and from the length cap,
              and strips and counts timestamp ids; RecordingRepetitionStop records the first fire only
@@ -20,7 +20,7 @@
              the manifest and a --model typo refuse (exit 2) before any model is loaded, a store not built yet exits 1;
              --limit-per-set is speed_probe's draw and cannot be tabled (the box template's --tables is skipped with a
              note, not refused: smoke B's quick items); a heartbeat per batch and a bounded one around the load;
-             --fetch-only; never exit 3
+             never exit 3
 """
 import json
 import os
@@ -103,20 +103,19 @@ def _utts(durations):
     return [trainset.Utt(f"s/{i}", "s", float(d), 1, 0, 0, 0) for i, d in enumerate(durations)]
 
 
-def test_whisper_batches_cut_the_eval_batches_at_the_row_cap():
+def test_split_rows_cuts_the_eval_batches_at_the_row_cap():
     """A 273-row eval batch (the students' batch of short clips) is cut into 64, 64, 64, 64, 17 at cap 64; the pieces
     keep the eval's order and hold every row once; no cap leaves the batches as they are."""
     utts = _utts([200.0] * 3 + [1.0] * 273)  # three clips over half the budget each get a batch of their own
     pooled = trainset.eval_batches(utts, 273.0)
     assert [len(b) for b in pooled] == [1, 1, 1, 273]
-    cut = W.whisper_batches(utts, 273.0, 64)
+    cut = W.split_rows(pooled, 64)
     assert [len(b) for b in cut] == [1, 1, 1, 64, 64, 64, 64, 17]
     assert [i for b in cut for i in b] == [i for b in pooled for i in b]
     assert sorted(i for b in cut for i in b) == list(range(len(utts)))
-    assert W.whisper_batches(utts, 273.0, None) == pooled == W.whisper_batches(utts, 273.0, 0)
-    sub = list(range(5, 200))
-    assert [i for b in W.whisper_batches(utts, 273.0, 64, sub) for i in b] == [
-        i for b in trainset.eval_batches(utts, 273.0, sub) for i in b]
+    assert W.split_rows(pooled, None) == pooled == W.split_rows(pooled, 0)
+    sub = trainset.eval_batches(utts, 273.0, list(range(5, 200)))
+    assert [i for b in W.split_rows(sub, 64) for i in b] == [i for b in sub for i in b]
     assert W.split_rows([[1, 2, 3], [4]], 2) == [[1, 2], [3], [4]]
 
 
@@ -653,25 +652,13 @@ def test_limit_per_set_skips_the_box_templates_tables(wenv, tiny_dir, tmp_path, 
     assert len(events(out, "tables_skipped")) == 2 and not tables.exists()
 
 
-def test_fetch_only_and_the_exit_codes(tiny_dir, monkeypatch):
-    """--fetch-only fetches a key's pinned snapshot under a bounded heartbeat and exits 0 without a store or out; a
-    model dir has nothing to fetch (exit 2); whatever stops the run, never the queue's exit 3."""
-    got, bounded = [], []
-
-    def resolve(model, cache=None):
-        got.append((model, cache))
-        return tiny_dir, W.WHISPER_MODELS[model]
-
-    monkeypatch.setattr(W, "resolve", resolve)
-    real = heartbeat.beating
-    monkeypatch.setattr(heartbeat, "beating", lambda path=None, every_s=30.0, max_s=None: (bounded.append(max_s),
-                                                                                         real(path, every_s, max_s))[1])
-    assert we.main(["--model", "whisper-large-v3-turbo", "--fetch-only", "--hf-cache", "cache/hf"]) == 0
-    assert got == [("whisper-large-v3-turbo", "cache/hf")] and bounded == [3600]
-    assert we.main(["--model", str(tiny_dir), "--system", "x", "--fetch-only"]) == 2
+def test_the_exit_codes(tiny_dir, monkeypatch):
+    """An argument error exits 2 (a model dir needs --system); whatever stops the run, never the queue's exit 3."""
+    argv = ["--store", "cache/eval", "--out", "out", "--manifest", "study_manifest.json"]
+    assert we.main(["--model", str(tiny_dir), *argv]) == 2
 
     def stop3(args):
         raise SystemExit(3)
 
     monkeypatch.setattr(we, "run", stop3)
-    assert we.main(["--model", "whisper-small", "--fetch-only"]) == 1
+    assert we.main(["--model", "whisper-small", *argv]) == 1

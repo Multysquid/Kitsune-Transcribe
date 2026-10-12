@@ -10,7 +10,8 @@ micro-batch sizes, so their step values are measured here: on the frozen study s
 reproduce those numbers, and they are re-checked on full.parquet before launch. The same readout gives the smoke configs'
 memory.probe_shapes (worst_shapes on full.parquet) and the step counts behind plan_total_steps.
 
-Per student (--student NAME=FAMILY:MICRO:STEP:EPOCHS, repeatable; default the four full students below):
+Per student (--student NAME=FAMILY:MICRO:STEP:EPOCHS, repeatable; default the four full students as the boxes ran
+them, DEFAULT_STUDENTS):
   steps_per_epoch, total_steps   every epoch's plan length and their sum: the T that plan_epochs pins (less the rows a
                                  frame store's preflight drops, 0 in the study)
   step_real_s {mean, min, max}   epoch 0's real audio seconds per step; study_step_real_s and delta_pct: against the
@@ -32,8 +33,9 @@ the trainer's frame-planner fingerprint, so resume tooling must not compare it w
 are exact for both families.
 
 Usage (CPU, a few minutes on the full selection; no labels or audio needed):
-  python tools/full_plan.py --selection D:/kitsune-study/selections/study_1000h.parquet --json plan.json
-  python tools/full_plan.py --selection full.parquet --student p03=ctc:600:1350:3 --student p03-1300=ctc:600:1300:3
+  python tools/full_plan.py --selection full.parquet --json plan_launch.json      # the four students at their epochs
+  python tools/full_plan.py --selection D:/kitsune-study/selections/study_1000h.parquet --student p03=ctc:600:1350:1 \\
+      --student p03-1300=ctc:600:1300:1                                           # step values against the study's
 """
 import argparse
 import json
@@ -49,9 +51,10 @@ if str(ROOT) not in sys.path:
 
 POOL_MICRO, SEED, MAX_DEC_LEN, COOLDOWN_FRAC = 50, 1234, 200, 0.2  # 04_distill DEFAULTS / the study and full configs
 FAMILIES = ("aed", "ctc")
-# the full students: family, batch.micro_audio_s, batch.step_audio_s, schedule.epochs (contract 3, DECISIONS C10)
-DEFAULT_STUDENTS = {"t06": ("aed", 450, 1730, 3), "p03": ("ctc", 600, 1350, 3), "p01": ("ctc", 1600, 1500, 4),
-                    "p005": ("ctc", 1600, 1500, 4)}
+# the full students: family, batch.micro_audio_s, batch.step_audio_s (contract 3, DECISIONS C10) and the epochs the
+# boxes ran (tools/make_full_configs.py launch_epochs: the plan record's "launch" part)
+DEFAULT_STUDENTS = {"t06": ("aed", 450, 1730, 6), "p03": ("ctc", 600, 1350, 6), "p01": ("ctc", 1600, 1500, 4),
+                    "p005": ("ctc", 1600, 1500, 10)}
 # epoch 0's step_real_s_mean of the study runs' plan events (study-t06-20260926T174027Z at micro 600, study-p03-
 # 20260926T172336Z at 1200, study-p01-20260926T172421Z and study-p005-20260926T172507Z at 1600; step 1500 each)
 STUDY_STEP_REAL_S = {"t06": 1730.7220159744832, "p03": 1176.470242226075, "p01": 1538.4610859879444,

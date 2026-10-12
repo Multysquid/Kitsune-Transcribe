@@ -13,7 +13,7 @@ Flow:
   3. The model: a WHISPER_MODELS key is fetched at its pinned revision into --hf-cache (only its allowed files), a
      model dir is used as it is; loaded under a heartbeat (kitsune.heartbeat.beating, bounded: LOAD_BEAT_MAX_S).
   4. Per set, resumable at set granularity (a set whose greedy_<set>.parquet and .parts/<set>.json agree is skipped):
-     whisper_batches (the eval's batches, row-capped at --max-rows), the audio through kitsune.evaluate._prefetched,
+     split_rows (the eval's batches, row-capped at --max-rows), the audio through kitsune.evaluate._prefetched,
      features, greedy_whisper, decode_texts; the thermal guard (05's, --max-temp) and a heartbeat beat before every
      batch. --force decodes the named sets again, as 05's does: its first run deletes their outputs and records what it
      forces (.parts/force.json), so the same forced command after a stop (a stall kill, a new host) finds the record,
@@ -45,15 +45,14 @@ scores part of each set, so it cannot be tabled (05 --from-evals refuses a set t
 --tables given with it is skipped, with a note on stderr and a tables_skipped event, and no study.json or tables are
 written. It is not refused, because smoke B's turbo, kotoba and small items are the box's Whisper argv template
 (contract 7, which carries --tables {out}/tables) plus --limit-per-set 50: a refusal would fail those items at once.
---manifest is optional with it (given, the sets are still checked against it). --fetch-only: only step 3's download,
-on CPU (a prefetch; nothing else is read or written).
+--manifest is optional with it (given, the sets are still checked against it).
 
 Exit codes: 0 done; 2 refused (a store whose rows are not the manifest's, a frame store, the manifest, identity, tables
 refused by 05, bad arguments incl. a --model that is neither a key nor a model dir); 1 any other error, including a
 --store that is not built yet (retryable: the queue's stores item may still be building it). Never 3 (the queue's
 throughput code).
 
-Usage (box 2's registry eval item; smoke B's large-v3 item adds --sets eval_jsut):
+Usage (box full-p's registry eval items; smoke B's large-v3 item adds --sets eval_jsut):
   python tools/whisper_eval.py --model whisper-large-v3 --store <root>/cache/eval \
       --manifest labels/full/selections/study_manifest.json --out runs/whisper-large-v3-<stamp> \
       --tables runs/whisper-large-v3-<stamp>/tables --hf-cache <root>/cache/hf --device cuda --max-temp 0
@@ -126,7 +125,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="the eval TOKEN store (<cache_dir>/eval), a built kitsune.trainset dir")
     ap.add_argument("--manifest", default=None,
                     help="the study's frozen eval manifest (study_manifest.json); required except with "
-                         "--limit-per-set or --fetch-only")
+                         "--limit-per-set")
     ap.add_argument("--prereg", default=str(ROOT / "study" / "PREREG.json"),
                     help="PREREG.json whose manifest block the manifest is compared with once filled (default "
                          "%(default)s)")
@@ -149,7 +148,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--no-fp32-head", action="store_true",
                     help="the LM head in the model's dtype (default: fp32, the AED students' rule)")
     ap.add_argument("--hf-cache", default=None, help="the HF cache the pinned snapshot goes to (box: <root>/cache/hf)")
-    ap.add_argument("--fetch-only", action="store_true", help="download the pinned snapshot and stop (CPU)")
     ap.add_argument("--tables", default=None,
                     help="also 05 --from-evals: <tables>/<system>/<set>.parquet and study.json in --out")
     ap.add_argument("--force", action="store_true", help="decode the named sets again")
@@ -164,12 +162,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     if args.system is None:
         if args.model in W.WHISPER_MODELS:
             args.system = args.model
-        elif not args.fetch_only:
+        else:
             ap.error("--model is a model dir: name its system with --system")
-    if args.fetch_only:
-        if args.model not in W.WHISPER_MODELS:
-            ap.error("--fetch-only downloads a Whisper key's pinned snapshot: a model dir needs no fetch")
-        return args
     for flag, v in (("--store", args.store), ("--out", args.out)):
         if not v:
             ap.error(f"{flag} is required")
@@ -359,11 +353,6 @@ def whisper_record(args, out: Path, meta: dict, status: str, **extra) -> dict:
 
 def run(args) -> int:
     M = m05()
-    if args.fetch_only:
-        with heartbeat.beating(max_s=W.LOAD_BEAT_MAX_S):
-            path, spec = W.resolve(args.model, args.hf_cache)
-        print(f"{spec.repo}@{spec.revision} -> {path}", flush=True)
-        return 0
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     (out / PARTS).mkdir(exist_ok=True)

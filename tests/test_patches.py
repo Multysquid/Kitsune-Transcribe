@@ -16,7 +16,6 @@ from torch import nn  # noqa: E402
 from kitsune.patches import (  # noqa: E402
     assert_bn_frozen,
     freeze_batchnorm,
-    is_relpos_patched,
     patch_relpos_once_per_batch,
     sdpa_backend_report,
     train_mode,
@@ -197,7 +196,7 @@ def test_relpos_patch_idempotent_and_unpatch():
         ref = logits_of(model, batch)
     h1 = patch_relpos_once_per_batch(model)
     h2 = patch_relpos_once_per_batch(model)
-    assert h1 is h2 and is_relpos_patched(model)
+    assert h1 is h2 and getattr(model, "_kitsune_relpos_unpatch", None) is h1
     attn = model.model.encoder.layers[1].self_attn
     assert "forward" in attn.relative_k_proj.__dict__ and "forward" in model.model.encoder.encode_positions.__dict__
     with torch.no_grad():
@@ -208,7 +207,7 @@ def test_relpos_patch_idempotent_and_unpatch():
 
     h1()
     h1()  # a second call is a no-op
-    assert not is_relpos_patched(model)
+    assert getattr(model, "_kitsune_relpos_unpatch", None) is None
     assert "forward" not in attn.relative_k_proj.__dict__
     assert "forward" not in model.model.encoder.encode_positions.__dict__
     with torch.no_grad():

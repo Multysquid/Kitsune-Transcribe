@@ -110,10 +110,6 @@ def evenly_spaced(n_keep: int, n_total: int) -> list[int]:
     return [(2 * i * (n_total - 1) + n_keep - 1) // den for i in range(n_keep)]
 
 
-def default_spec(n_enc: int = 20, ffn: int = 2560, dec=(0, 2, 5, 7)) -> StudentSpec:
-    return StudentSpec(enc_layers=evenly_spaced(n_enc, TEACHER_ENC_LAYERS), ffn_dim=ffn, dec_layers=list(dec))
-
-
 # ------------------------------------------------------------------------------------------------ config + counts
 
 
