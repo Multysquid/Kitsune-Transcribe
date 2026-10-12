@@ -895,7 +895,7 @@ def test_resume_preflight_guards_a_done_box(repo, monkeypatch, devslice):
     lost in its eval pool); a reset of the run, or a continuation lost on its way (the summary shows the run running
     with its continuation record), passes. (b) A set-only id of a done run is refused (resume-pull refuses a set-only
     run past its cooldown)."""
-    rid = "full-p01-20261001T184145Z"
+    rid = "full-p01-20261002T120000Z"  # not box 1's run, whose head is H14's re-run (launch.RETIRED_CONTINUATIONS)
     reg = launch.full_registry(SHA)[0]
     data = box_data("p01", reg, repo.root)
 
@@ -931,7 +931,7 @@ def test_a_fresh_launch_over_a_done_box_is_refused(repo, monkeypatch, devslice):
     is refused ("no train item of box p01 ran it"). So a fresh launch over a done train item is refused unless
     --fresh-over-done; no summary, or one whose train items are not done (a box that died in its first training: its
     owner relaunches it fresh or resumes it), passes; the continuation itself passes."""
-    rid = "full-p01-20261001T184145Z"
+    rid = "full-p01-20261002T120000Z"  # not box 1's run, whose head is H14's re-run (launch.RETIRED_CONTINUATIONS)
     reg = launch.full_registry(SHA)[0]
     data = box_data("p01", reg, repo.root)
 
@@ -1373,8 +1373,33 @@ def test_a_resume_of_a_box_whose_runs_are_continued_elsewhere_needs_the_flag(coo
     problems, notes = cool(runs, box="p005", resets=[RID005], allow_continued_runs=True)
     assert problems == [] and any("(--allow-continued-runs: not refused)" in n for n in notes), (problems, notes)
     runs[fullrun.box_summary_path("p01")] = {"items": {"full-p01": {"kind": "train", "status": "running",
-                                                                    "run_dir": "runs/full-p01-20261001T184145Z"}}}
+                                                                    "run_dir": "runs/full-p01-20261002T120000Z"}}}
     assert cool(runs, box="p01")[0] == []
+
+
+@pytest.mark.parametrize("box, item, rid", [("full-p", "full-p03", RID03), ("p005", "full-p005", RID005),
+                                            ("p01", "full-p01", "full-p01-20261001T184145Z")])
+def test_the_retired_continuations_still_need_the_flag(monkeypatch, box, item, rid):
+    """Box p-cool left the registry and no registry box continues another's runs, but its H14 re-runs sit at the heads
+    of boxes full-p's, p01's and p005's runs (launch.RETIRED_CONTINUATIONS): on this checkout's registry a resume of
+    one of those runs (a plain one, or its --resume-reset) is still refused unless --allow-continued-runs; another run
+    of the box is not concerned."""
+    reg = fullrun.load_registry(ROOT / fullrun.BOXES_FILE)
+    assert not any(fullrun.continues_of(b, reg) for b in reg["boxes"])  # guard (d) has only the retired record
+
+    def go(run_id, resets=(), **kw):
+        hub = FullHub({}, {fullrun.box_summary_path(box): {"items": {
+            item: {"kind": "train", "status": "done", "run_dir": f"runs/{run_id}"}}}})
+        monkeypatch.setattr(launch, "_hub", lambda: (hub, hub.download))
+        return launch.resume_preflight(RUNS, SCRATCH, box, list(resets), {}, allow_done_trains=True, reg=reg, **kw)
+
+    for resets in ((), (rid,)):
+        problems, _ = go(rid, resets)
+        assert any(f"a resume of box {box}: its run(s) {rid} ({item}) are continued by box p-cool" in p
+                   and "--allow-continued-runs" in p for p in problems), (resets, problems)
+    problems, notes = go(rid, allow_continued_runs=True)
+    assert problems == [] and any("(--allow-continued-runs: not refused)" in n for n in notes), (problems, notes)
+    assert go(f"{item}-20261012T000000Z")[0] == []
 
 
 def test_the_allow_continued_runs_flag_reaches_the_preflight_and_is_full_only(full_launch, capsys):

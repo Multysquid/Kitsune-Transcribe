@@ -432,9 +432,8 @@ def upload_infra(api, repo: str, repo_type: str, dest: str, dry_run: bool, deep:
                                            commit_message="finish: infra logs"), "infra commit")
 
 
-def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S, *, errors: list | None = None) -> bool:
-    """Run fn in a daemon thread and wait at most `timeout` s; failures are logged, never raised (and appended to
-    `errors` as "<type>: <message>" when given)."""
+def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S) -> bool:
+    """Run fn in a daemon thread and wait at most `timeout` s; failures are logged, never raised."""
     ok = []
 
     def target():
@@ -443,8 +442,6 @@ def best_effort(fn, what: str, timeout: float = INFRA_TIMEOUT_S, *, errors: list
             ok.append(True)
         except Exception as e:
             log(f"{what} failed: {type(e).__name__}: {e}")
-            if errors is not None:
-                errors.append(f"{type(e).__name__}: {e}"[:300])
 
     th = threading.Thread(target=target, name=what, daemon=True)
     th.start()

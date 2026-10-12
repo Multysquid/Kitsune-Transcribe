@@ -20,7 +20,7 @@
 # on the box controllers' heartbeat, KITSUNE_WATCHDOG_HB_FILE=train_hb under $KITSUNE_STATE (bootstrap's phases, the
 # queue's poll, the supervisor's bounded finish calls touch it; the trainers beat their own item files, which the
 # queue's stall check reads), with KITSUNE_WATCHDOG_ORPHAN_S from the registry. KITSUNE_WATCHDOG_ORPHAN_ACTION=stop
-# (boxes p01 and full) is the label rule with the reason "watchdog: box controller heartbeat stale"; alert (the smoke
+# (every box but smoke A) is the label rule with the reason "watchdog: box controller heartbeat stale"; alert (the smoke
 # box, whose fault test freezes the heartbeat on purpose) only appends {"wall", "kind": "orphan_alert", "hb", "age_s",
 # "limit_s"} to $KITSUNE_STATE/watchdog_alerts.jsonl, never syncs or stops, and re-arms once the file is fresh again.
 # The defaults (label_hb, stop) keep the label box exactly as it was.

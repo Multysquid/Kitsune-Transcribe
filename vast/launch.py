@@ -55,7 +55,8 @@ full_step_<from_step> (complete, pre_cooldown, its resets, its early-stop cooldo
 and the run's end at to_step), one planner n_utts for all of them (one store), and no readout dir m4-<rid>-r<N> on the
 Hub that the box would write into (unless its own summary records that continuation); a live instance of the box or of
 a source box (running, loading, created, or a null actual_status: holds_host) is refused. A --resume of a box whose
-runs another box continues needs --allow-continued-runs (that box's continuation wrote into the same run dirs).
+runs another box continues, or a retired one did (RETIRED_CONTINUATIONS: the H14 re-runs at the heads of boxes
+full-p's, p01's and p005's runs), needs --allow-continued-runs (that box's continuation wrote into the same run dirs).
 Every job avoids the machines of vast/blocklist.json; a full box also those whose download gate said slow in the last
 GATE_BLOCK_DAYS (full/box-*/infra/*/download_gate.json) and the label runs' failed hosts. The box times its Hub link
 first (kitsune.netgate: KITSUNE_GATE_BYTES, --gate-hours; 0 turns it off):
@@ -196,6 +197,12 @@ QUANT_CODE = ("kitsune/quant.py", "tools/speed_probe.py", "scripts/05_evaluate.p
 # A's measured s/step and box 1's; without box 1's part they are provisional (contract 7), and launch says so
 SPEED_RECORD = "configs/full/plan/box2_hours.json"
 SPEED_RECORD_BOXES = ("full-t", "p005")
+# DECISIONS H14's cooldown re-runs (2026-10-09, box p-cool, retired with its registry entry): each wrote into its source
+# box's run dir and over its final export, so these runs' heads on the runs repo are the re-runs, not the released
+# models (P-0.3B 61afd417, P-0.1B c4604304, P-0.05B d2caddfc). resume_preflight's guard (d) reads them as it read
+# p-cool's continues blocks: a resume of box full-p, p01 or p005 over one of them needs --allow-continued-runs
+RETIRED_CONTINUATIONS = {"full-p03-20261003T230143Z": "p-cool", "full-p01-20261001T184145Z": "p-cool",
+                         "full-p005-20261008T160232Z": "p-cool"}
 # a vast instance in one of these states holds (or is about to hold) a host: a second box of a continuation box, or
 # a live source box of its runs, is refused when its actual_status, intended_status or cur_state is one of them or
 # its actual_status is still null (a just-created instance vast is scheduling; holds_host), and only warned about
@@ -1482,7 +1489,9 @@ def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, 
     (c) a box with continues items may have no summary yet (its first launch): its continuations are checked by
         continuation_preflight, each from the box's own summary when that records it, else from its source box's
         summary;
-    (d) a box whose summary's train runs another registry box continues (a source box after its continuation box) is
+    (d) a box whose summary's train runs another registry box continues (a source box after its continuation box), or
+        a retired box continued (RETIRED_CONTINUATIONS: H14's re-runs, box p-cool's, at the heads of boxes full-p's,
+        p01's and p005's runs; a registry continues block of the run, the box's own too, takes its place), is
         refused unless allow_continued_runs (--allow-continued-runs): that box's continuation wrote into the same run
         dir and over the same final export, so a resume here would adopt (or score, or sync over) the other box's
         weights."""
@@ -1526,15 +1535,17 @@ def resume_preflight(out_repo: str, scratch_repo: str | None, box: str, resets, 
                     notes.append(f"{msg} (--allow-done-trains: not refused)")
                 else:
                     problems.append(msg)
-            if reg is not None:  # (d): another box continued one of this box's runs
-                others = {c["run_id"]: (b, name) for b in reg["boxes"] if b != box
-                          for name, c in fullrun.continues_of(b, reg).items()}
-                if hit := sorted(rid for rid in ran if rid in others):
+            if reg is not None:  # (d): another box continued one of this box's runs (or a retired box did)
+                others = {rid: (b, None) for rid, b in RETIRED_CONTINUATIONS.items()}
+                others.update({c["run_id"]: (b, name) for b in reg["boxes"]  # a registry block wins, the box's own too
+                               for name, c in fullrun.continues_of(b, reg).items()})
+                if hit := sorted(rid for rid in ran if rid in others and others[rid][0] != box):
                     msg = (f"a resume of box {box}: its run(s) " + ", ".join(
                         f"{rid} ({ran[rid]})" for rid in hit) + " are continued by box " + ", ".join(
-                        sorted({others[rid][0] for rid in hit})) + f" (its registry continues blocks): that "
-                        f"continuation writes into the same run dir and final export, so this box would adopt, score "
-                        f"or sync over its weights; pass --allow-continued-runs only when that is meant")
+                        sorted({others[rid][0] for rid in hit})) + f" (its registry continues blocks, or launch's "
+                        f"RETIRED_CONTINUATIONS for a retired box): that continuation writes into the same run dir and "
+                        f"final export, so this box would adopt, score or sync over its weights; pass "
+                        f"--allow-continued-runs only when that is meant")
                     if allow_continued_runs:
                         notes.append(f"{msg} (--allow-continued-runs: not refused)")
                     else:
@@ -1895,8 +1906,10 @@ def main(argv: list[str] | None = None) -> int:
                          "smoke-b verdict at its quant code (DECISIONS F2's go signal; the refusal becomes a warning)")
     ap.add_argument("--allow-continued-runs", action="store_true",
                     help="full: a --resume/--resume-reset/--resume-set of a box whose Hub summary's runs another "
-                         "registry box continues (its `continues` blocks, DECISIONS H14); refused without it, because "
-                         "that continuation wrote into the same run dirs and the same final export path")
+                         "registry box continues (its `continues` blocks, DECISIONS H14) or a retired box continued "
+                         "(RETIRED_CONTINUATIONS: H14's re-runs of boxes full-p's, p01's and p005's runs); refused "
+                         "without it, because that continuation wrote into the same run dirs and the same final export "
+                         "path")
     ap.add_argument("--no-self-stop", action="store_true",
                     help="debugging: the box does not stop itself when its on-start or bootstrap fails "
                          "(KITSUNE_NO_SELF_STOP=1); the watchdog still stops it once onstart.sh has started it")
