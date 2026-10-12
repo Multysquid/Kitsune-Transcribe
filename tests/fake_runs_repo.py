@@ -1,5 +1,5 @@
 """A runs repo on disk that several processes commit into at once, with the Hub's commit rate limit (a 429), for the
-full queue's tests (tests/test_full_queue.py, tests/test_full_chain.py).
+full queue's tests (tests/test_full_queue.py).
 
     hub = DirHub.create(tmp_path / "hub", limit=6, window_s=0.5)   # at most 6 commits in any 0.5 s, else 429
     hub.commit({"runs/x/a.txt": b"..."}, writer="x", box="A")      # raises RateLimited over the limit

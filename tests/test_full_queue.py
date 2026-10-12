@@ -1439,17 +1439,18 @@ def test_a_reset_run_keeps_its_sets_until_the_state_after_the_reset_and_reads_ou
 @pytest.mark.parametrize("sets,spelled", [
     (["schedule.epochs=8", "early_stop.patience=12"], None),
     (["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
-      "augment.mix_p=0.05"],
+      "augment.end_trim_p=0.3"],
      ["schedule.epochs=04", "augment.enabled=TRUE", "augment.truncate_p=.30", "augment.concat_p=5e-1",
-      "augment.mix_p=5e-2"])], ids=["G3-epochs-patience", "H1-recipe"])
+      "augment.end_trim_p=3e-1"])], ids=["G3-epochs-patience", "H1-recipe"])
 def test_the_p01_continuation_takes_its_sets_and_scores_its_new_end(fq, hubs, monkeypatch, sets, spelled):
     """DECISIONS G3 and H1 end to end on the queue side: launch's KITSUNE_RESUME_RESET + KITSUNE_RESUME_SETS (G3: epochs
     8, patience 12; H1, the recipe test box: epochs 4 = box 1's T and the augmentation's enabled / truncate_p /
-    concat_p / mix_p) -> resume-pull plans the reset from the pre_cooldown state with its sets, the readout and a
-    same-box quant item the old summary never had start fresh -> adopt (the env parses to the plan's own list - for H1
-    from another spelling of the same values: fullrun.resume_set_value normalises both, so no resume_sets_differ) ->
-    every train attempt carries every --set until the reset is applied -> the readout writes -r1 and the quant item
-    (box p01's, `of` full-p01, needs m4-full-p01) reads the continuation's final step after the readout."""
+    concat_p, its retired mix_p swapped for end_trim_p) -> resume-pull plans the reset from the pre_cooldown state with
+    its sets, the readout and a same-box quant item the old summary never had start fresh -> adopt (the env parses to
+    the plan's own list - for H1 from another spelling of the same values: fullrun.resume_set_value normalises both, so
+    no resume_sets_differ) -> every train attempt carries every --set until the reset is applied -> the readout writes
+    -r1 and the quant item (box p01's, `of` full-p01, needs m4-full-p01) reads the continuation's final step after the
+    readout."""
     once = ["schedule.resume_reset=true", *sets]
     reg = copy.deepcopy(fq.reg)
     quant = {"name": "quant-fp16-full-p01", "kind": "eval", "of": "full-p01", "needs": ["m4-full-p01"],
@@ -1877,7 +1878,7 @@ def test_a_continuation_boxs_first_launch_resets_each_run_from_its_source_and_re
         assert plan["items"][f"m4-{name}"]["status"] == "fresh"
     assert plan["items"]["stores-ctc"]["status"] == "fresh"
     assert cool_once("full-p005")[3] == "schedule.resume_reset_keep_cooldown=true"
-    assert cool_once("full-p01")[-2] == 'augment.codecs=["mp3","gsm","ulaw8k"]'
+    assert cool_once("full-p01")[-1] == 'augment.codecs=["mp3","gsm","ulaw8k"]'
     summaries = [f for f in cool.fetched if f.endswith("/queue_summary.json")]
     assert sorted(summaries) == sorted([COOL_SUMMARY, *map(fullrun.box_summary_path, ("full-p", "p01", "p005"))])
     env = dict(FAKE_RC=json.dumps({"full-p01": [1, 0]}))  # P-0.1B's first attempt dies right after its reset

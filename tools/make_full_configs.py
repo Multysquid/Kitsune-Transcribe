@@ -180,21 +180,20 @@ RECIPE_AED = {**RECIPE_V4, "cuts": AED_CUTS, "cuts_sha256": AED_CUTS_SHA256}  # 
 #   cut_keep_word    every cut keeps a content token of the utterance it ends in (never the bare start piece "▁"
 #                    alone: ~3.4 % of ReazonSpeech's cuts kept 1-3 s of an untranscribed lead-in with no word)
 #   guard_per_piece  truncate_min_row_s 3.0 and the cut's lower bound (30 % of the utterance, 1 s) hold for each
-#                    utterance of a joined row (no cut inside one under 3 s, none keeping a sliver of a longer one), as
-#                    background_min_row_s would (0 here, as in v4: every row may get a background)
+#                    utterance of a joined row (no cut inside one under 3 s, none keeping a sliver of a longer one)
 #   end_trim_voiced  the end trim keeps the audio up to the last voiced sound of the row's last utterance (the last
 #                    word's token sits at its onset: the old trim removed a median 0.23 s of its sound) and counts no
 #                    "▁" as a word. Expect aug/end_trimmed to fall: on the noisy sources a row's trailing audio is
 #                    within 35 dB of its peak, so the trim fires on ~79 % of Galgame rows but ~5 % of ReazonSpeech's
 #                    and ~11-16 % of Emilia's (~99-100 % each under v4; train shards, 2026-10-09)
-# Recipe v4 with the trainer's defaults of its ranges and short-row guard written out (04_distill DEFAULTS augment:
-# background noise 0-20 dB, background speech 10-25 dB, volume -20..+10 dB, codecs MP3 / GSM 6.10 / mu-law,
-# background_min_row_s 0: every row may get a background), so that as a continuation's recipe it inherits no range or
-# short-row guard from the state it resumes. Either family takes it (an AED recipe adds its cut table, as RECIPE_AED
-# does)
-RECIPE_V5 = {**RECIPE_V4, "noise_snr_db": [0.0, 20.0], "speech_snr_db": [10.0, 25.0], "gain_db": [-20.0, 10.0],
-             "codecs": ["mp3", "gsm", "ulaw8k"], "background_min_row_s": 0.0, "cut_keep_word": True,
-             "guard_per_piece": True, "end_trim_voiced": True}
+# Recipe v4 with the trainer's defaults of its ranges written out (04_distill DEFAULTS augment: background noise
+# 0-20 dB, background speech 10-25 dB, volume -20..+10 dB, codecs MP3 / GSM 6.10 / mu-law), so that as a
+# continuation's recipe it inherits no range from the state it resumes, and without recipe v2's mix_p 0.0: mixing is
+# retired (04_distill RETIRED_KEYS), so the key is none a continuation may set. Either family takes it (an AED recipe
+# adds its cut table, as RECIPE_AED does)
+RECIPE_V5 = {**{k: v for k, v in RECIPE_V4.items() if k != "mix_p"}, "noise_snr_db": [0.0, 20.0],
+             "speech_snr_db": [10.0, 25.0], "gain_db": [-20.0, 10.0], "codecs": ["mp3", "gsm", "ulaw8k"],
+             "cut_keep_word": True, "guard_per_piece": True, "end_trim_voiced": True}
 # DECISIONS H15 (the owner, 2026-10-10: "lets do the transcribe run anyway so we have a full checkpoint for transcribe
 # too"; then chose the recipe, 6 epochs with early stop and the t-box branch): BOX T'S RECIPE is the registered AED
 # recipe, RECIPE_AED (recipe v4 plus the cut table, H12), with two of recipe v5's fixes on, which the PR #53 review made
@@ -206,7 +205,7 @@ RECIPE_V5 = {**RECIPE_V4, "noise_snr_db": [0.0, 20.0], "speech_snr_db": [10.0, 2
 # cut_keep_word stays off (not named: the trainer's default false): every cut-table entry keeps a Cohere token of the
 # utterance it ends in, so on an AED row the key would only hold the table to what it already does. A fresh run from
 # step 0 (no continuation), so the keys it does not name are the trainer's defaults - recipe v4's ranges, every row may
-# get a background (background_min_row_s 0). full-t06 only; RECIPE_AED stays the record of H7/H11/H12's AED recipe
+# get a background. full-t06 only; RECIPE_AED stays the record of H7/H11/H12's AED recipe
 RECIPE_AED_H15 = {**RECIPE_AED, "guard_per_piece": True, "end_trim_voiced": True}
 # the full students (contract 7): their study run, schedule.epochs, warm-up (the study's, kitsune.prereg), optim.lr,
 # batch.micro_audio_s / step_audio_s (DECISIONS C10: the study's realised audio per step, tools/full_plan.py),

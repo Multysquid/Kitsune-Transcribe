@@ -52,22 +52,21 @@ def test_constants_exact_values():
     assert fr.RUN_ID_RE == r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"
     assert fr.ITEM_RE == r"^[a-z0-9][a-z0-9.-]*$"
     assert fr.RESUME_SET_KEYS == ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
-                                  "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s",
-                                  "augment.end_trim_p", "augment.noise_p", "augment.noise_bank",
-                                  "augment.noise_bank_sha256", "augment.speech_p", "augment.reverb_p",
-                                  "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p", "augment.codec_p",
-                                  "augment.background_min_row_s", "schedule.deadline_cooldown",
+                                  "augment.concat_p", "augment.truncate_min_row_s", "augment.end_trim_p",
+                                  "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256",
+                                  "augment.speech_p", "augment.reverb_p", "augment.rir_bank", "augment.rir_bank_sha256",
+                                  "augment.gain_p", "augment.codec_p", "schedule.deadline_cooldown",
                                   "augment.cut_keep_word", "augment.guard_per_piece", "augment.end_trim_voiced")
     assert fr.RESUME_SET_INT_MIN == {"schedule.epochs": 1, "early_stop.patience": 1}
     assert fr.RESUME_SET_KINDS == {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
-                                   "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
+                                   "augment.truncate_p": "prob", "augment.concat_p": "prob",
                                    "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob",
                                    "augment.noise_p": "prob", "augment.noise_bank": "path",
                                    "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob",
                                    "augment.reverb_p": "prob", "augment.rir_bank": "path",
                                    "augment.rir_bank_sha256": "sha256", "augment.gain_p": "prob",
-                                   "augment.codec_p": "prob", "augment.background_min_row_s": "seconds",
-                                   "schedule.deadline_cooldown": "bool", "augment.cut_keep_word": "bool",
+                                   "augment.codec_p": "prob", "schedule.deadline_cooldown": "bool",
+                                   "augment.cut_keep_word": "bool",
                                    "augment.guard_per_piece": "bool", "augment.end_trim_voiced": "bool"}
     assert fr.CODEC_NAMES == ("mp3", "gsm", "ulaw8k", "vorbis", "opus")
     assert fr.CONTINUE_LIST_KINDS == {"augment.noise_snr_db": "db_range", "augment.speech_snr_db": "db_range",
@@ -246,9 +245,9 @@ def test_parse_resume_sets():
     assert fr.parse_resume_sets(f"{RID}:early_stop.patience=12,{RID}:schedule.epochs=8") == {
         RID: ["early_stop.patience=12", "schedule.epochs=8"]}
     only = "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, augment.concat_p, " \
-           "augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, augment.noise_p, augment.noise_bank, " \
-           "augment.noise_bank_sha256, augment.speech_p, augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, " \
-           "augment.gain_p, augment.codec_p, augment.background_min_row_s, schedule.deadline_cooldown, " \
+           "augment.truncate_min_row_s, augment.end_trim_p, augment.noise_p, augment.noise_bank, " \
+           "augment.noise_bank_sha256, augment.speech_p, augment.reverb_p, augment.rir_bank, " \
+           "augment.rir_bank_sha256, augment.gain_p, augment.codec_p, schedule.deadline_cooldown, " \
            "augment.cut_keep_word, augment.guard_per_piece, augment.end_trim_voiced may change on a resume"
     for bad in (f"{RID}:early_stop.patience=0", f"{RID}:early_stop.patience=-1", f"{RID}:early_stop.patience=1.5",
                 f"{RID}:early_stop.patience=x", f"{RID}:early_stop.patience=",
@@ -270,8 +269,10 @@ def test_parse_resume_sets():
             fr.parse_resume_sets(bad)
 
 
+# DECISIONS H1, H4: the recipe test box's sets (its launch --resume-set values), its weak mix (augment.mix_p 0.05,
+# retired since: 04_distill RETIRED_KEYS) swapped for recipe v3's end trim
 RECIPE_SETS = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
-               "augment.mix_p=0.05"]  # DECISIONS H1, H4: the recipe test box's sets (its launch --resume-set values)
+               "augment.end_trim_p=0.3"]
 
 
 def test_parse_resume_sets_types_and_normalises_each_value():
@@ -280,13 +281,14 @@ def test_parse_resume_sets_types_and_normalises_each_value():
     round-trips to itself, and two spellings of one continuation are one continuation on the box (full_queue adopt's
     resume_sets_differ compares them)."""
     loose = [f"{RID}:schedule.epochs=04", f"{RID}:augment.enabled=True", f"{RID}:augment.truncate_p=.30",
-             f"{RID}:augment.concat_p=5e-1", f"{RID}:augment.mix_p=.050"]
+             f"{RID}:augment.concat_p=5e-1", f"{RID}:augment.end_trim_p=.30"]
     got = fr.parse_resume_sets(",".join(loose))
     assert got == {RID: RECIPE_SETS}
     word = ",".join(f"{rid}:{kv}" for rid, kvs in got.items() for kv in kvs)  # vast/launch.py's env word
     assert re.fullmatch(fr._ENV_WORD, word) and fr.parse_resume_sets(word) == got
     for key, val, want in (("augment.enabled", "FALSE", "false"), ("augment.enabled", "true", "true"),
-                           ("augment.mix_p", "0", "0.0"), ("augment.mix_p", "1", "1.0"), ("augment.mix_p", "1.", "1.0"),
+                           ("augment.speech_p", "0", "0.0"), ("augment.speech_p", "1", "1.0"),
+                           ("augment.speech_p", "1.", "1.0"), ("augment.speech_p", ".050", "0.05"),
                            ("augment.concat_p", "0.50", "0.5"), ("augment.truncate_p", "3E-1", "0.3"),
                            ("augment.truncate_p", "1e-7", "1e-07"), ("schedule.epochs", "008", "8"),
                            ("early_stop.patience", "12", "12"), ("augment.truncate_min_row_s", "3", "3.0"),
@@ -309,29 +311,29 @@ def test_parse_resume_sets_types_and_normalises_each_value():
     assert {k: fr.resume_set_rule(k) for k in fr.RESUME_SET_KEYS} == {
         "schedule.epochs": "an int >= 1", "early_stop.patience": "an int >= 1", "augment.enabled": "true or false",
         "augment.truncate_p": "a probability in [0, 1]", "augment.concat_p": "a probability in [0, 1]",
-        "augment.mix_p": "a probability in [0, 1]", "augment.truncate_min_row_s": "a number of seconds >= 0",
+        "augment.truncate_min_row_s": "a number of seconds >= 0",
         "augment.end_trim_p": "a probability in [0, 1]", "augment.noise_p": "a probability in [0, 1]",
         "augment.noise_bank": "a relative data-repo path (letters, digits, _ . - and /, no ..)",
         "augment.noise_bank_sha256": "a sha256 (64 lowercase hex digits)",
         "augment.speech_p": "a probability in [0, 1]", "augment.reverb_p": "a probability in [0, 1]",
         "augment.rir_bank": "a relative data-repo path (letters, digits, _ . - and /, no ..)",
         "augment.rir_bank_sha256": "a sha256 (64 lowercase hex digits)", "augment.gain_p": "a probability in [0, 1]",
-        "augment.codec_p": "a probability in [0, 1]", "augment.background_min_row_s": "a number of seconds >= 0",
-        "schedule.deadline_cooldown": "true or false", "augment.cut_keep_word": "true or false",
+        "augment.codec_p": "a probability in [0, 1]", "schedule.deadline_cooldown": "true or false",
+        "augment.cut_keep_word": "true or false",
         "augment.guard_per_piece": "true or false", "augment.end_trim_voiced": "true or false"}
     for bad, msg in ((f"{RID}:augment.enabled=yes", "augment.enabled must be true or false, not 'yes'"),
                      (f"{RID}:augment.enabled=1", "augment.enabled must be true or false"),
                      (f"{RID}:augment.enabled=", "augment.enabled must be true or false"),
                      (f"{RID}:augment.truncate_p=1.5", "augment.truncate_p must be a probability in \\[0, 1\\]"),
                      (f"{RID}:augment.concat_p=-0.1", "augment.concat_p must be a probability"),
-                     (f"{RID}:augment.mix_p=+0.2", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=nan", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=inf", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=1_0", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=0.2.1", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=x", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=0.2,{RID}:augment.mix_p=0.3", "augment.mix_p given twice"),
+                     (f"{RID}:augment.speech_p=+0.2", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=nan", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=inf", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=1_0", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=0.2.1", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=x", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=0.2,{RID}:augment.speech_p=0.3", "augment.speech_p given twice"),
                      (f"{RID}:augment.truncate_min_row_s=-1", "truncate_min_row_s must be a number of seconds >= 0"),
                      (f"{RID}:augment.truncate_min_row_s=inf", "truncate_min_row_s must be a number of seconds"),
                      (f"{RID}:augment.end_trim_p=1.5", "augment.end_trim_p must be a probability"),
@@ -352,12 +354,16 @@ def test_parse_resume_sets_types_and_normalises_each_value():
                      # the recipe's other keys keep the trainer's defaults: another value would be another recipe
                      (f"{RID}:augment.seed=1", "may change on a resume"),
                      (f"{RID}:augment.concat_max_s=20", "may change on a resume"),
-                     (f"{RID}:augment.mix_snr_db=[0,5]", "may change on a resume")):
+                     (f"{RID}:augment.mix_snr_db=[0,5]", "may change on a resume"),
+                     # mixing and the background's short-row guard are retired (04_distill RETIRED_KEYS)
+                     (f"{RID}:augment.mix_p=0.05", "may change on a resume"),
+                     (f"{RID}:augment.mix_p=0", "may change on a resume"),
+                     (f"{RID}:augment.background_min_row_s=3", "may change on a resume")):
         with pytest.raises(ValueError, match=msg):
             fr.parse_resume_sets(bad)
     # one run's int and recipe sets together, another run's apart, in the order given
-    two = f"{RID}:augment.mix_p=0.2,full-p01-20261001T184145Z:augment.enabled=false,{RID}:schedule.epochs=4"
-    assert fr.parse_resume_sets(two) == {RID: ["augment.mix_p=0.2", "schedule.epochs=4"],
+    two = f"{RID}:augment.speech_p=0.2,full-p01-20261001T184145Z:augment.enabled=false,{RID}:schedule.epochs=4"
+    assert fr.parse_resume_sets(two) == {RID: ["augment.speech_p=0.2", "schedule.epochs=4"],
                                          "full-p01-20261001T184145Z": ["augment.enabled=false"]}
 
 
@@ -380,17 +386,18 @@ def test_codec_names_are_the_acoustics_codecs():
 
 
 def test_h14_resume_set_keys():
-    """Two of DECISIONS H14's three scalar keys are resume sets too (launch --resume-set, KITSUNE_RESUME_SETS),
-    normalised like the others. schedule.resume_reset_keep_cooldown is not: only a registry continuation sets it
-    (CONTINUE_ONLY_KINDS; launch's continuation_preflight checks the state's cooldown record before renting), and
-    neither are the list-valued continuation keys (the env word is comma-separated)."""
-    got = fr.parse_resume_sets(f"{RID}:augment.background_min_row_s=3,{RID}:schedule.deadline_cooldown=FALSE")
-    assert got == {RID: ["augment.background_min_row_s=3.0", "schedule.deadline_cooldown=false"]}
-    assert fr.resume_set_value("augment.background_min_row_s", "0") == "0.0"
+    """Of DECISIONS H14's three scalar keys, schedule.deadline_cooldown is a resume set too (launch --resume-set,
+    KITSUNE_RESUME_SETS), normalised like the others. schedule.resume_reset_keep_cooldown is not: only a registry
+    continuation sets it (CONTINUE_ONLY_KINDS; launch's continuation_preflight checks the state's cooldown record before
+    renting), and neither are the list-valued continuation keys (the env word is comma-separated).
+    augment.background_min_row_s is retired (04_distill RETIRED_KEYS): neither a resume nor a continuation sets it."""
+    got = fr.parse_resume_sets(f"{RID}:schedule.deadline_cooldown=FALSE")
+    assert got == {RID: ["schedule.deadline_cooldown=false"]}
     assert "schedule.resume_reset_keep_cooldown" not in fr.RESUME_SET_KEYS + tuple(fr.RESUME_SET_KINDS)
     assert fr.resume_set_rule("schedule.resume_reset_keep_cooldown") == "true or false"  # a continuation's refusals
-    for bad, msg in ((f"{RID}:augment.background_min_row_s=-1", "background_min_row_s must be a number of seconds"),
-                     (f"{RID}:augment.background_min_row_s=inf", "background_min_row_s must be a number of seconds"),
+    assert "augment.background_min_row_s" not in fr.CONTINUE_SET_KEYS + tuple(fr.RESUME_SET_KINDS)
+    for bad, msg in ((f"{RID}:augment.background_min_row_s=3", "may change on a resume"),
+                     (f"{RID}:augment.background_min_row_s=0", "may change on a resume"),
                      (f"{RID}:schedule.resume_reset_keep_cooldown=true", "may change on a resume"),
                      (f"{RID}:schedule.resume_reset_keep_cooldown=1", "may change on a resume"),
                      (f"{RID}:schedule.deadline_cooldown=no", "deadline_cooldown must be true or false"),
@@ -414,8 +421,8 @@ def test_continue_set_text_spells_each_value_once():
             ("schedule.resume_reset_keep_cooldown", "False", "false"),
             ("augment.enabled", "true", "true"), ("augment.enabled", "True", "true"),
             ("schedule.epochs", 6, "6"), ("schedule.epochs", "06", "6"),
-            ("augment.background_min_row_s", 3.0, "3.0"), ("augment.background_min_row_s", 3, "3.0"),
-            ("augment.background_min_row_s", 0, "0.0"), ("augment.background_min_row_s", "3.0", "3.0"),
+            ("augment.truncate_min_row_s", 3.0, "3.0"), ("augment.truncate_min_row_s", 3, "3.0"),
+            ("augment.truncate_min_row_s", 0, "0.0"), ("augment.truncate_min_row_s", "3.0", "3.0"),
             ("augment.noise_p", 0.30, "0.3"), ("augment.noise_p", 1, "1.0"), ("augment.noise_p", 0, "0.0"),
             ("augment.noise_bank", "aug/musan-bg-v2", "aug/musan-bg-v2"),
             ("augment.rir_bank_sha256", sha.upper(), sha)):
@@ -468,15 +475,17 @@ def test_continue_set_text_spells_each_value_once():
     ("schedule.resume_reset_keep_cooldown", 1, r"keep_cooldown must be true or false, not '1'"),
     ("augment.noise_p", 1.5, r"noise_p must be a probability"),
     ("augment.noise_p", float("nan"), r"noise_p must be a probability"),
-    ("augment.background_min_row_s", -1, r"background_min_row_s must be a number of seconds >= 0"),
-    ("augment.background_min_row_s", True, r"background_min_row_s must be a number of seconds"),
-    ("augment.background_min_row_s", float("inf"), r"background_min_row_s must be a number of seconds"),
+    ("augment.truncate_min_row_s", -1, r"truncate_min_row_s must be a number of seconds >= 0"),
+    ("augment.truncate_min_row_s", True, r"truncate_min_row_s must be a number of seconds"),
+    ("augment.truncate_min_row_s", float("inf"), r"truncate_min_row_s must be a number of seconds"),
     ("augment.noise_bank", 12, r"noise_bank must be a relative data-repo path"),
     ("augment.noise_bank", "12", r"noise_bank must be a relative data-repo path"),  # JSON would read a number
     ("augment.noise_bank", None, r"noise_bank must be a relative data-repo path"),
     ("optim.lr", 0.001, r"'optim.lr' is not a key a continuation may set"),
     ("schedule.resume_reset", True, r"'schedule.resume_reset' is not a key a continuation may set"),
     ("augment.mix_snr_db", [0.0, 5.0], r"is not a key a continuation may set"),
+    ("augment.mix_p", 0.0, r"'augment.mix_p' is not a key a continuation may set"),  # retired (RETIRED_KEYS)
+    ("augment.background_min_row_s", 0.0, r"'augment.background_min_row_s' is not a key a continuation may set"),
 ])
 def test_continue_set_text_refuses(key, value, match):
     with pytest.raises(ValueError, match=match):
@@ -490,12 +499,12 @@ def test_continue_sets_in_the_sets_order():
                      "schedule.resume_reset_keep_cooldown": True, "_comment": "the gentle recipe",
                      "augment.noise_snr_db": [5.0, 20.0], "augment.speech_snr_db": [15, 25],
                      "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"],
-                     "augment.background_min_row_s": 3.0, "augment.speech_p": 0.3}}
+                     "augment.truncate_min_row_s": 3.0, "augment.speech_p": 0.3}}
     words = fr.continue_sets(cont)
     assert words == ["schedule.epochs=10", "schedule.deadline_cooldown=false",
                      "schedule.resume_reset_keep_cooldown=true", "augment.noise_snr_db=[5.0,20.0]",
                      "augment.speech_snr_db=[15.0,25.0]", "augment.gain_db=[-10.0,10.0]",
-                     'augment.codecs=["mp3","ulaw8k"]', "augment.background_min_row_s=3.0", "augment.speech_p=0.3"]
+                     'augment.codecs=["mp3","ulaw8k"]', "augment.truncate_min_row_s=3.0", "augment.speech_p=0.3"]
     # 04_distill's apply_set: key=value, the value json-parsed (a list / bool / number)
     assert [json.loads(w.partition("=")[2]) for w in words][:5] == [10, False, True, [5.0, 20.0], [15.0, 25.0]]
     assert fr.continue_sets(dict(cont, sets={})) == []
@@ -923,8 +932,7 @@ COOL_RID = "full-p01-20261001T184145Z"
 CONT_P01 = {"box": "p01", "run_id": COOL_RID, "from_step": 86328, "to_step": 107910, "resets_before": 1,
             "sets": {"schedule.epochs": 4, "schedule.deadline_cooldown": False, "augment.enabled": True,
                      "augment.noise_snr_db": [0.0, 20.0], "augment.speech_snr_db": [10.0, 25.0],
-                     "augment.gain_db": [-20.0, 10.0], "augment.codecs": ["mp3", "gsm", "ulaw8k"],
-                     "augment.background_min_row_s": 0.0}}
+                     "augment.gain_db": [-20.0, 10.0], "augment.codecs": ["mp3", "gsm", "ulaw8k"]}}
 
 
 def with_cool(reg: dict, **changes) -> dict:
@@ -951,7 +959,7 @@ def test_a_continuation_box_validates_and_lists_its_continuations(tmp_path, reg)
     assert fr.continue_sets(fr.continues_of("full-t", loaded)["full-p01"]) == [
         "schedule.epochs=4", "schedule.deadline_cooldown=false", "augment.enabled=true",
         "augment.noise_snr_db=[0.0,20.0]", "augment.speech_snr_db=[10.0,25.0]", "augment.gain_db=[-20.0,10.0]",
-        'augment.codecs=["mp3","gsm","ulaw8k"]', "augment.background_min_row_s=0.0"]
+        'augment.codecs=["mp3","gsm","ulaw8k"]']
     with pytest.raises(fr.RegistryError, match="'p005' is not in the registry"):
         fr.continues_of("p005", loaded)
     # comments are allowed in the block and in its sets, and the sets' comments are no --set words
@@ -992,7 +1000,9 @@ CONT_RULES = {
     "sets a bad int": (_set(**{"schedule.epochs": 0}), r"continues.sets: schedule.epochs must be an int >= 1, not "
                                                        r"'0'"),
     "sets a bad bool": (_set(**{"schedule.deadline_cooldown": "no"}), r"deadline_cooldown must be true or false"),
-    "sets a bad seconds": (_set(**{"augment.background_min_row_s": -3.0}), r"background_min_row_s must be a number"),
+    "sets a bad seconds": (_set(**{"augment.truncate_min_row_s": -3.0}), r"truncate_min_row_s must be a number"),
+    "sets a retired key": (_set(**{"augment.background_min_row_s": 0.0}), r"'augment.background_min_row_s' is not a "
+                                                                           r"key a continuation"),
     "sets a bad range": (_set(**{"augment.gain_db": [10.0, -10.0]}), r"continues.sets: augment.gain_db must be a "
                                                                      r"list \[low, high\]"),
     "sets a bad codec": (_set(**{"augment.codecs": ["mp3", "aac"]}), r"continues.sets: augment.codecs must be a "

@@ -379,16 +379,23 @@ def test_launch_full_argument_errors(full_launch, capsys):
                       (["--job", "label", "--scratch-repo", SCRATCH], "--scratch-repo: for --job full only"),
                       (["--job", "full", "--box", "p01", "--resume-set", "full-p01-20260927T120000Z:optim.lr=1"],
                        "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, "
-                       "augment.concat_p, augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, "
-                       "augment.noise_p, augment.noise_bank, augment.noise_bank_sha256, augment.speech_p, "
-                       "augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, augment.gain_p, augment.codec_p, "
-                       "augment.background_min_row_s, schedule.deadline_cooldown, augment.cut_keep_word, "
-                       "augment.guard_per_piece, augment.end_trim_voiced may change on a resume"),
+                       "augment.concat_p, augment.truncate_min_row_s, augment.end_trim_p, augment.noise_p, "
+                       "augment.noise_bank, augment.noise_bank_sha256, augment.speech_p, augment.reverb_p, "
+                       "augment.rir_bank, augment.rir_bank_sha256, augment.gain_p, augment.codec_p, "
+                       "schedule.deadline_cooldown, augment.cut_keep_word, augment.guard_per_piece, "
+                       "augment.end_trim_voiced may change on a resume"),
+                      # retired keys (04_distill RETIRED_KEYS): refused before renting, not by the trainer on the box
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:augment.mix_p=0.05"],
+                       "augment.end_trim_voiced may change on a resume"),
+                      (["--job", "full", "--box", "p01", "--resume-set",
+                        "full-p01-20260927T120000Z:augment.background_min_row_s=3"],
+                       "augment.end_trim_voiced may change on a resume"),
                       # DECISIONS H14: only a registry continuation keeps an early-stop cooldown (continuation_preflight
                       # checks the state's record before renting; no env resume set does)
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:schedule.resume_reset_keep_cooldown=true"],
-                       "augment.background_min_row_s, schedule.deadline_cooldown, augment.cut_keep_word, "
+                       "augment.codec_p, schedule.deadline_cooldown, augment.cut_keep_word, "
                        "augment.guard_per_piece, augment.end_trim_voiced may change on a resume"),
                       (["--job", "full", "--box", "p01", "--resume-set",
                         "full-p01-20260927T120000Z:augment.noise_bank=../bank"],
@@ -493,12 +500,13 @@ def test_the_recipe_test_flags_reach_the_box_env_in_one_spelling(full_launch, ca
     """DECISIONS H1: the recipe test box re-runs box 1's cooldown with the augmentation on - launch's reset and five
     sets of one run, typed in loose spellings, reach the box as one KITSUNE_RESUME_SETS word in the normalised spelling
     (fullrun.resume_set_value: the trainer's --set parses JSON, so "True" must arrive as true), which parses back to
-    the same list; the preflight sees the normalised sets too."""
+    the same list; the preflight sees the normalised sets too. Its weak mix (augment.mix_p 0.05, DECISIONS H4) is
+    retired (04_distill RETIRED_KEYS): recipe v3's end trim takes its place."""
     rid = "full-p01-20261001T184145Z"
     loose = ["schedule.epochs=04", "augment.enabled=True", "augment.truncate_p=.3", "augment.concat_p=0.50",
-             "augment.mix_p=.05"]
+             "augment.end_trim_p=.30"]
     want = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
-            "augment.mix_p=0.05"]  # weak mix: DECISIONS H4
+            "augment.end_trim_p=0.3"]
     rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
                            rid, *sum((["--resume-set", f"{rid}:{s}"] for s in loose), []), "--yes")
     out = capsys.readouterr().out
@@ -518,10 +526,10 @@ def test_the_p_test_box_flags_reach_the_box_env_in_one_spelling(full_launch, cap
     and parse back to the same list."""
     rid, sha = "full-p01-20261001T184145Z", "89abcdef" * 8
     loose = ["schedule.epochs=4", "augment.enabled=TRUE", "augment.truncate_p=.2", "augment.concat_p=0.5",
-             "augment.mix_p=0", "augment.truncate_min_row_s=3", "augment.end_trim_p=0.30", "augment.noise_p=.3",
+             "augment.truncate_min_row_s=3", "augment.end_trim_p=0.30", "augment.noise_p=.3",
              "augment.noise_bank=aug/musan-bg-v1", f"augment.noise_bank_sha256={sha.upper()}"]
     want = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.2", "augment.concat_p=0.5",
-            "augment.mix_p=0.0", "augment.truncate_min_row_s=3.0", "augment.end_trim_p=0.3", "augment.noise_p=0.3",
+            "augment.truncate_min_row_s=3.0", "augment.end_trim_p=0.3", "augment.noise_p=0.3",
             "augment.noise_bank=aug/musan-bg-v1", f"augment.noise_bank_sha256={sha}"]
     rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "p01", "--scratch-repo", SCRATCH, "--resume-reset",
                            rid, *sum((["--resume-set", f"{rid}:{s}"] for s in loose), []), "--yes")
@@ -547,10 +555,10 @@ def test_augment_sets_are_refused_for_a_box_without_a_ctc_trainer(full_launch, r
     rid = "full-t06-20261003T000000Z"
     rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "full-t", "--scratch-repo", SCRATCH, "--resume-reset",
                            rid, "--resume-set", f"{rid}:schedule.epochs=4", "--resume-set",
-                           f"{rid}:augment.enabled=true", "--resume-set", f"{rid}:augment.mix_p=0.2", "--yes")
+                           f"{rid}:augment.enabled=true", "--resume-set", f"{rid}:augment.speech_p=0.2", "--yes")
     out = capsys.readouterr().out
     assert rc == 1 and created(fake) is None, out
-    assert ("--resume-set augment.enabled, augment.mix_p: box full-t trains no CTC student (its train items' "
+    assert ("--resume-set augment.enabled, augment.speech_p: box full-t trains no CTC student (its train items' "
             "families: aed), and augment.* resume sets are the CTC family's") in out
     rc, fake = full_launch([[offer(1, 70001, 0.81)]], "--box", "full-t", "--scratch-repo", SCRATCH, "--resume-reset",
                            rid, "--resume-set", f"{rid}:schedule.epochs=4", "--dry-run")
@@ -973,8 +981,7 @@ RID03, RID005 = "full-p03-20261003T230143Z", "full-p005-20261008T160232Z"
 # it keeps)
 COOL = {"full-p03": (RID03, "full-p", 169376, 211720), "full-p005": (RID005, "p005", 67449, 80939)}
 GENTLE = {"schedule.epochs": 10, "schedule.deadline_cooldown": False, "schedule.resume_reset_keep_cooldown": True,
-          "augment.noise_snr_db": [5.0, 20.0], "augment.codecs": ["mp3", "ulaw8k"],
-          "augment.background_min_row_s": 3.0, "augment.noise_bank": "aug/bank-v1",
+          "augment.noise_snr_db": [5.0, 20.0], "augment.codecs": ["mp3", "ulaw8k"], "augment.noise_bank": "aug/bank-v1",
           "augment.noise_bank_sha256": "AB" * 32}
 COOL_SETS = {"full-p03": {"schedule.epochs": 6, "schedule.deadline_cooldown": False}, "full-p005": GENTLE}
 

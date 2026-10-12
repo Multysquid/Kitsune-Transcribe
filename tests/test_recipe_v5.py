@@ -802,16 +802,18 @@ def test_the_keys_are_resume_sets():
 
 
 def test_recipe_v5():
-    """RECIPE_V5 = recipe v4 with the trainer's defaults of its ranges and short-row guard written out (as a
-    continuation's recipe it inherits none from the state it resumes) and the three fixes on, proposed for the next run
-    (DECISIONS pending): no full run or generated config uses it whole - full-t06 alone names two of its keys,
-    guard_per_piece and end_trim_voiced, on (RECIPE_AED_H15, DECISIONS H15), cut_keep_word left at the default false;
-    every key is one a continuation may set; it loads on a CTC student's config and on an AED one's (its cut table
-    kept), its retired keys (mix_p and background_min_row_s at 0: RETIRED_KEYS) dropped."""
+    """RECIPE_V5 = recipe v4 less its mix_p (retired: RETIRED_KEYS) with the trainer's defaults of its ranges written
+    out (as a continuation's recipe it inherits none from the state it resumes) and the three fixes on, proposed for
+    the next run (DECISIONS pending): no full run or generated config uses it whole - full-t06 alone names two of its
+    keys, guard_per_piece and end_trim_voiced, on (RECIPE_AED_H15, DECISIONS H15), cut_keep_word left at the default
+    false; every key is one a continuation may set, none a retired one; it loads on a CTC student's config and on an
+    AED one's (its cut table kept)."""
     ranges = {"noise_snr_db": [0.0, 20.0], "speech_snr_db": [10.0, 25.0], "gain_db": [-20.0, 10.0],
-              "codecs": ["mp3", "gsm", "ulaw8k"], "background_min_row_s": 0.0}
-    assert M.RECIPE_V5 == dict(M.RECIPE_V4, **ranges, cut_keep_word=True, guard_per_piece=True, end_trim_voiced=True)
-    assert list(M.RECIPE_V5) == [*M.RECIPE_V4, *ranges, *FIXES]  # recipe v4's keys first, in its order
+              "codecs": ["mp3", "gsm", "ulaw8k"]}
+    v4 = {k: v for k, v in M.RECIPE_V4.items() if k != "mix_p"}
+    assert M.RECIPE_V4["mix_p"] == 0.0 and M.RECIPE_V5 == dict(v4, **ranges, cut_keep_word=True, guard_per_piece=True,
+                                                                 end_trim_voiced=True)
+    assert list(M.RECIPE_V5) == [*v4, *ranges, *FIXES]  # recipe v4's keys first, in its order
     assert all(r["augment"] is not M.RECIPE_V5 for r in M.FULL_RUNS.values())
     sets = {f"augment.{k}": v for k, v in M.RECIPE_V5.items()}
     assert set(sets) <= set(fr.CONTINUE_SET_KEYS) and len(fr.continue_sets({"sets": sets})) == len(sets)
@@ -819,8 +821,8 @@ def test_recipe_v5():
     full = ROOT / "configs" / "full"
     sets = [f"augment.{k}={json.dumps(v)}" for k, v in M.RECIPE_V5.items()]
     c = m.load_config(str(full / "full-p01.json"), sets)
-    live = {k: v for k, v in M.RECIPE_V5.items() if f"augment.{k}" not in m.RETIRED_KEYS}
-    assert c["augment"] == dict(m.DEFAULTS["augment"], **live) and len(live) < len(M.RECIPE_V5)
+    assert not {f"augment.{k}" for k in M.RECIPE_V5} & set(m.RETIRED_KEYS)
+    assert c["augment"] == dict(m.DEFAULTS["augment"], **M.RECIPE_V5)
     t = m.load_config(str(full / "full-t06.json"), sets)
     assert not m.is_ctc(t) and t["augment"]["cuts"] == M.AED_CUTS and all(t["augment"][k] is True for k in FIXES)
     blocks = {name: json.loads((full / f"{name}.json").read_text(encoding="utf-8")).get("augment") or {}

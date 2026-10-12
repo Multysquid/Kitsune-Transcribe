@@ -185,23 +185,21 @@ ITEM_RE = r"^[a-z0-9][a-z0-9.-]*$"
 # the step plan (scripts/04_distill.py RESUME_FIXED holds none of them: augment.* happens inside the train loader), so
 # a resume keeps its epoch position; 04_distill validates every value again on the box (validate: epochs, bools;
 # validate_augment: the probabilities, and an AED student's cut table, augment.cuts - its config's, never a set).
-# augment.mix_p and augment.background_min_row_s are retired (04_distill RETIRED_KEYS: the trainer drops them at 0 and
-# refuses any other value - on the box, after the paid boot); they stay in both tables only while box p-cool's
-# registry continuations spell them, and leave them with that box
+# Mixing and the background's short-row guard (augment.mix_p, augment.background_min_row_s) are retired (04_distill
+# RETIRED_KEYS refuses any value but 0), so neither is a set
 RESUME_SET_KEYS = ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
-                   "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s", "augment.end_trim_p",
-                   "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256", "augment.speech_p",
-                   "augment.reverb_p", "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p",
-                   "augment.codec_p", "augment.background_min_row_s", "schedule.deadline_cooldown",
-                   "augment.cut_keep_word", "augment.guard_per_piece", "augment.end_trim_voiced")
+                   "augment.concat_p", "augment.truncate_min_row_s", "augment.end_trim_p", "augment.noise_p",
+                   "augment.noise_bank", "augment.noise_bank_sha256", "augment.speech_p", "augment.reverb_p",
+                   "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p", "augment.codec_p",
+                   "schedule.deadline_cooldown", "augment.cut_keep_word", "augment.guard_per_piece",
+                   "augment.end_trim_voiced")
 RESUME_SET_INT_MIN = {"schedule.epochs": 1, "early_stop.patience": 1}
 RESUME_SET_KINDS = {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
-                    "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
-                    "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob", "augment.noise_p": "prob",
-                    "augment.noise_bank": "path", "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob",
-                    "augment.reverb_p": "prob", "augment.rir_bank": "path", "augment.rir_bank_sha256": "sha256",
-                    "augment.gain_p": "prob", "augment.codec_p": "prob", "augment.background_min_row_s": "seconds",
-                    "schedule.deadline_cooldown": "bool", "augment.cut_keep_word": "bool",
+                    "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.truncate_min_row_s": "seconds",
+                    "augment.end_trim_p": "prob", "augment.noise_p": "prob", "augment.noise_bank": "path",
+                    "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob", "augment.reverb_p": "prob",
+                    "augment.rir_bank": "path", "augment.rir_bank_sha256": "sha256", "augment.gain_p": "prob",
+                    "augment.codec_p": "prob", "schedule.deadline_cooldown": "bool", "augment.cut_keep_word": "bool",
                     "augment.guard_per_piece": "bool", "augment.end_trim_voiced": "bool"}
 # the codecs a continuation's augment.codecs may name: a copy of kitsune.acoustics.CODECS (numpy at import, so it is
 # not imported here; tests/test_fullrun.py holds the two equal)

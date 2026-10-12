@@ -226,11 +226,9 @@ COOL_RUNS = {"full-p03": ("full-p", "full-p03-20261003T230143Z", 16, 20, 0, 1, F
 # the two recipes' explicit ranges as H14's continues sets spelled them (a milder one, and recipe v4's at the trainer's
 # defaults)
 COOL_GENTLE = {"augment.noise_snr_db": [5.0, 20.0], "augment.speech_snr_db": [15.0, 25.0],
-               "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"],
-               "augment.background_min_row_s": 3.0}
+               "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"]}
 COOL_V4_FULL = {"augment.noise_snr_db": [0.0, 20.0], "augment.speech_snr_db": [10.0, 25.0],
-                "augment.gain_db": [-20.0, 10.0], "augment.codecs": ["mp3", "gsm", "ulaw8k"],
-                "augment.background_min_row_s": 0.0}
+                "augment.gain_db": [-20.0, 10.0], "augment.codecs": ["mp3", "gsm", "ulaw8k"]}
 
 
 def cool_continues(name: str) -> dict:
