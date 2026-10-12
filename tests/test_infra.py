@@ -1166,7 +1166,7 @@ def test_supervise_steps_aside_when_another_supervisor_runs(tmp_path, monkeypatc
 
 
 def test_supervise_waits_for_a_lock_a_bootstrap_leftover_still_holds(tmp_path, monkeypatch, capsys):
-    """Box p01-chain, 2026-10-01: a train_hb toucher's `sleep 60` that outlived bootstrap still held onstart's
+    """Box 53693389, 2026-10-01: a train_hb toucher's `sleep 60` that outlived bootstrap still held onstart's
     supervise.lock when onstart exec'd the supervisor, which refused at once and left the box idle. The supervisor now
     polls the lock (every LOCK_POLL_S, up to LOCK_WAIT_S, logged once) and runs once the leftover is gone."""
     calls = []
@@ -1447,7 +1447,7 @@ def finish_env(tmp_path, monkeypatch):
     monkeypatch.setattr(finish, "STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
     monkeypatch.setattr(finish, "vast_cli", lambda action: pytest.fail("CLI fallback must not be needed"))
-    for var in ("KITSUNE_OUT_REPO", "CONTAINER_ID", "CONTAINER_API_KEY", "KITSUNE_JOB", "KITSUNE_CHAIN_STAGE"):
+    for var in ("KITSUNE_OUT_REPO", "CONTAINER_ID", "CONTAINER_API_KEY", "KITSUNE_JOB"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("KITSUNE_BOX", "p01")
 
@@ -1558,7 +1558,7 @@ def test_finish_infra_upload_redacts_the_portal_secrets(tmp_path, monkeypatch):
 
 def test_hub_forbidden_dirs_mirror_huggingface_hub():
     """finish stays stdlib-only, so HUB_FORBIDDEN_DIRS mirrors the pinned huggingface_hub's FORBIDDEN_FOLDERS; a bump
-    that adds a rule fails here, not on a box (box 53693389 lost its chain infra commit to a .cache/ path)."""
+    that adds a rule fails here, not on a box (box 53693389 lost its infra commit to a .cache/ path)."""
     from huggingface_hub import CommitOperationAdd
     from huggingface_hub.utils import _paths
 

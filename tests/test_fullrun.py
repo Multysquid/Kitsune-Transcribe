@@ -28,7 +28,7 @@ RID = "full-p03-20260927T120000Z"
 def test_constants_exact_values():
     assert fr.JOB == "full"
     assert (fr.BOXES_FILE, fr.ENV_REGISTRY) == ("configs/full/boxes.json", "KITSUNE_FULL_REGISTRY")
-    assert fr.BOX_NAMES == ("full-smoke", "p01", "smoke-b", "full-t", "full-p", "p005", "p-cool")
+    assert fr.BOX_NAMES == ("full-smoke", "p01", "smoke-b", "full-t", "full-p", "p005")
     assert fr.HUB_DIR == "full" and fr.STATE_DEFAULT == "/workspace/kitsune_state"
     assert (fr.TRAIN_HB, fr.HB_DIR, fr.RESUME_PLAN, fr.VERDICT_FILE, fr.ALERTS_FILE, fr.GATE_FILE, fr.SUMMARY_FILE,
             fr.DEADLINE_FILE) == ("train_hb", "hb", "resume_plan.json", "smoke_verdict.json",
@@ -272,7 +272,7 @@ def test_parse_resume_sets():
 
 
 RECIPE_SETS = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
-               "augment.mix_p=0.05"]  # DECISIONS H1, H4: the recipe test box's sets (make_full_configs CONTINUATIONS)
+               "augment.mix_p=0.05"]  # DECISIONS H1, H4: the recipe test box's sets (its launch --resume-set values)
 
 
 def test_parse_resume_sets_types_and_normalises_each_value():
@@ -918,7 +918,8 @@ def test_speed_sources_that_pass(tmp_path, reg):
     assert _problems(reg, tmp_path) == []
 
 
-# a continuation box built on the tiny registry: box p01's run re-run from its pre_cooldown state (H14's p01 row)
+# a continuation box built on the tiny registry: box p01's run re-run from its pre_cooldown state (H14's p01 row), on
+# box full-t (a name the tiny registry leaves free; DECISIONS H14's box is retired)
 COOL_RID = "full-p01-20261001T184145Z"
 CONT_P01 = {"box": "p01", "run_id": COOL_RID, "from_step": 86328, "to_step": 107910, "resets_before": 1,
             "sets": {"schedule.epochs": 4, "schedule.deadline_cooldown": False, "augment.enabled": True,
@@ -928,12 +929,12 @@ CONT_P01 = {"box": "p01", "run_id": COOL_RID, "from_step": 86328, "to_step": 107
 
 
 def with_cool(reg: dict, **changes) -> dict:
-    """reg (a copy) plus box p-cool: box p01's items, its train item full-p01 continuing box p01's run (CONT_P01 with
-    `changes`)."""
+    """reg (a copy) plus the continuation box full-t: box p01's items, its train item full-p01 continuing box p01's
+    run (CONT_P01 with `changes`)."""
     reg = copy.deepcopy(reg)
     box = copy.deepcopy(reg["boxes"]["p01"])
     next(i for i in box["items"] if i["name"] == "full-p01")["continues"] = dict(copy.deepcopy(CONT_P01), **changes)
-    reg["boxes"]["p-cool"] = box
+    reg["boxes"]["full-t"] = box
     return reg
 
 
@@ -942,26 +943,22 @@ def test_a_continuation_box_validates_and_lists_its_continuations(tmp_path, reg)
     assert fr.registry_problems(cool, root=tmp_path) == []
     loaded = fr.load_registry(cool, root=tmp_path)
     assert fr.load_registry(loaded, root=tmp_path) == loaded  # the filled block validates again unchanged
-    assert fr.train_items("p-cool", loaded)[0]["continues"] == CONT_P01
+    assert fr.train_items("full-t", loaded)[0]["continues"] == CONT_P01
     assert fr.train_items("p01", loaded)[0]["continues"] is None  # the default: a run of its own
-    assert fr.continues_of("p-cool", loaded) == {"full-p01": CONT_P01}
+    assert fr.continues_of("full-t", loaded) == {"full-p01": CONT_P01}
     assert fr.continues_of("p01", loaded) == {} and fr.continues_of("full-p", loaded) == {}
-    fr.continues_of("p-cool", loaded)["full-p01"]["sets"].clear()  # a copy
-    assert fr.continues_of("p-cool", loaded)["full-p01"] == CONT_P01
-    assert fr.continue_sets(fr.continues_of("p-cool", loaded)["full-p01"]) == [
+    fr.continues_of("full-t", loaded)["full-p01"]["sets"].clear()  # a copy
+    assert fr.continues_of("full-t", loaded)["full-p01"] == CONT_P01
+    assert fr.continue_sets(fr.continues_of("full-t", loaded)["full-p01"]) == [
         "schedule.epochs=4", "schedule.deadline_cooldown=false", "augment.enabled=true",
         "augment.noise_snr_db=[0.0,20.0]", "augment.speech_snr_db=[10.0,25.0]", "augment.gain_db=[-20.0,10.0]",
         'augment.codecs=["mp3","gsm","ulaw8k"]', "augment.background_min_row_s=0.0"]
-    from fixtures_chain import CHAIN_BOX, with_chain
-    chained = with_chain(cool)  # p01-chain runs box p01 (the source), never p-cool
-    assert fr.registry_problems(chained, root=tmp_path, check_files=False) == []
-    assert fr.continues_of(CHAIN_BOX, chained) == {}
-    with pytest.raises(fr.RegistryError, match="'full-t' is not in the registry"):
-        fr.continues_of("full-t", loaded)
+    with pytest.raises(fr.RegistryError, match="'p005' is not in the registry"):
+        fr.continues_of("p005", loaded)
     # comments are allowed in the block and in its sets, and the sets' comments are no --set words
     commented = with_cool(reg, _comment="H14", sets=dict(CONT_P01["sets"], _why="explicit ranges"))
     assert fr.registry_problems(commented, root=tmp_path) == []
-    assert fr.continue_sets(fr.continues_of("p-cool", commented)["full-p01"]) == fr.continue_sets(CONT_P01)
+    assert fr.continue_sets(fr.continues_of("full-t", commented)["full-p01"]) == fr.continue_sets(CONT_P01)
 
 
 def _set(**sets):
@@ -1001,8 +998,8 @@ CONT_RULES = {
                                                                      r"list \[low, high\]"),
     "sets a bad codec": (_set(**{"augment.codecs": ["mp3", "aac"]}), r"continues.sets: augment.codecs must be a "
                                                                      r"non-empty list of distinct codec names"),
-    "box its own": ({"box": "p-cool"}, r"continues.box 'p-cool' is the item's own box"),
-    "box not in the registry": ({"box": "full-t"}, r"continues.box 'full-t' is not a registry box"),
+    "box its own": ({"box": "full-t"}, r"continues.box 'full-t' is the item's own box"),
+    "box not in the registry": ({"box": "p005"}, r"continues.box 'p005' is not a registry box"),
     "box unknown": ({"box": "box-a"}, r"continues.box 'box-a' is not a registry box"),
     "box without the item": ({"box": "full-p"}, r"continues.box 'full-p' has no train item 'full-p01'"),
     "box with other train items": ({"box": "smoke-b"}, r"continues.box 'smoke-b' has no train item"),
@@ -1013,7 +1010,7 @@ CONT_RULES = {
 def test_each_continues_rule_is_refused(tmp_path, reg, name):
     change, match = CONT_RULES[name]
     cool = with_cool(reg)
-    item = next(i for i in cool["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")
+    item = next(i for i in cool["boxes"]["full-t"]["items"] if i["name"] == "full-p01")
     if isinstance(change, str):
         item["continues"].pop(change.partition(":")[2])
     elif "_whole" in change:
@@ -1021,12 +1018,12 @@ def test_each_continues_rule_is_refused(tmp_path, reg, name):
     else:
         item["continues"].update(copy.deepcopy(change))
     probs = _refused(cool, tmp_path, match)
-    assert all("p-cool.items.full-p01.continues" in p for p in probs), probs  # nothing else breaks
+    assert all("full-t.items.full-p01.continues" in p for p in probs), probs  # nothing else breaks
 
 
 def test_a_continuation_keeps_its_runs_config(tmp_path, reg):
     cool = with_cool(reg)
-    next(i for i in cool["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")["config"] = \
+    next(i for i in cool["boxes"]["full-t"]["items"] if i["name"] == "full-p01")["config"] = \
         "configs/full/full-p03.json"
     probs = _refused(cool, tmp_path, r"continues.box 'p01': its train item 'full-p01' trains config "
                                      r"'configs/full/full-p01.json', this one 'configs/full/full-p03.json'",
@@ -1039,28 +1036,14 @@ def test_a_continuation_box_continues_each_run_once(tmp_path, reg):
     p03 = {"name": "full-p03", "kind": "train", "config": "configs/full/full-p03.json", "study_run": "study-p03",
            "family": "ctc", "max_hours": 5.0, "needs": ["stores-ctc"],
            "continues": dict(copy.deepcopy(CONT_P01), box="full-p")}  # box full-p runs a full-p03 with that config
-    cool["boxes"]["p-cool"]["items"].append(p03)
-    probs = _refused(cool, tmp_path, rf"p-cool.items.full-p03.continues.run_id '{COOL_RID}' is continued by item "
-                                     rf"'full-p01' of box p-cool too: one item per run", check_files=False)
+    cool["boxes"]["full-t"]["items"].append(p03)
+    probs = _refused(cool, tmp_path, rf"full-t.items.full-p03.continues.run_id '{COOL_RID}' is continued by item "
+                                     rf"'full-p01' of box full-t too: one item per run", check_files=False)
     assert len(probs) == 1, probs
     p03["continues"]["run_id"] = "full-p03-20261003T230143Z"
     assert fr.registry_problems(cool, root=tmp_path, check_files=False) == []
-    assert list(fr.continues_of("p-cool", fr.load_registry(cool, root=tmp_path, check_files=False))) == [
+    assert list(fr.continues_of("full-t", fr.load_registry(cool, root=tmp_path, check_files=False))) == [
         "full-p01", "full-p03"]  # registry order
-
-
-def test_a_continues_box_is_never_a_chain_part(tmp_path, reg):
-    from fixtures_chain import CHAIN, CHAIN_BOX, with_chain
-    stages = copy.deepcopy(CHAIN["chain"])
-    stages[1]["parts"] = ["p-cool"]
-    chained = with_chain(with_cool(reg), chain=stages)
-    probs = _refused(chained, tmp_path, rf"boxes.{CHAIN_BOX}.chain\[1\]: part 'p-cool' has continues items "
-                                        r"\['full-p01'\]: a box that continues other boxes' runs runs alone",
-                     check_files=False)
-    assert len(probs) == 1, probs
-    # a chain box is no continuation's source either
-    _refused(with_chain(with_cool(reg, box=CHAIN_BOX)), tmp_path, rf"continues.box '{CHAIN_BOX}' is a chain box",
-             check_files=False)
 
 
 def test_malformed_registries_do_not_crash(tmp_path):
@@ -1320,22 +1303,21 @@ def test_cli_refusals(tmp_path, monkeypatch, capsys):
 def test_cli_has_continues(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("KITSUNE_FULL_REGISTRY", raising=False)
     monkeypatch.delenv("KITSUNE_BOX", raising=False)
-    monkeypatch.setenv("KITSUNE_CHAIN_STAGE", "x")  # a chain's stage is no business of has-continues
     root = ["--root", str(tmp_path)]
-    rc, _, err = _cli(["has-continues", "--box", "p-cool", *root], capsys)
+    rc, _, err = _cli(["has-continues", "--box", "full-t", *root], capsys)
     assert rc == 2 and "not in this checkout" in err  # no registry
     reg = with_cool(tiny_registry(tmp_path))
     (tmp_path / fr.BOXES_FILE).write_text(json.dumps(reg), encoding="utf-8")
-    assert _cli(["has-continues", "--box", "p-cool", *root], capsys) == (0, "1\n", "")
+    assert _cli(["has-continues", "--box", "full-t", *root], capsys) == (0, "1\n", "")
     assert _cli(["has-continues", "--box", "p01", *root], capsys) == (0, "0\n", "")
     assert _cli(["has-continues", "--box", "full-p", *root], capsys) == (0, "0\n", "")
-    monkeypatch.setenv("KITSUNE_BOX", "p-cool")  # bootstrap: --box from the env
+    monkeypatch.setenv("KITSUNE_BOX", "full-t")  # bootstrap: --box from the env
     assert _cli(["has-continues", *root], capsys) == (0, "1\n", "")
-    rc, out, err = _cli(["has-continues", "--box", "full-t", *root], capsys)
-    assert (rc, out) == (2, "") and "'full-t' is not in the registry" in err  # an unknown box
-    next(i for i in reg["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")["continues"]["from_step"] = 0
+    rc, out, err = _cli(["has-continues", "--box", "p005", *root], capsys)
+    assert (rc, out) == (2, "") and "'p005' is not in the registry" in err  # an unknown box
+    next(i for i in reg["boxes"]["full-t"]["items"] if i["name"] == "full-p01")["continues"]["from_step"] = 0
     (tmp_path / fr.BOXES_FILE).write_text(json.dumps(reg), encoding="utf-8")
-    rc, out, err = _cli(["has-continues", "--box", "p-cool", *root], capsys)
+    rc, out, err = _cli(["has-continues", "--box", "full-t", *root], capsys)
     assert (rc, out) == (2, "") and "from_step 0 is not an int > 0" in err  # a bad registry
     with pytest.raises(SystemExit) as e:
         fr.main(["has-continues", "--box", "box-a", *root])  # not a full box name
