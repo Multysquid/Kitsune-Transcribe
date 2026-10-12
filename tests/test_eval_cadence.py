@@ -947,9 +947,9 @@ def test_the_next_run_template_is_the_viability_runs_config_with_the_reports_cha
     DEFAULTS with early stopping on and its eval cadence (a greedy decode of 600 s of the probe, a mini eval every 500
     steps; git show 76b28a1:configs/viability.json) - with exactly the changes of the first run's report: micro-batches
     of 600 s as the memory probe's first choice, the epochs clock (8 epochs), a complete eval every 2 epochs with the
-    minis in between, verdict v2, the smoke profile on, the reference model left to be filled in. DEFAULTS keep the
-    first run's values (v1, the wall clock, 400 s, the profile on "auto"). Its schedule leaves verdict v2 the 3
-    pre-cooldown complete evals it needs, and its _comment pre-registers v2."""
+    minis in between, verdict v2, the smoke profile on, eval.reference null (the reference-model bar is retired).
+    DEFAULTS keep the first run's values (v1, the wall clock, 400 s, the profile on "auto"). Its schedule leaves verdict
+    v2 the 3 pre-cooldown complete evals it needs, and its _comment pre-registers v2."""
     m = load_script("04_distill")
 
     def leaves(d, where=""):
