@@ -6163,14 +6163,29 @@ def exit_process(rc: int):
     sys.exit(rc)
 
 
+def enable_faulthandler() -> bool:
+    """faulthandler for every thread on stderr's file descriptor, or on the process's own stderr when sys.stderr has
+    none (a test's capture: fileno() raises io.UnsupportedOperation); False, and nothing enabled, when neither has
+    one. On the box sys.stderr is the queue item's log file."""
+    for f in (sys.stderr, sys.__stderr__):
+        if f is None:
+            continue
+        try:
+            faulthandler.enable(file=f, all_threads=True)
+            return True
+        except (AttributeError, ValueError, OSError):  # io.UnsupportedOperation is both of the last two
+            continue
+    return False
+
+
 def run_script(argv=None):
     """The __main__ entry: exit_process(main()). main() re-raises a failure, which skipped exit_process: one it
     re-raised with an upload still running (_HARD_EXIT) is reported as the interpreter would (the traceback, or a
     SystemExit's message) and leaves by exit_process too, with EXIT_FAIL (a SystemExit's int code); finalizing with
     the upload's thread in hf_xet aborted the process (rc -6). Any other failure propagates as before. A native crash
-    prints every thread's Python stack to stderr first (faulthandler): box T's trainer died twice of SIGSEGV (rc -11,
-    2026-10-10) without a traceback."""
-    faulthandler.enable(all_threads=True)
+    prints every thread's Python stack to stderr first (enable_faulthandler): box T's trainer died twice of SIGSEGV
+    (rc -11, 2026-10-10) without a traceback."""
+    enable_faulthandler()
     try:
         rc = main(argv)
     except BaseException as e:

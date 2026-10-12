@@ -175,6 +175,8 @@ def test_a_crash_closes_the_logs_before_waiting_on_uploads(tmp_path, monkeypatch
     import time
     from types import SimpleNamespace
 
+    from kitsune import evaluate  # noqa: F401  make_summary's import (transformers: up to a minute cold): not timed
+
     m = load_script("04_distill")
     monkeypatch.setattr(m, "FAILED_UPLOAD_WAIT_S", 0.3)
     release, order = threading.Event(), []
@@ -264,6 +266,8 @@ def test_a_failure_with_an_upload_running_skips_finalization_too(tmp_path, monke
     import copy
     import threading
     from types import SimpleNamespace
+
+    from kitsune import evaluate  # noqa: F401  make_summary's import, cold, could outlast the stalled upload's 30 s
 
     m = load_script("04_distill")
     monkeypatch.setattr(m, "FAILED_UPLOAD_WAIT_S", 0.3)

@@ -1008,39 +1008,6 @@ def test_the_exit_trap_acts_in_bootstraps_own_process_only(tmp_path):
     assert not alive, "bootstrap's own exit stops the label pull"
 
 
-def toucher_script(tmp_path: Path, func: str) -> Path:
-    """beat_train_hb started and killed as phase does, with a `sleep` on PATH that notes its pid when the toucher calls
-    it (`sleep 60`) and then sleeps 60 s in place (exec): the script says whether that sleep outlived its toucher. The
-    killed sleep gets 20 s to go (a busy Git Bash took over 3 s), well short of the old toucher's 60 s sleep."""
-    fake = tmp_path / "bin"
-    fake.mkdir()
-    bash_script(fake / "sleep", "#!/bin/bash", '[ "$1" != 60 ] || { echo $$ >> "$SLEEP_PIDS"; set -- 60; }',
-                'exec "$REAL_SLEEP" "$@"')
-    pids = tmp_path / "sleep_pids"
-    return bash_script(
-        tmp_path / "toucher.sh", "set -euo pipefail", 'export REAL_SLEEP="$(command -v sleep)"',
-        f'fake="$(cd "{fake.as_posix()}" && pwd)"  # /d/... under Git Bash: PATH splits at the colon of D:/',
-        f'export SLEEP_PIDS="{pids.as_posix()}" PATH="$fake:$PATH"', 'chmod +x "$fake/sleep"',
-        f'STATE="{tmp_path.as_posix()}"', func,
-        "beat_train_hb 100 &", "hb=$!",
-        'for i in $(seq 200); do [ -s "$SLEEP_PIDS" ] && break; "$REAL_SLEEP" 0.05; done',
-        'kill "$hb"; wait "$hb" || true', 'p=$(head -1 "$SLEEP_PIDS")',
-        'for i in $(seq 400); do kill -0 "$p" 2>/dev/null || { echo "sleep gone"; exit 0; }; "$REAL_SLEEP" 0.05; done',
-        'kill "$p"; echo "sleep outlived its toucher"')
-
-
-def test_a_toucher_takes_its_sleep_with_it(tmp_path):
-    """phase kills its train_hb toucher, not the toucher's child: a `sleep 60` left behind kept onstart's supervise.lock
-    (fd 7) up to a minute after bootstrap, and supervise.py, started right then, refused to run. The toucher now sleeps
-    in the background and kills that sleep when it is killed (the old toucher fails this under Git Bash and Linux)."""
-    bash = find_bash()
-    if bash is None:
-        pytest.skip("bash not available")
-    script = toucher_script(tmp_path, bootstrap_funcs("beat_train_hb"))
-    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=120)
-    assert r.returncode == 0 and "sleep gone" in r.stdout, r.stdout + r.stderr
-
-
 def test_nothing_of_bootstraps_holds_onstarts_supervise_lock():
     """onstart's detached subshell holds supervise.lock (fd 7) while bootstrap runs and closes it right before it execs
     supervise.py: bootstrap runs with fd 7 closed, and bootstrap closes it itself before its first command (for a
@@ -1202,6 +1169,36 @@ def test_linux_onstarts_exit_trap_unlocks_in_onstart_only(tmp_path):
         f'flock -n "{lock}" true && echo "SIGTERM exit: unlocked"')
     r = run_linux(driver)
     assert "normal exit: unlocked" in r.stdout and "SIGTERM exit: unlocked" in r.stdout, r.stdout + r.stderr
+
+
+def toucher_script(tmp_path: Path, func: str) -> Path:
+    """beat_train_hb started and killed as phase does, under Linux bash, with a `sleep` on PATH that notes its pid when
+    the toucher calls it (`sleep 60`) and then sleeps 60 s in place (exec): the script says whether that sleep outlived
+    its toucher. The killed sleep gets 20 s to go, well short of the old toucher's 60 s sleep."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    bash_script(fake / "sleep", "#!/bin/bash", '[ "$1" != 60 ] || { echo $$ >> "$SLEEP_PIDS"; set -- 60; }',
+                'exec "$REAL_SLEEP" "$@"')
+    pids = tmp_path / "sleep_pids"
+    return bash_script(
+        tmp_path / "toucher.sh", "set -euo pipefail", 'export REAL_SLEEP="$(command -v sleep)"',
+        f'fake="{linux_path(fake)}"', f'export SLEEP_PIDS="{linux_path(pids)}" PATH="$fake:$PATH"',
+        'chmod +x "$fake/sleep"', f'STATE="{linux_path(tmp_path)}"', func,
+        "beat_train_hb 100 &", "hb=$!",
+        'for i in $(seq 200); do [ -s "$SLEEP_PIDS" ] && break; "$REAL_SLEEP" 0.05; done',
+        'kill "$hb"; wait "$hb" || true', 'p=$(head -1 "$SLEEP_PIDS")',
+        'for i in $(seq 400); do kill -0 "$p" 2>/dev/null || { echo "sleep gone"; exit 0; }; "$REAL_SLEEP" 0.05; done',
+        'kill "$p"; echo "sleep outlived its toucher"')
+
+
+def test_linux_a_toucher_takes_its_sleep_with_it(tmp_path):
+    """phase kills its train_hb toucher, not the toucher's child: a `sleep 60` left behind kept onstart's supervise.lock
+    (fd 7) up to a minute after bootstrap, and supervise.py, started right then, refused to run. The toucher now sleeps
+    in the background and kills that sleep when it is killed (the old toucher fails this). Under Linux bash only - the
+    boxes' bash: Git Bash's emulated signals lose the trap's kill, as with the test below (PR #41), so there it tested
+    MSYS's signal emulation, not the toucher."""
+    r = run_linux(toucher_script(tmp_path, bootstrap_funcs("beat_train_hb")), timeout=120)
+    assert r.returncode == 0 and "sleep gone" in r.stdout, r.stdout + r.stderr
 
 
 def toucher_term_script(path: Path, trap: str) -> Path:
