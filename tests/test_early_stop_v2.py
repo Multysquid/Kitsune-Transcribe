@@ -821,6 +821,43 @@ def test_the_resume_reset_takes_a_new_patience(env, monkeypatch):
     assert len(events(run, "resume_reset")) == 1
 
 
+def test_a_resume_reset_drops_a_retired_mode_the_state_holds(env):
+    """Box p-cool's cooldown re-runs (DECISIONS H14) trained P-0.3B and P-0.05B with the short-row guard
+    augment.background_min_row_s 3.0, retired since (RETIRED_KEYS), and their states on the runs repo still hold it,
+    the pre_cooldown ones too. From such a state a plain resume is refused (the run would go on without the mode), a
+    --set of the key at its off value too; the queue's resume_check reads its store; a resume reset continues from it
+    without the mode (a `retired_keys_dropped` event names it), and every state saved after it lacks the key."""
+    m = load_script("04_distill")
+    over = {"subset": {"train_audio_s": 24, "eval_audio_s": 4},
+            "schedule": {"clock": "epochs", "epochs": 2, "warmup_steps": 300, "cooldown_frac": 0.5, "max_steps": None},
+            "batch": {"step_audio_s": 4, "micro_audio_s": 3, "pool_micro": 4},
+            "eval": {"every_steps": None, "every_min": None, "probe_is_train": True,
+                     "dev": {"every_steps": 1, "per_source": 3}},
+            "early_stop": rule(patience=2, min_delta_abs=FLAT)}
+    path = write_config(env, "held", over)
+    assert m.main(["--config", path]) == 0
+    run = one_run(env["root"], "held")
+    assert summary(run)["end_reason"] == "early_stop"
+    for d in (run / "checkpoints").glob("full_step_*"):  # as box p-cool's re-runs saved them
+        state = torch.load(d / "trainer.pt", map_location="cpu", weights_only=True)
+        state["cfg"]["augment"]["background_min_row_s"] = 3.0
+        torch.save(state, d / "trainer.pt")
+    pc = run / "checkpoints" / "full_step_3"
+    for extra in ([], ["--set", "augment.background_min_row_s=0.0"]):
+        with pytest.raises(SystemExit, match="background_min_row_s"):
+            m.main(["--config", path, "--resume", str(pc), *extra])
+    assert m.resume_check(run)["ok"] is True
+
+    flag = ["--set", "schedule.resume_reset=true", "--set", "schedule.epochs=3", "--set", "early_stop.enabled=false"]
+    assert m.main(["--config", path, "--resume", str(pc), *flag]) == 0
+    (ev,) = events(run, "retired_keys_dropped")
+    assert ev["keys"] == {"augment.background_min_row_s": 3.0} and ev["at_step"] == 3
+    s = summary(run)
+    assert s["status"] == "complete" and s["resume_resets"] == 1 and s["steps"] > 5
+    after = [p for p in (run / "checkpoints").glob("full_step_*") if int(p.name.rsplit("_", 1)[1]) > 3]
+    assert after and all("background_min_row_s" not in trainer_json(run, p.name)["cfg"]["augment"] for p in after)
+
+
 class FakeScratch:
     """A ScratchUploader as the trainer's loop sees it, without a Hub: no timed state goes anywhere (the runs here set
     no ckpt.upload_full_every_min), it only makes the run one with timed states (save_full's pre_cooldown restate)."""

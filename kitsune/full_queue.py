@@ -924,7 +924,8 @@ class FullQueue(Q.Queue):
                 it["check_resume"] = "refused"
                 self._fault_failed(name)
                 self._end(name, "failed", "item_failed", reason="check-resume refused the pulled state (the store's "
-                                                                "planner fingerprint or size differs)")
+                                                                "planner fingerprint or size differs, or the trainer "
+                                                                "refuses its config: the item's log)")
                 return False
             else:
                 return self._hold(name, f"check-resume exit {rc}")
@@ -2245,11 +2246,14 @@ def build_stores(config: str, sets: list[str], eval_only: bool = False) -> int:
 
 def check_resume(run_dir: str) -> int:
     """The trainer's resume_check on a pulled run dir (CPU): 0 the store matches its newest state; 3 the planner
-    fingerprint or the number of utterances differs (the item fails, no retry); 1 the store is not built yet or
-    anything else (retried)."""
+    fingerprint or the number of utterances differs, or the trainer refuses the state's config (a SystemExit; the item
+    fails, no retry); 1 the store is not built yet or anything else (retried)."""
     try:
         D = Q._load_trainer()
         res = D.resume_check(Path(run_dir))
+    except SystemExit as e:  # the trainer's refusal (an unknown config key): the same on every try
+        print(f"check-resume: refused: {e}", flush=True)
+        return EXIT_REFUSED
     except Exception as e:  # noqa: BLE001  retryable
         print(f"check-resume: {type(e).__name__}: {e}", flush=True)
         return EXIT_FAIL

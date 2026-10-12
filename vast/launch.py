@@ -200,7 +200,9 @@ SPEED_RECORD_BOXES = ("full-t", "p005")
 # DECISIONS H14's cooldown re-runs (2026-10-09, box p-cool, retired with its registry entry): each wrote into its source
 # box's run dir and over its final export, so these runs' heads on the runs repo are the re-runs, not the released
 # models (P-0.3B 61afd417, P-0.1B c4604304, P-0.05B d2caddfc). resume_preflight's guard (d) reads them as it read
-# p-cool's continues blocks: a resume of box full-p, p01 or p005 over one of them needs --allow-continued-runs
+# p-cool's continues blocks: a resume of box full-p, p01 or p005 over one of them needs --allow-continued-runs. P-0.3B's
+# and P-0.05B's re-runs trained with the retired augment.background_min_row_s 3.0, which their states (the pre_cooldown
+# ones too) still hold: the trainer continues from them only with a --resume-reset (04_distill retired_held)
 RETIRED_CONTINUATIONS = {"full-p03-20261003T230143Z": "p-cool", "full-p01-20261001T184145Z": "p-cool",
                          "full-p005-20261008T160232Z": "p-cool"}
 # a vast instance in one of these states holds (or is about to hold) a host: a second box of a continuation box, or

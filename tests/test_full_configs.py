@@ -271,6 +271,16 @@ def test_a_config_is_its_study_run_but_for_the_contract_keys(x):
         assert c["loss"].get("w_ctc") == (0.8 if x.startswith("p") else None)  # the AED study config leaves it out
 
 
+def test_a_from_scratch_study_run_is_refused():
+    """The size study's from-scratch runs (T-0.1B, its replicate, T-0.05B, the bridge) trained BatchNorm and an aux-CTC
+    head, modes the trainer no longer has: run_config builds no config for them."""
+    scratch = sorted(r for r, spec in prereg.RUNS.items() if spec["init_class"] == "scratch")
+    assert scratch == ["study-bridge", "study-t005", "study-t01", "study-t01-s1235"]
+    for run in scratch:
+        with pytest.raises(ValueError, match="retired modes"):
+            S.run_config(run)
+
+
 def test_the_section_7_table():
     """Contract 7's table with the boxes' epochs now (DECISIONS G1, confirmed by the owner on 2026-10-02: T-0.6B 3,
     P-0.3B 3, P-0.05B 5, the 10-epoch request withdrawn; P-0.3B 6 since H5, T-0.6B 8 under H7 and 6 since H15,

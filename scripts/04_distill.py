@@ -188,7 +188,9 @@ sha256, as its store build hashed it) and started_utc (the run's first start).
 Retired keys (RETIRED_KEYS): the size study's LR probe, T/2 branch and calibration runs, the laptop's host-memory
 optimizer (optim.offload), eval.gate false and the augmentation's mix, quiet pads and background_min_row_s are gone; a
 config may still spell their keys at the values that left them off (every saved run config and configs/full/*.json
-do), never at another.
+do), never at another. The one exception is a saved state that holds one on: box p-cool's re-runs of P-0.3B and
+P-0.05B trained with background_min_row_s 3.0, and only a resume reset continues from their states, without it
+(retired_held).
 
 Test hook: the environment variable KITSUNE_CRASH_AT_STEP=<n> raises a RuntimeError just before step n (exercises
 the crash path and --resume; it lives in the environment so a resumed run does not inherit it from the config).
@@ -597,7 +599,9 @@ DEFAULTS = {
 # truncate_pad_p, end_pad_p, pad_frames, background_min_row_s), none of which a released model trained with. Every
 # saved run config (runs/<run_id>/config.json, trainer.pt) holds the DEFAULTS of its day, and so do the byte-pinned
 # configs/full/*.json: _merge and apply_set drop such a key when it holds this value (a block: every key of it) and
-# refuse any other, so those configs still load for a resume or a readout while no config can turn a mode back on
+# refuse any other, so those configs still load for a resume or a readout while no config can turn a mode back on.
+# The exception: the states of box p-cool's cooldown re-runs of P-0.3B and P-0.05B (DECISIONS H14) hold
+# background_min_row_s 3.0, and only a resume reset takes them (retired_held)
 RETIRED_KEYS = {
     "branch": {"parent": None, "resume_frac": 0.4, "end_frac": 0.5},
     "lr_probe": {"enabled": False},
@@ -704,6 +708,26 @@ def retired(key: str, value) -> bool:
         if not k.startswith("_"):
             retired(f"{key}.{k}", v)
     return True
+
+
+def retired_held(cfg: dict, where: str = "") -> dict:
+    """The retired keys (RETIRED_KEYS) a saved state's config holds at a value other than the one that left their mode
+    off, {dotted key: value}, taken out of `cfg` (in place) so that _merge takes the rest. Box p-cool's cooldown
+    re-runs (DECISIONS H14, the gentle recipe) trained P-0.3B and P-0.05B with augment.background_min_row_s 3.0, and
+    their states on the runs repo hold it, the pre_cooldown ones too (save_full rewrote them at the reset's step).
+    build lets a resume reset continue from such a state without the mode (the `retired_keys_dropped` event) and
+    refuses any other resume of one, which would go on training without it; resume_check reads only its store."""
+    held = {}
+    for k, v in list(cfg.items()):
+        key = f"{where}{k}"
+        if key in RETIRED_KEYS:
+            try:
+                retired(key, v)
+            except SystemExit:
+                held[key] = cfg.pop(k)
+        elif isinstance(v, dict) and not k.startswith("_"):
+            held.update(retired_held(v, f"{key}."))
+    return held
 
 
 def apply_set(cfg: dict, assignment: str) -> tuple[str, object]:
@@ -4027,7 +4051,9 @@ def resume_check(run_dir: Path) -> dict:
     except SystemExit as e:  # not SystemExit: the caller is a library (kitsune.full_queue check-resume), not a CLI
         raise FileNotFoundError(str(e)) from None
     state = torch.load(full / "trainer.pt", map_location="cpu", weights_only=True)
-    cfg = _merge(DEFAULTS, copy.deepcopy(state["cfg"]))  # keys added since it was written take the defaults
+    saved = copy.deepcopy(state["cfg"])
+    retired_held(saved)  # a retired mode the state still holds (build decides on it) shapes no store
+    cfg = _merge(DEFAULTS, saved)  # keys added since it was written take the defaults
     micro = float((state["st"].get("memory") or {}).get("micro_audio_s", cfg["batch"]["micro_audio_s"]))
     sp = state.get("planner") or {}
     out = dict(ok=False, reason=None, state_fingerprint=sp.get("fingerprint"), store_fingerprint=None,
@@ -4648,10 +4674,17 @@ def build(args) -> tuple[Run, dict | None]:
     if args.resume:
         full = find_full_state(Path(args.resume))
         state = torch.load(full / "trainer.pt", map_location="cpu", weights_only=True)
-        cfg = _merge(DEFAULTS, copy.deepcopy(state["cfg"]))  # keys added since it was written take the defaults
+        cfg = copy.deepcopy(state["cfg"])
+        held = retired_held(cfg)  # a retired mode still on in the state's config (box p-cool's re-runs)
+        cfg = _merge(DEFAULTS, cfg)  # keys added since it was written take the defaults
         saved = copy.deepcopy(cfg)
         overrides, repeated = resume_overrides(saved, [apply_set(cfg, s) for s in args.set])
         validate(cfg)
+        if held and not cfg["schedule"]["resume_reset"]:
+            raise SystemExit(f"--resume {full}: the state's config holds retired modes the trainer no longer has "
+                             f"({json.dumps(held, default=str)}; RETIRED_KEYS), so the run cannot go on as it trained. "
+                             "Only a continuation takes such a state: --set schedule.resume_reset=true drops them (the "
+                             "retired_keys_dropped event)")
         new_epochs = cfg["schedule"]["epochs"]
         planned = cfg["schedule"]["clock"] == "epochs" and not state["st"].get("total_steps")
         if (new_epochs != saved["schedule"]["epochs"] and new_epochs is not None and not planned
@@ -4679,7 +4712,7 @@ def build(args) -> tuple[Run, dict | None]:
             raise SystemExit("schedule.resume_reset (and resume_reset_keep_cooldown) is a resume's one-shot flag: pass "
                              "it with --resume <state> (--set schedule.resume_reset=true), never in a config or a fresh "
                              "start")
-        overrides = repeated = {}
+        overrides = repeated = held = {}
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_dir = rpath(cfg["runs_root"]) / f"{cfg['run_name']}-{stamp}"
         n = 1
@@ -4736,6 +4769,8 @@ def build(args) -> tuple[Run, dict | None]:
                     config_arg_ignored=args.config, set_aside=moved, upload_again=again,
                     **({"upload_again_fracs": again_fracs} if again_fracs else {}), host=host, prev_host=prev,
                     new_host=new_host, **({"scratch_marks_dropped": dropped} if dropped else {}))
+        if held:  # a resume reset (build refused any other resume): the continuation trains without them
+            R.log.event("retired_keys_dropped", from_state=str(full), at_step=state["step"], keys=held)
         for name in ([again] if again else []) + again_fracs:
             R.uploader.submit(R.ckpt_dir / name, name)
     return R, state

@@ -1595,7 +1595,7 @@ class StubTrainer:
 
     def resume_check(self, run_dir):
         self.calls.append(("resume_check", str(run_dir)))
-        if isinstance(self.resume, Exception):
+        if isinstance(self.resume, BaseException):
             raise self.resume
         return self.resume
 
@@ -1624,7 +1624,8 @@ def test_build_stores_builds_train_eval_and_dev_or_the_eval_store_alone(monkeypa
 
 @pytest.mark.parametrize("res, rc", [({"ok": True}, 0), ({"ok": False, "reason": "store not built"}, 1),
                                      ({"ok": False, "reason": "fingerprint differs"}, 3),
-                                     (RuntimeError("torch"), 1)])
+                                     (RuntimeError("torch"), 1),
+                                     (SystemExit("unknown config key augment.mix"), 3)])  # the trainer's refusal
 def test_check_resume_exit_codes(monkeypatch, res, rc):
     D = StubTrainer(resume=res)
     monkeypatch.setattr(Q, "_load_trainer", lambda: D)

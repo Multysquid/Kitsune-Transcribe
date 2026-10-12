@@ -223,8 +223,8 @@ def tiny_registry(root, *, write_boxes: bool = False) -> dict:
 COOL_RUNS = {"full-p03": ("full-p", "full-p03-20261003T230143Z", 16, 20, 0, 1, False),
              "full-p01": ("p01", "full-p01-20261001T184145Z", 32, 40, 1, 2, False),
              "full-p005": ("p005", "full-p005-20261008T160232Z", 16, 20, 0, 1, True)}
-# the two recipes' explicit ranges as H14's continues sets spelled them (a milder one, and recipe v4's at the trainer's
-# defaults)
+# the two recipes' explicit ranges from H14's continues sets (a milder one, and recipe v4's at the trainer's defaults),
+# less their short-row guard augment.background_min_row_s (3.0 and 0.0), retired since (04_distill RETIRED_KEYS)
 COOL_GENTLE = {"augment.noise_snr_db": [5.0, 20.0], "augment.speech_snr_db": [15.0, 25.0],
                "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"]}
 COOL_V4_FULL = {"augment.noise_snr_db": [0.0, 20.0], "augment.speech_snr_db": [10.0, 25.0],
@@ -233,8 +233,8 @@ COOL_V4_FULL = {"augment.noise_snr_db": [0.0, 20.0], "augment.speech_snr_db": [1
 
 def cool_continues(name: str) -> dict:
     """The continues block of the continuation box's train item `name` (COOL_RUNS): schedule.epochs,
-    schedule.deadline_cooldown false, the keep-cooldown flag where H14 sets it, then the recipe's ranges (the order
-    H14's registry entries wrote them in)."""
+    schedule.deadline_cooldown false, the keep-cooldown flag where H14 sets it, then the recipe's ranges (in the order
+    H14's registry entries wrote them, its retired short-row guard left out)."""
     src, rid, from_step, to_step, before, epochs, keep = COOL_RUNS[name]
     sets = {"schedule.epochs": epochs, "schedule.deadline_cooldown": False}
     if keep:

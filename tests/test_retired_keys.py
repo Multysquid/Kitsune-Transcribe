@@ -10,6 +10,8 @@ mix, quiet pads and short-row guard - modes no released model trained with, gone
   its keys are DEFAULTS' or retired ones at their off values; and so does each as a saved run config - the full
   DEFAULTS of before the cleanup, the retired keys at their off values, merged with it, as runs/<run_id>/config.json
   and trainer.pt hold it - through build()'s merge, a resume's --set of a retired key and 05's readout loader
+- a saved state that holds a retired mode on (box p-cool's re-runs: augment.background_min_row_s 3.0): retired_held
+  takes it out and names it (build's resume reset of such a state: tests/test_early_stop_v2.py)
 - the keys kept for the saved configs say what is left: bn.mode "frozen", bn.momentum null, loss.aux_ctc_weight 0,
   eval.reference null
 CPU only, no model."""
@@ -166,6 +168,22 @@ def test_the_committed_configs_load(m, path):
     assert m.resume_overrides(copy.deepcopy(resumed), [m.apply_set(resumed, word)]) == ({}, {"augment.mix_p": 0.0})
     with pytest.raises(SystemExit, match="augment.mix_p"):
         m.apply_set(resumed, "augment.mix_p=0.1")
+
+
+def test_a_state_may_hold_a_retired_mode_on(m):
+    """retired_held: box p-cool's re-runs of P-0.3B and P-0.05B saved their states with augment.background_min_row_s
+    3.0. It takes such a key (or a block that turns its mode on) out of the saved config and names it, so _merge takes
+    the rest; a key at its off value stays for _merge to drop, as in any saved config."""
+    raw = json.loads((FULL / "full-p03.json").read_text(encoding="utf-8"))
+    saved = m._merge(old_defaults(m), raw)
+    clean = copy.deepcopy(saved)
+    assert m.retired_held(clean) == {} and clean == saved
+    saved["augment"]["background_min_row_s"] = 3.0
+    saved["lr_probe"] = {"enabled": True}
+    assert m.retired_held(saved) == {"augment.background_min_row_s": 3.0, "lr_probe": {"enabled": True}}
+    assert "background_min_row_s" not in saved["augment"] and "lr_probe" not in saved
+    assert saved["augment"]["mix_p"] == 0.0 and "branch" in saved  # at their off values: _merge's to drop
+    assert m._merge(m.DEFAULTS, saved) == m.load_config(str(FULL / "full-p03.json"), [])
 
 
 def test_the_readout_loader_takes_a_saved_run_config(m, tmp_path):

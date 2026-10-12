@@ -8,9 +8,10 @@ A study run's config (run_config) is three layers, merged in this order:
      eval.full_at_fracs [0.2, 0.4, 0.6, 0.8] (eval.every_min null, no per-epoch evals), the lean checkpoints (weights
      at 0.4 and at the end, a local full state at 0.4, and at 0.8 uploaded for the runs of at most 0.1B), log syncs
      every 20 min, the runs repo as hf.output_repo; and per run what kitsune.prereg.RUNS fixes: family, student,
-     seed, the warm-up, the weight decay, the aux-CTC weight, the planned micro-batch and the BatchNorm mode (frozen
-     for the pruned students, train for the ones built from scratch, bridge included), plus loss.w_ctc
-     (kitsune.prereg.W_CTC) for the CTC students.
+     seed, the warm-up, the weight decay and the planned micro-batch, plus loss.w_ctc (kitsune.prereg.W_CTC) for the
+     CTC students. BatchNorm stays frozen and the aux-CTC weight 0, as for every pruned student: the trainer has no
+     other mode now (the from-scratch runs, bridge included, trained BatchNorm and an aux-CTC head, both retired), so
+     run_config refuses a from-scratch run.
 schedule.max_steps, optim.lr and eval.mini.every_steps stay null: full_config puts the full run on the epochs clock
 and sets its LR (FULL_RUNS).
 
@@ -72,16 +73,19 @@ def base_config(out_repo: str = RUNS_REPO) -> dict:
 
 
 def run_config(run: str, out_repo: str = RUNS_REPO) -> dict:
-    """The study run `run` (a key of kitsune.prereg.RUNS) with its placeholders (max_steps, lr, mini cadence) null."""
+    """The study run `run` (a key of kitsune.prereg.RUNS, a pruned student's) with its placeholders (max_steps, lr,
+    mini cadence) null. ValueError for a from-scratch run: it trained modes the trainer no longer has."""
     spec = prereg.RUNS[run]
-    scratch = spec["init_class"] == "scratch"
+    if spec["init_class"] == "scratch":
+        raise ValueError(f"{run}: the size study's from-scratch runs trained retired modes (bn.mode train and the "
+                         "aux-CTC head; 04_distill BN_MODES, validate_study)")
     small = int(spec["params_total"]) <= SMALL_PARAMS
     over = {
         "run_name": run, "student": spec["student"], "seed": int(spec["seed"]),
         "schedule": {"warmup_steps": int(spec["warmup_steps"])},
         "optim": {"weight_decay": float(spec["weight_decay"])},
-        "loss": {"aux_ctc_weight": float(spec["aux_ctc"])},
-        "bn": {"mode": "train" if scratch else "frozen"},
+        "loss": {"aux_ctc_weight": 0.0},  # spelled, as the byte-pinned configs/full/*.json do
+        "bn": {"mode": "frozen"},
         "batch": {"micro_audio_s": spec["micro_audio_s"]},
         "ckpt": {"full_at_fracs": list(FULL_FRACS_SMALL if small else FULL_FRACS),
                  "upload_full_at": ["frac:0.8"] if small else []},
