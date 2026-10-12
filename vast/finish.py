@@ -669,7 +669,7 @@ def _hub_sha256(api, repo: str, repo_type: str, path: str, tmp: Path) -> str | N
 def verify_chain(api, repo: str, repo_type: str) -> list[str]:
     """The chain's records on the Hub, byte for byte (the sha256 of a downloaded copy): its summary at
     full/box-<KITSUNE_BOX>/, and each part's summary and verdict at full/box-<part>/ (the standalone boxes' paths, which
-    box 2's of_box and the report read). A missing or different file is put once and compared again."""
+    an of_box item and tools/full_report.py read). A missing or different file is put once and compared again."""
     box = os.environ.get("KITSUNE_BOX") or "unknown"
     pairs = [(STATE_DIR / SUMMARY_FILE, f"full/box-{box}/{SUMMARY_FILE}")]
     chain = STATE_DIR / CHAIN_DIR

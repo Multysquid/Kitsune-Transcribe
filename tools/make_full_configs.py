@@ -46,9 +46,12 @@ Data configs (launch's --config and bootstrap's KITSUNE_CONFIG: what a box rebui
 Inputs besides the two generators' own: PLAN_FILE (configs/full/plan/full_study.json, in a folder of its own so every
 configs/full/*.json is a config), the JSON tools/full_plan.py wrote for full.parquet and smoke.parquet at SMOKE_EPOCHS
 (its "full" and "smoke" parts; --import-plan records a new measurement; the local selection paths become the repo
-paths), and its "launch" part: tools/full_plan.py on full.parquet at the epochs the boxes run now (FULL_RUNS; a student
-with a continuation at its CONTINUATIONS epochs: since DECISIONS H13 the cooldown re-runs keep their runs' own 6, 4
-and, H14, 10), --import-launch-plan:
+paths; full_plan's default students run at the boxes' epochs, so these take explicit ones):
+  python tools/full_plan.py --selection <full.parquet|smoke.parquet> --student t06=aed:450:1730:3
+      --student p03=ctc:600:1350:3 --student p01=ctc:1600:1500:4 --student p005=ctc:1600:1500:4 --json <OUT>
+and its "launch" part: tools/full_plan.py on full.parquet at the epochs the boxes run now (FULL_RUNS; a student with a
+continuation at its CONTINUATIONS epochs: since DECISIONS H13 the cooldown re-runs keep their runs' own 6, 4 and, H14,
+10; full_plan's DEFAULT_STUDENTS), --import-launch-plan:
   python tools/full_plan.py --selection <full.parquet> --student t06=aed:450:1730:<E> --student p03=ctc:600:1350:<E>
       --student p005=ctc:1600:1500:<E> --student p01=ctc:1600:1500:<E> --json plan_launch.json
   python tools/make_full_configs.py --import-launch-plan plan_launch.json
@@ -58,8 +61,9 @@ registry must carry (registry_numbers), which tests/test_full_configs.py checks:
 smoke train items', for smoke check 3), their plan_hours = plan v3's hours at the step count measured on full.parquet
 (PLAN_V3: hours x measured T / plan T, 2 decimals; also the full train items' max_hours until box 1's speed replaces
 them), and F4's seconds, the deadline fault of smoke-p005 (deadline_fault_s). After a rebuilt selection: tools/
-full_plan.py --json on full.parquet and on smoke.parquet, --import-plan with both (it prints what boxes.json must be
-changed in), then those numbers into boxes.json by hand, then --check and the tests.
+full_plan.py --json on full.parquet and on smoke.parquet at SMOKE_EPOCHS (the explicit --student flags above),
+--import-plan with both (it prints what boxes.json must be changed in), then those numbers into boxes.json by hand, then
+--check and the tests.
 
 The boxes' hours (HOURS_BOXES: box full-t, box p005, and box p-cool, whose three continuations are the cooldown re-runs
 of P-0.3B, P-0.1B and P-0.05B, DECISIONS H14): SPEED_FILE
@@ -84,7 +88,7 @@ parts), and that every continues block is the generator's (continues_problems).
 Usage:
   python tools/make_full_configs.py                  # write configs/full/*.json (and remove stale generated ones)
   python tools/make_full_configs.py --check          # exit 1 if a committed file differs or the registry is invalid
-  python tools/make_full_configs.py --import-plan full_plan_full.json full_plan_smoke.json   # a new measurement
+  python tools/make_full_configs.py --import-plan full_plan_full.json full_plan_smoke.json   # at SMOKE_EPOCHS
   python tools/make_full_configs.py --import-launch-plan plan_launch.json                   # the boxes' epochs
   python tools/make_full_configs.py --import-speed --smoke-verdict smoke_verdict.json      # the hours (smoke A)
 """

@@ -7,7 +7,7 @@ the Parakeet baselines, and scripts/05_evaluate.py's family switch, manifest che
               gives frame argmax agreement 1, a KL of the fp16 storage only, the teacher's text on every row; a row
               whose stored n_frames differs is left out of the frame metrics and counted; a frame store's batches
               (their own targets, as the CTC trainer's FrameBatchDataset collates them) give the same numbers, and
-              where the CTC trainer's frame stores exist, ctc_eval on one is its kitsune.ctc_eval pass to the bit
+              ctc_eval on one of the CTC trainer's frame stores is its kitsune.ctc_eval pass to the bit
   verdict     family "ctc" judges against Parakeet's CTC path, registered or pending; the Cohere verdict is unchanged
   05 (ctc)    the same student through scripts/05_evaluate.py on a study manifest, with the probe: tables, study.json,
               verdict v2 with family ctc; --teachers and --from-evals; the refusals: a manifest that does not hash to
@@ -17,8 +17,8 @@ the Parakeet baselines, and scripts/05_evaluate.py's family switch, manifest che
               more than 0.1 % of the probe's rows
   real data   (skipped without it) the stored ctc_hyp of the label box's eval shards scores to its stored ctc_cer on
               every row and to the measured corpus CERs (Parakeet TDT / CTC JSUT 6.62 / 6.71, CV8 7.50 / 7.58, Reazon
-              10.20 / 9.71 %; Cohere 8.30 / 4.07 / 6.28 %); the first A100 run's per-set CER from its eval parquets;
-              ctc_eval of the real Parakeet CTC teacher on real eval rows against its stored frame targets and text
+              10.20 / 9.71 %; Cohere 8.30 / 4.07 / 6.28 %); ctc_eval of the real Parakeet CTC teacher on real eval
+              rows against its stored frame targets and text
 CPU only, synthetic data in the repo's formats; nothing needs the network.
 """
 import json
@@ -560,15 +560,12 @@ def test_ctc_eval_reads_a_frame_stores_batches(ctc_env, monkeypatch):
 
 
 def test_the_ctc_eval_is_the_ctc_trainers_on_its_frame_store(ctc_env, tmp_path):
-    """Where the CTC trainer's frame stores exist (kitsune.trainset.build_frame_stores, kitsune.ctc_eval; skipped
-    before they do): ctc_eval over a frame store of the eval sets gives, row for row, the sums of the trainer's own
-    pass (ctc_eval_records), and summarise_ctc_tf its summary and per-utterance table to the bit, key for key; the
-    greedy CTC paths are the same."""
+    """On the CTC trainer's frame store (kitsune.trainset.build_frame_stores, kitsune.ctc_eval): ctc_eval over a frame
+    store of the eval sets gives, row for row, the sums of the trainer's own pass (ctc_eval_records), and
+    summarise_ctc_tf its summary and per-utterance table to the bit, key for key; the greedy CTC paths are the same."""
+    from kitsune import ctc_eval as CE
     from kitsune import trainset
 
-    if not hasattr(trainset, "build_frame_stores"):
-        pytest.skip("no frame stores in kitsune.trainset (the CTC trainer's, wave 2)")
-    CE = pytest.importorskip("kitsune.ctc_eval")
     env = ctc_env
     fc = env["fc"]
     fstore = trainset.build_frame_stores(env["sel"], fc.data, env["root"] / "corpus" / "parakeet_out", tmp_path / "fs",
