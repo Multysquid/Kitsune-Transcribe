@@ -13,10 +13,8 @@ Sources (all streamed file-by-file from HF; each raw download is deleted after c
                 NEVER point this at the amphion Emilia/JA (non-YODAS) files: those are CC BY-NC.
   emilia_nc     laion/Emolia JA-B*_standard.tar.gz: Emilia's non-YODAS Japanese part (podcasts, talk shows; CC BY-NC 4.0,
                 non-commercial models only), same format and filters as emilia_yodas, --emilia-nc-hours budget
-  reazon_large  japanese-asr/whisper_transcriptions.reazonspeech.large (~5000 h, contains medium and small; rows
-                already in reazon_small/reazon_medium are skipped)
-  cv            Common Voice ja  -- NOT on HF anymore. Download cv-corpus-*-ja.tar.gz from
-                https://datacollective.mozillafoundation.org and extract to data/raw/common_voice/ ; this script ingests it.
+  reazon_large  japanese-asr/whisper_transcriptions.reazonspeech.large (~5000 h, contains the medium and small tiers;
+                rows already in reazon_small are skipped)
   eval_emilia   monitor-only Emilia hold-out: first 1000 Japanese clips of JA-B000029 from videos absent from
                 emilia_yodas (ingest that first); scored against the teacher's hypothesis, not part of the gate
   eval          japanese-asr/ja_asr.jsut_basic5000, ja_asr.common_voice_8_0, ja_asr.reazonspeech_test  (eval_jsut / eval_cv8 / eval_reazon)
@@ -29,8 +27,7 @@ the first one's shards (kitsune.store.lock_data_root; the OS drops the lock when
 
 Every upstream repo is read at a pinned commit (REVISIONS): the training box rebuilds the audio shards from the
 public repos instead of downloading them from home, and the teacher outputs are joined to that audio by utterance
-id, so the box must see byte-identical upstream files. The pins are the commits the local data/ was built from
-(data/raw/datasets--*/refs/main).
+id, so the box must see byte-identical upstream files. The pins are the commits the laptop's data/ was built from.
 
 Stems are stable too: shards are numbered after the manifest's (an unlisted shard left by a kill is removed), and each
 shard gets an id sidecar (shards/<source>/_ids/<stem>.parquet) naming the upstream input and ingest step it came from.
@@ -61,7 +58,6 @@ Usage:
   python scripts/01_prepare_data.py --data /workspace/Kitsune-Transcribe/data --extent-config configs/full.json
 """
 import argparse
-import csv
 import hashlib
 import json
 import os
@@ -92,7 +88,6 @@ MIN_DUR, MAX_DUR = 0.3, 30.0  # teacher fast path is <=30 s; shorter than 0.3 s 
 HF_PARQUET_SOURCES = {
     # name: (repo, split)
     "reazon_small": ("japanese-asr/whisper_transcriptions.reazonspeech.small", "train"),
-    "reazon_medium": ("japanese-asr/whisper_transcriptions.reazonspeech.medium", "train"),
     "reazon_large": ("japanese-asr/whisper_transcriptions.reazonspeech.large", "train"),
     "eval_jsut": ("japanese-asr/ja_asr.jsut_basic5000", "eval"),
     "eval_cv8": ("japanese-asr/ja_asr.common_voice_8_0", "eval"),
@@ -104,7 +99,6 @@ GALGAME_EVAL_ROWS = 1000  # first N kept utterances become the in-domain eval sp
 REVISIONS = {
     GALGAME_REPO: "3fb86654222b3f0af0f7c332ae6a0ef9752a9451",
     "japanese-asr/whisper_transcriptions.reazonspeech.small": "c74b52fc164cf7b64936ca62aee4336eac626739",
-    "japanese-asr/whisper_transcriptions.reazonspeech.medium": "c801154945d5cf756f727e06afbef472d60fed37",
     "japanese-asr/ja_asr.jsut_basic5000": "278db379fc96167ff2293d7abf9ab86976afcd78",
     "japanese-asr/ja_asr.common_voice_8_0": "bf8819e8d9a5feb51b0c718686bd20ea67a3c729",
     "japanese-asr/ja_asr.reazonspeech_test": "dd08bfb9dfc1cef4e4d0609fd78c3755d48b926f",
@@ -119,13 +113,13 @@ EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS = "JA/JA-B000029.tar", 1000  # last tar: far b
 EMOLIA_REPO = "laion/Emolia"
 # Emilia's language tag is per video, so a 'ja' tar still holds some English clips; require Japanese script instead
 _JA_SCRIPT = re.compile(r"[぀-ヿ㐀-䶿一-鿿]")
-ALL_SOURCES = ["reazon_small", "reazon_medium", "reazon_large", "galgame", "emilia_yodas", "emilia_nc", "cv", "eval",
-               "eval_jsut", "eval_cv8", "eval_reazon", "eval_emilia"]
-# ReazonSpeech tiers are nested (small is a subset of medium), so a larger tier must skip rows already ingested.
+ALL_SOURCES = ["reazon_small", "reazon_large", "galgame", "emilia_yodas", "emilia_nc", "eval", "eval_jsut", "eval_cv8",
+               "eval_reazon", "eval_emilia"]
+# ReazonSpeech tiers are nested (small is a subset of large), so reazon_large must skip rows already ingested.
 # Nothing dedups training against the gate eval sets (only eval_emilia is kept video-disjoint, in ingest_emilia):
 # ~16 eval_reazon lines match a reazon_small text (re-aired broadcasts), worth <= ~0.3 pp of its CER at worst; expect
-# more with the medium/large tiers.
-DEDUP_AGAINST = {"reazon_medium": ("reazon_small",), "reazon_large": ("reazon_small", "reazon_medium")}
+# more with reazon_large.
+DEDUP_AGAINST = {"reazon_large": ("reazon_small",)}
 MIN_FREE_GB = 30.0  # stop a download (resumably) before it would fill the data disk
 HOLD_POLL_S = 15  # --hold-file poll interval
 HEARTBEAT_ROWS = 1000  # touch --heartbeat every this many kept rows (one input can take minutes)
@@ -317,9 +311,8 @@ class Ingest:
     @staticmethod
     def free_download(local: Path):
         """Delete a finished hf_hub_download: the snapshot entry AND its blob (the snapshot is a symlink or a copy
-        depending on Windows privileges; unlinking only it leaves the multi-GB blob behind). In a per-input cache dir
-        (raw/DL_DIR/<hash>/datasets--*) that whole dir goes, a killed attempt's .incomplete file and hf's lock files
-        included; in an old shared cache only the repo's finished blobs, as before."""
+        depending on Windows privileges; unlinking only it leaves the multi-GB blob behind). Its per-input cache dir
+        (raw/DL_DIR/<hash>/datasets--*) goes whole, a killed attempt's .incomplete file and hf's lock files included."""
         local = Path(local)
         real = local.resolve()
         local.unlink(missing_ok=True)
@@ -329,10 +322,6 @@ class Ingest:
             if parent.name.startswith("datasets--"):
                 if parent.parent.parent.name == DL_DIR:
                     shutil.rmtree(parent.parent, ignore_errors=True)
-                else:
-                    for blob in (parent / "blobs").glob("*"):
-                        if not blob.name.endswith(".incomplete"):
-                            blob.unlink(missing_ok=True)
                 break
 
     def done(self):
@@ -642,35 +631,8 @@ def _emilia_video(id_or_key: str) -> str:
     return key[len("JA_"):key.rfind("_W")] if key.startswith("JA_") and "_W" in key else key
 
 
-def ingest_common_voice(ing: Ingest):
-    """Ingest a manually downloaded Common Voice ja corpus from data/raw/common_voice/<cv-corpus-*>/ja/."""
-    cands = list((ing.raw / "common_voice").glob("**/ja/clips"))
-    if not cands:
-        print("  cv: nothing found under data/raw/common_voice/**/ja/clips - download cv-corpus-*-ja.tar.gz from "
-              "https://datacollective.mozillafoundation.org, extract it there, and re-run with --sources cv")
-        return
-    ja = cands[0].parent
-    for tsv, split in [("train.tsv", "train"), ("dev.tsv", "train"), ("test.tsv", "eval")]:
-        p = ja / tsv
-        if not p.exists() or ing.is_finished(tsv):
-            continue
-        ing.begin_input(tsv)
-        with open(p, encoding="utf-8", newline="") as f:
-            rows = list(csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE))
-        for r in tqdm(rows, desc=f"cv/{tsv}", unit="clip"):
-            clip = ja / "clips" / r["path"]
-            if not clip.exists():
-                ing.stats["bad_audio"] += 1
-                continue
-            ing.add(split, f"cv/{Path(r['path']).stem}", clip.read_bytes(), r["sentence"])
-            if ing.limit_hit():
-                break
-        ing.finish_input(tsv)
-    ing.done()
-
-
 def source_repo(source: str) -> str | None:
-    """The upstream repo a source is read from (None: cv, a manual download)."""
+    """The upstream repo a source is read from (None: a name that is no single 01 source)."""
     if source in HF_PARQUET_SOURCES:
         return HF_PARQUET_SOURCES[source][0]
     return {"galgame": GALGAME_REPO, "emilia_yodas": EMILIA_REPO, "eval_emilia": EMILIA_REPO,
@@ -694,8 +656,6 @@ def ingest_source(ing: Ingest, cap: int | None, whisper_dir: Path | None = None,
             ingest_emilia_eval(ing, EMILIA_EVAL_TAR, EMILIA_EVAL_ROWS)
         elif s == "emilia_nc":
             ingest_emilia_nc(ing, emilia_nc_hours, max_inputs=cap)
-        elif s == "cv":
-            ingest_common_voice(ing)
     except BaseException:
         ing.end_downloads(abort=True)
         raise

@@ -310,7 +310,8 @@ def test_pull_downloads_only_missing_files_and_never_overwrites(stepctx, box):
     assert have.read_bytes() == b"local!"
     assert (box.kdir / "labels/full/teacher_out/galgame/train-00001.jsonl").read_bytes() == b"new"
     pats = [p for s in api.snapshots for p in s["allow_patterns"]]
-    assert "second_out/galgame/*" in pats and f"{label.PARAKEET_PATH}/*" in pats
+    assert "teacher_out/meta.json" in pats and f"{label.PARAKEET_PATH}/*" in pats
+    assert not any(p.startswith("second_out/") for p in pats), "the laptop's second opinions are no seed"
     assert all(s["revision"] == "rev1" for s in api.snapshots)
     ledger = json.loads((box.state / "label_ledger.json").read_text())
     assert "labels/full/teacher_out/galgame/train-00001.jsonl" in ledger["remote"]
@@ -362,6 +363,15 @@ def test_golden_tolerance(stepctx, box, monkeypatch, box_hyp, rc):
     res = json.loads((box.state / "golden.json").read_text())
     assert res["parakeet"]["tdt_cer"] == 0 and res["parakeet"]["n"] == 32
     assert (res["cohere"]["cer"] <= 0.01) == (rc == 0)
+
+
+def test_golden_reference_is_the_published_parallel_lists():
+    """kitsune/parakeet_golden.json as tools/publish_parakeet.py writes it ({ids, tdt, ctc}); an absent file is {}."""
+    golden = json.loads((ROOT / "kitsune" / "parakeet_golden.json").read_text(encoding="utf-8"))
+    ref = label.golden_reference(golden)
+    first = golden["ids"][0]
+    assert list(ref) == golden["ids"] and ref[first] == {"hyp": golden["tdt"][0], "ctc_hyp": golden["ctc"][0]}
+    assert label.golden_reference({}) == {}
 
 
 def test_golden_fails_on_a_bad_parakeet_shard(stepctx, box, monkeypatch):

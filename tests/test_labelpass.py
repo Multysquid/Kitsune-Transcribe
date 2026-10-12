@@ -241,7 +241,7 @@ def test_writer_errors_surface(tmp_path):
 
 
 def _args(**kw):
-    return argparse.Namespace(**(dict(k=16, save_encoder=False) | kw))
+    return argparse.Namespace(**(dict(k=16) | kw))
 
 
 def _fc(tmp_path):
@@ -250,7 +250,8 @@ def _fc(tmp_path):
 
 def test_shard_is_done_by_ids(tmp_path):
     """Done means these ids, not this row count: a same-size npz over other rows is refused, a subsequence with
-    skipped rows is accepted, and a missing jsonl is not done."""
+    skipped rows is accepted, and a missing jsonl is not done; nor is an npz with save_encoder set (no pass writes
+    one)."""
     fc = _fc(tmp_path)
     info = next(s for s in read_manifest(fc.data) if s.source == "src_a")
     stem = Path(info.path).stem
@@ -258,6 +259,12 @@ def test_shard_is_done_by_ids(tmp_path):
     ids = shard_ids(fc.data, info)
     assert tp.shard_is_done(npz, ids, _args())
     assert not tp.shard_is_done(npz, ids, _args(k=8))
+    with np.load(npz) as z:
+        arrays = dict(z)
+    np.savez(npz, **(arrays | {"save_encoder": np.bool_(True)}))
+    assert not tp.shard_is_done(npz, ids, _args())
+    np.savez(npz, **arrays)
+    assert tp.shard_is_done(npz, ids, _args())
     other = [i + "x" for i in ids]
     assert not tp.shard_is_done(npz, other, _args())
     # a subsequence: one row skipped by the pass
@@ -277,10 +284,9 @@ def test_pack_teacher_shard_matches_the_fixture_packing(tmp_path):
     ids = shard_ids(fc.data, info)
     utts = [fc.utts[i] for i in ids]
     per = {i: dict(tokens=u.tokens, top_idx=u.topk_idx, top_lp=u.topk_lp, lse=u.lse, truncated=u.truncated,
-                   hyp=u.hyp, enc=None) for i, u in enumerate(utts)}
+                   hyp=u.hyp) for i, u in enumerate(utts)}
     durs = np.array([u.duration for u in utts], dtype=np.float32)
-    packed = tp.pack_teacher_shard(ids, [u.text for u in utts], durs, len(ids), per, sorted(per), fc.k, False,
-                                   fc.prompt)
+    packed = tp.pack_teacher_shard(ids, [u.text for u in utts], durs, len(ids), per, sorted(per), fc.k, fc.prompt)
     with np.load(fc.teacher_out / "src_a" / f"{stem}.npz") as z:
         assert sorted(z.files) == sorted(packed)
         for key in z.files:
@@ -289,7 +295,7 @@ def test_pack_teacher_shard_matches_the_fixture_packing(tmp_path):
             a, b = np.asarray(packed[key]), z[key]
             assert a.dtype == b.dtype and a.shape == b.shape and a.tobytes() == b.tobytes(), key
     assert packed["cer"].dtype == np.float32 and packed["cer"].shape == (len(ids),)
-    empty = tp.pack_teacher_shard([], [], np.zeros(0, np.float32), 3, {}, [], fc.k, False, None)
+    empty = tp.pack_teacher_shard([], [], np.zeros(0, np.float32), 3, {}, [], fc.k, None)
     assert empty["topk_idx"].shape == (0, fc.k) and int(empty["n_scanned"]) == 3 and empty["prompt"].size == 0
 
 

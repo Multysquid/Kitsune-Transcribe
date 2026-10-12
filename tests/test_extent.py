@@ -281,8 +281,6 @@ def test_validate(monkeypatch):
         assert len(got) == 1, got
         return got[0]
 
-    assert problems(sources=FULL_SOURCES + ["reazon_medium"]).startswith("reazon_medium: refused")
-    assert problems(sources=FULL_SOURCES + ["cv"]).startswith("cv: refused")
     assert problems(sources=FULL_SOURCES + ["eval"]).startswith("eval: not a canonical source")
     assert "emilia_yodas is \"300h\" or an int 9..29, not 8" in problems({"emilia_yodas": 8})
     assert "not 30" in problems({"emilia_yodas": 30})
@@ -381,8 +379,7 @@ def test_closure_and_plan_steps():
     assert extent.closure(["galgame", "eval_jsut", "emilia_yodas@300h"]) == {"galgame", "eval_jsut",
                                                                               "emilia_yodas@300h"}
     keys = [s.key for s in extent.CANONICAL]
-    assert len(set(keys)) == len(keys) and {s.source for s in extent.CANONICAL} == set(prep.ALL_SOURCES) - {
-        "reazon_medium", "cv", "eval"}
+    assert len(set(keys)) == len(keys) and {s.source for s in extent.CANONICAL} == set(prep.ALL_SOURCES) - {"eval"}
     # the orders the ids depend on
     assert keys.index("reazon_small") < keys.index("reazon_large")
     assert keys.index("emilia_yodas@300h") < keys.index("eval_emilia") < keys.index("emilia_yodas")
@@ -656,7 +653,7 @@ def test_extent_config_refuses_other_flags_and_invalid_configs(full, world, tmp_
         with pytest.raises(SystemExit) as e:
             run01(monkeypatch, tmp_path / f"flags{i}", "--extent-config", str(full.config), *flags)
         assert e.value.code == 2 and f"drop {flags[0]}" in capsys.readouterr().err
-    bad = write_cfg(tmp_path / "bad.json", make_cfg(sources=FULL_SOURCES + ["reazon_medium"]))
+    bad = write_cfg(tmp_path / "bad.json", make_cfg(sources=FULL_SOURCES + ["eval"]))
     malformed = write_cfg(tmp_path / "malformed.json", dict(make_cfg(), eval_sets=5))  # a refusal, not a traceback
     for i, config in enumerate((bad, malformed, tmp_path / "missing.json")):
         with pytest.raises(SystemExit) as e:
@@ -664,7 +661,7 @@ def test_extent_config_refuses_other_flags_and_invalid_configs(full, world, tmp_
         assert e.value.code == prep.REFUSED_EXIT == 3
         assert f"{config}: not an extent config: " in capsys.readouterr().err
         assert not (tmp_path / f"bad{i}" / "manifest.jsonl").exists()
-    assert "reazon_medium: refused" in extent.validate(json.loads(bad.read_text(encoding="utf-8")))[0]
+    assert "eval: not a canonical source" in extent.validate(json.loads(bad.read_text(encoding="utf-8")))[0]
     assert world.listings == []
     # a relative CFG not found in the working directory is the checkout's, as for make_selection.py --config
     checkout = tmp_path / "checkout"

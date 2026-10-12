@@ -1,7 +1,7 @@
 """The Whisper yardsticks (WP6; kitsune/whisper.py, tools/whisper_eval.py) on tiny offline models, CPU only.
 
-  pins       WHISPER_MODELS: the four keys of the build contract, large-v3 and Kotoba at 02b's pins, turbo's and small's
-             40-hex revisions, the row caps 64 / 128
+  pins       WHISPER_MODELS: the four keys of the build contract, large-v3 at 02b's tokenizer pin, Kotoba at the Galgame
+             judge's commit, turbo's and small's 40-hex revisions, the row caps 64 / 128
   rules      max_new_tokens is the students' rule (443 at 448) and generate takes one more, never two; whisper_batches
              cuts the eval's own batches at the row cap in order (a 273-row batch -> 64, 64, 64, 64, 17);
              split_generated tells an EOS end from a repetition stop that pad == EOS hides, and from the length cap,
@@ -62,15 +62,17 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
 
 def test_the_pins_and_the_row_caps():
-    """The four systems of the build contract, each pinned to a 40-hex revision; large-v3 and Kotoba at the very
-    commits scripts/02b_second_opinion.py pins (Kotoba's is the model that chose the Galgame-neutral rows); the row caps
-    64 (large-v3) and 128 (the others)."""
+    """The four systems of the build contract, each pinned to a 40-hex revision; large-v3 at the very commit of
+    scripts/02b_second_opinion.py's whisper tokenizer, Kotoba at KOTOBA_JUDGE_REVISION (the model that chose the
+    Galgame-neutral rows); the row caps 64 (large-v3) and 128 (the others)."""
     m = W.WHISPER_MODELS
     assert list(m) == ["whisper-large-v3", "whisper-large-v3-turbo", "kotoba-whisper-v2.0", "whisper-small"]
     assert all(k == s.system and HEX40.match(s.revision) for k, s in m.items())
     b02 = load_script("02b_second_opinion")
     assert (m["whisper-large-v3"].repo, m["whisper-large-v3"].revision) == (b02.WHISPER_TOK, b02.WHISPER_TOK_REVISION)
-    assert (m["kotoba-whisper-v2.0"].repo, m["kotoba-whisper-v2.0"].revision) == (b02.MODEL2, b02.MODEL2_REVISION)
+    assert (m["kotoba-whisper-v2.0"].repo, m["kotoba-whisper-v2.0"].revision) == (
+        "kotoba-tech/kotoba-whisper-v2.0", W.KOTOBA_JUDGE_REVISION)
+    assert W.KOTOBA_JUDGE_REVISION == "7eb575277d18909a4af8a24e3ae8cce2e99794ae"
     assert m["whisper-large-v3-turbo"].revision == "41f01f3fe87f28c78e2fbf8b568835947dd65ed9"
     assert (m["whisper-small"].repo, m["whisper-small"].revision) == ("openai/whisper-small",
                                                                       "973afd24965f72e36ca33b3055d56a652f456b4d")

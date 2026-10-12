@@ -1,7 +1,7 @@
 """The label box controller: label the full extent on one rented GPU, upload it write-once, then end the box.
 
 Started by vast/onstart.sh (KITSUNE_JOB=label) in place of supervise.py; it holds $KITSUNE_STATE/supervise.lock, so
-`onstart.sh --rearm` sees it. The design is docs FINAL.md §1 and §10; in short:
+`onstart.sh --rearm` sees it. In short:
 
   steps    plan -> pull -> models -> selftest -> roots -> [ingest lane] -> golden -> [GPU lanes]
            each a bounded child `python vast/label.py step <name>`, recorded in label.json (selftest re-runs on every
@@ -90,8 +90,7 @@ SEED_SOURCES = ("reazon_small", "galgame", "emilia_yodas", "eval_jsut", "eval_cv
 TEACHER_SETTING_KEYS = ("model", "model_revision", "language", "punctuation", "k", "save_encoder")
 PARAKEET_SETTING_KEYS = ("k_tdt", "k_ctc", "ctc_dense_thr", "max_symbols")
 
-DESTROY_CLASSES = ("success", "budget", "host_failure", "slow_host")
-STOP_CLASSES = ("refusal", "integrity", "unknown", "sync_unverifiable")
+DESTROY_CLASSES = ("success", "budget", "host_failure", "slow_host")  # every other class stops the box
 
 # pins copied from modules that import torch (a test compares them with the sources)
 COHERE_MODEL_ID = "CohereLabs/cohere-transcribe-03-2026"  # scripts/02_teacher_pass.py MODEL_ID
@@ -967,27 +966,13 @@ class Controller:
 
     def f_reports(self):
         reports = self.root / "reports"
-        rc = self.run_bounded("judge_report", self.judge_argv(), MAKE_SELECTION_TIMEOUT_S, self.child_env(offline=True))
-        if rc != 0:  # a report, not a label: logged in labels.json, the run still seals
-            log(f"tools/judge_report.py exited {rc}; reports/galgame_judge.json is missing")
         write_json_atomic(reports / "parakeet_baselines.json", self.parakeet_baselines())
-        write_json_atomic(reports / "labels.json", dict(self.labels_report(), judge_report_rc=rc))
+        write_json_atomic(reports / "labels.json", self.labels_report())
         write_json_atomic(reports / "throughput.json", {"rates": self.lane_rates(), "last": self.state.get("rates"),
                                                         "syncs": self.state["syncs"], "disk": self.state.get("disk")})
         prov = self.root / "provenance"
         write_json_atomic(prov / f"{self.state['run_id']}.json", self.provenance())
         write_json_atomic(prov / "adopted.json", self.adopted())
-
-    def judge_argv(self) -> list[str]:
-        recipe = self.cfg.get("selection_recipe") or {}
-        thr = float(recipe.get("agree_max", 0.5))
-        for item in recipe.get("agree_max_source") or []:
-            src, _, val = str(item).partition("=")
-            if src == "galgame":
-                thr = float(val)
-        return [self.py, "tools/judge_report.py", "--kotoba", "seed/second_out/galgame",
-                "--parakeet", f"{self.second_rel}/galgame", "--teacher", f"{self.teacher_rel}/galgame",
-                "--out", f"{self.root_rel}/reports/galgame_judge.json", "--threshold", str(thr)]
 
     def parakeet_baselines(self) -> dict:
         out = {}
@@ -1300,7 +1285,7 @@ def step_pull(ctx: StepCtx):
     with ThreadPoolExecutor(16) as ex:
         list(ex.map(get, todo))
     log(f"pull: {len(todo)} label file(s) fetched, {len(listing) - len(todo)} already local")
-    seeds = ["teacher_out/meta.json", "second_out/galgame/*"] + [f"teacher_out/{s}/*" for s in SEED_SOURCES]
+    seeds = ["teacher_out/meta.json"] + [f"teacher_out/{s}/*" for s in SEED_SOURCES]
     api.snapshot_download(repo_id=repo, repo_type="dataset", revision=rev, local_dir=str(ctx.kdir / "seed"),
                           allow_patterns=seeds)
     api.snapshot_download(repo_id=repo, repo_type="dataset", revision=rev, local_dir=str(ctx.kdir),
@@ -1408,17 +1393,12 @@ def step_roots(ctx: StepCtx):
     write_json_atomic(dst, want)
 
 
-def golden_reference(obj) -> dict[str, dict]:
-    """kitsune/parakeet_golden.json ({"ids", "tdt", "ctc"} parallel lists) as id -> {"hyp", "ctc_hyp"}; also takes
-    {"rows": [{id, hyp, ctc_hyp}]} and {id: {tdt, ctc}}."""
-    if isinstance(obj, dict) and isinstance(obj.get("ids"), list):
-        return {i: {"hyp": t, "ctc_hyp": c} for i, t, c in zip(obj["ids"], obj.get("tdt") or [None] * len(obj["ids"]),
-                                                               obj.get("ctc") or [None] * len(obj["ids"]))}
-    rows = obj.get("rows") if isinstance(obj, dict) and isinstance(obj.get("rows"), list) else None
-    if rows is not None:
-        return {r["id"]: {"hyp": r.get("hyp", r.get("tdt")), "ctc_hyp": r.get("ctc_hyp", r.get("ctc"))} for r in rows}
-    return {i: {"hyp": v.get("hyp", v.get("tdt")), "ctc_hyp": v.get("ctc_hyp", v.get("ctc"))}
-            for i, v in obj.items() if isinstance(v, dict)}
+def golden_reference(obj: dict) -> dict[str, dict]:
+    """kitsune/parakeet_golden.json ({"ids", "tdt", "ctc"} parallel lists, as tools/publish_parakeet.py writes it) as
+    id -> {"hyp", "ctc_hyp"}; {} for an absent file (read_json's default)."""
+    ids = obj.get("ids") or []
+    return {i: {"hyp": t, "ctc_hyp": c} for i, t, c in zip(ids, obj.get("tdt") or [None] * len(ids),
+                                                           obj.get("ctc") or [None] * len(ids))}
 
 
 def step_golden(ctx: StepCtx):

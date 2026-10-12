@@ -190,19 +190,6 @@ def save_ledger(path: Path, ledger: dict):
     tmp.replace(path)
 
 
-def seed_ledger(ledger_path: Path, listing) -> int:
-    """Record remote files (RepoFile-like items, e.g. step plan's recursive listing) in the ledger; the next sync
-    still hashes each local file once before treating it as verified. Returns the number recorded."""
-    ledger = load_ledger(ledger_path)
-    n = 0
-    for item in listing:
-        if getattr(item, "size", None) is not None:
-            ledger["remote"][item.path] = remote_entry(item)
-            n += 1
-    save_ledger(ledger_path, ledger)
-    return n
-
-
 def remote_entry(item) -> list:
     lfs = getattr(item, "lfs", None)
     sha = getattr(lfs, "sha256", None) if lfs is not None else None

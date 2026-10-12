@@ -74,11 +74,6 @@ CANONICAL = (
 # step key -> the steps whose ids it reads (the 300 h step and eval_emilia read nothing the rest step writes)
 DEPENDS = {"reazon_large": ("reazon_small",), "eval_emilia": ("emilia_yodas@300h",),
            "emilia_yodas": ("emilia_yodas@300h", "eval_emilia")}
-REFUSED = {
-    "reazon_medium": "no canonical step: reazon_large already holds its rows, and ingested after reazon_large it would "
-                     "dedup against reazon_small only and duplicate ~1,500 h",
-    "cv": "a manual download (not on the Hub), so no box can rebuild it",
-}
 EXTENT_KEYS = ("name", "root", "inputs")
 # A100 sizing (vast/launch.py): everything on its disk but audio and labels (image, caches, train states, weights and
 # 01's 30 GB free-space floor), the label files per audio-hour (teacher npz + jsonl + second opinion, laptop-measured)
@@ -166,11 +161,10 @@ def validate(cfg: dict) -> list[str]:
     """Problems with the config's extent block; [] if it is a valid extent config.
 
     sources and eval_sets are spelled out (the trainer's defaults are the viability run's, which the extent would not
-    rebuild or pull); every name must be a canonical source (reazon_medium and cv are refused); `inputs` caps only
-    CAPPABLE sources the config names, each with 1..UPSTREAM_INPUTS files (emilia_yodas: "300h" or
-    >= EMILIA_300H_INPUTS); selection_recipe judges every source in full (partial_second_opinion is []); `root` is
-    labels/<name> and the common parent of teacher_root, second_root, parakeet_root (if set) and selection, which all
-    lie under it. All of them normalized paths."""
+    rebuild or pull); every name must be a canonical source; `inputs` caps only CAPPABLE sources the config names, each
+    with 1..UPSTREAM_INPUTS files (emilia_yodas: "300h" or >= EMILIA_300H_INPUTS); selection_recipe judges every
+    source in full (partial_second_opinion is []); `root` is labels/<name> and the common parent of teacher_root,
+    second_root, parakeet_root (if set) and selection, which all lie under it. All of them normalized paths."""
     ext = extent_block(cfg)
     if not isinstance(ext, dict):
         return ["the config has no extent block ({\"name\", \"root\", \"inputs\"})"]
@@ -203,9 +197,7 @@ def validate(cfg: dict) -> list[str]:
         problems.append("the config names no sources or eval_sets")
     known = {s.source for s in CANONICAL}
     for n in ns:
-        if n in REFUSED:
-            problems.append(f"{n}: refused, {REFUSED[n]}")
-        elif n not in known:
+        if n not in known:
             problems.append(f"{n}: not a canonical source ({', '.join(sorted(known))})")
     for src, n in inputs.items():
         if src not in CAPPABLE:

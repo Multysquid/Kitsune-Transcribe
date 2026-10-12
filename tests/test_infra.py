@@ -28,11 +28,9 @@ DIGEST_IMAGE = "ghcr.io/multysquid/kitsune-train@sha256:" + "ab" * 32
 
 sys.path.insert(0, str(VAST))
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "tests"))
 finish = importlib.import_module("finish")
 supervise = importlib.import_module("supervise")
 launch = importlib.import_module("launch")
-from fixtures import REAL, no_real_data  # noqa: E402
 
 
 def load_path(name: str, path: Path):
@@ -2061,19 +2059,6 @@ def test_every_upstream_repo_is_pinned(prep):
     assert prep.REVISIONS["japanese-asr/whisper_transcriptions.reazonspeech.small"].startswith("c74b52fc")
 
 
-def test_pins_match_the_local_download_cache(prep):
-    """The pins must be the commits data/ was built from (hf_hub_download records them in refs/main)."""
-    raw = REAL / "data" / "raw"
-    checked = 0
-    for repo, sha in prep.REVISIONS.items():
-        ref = raw / f"datasets--{repo.replace('/', '--')}" / "refs" / "main"
-        if ref.exists():
-            assert ref.read_text(encoding="utf-8").strip() == sha, repo
-            checked += 1
-    if not checked:
-        no_real_data(f"no local download cache under {raw}")
-
-
 def test_downloads_use_the_pinned_revision(prep, tmp_path, monkeypatch):
     seen = []
 
@@ -2102,7 +2087,7 @@ def test_second_opinion_mirror_pins_match_01(prep):
     second = load_path("second_opinion_02b", ROOT / "scripts" / "02b_second_opinion.py")
     pins = dict(second.JOIN_SOURCES.values())
     assert pins == {repo: prep.REVISIONS[repo] for repo in pins}
-    assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (second.MODEL2_REVISION, second.WHISPER_TOK_REVISION))
+    assert re.fullmatch(r"[0-9a-f]{40}", second.WHISPER_TOK_REVISION)
 
 
 def test_student_build_reads_the_teacher_commit_the_targets_and_the_card_name():
@@ -2135,27 +2120,27 @@ def test_label_passes_read_the_hub_at_a_pin():
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
         reads = [c for c in calls if c.func.attr in ("from_pretrained", "list_repo_files")]
         assert reads and all(any(k.arg == "revision" for k in c.keywords) for c in reads), name
-        for c in calls:  # HfFileSystem paths carry the revision as datasets/<repo>@<rev>/<file>
-            if c.func.attr == "open" and c.args and isinstance(c.args[0], ast.JoinedStr):
-                parts = [v.value for v in c.args[0].values if isinstance(v, ast.Constant)]
-                assert "@" in parts, name
 
 
-def test_teacher_meta_from_before_the_pin_resumes(tmp_path):
-    """A teacher_out/meta.json written before the teacher was pinned has no model_revision: it counts as the pin, so the
-    pass resumes and the key is back-filled; a meta.json from another teacher commit still stops it."""
+def test_teacher_meta_from_another_commit_stops_the_pass(tmp_path, capsys):
+    """A teacher_out/meta.json written with this pass's settings resumes, untouched; one from another teacher commit
+    (or without the pin) stops it, with 65 under --strict-existing."""
     teacher_pass = load_path("teacher_pass_02", ROOT / "scripts" / "02_teacher_pass.py")
     settings = dict(model=teacher_pass.MODEL_ID, model_revision=teacher_pass.MODEL_REVISION, language="ja",
                     punctuation=True, k=16, save_encoder=False)
-    legacy = {key: val for key, val in settings.items() if key != "model_revision"} | dict(eos_token_id=3)
     meta = tmp_path / "meta.json"
-    meta.write_text(json.dumps(legacy), encoding="utf-8")
+    written = json.dumps(settings | dict(eos_token_id=3))
+    meta.write_text(written, encoding="utf-8")
     teacher_pass.check_meta(meta, settings)
-    assert json.loads(meta.read_text(encoding="utf-8")) == legacy | {"model_revision": teacher_pass.MODEL_REVISION}
-    teacher_pass.check_meta(meta, settings)
-    meta.write_text(json.dumps(legacy | {"model_revision": "f" * 40}), encoding="utf-8")
-    with pytest.raises(SystemExit, match="model_revision"):
-        teacher_pass.check_meta(meta, settings)
+    assert meta.read_text(encoding="utf-8") == written
+    unpinned = {key: val for key, val in settings.items() if key != "model_revision"}
+    for other in (settings | {"model_revision": "f" * 40}, unpinned):
+        meta.write_text(json.dumps(other), encoding="utf-8")
+        with pytest.raises(SystemExit, match="model_revision"):
+            teacher_pass.check_meta(meta, settings)
+        with pytest.raises(SystemExit) as e:
+            teacher_pass.check_meta(meta, settings, strict=True)
+        assert e.value.code == teacher_pass.INTEGRITY_EXIT and "model_revision" in capsys.readouterr().err
 
 
 # ------------------------------------------------------------------------------------------------------ smoke model

@@ -5,7 +5,7 @@ sit next to the students' and the teachers' in tools/full_report.py.
 Models (WHISPER_MODELS; the system name is the key, the tables' and the speed record's name):
   whisper-large-v3        openai/whisper-large-v3 @ 06f233fe (scripts/02b_second_opinion.py's WHISPER_TOK pin)
   whisper-large-v3-turbo  openai/whisper-large-v3-turbo @ 41f01f3f (4 decoder layers)
-  kotoba-whisper-v2.0     kotoba-tech/kotoba-whisper-v2.0 @ 7eb57527 (02b's MODEL2 pin: the model that chose the
+  kotoba-whisper-v2.0     kotoba-tech/kotoba-whisper-v2.0 @ 7eb57527 (KOTOBA_JUDGE_REVISION: the model that chose the
                           Galgame-neutral rows, so its M4 is biased low by construction; the report prints M4-all)
   whisper-small           openai/whisper-small @ 973afd24 (pinned from the Hub when this module was written; 80 mel
                           bins: the loader takes the feature extractor of each model's own snapshot, never 128)
@@ -73,6 +73,10 @@ DEFAULT_MAX_ROWS = 64  # the row cap of a model dir outside WHISPER_MODELS: larg
 LOAD_BEAT_MAX_S = 3600  # heartbeat.beating's bound around a download + load (the contract's section 9)
 REPETITION = dict(window=24, max_period=12)  # kitsune.generation.RepetitionStop's defaults, recorded in whisper.json
 FALLBACK_THRESHOLDS = ("logprob_threshold", "compression_ratio_threshold", "no_speech_threshold")  # load_whisper: off
+# the commit of the Galgame judge before the label box (02b's kotoba-whisper on the laptop GPU, since removed): its
+# stored hypotheses of the galgame hold-out chose the Galgame-neutral rows, a frozen input since (the study manifest,
+# tools/full_report.py KOTOBA_JSONL_SHA256); the yardstick scores that very model
+KOTOBA_JUDGE_REVISION = "7eb575277d18909a4af8a24e3ae8cce2e99794ae"
 
 
 @dataclass(frozen=True)
@@ -90,8 +94,8 @@ WHISPER_MODELS: dict[str, WhisperSpec] = {s.system: s for s in (
                 "Apache-2.0", "Whisper large-v3"),
     WhisperSpec("whisper-large-v3-turbo", "openai/whisper-large-v3-turbo", "41f01f3fe87f28c78e2fbf8b568835947dd65ed9",
                 128, "MIT", "Whisper large-v3 turbo"),
-    WhisperSpec("kotoba-whisper-v2.0", "kotoba-tech/kotoba-whisper-v2.0", "7eb575277d18909a4af8a24e3ae8cce2e99794ae",
-                128, "Apache-2.0", "Kotoba-Whisper v2.0"),
+    WhisperSpec("kotoba-whisper-v2.0", "kotoba-tech/kotoba-whisper-v2.0", KOTOBA_JUDGE_REVISION, 128, "Apache-2.0",
+                "Kotoba-Whisper v2.0"),
     # the owner's yes (2026-09-27); revision = HfApi().model_info("openai/whisper-small").sha read that day
     WhisperSpec("whisper-small", "openai/whisper-small", "973afd24965f72e36ca33b3055d56a652f456b4d", 128,
                 "Apache-2.0", "Whisper small"),
