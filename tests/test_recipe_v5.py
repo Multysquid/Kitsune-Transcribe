@@ -536,17 +536,20 @@ GOLDEN_AED = dict(seed=5, max_tokens=191, truncate_p=0.6, truncate_min_frac=0.1,
                   reverb_p=0.3, gain_p=0.3, background_min_row_s=1.5)
 
 
-def batch_digest(ds, mbs, made: list) -> str:
+def batch_digest(ds, mbs, made: list | None, drop: tuple = ()) -> str:
     """sha256 of an augmented dataset's micro-batches as the house rule pins them: every output but the audio samples
-    (lengths, the frame targets or tokens, ids, durations, the aug counters with their keys in order) and the state of
-    the micro-batch's generator after it (made: the generators augment_rng handed out, record_rngs), so an added,
-    dropped or reordered draw shows. The samples are left out: reverb's FFT and the mixes' sums may differ in their
-    last bits across machines, and every step's draws are in the generator's state."""
+    (lengths, the frame targets or tokens, ids, durations, the aug counters with their keys in order, but the counters
+    named in drop) and the state of the micro-batch's generator after it (made: the generators augment_rng handed out,
+    record_rngs; None for a dataset without an augmentation, which draws nothing), so an added, dropped or reordered
+    draw shows. The samples are left out: reverb's FFT and the mixes' sums may differ in their last bits across
+    machines, and every step's draws are in the generator's state."""
     h = hashlib.sha256()
     for idx in mbs:
         got = ds[idx]
-        rec = [[k, v.tolist() if isinstance(v, torch.Tensor) else v] for k, v in got.items() if k != "wave"]
-        rec.append(["rng", made[-1].bit_generator.state["state"]])
+        rec = [[k, v.tolist() if isinstance(v, torch.Tensor) else
+                {c: n for c, n in v.items() if c not in drop} if k == "aug" else v] for k, v in got.items() if k != "wave"]
+        if made is not None:
+            rec.append(["rng", made[-1].bit_generator.state["state"]])
         h.update(json.dumps(rec).encode())
     return h.hexdigest()
 
@@ -659,6 +662,54 @@ def test_keys_off_reproduce_the_code_before_them(tmp_path, monkeypatch):
     for name, ctc_extra, aed_extra in (("plain", None, None), ("explicit", dict(off, start_ids=SID), off)):
         with monkeypatch.context() as mp:
             assert golden_digests(tmp_path / name, mp.setattr, ctc_extra, aed_extra) == GOLDEN, name
+
+
+# ---------------------------------------------------------------------------------- the released models' recipes
+
+# The recipes the released models trained with (tools/make_full_configs.py): P-0.1B's run A0 (box 1, no augmentation),
+# P-0.3B's RECIPE (v2), P-0.05B's RECIPE_V4 and T-0.6B's RECIPE_AED_H15
+RELEASED = {"a0": None, "v2": M.RECIPE, "v4": M.RECIPE_V4, "aed_h15": M.RECIPE_AED_H15}
+# Digests of micro-batches under them (released_digests), recorded at db9ec64 - the code the four runs trained with, as
+# far as these steps go -, so that any later change of kitsune/trainset.py's augmentation keeps their streams draw for
+# draw. Each recipe with its codec step off (libsndfile builds differ; GOLDEN's comment) and the fixture banks for its
+# background and rooms; the CTC recipes on the frame store with ReazonSpeech-like lead-ins (lead_in_targets: every step
+# they name acts, the end trim included), A0 on its plain rows, the AED recipe on the token store with its cut table and
+# quiet tails. The counters of mix and the quiet pads, steps no released recipe used (0 under each), are not in them.
+RELEASED_COUNTERS_LEFT_OUT = ("mixed", "cut_padded", "end_padded")
+RELEASED_GOLDEN = {"a0": "5e5556bdb9396643e42435a5cc6fc4dbb929c8b6f1eea06375f0c62e419075da",
+                   "v2": "946076b8712ed6105d62791fa94c0e7d19234a311ca8ed8ae75137e1bd7231fe",
+                   "v4": "75aaab92ec17b402b09cbf2138410470d979e59491dc6894090b6e98f5ce65c5",
+                   "aed_h15": "d29db24ba80c6c50700b364f7751ae5cff5841db857f8f3c67e401aa3d152928"}
+
+
+def released_digests(root: Path, patch) -> dict:
+    """RELEASED_GOLDEN's digests from fresh stores under root (GOLDEN's stores, planners and seeds: 11 for the CTC
+    recipes, 5 and max_tokens 191 for the AED one, the start pieces the trainer hands a CTC augmentation). patch: a
+    monkeypatch.setattr."""
+    made = record_rngs(patch)
+    st = frame_store(root / "ctc")
+    bank = NoiseBank.load(make_noise_bank(root / "bg", kinds=("music", "speech", "song", "noise")))
+    rirs = NoiseBank.load(make_rir_bank(root / "rir"))
+    out = {"a0": batch_digest(T.dataset_for(st), micro_batches(st), None)}
+    lead_in_targets(patch)
+    for name in ("v2", "v4"):
+        aug = T.Augment.from_config(dict(RELEASED[name], codec_p=0.0), seed=11, punct_ids=P, start_ids=SID)
+        out[name] = batch_digest(T.dataset_for(st, augment=aug, noise=bank, rirs=rirs), micro_batches(st), made,
+                                 RELEASED_COUNTERS_LEFT_OUT)
+    quiet_tails(patch)
+    ast, cuts = aed_store(root / "aed")
+    p = T.StepPlanner(ast.utts, step_audio_s=12, micro_audio_s=6.0, max_dec_len=200, pool_micro=4, seed=0)
+    mbs = [mb for e in range(2) for step in p.epoch_plan(e) for mb in step]
+    aug = T.Augment.from_config(dict(RELEASED["aed_h15"], codec_p=0.0), seed=5, max_tokens=191)
+    out["aed_h15"] = batch_digest(T.dataset_for(ast, augment=aug, cuts=cuts, noise=bank, rirs=rirs), mbs, made,
+                                  RELEASED_COUNTERS_LEFT_OUT)
+    return out
+
+
+def test_the_released_recipes_streams(tmp_path, monkeypatch):
+    """The released models' recipes (RELEASED) give the micro-batches recorded with the code they trained with
+    (RELEASED_GOLDEN), every draw included; A0 reads the stored rows as they are."""
+    assert released_digests(tmp_path, monkeypatch.setattr) == RELEASED_GOLDEN
 
 
 # ----------------------------------------------------------------------------------------------------- the trainer
