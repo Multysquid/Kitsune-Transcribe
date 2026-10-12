@@ -500,16 +500,22 @@ def test_the_tensorboard_server_drops_the_steps_a_resume_discarded(tmp_path, mon
 
 def test_export_reads_a_flat_run_resumed_with_the_buckets(tmp_path, monkeypatch):
     """A run logged before the buckets and resumed with the bucketed logger: TensorBoard shows both layouts, and the
-    export gives one series per logged tag (export_run._from_tb maps the flat launch's tags by the tag map)."""
+    export gives one series per logged tag. export_run._from_tb maps the flat launch's tags by the tag map the resume
+    wrote, and a tag that only the flat launch logged (note), which no map holds, by TB_BUCKET_RULES."""
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
     run = make_run(tmp_path / "runs" / "mixed", flat_first=True, monkeypatch=monkeypatch)
     acc = EventAccumulator(str(run / "tb"))
     acc.Reload()
     assert {"loss/kl", "2_loss_accuracy/train_loss/kl"} <= set(acc.Tags()["scalars"])  # both layouts
-    s = tb_view(run)["tb_scalars"]
+    view = tb_view(run)
+    s = view["tb_scalars"]
     assert s["step"][s["tag"] == "loss/kl"].tolist() == [1, 2, 3, 4, 5, 6]  # one series by logged tag
     assert set(s.loc[s["tag"] == "loss/kl", "tb_tag"]) == {"2_loss_accuracy/train_loss/kl"}
+    assert "note" not in load_tag_map(run / "metrics" / "tag_map.json")  # the rules' fallback, not the map
+    t = view["tb_text"]
+    assert set(t.loc[t["tag"] == "note", "tb_tag"]) == {"3_misc/note"}
+    assert set(t.loc[t["tag"] == "note", "bucket"]) == {"3_misc"}
 
 
 def test_export_without_tag_map_gives_back_the_logged_tags(tmp_path):
