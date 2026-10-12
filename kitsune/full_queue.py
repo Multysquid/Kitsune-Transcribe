@@ -4,7 +4,7 @@ to its last verified upload, on a shared GPU queue; plus the resume of a box on 
 A box (fullrun.BOX_NAMES: full-smoke = smoke A, p01 = box 1 and its recipe test, full-t = T-0.6B, full-p = P-0.3B,
 smoke-b, p005 = the P test box, p-cool = three runs' cooldowns re-run (DECISIONS H14)) is the list of registry items of
 its spec, in registry order. FullQueue(study_queue.Queue) runs them with the study queue's process, state and upload
-machinery (hooks H1-H5 of the build contract, 0.3), but never its plans: it never reads prereg.rules()["boxes"].
+machinery (hooks H1-H5 of the build contract, 0.3).
 
   items      stores (python -m kitsune.full_queue build-stores: the trainer's own train, eval and dev store builds,
              once per family, alone), train (scripts/04_distill.py, the run named after the item), readout (the M4
@@ -167,7 +167,7 @@ SMOKE_VRAM_GB = 28.0  # check 2: every memory number of every smoke run
 SMOKE_MIN_STEPS = 300  # check 2: a VRAM window long enough (the deadline-fault item is exempt)
 BOX1_H_MAX, BOX2_H_MAX, FACTOR_MIN = 17.0, 45.0, 0.6  # check 3: the projected box hours and plan factors
 # check 5's loader rule: the steady-state share of the steps' time spent waiting on the loader, below DATA_WAIT_MAX
-# (the build contract's 0.02, kept: the owner may move it to prereg.DATA_WAIT_MAX, the study's 0.05). Box 53693389
+# (the build contract's 0.02; the size study's calibration allowed 0.05). Box 53693389
 # (2026-10-01) failed check 5 on the whole-run summary.throughput.data_wait_frac (smoke-p005 0.234): every launch builds
 # a new loader whose 8 spawned workers take ~6-7 s to start, its first step waits for them, and a short smoke that the
 # faults restarted (smoke-p01 3 launches, smoke-p03 2) is dominated by those start-ups. Its steady state was 0.0007 to
@@ -464,8 +464,8 @@ def _fetch_files(hub: Hub, files: dict[str, dict], dest: Path, stage: Path, base
 
 @dataclass
 class FullSettings(Q.Settings):
-    """The study queue's Settings plus the full box's: the scratch repo, the registry, the host's ids, the Hub readers
-    and the timing knobs the tests shrink."""
+    """The queue base's Settings (kitsune/study_queue.py) plus the full box's: the scratch repo, the registry, the
+    host's ids, the Hub readers and the timing knobs the tests shrink."""
     scratch_repo: str | None = field(default_factory=lambda: os.environ.get(fullrun.ENV_SCRATCH_REPO) or None)
     registry: dict | None = None  # None: configs/full/boxes.json of root ($KITSUNE_FULL_REGISTRY in the tests)
     machine_id: str | None = field(default_factory=lambda: os.environ.get(fullrun.ENV_MACHINE_ID) or None)
@@ -488,9 +488,10 @@ class FullSettings(Q.Settings):
 
 
 class FullQueue(Q.Queue):
-    """One registry box (the module docstring). It overrides the study queue's run, _ready, _next_for, resume_point,
-    finished, write_summary and drain_uploads and never calls their base versions; start, execute, stop_all,
-    kill_orphans, set_aside, find_run_dir and ensure_attribution are the study queue's."""
+    """One registry box (the module docstring). It gives the queue base (kitsune/study_queue.py) its hooks
+    (_load_state, argv_for, child_env, _ready, _next_for, resume_point, finished, drain_uploads) and has its own run
+    and summary; start, execute, stop_all, kill_orphans, set_aside, find_run_dir and ensure_attribution are the
+    base's."""
 
     def __init__(self, box: str, settings: FullSettings | None = None, registry: dict | None = None):
         s = settings or FullSettings()
@@ -513,10 +514,7 @@ class FullQueue(Q.Queue):
         self.items_spec = {it["name"]: it for it in self.spec["items"]}
         self.order = [it["name"] for it in self.spec["items"]]
         self._fresh = True
-        trains = [n for n in self.order if self.items_spec[n]["kind"] == "train"]
-        plan = dict(box=box, kind=fullrun.JOB, shared_queue=True, runs=trains, calibrate=[], probe_classes=[],
-                    reference=None, numbers_file=None, numbers_from=None, extras=[])
-        super().__init__(box, s, plan=plan)
+        super().__init__(box, s)
         if len(self.gpus) != int(self.spec["gpus"]):
             raise Q.QueueError(f"box {box} is registered with {self.spec['gpus']} GPU(s); the queue found "
                                f"{len(self.gpus)}: {self.gpus}")
@@ -1298,7 +1296,7 @@ class FullQueue(Q.Queue):
 
     # --------------------------------------------------------------------------------------------- the end
 
-    def finished(self, name: str, rc: int, todo: list[str], on_done=None):
+    def finished(self, name: str, rc: int, todo: list[str]):
         it, spec = self.item(name), self.spec_of(name)
         kind = spec["kind"]
         att = it["attempts"][-1]

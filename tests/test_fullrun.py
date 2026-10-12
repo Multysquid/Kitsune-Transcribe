@@ -106,7 +106,7 @@ def test_data_blocks():
     study = json.loads((ROOT / "study" / "data.json").read_text(encoding="utf-8"))
     for k in ("data_root", "teacher_root", "second_root", "parakeet_root", "sources", "eval_sets"):
         assert fr.FULL_DATA[k] == study[k] == fr.SMOKE_DATA[k]
-    rec = {k: v for k, v in prereg.registered_recipe().items() if k != "study"}
+    rec = {k: v for k, v in study["selection_recipe"].items() if k != "study"}  # the registered recipe (PREREG.json)
     assert {k: v for k, v in fr.FULL_DATA["selection_recipe"].items() if k not in ("study", "full_study")} == rec
     assert fr.SMOKE_DATA["extent"] == study["extent"]
     assert fr.FULL_DATA["selection_recipe"]["full_study"] is not fr.FULL_STUDY  # no aliasing of the module constant

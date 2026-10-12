@@ -1,11 +1,11 @@
-"""The size study's speed probe (study/STUDY.md 4.2 "Speed" and "VRAM", 4.7 Pareto; decision 28): one model at a time,
-a batched RTF and a batch-1 latency (p50 / p95) on a fixed id list, and the peak VRAM, on the study box at the end, on
-an idle host (the queue calls it once per system).
+"""The speed probe (the size study's study/STUDY.md 4.2 "Speed" and "VRAM", 4.7 Pareto; decision 28): one model at a
+time, a batched RTF and a batch-1 latency (p50 / p95) on a fixed id list, and the peak VRAM, on an idle host (a full
+box's speed items: kitsune/full_queue.py calls it once per system).
 
 Kinds (--kind), each decoded exactly as the study scores it:
   aed           a Transcribe student dir (kitsune.student.load_student): the greedy AED decode with the teacher pass's
                 settings (kitsune.evaluate.greedy_generate: num_beams 1, RepetitionStop, max_new 16 + 10 s), the LM head
-                in fp32 (kitsune.evaluate._fp32_head), the student's own LogMel; its decode length: --decode-len below
+                in fp32 (kitsune.evaluate._fp32_head), the student's own LogMel; the free decode (below)
   cohere        the Cohere teacher (CohereLabs/cohere-transcribe-03-2026 at the revision its labels came from, or
                 --model), the same decode
   ctc           a Parakeet CTC student dir (kitsune.ctc_student.load_ctc_student): the encoder, the CTC head in fp32,
@@ -41,15 +41,11 @@ longest of the latency ids, then the first --warmup-1 ids (--warmup-1 0: none) -
 VRAM (CUDA): each pass's peak allocated and reserved bytes are kept, and vram_gb = the larger reserved peak / 1e9, what
 the model took from the card at that batch size. On CPU the VRAM fields are null.
 
-AED decode length (--decode-len; aed and cohere kinds): an AED decode's time grows with the tokens it emits, so a model
-that does not stop where a trained one would (an untrained init dir: a scratch decoder runs to max_new, a pruned one
-derails at step 0) times its weights, not its shape. "teacher" pins every batch to exactly the teacher's token count of
-its longest row (the store's n_tok: the stored greedy tokens with EOS; batch-1: the utterance's own; greedy_generate's
-pin_new: EOS held off until then, no RepetitionStop), which is what a student that has learnt to stop decodes. "greedy":
-the free decode, as the evaluator runs it. "auto" (default): teacher for a student dir without the trainer's "trained"
-record in student_meta.json (a study student's init dir, which the study box times as its shape), greedy otherwise (a
-trained checkpoint, the Cohere teacher). The record says which (decode_len), whether the weights were trained, and the
-tokens decoded per utterance (tokens_per_utt; CTC and TDT: the output tokens).
+AED decode length (aed and cohere kinds): an AED decode's time grows with the tokens it emits, so it is timed as the
+evaluator runs it, the free greedy decode of trained weights (a model that does not stop where a trained one would - an
+untrained init dir - times its weights, not its shape; the size study pinned such dirs to the teacher's token counts,
+an option removed after it, the last commit with it being 76b28a1). The record says how many tokens it decoded per
+utterance (tokens_per_utt; CTC and TDT: the output tokens).
 
 Numerics (--dtype): auto = bf16 on CUDA, fp32 on CPU. bf16: the weights in bf16 and bf16 autocast (the heads computed
 in fp32 as above; the TDT path's encoder in bf16, the rest fp32, as the label box ran it). fp32: fp32 weights, no
@@ -69,12 +65,12 @@ Output (--out, JSON, merged, written atomically): {"schema": 1, "ids": [...], "i
 record}, "failed": {name: why}}. A record: kind, model, device, gpu, dtype, batch_s, n_utts, audio_s, batches, rtf,
 wall_s, the batch-1
 fields (n_latency, p50_s, p95_s, mean_s, rtf_1_p50), vram_peak_allocated_bytes / _reserved_bytes for each pass,
-vram_gb, params_total, weights_bytes, relpos_patch, decode_len, trained, tokens_per_utt, cer_ref_corpus, max_rows (the
+vram_gb, params_total, weights_bytes, relpos_patch, tokens_per_utt, cer_ref_corpus, max_rows (the
 batched pass's row cap, null without one), n_truncated / n_timestamp_tokens (whisper's batched pass: rows the stop or
 the length cap cut, timestamp ids stripped; null for the other kinds), fp32_head (whisper: whether its LM head ran in
 fp32; null for the other kinds, whose heads are fixed), idle, versions (python, torch, transformers, cuda, host,
-torchao, machine_id = $KITSUNE_MACHINE_ID, cpu), time_utc. tools/study_report.py --speed reads it (the Pareto view:
-rtf, vram_gb, p50_s, p95_s; kitsune.study_stats.speed_entry); the full runs' report groups records by machine_id + gpu.
+torchao, machine_id = $KITSUNE_MACHINE_ID, cpu), time_utc. tools/full_report.py --speed reads it and groups the records
+by machine_id + gpu.
 
 Quantised variants (the full runs; kitsune.quant, contract section 8; aed and ctc kinds): --quant <fmt> times the
 student quantised after its dtype cast (kitsune.quant.apply: torchao's kernels on CUDA; --quant-impl emulate only when
@@ -101,7 +97,7 @@ Sanity (F4, DECISIONS F; smoke B check 16): a timed number of a model that decod
 53693389's fp8-w8a8 records decoded NaN-filled garbage (cer_ref_corpus 0.939-0.945 against 0.19-0.27 for every other
 format) and passed check 16 as "done". So every --quant or --compile probe, after both clocks and the census (nothing
 it does can touch the timings or the VRAM peaks), frees the timed model and loads the same weights once more in the
-probe's dtype, eager, unquantised, with the rel-pos patch and decode length as timed (reference_pass), and decodes the
+probe's dtype, eager, unquantised, with the rel-pos patch as timed (reference_pass), and decodes the
 same ids in the very batches of the batched pass. The record's sanity: ok when both corpus CERs are finite and the
 timed model's is at most SANITY_MAX_DELTA (5 pp) above the reference's. The bound: on the study's 200 speed ids every
 format that worked on box 53693389's smoke B stayed within 0.8 pp of its student's bf16 CER (int8 W8A16 / W8A8, NVFP4
@@ -115,13 +111,13 @@ file's top-level failed {system: {error, stage, quant, compile, time_utc, versio
 system removes it), and the exit stays 1: tools/full_report.py lists failed and left-out probes instead of leaving a
 row silently empty.
 
-Usage (on the box, at its end, one call per system; kitsune/study_queue.py phase_speed passes these):
-  python tools/speed_probe.py --kind aed --model students/study/t03 --system study-t03 \
-      --store cache/eval --per-set 40 --out runs/speed-B/speed.json --require-idle
+Usage (on the box, one call per system; kitsune/full_queue.py passes these, from the registry's speed items):
+  python tools/speed_probe.py --kind aed --model runs/<run_id>/checkpoints/step_<N> --system full-t06 \
+      --store cache/eval --per-set 40 --out runs/speed-full-t-<stamp>/speed.json --require-idle
   python tools/speed_probe.py --kind cohere --system cohere --store cache/eval --per-set 40 \
-      --out runs/speed-B/speed.json --require-idle
+      --out runs/speed-full-t-<stamp>/speed.json --require-idle
   python tools/speed_probe.py --kind parakeet-tdt --model models/parakeet-tdt_ctc-0.6b-ja-hf --system parakeet-tdt \
-      --store cache/eval --per-set 40 --out runs/speed-B/speed.json --require-idle
+      --store cache/eval --per-set 40 --out runs/speed-full-t-<stamp>/speed.json --require-idle
   python tools/speed_probe.py --kind whisper --model whisper-large-v3 --hf-cache cache/hf --store cache/eval \
       --per-set 40 --out runs/speed-smoke-b-<stamp>/speed.json --require-idle      # system = the key
 """
@@ -148,8 +144,6 @@ from kitsune.store import ids_sha256  # noqa: E402
 
 SCHEMA = 1
 KINDS = ("aed", "cohere", "ctc", "parakeet-ctc", "parakeet-tdt", "whisper")
-AED_KINDS = ("aed", "cohere")  # the autoregressive decodes: their time depends on the tokens they emit
-DECODE_LENS = ("auto", "greedy", "teacher")
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 TEACHER_REVISION = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"  # == scripts/03_build_student.TEACHER_REVISION (tested)
 MAX_SYMBOLS = 10  # the label pass's TDT guard (kitsune.parakeet; vast/label.py)
@@ -263,16 +257,15 @@ def _weights_bytes(model) -> int:
 
 
 class AedRunner:
-    """A Cohere ASR model (a Transcribe student or the teacher): greedy_generate on the eval's LogMel features; with
-    pin (decode_len "teacher") every batch decodes exactly its longest row's teacher token count."""
+    """A Cohere ASR model (a Transcribe student or the teacher): greedy_generate on the eval's LogMel features."""
 
     tokens = 0  # tokens decoded since the last reset (every runner counts them)
 
-    def __init__(self, model, processor, device, dtype: str, prompt, eos: int, pad: int, pin: bool = False):
+    def __init__(self, model, processor, device, dtype: str, prompt, eos: int, pad: int):
         from kitsune import evaluate as ev
         from kitsune.features import LogMel
 
-        self.ev, self.device, self.amp, self.pin = ev, device, _amp(device, dtype), bool(pin)
+        self.ev, self.device, self.amp = ev, device, _amp(device, dtype)
         self.model = model.to(device, dtype=torch.bfloat16 if dtype == "bf16" else torch.float32).eval()
         self.feat = LogMel.from_feature_extractor(processor.feature_extractor).to(device)
         self.tokenizer = processor.tokenizer
@@ -289,7 +282,7 @@ class AedRunner:
         stack.enter_context(self.ev._fp32_head(self.model))
         return stack
 
-    def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
+    def decode(self, waves: list[np.ndarray], durations: list[float]) -> list[str]:
         from kitsune.features import pad_waves
 
         wave, lengths = pad_waves(waves)
@@ -298,7 +291,7 @@ class AedRunner:
             feats, fmask = self.feat(wave, lengths)
         # max_new from the store's durations, as greedy_eval takes them
         rows = self.ev.greedy_generate(self.model, feats, fmask, max(durations), prompt_ids=self.prompt, eos=self.eos,
-                                       pad=self.pad, amp=self.amp, pin_new=max(n_tok) if self.pin else None)
+                                       pad=self.pad, amp=self.amp)
         self.tokens += sum(len(ids) for ids, _ in rows)
         return self.tokenizer.batch_decode([ids for ids, _ in rows], skip_special_tokens=True)
 
@@ -321,7 +314,7 @@ class CtcRunner:
     def context(self):
         return torch.inference_mode()
 
-    def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
+    def decode(self, waves: list[np.ndarray], durations: list[float]) -> list[str]:
         from kitsune.evaluate import amp_dtype
 
         feats, lens = self.feat(waves)
@@ -355,7 +348,7 @@ class TdtRunner:
     def context(self):
         return torch.inference_mode()
 
-    def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
+    def decode(self, waves: list[np.ndarray], durations: list[float]) -> list[str]:
         P, t = self.P, self.teacher
         feats, lens = self.feat(waves)
         mask = self.CS.lengths_to_mask(lens, feats.shape[1]).long()
@@ -404,7 +397,7 @@ class WhisperRunner:
             stack.enter_context(_fp32_head(self.model))
         return stack
 
-    def decode(self, waves: list[np.ndarray], durations: list[float], n_tok: list[int]) -> list[str]:
+    def decode(self, waves: list[np.ndarray], durations: list[float]) -> list[str]:
         self.heartbeat.beat()
         feats = self.W.features(self.wm, waves)
         rows = self.W.greedy_whisper(self.wm, feats, max(durations), fp32_head=False)  # context() holds the fp32 head
@@ -414,39 +407,13 @@ class WhisperRunner:
         return self.W.decode_texts(self.wm, rows)
 
 
-def trained_weights(kind: str, model: str | None) -> bool | None:
-    """Whether a student dir holds trained weights: the trainer's "trained" record in its student_meta.json (a
-    checkpoint the trainer exported has it, a student init dir from 03 / 03c does not); None for the teachers."""
-    if kind not in ("aed", "ctc") or not model:
-        return None
-    try:
-        meta = json.loads((Path(model) / "student_meta.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    return bool(meta.get("trained"))
-
-
-def decode_len_of(kind: str, choice: str, trained: bool | None) -> str | None:
-    """The AED decode length a probe runs (module docstring): None for the non-autoregressive kinds; "auto" is
-    "teacher" for an untrained student dir, "greedy" otherwise; Whisper always decodes freely ("greedy": it has no
-    stored token counts of its own, parse_args refuses "teacher")."""
-    if kind == "whisper":
-        return "greedy"
-    if kind not in AED_KINDS:
-        return None
-    if choice != "auto":
-        return choice
-    return "teacher" if kind == "aed" and trained is False else "greedy"
-
-
 def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, store, revision: str,
-                relpos_patch: bool = True, decode_len: str | None = None, quant: dict | None = None,
-                compile: bool = False, *, hf_cache: str | None = None, max_rows: int | None = None,
-                fp32_head: bool = True):
+                relpos_patch: bool = True, quant: dict | None = None, compile: bool = False, *,
+                hf_cache: str | None = None, max_rows: int | None = None, fp32_head: bool = True):
     """The runner of one kind and its model's description; relpos_patch: kitsune.patches.patch_relpos_once_per_batch
     on its encoder, as the trainer and the evaluator run every one of these encoders (perf.relpos_patch; never for
-    whisper, which has no FastConformer: the patch refuses a model without Parakeet's rel-pos encoding); decode_len
-    "teacher": an AED runner pinned to the teacher's token counts. quant {fmt, impl, scope, mx_rounding}: the model
+    whisper, which has no FastConformer: the patch refuses a model without Parakeet's rel-pos encoding). quant {fmt,
+    impl, scope, mx_rounding}: the model
     quantised after the runner's dtype cast and before the patch (fp16: the runner keeps fp32 weights, kitsune.quant
     casts them, autocast fp16), runner.quant = the recipe, weights_bytes = the deployable bytes. The runner's bf16 cast
     comes first (the study's timing convention: BatchNorm statistics bf16 too), and kitsune.quant.apply leaves those
@@ -455,7 +422,7 @@ def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, 
     fp32_head: whisper's snapshot cache, row cap and LM-head precision."""
     fp16 = bool(quant) and quant["fmt"] == "fp16"
     runner, desc = _runner(kind, model, device, "fp32" if fp16 else dtype, store.info or {}, revision,
-                           pin=decode_len == "teacher", hf_cache=hf_cache, max_rows=max_rows, fp32_head=fp32_head)
+                           hf_cache=hf_cache, max_rows=max_rows, fp32_head=fp32_head)
     runner.quant = None
     runner.weights_bytes_resident = runner.weights_bytes
     if quant:
@@ -486,7 +453,7 @@ def load_runner(kind: str, model: str | None, device: torch.device, dtype: str, 
 
 
 def _runner(kind: str, model: str | None, device: torch.device, dtype: str, info: dict, revision: str,
-            pin: bool = False, hf_cache: str | None = None, max_rows: int | None = None, fp32_head: bool = True):
+            hf_cache: str | None = None, max_rows: int | None = None, fp32_head: bool = True):
     if kind == "whisper":
         from kitsune import heartbeat
         from kitsune import whisper as W
@@ -512,7 +479,7 @@ def _runner(kind: str, model: str | None, device: torch.device, dtype: str, info
             proc = AutoProcessor.from_pretrained(str(model))
             desc = str(model)
         return AedRunner(m, proc, device, dtype, info.get("prompt", trainset.PROMPT), info.get("eos", trainset.EOS),
-                         info.get("pad", trainset.PAD), pin=pin), desc
+                         info.get("pad", trainset.PAD)), desc
     if kind in ("ctc", "parakeet-ctc"):
         from transformers import AutoProcessor
 
@@ -561,28 +528,26 @@ def batch_plan(dur: np.ndarray, batch_s: float, max_rows: int | None) -> list[li
 
 
 def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[str], device: torch.device, *,
-          batch_s: float, warmup: int, warmup_1: int, latency_n: int | None, n_tok: list[int] | None = None,
-          profile_kernels: bool = False, batch_rows: int | None = None) -> dict:
-    """The timed passes over `waves` (module docstring): the batched pass after its warm-up, then the batch-1 pass
-    after its own. durations: the store's seconds of each wave (the batching and the RTF's audio seconds); n_tok: the
-    teacher's tokens of each (an AED runner pinned to them reads them); the batched pass's row cap: the runner's
-    max_rows (whisper), else batch_rows, else none - the same real-seconds batches as every kind, cut at that many
-    rows (pack_micro_batches' cap_tokens over one "token" per row). Returns the record's numbers, with the batch-1
-    hypotheses kept (hyp_diff_1; "_hyps": (batched, batch-1) for --hyps-out) and, with profile_kernels, an untimed
-    batched and batch-1 decode under kitsune.quant.kernel_census (kernels). Beats the item's heartbeat once per timed
-    repeat, and under beating (max 1800 s) through the warm-ups."""
+          batch_s: float, warmup: int, warmup_1: int, latency_n: int | None, profile_kernels: bool = False,
+          batch_rows: int | None = None) -> dict:
+    """The timed passes over `waves` (module docstring): the batched pass after its warm-up, then the batch-1 pass after
+    its own. durations: the store's seconds of each wave (the batching and the RTF's audio seconds); the batched
+    pass's row cap: the runner's max_rows (whisper), else batch_rows, else none - the same real-seconds batches as
+    every kind, cut at that many rows (pack_micro_batches' cap_tokens over one "token" per row). Returns the
+    record's numbers, with the batch-1 hypotheses kept (hyp_diff_1; "_hyps": (batched, batch-1) for --hyps-out) and,
+    with profile_kernels, an untimed batched and batch-1 decode under kitsune.quant.kernel_census (kernels). Beats
+    the item's heartbeat once per timed repeat, and under beating (max 1800 s) through the warm-ups."""
     from kitsune import heartbeat
     from kitsune.evaluate import corpus_cer
 
     dur = np.asarray(durations, dtype=np.float64)
-    tok = [1] * len(waves) if n_tok is None else [int(x) for x in n_tok]
     max_rows = getattr(runner, "max_rows", None) or batch_rows
     plan = batch_plan(dur, batch_s, max_rows)
     counted = [k for k in ("n_truncated", "n_timestamp_tokens") if hasattr(runner, k)]  # whisper's per-pass counts
     n1 = len(waves) if latency_n is None else min(int(latency_n), len(waves))
 
     def run(idx):
-        return runner.decode([waves[i] for i in idx], [float(dur[i]) for i in idx], [tok[i] for i in idx])
+        return runner.decode([waves[i] for i in idx], [float(dur[i]) for i in idx])
 
     with runner.context():
         with heartbeat.beating(max_s=1800):  # a torch.compile warm-up can take minutes
@@ -650,12 +615,11 @@ def probe(runner, waves: list[np.ndarray], durations: list[float], refs: list[st
 
 
 def reference_pass(kind: str, model: str | None, device: torch.device, dtype: str, store, revision: str,
-                   waves: list[np.ndarray], durations: list[float], refs: list[str], n_tok: list[int] | None, *,
-                   relpos_patch: bool, decode_len: str | None, batch_s: float, batch_rows: int | None,
-                   hf_cache: str | None = None, fp32_head: bool = True) -> dict:
+                   waves: list[np.ndarray], durations: list[float], refs: list[str], *, relpos_patch: bool,
+                   batch_s: float, batch_rows: int | None, hf_cache: str | None = None, fp32_head: bool = True) -> dict:
     """The sanity's bf16 reference (module docstring, "Sanity"): the same weights loaded once more in the probe's
     dtype (bf16 on CUDA), eager and unquantised (load_runner with quant None, compile False), with the rel-pos patch
-    and decode length the timed probe ran, decoding the id list in the batched pass's batches (batch_plan), untimed.
+    the timed probe ran, decoding the id list in the batched pass's batches (batch_plan), untimed.
     Called after both clocks, with the timed model freed. Returns {dtype, cer_ref_corpus, tokens_per_utt, batches,
     wall_s, _hyps}."""
     from kitsune import heartbeat
@@ -663,17 +627,15 @@ def reference_pass(kind: str, model: str | None, device: torch.device, dtype: st
 
     t0 = time.time()
     with heartbeat.beating(max_s=1800):
-        runner, _ = load_runner(kind, model, device, dtype, store, revision, relpos_patch=relpos_patch,
-                                decode_len=decode_len, quant=None, compile=False, hf_cache=hf_cache,
-                                max_rows=batch_rows, fp32_head=fp32_head)
+        runner, _ = load_runner(kind, model, device, dtype, store, revision, relpos_patch=relpos_patch, quant=None,
+                                compile=False, hf_cache=hf_cache, max_rows=batch_rows, fp32_head=fp32_head)
         dur = np.asarray(durations, dtype=np.float64)
-        tok = [1] * len(waves) if n_tok is None else [int(x) for x in n_tok]
         plan = batch_plan(dur, batch_s, getattr(runner, "max_rows", None) or batch_rows)
         hyps: list[str | None] = [None] * len(waves)
         runner.tokens = 0
         with runner.context():
             for b in plan:
-                out = runner.decode([waves[i] for i in b], [float(dur[i]) for i in b], [tok[i] for i in b])
+                out = runner.decode([waves[i] for i in b], [float(dur[i]) for i in b])
                 for i, h in zip(b, out):
                     hyps[i] = h
                 heartbeat.beat()
@@ -825,10 +787,6 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="refuse (exit 3) while another compute process is on the GPU")
     ap.add_argument("--no-relpos-patch", action="store_true",
                     help="time the encoder without the rel-pos-once-per-batch patch (the trainer and evaluator use it)")
-    ap.add_argument("--decode-len", default="auto", choices=DECODE_LENS,
-                    help="aed / cohere: teacher = every batch decodes its longest row's teacher token count, greedy = "
-                         "the free decode, auto = teacher for an untrained student dir, else greedy (default "
-                         "%(default)s)")
     from kitsune.quant import COMPILE_SUFFIX, IMPLS, MX_ROUNDINGS, QUANT_FORMATS, SCOPES
 
     ap.add_argument("--quant", default="none", choices=("none", *QUANT_FORMATS),
@@ -872,8 +830,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     if args.kind == "whisper":
         from kitsune.whisper import WHISPER_MODELS
 
-        if args.decode_len == "teacher":
-            ap.error("--kind whisper decodes freely: --decode-len teacher pins an AED decode to Cohere's token counts")
         if not args.system:
             if args.model not in WHISPER_MODELS:
                 ap.error("--kind whisper with a model dir needs --system")
@@ -937,20 +893,12 @@ def main(argv=None) -> int:
     if missing := [i for i in ids if i not in pos]:
         print(f"REFUSED: {len(missing)} ids are not in {args.store}, e.g. {missing[:3]}", file=sys.stderr)
         return EXIT_REFUSED
-    trained = trained_weights(args.kind, args.model)
-    decode_len = decode_len_of(args.kind, args.decode_len, trained)
-    if decode_len == "teacher" and (store.info or {}).get("kind") == "frames":
-        print(f"REFUSED: {args.store} is a frame store, whose token counts are the CTC targets': an AED decode pinned "
-              "to the teacher's length needs a token store (the eval store, cache/eval)", file=sys.stderr)
-        return EXIT_REFUSED
     waves = [store.wave(pos[i]) for i in ids]  # decoded before any clock starts
     durations = [float(store.utts[pos[i]].duration) for i in ids]
-    n_tok = [int(store.utts[pos[i]].n_tok) for i in ids]  # the teacher's tokens with EOS (a token store's)
     refs = store.frame().set_index("id").loc[ids, "ref"].tolist()
     stages: list[str] = []
     try:
-        rec = _timed_record(args, device, dtype, store, quant, decode_len, trained, waves, durations, n_tok, refs, ids,
-                            stages)
+        rec = _timed_record(args, device, dtype, store, quant, waves, durations, refs, ids, stages)
     except Exception as e:  # noqa: BLE001 - recorded in the file's failed block, then re-raised: the exit stays 1
         try:
             merge_failure(out, ids, system, dict(error=f"{type(e).__name__}: {e}"[:1000],
@@ -975,8 +923,7 @@ def main(argv=None) -> int:
     return 0
 
 
-def _timed_record(args, device, dtype, store, quant, decode_len, trained, waves, durations, n_tok, refs, ids,
-                  stages: list) -> dict:
+def _timed_record(args, device, dtype, store, quant, waves, durations, refs, ids, stages: list) -> dict:
     """main's load, probe and (for --quant / --compile) the bf16 reference with the sanity, as one record; the stage
     it is in is appended to stages (main's failure record names it)."""
     import gc
@@ -988,9 +935,8 @@ def _timed_record(args, device, dtype, store, quant, decode_len, trained, waves,
     t0 = time.time()
     with heartbeat.beating(max_s=1800):
         runner, desc = load_runner(args.kind, args.model, device, dtype, store, args.revision,
-                                   relpos_patch=not args.no_relpos_patch, decode_len=decode_len, quant=quant,
-                                   compile=args.compile, hf_cache=args.hf_cache, max_rows=args.batch_rows,
-                                   fp32_head=not args.no_fp32_head)
+                                   relpos_patch=not args.no_relpos_patch, quant=quant, compile=args.compile,
+                                   hf_cache=args.hf_cache, max_rows=args.batch_rows, fp32_head=not args.no_fp32_head)
     load_s = time.time() - t0
     amp = getattr(runner, "amp", None)
     qrec = getattr(runner, "quant", None) or {}
@@ -998,8 +944,8 @@ def _timed_record(args, device, dtype, store, quant, decode_len, trained, waves,
                gpu=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
                dtype="fp16" if quant and quant["fmt"] == "fp16" else dtype,
                params_total=int(runner.params), weights_bytes=int(runner.weights_bytes), load_s=round(load_s, 2),
-               relpos_patch=None if args.kind == "whisper" else not args.no_relpos_patch, decode_len=decode_len,
-               trained=trained, fp32_head=getattr(runner, "fp32_head", None),
+               relpos_patch=None if args.kind == "whisper" else not args.no_relpos_patch,
+               fp32_head=getattr(runner, "fp32_head", None),
                quant=quant["fmt"] if quant else None, quant_impl=quant["resolved"] if quant else None,
                quant_scope=quant["scope"] if quant else None, mx_rounding=quant["mx_rounding"] if quant else None,
                quant_recipe=dict(version=qrec.get("recipe_version"), sha256=qrec.get("recipe_sha256")) if quant
@@ -1009,7 +955,7 @@ def _timed_record(args, device, dtype, store, quant, decode_len, trained, waves,
                weights_bytes_resident=int(getattr(runner, "weights_bytes_resident", runner.weights_bytes)))
     stages.append("probe")
     res = probe(runner, waves, durations, refs, device, batch_s=args.batch_s, warmup=args.warmup,
-                warmup_1=args.warmup_1, latency_n=args.latency_n, n_tok=n_tok, profile_kernels=args.profile_kernels,
+                warmup_1=args.warmup_1, latency_n=args.latency_n, profile_kernels=args.profile_kernels,
                 batch_rows=args.batch_rows)
     hyps, hyps_1 = res.pop("_hyps")
     rec.update(res)
@@ -1025,9 +971,9 @@ def _timed_record(args, device, dtype, store, quant, decode_len, trained, waves,
             torch.compiler.reset()
         free_cache(device)
         base = split_system(args.system or args.kind)[0]
-        ref = reference_pass(args.kind, args.model, device, dtype, store, args.revision, waves, durations, refs, n_tok,
-                             relpos_patch=not args.no_relpos_patch, decode_len=decode_len, batch_s=args.batch_s,
-                             batch_rows=args.batch_rows, hf_cache=args.hf_cache, fp32_head=not args.no_fp32_head)
+        ref = reference_pass(args.kind, args.model, device, dtype, store, args.revision, waves, durations, refs,
+                             relpos_patch=not args.no_relpos_patch, batch_s=args.batch_s, batch_rows=args.batch_rows,
+                             hf_cache=args.hf_cache, fp32_head=not args.no_fp32_head)
         ref_hyps = ref.pop("_hyps")
         rec["reference"] = dict(ref, system=base)
         rec["sanity"] = cer_sanity(rec["cer_ref_corpus"], ref["cer_ref_corpus"], reference=base,

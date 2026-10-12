@@ -6,7 +6,6 @@ The corpus plants one kind of bad row per rule and a toy extent record spreads g
 reason, the extent filter and the reazon_large cap readout are exercised; the expectations come from the ground truth
 the fixture WROTE, not from the code under test. CPU only, no network.
 """
-import copy
 import importlib
 import json
 import shutil
@@ -263,58 +262,6 @@ def test_manifest_views_and_baselines(st, built):
     assert side["selection"] == {"path": "labels/t/selections/study.parquet", "sha256": ms.file_sha256(built.parquet)}
     assert side["manifest"] == {"path": "labels/t/selections/study_manifest.json",
                                 "sha256": ms.file_sha256(built.manifest_path)}
-
-
-def registered(side: dict) -> dict:
-    """The toy sidecar dressed as the pre-registered selection (its recipe, seed, sources, eval sets, file names and
-    extent; eval_emilia and the two unlabelled sources borrowed from existing entries): what the fill reads is the
-    toy build's own ids, views and baselines."""
-    sc = copy.deepcopy(side)
-    sc.update(sources=list(prereg.STUDY_SOURCES), eval_sets=list(prereg.STUDY_EVAL_SETS),
-              recipe=prereg.registered_recipe(), seed=prereg.SELECTION_SEED)
-    sc["selection"]["path"] = prereg.SELECTION_FILE
-    sc["manifest"]["path"] = prereg.study_files(prereg.SELECTION_FILE)[1]
-    for k in ("ids_sha256", "n"):
-        sc[k]["eval"]["eval_emilia"] = sc[k]["eval"]["eval_cv8"]
-    for b in sc["baselines"].values():
-        b["eval_emilia"] = b["eval_cv8"]
-    sc["n"]["probe"] = prereg.STUDY_SELECTION["probe_n"] * len(prereg.STUDY_SOURCES)
-    sc["extent"] = {"name": "full", "inputs": {**{k: v for k, v in prereg.STUDY_INPUTS.items() if v is not None},
-                                               "reazon_large": 2}}
-    sc["details"]["pool_hours_if_capped"] = {"reazon_large": {"1": 1000.0, "2": 1010.0}}  # the rule: 2
-    sc["draw"].update(budget_s=float(prereg.STUDY_SELECTION["draw_audio_s"]), drawn_s=3_599_000.0,
-                      pool_s=1010.0 * 3600)
-    # the uploaded selection's drawn hours per source, so the realised mix is the recorded one (prereg.mix_problems)
-    drawn = {"reazon_small": 90.770, "reazon_large": 325.516, "emilia_yodas": 267.630, "emilia_nc": 195.987,
-             "galgame": 120.097}
-    sc["hours"] = {src: {**(sc.get("hours") or {}).get(src, {}), "drawn": {"hours": h}} for src, h in drawn.items()}
-    return sc
-
-
-def test_the_sidecar_fills_the_prereg_only_when_it_is_the_registered_selection(built):
-    """python -m kitsune.prereg --write study/ --sidecar ...: the toy build (its own recipe, sources and extent) is
-    refused, and the same sidecar with the registered recipe, seed, sources and extent fills every pending field from
-    the build's own hashes, views and baselines."""
-    side = built.sidecar
-    with pytest.raises(ValueError, match="not the pre-registered study selection"):
-        prereg.rules(side)
-    problems = prereg.sidecar_problems(side)
-    assert any(p.startswith("sources") for p in problems) and any(p.startswith("recipe") for p in problems)
-    sc = registered(side)
-    assert prereg.sidecar_problems(sc) == []
-    r = prereg.rules(sc)
-    assert prereg.pending(r) == []
-    m = r["manifest"]
-    assert m["train"] == {"ids_sha256": side["ids_sha256"]["train"], "n": side["n"]["train"],
-                          "hours": pytest.approx(3_599_000 / 3600)}
-    assert m["sets"]["galgame"]["ids_sha256"] == built.manifest["sets"]["galgame"]["ids_sha256"]
-    assert m["galgame_views"]["neutral"] == {"ids_sha256": built.manifest["galgame_views"]["neutral"]["ids_sha256"],
-                                             "n": len(built.manifest["galgame_views"]["neutral"]["ids"])}
-    assert m["manifest_sha256"] == ms.file_sha256(built.manifest_path)
-    assert r["baselines"]["cohere"]["m4"] == pytest.approx(side["baselines"]["cohere"]["m4"])
-    assert r["baselines"]["parakeet-ctc"]["galgame_neutral"] == side["baselines"]["parakeet-ctc"]["galgame_neutral"][
-        "cer"]
-    assert r["data"]["extent"]["inputs"]["reazon_large"] == 2
 
 
 def test_corpus_cer_is_the_evaluators():

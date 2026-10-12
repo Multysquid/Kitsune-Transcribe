@@ -92,25 +92,21 @@ the protocol is the size study's, study/PREREG.json):
             none) the eval is checked against the study's frozen eval manifest (kitsune.study_stats.parse_manifest:
             every set's ids hash to its sha256; against study/PREREG.json's manifest block): the config's
             eval_sets hold every manifest set (unless --sets names a part), and each evaluated set's rows in the eval
-            store must be exactly the manifest's ids, else the eval refuses before any model is loaded. A study eval
-            without a manifest refuses too (study_intent: --tables / --system / --anchor, a ctc student, a study
-            selection or a study run name; --manifest none evaluates a study config without tables). Afterwards it
-            writes
+            store must be exactly the manifest's ids, else the eval refuses before any model is loaded. An eval that
+            asks for tables (--tables / --system) or scores a ctc student refuses without a manifest too
+            (study_intent; --manifest none evaluates a ctc config without tables). Afterwards it writes
               tables/<system>/<set>.parquet  the per-utterance table of CONTRACT.md 5 (kitsune.evaluate.
                                utterance_table: id, set, ref, hyp, edits, ref_len, hyp_len, sub, del, ins, edits_style,
                                edits_nostyle, truncated), in manifest order, one file per set: --tables DIR is what
-                               tools/study_report.py --tables reads. --system names it (default: the run's name,
-                               default_system - the config's run_name, a T/2 branch's <parent>-half as the trainer names
-                               it). A system's tables are one eval's: a set without a table now loses an older one. A
-                               set whose decoded rows are not all of its manifest ids gets no table and the run exits
-                               non-zero, as does a manifest set not evaluated (except those a --sets eval left out)
+                               tools/full_report.py --tables reads. --system names it (default: the config's
+                               run_name, default_system). A system's tables are one eval's: a set without a table now
+                               loses an older one. A set whose decoded rows are not all of its manifest ids gets no
+                               table and the run exits non-zero, as does a manifest set not evaluated (except those a
+                               --sets eval left out)
               study.json       per stratum (the eval sets, Galgame as its views galgame_neutral / galgame_all /
                                galgame_label_box) the system's corpus CER (raw and no-style) and its own teacher's on
                                the same rows, M4 and the gate-pooled CER, the manifest's hashes, the tables written,
                                the sets refused or missing
-  --anchor  the first run's 0.6B (its checkpoint dir, e.g. step_9774) re-scored on the manifest (decision 29) as system
-            anchor-b20: an aed eval with the study config's eval settings, no history, no verdict, no probe. A config
-            whose run_name is anchor-b20 (configs/study/anchor-b20.json) is this mode without the flag
   --teachers  no model: the teachers' tables from their stored hypotheses on the manifest rows - cohere (teacher_out
             hyp), parakeet-ctc (parakeet_out ctc_hyp), parakeet-tdt (parakeet_out hyp) - after checking that both roots
             hold every manifest row with the same reference, that the stored per-utterance cer / ctc_cer are this
@@ -124,8 +120,8 @@ the protocol is the size study's, study/PREREG.json):
             with a whisper.json (kitsune.whisper.WHISPER_META) is a Whisper system's whatever --config says: family
             "whisper", no teacher (teacher null, no teacher_cer / *_teacher / *_ratio), and study.json carries its model
             and decode blocks. A teacher table is built only when every set's parquet has the teacher_hyp column
-A generated study config whose schedule.max_steps is still null (its box fills it) is validated with a stand-in; the
-eval never reads it.
+The configs/study/study-t06.json the study's generator left (schedule.max_steps null: its box filled it) loads with
+--set schedule.max_steps=<any>, as the trainer's validate needs one on the steps clock; the eval never reads it.
 
 Quantised variants (the full runs; kitsune.quant, contract section 8). --quant <fmt> (fp16, int8-w8a16, int8-w8a8,
 nvfp4-w4a16, nvfp4-w4a4, mxfp4-w4a4, fp8-w8a8; --fp16 is --quant fp16) scores the checkpoint in that format: the
@@ -137,8 +133,8 @@ torchao refuses) and emulates on CPU; emulate simulates on any device (recorded 
 fp16 runs its fp16 weights under fp16 autocast, on CPU too, and its encoder self-attention in fp32 outside it
 (kitsune.quant.FP16_FP32_MODULES). A quantised eval is a system of its own, <run_name>@<fmt>
 (an explicit --system must carry the suffix: a variant's tables must never replace the bf16 ones), with no history and
-no verdict (verdict_skipped: the trends read the training run's history), not with --anchor, --teachers or
---from-evals; the format, impl, scope and rounding enter the --out identity (only then: other --out dirs keep theirs).
+no verdict (verdict_skipped: the trends read the training run's history), not with --teachers or --from-evals; the
+format, impl, scope and rounding enter the --out identity (only then: other --out dirs keep theirs).
 A NonFiniteMonitor counts the forwards, rows and modules with a non-finite value; every run records its counts and the
 quantised layers' call counters under .parts/quant/ (flushed every 30 s, so a killed run leaves them), and the
 quant block of study.json, summary.json and evaluator.json totals them: format, impl, scope, mx_rounding, source
@@ -157,14 +153,12 @@ and m3 (the gate sets; with _teacher / _ratio for the raw ones).
 Usage:
   python scripts/05_evaluate.py --root D:/Shizu-ko-distill --config runs/<run_id>/config.json \
       --ckpt runs/<run_id>/checkpoints/step_<N> --out <dir> [--probe] [--sets eval_jsut eval_cv8] [--vram-frac 0.95]
-  python scripts/05_evaluate.py --config configs/study/study-p01.json --ckpt <step dir> --out <dir> --probe \
-      --tables evals/study                                       # a CTC student on the manifest, its tables
-  python scripts/05_evaluate.py --config configs/study/anchor-b20.json \
-      --ckpt runs/viability-b20x2560-20260925T071746Z/checkpoints/step_9774 --out evals/anchor --tables evals/study
-  python scripts/05_evaluate.py --config configs/study/study-t06.json --teachers --out evals/teachers \
-      --tables evals/study
+  python scripts/05_evaluate.py --config runs/<rd>/config.json --ckpt runs/<rd>/checkpoints/step_<N> --out <dir> \
+      --probe --tables evals/study                               # a CTC student on the manifest, its tables
+  python scripts/05_evaluate.py --config configs/study/study-t06.json --set schedule.max_steps=20000 --teachers \
+      --out evals/teachers --tables evals/study
   python scripts/05_evaluate.py --from-evals runs/<run_id>/evals/step_<N> --system study-t03 \
-      --config configs/study/study-t03.json --out evals/study-t03 --tables evals/study
+      --config runs/<run_id>/config.json --out evals/study-t03 --tables evals/study
   python scripts/05_evaluate.py --config runs/<rd>/config.json --ckpt runs/<rd>/checkpoints/step_<N> \
       --quant nvfp4-w4a4 --out <dir> --tables <dir>/tables --cache-dir cache --max-temp 0   # in memory
   python -m kitsune.quant readout --config runs/<rd>/config.json --ckpt runs/<rd>/checkpoints/step_<N> \
@@ -177,7 +171,6 @@ import json
 import math
 import os
 import random
-import re
 import shutil
 import subprocess
 import sys
@@ -205,11 +198,8 @@ from kitsune.store import fsync_path  # noqa: E402
 # config keys holding paths, resolved against --root when relative (cache_dir is replaced by --cache-dir); a null one
 # (parakeet_root outside the study) stays null
 PATH_KEYS = ("student", "data_root", "teacher_root", "second_root", "selection", "runs_root", "parakeet_root")
-ANCHOR = "anchor-b20"  # the first run's 0.6B re-scored on the manifest (decision 29; kitsune.study_stats.ANCHOR)
 MANIFEST_FILE = "study_manifest.json"  # next to the study selection (kitsune.prereg.MANIFEST_FILE)
 PREREG_JSON = ROOT / "study" / "PREREG.json"
-VALIDATE_MAX_STEPS = 10**9  # load_cfg: the stand-in for a study config's unset max_steps while it is validated
-HALF = "-half"  # a T/2 branch's run name: <parent run_name>-half (04_distill.build; kitsune.study_stats.HALF)
 # decision 15 for the probe's rows (train rows): at most this share may have a frame count other than their stored
 # n_frames (the CTC trainer's kitsune.trainset.FRAME_MISMATCH_MAX_FRAC); any eval row is a hard fail
 PROBE_MISMATCH_MAX_FRAC = 0.001
@@ -499,18 +489,7 @@ def load_cfg(D, args) -> tuple[dict, Path]:
         D.apply_set(cfg, s)
     if args.batch_s is not None:
         cfg["eval"]["batch_s"] = float(args.batch_s)
-    sch = cfg["schedule"]
-    # a generated study config (tools/make_study_configs.py) leaves max_steps to its box, which fills it from the
-    # PREREG numbers when it starts the run: the trainer's validate needs one on the steps clock, the eval reads none,
-    # so it is validated with a stand-in and stays null
-    unset = sch.get("clock") == "steps" and sch.get("max_steps") is None
-    if unset:
-        sch["max_steps"] = VALIDATE_MAX_STEPS
-    try:
-        D.validate(cfg)
-    finally:
-        if unset:
-            sch["max_steps"] = None
+    D.validate(cfg)
     if family_of(cfg) not in ("aed", "ctc"):
         raise SystemExit(f"family must be 'aed' or 'ctc', got {cfg['family']!r}")
     root = Path(args.root).resolve()
@@ -618,8 +597,8 @@ class Ctx:
     teacher_rows: dict | None = None  # ctc: id -> Parakeet's stored CTC row (the teacher of the greedy tables)
     targets: dict | None = None  # ctc: id -> the stored Parakeet frame targets (kitsune.ctc_targets.FrameTargets)
     manifest: dict | None = None  # load_manifest's record (the study manifest the store was checked against), or None
-    system: str | None = None  # the tables' system name (--system; the config's run_name; anchor-b20)
-    verdict_off: str | None = None  # why no verdict is written (--anchor), or None
+    system: str | None = None  # the tables' system name (--system; the config's run_name)
+    verdict_off: str | None = None  # why no verdict is written (a quantised eval), or None
     quant: dict | None = None  # a quantised eval's quant block (quant_totals), or None
     weights: dict | None = None  # the --ckpt's weights: {path, file_bytes} (study.json)
     monitor: object = None  # a quantised eval's kitsune.quant.NonFiniteMonitor while the model runs
@@ -1398,9 +1377,9 @@ def study_block(man, tables: dict[str, pd.DataFrame], teacher: dict[str, pd.Data
     table_cer), and its teacher's on the same rows with the ratio; M4 (the macro mean over JSUT, CV8, Reazon and
     Galgame-neutral), the qualifier pairs, JSUT + Galgame-neutral raw and no-style, and the gate-pooled CER
     (sum / sum over JSUT, CV8, Reazon: the first run's val_cer), each with the teacher's and the ratio when it has
-    them. The full runs' macro metrics next to them (kitsune.evaluate; never in study_stats.METRICS): m4_nostyle (M4's
-    sets, no-style), m4_all and m4_all_nostyle (M4 with Galgame's whole set, M4_ALL_STRATA) and m3 (the gate sets,
-    M3_STRATA), the raw ones with the teacher's and the ratio."""
+    them. The full runs' macro metrics next to them (kitsune.evaluate; the size study's report had none): m4_nostyle
+    (M4's sets, no-style), m4_all and m4_all_nostyle (M4 with Galgame's whole set, M4_ALL_STRATA) and m3 (the gate
+    sets, M3_STRATA), the raw ones with the teacher's and the ratio."""
     from kitsune import evaluate as ev
     from kitsune import study_stats as ss
 
@@ -1593,13 +1572,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--prereg", default=str(PREREG_JSON),
                     help="PREREG.json whose manifest (and, for --teachers, baselines) block is compared once filled "
                          "(default %(default)s)")
-    ap.add_argument("--system", default=None,
-                    help="the tables' system name (default: the config's run_name; anchor-b20 with --anchor)")
+    ap.add_argument("--system", default=None, help="the tables' system name (default: the config's run_name)")
     ap.add_argument("--tables", default=None,
                     help="the dir the per-utterance tables go to, as <dir>/<system>/<set>.parquet (default "
                          "<out>/tables)")
-    ap.add_argument("--anchor", action="store_true",
-                    help="the first run's 0.6B re-scored on the manifest as anchor-b20: no history, verdict or probe")
     ap.add_argument("--teachers", action="store_true",
                     help="no model: the tables of cohere, parakeet-ctc and parakeet-tdt from their stored hypotheses")
     ap.add_argument("--from-evals", default=None, metavar="DIR",
@@ -1655,11 +1631,9 @@ def parse_args(argv=None) -> argparse.Namespace:
             ap.error("--fp16 is --quant fp16: use one of them")
         args.quant = "fp16"
     if args.quant not in (None, "none"):
-        if on := [f for f, v in (("--teachers", args.teachers), ("--from-evals", args.from_evals),
-                                 ("--anchor", args.anchor)) if v]:
+        if on := [f for f, v in (("--teachers", args.teachers), ("--from-evals", args.from_evals)) if v]:
             ap.error(f"--quant scores a student's checkpoint: not with {' or '.join(on)}")
-    modes = [m for m, on in (("--teachers", args.teachers), ("--from-evals", args.from_evals),
-                             ("--anchor", args.anchor)) if on]
+    modes = [m for m, on in (("--teachers", args.teachers), ("--from-evals", args.from_evals)) if on]
     if len(modes) > 1:
         ap.error(f"{' and '.join(modes)} are different modes: use one")
     if (args.teachers or args.from_evals) and args.ckpt:
@@ -1670,8 +1644,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         ap.error("--from-evals needs --system (the name its tables go under)")
     if args.config is None and not args.from_evals:
         ap.error("--config is required (a trainer config or a run's config.json)")
-    if args.anchor and args.probe:
-        ap.error("--anchor has no probe: the anchor was trained on another run's data")
     if args.max_temp and not args.resume_temp < args.max_temp:
         ap.error("--resume-temp must be below --max-temp")
     if args.vram_frac is not None and not 0 < args.vram_frac <= 1:
@@ -1704,47 +1676,26 @@ def _tables_dir(args, out: Path) -> Path:
 
 
 def default_system(cfg: dict, args, trained: dict, fmt: str = "none") -> str:
-    """The tables' system name without --system: anchor-b20 with --anchor, else the run's name as the trainer gave it -
-    the config's run_name, and for a T/2 branch config (branch.parent) the name of the checkpoint's run (its trained
-    run_id less the -<stamp>): <parent run_name>-half when the config kept its parent's run_name (04_distill.build),
-    so a branch's tables never land on its parent's. A branch checkpoint without that run id needs a -half run_name
-    or --system. A quantised eval (fmt) is <that name>@<fmt> (kitsune.quant.system_name)."""
+    """The tables' system name without --system: the config's run_name, the run's name as the trainer gave it. A
+    quantised eval (fmt) is <that name>@<fmt> (kitsune.quant.system_name)."""
     if fmt != "none":
         from kitsune.quant import system_name
 
         return system_name(default_system(cfg, args, trained), fmt)
-    if args.anchor:
-        return ANCHOR
-    name = cfg["run_name"]
-    if (cfg.get("branch") or {}).get("parent"):
-        m = re.fullmatch(r"(.+)-\d{8}T\d{6}Z(?:-\d+)?", str(trained.get("run_id") or ""))
-        if m:
-            return m.group(1)
-        if not name.endswith(HALF):
-            raise SystemExit(f"a T/2 branch config (branch.parent) with run_name {name!r} and a checkpoint without the "
-                             f"trainer's run id: the trainer names such a run {name}{HALF} unless its run_name differs "
-                             "from the parent's - name its tables with --system")
-    return name
+    return cfg["run_name"]
 
 
 def study_intent(cfg: dict, args) -> str | None:
-    """Why an eval without a manifest would be a study eval that cannot be one (main refuses it), or None: --tables,
-    --system or --anchor ask for the study's tables; a CTC student, a study selection (selection_recipe.study) or a
-    study run name (kitsune.study_stats.is_study_run, or the anchor's) are the study's. --manifest none turns the check
+    """Why an eval without a manifest would be a manifest eval that cannot be one (main refuses it), or None: --tables
+    or --system ask for the manifest's tables; a CTC student is scored on the manifest. --manifest none turns the check
     off, except for what asks for tables."""
-    from kitsune import study_stats as ss
-
-    asks = [f for f, on in (("--tables", args.tables), ("--system", args.system), ("--anchor", args.anchor)) if on]
+    asks = [f for f, on in (("--tables", args.tables), ("--system", args.system)) if on]
     if asks:
         return f"{' and '.join(asks)} write the study's tables"
     if args.manifest and args.manifest.lower() == "none":
         return None
     if family_of(cfg) == "ctc":
         return "a ctc (Parakeet) student is a study run"
-    if (cfg.get("selection_recipe") or {}).get("study"):
-        return "the config's selection is the study's (selection_recipe.study)"
-    if ss.is_study_run(cfg["run_name"]) or cfg["run_name"] == ANCHOR:
-        return f"run_name {cfg['run_name']} is a study run"
     return None
 
 
@@ -1924,22 +1875,10 @@ def main(argv=None) -> int:
     family = family_of(cfg)
     if (fc := ckpt_family(ckpt)) not in (None, family):
         raise SystemExit(f"{ckpt} is a {fc} model, the config's family is {family}")
-    anchor_implied = not args.anchor and cfg["run_name"] == ANCHOR
-    if anchor_implied:  # the anchor's study config (configs/study/anchor-b20.json; the box's queue passes no --anchor)
-        if args.probe:
-            raise SystemExit(f"run_name {ANCHOR} is the anchor re-score, which has no probe: drop --probe")
-        args.anchor = True
-    if args.anchor and family != "aed":
-        raise SystemExit("--anchor re-scores the first run's 0.6B (a Transcribe model): it needs an aed config")
-    if args.anchor:
-        args.history = "none"  # the anchor's history is another run's, on other eval sets
     trained = S.load_meta(ckpt).get("trained") or {}
     q = quant_request(args, ckpt)  # the format this eval scores ("none": the checkpoint as it is)
     fmt = q["fmt"]
     if fmt != "none":
-        if args.anchor:
-            raise SystemExit(f"REFUSED: --quant scores a student's variant, not the anchor re-score (--anchor or an "
-                             f"{ANCHOR} config)")
         if cfg["perf"]["compile"]:
             raise SystemExit("REFUSED: a quantised eval runs without torch.compile: --set perf.compile=false")
         args.history = "none"  # a variant has no eval history of its own: no verdict
@@ -1971,14 +1910,13 @@ def main(argv=None) -> int:
                autocast=cfg["autocast"], batch_s=float(cfg["eval"]["batch_s"]), chunk_s=args.chunk_s,
                versions=_versions(), status="running")
     if family != "aed" or mpath is not None:  # the aed record without a manifest stays as it was
-        inv.update(family=family, system=system, manifest=str(mpath) if mpath else None, anchor=bool(args.anchor))
+        inv.update(family=family, system=system, manifest=str(mpath) if mpath else None)
     if fmt != "none":
         inv["quant"] = dict(fmt=fmt, impl=impl, scope=q["scope"], mx_rounding=q["mx_rounding"],
                             source="file" if q["variant"] else "memory")
     log.event("evaluate_start", ckpt=str(ckpt), step=step, sets=sets, probe=args.probe, device=str(device),
               autocast=cfg["autocast"], batch_s=float(cfg["eval"]["batch_s"]), config=str(cfg_path),
               root=inv["root"], out=str(out), **({"family": family, "system": system} if "family" in inv else {}),
-              **({"anchor_implied": True} if anchor_implied else {}),
               **({"quant": inv["quant"]} if fmt != "none" else {}))
     ctx = None
     refused = {}
@@ -2037,9 +1975,7 @@ def main(argv=None) -> int:
         ctx = Ctx(D=D, ev=ev, cfg=cfg, args=args, out=out, log=log, store=store, greedy_ids=set(greedy_ids),
                   identity_key=hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest(),
                   reference=reference, family=family, teacher_rows=teacher_rows, targets=targets, manifest=M,
-                  system=system, verdict_off="anchor: its history is another run's on other eval sets; it gets "
-                                             "tables and a summary, no verdict" if args.anchor else None,
-                  weights=weights_record(ckpt),
+                  system=system, weights=weights_record(ckpt),
                   quant=quant_totals(out, quant_base(q, impl, system, ckpt)) if fmt != "none" else None)
         if fmt != "none":
             ctx.verdict_off = "quant variant: the verdict reads the training run's history"

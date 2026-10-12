@@ -335,7 +335,7 @@ def test_frame_store_holds_the_label_pass_targets(env):
 
 
 def test_the_evaluator_and_the_box_get_the_token_eval_store(env, tmp_path):
-    """What scripts/05_evaluate.py and the box's store step (kitsune/study_queue.py build-stores) call for a family-ctc
+    """What scripts/05_evaluate.py and the box's store step (kitsune/full_queue.py build-stores) call for a family-ctc
     config: build_eval_store(cfg, log) returns the TOKEN eval store (the evaluator scores every system on it and reads
     the frame targets from parakeet_out itself; the speed probe opens cache/eval) and builds the trainer's frame eval
     store of the same rows alongside, which the trainer then reuses; train_store_spec gives the plain name, under which

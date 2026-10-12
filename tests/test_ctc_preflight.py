@@ -134,17 +134,16 @@ def test_per_gpu_cpus_divides_the_quota_by_the_boxs_gpus(tmp_path, monkeypatch):
 
 
 def test_the_loader_workers_are_half_a_gpus_share_on_linux(monkeypatch):
-    """kitsune.trainset.default_num_workers (the trainer's perf.num_workers "auto") and kitsune.study_queue.auto_workers
-    (the queue's shm budget for it) are one rule: min(8, per_gpu_cpus() // 2), at least 1; Windows keeps 2."""
-    from kitsune import study_queue, trainset
+    """kitsune.trainset.default_num_workers (the trainer's perf.num_workers "auto"): min(8, per_gpu_cpus() // 2), at
+    least 1; Windows keeps 2."""
+    from kitsune import trainset
 
     for cpus, want in ((64, 8), (16, 8), (15, 7), (3, 1), (1, 1)):
         monkeypatch.setattr(P, "per_gpu_cpus", lambda n_gpus=None, c=cpus: c)
         monkeypatch.setattr(trainset.os, "name", "posix")
         got = trainset.default_num_workers()
         monkeypatch.undo()
-        monkeypatch.setattr(P, "per_gpu_cpus", lambda n_gpus=None, c=cpus: c)
-        assert got == study_queue.auto_workers() == want, cpus
+        assert got == want, cpus
     monkeypatch.setattr(trainset.os, "name", "nt")
     windows = trainset.default_num_workers()
     monkeypatch.undo()

@@ -43,7 +43,7 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-import study_report  # noqa: E402
+import full_report  # noqa: E402
 import whisper_eval as we  # noqa: E402
 from fixtures import load_script  # noqa: E402
 from fixtures_whisper import EOS, EVAL_SETS, MAX_TARGET, NO_TS, PROMPT, V, tiny_whisper_dir, whisper_env  # noqa: E402
@@ -460,7 +460,7 @@ def test_the_tables_and_study_json(wenv, first_run):
     assert st["whisper"]["model"] == load(out / "whisper.json")["model"]
     assert st["whisper"]["decode"]["prompt_ids"] == PROMPT
     man = ss.parse_manifest(wenv["manifest"])
-    loaded, _ = study_report.load_tables(tables, man.sets)
+    loaded, _ = full_report.load_tables(tables, man.sets)
     corpus = ss.build_corpus(loaded, man)
     assert list(corpus.systems) == ["whisper-tiny"]
     point = ss.point_sums(corpus)

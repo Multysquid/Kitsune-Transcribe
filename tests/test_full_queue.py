@@ -1661,7 +1661,7 @@ def test_plan_lists_the_registry_items(fq, monkeypatch, capsys):
     assert F.main(["run", "--box", "p01"]) == F.EXIT_FAIL  # a registry it cannot read: refused, no crash
 
 
-def test_the_queue_never_imports_the_trainer_or_reads_the_study_box_plans(fq, monkeypatch):
+def test_the_queue_never_imports_the_trainer():
     import subprocess
 
     code = ("import sys; import kitsune.full_queue as F; "
@@ -1669,12 +1669,37 @@ def test_the_queue_never_imports_the_trainer_or_reads_the_study_box_plans(fq, mo
     out = subprocess.run([PY, "-c", code], cwd=str(ROOT), capture_output=True, text=True, timeout=120)
     assert out.returncode == 0 and out.stdout.strip() == "[]", out.stderr
 
-    def no_plan(*a, **k):
-        raise AssertionError("a full box never reads prereg.rules()['boxes']")
 
-    monkeypatch.setattr(Q, "box_plan", no_plan)
-    q = fq.make("full-p")
-    assert q.plan["shared_queue"] and q.plan["runs"] == ["full-t06", "full-p03", "full-p005"]
+# ======================================================================= the queue base (kitsune/study_queue.py)
+
+
+def test_the_base_commands_and_the_orphan_matcher(fq):
+    """The queue base's default command lines (the full queue's stores and check-resume are its own), and kill_orphans'
+    matcher (ORPHAN_CMDS): every process the full queue starts, never the full queue's own run command."""
+    q = fq.make("p01", train_cmd=None, stores_cmd=None, eval_cmd=None, speed_cmd=None, check_resume_cmd=None)
+    assert q._cmd("train") == [PY, str(q.root / "scripts" / "04_distill.py")]
+    assert q._cmd("eval") == [PY, str(q.root / "scripts" / "05_evaluate.py")]
+    assert q._cmd("speed") == [PY, str(q.root / Q.SPEED_TOOL)]
+    assert q._cmd("stores") == [PY, "-m", "kitsune.full_queue", "build-stores"]
+    assert q._cmd("check-resume") == [PY, "-m", "kitsune.full_queue", "check-resume"]
+    for cmd in ("kitsune.full_queue build-stores", "kitsune.full_queue check-resume", "speed_probe", "whisper_eval",
+                "kitsune.quant", "04_distill", "05_evaluate"):
+        assert cmd in Q.ORPHAN_CMDS
+    assert not any(c in "/venv/main/bin/python -m kitsune.full_queue run --box p01" for c in Q.ORPHAN_CMDS)
+
+
+def test_step_tail_reads_only_what_was_appended(tmp_path):
+    m = tmp_path / "metrics"
+    m.mkdir()
+    f = m / "scalars.jsonl"
+    t = Q.StepTail(tmp_path)
+    assert t.poll() == {}
+    f.write_text(json.dumps({"step": 1, "wall": 1.0, "tag": "sched/train_s", "value": 1.0}) + "\n"
+                 + '{"step": 2, "wall": 2.0, "tag": "sched/tr', encoding="utf-8")
+    assert list(t.poll()) == [1]
+    with open(f, "a", encoding="utf-8") as fh:
+        fh.write('ain_s", "value": 2.0}\n')
+    assert t.poll()[2]["train_s"] == 2.0 and Q.read_step_rows(tmp_path)[2]["wall"] == 2.0
 
 
 # ================================================================ the readout rule (a readout gets its number)
