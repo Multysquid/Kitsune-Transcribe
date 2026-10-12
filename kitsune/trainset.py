@@ -32,10 +32,10 @@ per utterance, kitsune.ctc_targets.FrameTargets; FrameBatchDataset collates it, 
 it without a decoder. dataset_for(stores) picks the dataset of a store. Either family's TRAIN loader may augment its
 micro-batches (dataset_for(stores, augment=Augment(...)); the "augmentation" section below; scripts/04_distill.py
 augment.*): rows cut inside a sentence (before one of its words, never between its last word and its mark),
-utterances joined into longer rows, another row's speech mixed in. An AED row has no frame targets to cut, so its cuts
-come from a cut table (kitsune.aed_cuts: the Parakeet teacher's alignment of the same rows, mapped onto the Cohere
-tokens) joined to the dataset (cuts=CutIndex). A
-dataset built without it - every eval, dev, probe, smoke and memory-probe one - returns the stored rows as they are.
+utterances joined into longer rows, background speech, rooms, background audio, volume and codecs. An AED row has no
+frame targets to cut, so its cuts come from a cut table (kitsune.aed_cuts: the Parakeet teacher's alignment of the same
+rows, mapped onto the Cohere tokens) joined to the dataset (cuts=CutIndex). A dataset built without it - every eval,
+dev, probe, smoke and memory-probe one - returns the stored rows as they are.
 """
 import copy
 import hashlib
@@ -1016,10 +1016,11 @@ class AudioBatchDataset(torch.utils.data.Dataset):
     augment (an Augment with max_tokens set; the train loader's only, scripts/04_distill.py augment.* on an AED student)
     and cuts (a kitsune.aed_cuts.CutIndex over this dataset's rows; needed when augment.truncate_p > 0): each
     micro-batch is augmented after decoding (_augmented; the "AED rows" part of the "augmentation" section below) - its
-    rows joined, cut at a cut-table frame and mixed - and collated as above, plus `aug`, a dict of counts (utts, rows,
-    concat_groups, concat_utts, truncated, mixed, cut_padded and end_padded - always 0 -, concat_capped,
-    cut_mismatch, end_trimmed). A joined row holds several utterances: its ids are theirs joined by "+", sources and index the
-    first one's. None (the default) returns the stored rows exactly as before the augmentation existed, without `aug`.
+    rows joined, cut at a cut-table frame, end-trimmed and through the acoustic steps - and collated as above, plus
+    `aug`, a dict of counts (utts, rows, concat_groups, concat_utts, truncated, concat_capped, cut_mismatch,
+    end_trimmed, and the acoustic steps'). A joined row holds several utterances: its ids are theirs joined by "+",
+    sources and index the first one's. None (the default) returns the stored rows exactly as before the augmentation
+    existed, without `aug`.
     """
 
     def __init__(self, stores: Stores, augment: "Augment | None" = None, cuts=None, noise=None, rirs=None):
@@ -1133,11 +1134,12 @@ class AudioBatchDataset(torch.utils.data.Dataset):
 
     def _augmented(self, idx: Sequence[int], keep: list[int], waves: list[np.ndarray], dropped: list[str]) -> dict:
         """__getitem__ under self.augment: the decoded rows (store indices `keep`, audio `waves`) joined, cut, end-trimmed
-        and mixed in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's own stream, as
-        FrameBatchDataset._augmented - then collated as the plain path collates. A join is refused (the micro-batch
-        stays as it is, concat_capped) when one of its rows would hold more than max_tokens target tokens: the planner
-        never planned such a decoder. A cut lands on a frame of the rows' cut-table entries (aed_cut_candidates) and
-        keeps the Cohere tokens that entry names, then EOS. Metadata of a row as FrameBatchDataset._augmented's."""
+        and through the acoustic steps in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's
+        own stream, as FrameBatchDataset._augmented - then collated as the plain path collates. A join is refused (the
+        micro-batch stays as it is, concat_capped) when one of its rows would hold more than max_tokens target tokens:
+        the planner never planned such a decoder. A cut lands on a frame of the rows' cut-table entries
+        (aed_cut_candidates) and keeps the Cohere tokens that entry names, then EOS. Metadata of a row as
+        FrameBatchDataset._augmented's."""
         a, eos = self.augment, self.eos
         rng = augment_rng(a.seed, idx)
         rows = [_TokRow(w, *self.targets(i), i, ctc_frames(len(w))) for w, i in zip(waves, keep)]
@@ -1152,8 +1154,8 @@ class AudioBatchDataset(torch.utils.data.Dataset):
                     groups = len(rows)
                 else:
                     capped = 1
-        originals = [r.wave for r in rows]  # mix's interferers: the rows before any cut or mix
-        n_cut = n_mixed = mismatch = 0
+        originals = [r.wave for r in rows]  # the background speech's other rows: the rows before any cut
+        n_cut = mismatch = 0
         if a.truncate_p > 0:
             for r in rows:
                 if rng.random() < a.truncate_p:
@@ -1173,16 +1175,6 @@ class AudioBatchDataset(torch.utils.data.Dataset):
             for r in rows:
                 if r.cut is None and rng.random() < a.end_trim_p and r.trim_end(rng, voiced=a.end_trim_voiced):
                     n_trim += 1
-        if a.mix_p > 0 and len(rows) >= 2:
-            for p, r in enumerate(rows):
-                if rng.random() >= a.mix_p:
-                    continue
-                q = int(rng.integers(len(rows) - 1))
-                q += q >= p  # another row: a different utterance (every utterance is in exactly one row)
-                got = mix_into(r.wave, originals[q], rng, a.mix_snr_db)
-                if got is not None:
-                    r.wave = got[0]
-                    n_mixed += 1
         acoustic = acoustic_chain(rows, originals, self.noise, self.rirs, a, rng)
         B = len(rows)
         durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None or r.trimmed
@@ -1194,8 +1186,7 @@ class AudioBatchDataset(torch.utils.data.Dataset):
                    ids=["+".join(self.ids[i] for i in r.pieces) for r in rows],
                    sources=[self.sources[r.pieces[0]] for r in rows], dropped=dropped)
         out["aug"] = dict(utts=len(keep), rows=B, concat_groups=groups, concat_utts=len(keep) if groups else 0,
-                          truncated=n_cut, mixed=n_mixed, cut_padded=0, end_padded=0, concat_capped=capped,
-                          cut_mismatch=mismatch, end_trimmed=n_trim, **acoustic)
+                          truncated=n_cut, concat_capped=capped, cut_mismatch=mismatch, end_trimmed=n_trim, **acoustic)
         return out
 
 
@@ -1220,10 +1211,11 @@ class FrameBatchDataset(torch.utils.data.Dataset):
     Picklable without the data; the memmaps open lazily in each process.
 
     augment (an Augment; the train loader's only, scripts/04_distill.py augment.*): each micro-batch is augmented after
-    decoding (_augmented; the "augmentation" section below) - its rows joined, cut and mixed - and collated as above,
-    plus `aug`, a dict of counts (utts, rows, concat_groups, concat_utts, truncated, mixed). A joined row holds several
-    utterances: its ids are theirs joined by "+", sources and index the first one's. None (the default) returns the
-    stored rows exactly as before the augmentation existed, without `aug`."""
+    decoding (_augmented; the "augmentation" section below) - its rows joined, cut, end-trimmed and through the acoustic
+    steps - and collated as above, plus `aug`, a dict of counts (utts, rows, concat_groups, concat_utts, truncated,
+    end_trimmed, and the acoustic steps'). A joined row holds several utterances: its ids are theirs joined by "+",
+    sources and index the first one's. None (the default) returns the stored rows exactly as before the augmentation
+    existed, without `aug`."""
 
     ARRAYS = ("frames_blank_lp", "dense_frame", "dense_topk_idx", "dense_topk_lp", "ctc_ids")
 
@@ -1330,15 +1322,15 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         return out
 
     def _augmented(self, idx: Sequence[int], keep: list[int], waves: list[np.ndarray], dropped: list[str]) -> dict:
-        """__getitem__ under self.augment: the decoded rows (store indices `keep`, audio `waves`) joined, cut, padded
-        and mixed in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's own stream, a
-        function of its index list alone - then collated as the plain path collates. The order matters: a joined row can
-        be cut (inside any piece, never before truncate_min_s), a pad follows the cut (or the whole row's end), and mix
-        takes its interferers from the rows as they were before the cut and before any mixing (clean speech, the length
-        of the whole row). Metadata of a row: ids its pieces' joined by "+" (a cut row only those that start before the
-        cut), sources and index the first piece's (the trainer's per-source sums count a joined row under its first
-        piece's source), durations the pieces' stored durations summed (a cut or padded row: the seconds of audio it
-        holds), agree the smallest known one (NaN if none is known)."""
+        """__getitem__ under self.augment: the decoded rows (store indices `keep`, audio `waves`) joined, cut, end-trimmed
+        and through the acoustic steps in that order, each step drawing from augment_rng(seed, idx) - the micro-batch's
+        own stream, a function of its index list alone - then collated as the plain path collates. The order matters: a
+        joined row can be cut (inside any piece, never before truncate_min_s), and the background speech takes the other
+        rows as they were before the cut (clean speech, the length of the whole row). Metadata of a row: ids its pieces'
+        joined by "+" (a cut row only those that start before the cut), sources and index the first piece's (the
+        trainer's per-source sums count a joined row under its first piece's source), durations the pieces' stored
+        durations summed (a cut or trimmed row: the seconds of audio it holds), agree the smallest known one (NaN if
+        none is known)."""
         from kitsune.ctc_targets import collate_frame_targets
 
         a = self.augment
@@ -1351,12 +1343,8 @@ class FrameBatchDataset(torch.utils.data.Dataset):
                 order = rng.permutation(len(rows))  # which utterances share a row, and in which order: random
                 rows = [_join_rows([rows[j] for j in order[g:g + k]], rng) for g in range(0, len(rows), k)]
                 groups = len(rows)
-        # mix's interferers and the pads' room tone: the rows before any cut (a view) or mix (a copy)
-        originals = [r.wave for r in rows]
-        # the micro-batch's padded frames after the join, before any cut: a pad never makes a row longer than this, so
-        # the rows x longest rectangle the planner and the memory probe sized stays as it is
-        width = max((r.ft.n_frames for r in rows), default=0)
-        n_cut = n_mixed = n_cut_pad = n_end_pad = 0
+        originals = [r.wave for r in rows]  # the background speech's other rows: the rows before any cut (a view)
+        n_cut = 0
         if a.truncate_p > 0:
             for r in rows:
                 if rng.random() < a.truncate_p:
@@ -1366,42 +1354,19 @@ class FrameBatchDataset(torch.utils.data.Dataset):
                     if c is not None:
                         r.cut_at(c, rng)
                         n_cut += 1
-        if a.truncate_pad_p > 0 or a.end_pad_p > 0:
-            for p, r in enumerate(rows):
-                prob = a.truncate_pad_p if r.cut is not None else a.end_pad_p
-                if prob <= 0 or rng.random() >= prob:
-                    continue
-                room = width - r.ft.n_frames
-                if room < 1:  # the longest whole row: a pad would widen the micro-batch
-                    continue
-                r.pad_quiet(min(int(rng.integers(a.pad_frames[0], a.pad_frames[1] + 1)), room), originals[p], rng)
-                if r.cut is not None:
-                    n_cut_pad += 1
-                else:
-                    n_end_pad += 1
         n_trim = 0
         if a.end_trim_p > 0:
             for r in rows:
-                if (r.cut is None and not r.pad and rng.random() < a.end_trim_p
+                if (r.cut is None and rng.random() < a.end_trim_p
                         and r.trim_end(a.punct_ids, rng, voiced=a.end_trim_voiced, start_ids=a.start_ids)):
                     n_trim += 1
-        if a.mix_p > 0 and len(rows) >= 2:
-            for p, r in enumerate(rows):
-                if rng.random() >= a.mix_p:
-                    continue
-                q = int(rng.integers(len(rows) - 1))
-                q += q >= p  # another row: a different utterance (every utterance is in exactly one row)
-                got = mix_into(r.wave, originals[q], rng, a.mix_snr_db)
-                if got is not None:
-                    r.wave = got[0]
-                    n_mixed += 1
         acoustic = acoustic_chain(rows, originals, self.noise, self.rirs, a, rng)
         B = len(rows)
         lengths = np.array([len(r.wave) for r in rows], dtype=np.int64)
         wave = np.zeros((B, int(lengths.max()) if B else 0), dtype=np.float32)
         for b, r in enumerate(rows):
             wave[b, :len(r.wave)] = r.wave
-        durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None or r.pad or r.trimmed
+        durations = np.array([len(r.wave) / TARGET_SR if r.cut is not None or r.trimmed
                               else self.duration[r.pieces].sum(dtype=np.float32) for r in rows], dtype=np.float32)
         agree = np.array([_nanmin(self.agree[r.pieces]) for r in rows], dtype=np.float32)
         out = dict(wave=torch.from_numpy(wave), lengths=torch.from_numpy(lengths),
@@ -1412,8 +1377,7 @@ class FrameBatchDataset(torch.utils.data.Dataset):
         out.update(collate_frame_targets([r.ft for r in rows]) if B else _empty_frame_targets())
         out["n_tok"] = out["ctc_target_lengths"].clone()
         out["aug"] = dict(utts=len(keep), rows=B, concat_groups=groups, concat_utts=len(keep) if groups else 0,
-                          truncated=n_cut, mixed=n_mixed, cut_padded=n_cut_pad, end_padded=n_end_pad,
-                          end_trimmed=n_trim, **acoustic)
+                          truncated=n_cut, end_trimmed=n_trim, **acoustic)
         return out
 
 
@@ -1441,7 +1405,8 @@ def _nanmin(x: np.ndarray) -> float:
 #     with it, 30 of 30), and a real sentence end inside a long chunk gets none;
 #   - no row ever holds two utterances or a second voice: joined utterances (ReazonSpeech 11.9 % CER per utterance,
 #     33.7 % with 4 of them in one input; CV 10.3 -> 15.9 %) and conversational streams with crosstalk go badly.
-# Three fixes, each keeping the teacher's per-frame targets right for the input the student gets:
+# Two fixes, each keeping the teacher's per-frame targets right for the input the student gets (a second voice is the
+# acoustic steps' background speech, below):
 #   concat    per micro-batch (concat_p): ALL its rows joined into groups of k, k drawn among the divisors of the row
 #             count in [2, concat_max_n] with k x the longest row <= concat_max_s (none: no join). Every piece but the
 #             last is padded (AUG_PAD_STD noise) or trimmed to exactly FRAME_SAMPLES x its stored n_frames, so each
@@ -1470,51 +1435,28 @@ def _nanmin(x: np.ndarray) -> float:
 #             the input ending is no longer a reason to emit one. A cut between a sentence's last word and its mark
 #             (the Parakeet teacher puts the mark after the trailing silence) would keep a COMPLETE sentence without its
 #             mark and teach the opposite - dropping real marks -, so the word rule excludes it (truncate_frames)
-#   pad       per cut row (truncate_pad_p) and per whole row (end_pad_p): n frames of quiet appended (n uniform in
-#             pad_frames, 80 ms each; quiet_pad: PAD_ROOM_P of the pads the row's own room tone, the rest AUG_PAD_STD
-#             noise) with pure-blank targets (blank_frame_targets). Why (the external review of the first recipe's
-#             test model, 2026-10-03): the app ends a chunk at a window edge - mostly inside a word - and pads it with
-#             0.2 s of quiet, and a cut that only ever ENDED the input taught nothing about "the speech stops, then
-#             quiet": that model still put 。 after 99.7 % of cuts through a word. A cut row with a pad keeps no mark
-#             (its sentence still runs); a whole row with a pad keeps its mark before the quiet (a complete sentence,
-#             then silence), so silence alone is no cue either way. The audio is first squared to whole frames
-#             (join_waves), so the pad starts on an encoder frame boundary. A pad never makes a row longer than the
-#             micro-batch's longest row after the join (the planned rectangle): the longest whole row gets none, and a
-#             pad is clipped to the room left
-#   mix       per row (mix_p, micro-batches of 2+ rows): a random segment of another row's audio - as it was before any
-#             cut or mix: clean, whole - added at a random offset, scaled to an SNR drawn from mix_snr_db (dB of this
-#             row's power over the segment's, both over the span they share); the targets stay this row's (clean
-#             teacher, noisy student), so the student transcribes the dominant voice through crosstalk and background
-#             talk. The length never changes
 # No step changes a row's frame count other than as its targets change (concat sums whole frames, truncate cuts at a
-# frame boundary, a pad adds whole frames, mix keeps the length), so ctc_frames(samples) == n_frames holds for every row
-# the loss reads.
-# Deterministic: each micro-batch draws from augment_rng(seed, its index list) alone, so a resumed or branched run -
-# which replays the same index lists - augments every micro-batch exactly as the original did, whichever worker decodes
-# it (a micro-batch whose index list recurs in a later epoch is augmented the same way again; with the planner's
-# reshuffled pools that needs the same utterances in the same order, which only a one-row micro-batch meets). Pure numpy
-# in the worker - a join, a slice, one copy per mixed row -: measured on the laptop, 0.05-0.35 s more per 1600 s
-# micro-batch with all three on (the most for 1 s rows, 1600 of them), next to the ~0.7-1.6 s its MP3/OGG decode takes
-# on one core (default_num_workers' rates).
-# Acoustic steps (DECISIONS H12; acoustic_chain), after the joins, cuts, pads, end trim and mix, for both families,
-# each per row and from the same stream, the targets always the teacher's on the clean row - so the student learns that
-# none of these changes what is said:
+# frame boundary), so ctc_frames(samples) == n_frames holds for every row the loss reads.
+# Deterministic: each micro-batch draws from augment_rng(seed, its index list) alone, so a resumed run - which replays
+# the same index lists - augments every micro-batch exactly as the original did, whichever worker decodes it (a
+# micro-batch whose index list recurs in a later epoch is augmented the same way again; with the planner's reshuffled
+# pools that needs the same utterances in the same order, which only a one-row micro-batch meets). Pure numpy in the
+# worker - a join, a slice -: measured on the laptop, 0.05-0.35 s more per 1600 s micro-batch (the most for 1 s rows,
+# 1600 of them; with a since-retired mix step on too), next to the ~0.7-1.6 s its MP3/OGG decode takes on one core
+# (default_num_workers' rates).
+# Acoustic steps (DECISIONS H12; acoustic_chain), after the joins, cuts and end trim, for both families, each per row
+# and from the same stream, the targets always the teacher's on the clean row - so the student learns that none of
+# these changes what is said:
 #   speech    background speech (speech_p): 1-4 voices (speech_talkers), each another row of the micro-batch (Japanese)
 #             or the bank's speech (MUSAN: 17 languages), summed - two or more are babble - at speech_snr_db (10-25 dB)
-#             of voiced power below the row, which stays the dominant voice (mix_into's single interferer at 5-20 dB
-#             made two equally loud voices worse in the recipe test: these stay well below)
+#             of voiced power below the row, which stays the dominant voice (the recipe test's single interferer at
+#             5-20 dB, a mix step since retired, made two equally loud voices worse: these stay well below)
 #   reverb    room echo (reverb_p): a room impulse response (aug/rirs-v1: OpenSLR 28's simulated and real rooms) over
 #             the whole row, background speech included - one room -, its direct path at sample 0 (frames aligned)
 #   noise     music without vocals, noise and songs with lyrics (noise_p; BACKGROUND_KINDS) under the whole row, dry
 #   gain      volume (gain_p): gain_db (-20..+10 dB), clipped at full scale
 #   codec     a real encoder and back in memory (codec_p; kitsune.acoustics: MP3 at 30-100 kbit/s, GSM 6.10 and
 #             mu-law at 8 kHz), length and alignment kept (measured: lag 0 for each)
-# background_min_row_s > 0 (DECISIONS H14's gentle recipe): a row whose audio at the chain's entry - as the student hears
-# it, after the joins, cuts, pads and trim - is shorter than that many seconds is spared the speech and background
-# steps (a short command under a song or babble is mostly the song): their gate is still drawn for it, so the rows
-# before it draw what they drew, then it is skipped; reverb, gain and codec still apply. The chain then counts
-# short_rows, speech_spared and noise_spared (0 included) on every micro-batch; at 0 (the default) it never does, and
-# the stream and counts are the recipe's as before the key
 # The recipe audit of 2026-10-09 (the lone-。 empties; its findings B1-B3) found three faults of the steps above, each
 # fixed behind a key of its own, false by default - off, every draw, row, count and event is as before the key:
 #   cut_keep_word    (B1) on ReazonSpeech the teacher puts the bare start piece "▁" on frame 0 and leaves an
@@ -1525,15 +1467,14 @@ def _nanmin(x: np.ndarray) -> float:
 #                    An AED row's cuts (its cut table's entries) each keep Cohere tokens of their own piece - CTX
 #                    matching characters of its text before the boundary -: the key holds them to that
 #                    (aed_cut_candidates)
-#   guard_per_piece  (B2) truncate_min_row_s, the cut's lower bound and background_min_row_s tested the joined row, so a
-#                    1-3 s utterance inside one was still cut and got background, and a cut could keep 80 ms of a
-#                    long later utterance. Per piece instead: no cut strictly inside a piece shorter than
-#                    truncate_min_row_s, nor inside a longer piece before ITS lower bound (max(truncate_min_frac x its
-#                    frames, truncate_min_s, 1 frame), as if it stood alone; piece_guard_frames) - a cut at a piece's
-#                    first frame drops it whole and stays allowed -, and a row is short for the background when ANY
-#                    of its pieces is (piece_samples), in both families: an AED row carries its pieces' offsets and
-#                    frames as a CTC row does. The joined row's own rules still hold: the key only takes candidates
-#                    and backgrounds away, never adds one, and changes nothing on a single-piece row
+#   guard_per_piece  (B2) truncate_min_row_s and the cut's lower bound tested the joined row, so a 1-3 s utterance
+#                    inside one was still cut, and a cut could keep 80 ms of a long later utterance. Per piece instead:
+#                    no cut strictly inside a piece shorter than truncate_min_row_s, nor inside a longer piece before
+#                    ITS lower bound (max(truncate_min_frac x its frames, truncate_min_s, 1 frame), as if it stood
+#                    alone; piece_guard_frames) - a cut at a piece's first frame drops it whole and stays allowed -, in
+#                    both families: an AED row carries its pieces' offsets and frames as a CTC row does. The joined
+#                    row's own rules still hold: the key only takes candidates away, never adds one, and changes nothing
+#                    on a single-piece row
 #   end_trim_voiced  (B3) the CTC end trim cut at the end of the last word's argmax run, but the teacher fires a token
 #                    near its onset: it removed a median 0.23 s of that word's voiced audio and kept its token, and
 #                    counted "▁" as a word ('▁ ... 。' became a 2-frame '▁ 。' row). The trim then keeps every frame
@@ -1553,19 +1494,11 @@ SPEECH_MAX_TALKERS = 8  # the most voices speech_talkers may ask for
 
 AUG_PAD_STD = 1e-5  # the noise between joined pieces (~-100 dBFS): never digital zeros, whose LogMel floor is a feature
 # no recording has, which the student would then see at every join and nowhere else
-MIX_SILENT_POWER = 1e-8  # a mean square below this (-80 dBFS) is silence: no level to scale an interferer to (or by)
-MIX_MIN_COVER = 0.5  # the interferer's segment covers a uniform share in [MIX_MIN_COVER, 1] of the shorter of the rows
 TRUNCATE_PAUSE_FRAMES = 4  # a pause cut lands in a run of >= this many teacher-blank frames (>= 320 ms of pause)
-PAD_MAX_FRAMES = 25  # the longest pad augment.pad_frames may ask for (2 s)
-# where a cut (or padded) row's audio may end and still be c encoder frames: ctc_frames(L) == c for every L in
+# where a cut row's audio may end and still be c encoder frames: ctc_frames(L) == c for every L in
 # [FRAME_SAMPLES c - END_BELOW, FRAME_SAMPLES c + END_ABOVE] (the valid mel frames L // HOP run 8c - 7 .. 8c)
 END_BELOW = FRAME_SAMPLES - HOP  # 1120 samples
 END_ABOVE = HOP - 1  # 159 samples
-PAD_ROOM_P = 0.5  # the share of pads cut from the row's own room tone (a voice-detector chunk's silence); the rest is
-# AUG_PAD_STD noise (an app's zero pad, without the exact zeros whose LogMel floor no recording has)
-PAD_ROOM_FRAMES = 8  # room tone: whole frames drawn among the row's this-many quietest ...
-PAD_ROOM_MAX_POWER = 1e-4  # ... whose mean square is below this (-40 dBFS); a row without one gets noise
-PAD_MIN_BLANK_LP = math.log(0.99)  # a pad frame's log p(blank): the row's most confident blank frame's, at least this
 
 
 @dataclass(frozen=True)
@@ -1573,35 +1506,32 @@ class Augment:
     """What a train FrameBatchDataset (or AudioBatchDataset) does to each micro-batch (the section comment above).
     scripts/04_distill.py
     builds it from augment.* (from_config) with seed = augment.seed or the run's seed, concat_max_s clamped to the
-    longest train utterance and punct_ids from the student's tokenizer. concat_p: per micro-batch; truncate_p, mix_p:
-    per row; truncate_min_frac / truncate_min_s: the cut's lower bound (a share of the row's frames, seconds);
-    truncate_pause_p: the share of cuts placed inside a pause (truncate_cut); punct_ids: the token ids a cut must never
-    remove alone - the sentence marks and commas (truncate_frames; required when truncate_p > 0, since without them
-    the rule cannot tell a sentence's mark from its words); concat_max_n / concat_max_s: the pieces and seconds of a
-    joined row; mix_snr_db: (low, high) dB of the row's power over the interferer's, drawn uniformly; truncate_pad_p /
-    end_pad_p: per cut row / per whole row, a quiet pad of (low, high) pad_frames 80 ms frames (inclusive) after it;
+    longest train utterance and punct_ids from the student's tokenizer. concat_p: per micro-batch; truncate_p: per row;
+    truncate_min_frac / truncate_min_s: the cut's lower bound (a share of the row's frames, seconds); truncate_pause_p:
+    the share of cuts placed inside a pause (truncate_cut); punct_ids: the token ids a cut must never remove alone -
+    the sentence marks and commas (truncate_frames; required when truncate_p > 0, since without them the rule cannot
+    tell a sentence's mark from its words); concat_max_n / concat_max_s: the pieces and seconds of a joined row;
     truncate_min_row_s: rows shorter than this (seconds, the row's frames) are never cut.
     max_tokens: set for an AED (token-target) dataset - AudioBatchDataset's augmentation, the section comment's "AED
     rows" - and None for the CTC family's: the most target tokens (EOS included) a joined row may hold, the planner's
     max_dec_len less the prompt's length - 1. An AED augmentation takes no punct_ids (its cuts come from the cut table,
-    whose rule already keeps every cut before a word) and no pads (truncate_pad_p and end_pad_p 0). end_trim_p: per
-    row that was not cut (nor padded), trim its trailing silence to a short drawn tail, its sentence mark kept (end
-    trim: an AED row's tokens as they are, a CTC row's mark frames moved up to its last word; a CTC one needs
+    whose rule already keeps every cut before a word). end_trim_p: per row that was not cut, trim its trailing silence
+    to a short drawn tail, its sentence mark kept (end trim: an AED row's tokens as they are, a CTC row's mark frames
+    moved up to its last word; a CTC one needs
     punct_ids). noise_p: per row, background audio from the bank (kitsune.noise_bank: its music, noise and songs)
     mixed under the whole row at an SNR drawn from noise_snr_db ((low, high) dB of the row's voiced power over the
     background's). The other acoustic steps (DECISIONS H12; the section comment's "acoustic steps"), each per row:
     speech_p - background speech, speech_talkers (low, high) voices summed, each another row of the micro-batch with
     probability speech_batch_p or the bank's speech, at speech_snr_db dB of voiced power below the row; reverb_p - a
     room impulse response from the RIR bank; gain_p - gain_db dB, clipped at full scale; codec_p - one of codecs
-    (kitsune.acoustics) and back. background_min_row_s: rows shorter than this (seconds of their audio at the acoustic
-    chain) get no background speech and no background (0: every row may; acoustic_chain).
+    (kitsune.acoustics) and back.
     The audit's fixes (the section comment's B1-B3), each False by default (the steps as before the key), each for
     either family:
     cut_keep_word - a cut keeps a content token of the piece it ends in (a CTC row: truncate_frames' content_kept;
     an AED row: a Cohere token of that piece, aed_cut_candidates); start_ids: the student tokenizer's bare start pieces
     "▁", no content (scripts/04_distill.py start_token_ids; a CTC one's, like punct_ids - an AED one takes none);
-    guard_per_piece - truncate_min_row_s, the cut's lower bound and background_min_row_s apply to each piece of a
-    joined row as well (piece_guard_frames, piece_samples); end_trim_voiced - the end trim keeps the audio up to the
+    guard_per_piece - truncate_min_row_s and the cut's lower bound apply to each piece of a joined row as well
+    (piece_guard_frames); end_trim_voiced - the end trim keeps the audio up to the
     last voiced sound of the row's last piece, judged at that piece's own level (pieces_voiced_end), and a CTC row's
     counts no start piece as a word (_AugRow.trim_end)."""
 
@@ -1614,11 +1544,6 @@ class Augment:
     concat_p: float = 0.0
     concat_max_s: float = 28.0
     concat_max_n: int = 4
-    mix_p: float = 0.0
-    mix_snr_db: tuple = (5.0, 20.0)
-    truncate_pad_p: float = 0.0
-    end_pad_p: float = 0.0
-    pad_frames: tuple = (1, 5)
     truncate_min_row_s: float = 0.0
     max_tokens: int | None = None
     end_trim_p: float = 0.0
@@ -1633,15 +1558,12 @@ class Augment:
     gain_db: tuple = (-20.0, 10.0)
     codec_p: float = 0.0
     codecs: tuple = DEFAULT_CODECS
-    background_min_row_s: float = 0.0
     start_ids: tuple = ()
     cut_keep_word: bool = False
     guard_per_piece: bool = False
     end_trim_voiced: bool = False
 
     def __post_init__(self):
-        snr = tuple(float(x) for x in self.mix_snr_db)
-        object.__setattr__(self, "mix_snr_db", snr)
         nsnr = tuple(float(x) for x in self.noise_snr_db)
         object.__setattr__(self, "noise_snr_db", nsnr)
         ssnr = tuple(float(x) for x in self.speech_snr_db)
@@ -1655,41 +1577,32 @@ class Augment:
         object.__setattr__(self, "punct_ids", tuple(sorted(int(i) for i in self.punct_ids)))
         object.__setattr__(self, "start_ids", tuple(sorted(int(i) for i in self.start_ids)))
         fixes = (self.cut_keep_word, self.guard_per_piece, self.end_trim_voiced)
-        pf = tuple(self.pad_frames)
-        whole = len(pf) == 2 and all(float(x) == int(x) for x in pf)
-        object.__setattr__(self, "pad_frames", tuple(int(x) for x in pf) if whole else pf)
-        probs = (self.truncate_p, self.truncate_pause_p, self.concat_p, self.mix_p, self.truncate_pad_p,
-                 self.end_pad_p, self.end_trim_p, self.noise_p, self.speech_p, self.speech_batch_p, self.reverb_p,
-                 self.gain_p, self.codec_p)
+        probs = (self.truncate_p, self.truncate_pause_p, self.concat_p, self.end_trim_p, self.noise_p, self.speech_p,
+                 self.speech_batch_p, self.reverb_p, self.gain_p, self.codec_p)
         aed = self.max_tokens is not None
         ok = (int(self.seed) >= 0 and all(0.0 <= float(p) <= 1.0 for p in probs)
               and 0.0 <= float(self.truncate_min_frac) < 1.0 and float(self.truncate_min_s) >= 0.0
-              and float(self.concat_max_s) > 0.0 and int(self.concat_max_n) >= 2 and len(snr) == 2
-              and 0.0 <= snr[0] <= snr[1] and all(0 <= i < CTC_BLANK for i in self.punct_ids)
+              and float(self.concat_max_s) > 0.0 and int(self.concat_max_n) >= 2
+              and all(0 <= i < CTC_BLANK for i in self.punct_ids)
               and (aed or float(self.truncate_p) == 0.0 or len(self.punct_ids) > 0)
-              and whole and 1 <= self.pad_frames[0] <= self.pad_frames[1] <= PAD_MAX_FRAMES
               and float(self.truncate_min_row_s) >= 0.0
-              and (not aed or (int(self.max_tokens) >= 2 and not self.punct_ids
-                               and float(self.truncate_pad_p) == 0.0 and float(self.end_pad_p) == 0.0))
+              and (not aed or (int(self.max_tokens) >= 2 and not self.punct_ids))
               and (aed or float(self.end_trim_p) == 0.0 or len(self.punct_ids) > 0)
               and len(nsnr) == 2 and nsnr[0] <= nsnr[1]
               and len(ssnr) == 2 and all(np.isfinite(ssnr)) and ssnr[0] <= ssnr[1]
               and len(gdb) == 2 and all(np.isfinite(gdb)) and gdb[0] <= gdb[1]
               and st_whole and 1 <= self.speech_talkers[0] <= self.speech_talkers[1] <= SPEECH_MAX_TALKERS
               and all(c in CODECS for c in self.codecs) and (float(self.codec_p) == 0.0 or len(self.codecs) > 0)
-              and math.isfinite(float(self.background_min_row_s)) and float(self.background_min_row_s) >= 0.0
               and all(isinstance(x, bool) for x in fixes) and all(0 <= i < CTC_BLANK for i in self.start_ids)
               and (not aed or not self.start_ids))
         if not ok:
             raise ValueError(f"not an augmentation: {self} (probabilities in [0, 1], truncate_min_frac in [0, 1), "
-                             "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, 0 <= mix_snr_db low <= high, "
-                             "punct_ids token ids below the blank and given whenever truncate_p > 0, pad_frames whole "
-                             f"(low, high) with 1 <= low <= high <= {PAD_MAX_FRAMES}, truncate_min_row_s >= 0; an AED "
-                             "one (max_tokens set): max_tokens >= 2, no punct_ids, truncate_pad_p and end_pad_p 0; "
-                             "a CTC one's end_trim_p needs punct_ids; noise_snr_db, speech_snr_db and gain_db finite "
-                             f"(low, high) with low <= high; speech_talkers whole with 1 <= low <= high <= "
-                             f"{SPEECH_MAX_TALKERS}; codecs among {CODECS}, at least one when codec_p > 0; "
-                             "background_min_row_s finite and >= 0; start_ids token ids below the blank; "
+                             "truncate_min_s >= 0, concat_max_s > 0, concat_max_n >= 2, punct_ids token ids below the "
+                             "blank and given whenever truncate_p > 0, truncate_min_row_s >= 0; an AED one "
+                             "(max_tokens set): max_tokens >= 2, no punct_ids; a CTC one's end_trim_p needs punct_ids; "
+                             "noise_snr_db, speech_snr_db and gain_db finite (low, high) with low <= high; "
+                             f"speech_talkers whole with 1 <= low <= high <= {SPEECH_MAX_TALKERS}; codecs among "
+                             f"{CODECS}, at least one when codec_p > 0; start_ids token ids below the blank; "
                              "cut_keep_word, guard_per_piece and end_trim_voiced true or false; an AED one with no "
                              "start_ids)")
 
@@ -1920,15 +1833,6 @@ def piece_guard_frames(n_frames: int, offsets: Sequence[int], min_row_s: float, 
     return out
 
 
-def piece_samples(n: int, offsets: Sequence[int]) -> list[int]:
-    """The samples of each piece of a row of n samples whose pieces start at frames `offsets` (guard_per_piece's
-    background rule, acoustic_chain): FRAME_SAMPLES x its frames for every piece but the last (join_waves squares each
-    to exactly that), the rest of the row for the last (after a cut, the trim or a pad: what is left of it) - so a
-    single-piece row's is n, its length, the rule without the key."""
-    offs = [int(o) for o in offsets] or [0]
-    return [FRAME_SAMPLES * (b - a) for a, b in zip(offs[:-1], offs[1:])] + [int(n) - FRAME_SAMPLES * offs[-1]]
-
-
 def truncate_cut(ft: "FrameTargets", rng: np.random.Generator, min_frac: float, min_s: float,
                  punct_ids: Sequence[int], pause_p: float = 0.0, min_row_s: float = 0.0, *,
                  offsets: Sequence[int] | None = None, keep_word: bool = False, start_ids: Sequence[int] = (),
@@ -1976,93 +1880,23 @@ def join_waves(waves: Sequence[np.ndarray], n_frames: Sequence[int], rng: np.ran
     return np.concatenate(out).astype(np.float32, copy=False)
 
 
-def mix_into(dst: np.ndarray, src: np.ndarray, rng: np.random.Generator,
-             snr_db: Sequence[float]) -> tuple[np.ndarray, dict] | None:
-    """dst with a segment of src added: n samples (a uniform share in [MIX_MIN_COVER, 1] of the shorter of the two)
-    from a random start in src, at a random offset in dst, scaled so that 10 log10(power(dst over those n samples) /
-    power(the scaled segment)) is an SNR drawn uniformly from snr_db. Returns (the new array - dst itself is never
-    written: it may be another row's interferer -, {src_start, offset, n, snr_db, gain}), or None when there is
-    nothing to mix (a row under 2 samples; either span silent, below MIX_SILENT_POWER: no level to scale to, and
-    scaling a silent segment up would only turn its noise floor into a loud hiss)."""
-    L = min(len(dst), len(src))
-    if L < 2:
-        return None
-    n = int(rng.integers(math.ceil(MIX_MIN_COVER * L), L + 1))
-    s0 = int(rng.integers(0, len(src) - n + 1))
-    off = int(rng.integers(0, len(dst) - n + 1))
-    snr = float(rng.uniform(float(snr_db[0]), float(snr_db[1])))
-    seg = np.asarray(src[s0:s0 + n], dtype=np.float32)
-    span = np.asarray(dst[off:off + n], dtype=np.float32)
-    # the powers as float32 dot products (BLAS, no float64 copies of up to 30 s of audio per mixed row): ~1e-6 relative,
-    # 1e-5 dB of SNR
-    p_dst, p_seg = float(np.dot(span, span)) / n, float(np.dot(seg, seg)) / n
-    if p_dst < MIX_SILENT_POWER or p_seg < MIX_SILENT_POWER:
-        return None
-    gain = math.sqrt(p_dst / (p_seg * 10.0 ** (snr / 10.0)))
-    out = np.array(dst, dtype=np.float32, copy=True)
-    out[off:off + n] += np.float32(gain) * seg
-    return out, dict(src_start=s0, offset=off, n=n, snr_db=snr, gain=gain)
-
-
 def end_samples(c: int, rng: np.random.Generator) -> int:
-    """Where a row of c encoder frames ends when it is cut (or padded): a sample drawn uniformly in [FRAME_SAMPLES c -
+    """Where a row of c encoder frames ends when it is cut: a sample drawn uniformly in [FRAME_SAMPLES c -
     END_BELOW, FRAME_SAMPLES c + END_ABOVE], every one of which is still c frames (ctc_frames), so its last frame
     is as full or as empty as a natural utterance's or an app chunk's - never always exactly full, which the first
     recipe's student learned to read as "cut, so no mark"."""
     return FRAME_SAMPLES * int(c) + int(rng.integers(-END_BELOW, END_ABOVE + 1))
 
 
-def blank_frame_targets(n: int, blank_lp: float, k: int) -> "FrameTargets":
-    """n frames of pure blank, a quiet pad's targets: log p(blank) = blank_lp at every frame and no dense frame (the
-    teacher's p(blank) there is above its dense threshold), so no token - and no mark - comes from them; top-k width k,
-    the row's, for join_frame_targets."""
-    from kitsune.ctc_targets import FrameTargets
-
-    n, k = int(n), int(k)
-    return FrameTargets(n, np.full(n, blank_lp, dtype=np.float16), np.zeros(0, np.int32), np.zeros((0, k), np.int16),
-                        np.zeros((0, k), np.float16), np.zeros(0, np.int32))
-
-
-def quiet_pad(src: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
-    """n x FRAME_SAMPLES samples of quiet for a pad: with probability PAD_ROOM_P the room tone of src (the row's audio
-    before any cut) - n whole frames drawn, with replacement and in random order, among its PAD_ROOM_FRAMES quietest
-    whose mean square is below PAD_ROOM_MAX_POWER, as a voice-detector chunk ends in its own silence -, otherwise, or
-    when src has no such frame, AUG_PAD_STD noise, as an app's zero pad reads."""
-    n = int(n)
-    if rng.random() < PAD_ROOM_P:
-        m = len(src) // FRAME_SAMPLES
-        if m:
-            fr = np.asarray(src[:m * FRAME_SAMPLES], dtype=np.float32).reshape(m, FRAME_SAMPLES)
-            ms = np.einsum("ij,ij->i", fr, fr) / FRAME_SAMPLES
-            order = np.argsort(ms, kind="stable")[:PAD_ROOM_FRAMES]
-            quiet = order[ms[order] < PAD_ROOM_MAX_POWER]
-            if len(quiet):
-                return fr[quiet[rng.integers(len(quiet), size=n)]].reshape(-1).copy()
-    return np.float32(AUG_PAD_STD) * rng.standard_normal(n * FRAME_SAMPLES, dtype=np.float32)
-
-
 class _AugRow:
     """One row of an augmented micro-batch: its audio, targets, the store indices of its pieces and their first frames,
-    the frame it was cut at (None: whole) and the frames of quiet appended after it (0: none)."""
+    the frame it was cut at (None: whole) and whether its end was trimmed."""
 
-    __slots__ = ("wave", "ft", "pieces", "offsets", "cut", "pad", "trimmed")
+    __slots__ = ("wave", "ft", "pieces", "offsets", "cut", "trimmed")
 
     def __init__(self, wave: np.ndarray, ft, pieces: list[int], offsets: list[int]):
-        self.wave, self.ft, self.pieces, self.offsets, self.cut, self.pad = wave, ft, pieces, offsets, None, 0
+        self.wave, self.ft, self.pieces, self.offsets, self.cut = wave, ft, pieces, offsets, None
         self.trimmed = False
-
-    def pad_quiet(self, n: int, src: np.ndarray, rng: np.random.Generator):
-        """Append n frames of quiet (quiet_pad, room tone from src) with pure-blank targets at the row's most confident
-        blank (at least PAD_MIN_BLANK_LP): the audio first squared to exactly FRAME_SAMPLES x its frames as a joined
-        piece is (join_waves), so the pad starts on an encoder frame boundary and the row's frames grow by exactly n;
-        the padded row's end drawn as a cut's (end_samples).
-        The targets before the pad are unchanged: a cut row still ends without a mark, a whole row keeps its own."""
-        n, T = int(n), self.ft.n_frames
-        b = max(float(np.max(self.ft.blank_lp)) if T else 0.0, PAD_MIN_BLANK_LP)
-        wave = join_waves([self.wave, quiet_pad(src, n, rng)], [T, n], rng)
-        self.wave = wave[:min(end_samples(T + n, rng), len(wave))]  # the end drawn, as a cut's (end_samples)
-        self.ft = join_frame_targets([self.ft, blank_frame_targets(n, b, self.ft.k)])
-        self.pad += n
 
     def cut_at(self, c: int, rng: np.random.Generator | None = None):
         """Keep the first c frames: the targets cut_frame_targets', only the pieces that start before c, and the audio
@@ -2144,29 +1978,11 @@ def mark_tail(ft: "FrameTargets", punct_ids: Sequence[int],
 def acoustic_chain(rows, originals, noise, rirs, a: Augment, rng: np.random.Generator) -> dict:
     """The acoustic steps of either family's rows, in this order (the section comment's "acoustic steps"): background
     speech, room echo, background music / noise / songs, volume, codec - each from the micro-batch's own stream, its
-    targets unchanged. Returns the aug counts {speech_mixed, reverbed, noised, gained, clipped, coded}; with
-    a.background_min_row_s > 0 also short_rows (rows under it at the chain's entry: no step changes a row's length,
-    so that is the length the student hears), speech_spared and noise_spared (rows the speech / background gate picked
-    and the limit spared) - on every micro-batch, 0 included, since the train step sums every micro-batch's counts under
-    the first one's keys (scripts/04_distill.py train_step). At 0 the keys, the draws and the rows are exactly the
-    chain's before the key existed. a.guard_per_piece: a row is short when ANY of its pieces is (piece_samples of its
-    offsets: a joined row's utterance under the limit is spared with its row; a single-piece row's rule is
-    unchanged)."""
-    lim = int(round(float(a.background_min_row_s) * TARGET_SR))
-    if lim <= 0:
-        short = None
-    elif a.guard_per_piece:
-        short = [min(piece_samples(len(r.wave), r.offsets)) < lim for r in rows]
-    else:
-        short = [len(r.wave) < lim for r in rows]
-    sp_s, sp_n = [], []
-    out = dict(speech_mixed=mix_speech(rows, originals, noise, a, rng, short=short, spared=sp_s),
-               reverbed=reverberate(rows, rirs, a, rng),
-               noised=mix_background(rows, noise, a, rng, short=short, spared=sp_n))
+    targets unchanged. Returns the aug counts {speech_mixed, reverbed, noised, gained, clipped, coded}."""
+    out = dict(speech_mixed=mix_speech(rows, originals, noise, a, rng), reverbed=reverberate(rows, rirs, a, rng),
+               noised=mix_background(rows, noise, a, rng))
     out.update(vary_gain(rows, a, rng))
     out["coded"] = apply_codecs(rows, a, rng)
-    if short is not None:
-        out.update(short_rows=int(sum(short)), speech_spared=len(sp_s), noise_spared=len(sp_n))
     return out
 
 
@@ -2179,14 +1995,12 @@ def _stretch(src: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
     return np.resize(np.roll(src, -int(rng.integers(len(src)))), n).astype(np.float32, copy=False)
 
 
-def mix_speech(rows, originals, bank, a: Augment, rng: np.random.Generator, short=None, spared=None) -> int:
+def mix_speech(rows, originals, bank, a: Augment, rng: np.random.Generator) -> int:
     """The background speech step (speech_p): per row, speech_talkers voices drawn (low, high), each another row of the
     micro-batch (its audio before any cut: originals) with probability speech_batch_p - Japanese - or else a stretch
     of the bank's speech (MUSAN: 17 languages), each at unit voiced power and summed (two or more: babble), then added
     at speech_snr_db dB of voiced power below the row - so the row stays the dominant voice, and its targets, the
-    teacher's on the clean row, say that the voices behind it are not to be written. Returns the rows it changed.
-    short (acoustic_chain; None: no row): per row, True spares it after its gate draw (the row's index joins spared,
-    a list, when given), so the other rows' draws do not depend on whether it was short."""
+    teacher's on the clean row, say that the voices behind it are not to be written. Returns the rows it changed."""
     if a.speech_p <= 0:
         return 0
     from kitsune.noise_bank import background_segment, voiced_power
@@ -2195,10 +2009,6 @@ def mix_speech(rows, originals, bank, a: Augment, rng: np.random.Generator, shor
     n = 0
     for p, r in enumerate(rows):
         if rng.random() >= a.speech_p:
-            continue
-        if short is not None and short[p]:  # background_min_row_s: picked, spared
-            if spared is not None:
-                spared.append(p)
             continue
         m = len(r.wave)
         talkers = []
@@ -2245,23 +2055,19 @@ def reverberate(rows, rirs, a: Augment, rng: np.random.Generator) -> int:
     return n
 
 
-def mix_background(rows, bank, a: Augment, rng: np.random.Generator, short=None, spared=None) -> int:
+def mix_background(rows, bank, a: Augment, rng: np.random.Generator) -> int:
     """The background step of either family's rows (noise_p): per row, a stretch of the bank's music, noise and songs
     (BACKGROUND_KINDS; never its speech, the speech step's) as long as the row mixed under all of it at an SNR drawn
     from noise_snr_db (kitsune.noise_bank.add_background) - dry, as a stream mixes its game sound and music in -, its
     targets unchanged: the teacher's on the clean audio, so a song's lyrics are not to be written. Returns the rows it
-    changed (a silent row or stretch is left as it is). short / spared: as mix_speech's."""
+    changed (a silent row or stretch is left as it is)."""
     if a.noise_p <= 0 or bank is None or not bank.has(BACKGROUND_KINDS):
         return 0
     from kitsune.noise_bank import add_background, background_segment
 
     n = 0
-    for p, r in enumerate(rows):
+    for r in rows:
         if rng.random() >= a.noise_p:
-            continue
-        if short is not None and short[p]:  # background_min_row_s: picked, spared
-            if spared is not None:
-                spared.append(p)
             continue
         seg = background_segment(bank, len(r.wave), rng, BACKGROUND_KINDS)  # a near-silent stretch is drawn again
         got = None if seg is None else add_background(r.wave, seg, rng, a.noise_snr_db)
@@ -2370,9 +2176,7 @@ def _join_rows(parts: list[_AugRow], rng: np.random.Generator) -> _AugRow:
 #             (median 0.28 s; ReazonSpeech and Emilia end tightly but are noisy or spontaneous), so "clean audio that
 #             ends tightly" was "a cut": P-0.3B left the mark off 7 % of JSUT's complete sentences, whose audio ends
 #             within ~0.05 s of the last word, and kept it on 100 % of Galgame's. Trimmed complete rows make a tight
-#             end mean nothing by itself. Before mix, so the interferer does not hide the row's silence
-#   mix       as above (the targets the clean row's)
-# No pads: a quiet pad would add no token, and the recipe keeps them off for both families.
+#             end mean nothing by itself. Before the acoustic steps, so a background does not hide the row's silence
 END_TRIM_DB = 35.0  # a 10 ms frame is voiced within this many dB of the row's loudest (the review's tail_sil.py rule)
 END_TRIM_TAIL_S = (0.01, 0.08)  # the trimmed row keeps this much audio after its last voiced frame (JSUT: 0.00-0.05 s)
 TOKEN_CUT_FLOOR_LP = -30.0  # the cut row's EOS position: the log-prob of its other top-k ids (e^-30 ~ 1e-13 each)

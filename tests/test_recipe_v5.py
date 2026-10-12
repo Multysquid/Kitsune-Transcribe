@@ -3,15 +3,15 @@
 false by default:
 
 - off, every function and dataset is as before the key: the cut candidates, the drawn cut and the generator's state
-  after it, the trimmed rows, the acoustic chain's spared rows and the aug counters' keys (and the start pieces the
-  trainer now always hands the CTC augmentation change nothing by themselves); and whole augmented micro-batches of
-  both families, every step on but the codec, reproduce digests recorded from the code before the keys (d599b2e)
+  after it, the trimmed rows and the aug counters' keys (and the start pieces the trainer now always hands the CTC
+  augmentation change nothing by themselves); and whole augmented micro-batches of both families, every step on but
+  the codec, reproduce their recorded digests (GOLDEN), and so do the released models' recipes (RELEASED_GOLDEN)
 - cut_keep_word (B1): no cut keeps only the bare start piece "▁" - not in a ReazonSpeech-like lead-in before the first
   word, not in a joined row's later piece; a cut at a piece boundary after a piece with a word stays allowed; a word
   merged into the start piece is a word; an AED cut keeps a Cohere token of the piece it ends in
 - guard_per_piece (B2): a 2 x 1.6 s joined row under truncate_min_row_s 3 keeps only its boundary candidate (either
-  family) and, under background_min_row_s 3, gets no background; a cut inside a longer later piece keeps at least that
-  piece's own lower bound of it (either family); the joined row's own rule still holds
+  family); a cut inside a longer later piece keeps at least that piece's own lower bound of it (either family); the
+  joined row's own rule still holds
 - end_trim_voiced (B3): the end trim keeps a row's voiced audio that runs past its last word's spike - in a joined row
   too, whose last piece is quieter than the one before it (either family) -, leaves a '▁ ... 。' row and a row whose
   voice runs into its mark alone, and no longer shrinks a frame-0-only-word row to 2 frames
@@ -283,47 +283,6 @@ def test_guard_per_piece_lower_bound():
         assert frames.tolist() == want and kept.tolist() == [4 + (f - 21) // 5 + 1 for f in want]
 
 
-def test_guard_per_piece_background(tmp_path):
-    """background_min_row_s 3, background noise (then background speech) on every row: off, the joined 2 x 1.6 s row
-    (3.2 s) gets it, as a 3.2 s single row does, and only the 1.6 s single row is spared; on, the joined row is spared
-    too (a piece under 3 s), the single rows as off - the rows before it byte for byte (their draws are unchanged). An
-    AED row of the same pieces is spared the same way; the counters' keys stay the chain's."""
-    bank = NoiseBank.load(make_noise_bank(tmp_path / "bg", kinds=("music", "speech", "song", "noise")))
-    pa_, pb = (T._AugRow(voiced(25600, 25600, 3 + i), ft(piece20(60 + 10 * i)), [i], [0]) for i in range(2))
-    joined = T._join_rows([pa_, pb], np.random.default_rng(0))
-    assert joined.offsets == [0, 20] and len(joined.wave) == 51200
-    assert T.piece_samples(51200, [0, 20]) == [25600, 25600] and T.piece_samples(25600, [0]) == [25600]
-    waves = [voiced(51200, 51200, 1), voiced(25600, 25600, 2), joined.wave]
-
-    def rows():
-        return [T._AugRow(waves[0].copy(), ft(piece20(60) * 2), [2], [0]),
-                T._AugRow(waves[1].copy(), ft(piece20(60)), [3], [0]),
-                T._AugRow(waves[2].copy(), joined.ft, joined.pieces, joined.offsets)]
-
-    for step, changed, spared in ((dict(noise_p=1.0), "noised", "noise_spared"),
-                                  (dict(speech_p=1.0, speech_batch_p=0.5), "speech_mixed", "speech_spared")):
-        got = {}
-        for per in (False, True):
-            a = T.Augment(seed=1, background_min_row_s=3.0, guard_per_piece=per, **step)
-            rs = rows()
-            got[per] = (T.acoustic_chain(rs, [w.copy() for w in waves], bank, None, a, np.random.default_rng(5)), rs)
-        (c_off, r_off), (c_on, r_on) = got[False], got[True]
-        assert list(c_on) == list(c_off) == ["speech_mixed", "reverbed", "noised", "gained", "clipped", "coded",
-                                             "short_rows", "speech_spared", "noise_spared"]
-        assert (c_off["short_rows"], c_off[changed], c_off[spared]) == (1, 2, 1)
-        assert (c_on["short_rows"], c_on[changed], c_on[spared]) == (2, 1, 2)
-        assert [np.array_equal(r.wave, w) for r, w in zip(r_off, waves)] == [False, True, False]
-        assert [np.array_equal(r.wave, w) for r, w in zip(r_on, waves)] == [False, True, True]
-        assert all(np.array_equal(x.wave, y.wave) for x, y in zip(r_off[:2], r_on[:2]))
-
-    aed = T._join_tok_rows([tok_row(0, 20, 1, voiced(25600, 25600, 6)), tok_row(1, 20, 1, voiced(25600, 25600, 7))],
-                           EOS, np.random.default_rng(0))
-    for per, spared in ((False, 0), (True, 1)):
-        a = T.Augment(seed=1, max_tokens=50, noise_p=1.0, background_min_row_s=3.0, guard_per_piece=per)
-        c = T.acoustic_chain([aed], [aed.wave], bank, None, a, np.random.default_rng(1))
-        assert (c["short_rows"], c["noise_spared"], c["noised"]) == (spared, spared, 1 - spared)
-
-
 # ------------------------------------------------------------------------------------------ B3: end_trim_voiced
 
 
@@ -474,8 +433,8 @@ def micro_batches(st) -> list[list[int]]:
     return out
 
 
-AUG_KEYS = ["utts", "rows", "concat_groups", "concat_utts", "truncated", "mixed", "cut_padded", "end_padded",
-            "end_trimmed", "speech_mixed", "reverbed", "noised", "gained", "clipped", "coded"]  # the counters as today
+AUG_KEYS = ["utts", "rows", "concat_groups", "concat_utts", "truncated", "end_trimmed", "speech_mixed", "reverbed",
+            "noised", "gained", "clipped", "coded"]  # the counters as today
 
 
 def test_the_keys_on_a_frame_store(store, monkeypatch):
@@ -515,39 +474,38 @@ def test_the_keys_on_a_frame_store(store, monkeypatch):
 
 # ------------------------------------------------------------------- off: whole micro-batches as before the keys
 
-# Digests of augmented micro-batches made by the code before the keys (d599b2e, origin/cooldown-v4), every step on but
-# the codec (libsndfile builds differ): batch_digest of the CTC frame store with its own targets ("ctc") and with
-# ReazonSpeech-like lead-ins ("ctc_lead_in", lead_in_targets), and of an AED token store with its cut table and 0.4 s
-# quiet tails ("aed"). Recorded by importing a copy of this file into a d599b2e checkout and calling
-# golden_digests(root, setattr) - with every key off the code must still give them, draw for draw. Over their 82, 82
-# and 96 utterances every step but the codec acts (joins, cuts, pads, mixes, background speech and noise, rooms,
-# volume, the short-row guard; the end trim on "ctc_lead_in" and "aed": the store's own CTC targets put the mark right
-# behind the word). They also pin numpy's Generator streams (numpy 2.5.3, requirements-train.txt): a numpy whose
-# streams changed would fail here, as it would break a resumed run's replay.
-GOLDEN = {"ctc": "81350b60014fd99e0dcbaa0092c52e3b2e92f3b5ec465869fd33a1b7c7a83788",
-          "ctc_lead_in": "7c292d634e8a7e22481ea686c63d36df14b0b09f68a53f76ce5da16e25cc9604",
-          "aed": "22b3f8f2a82b5c5d50b489836b078ca37c2a397a47d5c20c9d95de5de4d306ee"}
+# Digests of augmented micro-batches, every step on but the codec (libsndfile builds differ): batch_digest of the CTC
+# frame store with its own targets ("ctc") and with ReazonSpeech-like lead-ins ("ctc_lead_in", lead_in_targets), and of
+# an AED token store with its cut table and 0.4 s quiet tails ("aed"), from golden_digests(root, setattr) - with every
+# key off the code must still give them, draw for draw. First recorded on the code before the keys (d599b2e, by
+# importing a copy of this file into that checkout); recorded again at db9ec64 - the same code, its mix, quiet pads and
+# short-row guard off and their counters left out -, before the cleanup that removed those three steps, which gives
+# them since. Over their 82, 82 and 96 utterances every step but the codec acts (joins, cuts, background speech and
+# noise, rooms, volume; the end trim on "ctc_lead_in" and "aed": the store's own CTC targets put the mark right behind
+# the word). They also pin numpy's Generator streams (numpy 2.5.3, requirements-train.txt): a numpy whose streams
+# changed would fail here, as it would break a resumed run's replay.
+GOLDEN = {"ctc": "d0d70da89a19e66e1f4e23429227eb545a5b41ac079d608ba1d908d876a96438",
+          "ctc_lead_in": "7ae727416b20f24001a874b6677fe077cc9a716feca3e790bc4876ac1f2d1e77",
+          "aed": "b4977f4f9c5e19fbd2cf5cc352cd9fb78c41d740c717ae4706230384696b9bec"}
 GOLDEN_CTC = dict(seed=11, punct_ids=P, truncate_p=0.6, truncate_min_frac=0.2, truncate_min_s=0.3,
-                  truncate_pause_p=0.5, truncate_min_row_s=1.0, concat_p=0.6, mix_p=0.2, truncate_pad_p=0.3,
-                  end_pad_p=0.2, end_trim_p=0.6, noise_p=0.4, speech_p=0.3, reverb_p=0.3, gain_p=0.4,
-                  background_min_row_s=1.5)
+                  truncate_pause_p=0.5, truncate_min_row_s=1.0, concat_p=0.6, end_trim_p=0.6, noise_p=0.4,
+                  speech_p=0.3, reverb_p=0.3, gain_p=0.4)
 GOLDEN_AED = dict(seed=5, max_tokens=191, truncate_p=0.6, truncate_min_frac=0.1, truncate_min_s=0.2,
-                  truncate_min_row_s=1.0, concat_p=0.7, mix_p=0.3, end_trim_p=0.5, noise_p=0.4, speech_p=0.3,
-                  reverb_p=0.3, gain_p=0.3, background_min_row_s=1.5)
+                  truncate_min_row_s=1.0, concat_p=0.7, end_trim_p=0.5, noise_p=0.4, speech_p=0.3, reverb_p=0.3,
+                  gain_p=0.3)
 
 
-def batch_digest(ds, mbs, made: list | None, drop: tuple = ()) -> str:
+def batch_digest(ds, mbs, made: list | None) -> str:
     """sha256 of an augmented dataset's micro-batches as the house rule pins them: every output but the audio samples
-    (lengths, the frame targets or tokens, ids, durations, the aug counters with their keys in order, but the counters
-    named in drop) and the state of the micro-batch's generator after it (made: the generators augment_rng handed out,
-    record_rngs; None for a dataset without an augmentation, which draws nothing), so an added, dropped or reordered
-    draw shows. The samples are left out: reverb's FFT and the mixes' sums may differ in their last bits across
-    machines, and every step's draws are in the generator's state."""
+    (lengths, the frame targets or tokens, ids, durations, the aug counters with their keys in order) and the state of
+    the micro-batch's generator after it (made: the generators augment_rng handed out, record_rngs; None for a dataset
+    without an augmentation, which draws nothing), so an added, dropped or reordered draw shows. The samples are left
+    out: reverb's FFT and the background sums may differ in their last bits across machines, and every step's draws
+    are in the generator's state."""
     h = hashlib.sha256()
     for idx in mbs:
         got = ds[idx]
-        rec = [[k, v.tolist() if isinstance(v, torch.Tensor) else
-                {c: n for c, n in v.items() if c not in drop} if k == "aug" else v] for k, v in got.items() if k != "wave"]
+        rec = [[k, v.tolist() if isinstance(v, torch.Tensor) else v] for k, v in got.items() if k != "wave"]
         if made is not None:
             rec.append(["rng", made[-1].bit_generator.state["state"]])
         h.update(json.dumps(rec).encode())
@@ -674,8 +632,8 @@ RELEASED = {"a0": None, "v2": M.RECIPE, "v4": M.RECIPE_V4, "aed_h15": M.RECIPE_A
 # draw. Each recipe with its codec step off (libsndfile builds differ; GOLDEN's comment) and the fixture banks for its
 # background and rooms; the CTC recipes on the frame store with ReazonSpeech-like lead-ins (lead_in_targets: every step
 # they name acts, the end trim included), A0 on its plain rows, the AED recipe on the token store with its cut table and
-# quiet tails. The counters of mix and the quiet pads, steps no released recipe used (0 under each), are not in them.
-RELEASED_COUNTERS_LEFT_OUT = ("mixed", "cut_padded", "end_padded")
+# quiet tails. The counters of the mix and quiet-pad steps, which no released recipe used (0 under each) and the
+# cleanup removed with them, were left out of the recording.
 RELEASED_GOLDEN = {"a0": "5e5556bdb9396643e42435a5cc6fc4dbb929c8b6f1eea06375f0c62e419075da",
                    "v2": "946076b8712ed6105d62791fa94c0e7d19234a311ca8ed8ae75137e1bd7231fe",
                    "v4": "75aaab92ec17b402b09cbf2138410470d979e59491dc6894090b6e98f5ce65c5",
@@ -694,15 +652,13 @@ def released_digests(root: Path, patch) -> dict:
     lead_in_targets(patch)
     for name in ("v2", "v4"):
         aug = T.Augment.from_config(dict(RELEASED[name], codec_p=0.0), seed=11, punct_ids=P, start_ids=SID)
-        out[name] = batch_digest(T.dataset_for(st, augment=aug, noise=bank, rirs=rirs), micro_batches(st), made,
-                                 RELEASED_COUNTERS_LEFT_OUT)
+        out[name] = batch_digest(T.dataset_for(st, augment=aug, noise=bank, rirs=rirs), micro_batches(st), made)
     quiet_tails(patch)
     ast, cuts = aed_store(root / "aed")
     p = T.StepPlanner(ast.utts, step_audio_s=12, micro_audio_s=6.0, max_dec_len=200, pool_micro=4, seed=0)
     mbs = [mb for e in range(2) for step in p.epoch_plan(e) for mb in step]
     aug = T.Augment.from_config(dict(RELEASED["aed_h15"], codec_p=0.0), seed=5, max_tokens=191)
-    out["aed_h15"] = batch_digest(T.dataset_for(ast, augment=aug, cuts=cuts, noise=bank, rirs=rirs), mbs, made,
-                                  RELEASED_COUNTERS_LEFT_OUT)
+    out["aed_h15"] = batch_digest(T.dataset_for(ast, augment=aug, cuts=cuts, noise=bank, rirs=rirs), mbs, made)
     return out
 
 
@@ -755,7 +711,6 @@ def test_the_keys_in_the_trainer_config():
     m.validate(cfg)
     assert changed == {"augment.cut_keep_word": True} and same == {"augment.end_trim_voiced": False}
     assert cfg["augment"]["cut_keep_word"] is True and cfg["augment"]["guard_per_piece"] is False
-    assert m.branch_differences(old, saved) == []  # the old parent's missing keys are the defaults
 
 
 def fake_run(m, sets: list[str]):
@@ -782,14 +737,14 @@ def fake_run(m, sets: list[str]):
     return spec, event, out.getvalue()
 
 
-# the CTC `augment` event's fields before the fixes (scripts/04_distill.py setup_augment and noise_fields at d599b2e)
+# the CTC `augment` event's fields before the fixes (scripts/04_distill.py setup_augment and noise_fields at d599b2e,
+# less the mix and quiet-pad settings the cleanup retired)
 EVENT_KEYS = {"kind", "seed", "truncate_p", "truncate_min_frac", "truncate_min_s", "truncate_pause_p", "punct_ids",
               "concat_p", "concat_max_n", "concat_max_s", "concat_max_s_config", "longest_train_s",
-              "concat_max_s_clamped", "mix_p", "mix_snr_db", "truncate_pad_p", "end_pad_p", "pad_frames",
-              "truncate_min_row_s", "end_trim_p", "noise_p", "noise_snr_db", "noise_bank", "noise_bank_sha256",
-              "noise_clips", "noise_hours", "noise_kind_hours", "speech_p", "speech_snr_db", "speech_talkers",
-              "speech_batch_p", "reverb_p", "rir_bank", "rir_bank_sha256", "rir_clips", "gain_p", "gain_db", "codec_p",
-              "codecs"}
+              "concat_max_s_clamped", "truncate_min_row_s", "end_trim_p", "noise_p", "noise_snr_db", "noise_bank",
+              "noise_bank_sha256", "noise_clips", "noise_hours", "noise_kind_hours", "speech_p", "speech_snr_db",
+              "speech_talkers", "speech_batch_p", "reverb_p", "rir_bank", "rir_bank_sha256", "rir_clips", "gain_p",
+              "gain_db", "codec_p", "codecs"}
 
 
 def test_the_augment_event_and_line():
@@ -852,7 +807,7 @@ def test_recipe_v5():
     (DECISIONS pending): no full run, continuation or generated config uses it whole - full-t06 alone names two of its
     keys, guard_per_piece and end_trim_voiced, on (RECIPE_AED_H15, DECISIONS H15), cut_keep_word left at the default
     false; every key is one a continuation may set; it loads on a CTC student's config and on an AED one's (its cut
-    table kept)."""
+    table kept), its retired keys (mix_p and background_min_row_s at 0: RETIRED_KEYS) dropped."""
     assert M.RECIPE_V5 == dict(M.RECIPE_V4_FULL, cut_keep_word=True, guard_per_piece=True, end_trim_voiced=True)
     assert list(M.RECIPE_V5)[:len(M.RECIPE_V4_FULL)] == list(M.RECIPE_V4_FULL)
     assert {"noise_snr_db", "speech_snr_db", "gain_db", "codecs", "background_min_row_s"} <= set(M.RECIPE_V5)
@@ -864,7 +819,8 @@ def test_recipe_v5():
     full = ROOT / "configs" / "full"
     sets = [f"augment.{k}={json.dumps(v)}" for k, v in M.RECIPE_V5.items()]
     c = m.load_config(str(full / "full-p01.json"), sets)
-    assert c["augment"] == dict(m.DEFAULTS["augment"], **M.RECIPE_V5)
+    live = {k: v for k, v in M.RECIPE_V5.items() if f"augment.{k}" not in m.RETIRED_KEYS}
+    assert c["augment"] == dict(m.DEFAULTS["augment"], **live) and len(live) < len(M.RECIPE_V5)
     t = m.load_config(str(full / "full-t06.json"), sets)
     assert not m.is_ctc(t) and t["augment"]["cuts"] == M.AED_CUTS and all(t["augment"][k] is True for k in FIXES)
     blocks = {name: json.loads((full / f"{name}.json").read_text(encoding="utf-8")).get("augment") or {}

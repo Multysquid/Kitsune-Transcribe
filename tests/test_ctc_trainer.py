@@ -9,8 +9,8 @@
   format): smoke (frame preflight events, LogMel vs the Parakeet extractor, padded rows on frame log-probs, FLOPs),
   the step-0 / fraction / mini / final evals with the CTC metrics and the greedy CTC decode, the verdict against the
   Parakeet CTC teacher, summary.json (family, selection_sha256, started_utc), the TensorBoard tags; a crash resumed
-  from a mid state ends with exactly the uninterrupted run's weights; the T/2 branch is the T/2 run; an LR probe; the
-  export reloads with load_ctc_student and decodes as the trained weights do
+  from a mid state ends with exactly the uninterrupted run's weights; the export reloads with load_ctc_student and
+  decodes as the trained weights do
 CPU only, tiny models, synthetic data in the real on-disk formats."""
 import copy
 import hashlib
@@ -278,7 +278,7 @@ def test_validate_the_family_keys(env):
     assert c["family"] == "ctc" and m.is_ctc(c) and not m.is_ctc({})
     for bad, match in ((["family=ctc"], "needs parakeet_root"), (["family=rnnt"], "family must be one of"),
                        (["loss.w_ctc=-1"], "loss.w_ctc"), (["loss.w_ctc=x"], "loss.w_ctc"),
-                       (["family=ctc", "parakeet_root=po", "loss.aux_ctc_weight=0.3"], "aux-CTC head")):
+                       (["family=ctc", "parakeet_root=po", "loss.aux_ctc_weight=0.3"], "aux_ctc_weight must be 0")):
         with pytest.raises(SystemExit, match=match):
             m.load_config(None, bad)
     saved = m.load_config(None, [])
@@ -623,7 +623,7 @@ def test_gradient_checkpointing_gives_the_same_gradients(env):
 
 
 # the reference run of the end-to-end tests: the smoke phase, the step-0 eval, a complete eval at 50 %, mini evals, a
-# kept full state at 40 % (the T/2 branch's), weights at 50 %, histograms and layer stats, the final eval and verdict
+# kept full state at 40 %, weights at 50 %, histograms and layer stats, the final eval and verdict
 REF_OVER = {"smoke": {"enabled": True, "steps": 3, "min_audio_s_per_s": 0, "require_loss_decrease": False,
                       "pad_utts": 4, "decode_per_set": 2},
             "eval": {"full_at_fracs": [0.5], "mini": {"every_steps": 5, "val_per_set": 2, "train_utts": 3},
@@ -845,64 +845,6 @@ def test_a_crash_resumed_from_a_mid_state_is_the_uninterrupted_run(env, ref_run,
     # started_utc: the first start's, kept across the resume (the state the first attempt saved at step 8 has it)
     first = json.loads((crash / "checkpoints" / "full_step_8" / "trainer.json").read_text(encoding="utf-8"))
     assert first["st"]["started_utc"] and summary_of(crash)["started_utc"] == first["st"]["started_utc"]
-
-
-def test_the_branch_is_the_t_half_run(env, ref_run):
-    """The T/2 branch of the reference run (its full state at 40 % = step 8) against a run with max_steps 10: the same
-    LR curve, data order and weights at its end; one complete final eval; the branch record in summary.json and its
-    own started_utc."""
-    m = load_script("04_distill")
-    assert m.main(["--config", write_config(env, "ctc-half", merged(REF_OVER, {"schedule": {"max_steps": 10}}))]) == 0
-    half = one_run(env["root"], "ctc-half")
-    path = env["root"] / "ctc-branch.json"
-    path.write_text(json.dumps(merged(env["base"], dict(REF_OVER, run_name="ctc-ref",
-                                                        branch={"parent": str(ref_run)})), indent=1), encoding="utf-8")
-    assert m.main(["--config", str(path)]) == 0
-    branch = one_run(env["root"], "ctc-ref-half")
-    s = summary_of(branch)
-    assert s["branch"] == dict(parent_run_id=ref_run.name, resume_step=8, end_step=10, t_c=8.0)
-    assert s["family"] == "ctc" and s["started_utc"] != summary_of(ref_run)["started_utc"]
-    assert [(e["at_step"], e["complete"], e["final"]) for e in events(branch, "eval")] == [(10, True, True)]
-    got = pd.concat([steps_of(ref_run).query("step <= 8"), steps_of(branch)])
-    np.testing.assert_array_equal(got["opt/lr"].to_numpy(), steps_of(half)["opt/lr"].to_numpy())
-    ub, uh = utts_of(branch), utts_of(half)
-    for step in (9, 10):
-        x, y = ub[ub["step"] == step].sort_values("id"), uh[uh["step"] == step].sort_values("id")
-        assert len(x) and x["id"].tolist() == y["id"].tolist() and x["masked_frac"].tolist() == y["masked_frac"].tolist()
-    wa = torch.load(branch / "checkpoints" / "full_step_10" / "model.pt", weights_only=True)
-    wh = torch.load(half / "checkpoints" / "full_step_10" / "model.pt", weights_only=True)
-    for k in wa:
-        torch.testing.assert_close(wa[k], wh[k], rtol=1e-5, atol=1e-6, msg=k)
-
-
-def test_lr_probe_ctc(env):
-    """An LR probe of a CTC student: metrics only, and at the end the CTC objective w_kl x KL + w_ctc x CTC per target
-    token, teacher-forced on the complete gate sets, pooled and per set - the same numbers kitsune.ctc_eval gives for
-    the probe's final weights."""
-    from kitsune import ctc_eval as ce
-    from kitsune import ctc_student as CS
-
-    m = load_script("04_distill")
-    over = {"lr_probe": {"enabled": True}, "schedule": {"max_steps": 6, "warmup_steps": 2},
-            "eval": {"every_steps": 2, "mini": {"every_steps": 3}}, "ckpt": {"weights_every_steps": 2}}
-    assert m.main(["--config", write_config(env, "ctc-probe", over)]) == 0
-    run = one_run(env["root"], "ctc-probe")
-    kinds = [e["kind"] for e in events(run)]
-    assert "eval_mini" not in kinds and "eval" not in kinds and kinds.count("eval_start") == 1
-    assert not list((run / "checkpoints").glob("step_*"))
-    res = next(e for e in events(run) if e["kind"] == "lr_probe_result")
-    s = summary_of(run)
-    assert s["lr_probe"]["family"] == "ctc" == res["family"] and s["lr_probe"]["w_ctc"] == 0.8
-    assert res["objective"] == pytest.approx(s["lr_probe"]["kl"] + 0.8 * s["lr_probe"]["ctc"])
-    model = CS.load_ctc_student(env["student"], "cpu")
-    model.load_state_dict(torch.load(run / "checkpoints" / "full_step_6" / "model.pt", weights_only=True))
-    store = m.build_eval_store(cfg_of(env), Log(), frames=True)
-    tf, _, _, _ = ce.ctc_eval(model, store, CS.ctc_features(env["student"]).logmel, "cpu", 20.0, amp=False,
-                              decode=False)
-    assert res["objective"] == pytest.approx(ce.combined_loss_ctc(tf, 1.0, 0.8)["value"], rel=1e-6)
-    for x in EVAL:
-        d = tf["sets"][x]
-        assert res["per_set"][x] == pytest.approx(d["kl"] + 0.8 * d["ctc"], rel=1e-6)
 
 
 def test_the_padded_row_gate_fails_the_ctc_smoke(env):

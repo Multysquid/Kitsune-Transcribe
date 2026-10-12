@@ -400,10 +400,11 @@ def test_log_step_lean_rows_and_the_reserved_peak(tmp_path, monkeypatch):
         R.device = SimpleNamespace(type="cuda")
         R.log = SimpleNamespace(step_row=lambda row, step: rows.__setitem__(step, dict(row)),
                                 train_utts=lambda u: None, scalars=lambda *a: None)
-        R.planner, R.l2sp, R.src_index = SimpleNamespace(epoch_stats={0: {"steps": 100}}), None, {"src_a": 0}
+        R.planner, R.src_index = SimpleNamespace(epoch_stats={0: {"steps": 100}}), {"src_a": 0}
+        R.l2sp = SimpleNamespace(value=lambda: 0.1)  # the decoupled L2-SP value loss/l2sp logs
         return R
 
-    out = dict(n_tok=10, tot=np.arange(1.0, len(m.TERMS) + 1), l2sp=0.1, audio_real=5.0, audio_pad=6.0, dec_real=8.0,
+    out = dict(n_tok=10, tot=np.arange(1.0, len(m.TERMS) + 1), audio_real=5.0, audio_pad=6.0, dec_real=8.0,
                dec_pad=10.0, grad_norm=1.0, clip_coef=1.0, masked_frac=0.1, n_utts=2, dropped=0, n_micro=1,
                by_src=np.ones((1, 3)), n_src=np.array([10]), by_bucket=np.ones((2, 3)), n_bucket=np.array([4, 2]),
                utts=[])

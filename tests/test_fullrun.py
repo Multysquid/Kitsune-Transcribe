@@ -36,7 +36,6 @@ def test_constants_exact_values():
     assert (fr.TIMED_POINTER, fr.SCRATCH_MARK, fr.TIMED_REASON, fr.POINTER_FORMAT) == (
         "timed_state.json", ".scratch_pending", "timed", 1)
     assert fr.STATE_FILES_REQUIRED == ("model.pt", "optimizer.pt", "l2sp.pt", "trainer.pt", "trainer.json")
-    assert fr.STATE_FILES_OPTIONAL == ("aux_ctc.pt",)
     assert fr.FROZEN_MANIFEST == "labels/full/selections/study_manifest.json"
     assert fr.FROZEN_MANIFEST_SHA256 == "ef56dec2b69bfe54f96a5ad1df36bde38255b68799873ab5f12346da78ac3796"
     assert fr.FULL_DIR == "labels/full/selections/full_study"
@@ -534,7 +533,6 @@ def test_pointer_problems_accepts_a_good_pointer():
     assert fr.pointer_problems(_pointer()) == []
     p = _pointer(kitsune_sha=None, selection_sha256=None, epoch=1, host={"hostname": "h", "machine_id": None,
                                                                           "container_id": None})
-    p["files"]["aux_ctc.pt"] = {"size": 0, "sha256": "a" * 64}
     assert fr.pointer_problems(p) == []
     assert fr.pointer_problems(json.loads(json.dumps(_pointer()))) == []  # survives the JSON round trip
 
@@ -545,6 +543,7 @@ def test_pointer_problems_accepts_a_good_pointer():
     (lambda p: p["files"].pop("trainer.json"), "lacks"),
     (lambda p: p["files"].pop("model.pt"), "lacks"),
     (lambda p: p["files"].update({"events.jsonl": {"size": 1, "sha256": "0" * 64}}), "not state files"),
+    (lambda p: p["files"].update({"aux_ctc.pt": {"size": 1, "sha256": "0" * 64}}), "not state files"),  # retired
     (lambda p: p["files"]["model.pt"].update(sha256="xyz"), "64 hex"),
     (lambda p: p["files"]["model.pt"].update(sha256="A" * 64), "64 hex"),
     (lambda p: p["files"]["model.pt"].update(size=-1), "size"),

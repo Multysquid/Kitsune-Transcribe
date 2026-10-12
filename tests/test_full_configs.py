@@ -90,6 +90,12 @@ def cfg(name: str) -> dict:
     return json.loads((FULL / f"{name}.json").read_text(encoding="utf-8"))
 
 
+def live(trainer, recipe: dict) -> dict:
+    """A recipe's keys the trainer still has: a retired one at its off value (mix_p 0.0, background_min_row_s 0.0:
+    04_distill RETIRED_KEYS) the trainer drops when it loads the config."""
+    return {k: v for k, v in recipe.items() if f"augment.{k}" not in trainer.RETIRED_KEYS}
+
+
 @pytest.fixture(scope="module")
 def plan():
     return M.load_plan()
@@ -305,8 +311,9 @@ def test_write_all_keeps_the_hand_written_files(tmp_path):
 
 
 def test_every_config_loads_with_the_trainer(trainer, reg):
-    """Each generated config passes 04_distill.load_config (DEFAULTS merge: no unknown key; validate incl.
-    validate_full, validate_state and validate_box), and so does smoke-b's store config with the item's sets."""
+    """Each generated config passes 04_distill.load_config (DEFAULTS merge: no unknown key, a retired one only at its
+    off value, RETIRED_KEYS; validate incl. validate_full, validate_state and the selection recipes), and so does
+    smoke-b's store config with the item's sets."""
     for n in GENERATED:
         c = trainer.load_config(str(FULL / f"{n}.json"), [])
         if not n.startswith("data-"):
@@ -317,7 +324,7 @@ def test_every_config_loads_with_the_trainer(trainer, reg):
         want = {"full-p03": M.RECIPE, "full-t06": M.RECIPE_AED_H15, "full-p005": M.RECIPE_V4}.get(n)
         assert trainer.augment_on(c) == (want is not None), n
         if want is not None:
-            assert c["augment"] == dict(trainer.DEFAULTS["augment"], **want)
+            assert c["augment"] == dict(trainer.DEFAULTS["augment"], **live(trainer, want))
     st = items(reg, "smoke-b")["stores-eval"]
     trainer.load_config(str(ROOT / st["config"]), st["sets"])
     with pytest.raises(SystemExit, match="max_steps"):  # the generated study config leaves them null: the sets fill
@@ -977,7 +984,8 @@ def test_box_p005_is_the_p_test_box(reg, trainer):
     import hashlib
     p_box_items(reg, "p005", "p005", RUN_H["p005"]["full-p005"])
     c = trainer.load_config(str(FULL / "full-p005.json"), [])
-    assert c["schedule"]["epochs"] == 10 and c["augment"] == dict(trainer.DEFAULTS["augment"], **M.RECIPE_V4)
+    assert c["schedule"]["epochs"] == 10 and c["augment"] == dict(trainer.DEFAULTS["augment"],
+                                                                   **live(trainer, M.RECIPE_V4))
     assert c["early_stop"]["patience"] == M.COMMON["early_stop"]["patience"] == 6
     assert fullrun.box_extra_dirs("p005", reg) == [M.NOISE_BANK, M.RIR_BANK] and M.HOURS_BOXES["p005"] == ("p005",)
     raw = (FULL / "full-p005.json").read_bytes().replace(b"\r\n", b"\n")
@@ -1037,19 +1045,23 @@ COOL = {"p03-cool": ("full-p", "p03", P03_RID, 169376, 211720, 0, 6, False, "REC
 def test_the_cooldown_recipes(trainer):
     """RECIPE_V4_FULL = recipe v4 with the trainer's defaults of the acoustic ranges and the short-row guard written
     out (so a continuation inherits none from the state it resumes); RECIPE_GENTLE = recipe v4 at milder ranges, no
-    GSM, and no background under rows shorter than 3 s (DECISIONS H14). Both validate on a CTC student."""
+    GSM, and no background under rows shorter than 3 s (DECISIONS H14). RECIPE_V4_FULL validates on a CTC student;
+    RECIPE_GENTLE no longer does: its short-row guard is retired (04_distill RETIRED_KEYS)."""
     d = trainer.DEFAULTS["augment"]
     ranges = ("noise_snr_db", "speech_snr_db", "gain_db", "codecs", "background_min_row_s")
-    assert M.RECIPE_V4_FULL == dict(M.RECIPE_V4, **{k: d[k] for k in ranges})
+    assert M.RECIPE_V4_FULL == dict(M.RECIPE_V4, **{k: d.get(k, 0.0) for k in ranges})
     assert {k: M.RECIPE_V4_FULL[k] for k in ranges} == {
         "noise_snr_db": [0.0, 20.0], "speech_snr_db": [10.0, 25.0], "gain_db": [-20.0, 10.0],
         "codecs": ["mp3", "gsm", "ulaw8k"], "background_min_row_s": 0.0}
     assert M.RECIPE_GENTLE == dict(M.RECIPE_V4, noise_snr_db=[5.0, 20.0], speech_snr_db=[15.0, 25.0],
                                    gain_db=[-10.0, 10.0], codecs=["mp3", "ulaw8k"], background_min_row_s=3.0)
     assert list(M.RECIPE_V4_FULL)[:len(M.RECIPE_V4)] == list(M.RECIPE_V4)  # recipe v4's keys first, in its order
-    for recipe in (M.RECIPE_V4_FULL, M.RECIPE_GENTLE):
-        c = trainer.load_config(str(FULL / "full-p01.json"), [f"augment.{k}={json.dumps(v)}" for k, v in recipe.items()])
-        assert c["augment"] == dict(d, **recipe)
+    c = trainer.load_config(str(FULL / "full-p01.json"),
+                            [f"augment.{k}={json.dumps(v)}" for k, v in M.RECIPE_V4_FULL.items()])
+    assert c["augment"] == dict(d, **live(trainer, M.RECIPE_V4_FULL))
+    with pytest.raises(SystemExit, match="augment.background_min_row_s 3.0: a retired mode"):
+        trainer.load_config(str(FULL / "full-p01.json"),
+                            [f"augment.{k}={json.dumps(v)}" for k, v in M.RECIPE_GENTLE.items()])
 
 
 def test_box_p_cool_runs_the_cooldown_reruns(reg, plan, trainer, capsys):
@@ -1058,7 +1070,8 @@ def test_box_p_cool_runs_the_cooldown_reruns(reg, plan, trainer, capsys):
     Each train item's continues block is continues_block's (the source box with the same-name, same-config item, the
     run id, the steps, the resets before, the sets), its max_hours box_hours', and its sets - as the queue passes them
     (fullrun.continue_sets, after schedule.resume_reset=true) - are ones the trainer takes on a resume of the run's
-    config, changing only augment.* and the schedule keys."""
+    config, changing only augment.* and the schedule keys; RECIPE_GENTLE's no longer: its short-row guard is retired
+    (04_distill RETIRED_KEYS)."""
     it = items(reg, "p-cool")
     assert list(it) == ["stores-ctc", *[n for x in ("p03", "p01", "p005") for n in (
         f"full-{x}", f"m4-full-{x}", *(f"quant-{f}-full-{x}" for f in QUANT_FORMATS))]]
@@ -1092,6 +1105,10 @@ def test_box_p_cool_runs_the_cooldown_reruns(reg, plan, trainer, capsys):
         # and the config validates with them (the augmentation on a CTC student)
         saved = trainer.load_config(str(FULL / f"full-{x}.json"), [])
         words = ["schedule.resume_reset=true", *COOL_SETS[name]]
+        if c["augment"].get("background_min_row_s"):  # RECIPE_GENTLE: its short-row guard is retired (RETIRED_KEYS)
+            with pytest.raises(SystemExit, match="augment.background_min_row_s 3.0: a retired mode"):
+                trainer.load_config(str(FULL / f"full-{x}.json"), words)
+            continue
         changed, same = trainer.resume_overrides(saved, [trainer.apply_set(copy.deepcopy(saved), w) for w in words])
         assert changed and all(k.startswith(("augment.", "schedule.")) for k in changed), (name, changed)
         assert {"schedule.resume_reset": True, "schedule.deadline_cooldown": False} == {
@@ -1099,19 +1116,12 @@ def test_box_p_cool_runs_the_cooldown_reruns(reg, plan, trainer, capsys):
         assert ("schedule.resume_reset_keep_cooldown" in changed) is keep
         assert same.get("schedule.epochs") == epochs  # the run's own epochs: the plan's T is the run's
         got = trainer.load_config(str(FULL / f"full-{x}.json"), words)
-        assert got["augment"] == dict(trainer.DEFAULTS["augment"], **c["augment"]) and trainer.augment_on(got)
+        assert got["augment"] == dict(trainer.DEFAULTS["augment"], **live(trainer, c["augment"]))
+        assert trainer.augment_on(got)
         assert got["schedule"]["deadline_cooldown"] is False and got["schedule"]["epochs"] == epochs
         assert got["schedule"]["resume_reset_keep_cooldown"] is keep
-    # P-0.3B's changes: its config's recipe v2 stays, recipe v4's other keys and the gentle ranges come in
-    saved = trainer.load_config(str(FULL / "full-p03.json"), [])
-    words = ["schedule.resume_reset=true", *COOL_SETS["p03-cool"]]
-    changed, same = trainer.resume_overrides(saved, [trainer.apply_set(copy.deepcopy(saved), w) for w in words])
-    assert {k for k in same if k.startswith("augment.")} == {"augment.enabled", "augment.truncate_p",
-                                                             "augment.concat_p", "augment.mix_p",
-                                                             "augment.truncate_min_row_s"}  # recipe v2's, the run's own
-    assert changed["augment.codecs"] == ["mp3", "ulaw8k"] and changed["augment.background_min_row_s"] == 3.0
-    # P-0.1B's: box 1's config has no augment block, so every recipe key but mix_p (0.0, the default) and the ranges
-    # at their defaults are repeats
+    # P-0.1B's: box 1's config has no augment block, so every recipe key but mix_p (0.0, retired at that value) and
+    # the ranges at their defaults are repeats
     saved = trainer.load_config(str(FULL / "full-p01.json"), [])
     words = ["schedule.resume_reset=true", *COOL_SETS["p01-cool"]]
     changed, same = trainer.resume_overrides(saved, [trainer.apply_set(copy.deepcopy(saved), w) for w in words])
@@ -1292,7 +1302,7 @@ def test_box_t_is_decisions_h15(reg, plan, trainer):
     assert not trainer.is_ctc(t) and trainer.augment_on(t)
     assert (t["augment"]["guard_per_piece"], t["augment"]["end_trim_voiced"], t["augment"]["cut_keep_word"]) == (
         True, True, False)
-    assert t["augment"] == dict(trainer.DEFAULTS["augment"], **M.RECIPE_AED_H15)
+    assert t["augment"] == dict(trainer.DEFAULTS["augment"], **live(trainer, M.RECIPE_AED_H15))
     # the plan: 6 epochs on full.parquet, each epoch as long as H7's 8-epoch plan's (the seeded planner), the WSD
     # cooldown from ceil(0.8 T) + 1
     s = plan["launch"]["students"]["t06"]

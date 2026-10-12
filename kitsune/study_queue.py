@@ -96,7 +96,6 @@ import os
 import re
 import shutil
 import signal
-import statistics
 import subprocess
 import sys
 import time
@@ -144,9 +143,6 @@ ORPHAN_CMDS = ("04_distill", "05_evaluate", "kitsune.full_queue build-stores", "
 STAMP_RE = r"-\d{8}T\d{6}Z(?:-\d+)?"
 DIVERGED = ("FloatingPointError",)  # a probe whose trainer stopped on non-finite gradients: its objective is non-finite
 DETERMINISTIC = ("SmokeFailed",)  # a trainer's smoke checks: a second try from the same start fails the same way
-# the calibration barrier (scripts/04_distill.py, calibrate.barrier): a trainer writes READY in its run dir before its
-# first step and waits for GO (or STOP), which the queue writes into every run dir of the group at once
-READY_FILE, GO_FILE = "READY", "GO"
 # /dev/shm (loader_sets): scripts/04_distill.py shm_cap keeps up to num_workers x prefetch micro-batches of up to
 # micro_audio_s of padded float32 16 kHz audio (+25 % for the rest) within half the free space it sees at its start.
 # The queue starts up to one trainer per GPU at the same moment, so each would budget the same free space: the queue
@@ -204,20 +200,11 @@ def _merge_line(rows: dict, line: str):
         row["wall"] = r.get("wall")
 
 
-def read_step_rows(run_dir) -> dict[int, dict]:
-    """step -> {train_s (the loop clock when the step was logged), data_wait_s, step_s, wall} from a run's
-    metrics/scalars.jsonl (flushed at every step; a later line of the same step, a resumed launch's, wins)."""
-    rows: dict[int, dict] = {}
-    p = Path(run_dir) / "metrics" / "scalars.jsonl"
-    if p.is_file():
-        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
-            _merge_line(rows, line)
-    return rows
-
-
 class StepTail:
-    """read_step_rows, incrementally: each poll() reads only what was appended since (the calibration monitor polls
-    every run of a group every few seconds, and a small run's file grows by ~7 KB a step)."""
+    """step -> {train_s (the loop clock when the step was logged), data_wait_s, step_s, wall} from a run's
+    metrics/scalars.jsonl (flushed at every step; a later line of the same step, a resumed launch's, wins), read
+    incrementally: each poll() reads only what was appended since (a monitor polls every running run every few
+    seconds, and a small run's file grows by ~7 KB a step)."""
 
     def __init__(self, run_dir):
         self.run_dir = Path(run_dir)
@@ -237,28 +224,6 @@ class StepTail:
         for line in lines:
             _merge_line(self.rows, line.decode("utf-8", "replace"))
         return self.rows
-
-
-def calibration_stats(rows: dict[int, dict], a: int, b: int) -> dict:
-    """The step-time table of steps (a, b] (prereg: the median step time over the window, logging included): each
-    step's time is the difference of its loop clock and the previous step's (both logged), so it holds the data wait,
-    the forward and backward, the optimizer, the step's logging and anything else between the two; data_wait_frac is
-    the loader's share of the summed time. Steps without their predecessor (a skipped step) are left out."""
-    dts, waits, done = [], [], []
-    for s in range(int(a) + 1, int(b) + 1):
-        cur, prev = rows.get(s), rows.get(s - 1)
-        if not cur or not prev or cur.get("train_s") is None or prev.get("train_s") is None:
-            continue
-        dt = float(cur["train_s"]) - float(prev["train_s"])
-        if not (math.isfinite(dt) and dt > 0):
-            continue
-        dts.append(dt)
-        waits.append(float(cur.get("data_wait_s") or 0.0))
-        done.append(s)
-    if not dts:
-        return dict(t_step_s=None, data_wait_frac=None, steps_measured=0, window=[int(a), int(b)], mean_step_s=None)
-    return dict(t_step_s=round(statistics.median(dts), 6), data_wait_frac=round(sum(waits) / sum(dts), 6),
-                steps_measured=len(dts), window=[int(a), max(done)], mean_step_s=round(sum(dts) / len(dts), 6))
 
 
 def window_end(rows: dict[int, dict], a: int, n: int) -> int | None:

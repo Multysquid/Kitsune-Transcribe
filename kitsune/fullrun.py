@@ -166,7 +166,6 @@ ALERTS_FILE, GATE_FILE, SUMMARY_FILE, DEADLINE_FILE = ("watchdog_alerts.jsonl", 
 # runs-repo UPLOAD_MARK (.upload_pending), which finish.py would treat as a state the runs repo must hold
 TIMED_POINTER, SCRATCH_MARK, TIMED_REASON, POINTER_FORMAT = "timed_state.json", ".scratch_pending", "timed", 1
 STATE_FILES_REQUIRED = ("model.pt", "optimizer.pt", "l2sp.pt", "trainer.pt", "trainer.json")
-STATE_FILES_OPTIONAL = ("aux_ctc.pt",)
 _UPLOAD_MARK = ".upload_pending"  # scripts/04_distill.py UPLOAD_MARK (it imports torch, so it is not imported here)
 
 # the frozen study eval manifest (data repo @ 4b0d801): every full readout scores it (--manifest), and the full and
@@ -585,9 +584,9 @@ _HEX64 = r"[0-9a-f]{64}"
 
 def pointer_problems(ptr: dict) -> list[str]:
     """Why a timed-state pointer (runs/<run_id>/timed_state.json, format 1) is not well formed: every key present with
-    its type, name == full_step_<step>, files = every STATE_FILES_REQUIRED entry plus only STATE_FILES_OPTIONAL ones
-    (never a marker file), each {size: int >= 0, sha256: 64 lowercase hex}, host {hostname, machine_id, container_id}.
-    Empty: resume-pull may trust it (and still checks the files against it)."""
+    its type, name == full_step_<step>, files = exactly the STATE_FILES_REQUIRED entries (never a marker file), each
+    {size: int >= 0, sha256: 64 lowercase hex}, host {hostname, machine_id, container_id}. Empty: resume-pull may trust
+    it (and still checks the files against it)."""
     if not isinstance(ptr, dict):
         return [f"pointer {ptr!r} is not an object"]
     p = []
@@ -611,7 +610,7 @@ def pointer_problems(ptr: dict) -> list[str]:
             p.append(f"pointer: files lists the marker file(s) {markers}")
         if missing := [f for f in STATE_FILES_REQUIRED if f not in files]:
             p.append(f"pointer: files lacks {missing}")
-        allowed = (*STATE_FILES_REQUIRED, *STATE_FILES_OPTIONAL, SCRATCH_MARK, _UPLOAD_MARK)
+        allowed = (*STATE_FILES_REQUIRED, SCRATCH_MARK, _UPLOAD_MARK)
         if extra := [f for f in files if f not in allowed]:
             p.append(f"pointer: files lists {extra}, not state files")
         for f, meta in files.items():

@@ -167,11 +167,11 @@ class Log:
         return [e["kind"] for e in self.events]
 
 
-def state_dir(root: Path, step: int, *, aux: bool = False, extra: dict | None = None) -> Path:
-    """A local full_step_<step>/ with every required state file (distinct bytes per step), optionally aux_ctc.pt."""
+def state_dir(root: Path, step: int, *, extra: dict | None = None) -> Path:
+    """A local full_step_<step>/ with every required state file (distinct bytes per step) and the extra files given."""
     d = root / "checkpoints" / f"full_step_{step}"
     d.mkdir(parents=True, exist_ok=True)
-    for i, f in enumerate(fullrun.STATE_FILES_REQUIRED + (fullrun.STATE_FILES_OPTIONAL if aux else ())):
+    for i, f in enumerate(fullrun.STATE_FILES_REQUIRED):
         (d / f).write_bytes(f"{f} of step {step} ".encode() * (i + 3))
     for f, b in (extra or {}).items():
         (d / f).write_bytes(b)
@@ -218,11 +218,11 @@ def test_host_info_and_code_sha(monkeypatch):
 
 
 def test_make_pointer_lists_the_state_files_and_nothing_else(tmp_path):
-    d = state_dir(tmp_path, 7, aux=True, extra={fullrun.SCRATCH_MARK: b"", ".upload_pending": b"",
-                                                 "trainer.pt.tmp": b"a half-written rewrite"})
+    d = state_dir(tmp_path, 7, extra={fullrun.SCRATCH_MARK: b"", ".upload_pending": b"",
+                                      "trainer.pt.tmp": b"a half-written rewrite"})
     ptr = scratch.make_pointer(RUN, d, **meta(7))
     assert fullrun.pointer_problems(ptr) == []
-    assert sorted(ptr["files"]) == sorted(fullrun.STATE_FILES_REQUIRED + ("aux_ctc.pt",))
+    assert sorted(ptr["files"]) == sorted(fullrun.STATE_FILES_REQUIRED)
     for f, m in ptr["files"].items():
         assert m == dict(size=(d / f).stat().st_size, sha256=hashlib.sha256((d / f).read_bytes()).hexdigest())
     assert (ptr["format"], ptr["run_id"], ptr["name"], ptr["step"], ptr["epoch"]) == (1, RUN, "full_step_7", 7, 0.7)
@@ -232,7 +232,7 @@ def test_make_pointer_lists_the_state_files_and_nothing_else(tmp_path):
     json.dumps(ptr)  # it goes up as JSON
 
     ptr = scratch.make_pointer(RUN, state_dir(tmp_path, 8), **meta(8, selection_sha256=None, kitsune_sha=None))
-    assert "aux_ctc.pt" not in ptr["files"] and fullrun.pointer_problems(ptr) == []
+    assert fullrun.pointer_problems(ptr) == []
     with pytest.raises(ValueError, match="full_step_9"):  # the dir must be the step's
         scratch.make_pointer(RUN, d, **meta(9))
     (d / "trainer.json").unlink()

@@ -2,14 +2,13 @@
 
 - the config keys and their validation (eval.dev, early_stop.smooth / allow_test_sets and the dev metrics,
   schedule.resume_reset / deadline_*, memory.probe_extended / probe_shapes, the epoch clock without max_steps,
-  selection_recipe.full_study in validate_box) and the two new RESUME_FIXED keys
+  selection_recipe.full_study in validate) and the two new RESUME_FIXED keys
 - the dev slice: the seeded dev pick (kitsune.fullrun.dev_pick over the selection's split "dev" rows), its store,
   runs/<run_id>/dev_ids.json, the `dev_store` event and the guard against other dev rows on a resume
 - the dev evals: they change no training number; a dev_ce early stop on the steps and the epoch clocks (the dev
   cadence apart from the full evals), and on a CTC student
 - early_stop.smooth (nothing counted before k values; min_evals and patience count smoothed checks)
-- the COOLDOWN file, acting once or ignored inside a cooldown, through the module-level stop_requested (the study box's
-  wrapper) and _stop_requested_trainer
+- the COOLDOWN file, acting once or ignored inside a cooldown, through stop_requested
 - the resume reset flag: one-shot, epochs extension, the refusals, a repeat before the first save, the runs repo's
   COOLDOWN copy deleted (or, when that fails, ignored); a resume that switches to the epoch clock needs no flag
 - 4c's extra memory-probe passes and synthetic shapes; 4d's deadline cooldown (schedule / start / compress / clear,
@@ -239,8 +238,6 @@ def test_the_new_keys_default_to_the_trainer_before_them_and_are_validated():
                 ["early_stop.allow_test_sets=false", "early_stop.metric=heldout_kl", "early_stop.enabled=false"],
                 ["early_stop.enabled=true", "early_stop.metric=dev_ce"],  # no eval.dev
                 ["early_stop.metric=dev_loss"],
-                ["eval.dev.every_steps=5", "lr_probe.enabled=true", "schedule.clock=steps", "schedule.max_steps=50",
-                 "schedule.warmup_steps=2"],
                 ["schedule.clock=epochs", "schedule.epochs=3", "schedule.max_steps=34620"],
                 ["schedule.deadline_cooldown=true"],  # the wall clock
                 ["schedule.deadline_cooldown=1"], ["schedule.deadline_check_steps=0"],
@@ -454,10 +451,6 @@ def test_setup_data_opens_the_dev_store_and_guards_its_rows(env, tmp_path):
     m.setup_data(R)
     data = next(e for e in evs if e["kind"] == "data")
     assert data["stores_reused"] == {"train": True, "eval": True, "dev": True}
-    # a state from before the store keys takes them from this store
-    R.st["dev"] = dict(ids_sha256=rec["ids_sha256"], n_ids=8, per_source=4)
-    m.setup_data(R)
-    assert R.st["dev"]["n"] == 8 and R.st["dev"]["store_ids_sha256"] == m._ids_sha256(ids)
     # the same pick, but the store holds other rows (a shard missing on a new host dropped some): a SystemExit
     R.st["dev"] = dict(R.st["dev"], n=7, store_ids_sha256=m._ids_sha256(ids[1:]))
     with pytest.raises(SystemExit, match="holds 8 rows .* scored 7"):
@@ -662,20 +655,18 @@ def test_the_cooldown_file(env, monkeypatch):
 def test_the_cooldown_file_inside_a_cooldown_changes_nothing(tmp_path):
     """Inside the scheduled cooldown, or after a dev trigger's early cooldown, COOLDOWN is only recorded (one
     `cooldown_file` event, ignored) and never goes through early_stop_trigger, so stopped_early keeps the dev
-    trigger. Checked through the module-level stop_requested (the study box's wrapper) and _stop_requested_trainer;
-    without the file nothing is logged."""
+    trigger. Checked through stop_requested; without the file nothing is logged."""
     m = load_script("04_distill")
     sets = ["schedule.clock=steps", "schedule.max_steps=20", "schedule.cooldown_frac=0.3", "schedule.warmup_steps=2"]
-    for name, fn in (("wrapper", m.stop_requested), ("trainer", m._stop_requested_trainer)):
-        run = tmp_path / name
-        run.mkdir()
-        R, evs, _ = _unit_run(m, run, sets)
-        R.st["step"] = 15  # >= t_c 14 of 20
-        assert fn(R) is False and not evs
-        (run / "COOLDOWN").touch()
-        assert fn(R) is False and fn(R) is False
-        assert evs == [dict(kind="cooldown_file", at_step=15, ignored="cooldown under way", epoch=0.0)]
-        assert R.st["early_stop"]["triggered"] is None and R.progress() == (15.0, 20.0)
+    run = tmp_path / "scheduled"
+    run.mkdir()
+    R, evs, _ = _unit_run(m, run, sets)
+    R.st["step"] = 15  # >= t_c 14 of 20
+    assert m.stop_requested(R) is False and not evs
+    (run / "COOLDOWN").touch()
+    assert m.stop_requested(R) is False and m.stop_requested(R) is False
+    assert evs == [dict(kind="cooldown_file", at_step=15, ignored="cooldown under way", epoch=0.0)]
+    assert R.st["early_stop"]["triggered"] is None and R.progress() == (15.0, 20.0)
 
     run = tmp_path / "after-dev"
     run.mkdir()
@@ -920,10 +911,7 @@ def test_resume_reset_refusals_on_their_own(tmp_path):
     m = load_script("04_distill")
     R, evs, _ = _unit_run(m, tmp_path, ["schedule.clock=steps", "schedule.max_steps=10", "schedule.warmup_steps=2",
                                         "schedule.resume_reset=true"])
-    R.st.update(step=12, branch=dict(t_c=5.0, end_step=10))
-    with pytest.raises(SystemExit, match="T/2 branch"):
-        m.resume_reset_start(R)
-    R.st["branch"] = None
+    R.st.update(step=12)
     before = m.resume_reset_start(R)
     assert R.cfg["schedule"]["resume_reset"] is False and R.st["resume_resets"] == 1
     with pytest.raises(SystemExit, match="not after the state's 12"):  # max_steps 10 <= step 12
@@ -1264,7 +1252,7 @@ def test_the_extended_memory_probe(monkeypatch):
             return orig(R, mb)
 
         monkeypatch.setattr(m, "fwd_bwd", fwd)
-        R = SimpleNamespace(device=torch.device("cpu"), ds=_Rows(), params=[], aux_ctc=None, cfg=cfg)
+        R = SimpleNamespace(device=torch.device("cpu"), ds=_Rows(), params=[], cfg=cfg)
         rec = dict(peak_gb={})
         m.probe_passes(R, planner, rec)
         monkeypatch.setattr(m, "fwd_bwd", orig)

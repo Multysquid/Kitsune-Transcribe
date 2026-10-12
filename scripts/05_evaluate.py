@@ -17,8 +17,7 @@ headline numbers and combined loss, and the verdict. This script runs that eval 
            in ONE pooled pass of duration-sorted batches of eval.batch_s padded seconds (trainset.eval_batches), the
            very batches of the trainer's final eval when they are the config's eval_sets
   summary  04_distill.eval_summary (headline, headline_scope, combined_loss val_full), eval_history_record and
-           gate_verdict over kitsune.evaluate.verdict with the config's verdict_options (eval.verdict_version) and
-           reference model (eval.reference; its file is read before the eval, relative to this repo)
+           kitsune.evaluate.verdict with the config's verdict_options (eval.verdict_version)
 On the same hardware, weights and settings the per-utterance results and summary.json are the trainer's to the bit
 (tests/test_evaluate_script.py, on CPU; on CUDA only since the per-utterance sums use no atomics, kitsune.ctc_kd's
 _per_row, and for the same batches: a sum depends on its batch's padded width). A real run's numbers are close to its
@@ -33,7 +32,7 @@ Output (--out; the layout of runs/<run_id>/evals/step_<N>/):
                   mode), combined_loss; step / train_s / epoch from the checkpoint's student_meta.json "trained" block,
                   final = the checkpoint is the run's end one. It covers every set in --out
   verdict.json    when the three gate sets are in --out and so is the train probe, if the config has one (eval.probe:
-                  pass --probe): gate_verdict of kitsune.evaluate.verdict, the trends read from the run's history
+                  pass --probe): kitsune.evaluate.verdict, the trends read from the run's history
                   before this step (--history: default the summary.json of the run the checkpoint sits in) and this
                   eval. The trainer's record of this eval holds the probe's KL, which the probe-KL and gap trends read,
                   so without the probe the verdict would not be the trainer's: none is written (a verdict_skipped
@@ -64,10 +63,10 @@ GPU safety (the laptop GPU is unstable under long loads): before every batch the
 if importable, else nvidia-smi at most every NVSMI_EVERY_S); at --max-temp or above the eval waits, polling every
 --poll-s, until it is down to --resume-temp (a thermal_pause and a thermal_resume event each; --max-temp 0: no guard).
 No readable temperature on CUDA stops the eval before it starts, and BLIND_READS failed reads in a row stop it later,
-paused or not (the finished chunks are kept). The CUDA caching allocator is capped as the trainer caps it
-(04_distill.cap_vram): on Windows at the free VRAM less a margin, since the driver would otherwise serve a batch that
-does not fit from shared system memory, several times slower, instead of failing it; --vram-frac also caps it at that
-fraction of the card, on any OS. An out-of-memory error stops with a pointer to --batch-s (a smaller one needs a new
+paused or not (the finished chunks are kept). The CUDA caching allocator is capped (04_distill.cap_vram): on Windows
+at the free VRAM less a margin, since the driver would otherwise serve a batch that does not fit from shared system
+memory, several times slower, instead of failing it; --vram-frac also caps it at that fraction of the card, on any
+OS. An out-of-memory error stops with a pointer to --batch-s (a smaller one needs a new
 --out; its batches are no longer the trainer's).
 
 The M4 readouts on the frozen eval manifest (every full run's readout items, the quantised readouts and smoke-b;
@@ -613,7 +612,6 @@ class Ctx:
     guard: ThermalGuard | None = None
     passes: list = field(default_factory=list)
     probe_empty: bool = False  # --probe found no probe rows: the trainer has no probe numbers either
-    reference: dict | None = None  # eval.reference's per-set CER (04_distill.reference_model), for the verdict
     family: str = "aed"
     teacher_rows: dict | None = None  # ctc: id -> Parakeet's stored CTC row (the teacher of the greedy tables)
     targets: dict | None = None  # ctc: id -> the stored Parakeet frame targets (kitsune.ctc_targets.FrameTargets)
@@ -1571,7 +1569,7 @@ def write_summary(ctx: Ctx, step: int, trained: dict, ckpt: Path) -> dict | None
     opts = dict(D.verdict_options(cfg))
     if ctx.family != "aed":  # the ratios to the family's own teacher (Parakeet's CTC path)
         opts.setdefault("family", ctx.family)
-    verdict = D.gate_verdict(cfg, ev.verdict(D.verdict_results(full_sum, history, ctx.reference), **opts))
+    verdict = ev.verdict(D.verdict_results(full_sum, history), **opts)
     _write_output_json(out / "verdict.json", verdict)
     ctx.log.event("verdict", verdict=verdict.get("verdict"), reasons=verdict.get("reasons"), history=src,
                   history_steps=[int(r["step"]) for r in history])
@@ -2019,9 +2017,6 @@ def main(argv=None) -> int:
                 log.event("teacher_baselines", sets=base)
             except FileNotFoundError as e:
                 log.event("teacher_baselines", skipped=str(e))
-        reference = D.reference_model(cfg)  # before the eval: a bad eval.reference file stops it here
-        if reference:
-            log.event("reference", **reference)
         ec = cfg["eval"]
         identity = dict(weights=weights_hash(ckpt), step=step, device=device.type, autocast=cfg["autocast"],
                         batch_s=float(ec["batch_s"]), tf32=bool(cfg["perf"]["tf32"]),
@@ -2036,7 +2031,7 @@ def main(argv=None) -> int:
         check_identity(out, identity)
         ctx = Ctx(D=D, ev=ev, cfg=cfg, args=args, out=out, log=log, store=store, greedy_ids=set(greedy_ids),
                   identity_key=hashlib.sha256(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest(),
-                  reference=reference, family=family, teacher_rows=teacher_rows, targets=targets, manifest=M,
+                  family=family, teacher_rows=teacher_rows, targets=targets, manifest=M,
                   system=system, verdict_off="anchor: its history is another run's on other eval sets; it gets "
                                              "tables and a summary, no verdict" if args.anchor else None,
                   weights=weights_record(ckpt),

@@ -4,12 +4,11 @@
   deterministic per seed and independent of input order) and the `subset` events that list them
 - schedule.clock "epochs": T = the steps of E full passes, warmup capped at 10 %, an eval at every epoch end (the last
   one is the final eval), the probe = the whole train subset (teacher-forced + greedy), SpecAugment off
-- optim.offload "cpu" (CpuOffloadAdamW): bit-for-bit the on-device AdamW (unit level), the same weights and loss
-  curves as the on-device optimizer in a full run, and an identical continuation after a crash + --resume
 - the overfit options are validated
 - the 8 GB laptop: the memory probe holds a step's gradients when steps accumulate micro-batches, histograms
-  concatenate one module at a time, the Windows VRAM cap, and checkpoint renames that wait for a scanner and come
-  after the files reach the disk
+  concatenate one module at a time, the Windows VRAM cap (scripts/05_evaluate.py's since the trainer's own went with
+  the laptop), and checkpoint renames that wait for a scanner and come after the files reach the disk
+- a resume sets an abandoned attempt aside and applies its optim / L2-SP / grad_ckpt overrides
 
 CPU only (the laptop GPU runs other jobs), a tiny random student and a synthetic corpus in the real on-disk formats."""
 import copy
@@ -153,96 +152,18 @@ def test_audio_subset_budget_fallback_and_determinism():
         m.audio_subset([], [], 1.0, np.random.default_rng(0))
 
 
-def test_l2sp_value_from_the_apply_pass():
-    """apply_(value=True) moves the weights exactly as apply_() and returns value() of the result (up to rounding)."""
-    from kitsune.kd import L2SP
-
-    torch.manual_seed(1)
-    a = [torch.randn(4, 5, requires_grad=True), torch.randn(7, requires_grad=True)]
-    b = [x.detach().clone().requires_grad_(True) for x in a]
-    la, lb = L2SP(zip("xy", a), lam=0.05), L2SP(zip("xy", b), lam=0.05)
-    with torch.no_grad():
-        for x, y in zip(a, b):
-            n = torch.randn_like(x)
-            x.add_(n)
-            y.add_(n)
-    assert la.apply_(0.5) is None
-    v = lb.apply_(0.5, value=True)
-    assert all(torch.equal(x, y) for x, y in zip(a, b))
-    assert float(v) == pytest.approx(float(la.value()), rel=1e-6) and float(v) > 0
-    assert float(lb.apply_(0.0, value=True)) == pytest.approx(float(lb.value()), rel=1e-6)  # lr 0: nothing moves
-    assert all(torch.equal(x, y) for x, y in zip(a, b))
-
-
-@pytest.mark.parametrize("fused", [False, True])
-def test_cpu_offload_adamw_is_adamw(monkeypatch, fused):
-    """Masters in (small, here) chunks, gradients copied over and freed, AdamW on the masters, push: the same weights
-    as torch.optim.AdamW on the parameters themselves (bitwise with foreach, within rounding with the fused kernel),
-    a parameter without a gradient skipped, and a state_dict round trip that rebuilds the masters from reloaded
-    weights continues identically."""
-    m = load_script("04_distill")
-    monkeypatch.setattr(m.CpuOffloadAdamW, "CHUNK", 40)  # 35 + (13 + 24): two chunks, one tensor starts a new one
-    torch.manual_seed(0)
-    shapes = [(5, 7), (13,), (3, 4, 2)]
-    hp = dict(lr=1e-2, betas=(0.9, 0.98), eps=1e-8, weight_decay=0.01)
-    ref = [torch.randn(s, requires_grad=True) for s in shapes]
-    dev = [p.detach().clone().requires_grad_(True) for p in ref]
-    opt_ref = torch.optim.AdamW(ref, **hp)
-    off = m.CpuOffloadAdamW(dev, fused=fused, **hp)
-    assert len(off.chunks) == 4 and off.info()["impl"] == ("fused" if fused else "foreach") and not off.pinned
-    tol = dict(atol=1e-6, rtol=0) if fused else dict(atol=0, rtol=0)
-
-    def step(pairs, opts, k):
-        grads = [torch.randn(s) for s in shapes]
-        if k == 2:
-            grads[1] = None  # no gradient this step: skipped, its moments untouched
-        for params in pairs:
-            for p, g in zip(params, grads):
-                p.grad = None if g is None else g.clone()
-        for o in opts:
-            o.step()
-            if isinstance(o, m.CpuOffloadAdamW):
-                assert all(p.grad is None for p in o.params)  # the device gradients are freed by step()
-                o.push()
-
-    for k in range(5):
-        step([ref, dev], [opt_ref, off], k)
-        for p, q in zip(ref, dev):
-            torch.testing.assert_close(q, p, **tol)
-    assert int(off.state_dict()["state"][1]["step"]) == 4 and int(opt_ref.state_dict()["state"][1]["step"]) == 4
-
-    # resume: fresh weights, then the checkpoint's weights loaded into them, then the optimizer state
-    sd = copy.deepcopy(off.state_dict())
-    dev2 = [torch.randn(s, requires_grad=True) for s in shapes]
-    off2 = m.CpuOffloadAdamW(dev2, fused=fused, **hp)
-    with torch.no_grad():
-        for p, q in zip(dev2, dev):
-            p.copy_(q)
-    off2.load_state_dict(sd)
-    assert all(g["fused"] == (True if fused else None) and g["foreach"] == (None if fused else True)
-               for g in off2.param_groups)
-    torch.manual_seed(7)
-    step([dev], [off], 5)
-    torch.manual_seed(7)
-    step([dev2], [off2], 5)
-    for p, q in zip(dev, dev2):
-        assert torch.equal(p, q)
-    with pytest.raises(ValueError):
-        m.CpuOffloadAdamW([torch.zeros(3, dtype=torch.bfloat16, requires_grad=True)], **hp)
-
-
 def test_overfit_options_are_validated():
     """The overfit runs' options refuse values they cannot run with; DEFAULTS (and so the viability run, which only
     turned early stopping on) set none of them."""
     m = load_script("04_distill")
-    for bad in (["schedule.clock=epochs"], ["schedule.clock=epochs", "schedule.epochs=0"], ["optim.offload=gpu"],
+    for bad in (["schedule.clock=epochs"], ["schedule.clock=epochs", "schedule.epochs=0"],
                 ["subset.train_audio_s=5", "subset.train_utts=10"], ["subset.eval_audio_s=-1"],
                 ["eval.every_epochs=0"], ["eval.probe=false", "eval.probe_is_train=true"], ["specaug.enabled=0"],
                 ["perf.loader_timeout_s=-1"], ["perf.loader_timeout_s=10m"]):
         with pytest.raises(SystemExit):
             m.load_config(None, bad)
     d = m.load_config(None, [])
-    assert d["optim"]["offload"] == "none" and d["specaug"]["enabled"] and d["schedule"]["clock"] == "wall"
+    assert d["specaug"]["enabled"] and d["schedule"]["clock"] == "wall"
     assert d["subset"]["train_audio_s"] is None and d["eval"]["every_epochs"] is None
     assert d["early_stop"] == dict(enabled=False, metric="heldout_kl", patience=3, min_delta_rel=0.005,
                                    min_delta_abs=0.0, min_evals=3, floor=None, action="cooldown", smooth=1,
@@ -259,8 +180,8 @@ class _Rows:
 
 def test_memory_probe_holds_the_steps_gradients(monkeypatch):
     """train_step accumulates a step's micro-batches into the same gradients, so micro-batch 2+ runs forward and
-    backward with the full fp32 gradients already allocated (2.3 GiB for the real student, which the offloaded run no
-    longer covers with an AdamW reserve). When steps have several micro-batches every probe pass must start from
+    backward with the full fp32 gradients already allocated (2.3 GiB for the real student). When steps have several
+    micro-batches every probe pass must start from
     allocated (zero) gradients, else the probe accepts a micro size that OOMs (or spills) from the second micro-batch
     on; with one micro-batch per step it starts from none, as a step's only micro-batch does. Freed afterwards."""
     from kitsune import trainset
@@ -471,13 +392,12 @@ def test_resume_from_an_older_full_state_sets_the_abandoned_attempt_aside(tmp_pa
 
 def test_epoch_clock_subsets_probe_and_no_specaug(env):
     """~8 s of train audio for 3 epochs of >= 2 steps, ~4 s of pooled eval audio, an eval after every epoch with the
-    whole train subset as the probe (teacher-forced) and ~3 s of it decoded greedily, SpecAugment off, offloaded
-    AdamW. Everything the TensorBoard view of the overfit runs relies on is checked here."""
+    whole train subset as the probe (teacher-forced) and ~3 s of it decoded greedily, SpecAugment off. Everything the
+    TensorBoard view of the overfit runs relies on is checked here."""
     m = load_script("04_distill")
     path = write_config(env, "ov-epochs", {
         "subset": {"train_audio_s": 8, "eval_audio_s": 4},
         "specaug": {"enabled": False},
-        "optim": {"offload": "cpu"},
         "schedule": {"clock": "epochs", "epochs": 3, "warmup_steps": 300, "cooldown_frac": 0.3},
         "batch": {"step_audio_s": 4, "micro_audio_s": 3, "pool_micro": 4},
         "eval": {"every_epochs": 1, "probe_is_train": True, "probe_greedy_audio_s": 3},
@@ -543,84 +463,7 @@ def test_epoch_clock_subsets_probe_and_no_specaug(env):
 
     # SpecAugment off: nothing masked, in the step rows and per utterance
     assert (steps["aug/masked_frac"] == 0).all() and (utts["masked_frac"] == 0).all()
-    assert next(e for e in ev if e["kind"] == "optim_offload")["impl"] == "foreach"
     assert {"smoke_steps", "smoke_padded_row", "verdict", "logger_close"} <= {e["kind"] for e in ev}
-
-
-def _offload_config(env, name: str, offload: str) -> str:
-    return write_config(env, name, {
-        "optim": {"offload": offload},
-        "schedule": {"warmup_steps": 3, "cooldown_frac": 0.3, "clock": "steps", "max_steps": 8},
-        "batch": {"step_audio_s": 6, "micro_audio_s": 3, "pool_micro": 4},
-        "eval": {"every_steps": 1000, "final_full_greedy": False},
-        "ckpt": {"weights_every_steps": 1000, "full_every_steps": 4, "keep_local": 5},
-        "smoke": {"enabled": False},
-    })
-
-
-def _state(run: Path, step: int) -> tuple[dict, dict]:
-    d = run / "checkpoints" / f"full_step_{step}"
-    return (torch.load(d / "model.pt", map_location="cpu", weights_only=True),
-            torch.load(d / "optimizer.pt", map_location="cpu", weights_only=True))
-
-
-def _assert_same_run(a: Path, b: Path) -> pd.DataFrame:
-    (wa, oa), (wb, ob) = _state(a, 8), _state(b, 8)
-    assert wa.keys() == wb.keys()
-    for k in wa:
-        torch.testing.assert_close(wb[k], wa[k], atol=1e-6, rtol=0, msg=k)
-    assert oa["state"].keys() == ob["state"].keys()
-    for i in oa["state"]:
-        for k in ("exp_avg", "exp_avg_sq"):
-            torch.testing.assert_close(ob["state"][i][k], oa["state"][i][k], atol=1e-9, rtol=1e-6)
-        assert float(ob["state"][i]["step"]) == float(oa["state"][i]["step"])
-    sa = pd.read_parquet(a / "metrics" / "steps.parquet")
-    sb = pd.read_parquet(b / "metrics" / "steps.parquet")
-    assert sa["step"].tolist() == sb["step"].tolist() == list(range(1, 9))
-    for col in ("loss/objective", "loss/kl", "loss/ce", "tok/top1", "opt/grad_norm", "opt/lr", "aug/masked_frac"):
-        np.testing.assert_allclose(sb[col].to_numpy(), sa[col].to_numpy(), rtol=1e-6, atol=1e-9, err_msg=col)
-    np.testing.assert_allclose(sb["loss/l2sp"].to_numpy(), sa["loss/l2sp"].to_numpy(), rtol=1e-5, err_msg="l2sp")
-    return sa
-
-
-def test_offload_matches_the_on_device_optimizer_and_resumes(env, monkeypatch):
-    """8 steps with optim.offload none vs cpu (fp32, CPU): the same weights (atol 1e-6), AdamW moments and loss curves;
-    the update ratios logged from the host masters match. Then the offloaded run crashes before step 6 and resumes from
-    its step-4 full state: the continuation ends at the same weights and replays the same losses."""
-    m = load_script("04_distill")
-    assert m.main(["--config", _offload_config(env, "ov-none", "none")]) == 0
-    assert m.main(["--config", _offload_config(env, "ov-cpu", "cpu")]) == 0
-    none, cpu = one_run(env["root"], "ov-none"), one_run(env["root"], "ov-cpu")
-    assert not any(e["kind"] == "optim_offload" for e in events(none))
-    info = next(e for e in events(cpu) if e["kind"] == "optim_offload")
-    assert info["impl"] == "foreach" and info["pinned"] is False and info["params"] > 0
-    steps = _assert_same_run(none, cpu)
-    assert (steps["aug/masked_frac"] > 0).all()  # SpecAugment on by default
-    sc_n, sc_c = (pd.read_parquet(r / "metrics" / "scalars.parquet") for r in (none, cpu))
-    ratio = [t for t in sc_n["tag"].unique() if t.startswith("layers/update_ratio/")]
-    assert ratio
-    for sc in (sc_n, sc_c):
-        assert set(sc[sc["tag"].isin(ratio)]["step"]) == {3, 6}
-    a = sc_n[sc_n["tag"].isin(ratio)].sort_values(["step", "tag"])["value"].to_numpy()
-    b = sc_c[sc_c["tag"].isin(ratio)].sort_values(["step", "tag"])["value"].to_numpy()
-    np.testing.assert_allclose(b, a, rtol=1e-5)
-
-    monkeypatch.setenv("KITSUNE_CRASH_AT_STEP", "6")
-    cfg = _offload_config(env, "ov-crash", "cpu")
-    with pytest.raises(RuntimeError, match="simulated crash"):
-        m.main(["--config", cfg])
-    monkeypatch.delenv("KITSUNE_CRASH_AT_STEP")
-    crash = one_run(env["root"], "ov-crash")
-    assert m.main(["--config", cfg, "--resume", str(crash / "checkpoints" / "full_step_4")]) == 0
-    assert next(e for e in events(crash) if e["kind"] == "resumed")["at_step"] == 4
-    _assert_same_run(cpu, crash)  # steps.parquet of the resumed run holds 1-4 from the first launch, 5-8 replayed
-    utts = parts(crash, "train_utts")
-    ref = parts(cpu, "train_utts")
-    for step in (5, 6):
-        a = ref[ref["step"] == step].sort_values("id")
-        b = utts[(utts["step"] == step) & (utts["attempt"] == 1)].sort_values("id")
-        assert a["id"].tolist() == b["id"].tolist() and len(a)
-        np.testing.assert_allclose(b["kl"].to_numpy(), a["kl"].to_numpy(), rtol=1e-6, atol=1e-9)
 
 
 def test_resume_applies_optim_l2sp_and_grad_ckpt_overrides(env, monkeypatch):
