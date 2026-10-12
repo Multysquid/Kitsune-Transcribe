@@ -4,6 +4,7 @@ Everything runs on CPU on a TINY random CohereAsr model built from the teacher's
 that loads the real 2B teacher is marked `slow`."""
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -428,11 +429,12 @@ def test_save_load_roundtrip(tmp_path):
     # the model card (licence terms, the Apache-2.0 modified-from notice) travels with the weights
     card = (out / "README.md").read_text(encoding="utf-8")
     assert card == S.MODEL_CARD.read_text(encoding="utf-8")
-    assert "license: other" in card and f"base_model: {S.TEACHER_ID}" in card
+    # CC BY-NC 4.0, the released models' licence (2026-10-12), as a Hub licence id: no custom license_name/link
+    assert "license: cc-by-nc-4.0\n" in card and "license_name" not in card and f"base_model: {S.TEACHER_ID}" in card
     assert "b1eacc2686a3d08ceaae5f24a88b1d519620bc09" in card and "non-commercial" in card
     # the licence texts it names (the Galgame card's own license_link points to a missing LICENSE.md)
     assert "https://www.gnu.org/licenses/gpl-3.0.txt" in card and "3fb86654222b3f0af0f7c332ae6a0ef9752a9451" in card
-    assert all(f"https://creativecommons.org/licenses/by/{v}/" in card for v in ("4.0", "3.0"))
+    assert all(f"https://creativecommons.org/licenses/{v}/" in card for v in ("by-nc/4.0", "by/4.0", "by/3.0"))
     with safe_open(out / "model.safetensors", "pt") as f:
         keys = set(f.keys())
         dtypes = {k: f.get_slice(k).get_dtype() for k in keys}
@@ -874,23 +876,35 @@ def test_model_card_describes_the_student():
 
 
 STUDY_STUDENTS = Path(os.environ.get("KITSUNE_STUDY_STUDENTS", "D:/kitsune-students/study"))
+_CARD_INTRO_END = "[Kitsune-Transcribe](https://github.com/Multysquid/Kitsune-Transcribe).\n"
+
+
+def _card_without_licence(card: str) -> tuple[str, str]:
+    """(the card up to its introduction without the front matter's licence lines, the card from Terms on): what the
+    licence change of 2026-10-12 left alone. It set the front matter's licence to cc-by-nc-4.0 (dropping the custom
+    license_name / license_link) and replaced the Status paragraph between the introduction and Terms with Licence."""
+    head, rest = card.split(_CARD_INTRO_END, 1)
+    return re.sub(r"(?m)^license.*\n", "", head) + _CARD_INTRO_END, rest[rest.index("\n## Terms\n"):]
 
 
 @pytest.mark.parametrize("name", ["t06", "t03"])
 def test_model_card_is_the_uploaded_readme(name):
-    """model_card renders exactly the README.md uploaded with each pruned Transcribe student init of the size study
+    """model_card renders the README.md uploaded with each pruned Transcribe student init of the size study
     (Multy123/kitsune-data students/study/<name>/, local copies under D:/kitsune-students/study; skipped without
-    them), from its student_meta.json alone; a checkpoint trained from it (its meta plus the trainer's `trained`
+    them) from its student_meta.json alone, except for the licence: those READMEs predate the release and still say
+    `license: other` and that the licence is fixed at release, while MODEL_CARD.md now says CC BY-NC 4.0. Everything
+    else - the front matter's datasets, the terms, the notice describing the student and the training data - is
+    byte for byte the uploaded card's; a checkpoint trained from the init (its meta plus the trainer's `trained`
     block, 04_distill save_weights) gets the same card. (The from-scratch inits' cards - bridge, t01, t01-s1235,
     t005 - came from the builder removed after the study; the last commit with it is 76b28a1.)"""
     d = STUDY_STUDENTS / name
     if not (d / "README.md").is_file() or not (d / "student_meta.json").is_file():
         pytest.skip(f"no uploaded student {d}")
     meta = json.loads((d / "student_meta.json").read_text(encoding="utf-8"))
-    want = (d / "README.md").read_bytes().decode("utf-8")
-    assert S.model_card(meta) == want
+    want = _card_without_licence((d / "README.md").read_bytes().decode("utf-8"))
+    assert _card_without_licence(S.model_card(meta)) == want
     trained = dict(meta, trained=dict(run_id=f"study-{name}", step=9370, reason="final", lr_phase="cooldown"))
-    assert S.model_card(trained) == want
+    assert S.model_card(trained) == S.model_card(meta)
 
 
 def test_importance_state_roundtrip(tmp_path):
