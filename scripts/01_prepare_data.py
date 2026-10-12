@@ -51,7 +51,7 @@ run finds them as cache hits, and a finished run removes raw/dl. Downloads and l
 (429, 5xx, dead connections) in-process. --hold-file forces one at a time (the label box's hold is per download).
 
 Usage:
-  python scripts/01_prepare_data.py --sources reazon_small galgame eval --galgame-shards 6
+  python scripts/01_prepare_data.py --sources reazon_small galgame eval --galgame-shards 6 --whisper-dir data/whisper
   python scripts/01_prepare_data.py --sources eval_cv8 --limit-rows 64      # smoke run -> writes to data_smoke/
   python scripts/01_prepare_data.py --data /workspace/Kitsune-Transcribe/data --sources reazon_small eval   # vast box
   python scripts/01_prepare_data.py --sources reazon_large emilia_nc --max-inputs reazon_large=40,emilia_nc=6
