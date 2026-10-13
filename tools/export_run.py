@@ -4,10 +4,9 @@ Why: the run dir is written for crash-safety (append-only jsonl, parquet parts, 
 files); analysis wants one table per kind. This folds everything into export/:
   - TensorBoard events (EventAccumulator: scalars, histograms, text) -> tb_*.parquet/csv. A resumed run's purged steps
     are dropped by the accumulator, as TensorBoard shows them. (This reader purges on every SessionLog.START, the
-    server only from a run's second one on: a run whose first event file opens without one, logged before
-    kitsune.runlog.RunLogger._tb_purge_step, shows the discarded steps in the server until tools/regroup_tb.py
-    rebuilds it.) TensorBoard files the tags under three buckets
-    (1_operational/, 2_loss_accuracy/, 3_misc/); the tables give back the logged tag (`tag`) with `bucket` and
+    server only from a run's second one on, so kitsune.runlog.RunLogger._tb_purge_step opens a run's first event file
+    with one: a run logged before it shows the discarded steps in the server.) TensorBoard files the tags under three
+    buckets (1_operational/, 2_loss_accuracy/, 3_misc/); the tables give back the logged tag (`tag`) with `bucket` and
     `tb_tag` next to it, from metrics/tag_map.json (copied as tag_map.json, and as the tag_map table); a tag the map
     lacks (no tag_map.json: a run logged before the buckets, or a copy without the file) is mapped by the same rules
     from the tags of the open files
@@ -19,8 +18,10 @@ files); analysis wants one table per kind. This folds everything into export/:
     mini evals' evals/step_<N>_mini/ likewise (eval_mini_tf, eval_mini_greedy, ...), summary.json files flattened to
     eval_summaries (a `mini` column; the eval's final and complete flags and its val-CER scope as columns),
     samples/*.jsonl -> samples, events.jsonl -> events
-  - infra/ (box logs and state that vast/finish.py uploads: kitsune.log, supervise.json, bootstrap timings, the
-    lifecycle events of the stop/destroy scripts) copied, its events and bootstrap timings also as tables
+  - infra/ (the viability run's box logs and state, which the retired train job's vast/finish.py put under
+    runs/<run_id>/infra/: kitsune.log, supervise.json, bootstrap timings, the lifecycle events of the stop/destroy
+    scripts; a full box's are under full/box-<box>/infra/<container>/ in the runs repo) copied, its events and
+    bootstrap timings also as tables
   - config.json (config.<stamp>.json of each restart), summary.json and env/ copied as they are
 The open files are append-only, so after a crash and resume they keep the rows of the steps the resumed launch
 replaced, and of those it never reached (a clipped time budget): a `discarded` column marks them (the resumes are read
@@ -28,8 +29,8 @@ from events.jsonl), so the open tables agree with TensorBoard and steps.
 CSV is written next to each parquet unless the table exceeds --max-csv-rows (list columns become JSON strings).
 
 Usage:
-  python tools/export_run.py runs/viability-b20x2560 --out exports/viability-b20x2560
-  python tools/export_run.py hf://<user>/<repo>/runs/viability-b20x2560 --out exports/viability-b20x2560
+  python tools/export_run.py runs/full-p01-20261001T184145Z --out exports/full-p01
+  python tools/export_run.py hf://<user>/<repo>/runs/full-p01-20261001T184145Z --out exports/full-p01
 """
 import argparse
 import json
@@ -165,7 +166,7 @@ def _from_tb(file_tag: str, plugin: str, inv: dict[str, dict[str, str]],
              fwd: dict[str, dict[str, str]] | None = None) -> tuple[str, str, str]:
     """Tag in the event files -> (logged tag, tb_tag, bucket), by the inverse (inv) and forward (fwd) tag map. Event
     files written before the buckets hold the logged tags themselves; the bucket columns then say where the bucketed
-    layout (tools/regroup_tb.py) puts them."""
+    layout puts them."""
     tag = inv.get(plugin, {}).get(file_tag)
     if tag is not None:
         return tag, file_tag, file_tag.split("/", 1)[0]
@@ -485,7 +486,7 @@ def write_readme(out: Path, src: str, tables: dict[str, pd.DataFrame], copied: l
              "(`tag`); `tb_tag` is where TensorBoard shows it and `bucket` its first component. The run's "
              "`metrics/tag_map.json` (copied as `tag_map.json`: `{tag: {tb_tag, bucket, plugin}}`) holds the mapping, "
              "the `tag_map` table lists it; the rules are `TB_BUCKET_RULES` in kitsune/runlog.py. A run logged before "
-             "the buckets has the logged tags in its event files; `tools/regroup_tb.py` rebuilds them in this layout.",
+             "the buckets has the logged tags in its event files.",
              ""]
     tm = tables.get("tag_map")
     if tm is not None and len(tm):

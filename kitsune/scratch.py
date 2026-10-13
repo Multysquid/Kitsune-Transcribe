@@ -6,7 +6,7 @@ the newest state (kitsune.full_queue resume-pull) and resumes. The scratch repo 
 creates (Multy123/kitsune-scratch); nothing here creates a repo, so a typo cannot make a new one and a token scoped to
 that repo is enough. Layout (kitsune.fullrun, contract 1.2 / 2.4), exactly one state per run:
 
-  runs/<run_id>/checkpoints/full_step_<N>/{model.pt, optimizer.pt, l2sp.pt, trainer.pt, trainer.json[, aux_ctc.pt]}
+  runs/<run_id>/checkpoints/full_step_<N>/{model.pt, optimizer.pt, l2sp.pt, trainer.pt, trainer.json}
   runs/<run_id>/timed_state.json          the pointer (format 1): step, epoch, planner fingerprint, train utterances,
                                           selection sha256, micro_audio_s, code sha, the saving host, and every
                                           committed file's size and sha256
@@ -21,9 +21,9 @@ that repo is enough. Layout (kitsune.fullrun, contract 1.2 / 2.4), exactly one s
                                           atomic: the pointer and the files it names change together. Retried on the
                                           Hub's transient answers
                                           (RETRY_STATUS and 5xx, and errors without a status: a dropped connection)
-                                          after RETRY_S; box 2's two trainers commit and squash the same repo, so a
-                                          409/412 from a squash racing a commit is expected. A failed squash is
-                                          recorded, not a failure: the next upload squashes again
+                                          after RETRY_S; a 409/412 from a squash racing another commit to the repo
+                                          is one of them. A failed squash is recorded, not a failure: the next upload
+                                          squashes again
   host_info(), code_sha(root)             the saving host ({hostname, machine_id, container_id}) and the code's git
                                           sha ($KITSUNE_SHA on a box), for the pointer and trainer.pt
 
@@ -128,15 +128,15 @@ def retryable(exc: BaseException) -> bool:
 def make_pointer(run_id: str, local_dir, *, step: int, epoch: float, planner_fingerprint: str, n_train_utts: int,
                  selection_sha256: str | None, micro_audio_s: float, kitsune_sha: str | None, host: dict) -> dict:
     """The pointer (contract 2.4, format 1) of the local full state `local_dir` = checkpoints/full_step_<step>/: files
-    = every state file in it (fullrun.STATE_FILES_REQUIRED, and STATE_FILES_OPTIONAL when present) with its size and
-    sha256, marker files never; exactly the files upload_state commits. ValueError when the dir is not full_step_<step>,
-    lacks a required file, or the pointer would not pass fullrun.pointer_problems."""
+    = every state file in it (fullrun.STATE_FILES_REQUIRED) with its size and sha256, marker files never; exactly the
+    files upload_state commits. ValueError when the dir is not full_step_<step>, lacks a required file, or the pointer
+    would not pass fullrun.pointer_problems."""
     local_dir = Path(local_dir)
     name = f"full_step_{int(step)}"
     if local_dir.name != name:
         raise ValueError(f"{local_dir}: a timed state of step {step} is a {name}/ dir")
     files = {}
-    for f in (*fullrun.STATE_FILES_REQUIRED, *fullrun.STATE_FILES_OPTIONAL):
+    for f in fullrun.STATE_FILES_REQUIRED:
         p = local_dir / f
         if p.is_file():
             files[f] = dict(size=p.stat().st_size, sha256=file_sha256(p))

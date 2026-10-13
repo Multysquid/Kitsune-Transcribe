@@ -262,9 +262,8 @@ def test_one_ingest_per_data_root(tmp_path, monkeypatch):
     again.close()
 
 
-def test_reazon_tiers_dedup_against_every_smaller_tier():
-    assert set(prep.DEDUP_AGAINST["reazon_large"]) == {"reazon_small", "reazon_medium"}
-    assert prep.DEDUP_AGAINST["reazon_medium"] == ("reazon_small",)
+def test_reazon_large_dedups_against_the_smaller_tier():
+    assert prep.DEDUP_AGAINST == {"reazon_large": ("reazon_small",)}
     assert "reazon_large" in prep.HF_PARQUET_SOURCES and "emilia_nc" in prep.ALL_SOURCES
 
 
@@ -314,12 +313,12 @@ def test_parquet_resume_matches_a_fresh_run(tmp_path, fake_hub, small_shards, mo
     restore()
     ing = ingest(resumed, "reazon_small", prep.ingest_hf_parquet, repo, split, ahead=ahead)
     assert split_ids(resumed, "reazon_small") == want and ing.stats["dup"] == 4
-    # a larger tier skips every row already in a smaller one (DEDUP_AGAINST), by name
+    # the larger tier skips every row already in the smaller one (DEDUP_AGAINST), by name
     p = tmp_path / "train-2.parquet"
     make_reazon_parquet(p, ["new0"])
     fake_hub["data/train-2.parquet"] = p
-    ing = ingest(resumed, "reazon_medium", prep.ingest_hf_parquet, *prep.HF_PARQUET_SOURCES["reazon_medium"])
-    assert ids(resumed, "reazon_medium") == ["reazon_medium/new0"] and ing.stats["dup"] == sum(sizes)
+    ing = ingest(resumed, "reazon_large", prep.ingest_hf_parquet, *prep.HF_PARQUET_SOURCES["reazon_large"])
+    assert ids(resumed, "reazon_large") == ["reazon_large/new0"] and ing.stats["dup"] == sum(sizes)
 
 
 def add_reazon_files(tmp_path: Path, fake_hub: dict, sizes: tuple[int, ...], tag: str = "f"):
@@ -620,7 +619,7 @@ def test_max_inputs_takes_a_sorted_prefix_and_galgame_alias_conflicts(tmp_path, 
     }
 
     assert prep.parse_max_inputs("reazon_large=40,emilia_nc=6") == {"reazon_large": 40, "emilia_nc": 6}
-    for bad in ("reazon_large", "reazon_large=0", "reazon_large=4 ", "cv=1", "eval_emilia=1", "galgame=2,galgame=3"):
+    for bad in ("reazon_large", "reazon_large=0", "reazon_large=4 ", "eval=1", "eval_emilia=1", "galgame=2,galgame=3"):
         with pytest.raises(argparse.ArgumentTypeError):
             prep.parse_max_inputs(bad)
 

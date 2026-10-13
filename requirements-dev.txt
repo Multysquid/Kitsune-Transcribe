@@ -1,4 +1,5 @@
-# the laptop's test tools, on top of requirements.txt / requirements-train.txt (never in the box image: the image
-# installs requirements-train.txt only, and a change there invalidates smoke-B's quant go signal, vast/launch.py
-# QUANT_CODE)
-pytest-xdist>=3.6  # python -m pytest tests -n 8 --dist loadfile (tests/conftest.py: one thread per worker, --basetemp)
+# The laptop's test tools, on top of requirements.txt:
+# pip install -r requirements.txt -r requirements-dev.txt -c requirements-train.txt (pytest comes with pytest-xdist,
+# held at the image's pin). Never in the box image: the image installs requirements-train.txt only (with its own pytest
+# pin), and a change there invalidates smoke-B's quant go signal (vast/launch.py QUANT_CODE).
+pytest-xdist>=3.6  # python -m pytest tests -n <workers> --dist loadfile (tests/conftest.py: one thread per worker)

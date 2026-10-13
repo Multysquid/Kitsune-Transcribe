@@ -1,82 +1,47 @@
-"""Run the trainer on the vast box and decide what happens to the instance when it ends (D50a).
+"""Run a full-data box's queue on the vast box and decide what happens to the instance when it ends.
 
-Policy (decide()):
-  exit 0                                   -> vast/finish.py --destroy  (verifies the HF upload first, stops if it can't)
-  exit 3 (ThroughputTooLow)                -> vast/finish.py --stop     (a slow host does not get faster)
-  any other exit after the trainer wrote summary.json with status "complete"
-                                           -> vast/finish.py --destroy  (it finished: final eval, verdict, summary)
-  any other failure, the FIRST one, reached step >= 100 and a local full state exists
-                                           -> resume once: 04 --resume <newest full state>
-  a second failure, a failure before step 100, or no full state to resume from
-                                           -> vast/finish.py --stop
-Why: after the smoke phase (100 steps) the code path is proven on this host, so a later crash is most likely transient
-(a host hiccup, a NaN spike) and one resume costs minutes. A trainer that dies after its complete summary (a crash in
-the interpreter's teardown, a kill while its end-state upload drains) has nothing left to train: a resume would only
-run the end phase and the final eval again, and finish.py --destroy uploads what is missing and verifies it first. A
-failure before step 100 is a code or hardware problem that a restart would only repeat on the meter, and a second
-failure means the same. Stop, not destroy, on every other failure path: the disk (checkpoints, logs) survives for a
-human to inspect.
+vast/onstart.sh execs this on a full box (KITSUNE_JOB=full, vast/launch.py --job full) once bootstrap has passed. It
+runs `python -m kitsune.full_queue run --box $KITSUNE_BOX` (kitsune/full_queue.py) and decides with decide_queue:
+  exit 0                       -> vast/finish.py --destroy  (it verifies the HF uploads first, and stops if it can't)
+  exit 4 (a training or store item failed for good, or a non-droppable training item did not finish)
+                               -> vast/finish.py --stop     (the disk is kept for a human to inspect)
+  any other exit, or a container restart during the queue
+                               -> the queue again, up to MAX_QUEUE_RESTARTS times, then --stop
+The queue resumes its runs itself (finished items skipped, runs resumed from their full states): the supervisor
+restarts only the queue. Any other non-zero exit first forces a log sync (finish.py --sync-only): a hard crash
+(segfault, OOM kill, CUDA fault) skips the queue's own syncs. Each attempt records the OOM kills the container's cgroup
+counted while it ran (oom_kills): the rc alone does not tell one that took a DataLoader worker from any other error.
 
-Every non-zero exit of a run whose summary.json is not complete first forces a log sync (finish.py --sync-only
---no-full; a finished run's finish.py --destroy uploads everything anyway): a hard crash (segfault, OOM kill, CUDA
-fault) skips the trainer's own final sync. The ~9 GB full state is left out there because a resume needs it only
-locally and every stop path (finish.py --stop) uploads it anyway; the GPU idles while this sync runs. Each attempt
-records the OOM kills the container's cgroup counted while it ran (oom_kills; "(oom_kill +N)" in its exit line): the
-rc alone does not tell one that took a DataLoader worker from any other error. The attempt history lives in
-$KITSUNE_STATE/supervise.json, so if the container restarts in the middle of an attempt (host reboot) the interrupted
-attempt counts as a failure (its run dir is found again from its start time or its --resume path) and the same policy
-applies; once a final decision is recorded the supervisor never starts another run. The file is written with fsyncs
-(save_state), and one that does not read as a history anyway is moved aside and ends in a recorded stop, as the history
-it held (a final decision, a resume already used) is unknown. finish.py writes its halt marker
-($KITSUNE_STATE/halt) only when it acts, after its sync and --destroy's verification, so a restart in between (a host
-reboot during the minutes-long upload) leaves a recorded decision and no marker; onstart.sh then boots the supervisor
-again, which runs that finish once more (it is idempotent: the Hub skips what it already has, then verify and act)
-instead of idling until the watchdog's deadline, which only stops the box. An exclusive lock
-($KITSUNE_STATE/supervise.lock, flock) keeps a second supervisor (vast/onstart.sh run again by hand during a healthy
-run) from treating the live attempt as interrupted. onstart's detached subshell holds the same lock while bootstrap runs
-and closes it right before it execs the supervisor, so the supervisor waits for it (wait_for_lock, up to LOCK_WAIT_S)
-before it steps aside: a process left over from bootstrap that still held it (a train_hb toucher's `sleep 60`, box
-p01-chain on 2026-10-01) made the supervisor exit at once, and the box idled with no supervisor.
+The attempt history lives in $KITSUNE_STATE/supervise.json, so if the container restarts in the middle of an attempt
+(host reboot) the interrupted attempt counts as a failure and the same policy applies; once a final decision is
+recorded the supervisor never starts the queue again. The file is written with fsyncs (save_state), and one that does
+not read as a history anyway is moved aside and ends in a recorded stop, as the history it held (a final decision, the
+restarts already used) is unknown. finish.py writes its halt marker ($KITSUNE_STATE/halt) only when it acts, after its
+sync and --destroy's verification, so a restart in between (a host reboot during the minutes-long upload) leaves a
+recorded decision and no marker; onstart.sh then boots the supervisor again, which runs that finish once more (it is
+idempotent: the Hub skips what it already has, then verify and act) instead of idling until the watchdog's deadline,
+which only stops the box. An exclusive lock ($KITSUNE_STATE/supervise.lock, flock) keeps a second supervisor
+(vast/onstart.sh run again by hand during a healthy run) from treating the live attempt as interrupted. onstart's
+detached subshell holds the same lock while bootstrap runs and closes it right before it execs the supervisor, so the
+supervisor waits for it (wait_for_lock, up to LOCK_WAIT_S) before it steps aside: a process left over from bootstrap
+that still held it (a train_hb toucher's `sleep 60`, box 53693389 on 2026-10-01) made the supervisor exit at once, and
+the box idled with no supervisor.
 
 The final finish.py call is bounded too (FINISH_TIMEOUT_S): its sync and --destroy's verification talk to the Hub (the
-repo listing has no timeout, and a crawling link has none overall), and a hang there would keep the GPU billing until the
-watchdog's deadline (up to 5.5 h after boot for an early failure). When it times out or fails, `finish.py --stop
---no-sync` follows (itself bounded: no Hub sync, the infra upload is capped); a timed-out destroy thus ends as a stop,
-which keeps the disk. vast/watchdog.sh stays the backstop for a supervisor that hangs anyway.
+repo listing has no timeout, and a crawling link has none overall), and a hang there would keep the GPU billing until
+the watchdog's deadline. When it times out or fails, `finish.py --stop --no-sync` follows (itself bounded: no Hub sync,
+the infra upload is capped); a timed-out destroy thus ends as a stop, which keeps the disk. vast/watchdog.sh stays the
+backstop for a supervisor that hangs anyway. The box watchdog reads the controllers' heartbeat $KITSUNE_STATE/train_hb:
+the queue beats it while it runs (the supervisor does not), and the supervisor beats it, bounded
+(kitsune.heartbeat.beating, max_s = the call's timeout + 60 s), around its own finish.py calls - the --sync-only after a
+queue failure and the final --stop/--destroy - so a slow but live upload is not taken for a dead controller, while a
+hung one still goes stale. vast/label.py, the label box's controller, uses load_state, save_state, acquire_lock and
+final_finish of this module.
 
-Contract with scripts/04_distill.py: CLI `--config <json> [--set hf.output_repo=<repo>] [--resume <path>]`; exit codes
-0 ok / 3 throughput too low / anything else failure; it writes runs/<run_id>/config.json at start,
-runs/<run_id>/metrics/scalars.jsonl rows {"step": ...}, and full states as runs/<run_id>/checkpoints/full_step_<N>[.ext].
-
-The study box (KITSUNE_JOB=study, vast/launch.py --job study): the supervisor runs the box's queue
-(`python -m kitsune.study_queue run --box $KITSUNE_BOX`, kitsune/study_queue.py) instead of one trainer, with its own
-policy (decide_queue): exit 0 -> finish.py --destroy (lean: KITSUNE_JOB=study); exit 4 (a pre-registered halt: the
-calibration still loader-bound, an LR edge after its extension, refused numbers) and exit 3 (a trainer's throughput
-floor) -> --stop; any other exit, or a container restart during the queue, -> the queue again (it resumes from its
-state file: finished items skipped, runs resumed from their local full states) up to MAX_QUEUE_RESTARTS times, then
---stop. The queue resumes its runs itself; the supervisor restarts only the queue. Same history file, lock, bounded
-final finish and halt-marker handling as the trainer path.
-
-A full-data runs box (KITSUNE_JOB=full, vast/launch.py --job full) runs `python -m kitsune.full_queue run --box
-$KITSUNE_BOX` (kitsune/full_queue.py) the same way, with the same decide_queue: its exit 0 destroys, 4 (a training or
-store item failed for good) stops with the disk kept, anything else restarts it. The box watchdog of a full box reads
-the controllers' heartbeat $KITSUNE_STATE/train_hb: the queue beats it while it runs (the supervisor does not), and the
-supervisor beats it, bounded (kitsune.heartbeat.beating, max_s = the call's timeout + 60 s), around its own finish.py
-calls - the --sync-only after a queue failure and the final --stop/--destroy - so a slow but live upload is not taken
-for a dead controller, while a hung one still goes stale.
-
-A chain box (KITSUNE_BOX=p01-chain; contract addendum E) runs its controller through the same command. Its exit 5 with
-its chain summary in $KITSUNE_STATE/queue_summary.json (kind chain, status gate_failed or failed: it ended before box 1
-trained) destroys - finish.py --destroy verifies the chain's summaries, verdicts and infra on the Hub first - with no
---sync-only before it; any other exit 5 is an ordinary failure. Each attempt records the chain stage its summary names,
-and the restart budget (MAX_QUEUE_RESTARTS) counts the failures of the last attempt's stage only, so the restarts of
-stage 1 never use up box 1's; every other box's attempts have stage None and share one budget, as before.
-
-Usage (started by vast/onstart.sh; KITSUNE_CONFIG / KITSUNE_OUT_REPO come from the instance env):
+Usage (started by vast/onstart.sh; KITSUNE_JOB, KITSUNE_BOX and KITSUNE_OUT_REPO come from the instance env):
   python vast/supervise.py
-  python vast/supervise.py --dry-run --train-cmd "python -c 'import sys; sys.exit(3)'"   # exercise the policy locally
-  KITSUNE_JOB=study KITSUNE_BOX=A python vast/supervise.py                               # the study box's queue
-  KITSUNE_JOB=full KITSUNE_BOX=p01 python vast/supervise.py                              # a full-data runs box
+  KITSUNE_JOB=full KITSUNE_BOX=p01 python vast/supervise.py --dry-run \
+      --queue-cmd "python -c 'import sys; sys.exit(4)'"                     # exercise the policy locally
 """
 import argparse
 import contextlib
@@ -89,30 +54,18 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 if str(ROOT) not in sys.path:  # kitsune.heartbeat (a full box's bounded beats around finish.py)
     sys.path.insert(1, str(ROOT))
 
-from finish import FULL_RE, newest_checkpoint  # noqa: E402
-
-EXIT_OK, EXIT_THROUGHPUT, EXIT_HALT = 0, 3, 4  # EXIT_HALT: the queue's halt (study: a rule; full: an item failed)
-# a chain box's controller (kitsune/full_queue.py ChainController): it ended before its last stage trained - a failed
-# gate, a failed stage-2 bootstrap, box 1 no longer fits - and nothing unique is on the disk: destroy (finish.py
-# verifies the chain's Hub records first). Only with its chain summary; any other exit 5 is an ordinary failure
-EXIT_CHAIN_DESTROY = 5
-CHAIN_NAMES = ("p01-chain",)  # kitsune.fullrun.CHAIN_NAMES (this script stays stdlib-only at import)
-CHAIN_DESTROY_STATUSES = ("gate_failed", "failed")
-MAX_QUEUE_RESTARTS = 2  # a queue (study or full): restarted after a crash at most this often, then the box stops
-# (a chain box: per stage, so a restart spent in stage 1 never takes one from box 1's training)
-QUEUE_JOBS = ("study", "full")  # KITSUNE_JOB values whose box runs a queue (--queue by default)
-FINISH_BEAT_EVERY_S = 30.0  # a full box: train_hb beats while a finish.py call runs (kitsune.heartbeat.beating)
-MIN_RESUME_STEP = 100
-MAX_FAILURES = 2
+# EXIT_HALT: the queue's halt (an item failed for good). A trainer's throughput floor (its exit 3) fails that item only
+# (kitsune/full_queue.py): the queue never exits 3, so a 3 here is any other failure
+EXIT_OK, EXIT_HALT = 0, 4
+MAX_QUEUE_RESTARTS = 2  # the queue: restarted after a crash at most this often, then the box stops
+FINISH_BEAT_EVERY_S = 30.0  # train_hb beats while a finish.py call runs (kitsune.heartbeat.beating)
 SYNC_TIMEOUT_S = 1800
 # the final --stop/--destroy; --destroy may still upload the ~9 GB full state and hashes every expected file to verify
 FINISH_TIMEOUT_S = {"stop": 1800, "destroy": 3600}
 FALLBACK_TIMEOUT_S = 900  # finish.py --stop --no-sync: infra upload capped at 180 s, then vast REST (3 tries) and CLI
-TAIL_BYTES = 256 << 10
 # supervise.lock: a lock still held when the supervisor starts is polled every LOCK_POLL_S for up to LOCK_WAIT_S before
 # it steps aside (wait_for_lock). Another live supervisor only delays its refusal by that long
 LOCK_WAIT_S = 180.0
@@ -124,48 +77,17 @@ def log(msg: str):
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} [supervise] {msg}", flush=True)
 
 
-def decide(rc: int | None, step: int, n_failures: int, full_state: Path | None,
-           summary: str | None = None) -> tuple[str, str]:
-    """-> (action, reason), action in {"destroy", "stop", "resume"}. rc None = attempt interrupted by a restart;
-    summary = the status in the run's summary.json after a failed attempt (summary_status)."""
+def decide_queue(rc: int | None, n_failures: int, reason: str | None = None) -> tuple[str, str]:
+    """The queue's policy -> (action, reason), action in {"destroy", "stop", "restart"}. rc None = the queue was
+    interrupted by a container restart; reason = its queue_summary.json's (a halt says why)."""
     if rc == EXIT_OK:
-        return "destroy", "trainer finished (exit 0)"
-    if rc == EXIT_THROUGHPUT:
-        return "stop", "throughput below the floor (exit 3)"
-    what = "interrupted by a container restart" if rc is None else f"exit {rc}"
-    if summary == "complete":
-        return "destroy", f"trainer finished (summary complete, {what})"
-    if n_failures >= MAX_FAILURES:
-        return "stop", f"second failure ({what}) at step {step}"
-    if step < MIN_RESUME_STEP:
-        return "stop", f"failed before step {MIN_RESUME_STEP} ({what} at step {step})"
-    if full_state is None:
-        return "stop", f"failed at step {step} ({what}) with no local full state to resume from"
-    return "resume", f"first failure ({what}) at step {step}; resuming from {full_state.name}"
-
-
-def is_chain_summary(summary) -> bool:
-    return isinstance(summary, dict) and summary.get("kind") == "chain" and summary.get("box") in CHAIN_NAMES
-
-
-def decide_queue(rc: int | None, n_failures: int, reason: str | None = None,
-                 summary: dict | None = None) -> tuple[str, str]:
-    """The study queue's policy -> (action, reason), action in {"destroy", "stop", "restart"}. rc None = the queue was
-    interrupted by a container restart; reason = its queue_summary.json's (a halt says why). A chain box's exit 5 with
-    its chain summary (kind chain, a CHAIN_NAMES box, status gate_failed or failed) destroys: it ended before its last
-    stage trained, and finish.py verifies its records on the Hub before the destroy."""
-    if rc == EXIT_CHAIN_DESTROY and is_chain_summary(summary) and summary.get("status") in CHAIN_DESTROY_STATUSES:
-        return "destroy", f"chain ended before box 1 trained: {reason or summary.get('reason') or 'see its summary'}"
-    if rc == EXIT_OK:
-        return "destroy", "study queue finished (exit 0)"
+        return "destroy", "queue finished (exit 0)"
     if rc == EXIT_HALT:
-        return "stop", f"study queue halted by a pre-registered rule: {reason or 'see queue_summary.json'}"
-    if rc == EXIT_THROUGHPUT:
-        return "stop", f"study queue: throughput below the floor (exit 3): {reason or ''}".rstrip(": ")
+        return "stop", f"queue halted (exit 4): {reason or 'see queue_summary.json'}"
     what = "interrupted by a container restart" if rc is None else f"exit {rc}"
     if n_failures > MAX_QUEUE_RESTARTS:
-        return "stop", f"study queue failed {n_failures} times ({what}): {reason or 'see queue_summary.json'}"
-    return "restart", f"study queue failed ({what}); restarting it (it resumes from its state)"
+        return "stop", f"queue failed {n_failures} times ({what}): {reason or 'see queue_summary.json'}"
+    return "restart", f"queue failed ({what}); restarting it (it resumes from its state)"
 
 
 def queue_reason(state_dir: Path) -> str | None:
@@ -175,25 +97,9 @@ def queue_reason(state_dir: Path) -> str | None:
         return None
 
 
-def queue_summary(state_dir: Path) -> dict | None:
-    """$KITSUNE_STATE/queue_summary.json (the queue's, or a chain's controller summary), or None."""
-    try:
-        doc = json.loads((state_dir / "queue_summary.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return doc if isinstance(doc, dict) else None
-
-
-def attempt_stage(state_dir: Path):
-    """The chain stage the controller was in (its summary's stage), or None (not a chain: every attempt shares the one
-    restart budget, as before)."""
-    summ = queue_summary(state_dir)
-    return summ.get("stage") if is_chain_summary(summ) else None
-
-
 def beating(hb: Path | None, timeout: float):
-    """A full box's bounded controller beat around one finish.py call (kitsune.heartbeat.beating, max_s = timeout +
-    60 s); a plain context without hb (the study box, the trainer path)."""
+    """The bounded controller beat around one finish.py call (kitsune.heartbeat.beating, max_s = timeout + 60 s); a
+    plain context without hb."""
     if hb is None:
         return contextlib.nullcontext()
     from kitsune import heartbeat
@@ -202,10 +108,9 @@ def beating(hb: Path | None, timeout: float):
 
 
 def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = False, *, hb: Path | None = None) -> int:
-    """The study box and the full-data runs' boxes: run the queue, restart it after a failure (decide_queue), then the
-    final finish.py call. The history (attempts with rc, the final decision) and its crash handling are the trainer
-    path's (supervise). hb: the controllers' heartbeat file a full box's watchdog reads, beaten around the finish.py
-    calls (none for the study box)."""
+    """Run the queue, restart it after a failure (decide_queue), then the final finish.py call; the history (attempts
+    with rc, the final decision) and its crash handling as the module docstring says. hb: the controllers' heartbeat
+    file the box's watchdog reads, beaten around the finish.py calls."""
     lock = wait_for_lock(state_path.with_suffix(".lock"))
     if lock is None:
         log(f"another supervisor holds {state_path.with_suffix('.lock')}; not starting a second one")
@@ -229,14 +134,12 @@ def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = Fals
         return 0
     for a in state["attempts"]:
         if "rc" not in a:  # the container died while the queue ran
-            a.update(rc=None, interrupted=True, stage=attempt_stage(state_path.parent))
+            a.update(rc=None, interrupted=True)
     while True:
         if state["attempts"]:
             last = state["attempts"][-1]
-            # a chain's restart budget is per stage (the attempt's stage from the chain summary; None elsewhere)
-            failures = sum(1 for a in state["attempts"] if a["rc"] != EXIT_OK and a.get("stage") == last.get("stage"))
-            action, reason = decide_queue(last["rc"], failures, queue_reason(state_path.parent),
-                                          queue_summary(state_path.parent))
+            failures = sum(1 for a in state["attempts"] if a["rc"] != EXIT_OK)
+            action, reason = decide_queue(last["rc"], failures, queue_reason(state_path.parent))
             log(f"decision after queue attempt {len(state['attempts'])}: {action} ({reason})")
             if action != "restart":
                 state["final"] = {"action": action, "reason": reason, "wall": time.time()}
@@ -248,83 +151,20 @@ def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = Fals
         save_state(state_path, state)
         env = dict(os.environ, KITSUNE_ATTEMPT=str(len(state["attempts"])))
         oom0 = oom_kills()
-        rc = run_trainer(queue_cmd, env)
+        rc = run_queue(queue_cmd, env)
         oom1 = oom_kills()
-        attempt.update(rc=rc, t1=time.time(), stage=attempt_stage(state_path.parent),
-                       oom_kills=oom1 - oom0 if oom0 is not None and oom1 is not None else None)
+        attempt.update(rc=rc, t1=time.time(), oom_kills=oom1 - oom0 if oom0 is not None and oom1 is not None else None)
         save_state(state_path, state)
         log(f"queue attempt {len(state['attempts'])} exited {rc} after {(attempt['t1'] - attempt['t0']) / 60:.1f} min")
-        # the stop and destroy paths sync everything anyway (a chain's exit 5: its destroy)
-        if rc not in (EXIT_OK, EXIT_HALT, EXIT_THROUGHPUT, EXIT_CHAIN_DESTROY):
+        # the stop and destroy paths sync everything anyway
+        if rc not in (EXIT_OK, EXIT_HALT):
             with beating(hb, SYNC_TIMEOUT_S):
                 call_finish(["--sync-only", *dry], timeout=SYNC_TIMEOUT_S)
 
 
-def find_run_dir(runs_root: Path, since: float) -> Path | None:
-    """The run dir the trainer created or touched since `since` (newest config.json wins), else None. Never an older
-    one: after --rearm the previous run's dirs (and full states) stay under runs/, and a fresh attempt that died
-    before writing its config.json would otherwise be credited with the old run's step and resumed from its state."""
-    if not runs_root.is_dir():
-        return None
-    cands = [d for d in runs_root.iterdir() if d.is_dir() and (d / "config.json").exists()]
-    cands = [d for d in cands if max((d / "config.json").stat().st_mtime, d.stat().st_mtime) >= since - 5]
-    return max(cands, key=lambda d: (d / "config.json").stat().st_mtime) if cands else None
-
-
-def tail_lines(path: Path, nbytes: int = TAIL_BYTES) -> list[str]:
-    if not path.exists():
-        return []
-    with open(path, "rb") as f:
-        f.seek(max(0, path.stat().st_size - nbytes))
-        return f.read().decode("utf-8", "replace").splitlines()
-
-
-def last_step(run_dir: Path | None) -> int:
-    """Highest optimizer step logged: tail of metrics/scalars.jsonl, else events.jsonl, else 0."""
-    if run_dir is None:
-        return 0
-    for rel in ("metrics/scalars.jsonl", "events.jsonl"):
-        steps = []
-        for line in tail_lines(run_dir / rel):
-            try:
-                s = json.loads(line).get("step")
-            except (json.JSONDecodeError, AttributeError):
-                continue  # the first line of a tail is usually cut; a torn last line is possible after a crash
-            if isinstance(s, (int, float)):
-                steps.append(int(s))
-        if steps:
-            return max(steps)
-    return 0
-
-
-def summary_status(run_dir: Path | None) -> str | None:
-    """The status in runs/<id>/summary.json ("complete" once the final eval and verdict are written; "failed" after a
-    Python exception, which rewrites it); None without a readable one."""
-    if run_dir is None:
-        return None
-    try:
-        status = json.loads((run_dir / "summary.json").read_text(encoding="utf-8")).get("status")
-    except (OSError, ValueError, AttributeError):
-        return None
-    return status if isinstance(status, str) else None
-
-
-def latest_full_state(run_dir: Path | None) -> Path | None:
-    return newest_checkpoint(run_dir / "checkpoints", FULL_RE) if run_dir else None
-
-
-def train_argv(train_cmd: list[str], config: str, out_repo: str | None, resume: Path | None) -> list[str]:
-    argv = [*train_cmd, "--config", config]
-    if out_repo:
-        argv += ["--set", f"hf.output_repo={out_repo}"]
-    if resume is not None:
-        argv += ["--resume", str(resume)]
-    return argv
-
-
 def oom_kills(cg: Path | None = None) -> int | None:
     """The container's OOM-kill counter (cgroup v2 memory.events, else v1 memory.oom_control); None without one. The
-    rc names an OOM kill only when it hit the trainer itself (-9): one that took a DataLoader worker ends the trainer
+    rc names an OOM kill only when it hit the process itself (-9): one that took a DataLoader worker ends a trainer
     with a plain error, and the host-wide RAM numbers in its logs do not show the container's own limit."""
     cg = cg or CGROUP
     for rel in ("memory.events", "memory/memory.oom_control"):
@@ -338,7 +178,7 @@ def oom_kills(cg: Path | None = None) -> int | None:
     return None
 
 
-def run_trainer(argv: list[str], env: dict) -> int:
+def run_queue(argv: list[str], env: dict) -> int:
     log(f"run: {shlex.join(argv)}")
     return subprocess.run(argv, cwd=ROOT, env=env).returncode
 
@@ -354,8 +194,8 @@ def call_finish(args: list[str], timeout: float | None = None) -> int:
 
 
 def final_finish(action: str, reason: str, dry: list[str], hb: Path | None = None):
-    """The final finish.py --stop/--destroy, bounded; `finish.py --stop --no-sync` after a timeout or failure. hb: a
-    full box's controller heartbeat, beaten (bounded) while each call runs."""
+    """The final finish.py --stop/--destroy, bounded; `finish.py --stop --no-sync` after a timeout or failure. hb: the
+    box's controller heartbeat, beaten (bounded) while each call runs (vast/label.py passes none)."""
     with beating(hb, FINISH_TIMEOUT_S[action]):
         rc = call_finish([f"--{action}", "--reason", reason, *dry], timeout=FINISH_TIMEOUT_S[action])
     log(f"finish exited {rc}")
@@ -370,8 +210,8 @@ def final_finish(action: str, reason: str, dry: list[str], hb: Path | None = Non
 def load_state(path: Path, required: str = "attempts") -> dict:
     """The attempt history (none yet: a fresh one). A file that is not one - empty or NUL-filled after an unclean host
     crash, torn bytes, a disk fault, a bad hand edit - is moved aside to <name>.corrupt-<unix time> and flagged
-    ("corrupt": where it went): the history it held is unknown (a final decision? a resume already used?), so
-    supervise() stops the box instead of starting a fresh run. `required` is the key every valid state has:
+    ("corrupt": where it went): the history it held is unknown (a final decision? the restarts already used?), so
+    supervise_queue() stops the box instead of starting the queue afresh. `required` is the key every valid state has:
     "attempts" (a list) for this supervisor, "phase" for vast/label.py (whose fresh state is {"phase": None,
     "final": None})."""
     fresh = {"attempts": [], "final": None} if required == "attempts" else {required: None, "final": None}
@@ -421,8 +261,8 @@ def save_state(path: Path, state: dict):
 
 
 def acquire_lock(path: Path):
-    """Exclusive, non-blocking flock held for the supervisor's lifetime (by the returned file object; the trainer
-    does not inherit it). None if another process holds it. Without fcntl (Windows) there is nothing to guard."""
+    """Exclusive, non-blocking flock held for the supervisor's lifetime (by the returned file object; the queue does
+    not inherit it). None if another process holds it. Without fcntl (Windows) there is nothing to guard."""
     try:
         import fcntl
     except ImportError:
@@ -458,112 +298,25 @@ def wait_for_lock(path: Path, wait_s: float | None = None, poll_s: float | None 
     return lock
 
 
-def attempt_run_dir(a: dict, runs_root: Path) -> Path | None:
-    """The run dir of a recorded attempt: stored when it ended; for one interrupted by a restart, the --resume path's
-    run dir, else the run dir created or touched since the attempt started."""
-    if a.get("run_dir"):
-        return Path(a["run_dir"])
-    if a.get("resume"):
-        return Path(a["resume"]).parent.parent  # runs/<id>/checkpoints/full_step_<N>
-    return find_run_dir(runs_root, a["t0"])
-
-
-def supervise(config: str, out_repo: str | None, runs_root: Path, train_cmd: list[str], state_path: Path,
-              dry_run: bool = False) -> int:
-    lock = wait_for_lock(state_path.with_suffix(".lock"))  # held until this function returns
-    if lock is None:
-        log(f"another supervisor holds {state_path.with_suffix('.lock')}; not starting a second one")
-        return 0
-    state = load_state(state_path)
-    dry = ["--dry-run"] if dry_run else []
-    aside = state.pop("corrupt", None)
-    if aside:  # the history is unknown: stop (the disk stays for a human), never a fresh run
-        reason = f"supervise.json unreadable (moved to {aside}); attempt history unknown"
-        state["final"] = {"action": "stop", "reason": reason, "wall": time.time(), "corrupt_state": aside}
-        save_state(state_path, state)  # before acting: a restart replays this stop instead of finding no history
-        log(f"decision: stop ({reason})")
-        final_finish("stop", reason, dry)
-        return 1
-    final = state.get("final")
-    if final:
-        log(f"a final decision is already recorded ({final}); not starting another run")
-        if not state_path.with_name("halt").exists():  # $KITSUNE_STATE/halt in production, as finish.py writes it
-            log("no halt marker: the container restarted before finish acted on that decision; running it again")
-            final_finish(final["action"], final.get("reason", ""), dry)
-        return 0
-    for a in state["attempts"]:
-        if "rc" not in a:  # the container died while this attempt was running
-            rd = attempt_run_dir(a, runs_root)
-            a.update(rc=None, interrupted=True, run_dir=str(rd) if rd else None, step=last_step(rd))
-            if summary_status(rd) == "complete":
-                a["summary"] = "complete"
-
-    while True:
-        resume = None
-        if state["attempts"]:
-            last = state["attempts"][-1]
-            run_dir = Path(last["run_dir"]) if last.get("run_dir") else None
-            failures = sum(1 for a in state["attempts"] if a["rc"] != EXIT_OK)
-            full = latest_full_state(run_dir) if last["rc"] != EXIT_OK else None
-            action, reason = decide(last["rc"], last["step"], failures, full, last.get("summary"))
-            log(f"decision after attempt {len(state['attempts'])}: {action} ({reason})")
-            if action != "resume":
-                state["final"] = {"action": action, "reason": reason, "wall": time.time()}
-                save_state(state_path, state)
-                final_finish(action, reason, dry)
-                return last["rc"] if last["rc"] is not None else 1
-            resume = full
-
-        attempt = {"t0": time.time(), "resume": str(resume) if resume else None}
-        state["attempts"].append(attempt)
-        save_state(state_path, state)
-        env = dict(os.environ, KITSUNE_ATTEMPT=str(len(state["attempts"])))
-        oom0 = oom_kills()
-        rc = run_trainer(train_argv(train_cmd, config, out_repo, resume), env)
-        oom1 = oom_kills()
-        run_dir = attempt_run_dir(attempt, runs_root)
-        attempt.update(rc=rc, t1=time.time(), run_dir=str(run_dir) if run_dir else None, step=last_step(run_dir),
-                       oom_kills=oom1 - oom0 if oom0 is not None and oom1 is not None else None)
-        if rc not in (EXIT_OK, EXIT_THROUGHPUT) and summary_status(run_dir) == "complete":
-            attempt["summary"] = "complete"  # recorded, so a supervisor restart replays the same decision
-        save_state(state_path, state)
-        oom = f" (oom_kill +{attempt['oom_kills']})" if attempt["oom_kills"] else ""
-        done = "; its summary.json is complete" if attempt.get("summary") else ""
-        log(f"attempt {len(state['attempts'])} exited {rc}{oom} at step {attempt['step']} after "
-            f"{(attempt['t1'] - attempt['t0']) / 60:.1f} min (run dir {run_dir}){done}")
-        if rc != EXIT_OK and not attempt.get("summary"):  # a finished run's --destroy syncs everything anyway
-            call_finish(["--sync-only", "--no-full", *dry], timeout=SYNC_TIMEOUT_S)
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--config", default=os.environ.get("KITSUNE_CONFIG", "configs/viability.json"))
-    ap.add_argument("--out-repo", default=os.environ.get("KITSUNE_OUT_REPO") or None)
-    ap.add_argument("--runs-root", default=str(ROOT / "runs"))
     ap.add_argument("--state", default=str(Path(os.environ.get("KITSUNE_STATE", "/workspace/kitsune_state")) / "supervise.json"))
-    ap.add_argument("--train-cmd", default=None, help="override the trainer command (default: python scripts/04_distill.py)")
-    ap.add_argument("--dry-run", action="store_true", help="run the trainer, but finish.py only prints (no stop/destroy)")
-    ap.add_argument("--queue", action="store_true", default=os.environ.get("KITSUNE_JOB") in QUEUE_JOBS,
-                    help="a queue box: run kitsune.study_queue (KITSUNE_JOB=study) or kitsune.full_queue "
-                         "(KITSUNE_JOB=full) for KITSUNE_BOX (the default for those jobs)")
+    ap.add_argument("--queue-cmd", default=None,
+                    help="override the queue command (default: python -m kitsune.full_queue run --box $KITSUNE_BOX)")
+    ap.add_argument("--dry-run", action="store_true", help="run the queue, but finish.py only prints (no stop/destroy)")
     args = ap.parse_args(argv)
 
-    if args.queue and os.environ.get("KITSUNE_JOB") == "full":
-        box = os.environ.get("KITSUNE_BOX") or ""
-        queue_cmd = shlex.split(args.train_cmd) if args.train_cmd else [sys.executable, "-m", "kitsune.full_queue",
-                                                                         "run", "--box", box]
-        hb = Path(args.state).parent / "train_hb"  # kitsune.fullrun.TRAIN_HB in $KITSUNE_STATE
-        log(f"full queue: box={box} out_repo={args.out_repo} state={args.state} dry_run={args.dry_run}")
-        return supervise_queue(queue_cmd, Path(args.state), args.dry_run, hb=hb)
-    if args.queue:
-        box = os.environ.get("KITSUNE_BOX") or ""
-        queue_cmd = shlex.split(args.train_cmd) if args.train_cmd else [sys.executable, "-m", "kitsune.study_queue",
-                                                                         "run", "--box", box]
-        log(f"study queue: box={box} out_repo={args.out_repo} state={args.state} dry_run={args.dry_run}")
-        return supervise_queue(queue_cmd, Path(args.state), args.dry_run)
-    train_cmd = shlex.split(args.train_cmd) if args.train_cmd else [sys.executable, str(ROOT / "scripts" / "04_distill.py")]
-    log(f"config={args.config} out_repo={args.out_repo} state={args.state} dry_run={args.dry_run}")
-    return supervise(args.config, args.out_repo, Path(args.runs_root), train_cmd, Path(args.state), args.dry_run)
+    if os.environ.get("KITSUNE_JOB") != "full":
+        log(f"KITSUNE_JOB is {os.environ.get('KITSUNE_JOB')!r}: this supervisor runs a full-data box's queue "
+            f"(KITSUNE_JOB=full)")
+        return 2
+    box = os.environ.get("KITSUNE_BOX") or ""
+    queue_cmd = shlex.split(args.queue_cmd) if args.queue_cmd else [sys.executable, "-m", "kitsune.full_queue", "run",
+                                                                     "--box", box]
+    hb = Path(args.state).parent / "train_hb"  # kitsune.fullrun.TRAIN_HB in $KITSUNE_STATE
+    log(f"full queue: box={box} out_repo={os.environ.get('KITSUNE_OUT_REPO')} state={args.state} "
+        f"dry_run={args.dry_run}")
+    return supervise_queue(queue_cmd, Path(args.state), args.dry_run, hb=hb)
 
 
 if __name__ == "__main__":

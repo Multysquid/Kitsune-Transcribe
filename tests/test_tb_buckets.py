@@ -1,18 +1,15 @@
 """TensorBoard buckets: every tag the trainer logs goes to TensorBoard under 1_operational/, 2_loss_accuracy/ or 3_misc/
-(kitsune.runlog.TB_BUCKET_RULES) while the open-format files keep the logged tag, and tools/regroup_tb.py rebuilds the
-event files of an existing run in that layout from its open files. The tags of a real laptop run are frozen in
-tests/tb_tags_overfit_1s.json, with the tags the eval-cadence change (mini evals, headline summary/*) and the
-combined-loss change (combined_loss/*) add to that run, and must each land where the owner's table below puts them.
-Every event file carries the Custom Scalars chart that overlays the combined-loss curves (TB_LAYOUT), its regexes
-matching exactly those curves' bucketed tags. CPU only."""
+(kitsune.runlog.TB_BUCKET_RULES) while the open-format files keep the logged tag, and tools/export_run.py gives the
+logged tag back. The tags of a real laptop run are frozen in tests/tb_tags_overfit_1s.json, with the tags the
+eval-cadence change (mini evals, headline summary/*) and the combined-loss change (combined_loss/*) add to that run, and
+must each land where the owner's table below puts them. Every event file carries the Custom Scalars chart that overlays
+the combined-loss curves (TB_LAYOUT), its regexes matching exactly those curves' bucketed tags. CPU only."""
 import contextlib
 import importlib.util
 import json
 import os
 import re
-import shutil
 import sys
-import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -365,7 +362,7 @@ def test_unmatched_and_colliding_tags_go_to_misc_once():
     assert TagMapper(tm.to_json()).lookup("samples", "scalars")["tb_tag"] == "2_loss_accuracy/samples"
 
 
-# ---------------------------------------------------------------------------------------------- regroup
+# ------------------------------------------------------------------------------------ runs, TensorBoard, export
 
 
 def tb_view(run: Path) -> dict[str, pd.DataFrame]:
@@ -400,18 +397,18 @@ def old_purge_step(self, resume, first):
     return self.step + 1 if resume else None
 
 
-def make_run(path: Path, *, flat: bool | str = False, monkeypatch=None, summary: dict | None = None,
-             first_start: bool | None = None, combined: bool = False) -> Path:
-    """A run with a resume from step 3 (steps 4-5 logged twice), histograms, text, an unmapped tag. flat=True logs the
-    way the logger did before the buckets (logged tags in TensorBoard, no tag_map.json); flat="first" only the first
-    launch, so the resume with the bucketed logger mixes both layouts in tb/. first_start=False (the default of a flat
-    run, which is older still) opens the first launch's event file without the SessionLog.START at step 0, as every
-    logger did before RunLogger._tb_purge_step. combined=True also logs the combined-loss chart's train curve
+def make_run(path: Path, *, flat_first: bool = False, monkeypatch=None, first_start: bool = True,
+             combined: bool = False) -> Path:
+    """A run with a resume from step 3 (steps 4-5 logged twice), histograms, text, an unmapped tag. flat_first=True
+    logs the first launch the way the logger did before the buckets (logged tags in TensorBoard, no tag_map.json), so
+    the resume with the bucketed logger mixes both layouts in tb/. first_start=False (implied by flat_first: such a
+    run is older still) opens the first launch's event file without the SessionLog.START at step 0, as every logger
+    did before RunLogger._tb_purge_step. combined=True also logs the combined-loss chart's train curve
     (combined_loss/train) at every step, as the trainer does since the combined loss; without it the run is one logged
     before that, as far as the chart goes."""
-    old = not (first_start if first_start is not None else not flat)
-    with monkeypatch.context() if flat or old else contextlib.nullcontext() as mp:
-        if flat:
+    old = flat_first or not first_start
+    with monkeypatch.context() if old else contextlib.nullcontext() as mp:
+        if flat_first:
             mp.setattr(RunLogger, "_tb_tag", lambda self, tag, plugin: tag)
         if old:
             mp.setattr(RunLogger, "_tb_purge_step", old_purge_step)
@@ -426,7 +423,7 @@ def make_run(path: Path, *, flat: bool | str = False, monkeypatch=None, summary:
                 state = log.state_dict()
         log.text("note", "hello", 5)
         log.close()
-        if flat == "first":
+        if flat_first:
             mp.undo()
         time.sleep(0.05)
         log = RunLogger(path, CFG, sync_every_min=60, capture=False, tee=False, resume=state)
@@ -435,78 +432,23 @@ def make_run(path: Path, *, flat: bool | str = False, monkeypatch=None, summary:
                           **({"combined_loss/train": 15.0 / s} if combined else {})}, s)
             log.hist("weight/enc0", torch.randn(1000, generator=g), s)
         log.samples(6, [dict(id="a", cer_ref=0.5, cer_teacher=0.5, ref="あい", teacher_hyp="あい", hyp="あう")])
-        log.close(summary=summary if summary is not None else {"status": "complete"})
+        log.close(summary={"status": "complete"})
     return path
 
 
-def test_regroup_a_flat_run(tmp_path, monkeypatch, capsys):
-    run = make_run(tmp_path / "runs" / "flat", flat=True, monkeypatch=monkeypatch)
-    assert not (run / "metrics" / "tag_map.json").exists()
-    before = tb_view(run)
-    assert "loss/kl" in set(before["tb_scalars"]["tag"])  # a flat run: bucket columns say where regroup puts it
-    assert before["tb_scalars"].set_index("tag").loc["loss/kl", "tb_tag"].iloc[0] == "2_loss_accuracy/train_loss/kl"
-    originals = sorted(p.name for p in (run / "tb").iterdir())
-    rg = load_tool("regroup_tb")
-    assert rg.main([str(run)]) == 0
-    out = capsys.readouterr().out
-    assert "2_loss_accuracy" in out and "1 resume purge" in out and "scalars:weird" in out
-    # logged before the combined loss (no combined_loss/* tag): no combined-loss chart, which would stay empty
-    assert "Custom Scalars charts: none (the run logged none of their curves)" in out
-
-    files = sorted(p.name for p in (run / "tb").iterdir())
-    assert [f for f in files if "tfevents" in f and f.endswith(".regrouped")] and len(files) == len(originals) + 1
-    (rebuilt,) = [run / "tb" / f for f in files if f.endswith(".regrouped")]
-    assert tb_layouts(rebuilt) == []
-    assert sorted(f for f in files if f.endswith(".bak")) == sorted(rg.backup_name(f) for f in originals)
-    assert not any("tfevents" in f for f in files if f.endswith(".bak"))  # TensorBoard skips them
-    after = tb_view(run)
-    for k in before:  # the same points, steps 4-5 of the first launch purged as before; only the TB tags changed
-        assert before[k].equals(after[k]), k
-    s = after["tb_scalars"]
-    assert s["step"][s["tag"] == "loss/kl"].tolist() == [1, 2, 3, 4, 5, 6]
-    assert s["value"][s["tag"] == "loss/kl"].tolist() == pytest.approx([1, 1 / 2, 1 / 3, 10 / 4, 10 / 5, 10 / 6])
-
-    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
-    acc = EventAccumulator(str(run / "tb"))
-    acc.Reload()
-    assert set(acc.Tags()["scalars"]) == {"2_loss_accuracy/train_loss/kl", "1_operational/opt/lr",
-                                          "3_misc/layers/grad_norm/enc0", "3_misc/weird"}
-    assert acc.Tags()["histograms"] == ["3_misc/weight/enc0"]
-    assert {"1_operational/config/text_summary", "2_loss_accuracy/samples/text_summary", "3_misc/note/text_summary",
-            "1_operational/events/logger_start/text_summary"} <= set(acc.Tags()["tensors"])
-    tag_map = load_tag_map(run / "metrics" / "tag_map.json")
-    assert tag_map["loss/kl"]["tb_tag"] == "2_loss_accuracy/train_loss/kl" and tag_map["weird"]["unmapped"] is True
-
-    # idempotent: a second run rebuilds from the open files, the originals stay as they are, never two copies
-    res = rg.regroup(run)
-    files2 = sorted(p.name for p in (run / "tb").iterdir())
-    assert [f for f in files2 if f.endswith(".bak")] == [f for f in files if f.endswith(".bak")]
-    assert len([f for f in files2 if f.endswith(".regrouped")]) == 1 and len(files2) == len(files)
-    assert all(tb_view(run)[k].equals(after[k]) for k in after)
-    assert res["counts"]["2_loss_accuracy"]["scalars"] == 1 and res["counts"]["3_misc"]["histograms"] == 1
-    assert res["records"]["purge"] == 1 and res["unmapped"] == ["scalars:weird", "text:note"]
-
-
-def test_regroup_a_bucketed_run_changes_nothing_visible(tmp_path):
-    """A run the new logger wrote (tags bucketed already, tb_tag_unmapped events among its events) rebuilds to the
-    same TensorBoard view."""
+def test_a_resumed_run_names_each_unmapped_tag_once(tmp_path):
+    """A run the logger wrote (tags bucketed, a resume from step 3): one tb_tag_unmapped event per unmapped tag across
+    both launches, and the export gives every TensorBoard tag back as the logged one."""
     run = make_run(tmp_path / "runs" / "new")
     ev = [json.loads(x)["kind"] for x in (run / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert ev.count("tb_tag_unmapped") == 2  # weird and note, each once, across both launches
-    before = tb_view(run)
-    assert set(before["tb_scalars"]["tag"]) == {"loss/kl", "opt/lr", "layers/grad_norm/enc0", "weird"}
-    load_tool("regroup_tb").regroup(run)
-    after = tb_view(run)
-    for k in before:
-        assert before[k].equals(after[k]), k
+    assert set(tb_view(run)["tb_scalars"]["tag"]) == {"loss/kl", "opt/lr", "layers/grad_norm/enc0", "weird"}
 
 
-def test_every_launch_writes_the_chart_and_regroup_keeps_it(tmp_path):
+def test_every_launch_writes_the_chart(tmp_path):
     """The logger writes TB_LAYOUT into its event file once per launch (the resume opens a second file, with a purge of
     the steps after the restored one: the chart at step 0 survives it); TensorBoard's Custom Scalars tab finds it in
-    the run, and a rebuild by regroup_tb of a run that logged a combined-loss curve writes it into its one file again.
-    The export's tables leave it out."""
+    the run. The export's tables leave it out."""
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
     run = make_run(tmp_path / "runs" / "chart", combined=True)
@@ -516,44 +458,10 @@ def test_every_launch_writes_the_chart_and_regroup_keeps_it(tmp_path):
     acc.Reload()
     assert LAYOUT_TAG in acc.Tags()["tensors"] and acc.Tensors(LAYOUT_TAG)[0].step == 0
     assert not any(LAYOUT_TAG in set(df["tag"]) for df in tb_view(run).values())
-    res = load_tool("regroup_tb").regroup(run)
-    (rebuilt,) = [p for p in (run / "tb").iterdir() if p.name.endswith(".regrouped")]
-    assert tb_layouts(rebuilt) == [(0, layout_as_written())] and res["charts"] == ["combined_loss: train vs val"]
-
-
-def test_regroup_writes_the_chart_only_for_a_run_that_logged_its_curves(tmp_path, capsys):
-    """Decision 8.18 (show it only if logged): a run logged before the combined loss has no combined_loss/* tag, so
-    regroup_tb leaves the combined-loss chart out of the rebuilt file - it would stay empty - though the run's own
-    event files carry it (every launch of the logger writes it, before any tag is known: a new run is unchanged). One
-    combined-loss curve is enough for the whole chart; drawn_layout picks the charts by the bucketed tags their
-    regexes match."""
-    rg = load_tool("regroup_tb")
-    old = make_run(tmp_path / "runs" / "old")
-    assert all(tb_layouts(f) == [(0, layout_as_written())] for f in (old / "tb").glob("*tfevents*"))
-    assert rg.main([str(old)]) == 0
-    assert "Custom Scalars charts: none (the run logged none of their curves)" in capsys.readouterr().out
-    (rebuilt,) = (old / "tb").glob("*.regrouped")
-    assert tb_layouts(rebuilt) == []
-    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-
-    acc = EventAccumulator(str(old / "tb"))
-    acc.Reload()
-    assert LAYOUT_TAG not in acc.Tags()["tensors"]  # the originals' copies went with them into the .bak files
-
-    new = make_run(tmp_path / "runs" / "new", combined=True)
-    assert rg.main([str(new)]) == 0
-    assert "Custom Scalars charts: combined_loss: train vs val" in capsys.readouterr().out
-    (rebuilt,) = (new / "tb").glob("*.regrouped")
-    assert tb_layouts(rebuilt) == [(0, layout_as_written())]
-
-    assert rg.drawn_layout([]) == {} and rg.drawn_layout(["loss/kl", "loss/objective", "summary/full/val_cer"]) == {}
-    for tag in COMBINED_LOSS_TAGS:
-        assert rg.drawn_layout(["loss/kl", tag]) == TB_LAYOUT, tag
 
 
 def starts(tb_file) -> list[int]:
-    """The steps of the SessionLog.START events in one event file (SummaryWriter's purge_step, regroup_tb's replayed
-    purges)."""
+    """The steps of the SessionLog.START events in one event file (SummaryWriter's purge_step)."""
     from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
     from tensorboard.compat.proto.event_pb2 import SessionLog
 
@@ -565,18 +473,11 @@ def test_the_tensorboard_server_drops_the_steps_a_resume_discarded(tmp_path, mon
     """After a crash and resume the server, not only the export's reader, drops the steps after the restored one, so a
     chart (the combined-loss one among them) does not double back at the resume: the logger opens the run's first event
     file with a SessionLog.START at step 0, and the server, which takes a run's first START for its start and ignores
-    it, purges on the resume's. A run logged before that (first_start=False) showed steps 4-5 of both launches in the
-    server while the export's EventAccumulator dropped the first launch's; tools/regroup_tb.py rebuilds it into one file
-    that opens with the same START, and the server then shows what the export shows."""
+    it, purges on the resume's. A run logged before that (first_start=False) shows steps 4-5 of both launches in the
+    server while the export's EventAccumulator drops the first launch's."""
     def export_view(run):
         s = tb_view(run)["tb_scalars"]
         return {t: list(zip(g["step"].tolist(), g["value"].tolist())) for t, g in s.groupby("tb_tag")}
-
-    def same(a, b):
-        assert a.keys() == b.keys()
-        for t in a:
-            assert [s for s, _ in a[t]] == [s for s, _ in b[t]], t
-            assert [v for _, v in a[t]] == pytest.approx([v for _, v in b[t]]), t
 
     kl = "2_loss_accuracy/train_loss/kl"
     run = make_run(tmp_path / "runs" / "new")
@@ -584,221 +485,37 @@ def test_the_tensorboard_server_drops_the_steps_a_resume_discarded(tmp_path, mon
     view = server_view(run)
     assert view[kl] == [(s, pytest.approx(v)) for s, v in [(1, 1), (2, 1 / 2), (3, 1 / 3), (4, 10 / 4), (5, 10 / 5),
                                                              (6, 10 / 6)]]
-    same(view, export_view(run))
+    exported = export_view(run)
+    assert view.keys() == exported.keys()
+    for t in view:
+        assert [s for s, _ in view[t]] == [s for s, _ in exported[t]], t
+        assert [v for _, v in view[t]] == pytest.approx([v for _, v in exported[t]]), t
     assert len(view) == 4 and all([s for s, _ in pts] == [1, 2, 3, 4, 5, 6] for pts in view.values())
 
     old = make_run(tmp_path / "runs" / "old", monkeypatch=monkeypatch, first_start=False)
     assert [starts(f) for f in sorted((old / "tb").glob("*tfevents*"))] == [[], [4]]
     assert [s for s, _ in server_view(old)[kl]] == [1, 2, 3, 4, 5, 4, 5, 6]  # the resume's START ignored
-    exported = export_view(old)
-    assert [s for s, _ in exported[kl]] == [1, 2, 3, 4, 5, 6]
-    load_tool("regroup_tb").regroup(old)
-    (rebuilt,) = (old / "tb").glob("*.regrouped")
-    assert starts(rebuilt) == [0, 4]  # its own START at step 0, then the resume's purge replayed
-    same(server_view(old), exported)
-    same(export_view(old), exported)
+    assert [s for s, _ in export_view(old)[kl]] == [1, 2, 3, 4, 5, 6]
 
 
-def test_regroup_refuses_a_live_run(tmp_path, monkeypatch, capsys):
-    rg = load_tool("regroup_tb")
-    live = make_run(tmp_path / "runs" / "live", summary={})  # just written, no final status
-    assert "not final" in rg.live_reason(live)
-    with pytest.raises(SystemExit, match="looks live"):
-        rg.regroup(live)
-    assert not list((live / "tb").glob("*.bak"))  # nothing was touched
-    assert rg.live_reason(live, now=time.time() + 400) is None  # quiet for 5 minutes: done
-    (live / "summary.json").unlink()
-    assert "no summary.json" in rg.live_reason(live)
-    done = make_run(tmp_path / "runs" / "done")
-    assert rg.live_reason(done) is None
-    # a resumed run keeps the failed launch's summary.json until it ends
-    summary = (done / "summary.json").read_bytes()
-    (done / "summary.json").write_text('{"status": "failed"}', encoding="utf-8")
-    os.utime(done / "summary.json", (time.time() - 60, time.time() - 60))
-    assert "resumed" in rg.live_reason(done)
-    # a launch that crashed just now (summary.json "failed", newer than every scalar, logger closed) is over unless
-    # it left a full state: then the supervisor relaunches it minutes later, its tb/ file opening before logger_start
-    os.utime(done / "summary.json", None)
-    assert rg.live_reason(done) is None
-    ck = done / "checkpoints" / "full_step_3"
-    ck.mkdir(parents=True)
-    (ck / "trainer.pt").write_bytes(b"")
-    assert "failed" in rg.live_reason(done)
-    with pytest.raises(SystemExit, match="looks live"):
-        rg.regroup(done)
-    assert not list((done / "tb").glob("*.bak"))
-    assert rg.live_reason(done, now=time.time() + 400) is None  # not relaunched within 5 minutes: over
-    (done / "summary.json").write_bytes(summary)
-    assert rg.regroup(live, force=True)["live"]  # --force
-    assert rg.main(["--all", "--runs-root", str(tmp_path / "runs")]) == 0
-    out = capsys.readouterr().out
-    assert f"skipped: {live} looks live" in out and f"{done}: rebuilt" in out and "2 runs under" in out
-    assert len(list((done / "tb").glob("*.regrouped"))) == len(list((live / "tb").glob("*.regrouped"))) == 1
-
-
-def kinds(run: Path) -> list[str]:
-    return [json.loads(x)["kind"] for x in (run / "events.jsonl").read_text(encoding="utf-8").splitlines() if x]
-
-
-def test_regroup_refuses_an_open_logger(tmp_path):
-    """A launch whose last logger_start has no logger_close is live while anything it writes changed in the last 5
-    minutes, even before its first scalar (scalars.jsonl empty) and when only its TensorBoard file moves."""
-    rg = load_tool("regroup_tb")
-    run = tmp_path / "runs" / "open"
-    log = RunLogger(run, CFG, sync_every_min=60, capture=False, tee=False)
-    try:
-        assert (run / "metrics" / "scalars.jsonl").stat().st_size == 0 and rg.logger_open(run) is True
-        assert "no logger_close" in rg.live_reason(run)
-        with pytest.raises(SystemExit, match="looks live"):
-            rg.regroup(run)
-        assert not list((run / "tb").glob("*.bak")) and not list(run.glob(".regroup-*"))
-        assert rg.live_reason(run, now=time.time() + 400) is None  # a killed launch never logs its close: 5 min
-        log.tb.flush()  # nothing left in the writer's queue to land in the event file later
-        old = time.time() - 1000
-        files = [run / f for f in rg.ACTIVITY] + rg.event_files(run / "tb")
-        for f in files:
-            os.utime(f, (old, old))
-        assert rg.live_reason(run) is None
-        os.utime(files[-1], None)  # only the event file was written just now
-        assert f"tb/{files[-1].name} changed" in rg.live_reason(run)
-    finally:
-        log.close()
-    assert rg.logger_open(run) is False and rg.live_reason(run) is None  # closed, no scalar: nothing to wait for
-    bare = tmp_path / "runs" / "bare"  # no events.jsonl at all: its recent writes decide
-    (bare / "metrics").mkdir(parents=True)
-    (bare / "metrics" / "scalars.jsonl").write_text("", encoding="utf-8")
-    assert rg.logger_open(bare) is None and "no logger_start" in rg.live_reason(bare)
-
-
-def _sizes(run: Path) -> dict[str, int]:
-    return {f.name: f.stat().st_size for f in (run / "tb").iterdir()}
-
-
-def test_regroup_puts_back_a_file_that_grows_after_the_rename(tmp_path, monkeypatch, capsys):
-    """--force skips the live check, never the one after the rename: a writer that keeps its event file open goes on
-    writing into the renamed .bak (the rename succeeds on Linux, and on Windows under TensorFlow's writer), so the
-    originals are renamed back and the tool exits non-zero."""
-    rg = load_tool("regroup_tb")
-    run = make_run(tmp_path / "runs" / "busy")
-    before, tag_map = _sizes(run), (run / "metrics" / "tag_map.json").read_bytes()
-    rename = Path.rename
-
-    def rename_then_flush(self, target):  # the writer's next flush lands in the renamed file
-        out = rename(self, target)
-        if str(target).endswith(".bak"):
-            with open(target, "ab") as f:
-                f.write(b"\0")
-        return out
-
-    monkeypatch.setattr(Path, "rename", rename_then_flush)
-    with pytest.raises(rg.BeingWritten, match="run is being written") as e:
-        rg.regroup(run, force=True)
-    assert "renamed back" in str(e.value) and isinstance(e.value, SystemExit)
-    after = _sizes(run)
-    assert after.keys() == before.keys() and all(after[n] == before[n] + 1 for n in before)  # back, with the byte
-    assert not list(run.glob(".regroup-*")) and (run / "metrics" / "tag_map.json").read_bytes() == tag_map
-    with pytest.raises(SystemExit, match="run is being written"):  # the command line: exit status 1 with the message
-        rg.main([str(run), "--force"])
-    assert rg.main(["--all", "--force", "--runs-root", str(tmp_path / "runs")]) == 1
-    assert "1 being written" in capsys.readouterr().out
-    monkeypatch.undo()
-    assert rg.regroup(run)["unmapped"] == ["scalars:weird", "text:note"]  # once the writer is gone it goes through
-
-
-def test_regroup_backs_out_when_a_launch_opens_an_event_file_during_the_rebuild(tmp_path, monkeypatch):
-    """A relaunch that opens its tb/ event file while the rebuild runs is not hidden in a .bak with the originals: the
-    tool backs out before it renames anything, --force or not."""
-    from torch.utils.tensorboard import SummaryWriter
-
-    rg = load_tool("regroup_tb")
-    run = make_run(tmp_path / "runs" / "relaunch")
-    before, tag_map = _sizes(run), (run / "metrics" / "tag_map.json").read_bytes()
-    write, writers = rg._write, []
-
-    def write_then_relaunch(r, out_dir):
-        res = write(r, out_dir)
-        writers.append(SummaryWriter(str(run / "tb"), purge_step=4, flush_secs=3600))  # the resumed RunLogger's
-        return res
-
-    monkeypatch.setattr(rg, "_write", write_then_relaunch)
-    try:
-        with pytest.raises(rg.BeingWritten, match="appeared in tb/ during the rebuild") as e:
-            rg.regroup(run, force=True)
-        assert isinstance(e.value, SystemExit)
-        after = _sizes(run)
-        (opened,) = set(after) - set(before)
-        assert "tfevents" in opened and all(after[n] == before[n] for n in before)  # nothing renamed
-        assert not list(run.glob(".regroup-*")) and (run / "metrics" / "tag_map.json").read_bytes() == tag_map
-    finally:
-        for w in writers:
-            w.close()
-
-
-def test_regroup_with_a_real_writer_holding_the_file(tmp_path):
-    """A SummaryWriter the live check cannot see (no logger, --force) keeps writing to its file during the rebuild: on
-    Windows without TensorFlow the rename itself fails, otherwise the file grows after it; either way tb/ is left as it
-    was and the tool refuses."""
-    from torch.utils.tensorboard import SummaryWriter
-
-    rg = load_tool("regroup_tb")
-    run = make_run(tmp_path / "runs" / "writer")
-    w = SummaryWriter(str(run / "tb"), flush_secs=3600)
-    stop = threading.Event()
-
-    def pump():
-        i = 0
-        while not stop.is_set():
-            w.add_scalar("x", float(i), i)
-            w.flush()
-            i += 1
-            stop.wait(0.1)
-
-    t = threading.Thread(target=pump, daemon=True)
-    t.start()
-    try:
-        names = sorted(_sizes(run))
-        with pytest.raises(rg.BeingWritten, match="run is being written|holds it open"):
-            rg.regroup(run, force=True)
-        assert sorted(_sizes(run)) == names and not list(run.glob(".regroup-*"))
-    finally:
-        stop.set()
-        t.join()
-        w.close()
-
-
-def test_resume_into_a_flat_run_warns_once_and_regroup_unifies_it(tmp_path, monkeypatch):
-    """A run logged before the buckets and resumed with the bucketed logger: one tb_layout_mixed event (not again on
-    the next restart, which finds the tag map), TensorBoard shows both layouts, and regroup_tb leaves one."""
+def test_export_reads_a_flat_run_resumed_with_the_buckets(tmp_path, monkeypatch):
+    """A run logged before the buckets and resumed with the bucketed logger: TensorBoard shows both layouts, and the
+    export gives one series per logged tag. export_run._from_tb maps the flat launch's tags by the tag map the resume
+    wrote, and a tag that only the flat launch logged (note), which no map holds, by TB_BUCKET_RULES."""
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-    run = make_run(tmp_path / "runs" / "mixed", flat="first", monkeypatch=monkeypatch)
-    ev = [json.loads(x) for x in (run / "events.jsonl").read_text(encoding="utf-8").splitlines() if x]
-    mixed = [e for e in ev if e["kind"] == "tb_layout_mixed"]
-    assert len(mixed) == 1 and len(mixed[0]["files"]) == 1 and "tools/regroup_tb.py" in mixed[0]["hint"]
-    assert [e["kind"] for e in ev].index("tb_layout_mixed") == max(i for i, e in enumerate(ev)
-                                                                   if e["kind"] == "logger_start") + 1
-    twin = tmp_path / "twin" / run.name
-    shutil.copytree(run, twin)
-    RunLogger(twin, CFG, sync_every_min=60, capture=False, tee=False).close()  # a later restart: warned already
-    assert kinds(twin).count("tb_layout_mixed") == 1 and kinds(twin)[-1] == "logger_close"
-
+    run = make_run(tmp_path / "runs" / "mixed", flat_first=True, monkeypatch=monkeypatch)
     acc = EventAccumulator(str(run / "tb"))
     acc.Reload()
     assert {"loss/kl", "2_loss_accuracy/train_loss/kl"} <= set(acc.Tags()["scalars"])  # both layouts
-    before = tb_view(run)
-    s = before["tb_scalars"]
+    view = tb_view(run)
+    s = view["tb_scalars"]
     assert s["step"][s["tag"] == "loss/kl"].tolist() == [1, 2, 3, 4, 5, 6]  # one series by logged tag
-    rg = load_tool("regroup_tb")
-    rg.regroup(run)
-    acc = EventAccumulator(str(run / "tb"))
-    acc.Reload()
-    # every tag bucketed; no Custom Scalars layout (TensorBoard's own fixed tag): the resumed launch's logger wrote the
-    # combined-loss chart, but the run logged none of its curves
-    assert all(t.split("/", 1)[0] in TB_BUCKETS for k in ("scalars", "histograms", "tensors") for t in acc.Tags()[k])
-    assert LAYOUT_TAG not in acc.Tags()["tensors"]
-    after = tb_view(run)
-    for k in before:
-        assert before[k].equals(after[k]), k
+    assert set(s.loc[s["tag"] == "loss/kl", "tb_tag"]) == {"2_loss_accuracy/train_loss/kl"}
+    assert "note" not in load_tag_map(run / "metrics" / "tag_map.json")  # the rules' fallback, not the map
+    t = view["tb_text"]
+    assert set(t.loc[t["tag"] == "note", "tb_tag"]) == {"3_misc/note"}
+    assert set(t.loc[t["tag"] == "note", "bucket"]) == {"3_misc"}
 
 
 def test_export_without_tag_map_gives_back_the_logged_tags(tmp_path):

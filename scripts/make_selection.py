@@ -75,8 +75,9 @@ pre-register):
                         (cer(kotoba-whisper hyp2, ref) <= study.neutral_max_cer and a non-empty reference, from the
                         laptop's second_out/galgame/eval-00000.jsonl: --kotoba-galgame), all, and label_box (the label
                         box's own filter: not truncated, agree <= the galgame threshold)
-python -m kitsune.prereg --write study/ --sidecar <selection>.json then fills the PREREG's pending fields; it takes only
-the pre-registered selection (recipe, seed, sources, eval sets, extent and the rule's reazon_large cap).
+The size study's PREREG fill (kitsune.prereg's generator, removed after the study) took its pending fields from this
+sidecar, of the pre-registered selection only (recipe, seed, sources, eval sets, extent and the rule's reazon_large
+cap): study/PREREG.json holds them, frozen.
 
 The full-data runs (a `selection_recipe.full_study` block, kitsune.fullrun.FULL_STUDY: kitsune.fullrun.FULL_DATA for
 labels/full/selections/full_study/full.parquet, SMOKE_DATA for smoke.parquet) keep every kept hour of the label root
@@ -110,13 +111,13 @@ sidecar_problems checks it at launch). Exit 0 written, 3 K5 over the limit, 1 re
 problems included), 2 bad arguments.
 
 Usage:
-  python scripts/make_selection.py --config configs/viability.json       # the viability run's selection
   python scripts/make_selection.py --sources reazon_small --agree-max 0.5 --out selection/reazon_only.parquet
-  python scripts/make_selection.py --config configs/full_sub3k.json --from-selection labels/full/selections/full.parquet
+  python scripts/make_selection.py --config configs/full.json            # the label box's selection
+  python scripts/make_selection.py --config SUB.json --from-selection labels/full/selections/full.parquet   # a subset
   python scripts/make_selection.py --config study/data.json --skip-audio-check     # the study (labels/full pulled)
-  python scripts/make_selection.py --config data-full.json --labels-root D:/kitsune-labels/full \\
+  python scripts/make_selection.py --config configs/full/data-p01.json --labels-root D:/kitsune-labels/full \\
       --manifest D:/kitsune-study/selections/study_manifest.json --skip-audio-check \\
-      --out D:/stage/labels/full/selections/full_study/full.parquet             # full mode (data-full.json: FULL_DATA)
+      --out D:/stage/labels/full/selections/full_study/full.parquet             # full mode (FULL_DATA)
 """
 import argparse
 from collections.abc import Sequence
@@ -693,7 +694,7 @@ def write_selection(sel: pd.DataFrame, out: Path, meta: dict):
 def main(argv: list[str] | None = None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=None,
-                    help="run config (e.g. configs/viability.json): --sources, --eval-sets and its selection_recipe "
+                    help="run config (e.g. configs/full.json): --sources, --eval-sets and its selection_recipe "
                          "(--agree-max, --agree-max-source, --filter-eval-sets) come from it, --out defaults to its "
                          "selection; none of those flags may be given too")
     ap.add_argument("--sources", nargs="+", default=None,
@@ -713,7 +714,7 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--second-out", default=None, help="default: the --config's second_root, else second_out")
     ap.add_argument("--data", default=None, help="default: the --config's data_root, else data")
     ap.add_argument("--parakeet-out", default=None,
-                    help="study only: default the --config's parakeet_root, else parakeet_out")
+                    help="study and full modes: default the --config's parakeet_root, else parakeet_out")
     ap.add_argument("--kotoba-galgame", default=None,
                     help=f"study only: the laptop's kotoba-whisper jsonl of the galgame hold-out, for the neutral view "
                          f"(default {KOTOBA_GALGAME} under the repo root)")
@@ -737,9 +738,6 @@ def main(argv: list[str] | None = None):
     ap.add_argument("--manifest-sha256", default=None, metavar="HEX",
                     help="full mode: the manifest's expected sha256 (default kitsune.fullrun.FROZEN_MANIFEST_SHA256; "
                          "for tests)")
-    ap.add_argument("--study-selection", default=None, metavar="PATH",
-                    help="full mode, report only: compare the greedy subsets (and, when its sidecar is next to it, "
-                         "the baselines) with this frozen study selection's")
     args = ap.parse_args(argv)
     recipe_flags = ("sources", "eval_sets", "agree_max", "agree_max_source", "filter_eval_sets",
                     "partial_second_opinion")
@@ -772,10 +770,10 @@ def main(argv: list[str] | None = None):
     full = None
     if args.full_study is not None:
         full = full_setup(args, cfg)  # its refusals exit 1, before any heavy work; --labels-root fills the roots
-    elif given := [f"--{k.replace('_', '-')}" for k in ("labels_root", "manifest", "manifest_sha256", "study_selection")
+    elif given := [f"--{k.replace('_', '-')}" for k in ("labels_root", "manifest", "manifest_sha256")
                    if getattr(args, k) is not None]:
         ap.error(f"{' '.join(given)}: only for a config with selection_recipe.full_study")
-    # the roots: explicit flags win, then the config's (the viability config's are these defaults)
+    # the roots: explicit flags win, then the config's, then the laptop's defaults (the trainer's DEFAULTS too)
     for flag, key, default in (("teacher_out", "teacher_root", "teacher_out"),
                                ("second_out", "second_root", "second_out"), ("data", "data_root", "data"),
                                ("parakeet_out", "parakeet_root", "parakeet_out")):
@@ -1313,21 +1311,6 @@ def full_meta_args(args, cfg: dict, record: dict | None, manifest_sha256: str, d
     return out
 
 
-def _study_check(path: Path, sel: pd.DataFrame, baselines: dict) -> list[str]:
-    """Report lines of --study-selection: the eval rows' greedy subsets and (with its sidecar) the baselines against the
-    frozen study selection's."""
-    lines = []
-    st = pd.read_parquet(path, columns=["id", "split", "in_greedy_subset"])
-    ours = set(sel["id"][(sel["split"] == "eval") & sel["in_greedy_subset"]])
-    theirs = set(st["id"][(st["split"] == "eval") & st["in_greedy_subset"]])
-    lines.append(f"greedy subsets vs {path.name}: {'equal' if ours == theirs else 'DIFFERENT'} ({len(ours)} ids)")
-    side = path.with_suffix(".json")
-    if side.is_file():
-        want = json.loads(side.read_text(encoding="utf-8")).get("baselines")
-        lines.append(f"baselines vs {side.name}: {'equal' if want == baselines else 'DIFFERENT'}")
-    return lines
-
-
 def full_main(args, cfg: dict, by_source: dict, stems, record, full: dict, t0: float) -> int:
     """Build and write the full selection and its sidecar (the sidecar last: it hashes the parquet). Returns 0, or 3
     when K5 is over its limit (nothing written). A refusal raises SystemExit (exit 1)."""
@@ -1389,9 +1372,6 @@ def full_main(args, cfg: dict, by_source: dict, stems, record, full: dict, t0: f
     print(f"K5 PASS: {k5['not_in_parakeet']} of {k5['candidates']} train rows in teacher_out only "
           f"({100 * k5['frac']:.4f} %, limit {100 * k5['max_frac']:g} %)")
     print("eval rows = the frozen manifest: " + ", ".join(f"{s} {n}" for s, n in body["n"]["eval"].items()))
-    if args.study_selection:
-        for line in _study_check(Path(args.study_selection), sel, body["baselines"]):
-            print(line)
     d = body["dev"]
     print("dev slice (rule %d):" % d["rule"])
     for s, b in d["by_source"].items():

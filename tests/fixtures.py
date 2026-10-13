@@ -255,8 +255,8 @@ def make_fake_corpus(root, sources: dict | None = None, *, rows_per_shard: int =
         encoder_hidden_size=1280, decoding="greedy", lm_head_dtype="float32", model_dtype="bfloat16",
     ), indent=2), encoding="utf-8")
     (fc.second_out / "meta.json").write_text(json.dumps(dict(
-        join_model="whisper-large-v3 (precomputed)", gpu_model="kotoba-tech/kotoba-whisper-v2.0",
-        tokenizer="openai/whisper-large-v3", agree="cer(teacher_hyp, hyp2)", cer2="cer(hyp2, dataset_text)"),
+        join_model="whisper-large-v3 (precomputed)", tokenizer="openai/whisper-large-v3",
+        judges={"galgame": "parakeet"}, agree="cer(teacher_hyp, hyp2)", cer2="cer(hyp2, dataset_text)"),
         indent=2), encoding="utf-8")
     return fc
 

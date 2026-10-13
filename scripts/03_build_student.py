@@ -1,5 +1,4 @@
 """Build the Kitsune student from the teacher: layer selection, FFN pruning by activation importance, BN recalibration.
-Or (--scratch) a randomly initialised student of the teacher's architecture at another width.
 
 The shape and the reasons for it are in kitsune/student.py. This script runs the pipeline end to end:
   1. seeded calibration sample of the selection's kept TRAIN rows (all --sources, equal share each), audio read by id
@@ -8,7 +7,7 @@ The shape and the reasons for it are in kitsune/student.py. This script runs the
      list: the first run's ids could not be drawn again after the selection was regenerated)
   2. load the teacher in --teacher-dtype (bf16) on --device, at --teacher-revision (the commit 02_teacher_pass read)
   3. FFN importance over --calib-utts utterances, log-mels computed on the device (kitsune.features.LogMel), in the
-     kept layers (--importance-layers spec) or in all 48 (all); or the FFN selection of another student (--ffn-from)
+     kept layers; or the FFN selection of another student (--ffn-from)
   4. build the student on CPU (fresh model, strict remapped state_dict); assert its count
   5. free the teacher
   6. student -> device in fp32; --bn recal: recalibrate BatchNorm on --bn-utts utterances (batch size 1);
@@ -17,14 +16,9 @@ The shape and the reasons for it are in kitsune/student.py. This script runs the
   8. step-0 eval on --step0-eval-utts utterances per eval set, teacher-forced + greedy (kitsune.evaluate)
   9. student_meta.json rewritten with stage "complete"
 
---scratch <shape> (kitsune.student.SCRATCH_SHAPES: t01, t005, bridge) replaces 1-6: the teacher's config and processor
-are read (not its weights) and kitsune.student.build_scratch_student builds a seeded random init (--seed; fresh BN).
-
 It is resumable, because the laptop GPU throws intermittent CUDA illegal-instruction faults:
-  importance cache      <out>/importance.pt, or --importance-cache: written after step 3; reused if it covers the same
-                        teacher commit, teacher dtype, calibration ids and the layers asked for. One
-                        --importance-layers all pass serves every size: point the other builds at it with
-                        --importance-cache (a named cache is never overwritten; one that does not match stops the build)
+  importance cache      <out>/importance.pt: written after step 3; reused if it covers the same teacher commit,
+                        teacher dtype, calibration ids and the kept layers
   student_meta.json     stage "saved": a re-run skips 1-7 and only redoes the step-0 eval; stage "complete": nothing
                         to do (--force rebuilds; a matching importance cache is still reused - delete it to recompute)
 The step-0 eval runs after the save (the spec lists it before), so a fault there cannot lose the built student. If
@@ -35,35 +29,29 @@ kept rows from each. A row group of reazon_small is ~256 utterances (~25 MB), so
 of the whole 7 GB source.
 
 student_meta.json (format 2) carries the size study's fields next to the build record: family "aed", init_class
-("pruned_kept" | "scratch"), params_total, params_non_embedding, closed_form_params (asserted equal to params_total
-before the save), seed, bn ("teacher" | "recal" | "fresh"; the recalibration's drift stats are under bn_recal),
-teacher "<repo>@<commit>", and enc_layers / ffn / dec_layers for a pruned student. A step-0 eval of a pruned student
-adds function_check: the step-0 CER against the teacher and KL on the 60-utterance CPU gate (--device cpu
---step0-eval-utts 20 with the default --seed: 20 per gate set; on_gate is false for any other draw), recorded but not
-classifying. STUDY.md 2.2's rule ("function lost" at a step-0 CER >= 90 %) classifies the Parakeet students only
-(scripts/03c_build_ctc_student.py): by the owner's decision of 2026-09-26 the pruned Transcribe students (T-0.6B,
-T-0.3B) are "function kept" (warm-up 300, probe class kept-t03) although their step-0 CER is >= 90 %, because an AED
-decoder derails at step 0 (T-0.6B: KL 4.207, CER 132 % against the teacher on the gate) and the first run trained this
-recipe fine. The model card saved next to the weights as README.md gets a modification notice that describes this
-student (kitsune.student.model_card).
+"pruned_kept", params_total, params_non_embedding, closed_form_params (asserted equal to params_total before the save),
+seed, bn ("teacher" | "recal"; the recalibration's drift stats are under bn_recal), teacher "<repo>@<commit>", and
+enc_layers / ffn / dec_layers. STUDY.md 2.2's rule ("function lost" at a step-0 CER >= 90 % against the teacher)
+classifies the Parakeet students only (scripts/03c_build_ctc_student.py): by the owner's decision of 2026-09-26 the
+pruned Transcribe students (T-0.6B, T-0.3B) are "function kept" (warm-up 300) although their step-0 CER is >= 90 %,
+because an AED decoder derails at step 0 (T-0.6B: KL 4.207, CER 132 % against the teacher on the 60-utterance CPU
+gate) and the first run trained this recipe fine. The model card saved next to the weights as README.md gets a
+modification notice that describes this student (kitsune.student.model_card).
 
 Usage:
   python scripts/03_build_student.py                                  # B20x2560 / dec 0 2 5 7 -> students/b20x2560-d4
                                                                       # (calibrated on reazon_small emilia_yodas galgame)
-  python scripts/03_build_student.py --enc-layers 4 --dec-layers 0 7  # laptop smoke student   -> students/b4x2560-d2
+  python scripts/03_build_student.py --enc-layers 4 --dec-layers 0 7  # a small test student  -> students/b4x2560-d2
 The size study's Transcribe students (on the laptop CPU; the first run's data dirs and its 1,000 calibration ids,
 importance_ids_sha256 5e31cd68..., recovered from the HF dataset history and kept in students/study/t03/
 calibration_ids.txt):
   python scripts/03_build_student.py --device cpu --teacher-dtype fp32 --step0-eval-utts 20 --bn keep \\
       --ffn-from students/b20x2560-d4 --out students/study/t06                      # T-0.6B: the first run's FFNs
   python scripts/03_build_student.py --device cpu --teacher-dtype fp32 --step0-eval-utts 20 --bn keep \\
-      --enc-layers 8 --importance-layers all --calib-ids <the first run's calibration_ids.txt> \\
+      --enc-layers 8 --calib-ids <the first run's calibration_ids.txt> \\
       --out students/study/t03                              # T-0.3B: B8x2560, T-0.6B's decoder {0,2,5,7} (the default)
-  python scripts/03_build_student.py --scratch bridge --device cpu --step0-eval-utts 0 --out students/study/bridge
-  python scripts/03_build_student.py --scratch t01 --device cpu --step0-eval-utts 0 --out students/study/t01
-  python scripts/03_build_student.py --scratch t01 --seed 1235 --device cpu --step0-eval-utts 0 \\
-      --out students/study/t01-s1235                                                  # the replicate
-  python scripts/03_build_student.py --scratch t005 --device cpu --step0-eval-utts 0 --out students/study/t005
+The study's from-scratch students (T-0.1B, T-0.05B, the bridge, the replicate) came from its --scratch mode, removed
+after the study (the last commit with it is 76b28a1); their builds are in the data repo (students/study/).
 """
 import argparse
 import gc
@@ -89,20 +77,13 @@ TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 # MODEL_CARD.md names); without a pin every hub read silently follows `main`
 TEACHER_REVISION = "b1eacc2686a3d08ceaae5f24a88b1d519620bc09"
 EVAL_SETS = ["eval_jsut", "eval_cv8", "eval_reazon"]
-SOURCES = ["reazon_small", "emilia_yodas", "galgame"]  # configs/viability.json "sources": calibrate on what it trains on
+SOURCES = ["reazon_small", "emilia_yodas", "galgame"]  # the viability run's sources: calibrate on what it trained on
 MAX_SECONDS = 30.0  # LogMel / HF fast path; the teacher pass skipped longer utterances anyway
 IMPORTANCE_FORMAT = 1
 # the teacher dtype of an importance cache whose key and info do not record one: every build before --teacher-dtype
 # ran the teacher in bf16
 LEGACY_IMPORTANCE_DTYPE = "torch.bfloat16"
 META_FORMAT = 2  # 2: the size study's fields; "bn" is the mode string (format 1 had the recalibration stats there)
-FUNCTION_LOST_CER = 0.9  # STUDY.md 2.2: step-0 CER vs the teacher >= this on the 60-utterance gate = function lost
-# ... for the Parakeet students only: a pruned Transcribe student's class is fixed by the owner (module docstring)
-AED_FUNCTION_RULE = ("owner decision 2026-09-26: pruned Transcribe students are function kept (warm-up 300, probe class "
-                     "kept-t03) whatever their step-0 CER; the 90 % rule classifies the Parakeet students only")
-# The 60-utterance CPU gate: 20 ids per EVAL_SETS set, drawn by step0_ids with this seed (sha d9d53e6e... on the first
-# run's selection). A step-0 eval drawn with another --seed is another sample, so it is not the gate.
-GATE_PER_SET, GATE_SEED = 20, 1234
 BN_MODES = {"keep": "teacher", "recal": "recal"}  # --bn value -> student_meta.json "bn"
 
 
@@ -309,25 +290,19 @@ def importance_key(cache: dict) -> dict:
 
 
 def load_or_compute_importance(teacher, featurizer, utts: list[dict], args, spec, device, out: Path, log=print):
-    """Stage 3, cached in --importance-cache (default <out>/importance.pt; atomic). Returns (importance, info).
+    """Stage 3, cached in <out>/importance.pt (atomic). Returns (importance, info).
 
-    The layers measured are spec's kept layers, or all the teacher's with --importance-layers all: FFN importance is
-    measured inside the full teacher, so it does not depend on which layers a student keeps, and one all-layer pass
-    serves every size. A cache is reused when it has the same key (teacher, commit, teacher dtype, calibration ids)
-    and covers the layers asked for; it is written only when it is recomputed. A cache named with --importance-cache
-    that exists but does not match stops the build: it is shared, and recomputing would overwrite it (maybe with fewer
-    layers). The dtype is in the key because the ranking depends on it: the same utterances through a bf16 and an
-    fp32 teacher rank a few neurons per FFN differently at the cut."""
+    The layers measured are spec's kept layers (FFN importance is measured inside the full teacher, so it does not
+    depend on which layers a student keeps). A cache is reused when it has the same key (teacher, commit, teacher
+    dtype, calibration ids) and covers the kept layers; it is written only when it is recomputed. The dtype is in the
+    key because the ranking depends on it: the same utterances through a bf16 and an fp32 teacher rank a few neurons
+    per FFN differently at the cut."""
     import torch
 
     from kitsune import student as S
 
-    named = getattr(args, "importance_cache", None)
-    path = Path(named or out / "importance.pt")
-    if getattr(args, "importance_layers", "spec") == "all":
-        layers = list(range(teacher.config.encoder_config.num_hidden_layers))
-    else:
-        layers = list(spec.enc_layers)
+    path = Path(out) / "importance.pt"
+    layers = list(spec.enc_layers)
     # the resolved commit (None for a local dir): importance from other teacher weights is recomputed, not reused
     key = dict(teacher=args.teacher, teacher_revision=getattr(teacher.config, "_commit_hash", None),
                teacher_dtype=teacher_dtype(teacher), ids_sha256=ids_sha([u["id"] for u in utts]), n_utts=len(utts))
@@ -343,11 +318,6 @@ def load_or_compute_importance(teacher, featurizer, utts: list[dict], args, spec
             log(f"  importance: reusing {path} ({c['info']['n_utts']} utts, {len(c['layers'])} layers, computed "
                 f"{c['info']['created']})")
             return S.importance_from_state(c["importance"]), dict(c["info"], reused=True, path=str(path))
-        if named:
-            sys.exit(f"--importance-cache {path} does not match this build (teacher commit, teacher dtype, "
-                     f"calibration ids or layers: it has {c and importance_key(c)}, "
-                     f"{len(c.get('layers', [])) if c else 0} layers; this build needs {key}, layers {layers}); it is "
-                     f"left as it is")
         if c is not None:
             log(f"  importance cache {path} does not match this run (teacher/dtype/sample/layers); recomputing")
 
@@ -447,19 +417,6 @@ def step0_eval(student, processor, featurizer, args, device, out: Path, log=prin
                 wall_s=round(time.time() - t0, 1))
 
 
-def function_check(step0: dict) -> dict:
-    """The step-0 numbers of a pruned Transcribe student that STUDY.md 2.2's rule reads: the pooled greedy CER against
-    the teacher's own transcripts and the teacher-forced KL. `over_threshold` is what the 90 % rule would read; it does
-    not classify here: `function` is "kept" by the owner's decision (AED_FUNCTION_RULE). `on_gate` says whether the
-    eval was the 60-utterance gate: 20 per gate set, drawn with GATE_SEED (the study builds it with --device cpu
-    --step0-eval-utts 20 and the default --seed)."""
-    cer = float(step0["greedy"]["all"]["cer_teacher_corpus"])
-    return dict(cer_vs_teacher=cer, kl=float(step0["teacher_forced"]["all"]["kl"]), threshold=FUNCTION_LOST_CER,
-                over_threshold=cer >= FUNCTION_LOST_CER, function="kept", by=AED_FUNCTION_RULE,
-                on_gate=(step0.get("n_per_set") == {s: GATE_PER_SET for s in EVAL_SETS}
-                         and step0.get("seed") == GATE_SEED))
-
-
 def read_ids_file(path: Path) -> list[str]:
     """--calib-ids: one id per line, in order; blank lines ignored."""
     try:
@@ -472,8 +429,6 @@ def build_identity(args) -> dict:
     """What makes two builds the same student (a "saved" dir is only resumed by an identical build): the shape, the
     BN mode, where the FFN selection comes from, the seed (it draws the calibration sample and the step-0 ids) and the
     calibration inputs (a --calib-ids list by the sha of its ids, so the same list anywhere is the same input)."""
-    if args.scratch:
-        return dict(init="scratch", shape=args.scratch, seed=args.seed)
     return dict(init="pruned", enc_layers=args.enc_layers, ffn=args.ffn, dec_layers=sorted(args.dec_layers),
                 tie_head=not args.no_tie_head, bn=args.bn, ffn_from=str(args.ffn_from) if args.ffn_from else None,
                 seed=args.seed, calibration=dict(
@@ -513,7 +468,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--teacher", default=TEACHER_ID, help="HF repo id or local dir of the teacher")
     ap.add_argument("--teacher-revision", default=TEACHER_REVISION,
                     help="commit of --teacher to read (default: the pin 02_teacher_pass read); ignored for a local dir")
-    ap.add_argument("--selection", default=str(ROOT / "selection" / "viability.parquet"))
+    ap.add_argument("--selection", default=str(ROOT / "selection" / "viability.parquet"),
+                    help="the selection the calibration draws its kept train rows from (default: the viability run's, "
+                         "selection/viability.parquet of the HF data repo, which students/b20x2560-d4 was built on)")
     ap.add_argument("--data", default=str(ROOT / "data"))
     ap.add_argument("--teacher-root", default=str(ROOT / "teacher_out"))
     ap.add_argument("--eval-cache", default=str(ROOT / "cache" / "eval"), help="kitsune.trainset eval store cache")
@@ -527,14 +484,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                          "without bf16 units. The copied weights are the same either way (the checkpoint is bf16), "
                          "but measured importance, and so the FFN selection near the cut, depends on it: "
                          "importance.pt records it and its cache key includes it")
-    ap.add_argument("--bn", choices=sorted(BN_MODES), default=None,
+    ap.add_argument("--bn", choices=sorted(BN_MODES), default="recal",
                     help="BatchNorm of a pruned student: recal = recalibrate on --bn-utts utterances (default, the "
                          "first run), keep = the teacher's running stats (the size study, decision 16)")
-    ap.add_argument("--importance-layers", choices=["spec", "all"], default="spec",
-                    help="measure FFN importance in the kept layers only, or in all teacher layers (one pass that "
-                         "every size can reuse through --importance-cache)")
-    ap.add_argument("--importance-cache", default=None,
-                    help="FFN importance cache to reuse or write (default: <out>/importance.pt)")
     ap.add_argument("--ffn-from", default=None,
                     help="reuse the FFN selection of this built student (its student_meta.json kept.ffn; read-only) "
                          "instead of measuring importance: T-0.6B takes the first run's students/b20x2560-d4")
@@ -542,26 +494,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="calibrate on exactly these ids (one per line, in order; e.g. another build's "
                          "calibration_ids.txt) instead of the seeded sample, which a changed selection or shard list "
                          "no longer reproduces")
-    ap.add_argument("--scratch", default=None, metavar="SHAPE",
-                    help="build a randomly initialised student of this kitsune.student.SCRATCH_SHAPES shape (t01, "
-                         "t005, bridge) instead of pruning; --seed seeds the init")
     args = ap.parse_args(argv)
-    if args.scratch:
-        bad = [f for f, v in (("--bn", args.bn), ("--ffn-from", args.ffn_from),
-                              ("--importance-cache", args.importance_cache), ("--calib-ids", args.calib_ids)) if v]
-        if args.importance_layers != "spec":
-            bad.append("--importance-layers")
-        if bad:
-            ap.error(f"--scratch builds a random init (fresh BN, no FFN selection): {', '.join(bad)} do not apply")
-    else:
-        args.bn = args.bn or "recal"
-        if args.ffn_from and (args.importance_layers != "spec" or args.importance_cache):
-            ap.error("--ffn-from takes the FFN selection as it is: --importance-layers/--importance-cache do not apply")
     if args.out is None:
-        name = (f"scratch-{args.scratch}-s{args.seed}" if args.scratch
-                else f"b{args.enc_layers}x{args.ffn}-d{len(args.dec_layers)}")
-        args.out = str(ROOT / "students" / name)
-    for k in ("selection", "data", "teacher_root", "eval_cache", "out", "importance_cache", "ffn_from", "calib_ids"):
+        args.out = str(ROOT / "students" / f"b{args.enc_layers}x{args.ffn}-d{len(args.dec_layers)}")
+    for k in ("selection", "data", "teacher_root", "eval_cache", "out", "ffn_from", "calib_ids"):
         if getattr(args, k) is not None:
             setattr(args, k, Path(getattr(args, k)))
     return args
@@ -574,7 +510,7 @@ def teacher_tag(repo: str, commit: str | None) -> str:
 
 def assert_count(report: dict, expected: int | None, what: str) -> None:
     """The count assert every study builder runs before it saves: total == closed form (== the pre-registered count
-    of a named study shape)."""
+    of a study shape)."""
     if report["total"] != report["closed_form"]:
         raise AssertionError(f"{what}: {report['total']:,} params != closed form {report['closed_form']:,}")
     if expected is not None and report["total"] != expected:
@@ -637,7 +573,7 @@ def build_pruned(args, spec, teacher_cfg, processor, featurizer, device, meta: d
         log(f"[3/8] FFN selection from {args.ffn_from}")
         keep_given, importance, imp_info = ffn_from_student(args.ffn_from, spec, teacher_ffn, log=log)
     else:
-        log(f"[3/8] FFN importance over {len(imp_utts)} utts ({args.importance_layers} layers)")
+        log(f"[3/8] FFN importance over {len(imp_utts)} utts ({len(spec.enc_layers)} layers)")
         importance, imp_info = load_or_compute_importance(teacher, featurizer, imp_utts, args, spec, device,
                                                           args.out, log=log)
     dur["importance"] = round(time.time() - t, 1)
@@ -702,39 +638,6 @@ def build_pruned(args, spec, teacher_cfg, processor, featurizer, device, meta: d
     return student
 
 
-def build_scratch(args, teacher_cfg, device, meta: dict, log=print):
-    """Stages 1-6 of a from-scratch student (kitsune.student.build_scratch_student). Returns the student on `device`."""
-    from dataclasses import asdict
-
-    import torch
-
-    from kitsune import student as S
-
-    shape = S.SCRATCH_SHAPES[args.scratch]
-    t = time.time()
-    meta["teacher_revision"] = getattr(teacher_cfg, "_commit_hash", None)
-    meta["teacher"] = teacher_tag(args.teacher, meta["teacher_revision"])
-    check_teacher_matches_targets(args.teacher_root, meta["teacher_revision"])  # its tokenizer and processor ship
-    log(f"[1/3] build {args.scratch} from scratch on CPU (seed {args.seed}): {shape}")
-    student = S.build_scratch_student(teacher_cfg, shape, args.seed, name=args.scratch)
-    report = S.param_report(student)
-    expected = S.SCRATCH_EXPECTED_PARAMS.get(args.scratch)
-    log(f"  {report['total']:,} params (closed form {report['closed_form']:,}"
-        f"{f', the study {expected:,}' if expected else ''}), encoder share {report['encoder_share']:.1%}")
-    assert_count(report, expected, f"scratch student {args.scratch}")
-    meta.update(
-        family="aed", init_class="scratch", bn="fresh", seed=args.seed, **S.count_fields(student),
-        expected_params=expected, scratch=dict(name=args.scratch, **asdict(shape)),
-        init=dict(weights="HF default (N(0, initializer_range), zero biases, LayerNorm 1/0)",
-                  subsampling_conv="PyTorch default reset_parameters (kaiming-uniform)",
-                  pos_emb="sinusoid / sqrt(D), NeMo FixedPositionalEncoding (frozen by the trainer)",
-                  batchnorm="fresh: running mean 0, var 1, trains", tie_head=True, scale_input=False, dropout=0.0),
-        params=report,
-    )
-    meta["durations_s"]["build"] = round(time.time() - t, 1)
-    return student.to(device=device, dtype=torch.float32)
-
-
 def main(argv=None) -> int:
     args = parse_args(argv)
     import torch
@@ -744,11 +647,9 @@ def main(argv=None) -> int:
     from kitsune.features import LogMel
 
     out = args.out
-    if args.scratch and args.scratch not in S.SCRATCH_SHAPES:
-        sys.exit(f"--scratch {args.scratch}: not one of {sorted(S.SCRATCH_SHAPES)}")
     teacher_cfg = AutoConfig.from_pretrained(args.teacher, revision=args.teacher_revision)
     n_teacher_layers = teacher_cfg.encoder_config.num_hidden_layers  # 48 for the real one
-    spec = None if args.scratch else S.StudentSpec(
+    spec = S.StudentSpec(
         enc_layers=S.evenly_spaced(args.enc_layers, n_teacher_layers), ffn_dim=args.ffn,
         dec_layers=sorted(args.dec_layers), tie_head=not args.no_tie_head)
     identity = build_identity(args)
@@ -767,11 +668,8 @@ def main(argv=None) -> int:
         torch.backends.cuda.matmul.allow_tf32 = True
         free, total = torch.cuda.mem_get_info(device)
         print(f"GPU free: {free / 2**30:.2f} of {total / 2**30:.1f} GiB")
-    if spec is not None:
-        print(f"student: enc {spec.enc_layers} ffn {spec.ffn_dim} dec {spec.dec_layers} tied={spec.tie_head} "
-              f"bn={args.bn} -> {out}")
-    else:
-        print(f"student: {args.scratch} from scratch, seed {args.seed} -> {out}")
+    print(f"student: enc {spec.enc_layers} ffn {spec.ffn_dim} dec {spec.dec_layers} tied={spec.tie_head} "
+          f"bn={args.bn} -> {out}")
 
     processor = AutoProcessor.from_pretrained(args.teacher, revision=args.teacher_revision)
     featurizer = LogMel.from_feature_extractor(processor.feature_extractor).to(device)
@@ -786,11 +684,8 @@ def main(argv=None) -> int:
         meta = dict(format=META_FORMAT, stage="building", teacher=args.teacher, build=identity,
                     args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                     git=git_info(), host=host_info(device), timestamps=dict(started=now()), durations_s={})
-        if spec is not None:
-            meta["spec"] = spec
-            student = build_pruned(args, spec, teacher_cfg, processor, featurizer, device, meta)
-        else:
-            student = build_scratch(args, teacher_cfg, device, meta)
+        meta["spec"] = spec
+        student = build_pruned(args, spec, teacher_cfg, processor, featurizer, device, meta)
         t = time.time()
         print(f"[save] -> {out}")
         meta["stage"] = "saved"
@@ -808,12 +703,6 @@ def main(argv=None) -> int:
             print(f"step-0 eval failed ({e!r}); the student is saved. Re-run to retry the eval, or finish with "
                   f"--step0-eval-utts 0")
             raise
-        if meta.get("init_class", "").startswith("pruned"):
-            fc = meta["function_check"] = function_check(meta["step0"])
-            print(f"  function check: step-0 KL {fc['kl']:.3f}, CER vs teacher {fc['cer_vs_teacher']:.3f} "
-                  f"({'>=' if fc['over_threshold'] else '<'} {FUNCTION_LOST_CER:.0%}"
-                  f"{'' if fc['on_gate'] else '; NOT the 60-utterance gate'}) -> function {fc['function']} "
-                  f"({AED_FUNCTION_RULE})")
     else:
         meta["step0"] = dict(skipped=True)
     meta["stage"] = "complete"

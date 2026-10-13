@@ -7,7 +7,7 @@ trainer's summary.json.
 
 Two worlds. The TEXT world scores real ref / hyp strings (kitsune.evaluate.utterance_table), so the metrics, the
 hallucination and kana counts can be checked against sums taken here by hand. The PLANTED world reuses
-test_study_stats.planted: every system's edits are the same base edits times a multiplier, so every ratio is exact and
+fixtures_planted.planted: every system's edits are the same base edits times a multiplier, so every ratio is exact and
 v_boot is 0, and a CI's half-width is 1.96 sqrt(k) sigma_run: that pins the noise term k of each comparison."""
 import hashlib
 import importlib.util
@@ -23,10 +23,10 @@ import pandas as pd
 import pytest
 
 from fixtures import ROOT, no_real_data
+from fixtures_planted import planted
 from kitsune import evaluate as ev
 from kitsune import study_stats as ss
 from kitsune.store import ids_sha256
-from test_study_stats import planted
 
 
 def _load():
@@ -258,7 +258,7 @@ def world(tmp_path_factory):
                   greedy=greedy_frames(ids, refs, wh, durations=durations, truncated=trunc))
     R["whisper-large-v3"] = text_table(ids, refs, wh, trunc)
 
-    # speed: smoke A and smoke B on one machine (the chart group), box full's re-time pair on another
+    # speed: smoke A and smoke B on one machine (the chart group), box full-t's re-time pair on another
     sp_ids = [ids[s][i] for s in ("eval_jsut", "eval_cv8", "eval_reazon") for i in range(3)]
     speed = [
         write_speed(pull / "speed-full-smoke-20261001T000000Z" / "speed.json", sp_ids, {
@@ -314,8 +314,6 @@ def test_metrics_match_hand_sums(world):
     # the greedy-only readouts were scored here, the others read as written
     assert rep["systems"]["full-t06"]["table_from"] == "greedy"
     assert rep["systems"]["full-p03"]["table_from"] == "tables"
-    # the local metrics never leak into the study's metric table
-    assert "m4_all" not in ss.METRICS and "m3" not in ss.METRICS
 
 
 def test_roles_offer_blocks_and_columns(world):
@@ -420,7 +418,7 @@ def test_ci_noise_terms(tmp_path):
 
 def test_speed_mapping_and_flags(world):
     """Own record in the chart group; a full-data row falls back to its study weights (S1); a token drift over 5 %
-    re-times T-0.6B from box full's pair (S2); another machine (S3); MXFP4 simulated (S4); none (S5). Three speed-*
+    re-times T-0.6B from box full-t's pair (S2); another machine (S3); MXFP4 simulated (S4); none (S5). Three speed-*
     files are read, two of them one machine."""
     rep = world["rep"]
     sg = rep["speed_groups"]
@@ -437,7 +435,7 @@ def test_speed_mapping_and_flags(world):
     assert sp["whisper-small"]["flags"] == ["S3"] and not sp["whisper-small"]["in_chart_group"]
     assert sp["cohere"]["flags"] == ["S5"]
     # T-0.6B: the readout emits 12 tokens a row, the timed study weights 10: S2, and the chart group's study-t06
-    # record times the full/study ratio box full timed on its own machine
+    # record times the full/study ratio box full-t timed on its own machine
     t = sp["full-t06"]
     assert t["flags"] == ["S1", "S2"] and t["drift"]["drift"] == pytest.approx(0.2)
     assert t["drift"]["n_ids"] == len(world["sp_ids"])
@@ -797,7 +795,7 @@ def test_speed_groups_from_queue_summaries(world, tmp_path, capsys):
 
 
 def test_s2_retime_keeps_variants_on_the_bf16_basis_and_chart_twins(world, tmp_path):
-    """S2: the bf16 full-t06 row AND its variant take box full's bf16 re-time ratio (the variant decodes the same
+    """S2: the bf16 full-t06 row AND its variant take box full-t's bf16 re-time ratio (the variant decodes the same
     tokens), so "x bf16 speed" and the chart's join compare one basis; each keeps its record's own numbers. A study
     row hides behind its full-data twin only when that twin is drawn: an emulated full variant leaves its timed study
     variant on the chart."""
@@ -856,7 +854,7 @@ def test_s2_retime_keeps_variants_on_the_bf16_basis_and_chart_twins(world, tmp_p
 
 
 def test_s2_retime_pair_on_the_chart_machine(world, tmp_path):
-    """Box full rented the chart group's machine: full-t06 has its own record there (no S1, no S2) and box full's
+    """Box full-t rented the chart group's machine: full-t06 has its own record there (no S1, no S2) and box full-t's
     speed-study-t06 re-time, newer and in the same file, stands for study-t06. A full-t06 variant still falls back to
     its study variant (S1) with S2, so it takes that same-file pair's ratio from the chart group: its "x bf16 speed"
     and its join stay on one basis. A pair from two files (two launches) is not a re-time pair."""
@@ -883,7 +881,7 @@ def test_s2_retime_pair_on_the_chart_machine(world, tmp_path):
     assert rc == 0 and list(rep["speed_groups"]["groups"]) == [PRIMARY]
     sp = {s: v["speed"] for s, v in rep["systems"].items()}
     assert sp["full-t06"]["flags"] == [] and sp["full-t06"]["rtf"] == pytest.approx(0.003)
-    assert sp["study-t06"]["file"] == str(full)  # box full's re-time replaces smoke A's record (newer, listed)
+    assert sp["study-t06"]["file"] == str(full)  # box full-t's re-time replaces smoke A's record (newer, listed)
     v = sp["full-t06@int8-w8a8"]
     assert v["flags"] == ["S1", "S2"] and v["retime"]["group"] == PRIMARY
     assert v["rtf"] == pytest.approx(0.0008 * 1.5) and v["unscaled"]["rtf"] == pytest.approx(0.0008)
@@ -1096,3 +1094,78 @@ def test_earlier_keeps_the_4_epoch_p01_next_to_its_continuation(world, tmp_path,
                       (f"full-p03-e3={pull / f'm4-{rid}'}", "not one readout of full-p03")):
         rc, _ = run([*base, "--earlier", bad], tmp_path / "bad")
         assert rc == 2 and want in capsys.readouterr().err, bad
+
+
+# ------------------------------------------------------------------------------------------------ the study's readers
+
+
+def test_run_summaries_in_the_trainer_layout(tmp_path):
+    """--run-summaries on the trainer's runs root as it is (load_summaries): stamped run dirs keyed by config.run_name,
+    the newest start of a run name counting, the start time from config.json or the stamp; a broken summary.json
+    refuses naming its path (InputError, exit 2)."""
+    root = tmp_path / "runs"
+    sel = "labels/full/selections/study_1000h.parquet"
+
+    def put(dirname, run_name, steps, created=None, resumes=0):
+        d = root / dirname
+        d.mkdir(parents=True)
+        cfg = {"run_name": run_name, "selection": sel}
+        summ = {"run_id": dirname, "status": "complete", "steps": steps, "resumes": resumes, "config": cfg}
+        (d / "summary.json").write_text(json.dumps(summ), encoding="utf-8")
+        if created:
+            (d / "config.json").write_text(json.dumps({"run_id": dirname, "created_utc": created, "config": cfg}),
+                                           encoding="utf-8")
+
+    put("study-t06-20261001T010203Z", "study-t06", 900)  # an earlier start that died: superseded
+    put("study-t06-20261001T030000Z", "study-t06", 9366, created="2026-10-01T03:00:00.123+00:00")
+    put("study-t06-half-20261001T080000Z", "study-t06-half", 4683)  # no config.json: the stamp is its start
+    put("study-t03-20261001T030000Z-1", "study-t03", 5000, resumes=1)
+    summ, notes = FR.load_summaries(root)
+    assert set(summ) == {"study-t06", "study-t06-half", "study-t03"}
+    assert summ["study-t06"]["steps"] == 9366 and len(notes["superseded"]) == 1
+    assert "20261001T010203Z" in notes["superseded"][0]
+    assert summ["study-t06"]["started_utc"] == "2026-10-01T03:00:00.123+00:00"
+    assert summ["study-t06-half"]["started_utc"] == "20261001T080000Z"
+    assert FR.load_summaries(None) == ({}, dict(read={}, superseded=[]))
+    (root / "study-t01-20261001T030000Z").mkdir()
+    (root / "study-t01-20261001T030000Z" / "summary.json").write_text("{", encoding="utf-8")
+    with pytest.raises(FR.InputError, match="study-t01-20261001T030000Z"):
+        FR.load_summaries(root)
+
+
+def test_tables_in_every_layout(tmp_path):
+    """--tables (load_tables): a system as one file with a set column, as one file per set (05 --tables), or as a
+    05_evaluate --out / trainer evals dir of greedy_<set>.parquet, whose other files (tf_*.parquet, a set outside the
+    manifest) are listed as ignored. A one-file table without a set column, a per-set file whose set column names
+    another set and a dir without a system table refuse."""
+    sets = ("eval_jsut", "eval_cv8")
+
+    def table(s: str, n: int = 3) -> pd.DataFrame:
+        return pd.DataFrame(dict(id=[f"{s}/u{i}" for i in range(n)], set=s, ref=["あいう"] * n, hyp=["あいえ"] * n,
+                                 edits=[1] * n, ref_len=[3] * n))
+
+    d = tmp_path / "tables"
+    (d / "per-set").mkdir(parents=True)
+    (d / "out-dir").mkdir()
+    pd.concat([table(s) for s in sets], ignore_index=True).to_parquet(d / "one-file.parquet")
+    for s in sets:
+        table(s).to_parquet(d / "per-set" / f"{s}.parquet")
+        table(s).drop(columns="set").assign(source=s).to_parquet(d / "out-dir" / f"greedy_{s}.parquet")
+    pd.DataFrame(dict(id=["x"])).to_parquet(d / "out-dir" / "tf_eval_jsut.parquet")
+    table("eval_reazon").to_parquet(d / "per-set" / "eval_reazon.parquet")
+    tables, ignored = FR.load_tables(d, sets)
+    assert sorted(tables) == ["one-file", "out-dir", "per-set"]
+    for name, df in tables.items():
+        assert sorted(df["set"].value_counts().items()) == [("eval_cv8", 3), ("eval_jsut", 3)], name
+        assert "source" not in df.columns and (df["edits"] == 1).all(), name
+    assert sorted(ignored) == [str(d / "out-dir" / "tf_eval_jsut.parquet"), str(d / "per-set" / "eval_reazon.parquet")]
+    table("eval_cv8").to_parquet(d / "per-set" / "eval_jsut.parquet")
+    with pytest.raises(SystemExit, match=r"its set column says \['eval_cv8'\], the file name eval_jsut"):
+        FR.load_tables(d, sets)
+    table("eval_jsut").drop(columns="set").to_parquet(d / "no-set.parquet")
+    with pytest.raises(SystemExit, match="a one-file system table needs a set column"):
+        FR.load_tables(d, sets)
+    (tmp_path / "none" / "sys").mkdir(parents=True)
+    pd.DataFrame(dict(id=["x"])).to_parquet(tmp_path / "none" / "sys" / "tf_eval_jsut.parquet")
+    with pytest.raises(SystemExit, match="no system table under"):
+        FR.load_tables(tmp_path / "none", sets)

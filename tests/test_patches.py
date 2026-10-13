@@ -16,7 +16,6 @@ from torch import nn  # noqa: E402
 from kitsune.patches import (  # noqa: E402
     assert_bn_frozen,
     freeze_batchnorm,
-    is_relpos_patched,
     patch_relpos_once_per_batch,
     sdpa_backend_report,
     train_mode,
@@ -70,8 +69,8 @@ GRAD_FLOOR = 1e-6  # parameters whose max |g| is below this x the global max are
 
 
 def parity_model():
-    """tiny_model with its subsampling convs re-initialised to the PyTorch default (seeded), as
-    kitsune.student.build_scratch_student does: HF's N(0, 0.02) shrinks the subsampling output to ~1e-5, so every
+    """tiny_model with its subsampling convs re-initialised to the PyTorch default (seeded), as the size study's
+    from-scratch builder did: HF's N(0, 0.02) shrinks the subsampling output to ~1e-5, so every
     encoder attention gradient - the part the patch changes - sits at 1e-11..1e-8, at the float32 noise floor of the
     backward pass; with the default init the patched relative_k_proj gets gradients of ~1e-5..1e-4 whose run-to-run
     noise is ~1e-7 relative, so a wrong gradient through the patch shows."""
@@ -197,7 +196,7 @@ def test_relpos_patch_idempotent_and_unpatch():
         ref = logits_of(model, batch)
     h1 = patch_relpos_once_per_batch(model)
     h2 = patch_relpos_once_per_batch(model)
-    assert h1 is h2 and is_relpos_patched(model)
+    assert h1 is h2 and getattr(model, "_kitsune_relpos_unpatch", None) is h1
     attn = model.model.encoder.layers[1].self_attn
     assert "forward" in attn.relative_k_proj.__dict__ and "forward" in model.model.encoder.encode_positions.__dict__
     with torch.no_grad():
@@ -208,7 +207,7 @@ def test_relpos_patch_idempotent_and_unpatch():
 
     h1()
     h1()  # a second call is a no-op
-    assert not is_relpos_patched(model)
+    assert getattr(model, "_kitsune_relpos_unpatch", None) is None
     assert "forward" not in attn.relative_k_proj.__dict__
     assert "forward" not in model.model.encoder.encode_positions.__dict__
     with torch.no_grad():

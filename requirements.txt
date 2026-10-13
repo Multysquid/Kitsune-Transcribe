@@ -1,14 +1,35 @@
-# torch: install the CUDA build separately, see README
+# The laptop's dependencies: running the released models (kitsune.quant.load_quantized, kitsune.generation) and the
+# repo's scripts, tools and tests on CPU. The code imports each package below (setuptools: TensorBoard's server does).
+# torch is not listed: install the build for your machine first (the CUDA one:
+# pip install torch --index-url https://download.pytorch.org/whl/cu130). The exact versions everything was trained and
+# tested with (torch 2.14.0) are the pins of requirements-train.txt, the box image's list; the test runner is in
+# requirements-dev.txt.
+
+# model + hub
 transformers>=5.13
+tokenizers
+safetensors
 huggingface_hub>=1.0
-datasets>=5.0
-pyarrow
+httpx  # huggingface_hub's HTTP client; 04_distill and vast/finish.py give it timeouts
+
+# data + audio
 numpy
+pyarrow
+pandas
 soundfile>=0.13
 librosa
-tqdm
+soxr
+scipy
+
+# eval + logging
 jiwer
-evaluate
-accelerate
-bitsandbytes
-sentencepiece
+rapidfuzz  # kitsune.aed_cuts' text alignment (also a jiwer dependency)
+tensorboard
+setuptools<81  # the TensorBoard server imports pkg_resources, which setuptools 82 removed
+tqdm
+psutil
+nvidia-ml-py  # NVML: GPU stats (kitsune.runlog) and 05_evaluate's thermal guard; both fall back without it
+
+# Optional, not installed by this file:
+# - torchao==0.18.0: the CUDA kernels of the quantised folders (kitsune.quant); not needed on CPU
+# - the vastai CLI for vast/launch.py: pip install vastai==1.8.0

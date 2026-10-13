@@ -96,16 +96,25 @@ def test_equals_the_step_planner(tmp_path):
 
 
 def test_default_students_and_study_deltas(tmp_path, capsys):
-    """Without --student: the four full students (p01 and p005 share one plan); a name starting with a study
-    student's compares against that student's realised step audio."""
+    """Without --student: the four full students at the epochs the boxes ran (tools/make_full_configs.py
+    launch_epochs; p01 and p005 share one plan, p005 at 10 epochs to p01's 4); a name starting with a study student's
+    compares against that student's realised step audio."""
     path = toy_selection(tmp_path / "sel.parquet", n=3000)
     got = fp.run(path, fp.default_students() + [fp.parse_student("p03-1300=ctc:600:1300:1")], log=lambda *_: None)
     assert list(got["students"]) == ["t06", "p03", "p01", "p005", "p03-1300"]
     s = got["students"]
     assert (s["t06"]["family"], s["t06"]["micro_audio_s"], s["t06"]["step_audio_s"], s["t06"]["epochs"]) == \
-        ("aed", 450, 1730, 3)
-    assert (s["p03"]["micro_audio_s"], s["p03"]["step_audio_s"], s["p03"]["epochs"]) == (600, 1350, 3)
-    assert {k: v for k, v in s["p01"].items()} == {k: v for k, v in s["p005"].items()}
+        ("aed", 450, 1730, 6)
+    assert (s["p03"]["micro_audio_s"], s["p03"]["step_audio_s"], s["p03"]["epochs"]) == (600, 1350, 6)
+    once = ("epochs", "steps_per_epoch", "total_steps", "cooldown_start_step")
+    assert (s["p01"]["epochs"], s["p005"]["epochs"]) == (4, 10)
+    assert s["p005"]["steps_per_epoch"][:4] == s["p01"]["steps_per_epoch"]
+    assert {k: v for k, v in s["p01"].items() if k not in once} == {k: v for k, v in s["p005"].items() if k not in once}
+    sys.path.insert(0, str(ROOT / "tools"))
+    import make_full_configs as M
+
+    assert {n: (m, st, e) for n, (_, m, st, e) in fp.DEFAULT_STUDENTS.items()} == {
+        x: (r["micro"], r["step"], M.launch_epochs(x)) for x, r in M.FULL_RUNS.items()}
     for name, study in (("t06", 1730.7220159744832), ("p03", 1176.470242226075), ("p01", 1538.4610859879444),
                         ("p03-1300", 1176.470242226075)):
         assert s[name]["study_step_real_s"] == study

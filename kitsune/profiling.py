@@ -12,8 +12,8 @@ torch.compile), the run records the evidence itself, in the smoke phase, for a f
            observes, so the weights, losses and RNG streams are those of a run without it (tests/test_smoke_profile.py
            on CPU). On the steps and epochs clocks the run is bitwise the same (the epochs clock pays the cost in box
            time); on the wall clock the cost comes out of the loop time, as an eval's or a checkpoint's does, so a
-           wall-clock config (configs/viability.json, smoke_laptop.json under "auto") trains fewer steps than it did
-           without the profiler. The profiled steps are left out of the smoke throughput check
+           wall-clock config (the viability run's, under "auto") trains fewer steps than it did without the
+           profiler. The profiled steps are left out of the smoke throughput check
   cycles   the recorded steps in profiler cycles (TRACE_STEPS first, then up to CYCLE_STEPS each): each cycle's events
            are aggregated when it ends and then dropped, which bounds host memory and CUPTI's buffers
   cost     the profiled steps run slower, and at each cycle's end the loop waits while the main thread parses and
@@ -21,10 +21,9 @@ torch.compile), the run records the evidence itself, in the smoke phase, for a f
            recorded event, measured on the laptop CPU (torch 2.14, 100k-500k CPU events). At the A100 student's ~150k
            events per step (TRACE_STEPS) the 20 steps' ~3M events come to ~3.5 min of processing, ~4-5 min with the
            slower steps - an extrapolation, not measured on a GPU (about 2 % of a 4 h loop, more of a short wall-clock
-           run such as smoke_laptop.json's 6 min). summary.json's wall_s (the window, start to summary) and
-           cycles[].process_s (each cycle's aggregation), and the `smoke_profile` event's wall_s, record the real cost.
-           Host RAM: ~6 KB per event of the cycle being aggregated (measured on CPU; ~5 GB for a 6-step cycle), freed
-           when the window ends (SmokeProfiler._release)
+           run). summary.json's wall_s (the window, start to summary) and cycles[].process_s (each cycle's aggregation),
+           and the `smoke_profile` event's wall_s, record the real cost. Host RAM: ~6 KB per event of the cycle being
+           aggregated (measured on CPU; ~5 GB for a 6-step cycle), freed when the window ends (SmokeProfiler._release)
   outputs  under runs/<run_id>/smoke/profile/ (uploaded with the logs, verified by vast/finish.py):
              summary.json          what to read (summarise): per step - iteration wall time and its data-wait share,
                                    GPU kernel time and its share, kernel launches (the CUDA runtime's launch calls)

@@ -1,8 +1,8 @@
 """The Whisper yardsticks (WP6; kitsune/whisper.py, tools/whisper_eval.py) on tiny offline models, CPU only.
 
-  pins       WHISPER_MODELS: the four keys of the build contract, large-v3 and Kotoba at 02b's pins, turbo's and small's
-             40-hex revisions, the row caps 64 / 128
-  rules      max_new_tokens is the students' rule (443 at 448) and generate takes one more, never two; whisper_batches
+  pins       WHISPER_MODELS: the four keys of the build contract, large-v3 at 02b's tokenizer pin, Kotoba at the Galgame
+             judge's commit, turbo's and small's 40-hex revisions, the row caps 64 / 128
+  rules      max_new_tokens is the students' rule (443 at 448) and generate takes one more, never two; split_rows
              cuts the eval's own batches at the row cap in order (a 273-row batch -> 64, 64, 64, 64, 17);
              split_generated tells an EOS end from a repetition stop that pad == EOS hides, and from the length cap,
              and strips and counts timestamp ids; RecordingRepetitionStop records the first fire only
@@ -20,7 +20,7 @@
              the manifest and a --model typo refuse (exit 2) before any model is loaded, a store not built yet exits 1;
              --limit-per-set is speed_probe's draw and cannot be tabled (the box template's --tables is skipped with a
              note, not refused: smoke B's quick items); a heartbeat per batch and a bounded one around the load;
-             --fetch-only; never exit 3
+             never exit 3
 """
 import json
 import os
@@ -43,7 +43,7 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-import study_report  # noqa: E402
+import full_report  # noqa: E402
 import whisper_eval as we  # noqa: E402
 from fixtures import load_script  # noqa: E402
 from fixtures_whisper import EOS, EVAL_SETS, MAX_TARGET, NO_TS, PROMPT, V, tiny_whisper_dir, whisper_env  # noqa: E402
@@ -62,15 +62,17 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 
 
 def test_the_pins_and_the_row_caps():
-    """The four systems of the build contract, each pinned to a 40-hex revision; large-v3 and Kotoba at the very
-    commits scripts/02b_second_opinion.py pins (Kotoba's is the model that chose the Galgame-neutral rows); the row caps
-    64 (large-v3) and 128 (the others)."""
+    """The four systems of the build contract, each pinned to a 40-hex revision; large-v3 at the very commit of
+    scripts/02b_second_opinion.py's whisper tokenizer, Kotoba at KOTOBA_JUDGE_REVISION (the model that chose the
+    Galgame-neutral rows); the row caps 64 (large-v3) and 128 (the others)."""
     m = W.WHISPER_MODELS
     assert list(m) == ["whisper-large-v3", "whisper-large-v3-turbo", "kotoba-whisper-v2.0", "whisper-small"]
     assert all(k == s.system and HEX40.match(s.revision) for k, s in m.items())
     b02 = load_script("02b_second_opinion")
     assert (m["whisper-large-v3"].repo, m["whisper-large-v3"].revision) == (b02.WHISPER_TOK, b02.WHISPER_TOK_REVISION)
-    assert (m["kotoba-whisper-v2.0"].repo, m["kotoba-whisper-v2.0"].revision) == (b02.MODEL2, b02.MODEL2_REVISION)
+    assert (m["kotoba-whisper-v2.0"].repo, m["kotoba-whisper-v2.0"].revision) == (
+        "kotoba-tech/kotoba-whisper-v2.0", W.KOTOBA_JUDGE_REVISION)
+    assert W.KOTOBA_JUDGE_REVISION == "7eb575277d18909a4af8a24e3ae8cce2e99794ae"
     assert m["whisper-large-v3-turbo"].revision == "41f01f3fe87f28c78e2fbf8b568835947dd65ed9"
     assert (m["whisper-small"].repo, m["whisper-small"].revision) == ("openai/whisper-small",
                                                                       "973afd24965f72e36ca33b3055d56a652f456b4d")
@@ -101,20 +103,19 @@ def _utts(durations):
     return [trainset.Utt(f"s/{i}", "s", float(d), 1, 0, 0, 0) for i, d in enumerate(durations)]
 
 
-def test_whisper_batches_cut_the_eval_batches_at_the_row_cap():
+def test_split_rows_cuts_the_eval_batches_at_the_row_cap():
     """A 273-row eval batch (the students' batch of short clips) is cut into 64, 64, 64, 64, 17 at cap 64; the pieces
     keep the eval's order and hold every row once; no cap leaves the batches as they are."""
     utts = _utts([200.0] * 3 + [1.0] * 273)  # three clips over half the budget each get a batch of their own
     pooled = trainset.eval_batches(utts, 273.0)
     assert [len(b) for b in pooled] == [1, 1, 1, 273]
-    cut = W.whisper_batches(utts, 273.0, 64)
+    cut = W.split_rows(pooled, 64)
     assert [len(b) for b in cut] == [1, 1, 1, 64, 64, 64, 64, 17]
     assert [i for b in cut for i in b] == [i for b in pooled for i in b]
     assert sorted(i for b in cut for i in b) == list(range(len(utts)))
-    assert W.whisper_batches(utts, 273.0, None) == pooled == W.whisper_batches(utts, 273.0, 0)
-    sub = list(range(5, 200))
-    assert [i for b in W.whisper_batches(utts, 273.0, 64, sub) for i in b] == [
-        i for b in trainset.eval_batches(utts, 273.0, sub) for i in b]
+    assert W.split_rows(pooled, None) == pooled == W.split_rows(pooled, 0)
+    sub = trainset.eval_batches(utts, 273.0, list(range(5, 200)))
+    assert [i for b in W.split_rows(sub, 64) for i in b] == [i for b in sub for i in b]
     assert W.split_rows([[1, 2, 3], [4]], 2) == [[1, 2], [3], [4]]
 
 
@@ -459,7 +460,7 @@ def test_the_tables_and_study_json(wenv, first_run):
     assert st["whisper"]["model"] == load(out / "whisper.json")["model"]
     assert st["whisper"]["decode"]["prompt_ids"] == PROMPT
     man = ss.parse_manifest(wenv["manifest"])
-    loaded, _ = study_report.load_tables(tables, man.sets)
+    loaded, _ = full_report.load_tables(tables, man.sets)
     corpus = ss.build_corpus(loaded, man)
     assert list(corpus.systems) == ["whisper-tiny"]
     point = ss.point_sums(corpus)
@@ -651,25 +652,13 @@ def test_limit_per_set_skips_the_box_templates_tables(wenv, tiny_dir, tmp_path, 
     assert len(events(out, "tables_skipped")) == 2 and not tables.exists()
 
 
-def test_fetch_only_and_the_exit_codes(tiny_dir, monkeypatch):
-    """--fetch-only fetches a key's pinned snapshot under a bounded heartbeat and exits 0 without a store or out; a
-    model dir has nothing to fetch (exit 2); whatever stops the run, never the queue's exit 3."""
-    got, bounded = [], []
-
-    def resolve(model, cache=None):
-        got.append((model, cache))
-        return tiny_dir, W.WHISPER_MODELS[model]
-
-    monkeypatch.setattr(W, "resolve", resolve)
-    real = heartbeat.beating
-    monkeypatch.setattr(heartbeat, "beating", lambda path=None, every_s=30.0, max_s=None: (bounded.append(max_s),
-                                                                                         real(path, every_s, max_s))[1])
-    assert we.main(["--model", "whisper-large-v3-turbo", "--fetch-only", "--hf-cache", "cache/hf"]) == 0
-    assert got == [("whisper-large-v3-turbo", "cache/hf")] and bounded == [3600]
-    assert we.main(["--model", str(tiny_dir), "--system", "x", "--fetch-only"]) == 2
+def test_the_exit_codes(tiny_dir, monkeypatch):
+    """An argument error exits 2 (a model dir needs --system); whatever stops the run, never the queue's exit 3."""
+    argv = ["--store", "cache/eval", "--out", "out", "--manifest", "study_manifest.json"]
+    assert we.main(["--model", str(tiny_dir), *argv]) == 2
 
     def stop3(args):
         raise SystemExit(3)
 
     monkeypatch.setattr(we, "run", stop3)
-    assert we.main(["--model", "whisper-small", "--fetch-only"]) == 1
+    assert we.main(["--model", "whisper-small", *argv]) == 1

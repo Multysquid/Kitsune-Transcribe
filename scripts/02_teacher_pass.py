@@ -14,9 +14,8 @@ FORMAT (npz):
   lse           (N,)        float32 logsumexp of the fp32 logits (raw logit = logprob + lse if ever needed)
   cer           (n,)        float32 CER of the teacher hypothesis vs. the dataset transcript (normalised)
   duration      (n,)        float32 seconds
-  n_scanned, k, save_encoder, prompt    scalars/1-d: settings that produced this shard (checked on resume)
-  enc_offsets   (n+1,)      int64   only with --save-encoder: frame span into enc_states
-  enc_states    (F, 1280)   float16 only with --save-encoder: final encoder layer output (unpadded frames)
+  n_scanned, k, save_encoder, prompt    scalars/1-d: settings that produced this shard (checked on resume;
+                                       save_encoder is always False: no pass ever stored encoder states)
 
 The remaining probability mass outside the top-k is 1 - sum(exp(topk_logprob)); clamp it at 0, since fp16 rounding of
 the log-probs can push the stored top-k mass ~1e-4 above 1.
@@ -111,14 +110,14 @@ def make_batches(durations: np.ndarray, max_batch_seconds: float, max_batch: int
 
 
 @torch.inference_mode()
-def run_batch(model, inputs, max_dur: float, k: int, save_encoder: bool):
+def run_batch(model, inputs, max_dur: float, k: int):
     """`inputs` is the processor output for one batch (featurised on a CPU worker thread)."""
     feats = inputs["input_features"].to(model.device, model.dtype)
     amask = inputs["attention_mask"].to(model.device)
     prompt = inputs["decoder_input_ids"].to(model.device)
     B = feats.shape[0]
 
-    # run the encoder once, hand its output to generate (no recompute) and optionally keep it
+    # run the encoder once and hand its output to generate (no recompute)
     enc = model.model.encoder(input_features=feats, attention_mask=amask)
     # observed ~3.6 tokens per audio second (max ~6.5); 16 + 10*s is a 1.5x margin on the max
     max_new = min(int(16 + 10 * max_dur), model.config.max_position_embeddings - prompt.shape[1] - 1)
@@ -155,7 +154,7 @@ def run_batch(model, inputs, max_dur: float, k: int, save_encoder: bool):
     lengths = (first_stop + ended_with_eos.long()).tolist()  # keep the EOS token so the student learns to stop
     truncated = (~ended_with_eos).tolist()  # cut by max_new_tokens or by RepetitionStop
 
-    result = dict(
+    return dict(
         gen=gen.cpu().numpy(),
         lengths=lengths,
         truncated=truncated,
@@ -164,11 +163,6 @@ def run_batch(model, inputs, max_dur: float, k: int, save_encoder: bool):
         lse=lse.cpu().numpy(),
         prompt=prompt[0].tolist(),
     )
-    if save_encoder:
-        h = enc.last_hidden_state.to(torch.float16).cpu().numpy()  # (B, F, 1280)
-        n_frames = enc.attention_mask.sum(dim=1).tolist() if enc.attention_mask is not None else [h.shape[1]] * B
-        result["enc"] = [h[i, : n_frames[i]] for i in range(B)]
-    return result
 
 
 def load_table(root: Path, job: ShardJob, limit_rows: int | None) -> dict:
@@ -205,7 +199,7 @@ def prepare(processor, t: dict, idx):
 
 
 def gpu(model, inputs, ok, t: dict, args) -> dict:
-    r = run_batch(model, inputs, float(t["durs"][ok].max()), args.k, args.save_encoder)
+    r = run_batch(model, inputs, float(t["durs"][ok].max()), args.k)
     per = {}
     for bi, i in enumerate(ok):
         L = r["lengths"][bi]
@@ -215,18 +209,17 @@ def gpu(model, inputs, ok, t: dict, args) -> dict:
             top_lp=r["top_lp"][bi, :L],
             lse=r["lse"][bi, :L],
             truncated=r["truncated"][bi],
-            enc=r["enc"][bi] if args.save_encoder else None,
         )
     t["prompt"] = r["prompt"]
     return per
 
 
-def pack_teacher_shard(ids, texts, durs, n, per, rows, k, save_encoder, prompt) -> dict:
+def pack_teacher_shard(ids, texts, durs, n, per, rows, k, prompt) -> dict:
     """The npz arrays of one shard (FORMAT above), rows in original row order. `per[i]["hyp"]` is the decoded
     hypothesis of row i; its CER against texts[i] is stored. Byte-for-byte the packing of tests/fixtures.py."""
     cers = np.array([cer_fn(per[i]["hyp"], texts[i]) for i in rows], dtype=np.float32)
     tok_lens = np.array([len(per[i]["tokens"]) for i in rows], dtype=np.int64)
-    packed = dict(
+    return dict(
         ids=np.array([ids[i] for i in rows]),
         tok_offsets=np.concatenate([[0], np.cumsum(tok_lens)]),
         tokens=np.concatenate([per[i]["tokens"] for i in rows]) if rows else np.zeros(0, np.int16),
@@ -237,14 +230,9 @@ def pack_teacher_shard(ids, texts, durs, n, per, rows, k, save_encoder, prompt) 
         duration=durs[rows],
         n_scanned=np.int64(n),
         k=np.int64(k),
-        save_encoder=np.bool_(save_encoder),
+        save_encoder=np.bool_(False),  # the key every sealed and adopted npz has, at its position
         prompt=np.array(prompt if prompt is not None else [], dtype=np.int64),
     )
-    if save_encoder:
-        enc_lens = np.array([len(per[i]["enc"]) for i in rows], dtype=np.int64)
-        packed["enc_offsets"] = np.concatenate([[0], np.cumsum(enc_lens)])
-        packed["enc_states"] = np.concatenate([per[i]["enc"] for i in rows]) if rows else np.zeros((0, 1280), np.float16)
-    return packed
 
 
 def jsonl_rows(packed: dict, ids, texts, durs, per, rows) -> list[dict]:
@@ -259,8 +247,7 @@ def finish_shard(processor, job: ShardJob, t: dict, per: dict, stats: dict, args
     hyps = processor.batch_decode([per[i]["tokens"].astype(np.int64) for i in rows], skip_special_tokens=True)
     for h, i in zip(hyps, rows):
         per[i]["hyp"] = h
-    packed = pack_teacher_shard(t["ids"], t["texts"], t["durs"], t["n"], per, rows, args.k, args.save_encoder,
-                                t["prompt"])
+    packed = pack_teacher_shard(t["ids"], t["texts"], t["durs"], t["n"], per, rows, args.k, t["prompt"])
     write_pair(job.out_dir / f"{job.stem}.jsonl", jsonl_rows(packed, t["ids"], t["texts"], t["durs"], per, rows),
                job.out_dir / f"{job.stem}.npz", packed, compressed=False)  # npz last: its presence marks the shard done
     cers = packed["cer"]
@@ -294,8 +281,7 @@ def shard_is_done(npz: Path, shard_ids: list[str], args) -> bool:
         return False
     try:
         with np.load(npz) as z:
-            if (int(z["n_scanned"]) != len(shard_ids) or int(z["k"]) != args.k
-                    or bool(z["save_encoder"]) != args.save_encoder):
+            if int(z["n_scanned"]) != len(shard_ids) or int(z["k"]) != args.k or bool(z["save_encoder"]):
                 return False
             ids = [str(x) for x in z["ids"].tolist()]
         if not ordered_subsequence(ids, shard_ids):
@@ -341,13 +327,8 @@ def try_adopt(src_dir: Path, job: ShardJob, shard_ids: list[str], prompt, args) 
 
 
 def check_meta(meta_path: Path, settings: dict, strict: bool = False):
-    """Exit if an existing meta.json was written with other settings (65 under --strict-existing). A meta.json from
-    before the teacher was pinned has no model_revision; that output all came from b1eacc2 (the only snapshot ever
-    cached, and still `main`), so it counts as the pin and the key is back-filled (meta.json is otherwise only written
-    when missing or with --force)."""
+    """Exit if an existing meta.json was written with other settings (65 under --strict-existing)."""
     old = json.loads(meta_path.read_text(encoding="utf-8"))
-    backfill = "model_revision" not in old
-    old.setdefault("model_revision", MODEL_REVISION)
     diff = {key: (old.get(key), val) for key, val in settings.items() if old.get(key) != val}
     if diff:
         msg = f"{meta_path} was written with different settings {diff}; use --force (recomputes everything) or a different --out"
@@ -355,8 +336,6 @@ def check_meta(meta_path: Path, settings: dict, strict: bool = False):
             print(msg, file=sys.stderr)
             sys.exit(INTEGRITY_EXIT)
         sys.exit(msg)
-    if backfill:
-        write_json_atomic(meta_path, old)
 
 
 def meta_prompt(path: Path):
@@ -383,8 +362,6 @@ def main():
     ap.add_argument("--prefetch", type=int, default=2, help="batches decoded+featurised ahead on CPU, across shards (min 1)")
     ap.add_argument("--workers", type=int, default=4, help="CPU threads that decode + featurise batches")
     ap.add_argument("--torch-threads", type=int, default=None, help="torch.set_num_threads for this process")
-    ap.add_argument("--save-encoder", action="store_true",
-                    help="also store final encoder states (fp16, ~32 KB per audio second: ~45 GB for 400 h)")
     ap.add_argument("--limit-shards", type=int, default=None)
     ap.add_argument("--limit-rows", type=int, default=None, help="debug: only the first N rows of each shard")
     ap.add_argument("--force", action="store_true", help="recompute shards that already have output; overwrite meta.json")
@@ -419,7 +396,7 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
     meta_path = out_root / "meta.json"
     settings = dict(model=MODEL_ID, model_revision=MODEL_REVISION, language=LANG, punctuation=PUNCT, k=args.k,
-                    save_encoder=args.save_encoder)
+                    save_encoder=False)  # the sealed and seed meta.json carry it (vast/label.py TEACHER_SETTING_KEYS)
     if meta_path.exists() and not args.force:
         check_meta(meta_path, settings, strict=args.strict_existing)
     adopt_prompt = None

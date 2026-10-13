@@ -356,7 +356,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                                                        "between sizes")
     ap.add_argument("--calib-utts", type=int, default=1000, help="calibration utterances for FFN importance")
     ap.add_argument("--sources", nargs="+", default=None, help="calibration sources (default: 03_build_student's)")
-    ap.add_argument("--selection", default=str(ROOT / "selection" / "viability.parquet"))
+    ap.add_argument("--selection", default=str(ROOT / "selection" / "viability.parquet"),
+                    help="the selection --calib-ids are kept train rows of, or the draw's (default: the viability "
+                         "run's, selection/viability.parquet of the HF data repo)")
     ap.add_argument("--data", default=str(ROOT / "data"))
     ap.add_argument("--seed", type=int, default=1234, help="calibration draw seed (the first run's)")
     ap.add_argument("--calib-per-group", type=int, default=16)

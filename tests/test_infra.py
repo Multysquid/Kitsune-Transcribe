@@ -28,11 +28,9 @@ DIGEST_IMAGE = "ghcr.io/multysquid/kitsune-train@sha256:" + "ab" * 32
 
 sys.path.insert(0, str(VAST))
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "tests"))
 finish = importlib.import_module("finish")
 supervise = importlib.import_module("supervise")
 launch = importlib.import_module("launch")
-from fixtures import REAL, no_real_data  # noqa: E402
 
 
 def load_path(name: str, path: Path):
@@ -278,8 +276,8 @@ def test_bootstrap_retries_the_audio_rebuild(tmp_path):
     the last one the last exit code, so set -e still stops bootstrap with the real cause. Exit 3 (the plan helper's
     NO_RETRY: a token or data repo the Hub refused) returns at once: three tries cost ~3 paid minutes for nothing."""
     text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
-    line = next(ln for ln in text.splitlines() if ln.lstrip().startswith("phase rebuild_audio"))
-    assert re.search(r"phase rebuild_audio retry \d+ timeout -k \d+ \d+m \"\$PY\" scripts/01_prepare_data\.py", line)
+    assert re.search(r'^phase rebuild_audio retry \d+ timeout -k \d+ "\$\{KITSUNE_REBUILD_TIMEOUT_MIN:-\d+\}m" "\$PY" '
+                     r'\\\n\s+scripts/01_prepare_data\.py ', text, re.M)
     bash = find_bash()
     if bash is None:
         pytest.skip("bash not available")
@@ -308,153 +306,48 @@ def test_bootstrap_retries_the_audio_rebuild(tmp_path):
     assert "slept" not in r.stdout and (tmp_path / "refusal").read_text().strip() == "1"
 
 
-def test_bootstrap_lists_parked_shards_in_the_manifest(tmp_path, prep):
-    """A parked source's shards come from the data repo without data/manifest.jsonl, but 01 reads other sources' rows
-    from the manifest: with emilia_yodas parked, eval_emilia's rebuild stopped with "ingest emilia_yodas first" and the
-    box was stopped. The helper's pull lists the parked shards as a local ingest would; a second pull adds nothing."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    from kitsune.store import SCHEMA, read_manifest
-
-    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
-    (tmp_path / "helper.py").write_text(re.search(r"<<'PYEOF'\n(.*?\n)PYEOF\n", text, re.S).group(1), encoding="utf-8")
-    stub = tmp_path / "stub" / "huggingface_hub"  # the parked shards below are what snapshot_download pulled
-    stub.mkdir(parents=True)
-    (stub / "__init__.py").write_text("def snapshot_download(*args, **kwargs):\n    pass\n", encoding="utf-8")
-    box, state = tmp_path / "box", tmp_path / "state"
-    (box / "configs").mkdir(parents=True)
-    state.mkdir()
-    (box / "configs" / "c.json").write_text(json.dumps(dict(
-        sources=["emilia_yodas"], eval_sets=["eval_emilia"], data_root="data", selection="selection/v.parquet",
-        student="students/s")), encoding="utf-8")
-    (state / "bootstrap_plan.json").write_text(json.dumps(dict(
-        patterns=[], parked=["emilia_yodas"], rebuild=["eval_emilia"],
-        files=["data/shards/emilia_yodas/train-00000.parquet"])), encoding="utf-8")
-    shards = box / "data" / "shards" / "emilia_yodas"
-    shards.mkdir(parents=True)
-    rows = [dict(id=f"emilia_yodas/JA_{v}_W{i:06d}", source="emilia_yodas", split="train", audio=b"", text="x",
-                 duration=1.5, sr=16000) for v, i in (("vid_a", 1), ("vid_a", 2), ("vid_b", 1))]
-    pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), shards / "train-00000.parquet")
-    env = dict(os.environ, KITSUNE_DIR=str(box), STATE=str(state), CONFIG="configs/c.json", KITSUNE_DATA_REPO="u/data",
-               KITSUNE_DATA_REVISION="main", PYTHONPATH=os.pathsep.join([str(tmp_path / "stub"), str(ROOT)]))
-    for _ in range(2):
-        r = subprocess.run([sys.executable, str(tmp_path / "helper.py"), "pull"], capture_output=True, text=True,
-                           env=env, timeout=120)
-        assert r.returncode == 0, r.stdout + r.stderr
-    (sh,) = read_manifest(box / "data")
-    assert (sh.path, sh.source, sh.split, sh.rows) == ("shards/emilia_yodas/train-00000.parquet", "emilia_yodas",
-                                                       "train", 3)
-    assert sh.hours == pytest.approx(4.5 / 3600)
-
-    class Reached(Exception):
-        pass
-
-    def download(repo, filename):
-        raise Reached(filename)
-
-    ing = prep.Ingest(box / "data", tmp_path / "raw", "eval_emilia", None)
-    ing.download = download
-    with pytest.raises(Reached):  # past the "ingest emilia_yodas first" check, on to the hold-out's tar
-        prep.ingest_emilia_eval(ing, prep.EMILIA_EVAL_TAR, prep.EMILIA_EVAL_ROWS)
-
-
 def test_bootstrap_pull_fails_before_the_rebuild_when_nothing_arrived(tmp_path):
     """When snapshot_download's one repo_info request fails (a Hub 5xx/429, a dropped connection; HF-X2) it returns the
     checkout it was given as local_dir, never empty, with only a warning and downloads nothing: the 10-20 min audio
-    rebuild then ran and only the coverage check (no teacher ids) stopped the box. The plan now records the files the
-    pull must bring, by the Hub client's own matcher; the pull exits non-zero while one is missing, under retry()."""
-    import huggingface_hub.utils._paths as hf_paths
-
+    rebuild then ran and only the coverage check (no teacher ids) stopped the box. The plan records the files the pull
+    must bring (by the Hub client's own matcher: tests/test_bootstrap_extent.py); the pull exits non-zero while one is
+    missing, under retry()."""
     text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
     line = next(ln for ln in text.splitlines() if ln.lstrip().startswith("phase pull_derived"))
     assert re.search(r'phase pull_derived retry \d+ timeout -k \d+ \d+m "\$PY" "\$HELPER" pull', line)
     (tmp_path / "helper.py").write_text(re.search(r"<<'PYEOF'\n(.*?\n)PYEOF\n", text, re.S).group(1), encoding="utf-8")
-    repo_files = ["README.md", "teacher_out/meta.json", "second_out/meta.json", "selection/v.parquet",
-                  *(f"students/s/{n}" for n in launch.STUDENT_FILES), "teacher_out/src_a/s0.npz",
-                  "second_out/src_a/s0.jsonl", "teacher_out/eval_x/s0.npz", "teacher_out/other/s0.npz"]
     stub = tmp_path / "stub" / "huggingface_hub"
     stub.mkdir(parents=True)
-    (stub / "__init__.py").write_text(
-        "class HfApi:\n"
-        "    def whoami(self):\n        return {'name': 'u'}\n"
-        "    def auth_check(self, *a, **k):\n        pass\n"
-        f"    def list_repo_files(self, *a, **k):\n        return {repo_files!r}\n"
-        "def snapshot_download(*args, **kwargs):\n    pass  # the silent no-op: nothing arrives\n", encoding="utf-8")
-    (stub / "utils.py").write_text(  # the real matcher (pure Python), which snapshot_download filters the tree with
-        "import importlib.util\n"
-        f"_s = importlib.util.spec_from_file_location('_hf_paths', {hf_paths.__file__!r})\n"
-        "_m = importlib.util.module_from_spec(_s)\n_s.loader.exec_module(_m)\n"
-        "filter_repo_objects = _m.filter_repo_objects\n", encoding="utf-8")
+    (stub / "__init__.py").write_text("def snapshot_download(*args, **kwargs):\n    pass  # the silent no-op: nothing "
+                                      "arrives\n", encoding="utf-8")
     box, state = tmp_path / "box", tmp_path / "state"
     (box / "configs").mkdir(parents=True)
-    (box / "README.md").write_text("git checkout\n", encoding="utf-8")
     state.mkdir()
     (box / "configs" / "c.json").write_text(json.dumps(dict(
-        sources=["src_a"], eval_sets=["eval_x"], data_root="data", selection="selection/v.parquet",
-        student="students/s")), encoding="utf-8")
+        sources=["src_a"], eval_sets=["eval_x"], data_root="data", selection="labels/full/selections/v.parquet")),
+        encoding="utf-8")
+    want = ["labels/full/teacher_out/meta.json", "labels/full/selections/v.parquet",
+            "labels/full/teacher_out/src_a/train-00000.npz"]
+    (state / "bootstrap_plan.json").write_text(json.dumps(dict(
+        patterns=["labels/full/teacher_out/meta.json", "labels/full/selections/v.parquet",
+                  "labels/full/teacher_out/src_a/*"], explicit=[], files=want, data_root="data", rebuild=["src_a"])),
+        encoding="utf-8")
     env = dict(os.environ, KITSUNE_DIR=str(box), STATE=str(state), CONFIG="configs/c.json", KITSUNE_DATA_REPO="u/data",
                KITSUNE_OUT_REPO="u/runs", KITSUNE_DATA_REVISION="main",
                PYTHONPATH=os.pathsep.join([str(tmp_path / "stub"), str(ROOT)]))
+    env.pop("KITSUNE_JOB", None)
 
-    def helper(cmd):
-        return subprocess.run([sys.executable, str(tmp_path / "helper.py"), cmd], capture_output=True, text=True,
+    def pull():
+        return subprocess.run([sys.executable, str(tmp_path / "helper.py"), "pull"], capture_output=True, text=True,
                               env=env, timeout=120)
 
-    r = helper("plan")
-    assert r.returncode == 0, r.stdout + r.stderr
-    want = json.loads((state / "bootstrap_plan.json").read_text(encoding="utf-8"))["files"]
-    assert want == [f for f in repo_files if f not in ("README.md", "teacher_out/other/s0.npz")]
-    r = helper("pull")
+    r = pull()
     assert r.returncode != 0 and f"pull incomplete: {len(want)} of {len(want)} planned files missing" in r.stderr
     for f in want:  # what a pull that reached the Hub leaves
         (box / f).parent.mkdir(parents=True, exist_ok=True)
         (box / f).write_bytes(b"x")
-    r = helper("pull")
+    r = pull()
     assert r.returncode == 0, r.stdout + r.stderr
-
-
-def test_bootstrap_coverage_is_checked_per_split(tmp_path):
-    """The trainer joins a split's teacher ids only against that split's audio shards (<split>-*.parquet). Pooled over
-    a source's splits, galgame's 1,000-row hold-out is 0.5 % of its ids: all of it missing (or moved into a train
-    shard by a rebuild that split the rows differently) passed the 0.99 floor, and the eval store then dropped the
-    hold-out with one printed line. The coverage check now holds every split of a source to the floor."""
-    import numpy as np
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
-    (tmp_path / "helper.py").write_text(re.search(r"<<'PYEOF'\n(.*?\n)PYEOF\n", text, re.S).group(1), encoding="utf-8")
-    box, state = tmp_path / "box", tmp_path / "state"
-    (box / "configs").mkdir(parents=True)
-    state.mkdir()
-    (box / "configs" / "c.json").write_text(json.dumps(dict(
-        sources=["gal"], eval_sets=["gal"], data_root="data", selection="selection/v.parquet", student="students/s")),
-        encoding="utf-8")
-    train, held = [f"gal/t{i:03d}" for i in range(300)], ["gal/e0", "gal/e1"]
-    (box / "teacher_out" / "gal").mkdir(parents=True)
-    np.savez(box / "teacher_out" / "gal" / "train-00000.npz", ids=np.array(train))
-    np.savez(box / "teacher_out" / "gal" / "eval-00000.npz", ids=np.array(held))
-    shards = box / "data" / "shards" / "gal"
-    shards.mkdir(parents=True)
-    pq.write_table(pa.table({"id": train}), shards / "train-00000.parquet")
-    pq.write_table(pa.table({"id": held}), shards / "train-00001.parquet")  # the hold-out's rows landed in train
-    env = dict(os.environ, KITSUNE_DIR=str(box), STATE=str(state), CONFIG="configs/c.json", KITSUNE_DATA_REPO="u/data",
-               KITSUNE_DATA_REVISION="main", KITSUNE_MIN_COVERAGE="0.99")
-
-    def coverage():
-        r = subprocess.run([sys.executable, str(tmp_path / "helper.py"), "coverage"], capture_output=True, text=True,
-                           env=env, timeout=120)
-        return r, json.loads((state / "bootstrap_coverage.json").read_text(encoding="utf-8"))
-
-    r, report = coverage()  # pooled: 302 of 302 ids joined
-    assert r.returncode != 0 and "coverage below 0.99 for ['gal/eval']" in r.stderr, r.stdout + r.stderr
-    assert report["gal/train"]["coverage"] == 1.0 and report["gal/eval"]["joined"] == 0
-    (shards / "train-00001.parquet").unlink()
-    pq.write_table(pa.table({"id": held}), shards / "eval-00000.parquet")
-    r, report = coverage()
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert set(report) == {"gal/train", "gal/eval"} and report["gal/eval"]["coverage"] == 1.0
 
 
 def test_bootstrap_plan_checks_the_box_token_on_the_output_repo(tmp_path):
@@ -493,13 +386,16 @@ def test_bootstrap_plan_checks_the_box_token_on_the_output_repo(tmp_path):
         "    def list_repo_files(self, *a, **k):\n"
         "        if os.environ.get('DENY_LIST'):\n"
         "            raise HTTPError(int(os.environ['DENY_LIST']))\n"
-        "        return []\n", encoding="utf-8")
+        "        return []\n"
+        "def hf_hub_download(*a, **k):\n"
+        "    raise AssertionError('the plan never reads a record the listing lacks')\n", encoding="utf-8")
     (stub / "utils.py").write_text("def filter_repo_objects(items, **kw):\n    return list(items)\n", encoding="utf-8")
     box, state = tmp_path / "box", tmp_path / "state"
     (box / "configs").mkdir(parents=True)
     state.mkdir()
     (box / "configs" / "c.json").write_text(json.dumps(dict(
-        sources=["src_a"], eval_sets=[], selection="selection/v.parquet", student="students/s")), encoding="utf-8")
+        sources=["src_a"], eval_sets=[], selection="labels/full/selections/v.parquet",
+        extent={"name": "full", "root": "labels/full", "inputs": {}})), encoding="utf-8")
     env = dict(os.environ, KITSUNE_DIR=str(box), STATE=str(state), CONFIG="configs/c.json", KITSUNE_DATA_REPO="u/data",
                KITSUNE_OUT_REPO="u/runs", KITSUNE_DATA_REVISION="main", DENY_WRITE="403",
                PYTHONPATH=os.pathsep.join([str(tmp_path / "stub"), str(ROOT)]))
@@ -531,6 +427,12 @@ def test_bootstrap_plan_checks_the_box_token_on_the_output_repo(tmp_path):
     assert "auth_check u/runs model write=True" in r.stdout and "HF_TOKEN cannot" not in r.stderr
     assert "data repo u/data@main lacks" in r.stderr, "past the token check, on to the data listing"
     assert r.returncode == 3, "the data the pinned revision lacks does not appear on a retry"
+    # a config without an extent: refused once the token checks pass (a full box rebuilds a sealed label extent)
+    cfg = json.loads((box / "configs" / "c.json").read_text(encoding="utf-8"))
+    (box / "configs" / "c.json").write_text(json.dumps({k: v for k, v in cfg.items() if k != "extent"}),
+                                            encoding="utf-8")
+    r = subprocess.run(run, capture_output=True, text=True, env=env, timeout=120)
+    assert r.returncode == 3 and "configs/c.json has no extent" in r.stderr, r.stdout + r.stderr
 
 
 def test_onstart_fits_vast_limits():
@@ -649,7 +551,7 @@ def test_onstart_skips_bootstrap_on_a_restart_with_a_supervisor_history(tmp_path
     script = tmp_path / "subshell.sh"
     script.write_text("\n".join(["set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }", "PY=bash", body]),
                       encoding="utf-8", newline="\n")
-    env = dict(os.environ, KITSUNE_STATE=state.as_posix(), KITSUNE_DIR=repo.as_posix())
+    env = dict(os.environ, KITSUNE_STATE=state.as_posix(), KITSUNE_DIR=repo.as_posix(), KITSUNE_JOB="full")
 
     def boot() -> tuple[list[str], str]:
         (state / "ran").unlink(missing_ok=True)
@@ -659,7 +561,7 @@ def test_onstart_skips_bootstrap_on_a_restart_with_a_supervisor_history(tmp_path
 
     ran, out = boot()  # first boot
     assert ran == ["bootstrap.sh", "supervise.py"] and "bootstrap start" in out
-    (state / "supervise.json").write_text('{"attempts": [{"t0": 1.0, "resume": null}]}', encoding="utf-8")
+    (state / "supervise.json").write_text('{"attempts": [{"t0": 1.0, "queue": true}]}', encoding="utf-8")
     ran, out = boot()  # a restart mid-attempt (or with a recorded final decision)
     assert ran == ["supervise.py"] and "supervisor history present" in out and "bootstrap start" not in out
 
@@ -677,16 +579,27 @@ def test_watchdog_dry_run(tmp_path):
 
 
 # --------------------------------------------------------------------------------------------------------- launch.py
+# launch.main's own behaviour (the create command, --yes, the vastai CLI's errors and absence, the image checks) on
+# box p01 of tests/fixtures_full.tiny_registry with the Hub side passing; the full job's filters, refusals and
+# preflights are tests/test_full_vast.py's, the label job's tests/test_label_launch.py's
 
-OFFERS_40 = [
-    {"id": 222, "gpu_name": "A100 SXM4", "gpu_ram": 40960, "dph_total": 0.926, "reliability": 0.99,
-     "cuda_max_good": 13.2, "cpu_cores_effective": 16, "cpu_ram": 96000, "inet_down": 900, "disk_bw": 2000,
-     "geolocation": "US"},
-    {"id": 111, "gpu_name": "A100 SXM4", "gpu_ram": 40960, "dph_total": 0.672, "reliability": 0.995,
-     "cuda_max_good": 13.0, "cpu_cores_effective": 12, "cpu_ram": 64000, "inet_down": 600, "disk_bw": 800,
-     "inet_down_cost": 0.01, "inet_up_cost": 0.02, "geolocation": "SE"},
-]
-OFFERS_80 = [{"id": 333, "gpu_name": "A100 SXM4", "gpu_ram": 81920, "dph_total": 1.604, "reliability": 0.99}]
+SCRATCH = "Multy123/kitsune-scratch"
+DAY = 86400
+# box p01's extent sizing (extent_preflight, faked): the disk, the download and the rebuild timeout
+SIZING = dict(down_gb=571.3, shard_gb=1100.0, sel_gb=90.0, stores=1, labels_gb=23.4, hours=13000.0, extra_gb=0.0,
+              disk_gb=1400, rebuild_timeout_min=387)
+
+
+def offer(i, machine, dph, **kw):
+    """A 1x RTX 5090 offer that passes the full box's client filter unless kw says otherwise."""
+    return dict({"id": i, "machine_id": machine, "gpu_name": "RTX 5090", "gpu_ram": 32607, "num_gpus": 1,
+                 "dph_total": dph, "reliability": 0.99, "verification": "verified", "duration": 30 * DAY,
+                 "cpu_ram": 64439, "inet_down_cost": 0.002, "inet_up_cost": 0.002, "geolocation": "Sweden, SE"}, **kw)
+
+
+# 222 is the cheaper per hour, 111 (listed second) the cheaper in all: ~$15.9 against ~$19.5 for box p01's 19.5 h and
+# ~653 GB of traffic
+OFFERS = [offer(222, 7001, 0.70, inet_down_cost=0.009, inet_up_cost=0.009), offer(111, 7002, 0.75)]
 
 
 class FakeVastai:
@@ -711,9 +624,37 @@ class FakeVastai:
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
 
+@pytest.fixture
+def full_box(tmp_path, monkeypatch):
+    """Box p01 of tests/fixtures_full.tiny_registry: launch's git reads serve its checkout at SHA, and the Hub side
+    passes (hf_preflight, extent_preflight with SIZING, full_preflight, no label or gate avoids)."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    from fixtures_full import tiny_registry
+
+    root = tmp_path / "checkout"
+    tiny_registry(root, write_boxes=True)
+
+    def at(sha, rel):
+        if sha != SHA or not (root / rel).is_file():
+            raise subprocess.CalledProcessError(128, ["git", "show", f"{sha}:{rel}"])
+        return (root / rel).read_bytes()
+
+    monkeypatch.setattr(launch, "git_show", at)
+    monkeypatch.setattr(launch, "config_at", lambda sha, c: json.loads(at(sha, c)))
+    monkeypatch.setattr(launch, "worktree_file", lambda rel: None)
+    monkeypatch.setattr(launch, "hf_preflight", lambda data, out, cfg: ("d" * 40, []))
+    monkeypatch.setattr(launch, "extent_preflight",
+                        lambda data, rev, cfg, extra_gb=0.0: ([], dict(SIZING, extra_gb=extra_gb)))
+    monkeypatch.setattr(launch, "full_preflight", lambda *a, **kw: ([], []))
+    monkeypatch.setattr(launch, "avoided_machines", lambda data, rev: (set(), []))
+    monkeypatch.setattr(launch, "gate_refusals", lambda out: ({}, []))
+    return root
+
+
 def launch_args(*extra):
-    return ["--data-repo", "Multy123/kitsune-data", "--out-repo", "Multy123/kitsune-runs", "--sha", SHA,
-            "--image", DIGEST_IMAGE, "--no-hf-check", "--skip-git-checks", *extra]
+    return ["--job", "full", "--box", "p01", "--data-repo", "Multy123/kitsune-data", "--out-repo",
+            "Multy123/kitsune-runs", "--scratch-repo", SCRATCH, "--sha", SHA, "--image", DIGEST_IMAGE,
+            "--skip-git-checks", *extra]
 
 
 @pytest.fixture
@@ -726,40 +667,36 @@ def fake_vastai(monkeypatch):
     return install
 
 
-def test_launch_dry_run_builds_query_and_command(fake_vastai, capsys):
-    fake = fake_vastai([OFFERS_40])
+def test_launch_dry_run_builds_query_and_command(full_box, fake_vastai, capsys):
+    fake = fake_vastai([OFFERS])
     assert launch.main(launch_args("--dry-run", "--yes")) == 0
     assert len(fake.calls) == 1, "dry run searches but never creates"
     search = fake.calls[0]
     assert search[:3] == ["/fake/vastai", "search", "offers"]
-    query = search[3]
-    for term in ("gpu_name in [A100_SXM4]", "num_gpus=1", "verified=true", "reliability>=0.98", "cuda_vers>=13.0",
-                 "cpu_cores_effective>=12", "cpu_ram>=64", "disk_bw>=500", "inet_down>=500", "inet_up>=500",
-                 "direct_port_count>=1", "gpu_ram<=48"):
-        assert term in query.split(" ") or term in query, term
-    assert search[4:] == ["--type", "on-demand", "-o", "dph", "--storage", "150", "--raw"]
+    assert {"gpu_name=RTX_5090", "num_gpus=1", "disk_space>=1400"} <= set(search[3].split(" "))
+    assert search[4:] == ["--type", "on-demand", "-o", "dph", "--storage", "1400", "--raw"]
     out = capsys.readouterr().out
     create_line = next(ln for ln in out.splitlines() if ln.strip().startswith("vastai create instance"))
-    # cheapest offer wins even if the API returned it second
+    # the lowest estimated total wins, though the API returned it second and it costs more per hour
     assert create_line.strip().startswith("vastai create instance 111 ")
-    for piece in (f"--image {DIGEST_IMAGE}", "--disk 150", "--ssh", "--direct", "--cancel-unavail",
-                  f"-e KITSUNE_SHA={SHA}", "-e KITSUNE_CONFIG=configs/viability.json",
+    for piece in (f"--image {DIGEST_IMAGE}", "--disk 1400", "--ssh", "--direct", "--cancel-unavail",
+                  f"-e KITSUNE_SHA={SHA}", "-e KITSUNE_CONFIG=configs/full/data-p01.json",
                   "-e KITSUNE_DATA_REPO=Multy123/kitsune-data", "-e KITSUNE_OUT_REPO=Multy123/kitsune-runs",
                   "-e TZ=UTC", "--onstart"):
         assert piece in create_line, piece
     assert "onstart_stub.sh" in create_line
     assert "HF_TOKEN" not in create_line
     assert "not creating anything (--dry-run)" in out
-    # bandwidth priced from the host's $/GB (OFFERS_40[1]: 0.01 down, 0.02 up)
-    assert "~$0.85 (~25 GB down, ~30 GB up" in out and "$/GBup" in out
+    # the traffic priced at the host's $/GB (offer 111: 0.002 down and up), the ranking's total in the table
+    assert "~595 GB down x $0.002/GB" in out and "$/GBup" in out and "est$" in out
 
 
-def test_launch_no_self_stop_goes_inside_the_env_value(fake_vastai, capsys):
+def test_launch_no_self_stop_goes_inside_the_env_value(full_box, fake_vastai, capsys):
     """vastai's create has no -e option and a second --env replaces the first: the flag must join the one value."""
-    fake_vastai([OFFERS_40])
+    fake_vastai([OFFERS])
     assert launch.main(launch_args("--dry-run")) == 0
     assert "KITSUNE_NO_SELF_STOP" not in capsys.readouterr().out
-    fake = fake_vastai([OFFERS_40])
+    fake = fake_vastai([OFFERS])
     assert launch.main(launch_args("--yes", "--no-self-stop")) == 0
     create = next(c for c in fake.calls if c[1:3] == ["create", "instance"])
     assert create.count("--env") == 1 and not any(a == "-e" for a in create)
@@ -781,42 +718,49 @@ def test_onstart_stub_stops_the_box_when_kitsune_sha_is_unset(tmp_path):
     assert "onstart.sh missing" in text and "unbound variable" not in text, text
 
 
-def test_launch_needs_yes_to_create(fake_vastai, capsys):
-    fake = fake_vastai([OFFERS_40])
+def test_launch_needs_yes_to_create(full_box, fake_vastai, capsys):
+    fake = fake_vastai([OFFERS])
     assert launch.main(launch_args()) == 0
     assert all(c[1:3] != ["create", "instance"] for c in fake.calls)
     assert "re-run with --yes" in capsys.readouterr().out
 
 
-def test_launch_falls_back_to_80gb_and_creates_with_yes(fake_vastai, capsys):
-    fake = fake_vastai([[], OFFERS_80])
+def test_launch_creates_with_yes_and_a_larger_disk_wins(full_box, fake_vastai, capsys):
+    fake = fake_vastai([OFFERS])
     assert launch.main(launch_args("--yes")) == 0
-    searches = [c for c in fake.calls if c[1:3] == ["search", "offers"]]
-    assert "gpu_ram<=48" in searches[0][3] and "gpu_ram>=70" in searches[1][3]
     create = next(c for c in fake.calls if c[1:3] == ["create", "instance"])
-    assert create[3] == "333"
+    assert create[3] == "111"
     assert create[create.index("--image") + 1] == DIGEST_IMAGE
-    assert create[create.index("--disk") + 1] == "150"
+    assert create[create.index("--disk") + 1] == "1400"
     assert Path(create[create.index("--onstart") + 1]) == VAST / "onstart_stub.sh"
     env = create[create.index("--env") + 1]
     assert f"-e KITSUNE_SHA={SHA}" in env and "-e TZ=UTC" in env and "HF_TOKEN" not in env
     assert not any("HF_TOKEN" in a for a in create)
     assert "created instance 98765" in capsys.readouterr().out
+    # an explicit --disk-gb above the extent's sizing is rented and searched for (below it is refused:
+    # tests/test_full_vast.py)
+    fake = fake_vastai([OFFERS])
+    assert launch.main(launch_args("--yes", "--disk-gb", "1600")) == 0
+    search = next(c for c in fake.calls if c[1:3] == ["search", "offers"])
+    assert "disk_space>=1600" in search[3].split(" ") and search[search.index("--storage") + 1] == "1600"
+    create = next(c for c in fake.calls if c[1:3] == ["create", "instance"])
+    assert create[create.index("--disk") + 1] == "1600"
 
 
-def test_launch_refuses_expensive_offer(fake_vastai):
-    fake = fake_vastai([[], OFFERS_80])
-    assert launch.main(launch_args("--yes", "--max-dph", "1.0")) == 1
+def test_launch_refuses_offers_over_max_dph(full_box, fake_vastai, capsys):
+    fake = fake_vastai([OFFERS])
+    assert launch.main(launch_args("--yes", "--max-dph", "0.5")) == 1
     assert all(c[1:3] != ["create", "instance"] for c in fake.calls)
+    assert "no 1x RTX 5090 offer matches the full-box filter" in capsys.readouterr().out
 
 
-def test_launch_reports_vastais_api_error_despite_exit_0(fake_vastai):
+def test_launch_reports_vastais_api_error_despite_exit_0(full_box, fake_vastai):
     """vastai 1.8.0 exits 0 on an API error, with nothing on stdout and the JSON error on stderr (VAST-X1)."""
     def refused(msg):
         return lambda argv: subprocess.CompletedProcess(argv, 0, stdout="", stderr=json.dumps(
             {"error": True, "status_code": 410, "msg": msg}))
 
-    fake_vastai([OFFERS_40], create=refused("error 410/3907: no_such_ask Instance type 111 is no longer available."))
+    fake_vastai([OFFERS], create=refused("error 410/3907: no_such_ask Instance type 111 is no longer available."))
     with pytest.raises(launch.LaunchError, match="no_such_ask"):
         launch.main(launch_args("--yes"))
     bad_key = subprocess.CompletedProcess([], 0, stdout="", stderr='{"error": true, "status_code": 401, '
@@ -826,23 +770,23 @@ def test_launch_reports_vastais_api_error_despite_exit_0(fake_vastai):
         launch.main(launch_args("--yes"))
 
 
-def test_launch_create_timeout_says_an_instance_may_exist(fake_vastai):
+def test_launch_create_timeout_says_an_instance_may_exist(full_box, fake_vastai):
     def hangs(argv):
         raise subprocess.TimeoutExpired(argv, 180)
 
-    fake_vastai([OFFERS_40], create=hangs)
-    with pytest.raises(launch.LaunchError, match=r"vastai show instances.*kitsune-viability-0123456"):
+    fake_vastai([OFFERS], create=hangs)
+    with pytest.raises(launch.LaunchError, match=r"vastai show instances.*kitsune-full-p01-data-p01-0123456"):
         launch.main(launch_args("--yes"))
 
 
-def test_launch_without_vastai_prints_install_help(monkeypatch, capsys):
+def test_launch_without_vastai_prints_install_help(full_box, monkeypatch, capsys):
     monkeypatch.setattr(launch.shutil, "which", lambda name: None)
     assert launch.main(launch_args()) == 2
     out = capsys.readouterr().out
     assert "pip install vastai==" in out and "checks passed" in out
 
 
-def test_launch_runs_the_checks_without_vastai(monkeypatch, capsys):
+def test_launch_runs_the_checks_without_vastai(full_box, monkeypatch, capsys):
     """The git/image/HF checks report before the CLI is needed (here: an image not pinned by digest)."""
     monkeypatch.setattr(launch.shutil, "which", lambda name: None)
     args = [a if a != DIGEST_IMAGE else "ghcr.io/multysquid/kitsune-train:main" for a in launch_args()]
@@ -853,10 +797,11 @@ def test_launch_runs_the_checks_without_vastai(monkeypatch, capsys):
 
 def test_launch_preflights_the_config_the_box_runs(tmp_path, monkeypatch, capsys):
     """The HF preflight read the working tree's config, while the box runs the one committed at --sha (KITSUNE_SHA):
-    with a --sha other than HEAD, launch checked one selection/eval sets and rented a box that runs another."""
+    with a --sha other than HEAD, launch checked one selection/eval sets and rented a box that runs another. Shown on
+    the label job, whose config is read at the sha as a full box's data config is (config_at)."""
     if shutil.which("git") is None:
         pytest.skip("git not available")
-    repo, name = tmp_path / "repo", "configs/viability.json"
+    repo, name = tmp_path / "repo", "configs/full.json"
     (repo / "configs").mkdir(parents=True)
     empty = tmp_path / "gitconfig"
     empty.write_text("", encoding="utf-8")
@@ -875,10 +820,12 @@ def test_launch_preflights_the_config_the_box_runs(tmp_path, monkeypatch, capsys
     commit("selection/B.parquet")  # HEAD and the working tree
     seen = []
     monkeypatch.setattr(launch, "ROOT", repo)
-    monkeypatch.setattr(launch, "hf_preflight", lambda data, out, cfg: (seen.append(cfg), (None, []))[1])
+    monkeypatch.setattr(launch, "label_preflight",
+                        lambda data, sha, cfg, cfgs, **kw: (seen.append(cfg), (None, [], []))[1])
+    monkeypatch.setattr(launch, "avoided_machines", lambda data, rev: (set(), []))
     monkeypatch.setattr(launch.shutil, "which", lambda name: None)
-    args = [a for a in launch_args() if a != "--no-hf-check"]
-    args[args.index("--sha") + 1] = sha_a
+    args = ["--job", "label", "--data-repo", "Multy123/kitsune-data", "--sha", sha_a, "--image", DIGEST_IMAGE,
+            "--skip-git-checks"]
     assert launch.main(args) == 2 and seen == [{"selection": "selection/A.parquet"}]
     capsys.readouterr()
     args[args.index("--sha") + 1] = "0" * 40  # not in this clone (--skip-git-checks): a listed problem, no traceback
@@ -958,7 +905,7 @@ def test_image_problems_refuse_an_image_built_from_other_dependencies(monkeypatc
     assert p.startswith(f"cannot read the commit {image} was built from (LaunchError")
 
 
-def test_launch_checks_the_image_revision_and_explains_a_missing_branch_tag(monkeypatch, capsys):
+def test_launch_checks_the_image_revision_and_explains_a_missing_branch_tag(full_box, monkeypatch, capsys):
     import urllib.error
 
     monkeypatch.setattr(launch.shutil, "which", lambda name: None)
@@ -982,13 +929,11 @@ def test_launch_checks_the_image_revision_and_explains_a_missing_branch_tag(monk
     assert len(calls) == 1, "an unresolved image is not checked"
 
 
-VIAB_CFG ={"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"],
-            "selection": "selection/viability.parquet", "student": "students/b20x2560-d4"}
-DATA_FILES = ["teacher_out/meta.json", "second_out/meta.json", "selection/viability.parquet",
-              "students/b20x2560-d4/config.json", "students/b20x2560-d4/model.safetensors",
-              "students/b20x2560-d4/processor_config.json", "students/b20x2560-d4/tokenizer.json",
-              "students/b20x2560-d4/tokenizer_config.json", "students/b20x2560-d4/student_meta.json",
-              "students/b20x2560-d4/README.md", "teacher_out/reazon_small/train-00000.npz", "teacher_out/reazon_small/train-00000.jsonl",
+# a run config's names and selection, and the data repo's listing of its teacher and second-opinion files
+CFG = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"],
+       "selection": "labels/full/selections/sub.parquet"}
+REPO_FILES = ["teacher_out/meta.json", "second_out/meta.json", "labels/full/selections/sub.parquet",
+              "teacher_out/reazon_small/train-00000.npz", "teacher_out/reazon_small/train-00000.jsonl",
               "second_out/reazon_small/train-00000.jsonl",
               "teacher_out/galgame/train-00000.npz", "teacher_out/galgame/train-00001.npz",
               "teacher_out/galgame/eval-00000.npz", "second_out/galgame/train-00000.jsonl",
@@ -998,53 +943,24 @@ DATA_FILES = ["teacher_out/meta.json", "second_out/meta.json", "selection/viabil
               "teacher_out/eval_jsut/eval-00000.jsonl"]
 
 
-def test_data_problems_complete_repo_passes():
-    assert launch.data_problems(DATA_FILES, VIAB_CFG) == []
-
-
-def test_data_problems_catch_a_partial_second_opinion_pass_and_missing_files():
-    files = [f for f in DATA_FILES if f not in ("second_out/galgame/train-00001.jsonl", "second_out/meta.json",
-                                                 "teacher_out/eval_jsut/eval-00000.npz")]
-    problems = launch.data_problems(files, VIAB_CFG)
-    assert any("second_out/galgame: 1 of 3 teacher shards have no second opinion (e.g. train-00001)" in p
-               for p in problems), problems
-    assert "no second_out/meta.json" in problems and "no teacher_out/eval_jsut/*.npz" in problems
-    # an eval-only set needs no second opinion
-    assert not any("eval_jsut: " in p and "second opinion" in p for p in problems)
-
-
-def test_data_problems_accept_a_deliberate_partial_second_opinion():
-    """A source in selection_recipe.partial_second_opinion trains on its judged shards only (the owner's decision for
-    galgame): launch and bootstrap's plan accept its unjudged shards, but not a source with no judged shard at all."""
-    cfg = dict(VIAB_CFG, selection_recipe={"partial_second_opinion": ["galgame"]})
-    files = [f for f in DATA_FILES if f != "second_out/galgame/train-00001.jsonl"]
-    assert launch.data_problems(files, cfg) == []
-    assert any("1 of 3 teacher shards have no second opinion" in p for p in launch.data_problems(files, VIAB_CFG))
-    none = [f for f in DATA_FILES if not f.startswith("second_out/galgame/")]
-    assert launch.data_problems(none, cfg) == ["second_out/galgame: none of its 3 teacher shards has a second opinion"]
-    text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
-    assert 'partial = set((cfg.get("selection_recipe") or {}).get("partial_second_opinion", []))' in text
-
-
-def test_data_problems_need_the_students_processor_and_tokenizer():
+def test_bootstrap_and_launch_need_the_same_student_files():
     """The trainer loads the processor and tokenizer from the student dir and has no fallback (the old one read the
-    gated teacher repo, a 403 with the box token): a student uploaded without them is caught on the laptop, before any
-    money is spent, and again by bootstrap's plan, before the paid audio rebuild, with the same list."""
-    files = [f for f in DATA_FILES if f != "students/b20x2560-d4/tokenizer.json"]
-    assert launch.data_problems(files, VIAB_CFG) == ["no students/b20x2560-d4/tokenizer.json"]
+    gated teacher repo, a 403 with the box token): a student uploaded without them is caught on the laptop
+    (full_preflight), before any money is spent, and again by bootstrap's plan, before the paid audio rebuild, with the
+    same list."""
     text = (VAST / "bootstrap.sh").read_text(encoding="utf-8")
     box = re.search(r"^STUDENT_FILES = (\(.*?\))$", text, re.M | re.S)
     assert box and eval(box.group(1)) == launch.STUDENT_FILES
     assert "student_meta.json" in launch.STUDENT_FILES and "README.md" in launch.STUDENT_FILES
-    assert 'required = [f"{selection}", *(f for s in students for f in student_files(s))]' in text
     assert 'return [f"{s}/{n}" for n in STUDENT_FILES + ((CTC_CARD,) if s in ctc_students else ())]' in text
+    assert 'problems += [f"no {f}" for s in students for f in student_files(s) if f not in have]' in text
 
 
-SEL_CFG = dict(VIAB_CFG, selection_recipe={"agree_max": 0.5, "agree_max_source": ["galgame=0.4"],
-                                           "filter_eval_sets": ["galgame"]})
+SEL_CFG = dict(CFG, selection_recipe={"agree_max": 0.5, "agree_max_source": ["galgame=0.4"],
+                                      "filter_eval_sets": ["galgame"]})
 SEL_ARGS = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"], "agree_max": 0.5,
             "agree_max_source": ["galgame=0.4"], "filter_eval_sets": ["galgame"], "out": "C:/laptop/sel.parquet",
-            "config": "configs/viability.json"}
+            "config": "configs/sub.json"}
 SEL_ROWS = [("reazon_small", "train", True, "kept"), ("galgame", "train", True, "kept"),
             ("galgame", "train", False, "agree>0.4"), ("eval_jsut", "eval", True, "kept"),
             ("galgame", "eval", True, "kept")]
@@ -1069,7 +985,7 @@ def write_selection(path: Path, rows, args=None) -> Path:
 def test_selection_problems_accept_not_judged_rows_only_as_recorded(tmp_path):
     """not_judged rows (a deliberate partial second opinion) are fine when the selection was built with the config's
     partial_second_opinion list; a selection built without it, or with another list, is refused."""
-    name, path = "selection/viability.parquet", tmp_path / "sel.parquet"
+    name, path = CFG["selection"], tmp_path / "sel.parquet"
     cfg = dict(SEL_CFG, selection_recipe=dict(SEL_CFG["selection_recipe"], partial_second_opinion=["galgame"]))
     rows = SEL_ROWS + [("galgame", "train", False, "not_judged")]
     args = dict(SEL_ARGS, partial_second_opinion=["galgame"])
@@ -1081,7 +997,7 @@ def test_selection_problems_accept_not_judged_rows_only_as_recorded(tmp_path):
 
 
 def test_selection_problems_flag_no_agree_rows(tmp_path):
-    name = "selection/viability.parquet"
+    name = CFG["selection"]
     path = write_selection(tmp_path / "sel.parquet", SEL_ROWS + [("galgame", "train", False, "no_agree")], SEL_ARGS)
     problems = launch.selection_problems(path, name, SEL_CFG)
     assert len(problems) == 1 and "1 rows as no_agree ({'galgame': 1})" in problems[0]
@@ -1089,27 +1005,26 @@ def test_selection_problems_flag_no_agree_rows(tmp_path):
 
 
 def test_selection_problems_flag_kept_rows_without_teacher_output_in_the_repo(tmp_path):
-    """data_problems only asks for some teacher npz per source (a galgame train npz also satisfies its hold-out), so a
-    kept row whose own teacher_file is not uploaded passed the preflight and build_stores raised FileNotFoundError on
-    the box, after the paid bootstrap. The selection's kept teacher_file references are checked against the repo."""
-    name = "selection/viability.parquet"
+    """A kept row whose own teacher_file is not uploaded (some teacher npz of its source is not enough: a galgame train
+    npz does not hold its hold-out) passed the preflight, and build_stores raised FileNotFoundError on the box, after
+    the paid bootstrap. The selection's kept teacher_file references are checked against the repo."""
+    name = CFG["selection"]
     path = write_selection(tmp_path / "sel.parquet", SEL_ROWS, SEL_ARGS)
-    assert launch.selection_problems(path, name, SEL_CFG, set(DATA_FILES)) == []
-    files = [f for f in DATA_FILES if f != "teacher_out/galgame/eval-00000.npz"]
-    assert launch.data_problems(files, VIAB_CFG) == []  # the train npz still satisfy "teacher shards for galgame"
+    assert launch.selection_problems(path, name, SEL_CFG, set(REPO_FILES)) == []
+    files = [f for f in REPO_FILES if f != "teacher_out/galgame/eval-00000.npz"]
     problems = launch.selection_problems(path, name, SEL_CFG, set(files))
     assert problems == [f"{name} keeps rows whose teacher output is not in the data repo: 1 of 8 files missing (e.g. "
                         f"teacher_out/galgame/eval-00000.npz): upload the teacher_out the selection was built from"]
     # only kept rows count: a dropped row's teacher file may be absent
     rows = SEL_ROWS + [("reazon_small", "eval", False, "agree>0.5")]
-    assert launch.selection_problems(write_selection(path, rows, SEL_ARGS), name, SEL_CFG, set(DATA_FILES)) == []
+    assert launch.selection_problems(write_selection(path, rows, SEL_ARGS), name, SEL_CFG, set(REPO_FILES)) == []
 
 
 def test_selection_problems_check_the_recipe_and_the_kept_rows(tmp_path):
     """A selection rebuilt with a flag forgotten (a threshold, a hold-out filter, an eval set, a source) or keeping
     nothing of a configured source or eval set is refused before renting; the recorded paths do not matter, the order
     of the lists and how a threshold is spelled neither."""
-    name, path = "selection/viability.parquet", tmp_path / "sel.parquet"
+    name, path = CFG["selection"], tmp_path / "sel.parquet"
     same = dict(SEL_ARGS, sources=["galgame", "reazon_small"], agree_max_source=["galgame=0.40"],
                 out="/elsewhere/x.parquet", config=None)
     assert launch.selection_problems(write_selection(path, SEL_ROWS, same), name, SEL_CFG) == []
@@ -1127,13 +1042,13 @@ def test_selection_problems_check_the_recipe_and_the_kept_rows(tmp_path):
     rows = [r for r in SEL_ROWS if r[0] != "reazon_small"]
     problems = launch.selection_problems(write_selection(path, rows, SEL_ARGS), name, SEL_CFG)
     assert len(problems) == 1 and "keeps no train rows of ['reazon_small']" in problems[0]
-    problems = launch.selection_problems(write_selection(path, SEL_ROWS, SEL_ARGS), name, VIAB_CFG)
+    problems = launch.selection_problems(write_selection(path, SEL_ROWS, SEL_ARGS), name, CFG)
     assert problems == ["the run config has no selection_recipe to check the selection against"]
-    # the real run config carries the recipe, spelled as make_selection.py records it
-    via = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
-    assert via["selection_recipe"] == {"agree_max": 0.5, "agree_max_source": ["emilia_yodas=0.2", "eval_emilia=0.2"],
-                                       "filter_eval_sets": ["eval_emilia", "galgame"],
-                                       "partial_second_opinion": ["galgame"]}
+    # the label box's config carries the recipe, spelled as make_selection.py records it
+    full = json.loads((ROOT / "configs" / "full.json").read_text(encoding="utf-8"))
+    assert full["selection_recipe"] == {"agree_max": 0.5,
+                                        "agree_max_source": ["emilia_yodas=0.2", "emilia_nc=0.2", "eval_emilia=0.2"],
+                                        "filter_eval_sets": ["eval_emilia", "galgame"], "partial_second_opinion": []}
 
 
 class FakeHfApi:
@@ -1157,12 +1072,11 @@ def test_hf_preflight_refuses_repos_that_are_not_private(monkeypatch):
     import huggingface_hub
 
     monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)  # hf_preflight imports it at call time
-    monkeypatch.setattr(launch, "data_problems", lambda files, cfg: [])
     data, out = "u/kitsune-data", "u/kitsune-runs"
     for vis, flagged in (((True, True), []), ((False, True), [data]), ((True, None), [out]),
                          ((False, False), [data, out])):
         monkeypatch.setattr(FakeHfApi, "private", dict(zip((data, out), vis)))
-        rev, problems = launch.hf_preflight(data, out, VIAB_CFG)
+        rev, problems = launch.hf_preflight(data, out, CFG)
         assert rev == "a" * 40
         assert [p.split(" ", 1)[0] for p in problems] == flagged, problems
         assert all("is not private" in p and "hf repos settings" in p and "--private" in p for p in problems)
@@ -1190,12 +1104,11 @@ def test_hf_preflight_blames_a_missing_output_repo_only_on_a_4xx(monkeypatch):
             raise self.error
 
     monkeypatch.setattr(huggingface_hub, "HfApi", FailingModelInfo)
-    monkeypatch.setattr(launch, "data_problems", lambda files, cfg: [])
     monkeypatch.setattr(FakeHfApi, "private", {"u/kitsune-data": True})
     for error, missing in ((hub_error(404, **{"X-Error-Code": "RepoNotFound"}), True), (hub_error(401), True),
                            (hub_error(503), False), (hub_error(429), False), (httpx.ConnectError("timed out"), False)):
         monkeypatch.setattr(FailingModelInfo, "error", error)
-        _, problems = launch.hf_preflight("u/kitsune-data", "u/kitsune-runs", VIAB_CFG)
+        _, problems = launch.hf_preflight("u/kitsune-data", "u/kitsune-runs", CFG)
         assert len(problems) == 1 and str(error).splitlines()[0] in problems[0], (error, problems)
         assert ("hf repos create u/kitsune-runs --private" in problems[0]) == missing, problems
         assert ("re-run launch" in problems[0]) != missing, problems
@@ -1215,194 +1128,53 @@ def test_launch_env_string_refuses_secrets():
 
 
 # ------------------------------------------------------------------------------------------------------ supervise.py
+# the history, the lock and the bounded final finish of supervise_queue; its policy (decide_queue) and the train_hb
+# beats are tests/test_full_supervise.py's
 
-@pytest.mark.parametrize("rc,step,n_fail,full,action", [
-    (0, 5000, 0, False, "destroy"),
-    (3, 150, 1, True, "stop"),
-    (1, 150, 1, True, "resume"),
-    (None, 150, 1, True, "resume"),
-    (1, 99, 1, True, "stop"),
-    (1, 150, 1, False, "stop"),
-    (1, 3000, 2, True, "stop"),
-])
-def test_decide(rc, step, n_fail, full, action):
-    assert supervise.decide(rc, step, n_fail, Path("full_step_100") if full else None)[0] == action
+QUEUE_CMD = ["python", "-m", "kitsune.full_queue", "run", "--box", "p01"]
 
 
-@pytest.mark.parametrize("rc,n_fail,summary,action", [
-    (-6, 1, "complete", "destroy"),  # an abort in the interpreter's teardown after the final eval and verdict
-    (None, 1, "complete", "destroy"),
-    (-6, 2, "complete", "destroy"),
-    (-6, 1, "failed", "resume"),
-    (3, 1, "complete", "stop"),
-])
-def test_decide_a_crash_after_the_complete_summary_destroys(rc, n_fail, summary, action):
-    act, reason = supervise.decide(rc, 5000, n_fail, Path("full_step_5000"), summary)
-    assert act == action
-    if action == "destroy":
-        assert "summary complete" in reason
+def run_queue(tmp_path, monkeypatch, rcs, state=None, finish=None):
+    """supervise_queue with the queue's exits scripted (rcs) and finish.py recorded (or `finish`); returns (rc, the
+    queue's argvs, the finish calls, the saved history)."""
+    calls, finishes = [], []
 
+    def queue(argv, env):
+        calls.append(list(argv))
+        return rcs.pop(0)
 
-class FakeTrainer:
-    """Plays a script of attempts: (exit code, last step, write a full state?[, summary.json status]) into one run
-    dir."""
-
-    def __init__(self, runs_root: Path, script):
-        self.run_dir, self.script, self.argvs = runs_root / "viability-b20x2560-test", list(script), []
-
-    def __call__(self, argv, env):
-        self.argvs.append(list(argv))
-        rc, step, full, *summary = self.script.pop(0)
-        (self.run_dir / "metrics").mkdir(parents=True, exist_ok=True)
-        (self.run_dir / "config.json").write_text("{}", encoding="utf-8")
-        with open(self.run_dir / "metrics" / "scalars.jsonl", "a", encoding="utf-8") as f:
-            for s in range(0, step + 1, 10):
-                f.write(json.dumps({"step": s, "wall": 0, "elapsed_s": 0, "tag": "loss/total", "value": 1.0}) + "\n")
-            f.write('{"step": 99999, "tag": "torn')  # a crash can leave half a line
-        if full:
-            (self.run_dir / "checkpoints" / f"full_step_{step}").mkdir(parents=True)
-        if summary:
-            (self.run_dir / "summary.json").write_text(json.dumps({"status": summary[0]}), encoding="utf-8")
-        return rc
-
-
-def run_supervise(tmp_path, monkeypatch, script, state=None, finish=None):
-    runs = tmp_path / "runs"
-    trainer = FakeTrainer(runs, script)
-    finishes = []
-    monkeypatch.setattr(supervise, "run_trainer", trainer)
+    monkeypatch.setattr(supervise, "run_queue", queue)
     monkeypatch.setattr(supervise, "call_finish",
                         finish or (lambda args, timeout=None: finishes.append(list(args)) or 0))
     state_path = tmp_path / "state" / "supervise.json"
     if state is not None:
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(state), encoding="utf-8")
-    rc = supervise.supervise("configs/viability.json", "Multy123/kitsune-runs", runs, ["python", "04.py"], state_path)
-    return rc, trainer, finishes, json.loads(state_path.read_text(encoding="utf-8"))
-
-
-def test_supervise_success_destroys(tmp_path, monkeypatch):
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(0, 500, True)])
-    assert rc == 0 and len(trainer.argvs) == 1
-    assert trainer.argvs[0] == ["python", "04.py", "--config", "configs/viability.json",
-                                "--set", "hf.output_repo=Multy123/kitsune-runs"]
-    assert [f[0] for f in finishes] == ["--destroy"]
-    assert state["final"]["action"] == "destroy" and state["attempts"][0]["step"] == 500
-
-
-def test_supervise_throughput_stops(tmp_path, monkeypatch):
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(3, 120, True)])
-    assert rc == 3 and len(trainer.argvs) == 1
-    assert [f[0] for f in finishes] == ["--sync-only", "--stop"]
-
-
-def test_supervise_late_failure_resumes_once_then_stops(tmp_path, monkeypatch):
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(1, 150, True), (1, 300, True)])
-    assert rc == 1 and len(trainer.argvs) == 2
-    resume = trainer.argvs[1][trainer.argvs[1].index("--resume") + 1]
-    assert Path(resume).name == "full_step_150"
-    assert "--resume" not in trainer.argvs[0]
-    assert [f[0] for f in finishes] == ["--sync-only", "--sync-only", "--stop"]
-    assert state["final"]["action"] == "stop" and "second failure" in state["final"]["reason"]
-
-
-def test_supervise_resume_then_success_destroys(tmp_path, monkeypatch):
-    rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [(1, 150, True), (0, 900, True)])
-    assert rc == 0 and len(trainer.argvs) == 2
-    assert [f[0] for f in finishes] == ["--sync-only", "--destroy"]
-
-
-def test_supervise_early_failure_stops_without_resume(tmp_path, monkeypatch):
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(1, 50, True)])
-    assert len(trainer.argvs) == 1 and [f[0] for f in finishes] == ["--sync-only", "--stop"]
-    assert "before step 100" in state["final"]["reason"]
-
-
-def test_supervise_never_credits_a_rearmed_attempt_with_the_old_run(tmp_path, monkeypatch):
-    """After --rearm the old run dir (step 5000, a full state) stays under runs/ while supervise.json starts afresh; a
-    new trainer that dies before writing its config.json failed before step 100, it is not the old run to resume."""
-    old = tmp_path / "runs" / "viability-b20x2560-20260923T000000Z"
-    (old / "metrics").mkdir(parents=True)
-    (old / "config.json").write_text("{}", encoding="utf-8")
-    (old / "metrics" / "scalars.jsonl").write_text(json.dumps({"step": 5000, "tag": "x", "value": 0}) + "\n")
-    (old / "checkpoints" / "full_step_5000").mkdir(parents=True)
-    day_ago = time.time() - 86400
-    for p in (old / "config.json", old):
-        os.utime(p, (day_ago, day_ago))
-    calls, finishes = [], []
-
-    def dies_at_import(argv, env):
-        calls.append(list(argv))
-        (tmp_path / "runs" / "viability-b20x2560-20260925T000000Z").mkdir()  # build() mkdirs before RunLogger
-        return 1
-
-    monkeypatch.setattr(supervise, "run_trainer", dies_at_import)
-    monkeypatch.setattr(supervise, "call_finish", lambda args, timeout=None: finishes.append(list(args)) or 0)
-    state_path = tmp_path / "state" / "supervise.json"
-    supervise.supervise("configs/viability.json", None, tmp_path / "runs", ["python", "04.py"], state_path)
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert len(calls) == 1 and [f[0] for f in finishes] == ["--sync-only", "--stop"]
-    assert state["attempts"][0]["run_dir"] is None and state["attempts"][0]["step"] == 0
-    assert "before step 100" in state["final"]["reason"]
-
-
-def test_supervise_late_failure_without_full_state_stops(tmp_path, monkeypatch):
-    rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [(1, 400, False)])
-    assert len(trainer.argvs) == 1 and finishes[-1][0] == "--stop"
-
-
-def test_supervise_recovers_after_container_restart(tmp_path, monkeypatch):
-    # the container died during attempt 1 after step 200 and a full state; the record is exactly what supervise
-    # saved before starting the trainer ({t0, resume}: the run dir is only added when an attempt ends)
-    run_dir = tmp_path / "runs" / "viability-b20x2560-test"
-    (run_dir / "metrics").mkdir(parents=True)
-    (run_dir / "config.json").write_text("{}", encoding="utf-8")
-    (run_dir / "metrics" / "scalars.jsonl").write_text(json.dumps({"step": 200, "tag": "x", "value": 0}) + "\n")
-    (run_dir / "checkpoints" / "full_step_200").mkdir(parents=True)
-    state = {"attempts": [{"t0": time.time() - 60, "resume": None}], "final": None}
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(0, 800, False)], state=state)
-    first = state["attempts"][0]
-    assert first["interrupted"] and first["step"] == 200 and Path(first["run_dir"]) == run_dir
-    assert len(trainer.argvs) == 1
-    assert Path(trainer.argvs[0][trainer.argvs[0].index("--resume") + 1]).name == "full_step_200"
-    assert finishes[-1][0] == "--destroy"
-
-
-def test_supervise_restart_during_the_resumed_attempt_stops(tmp_path, monkeypatch):
-    # attempt 1 failed at step 150 and was resumed; the container died during attempt 2: that is the second failure,
-    # found through attempt 2's --resume path
-    run_dir = tmp_path / "runs" / "viability-b20x2560-test"
-    (run_dir / "metrics").mkdir(parents=True)
-    (run_dir / "metrics" / "scalars.jsonl").write_text(json.dumps({"step": 420, "tag": "x", "value": 0}) + "\n")
-    (run_dir / "checkpoints" / "full_step_400").mkdir(parents=True)
-    state = {"attempts": [{"t0": 0.0, "resume": None, "rc": 1, "step": 150, "run_dir": str(run_dir)},
-                          {"t0": 1.0, "resume": str(run_dir / "checkpoints" / "full_step_150")}], "final": None}
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [], state=state)
-    assert trainer.argvs == [] and [f[0] for f in finishes] == ["--stop"]
-    assert state["attempts"][1]["step"] == 420 and "second failure" in state["final"]["reason"]
+    rc = supervise.supervise_queue(QUEUE_CMD, state_path)
+    return rc, calls, finishes, json.loads(state_path.read_text(encoding="utf-8"))
 
 
 def test_supervise_steps_aside_when_another_supervisor_runs(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(supervise, "acquire_lock", lambda path: None)
     monkeypatch.setattr(supervise, "LOCK_WAIT_S", 0.2)  # a live supervisor still holds it after the bounded wait
     monkeypatch.setattr(supervise, "LOCK_POLL_S", 0.05)
-    state = {"attempts": [{"t0": 0.0, "resume": None}], "final": None}  # the live attempt of the other supervisor
-    rc, trainer, finishes, after = run_supervise(tmp_path, monkeypatch, [(0, 10, False)], state=state)
-    assert rc == 0 and trainer.argvs == [] and finishes == [] and after == state  # untouched
+    state = {"attempts": [{"t0": 0.0, "queue": True}], "final": None}  # the live attempt of the other supervisor
+    rc, calls, finishes, after = run_queue(tmp_path, monkeypatch, [0], state=state)
+    assert rc == 0 and calls == [] and finishes == [] and after == state  # untouched
     out = capsys.readouterr().out
     assert out.count("waiting up to 0 s") == 1 and "not starting a second one" in out, out
 
 
 def test_supervise_waits_for_a_lock_a_bootstrap_leftover_still_holds(tmp_path, monkeypatch, capsys):
-    """Box p01-chain, 2026-10-01: a train_hb toucher's `sleep 60` that outlived bootstrap still held onstart's
+    """Box 53693389, 2026-10-01: a train_hb toucher's `sleep 60` that outlived bootstrap still held onstart's
     supervise.lock when onstart exec'd the supervisor, which refused at once and left the box idle. The supervisor now
     polls the lock (every LOCK_POLL_S, up to LOCK_WAIT_S, logged once) and runs once the leftover is gone."""
     calls = []
     monkeypatch.setattr(supervise, "acquire_lock", lambda path: calls.append(path) or (object() if len(calls) > 3
                                                                                          else None))
     monkeypatch.setattr(supervise, "LOCK_POLL_S", 0.01)
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(0, 500, True)])
-    assert rc == 0 and len(trainer.argvs) == 1 and [f[0] for f in finishes] == ["--destroy"]
+    rc, queue, finishes, state = run_queue(tmp_path, monkeypatch, [0])
+    assert rc == 0 and len(queue) == 1 and [f[0] for f in finishes] == ["--destroy"]
     assert len(calls) == 4 and calls[0] == tmp_path / "state" / "supervise.lock"
     out = capsys.readouterr().out
     assert out.count("is held by another process; waiting up to 180 s") == 1 and "got " in out, out
@@ -1411,7 +1183,7 @@ def test_supervise_waits_for_a_lock_a_bootstrap_leftover_still_holds(tmp_path, m
 
 def test_wait_for_lock_is_bounded(tmp_path, monkeypatch):
     """wait_for_lock: a free lock at once, without a wait or a log line; a lock held throughout: polled every 2 s for
-    180 s (one log line), then None. Both supervisor paths (the trainer's and the queues') take the lock through it."""
+    180 s (one log line), then None. The supervisor takes its lock through it."""
     held = []
     assert supervise.wait_for_lock(tmp_path / "free.lock", sleep=held.append) is not None and held == []
     now = [0.0]
@@ -1425,61 +1197,27 @@ def test_wait_for_lock_is_bounded(tmp_path, monkeypatch):
     assert supervise.wait_for_lock(tmp_path / "held.lock", sleep=sleep, clock=lambda: now[0]) is None
     assert sleeps == [2.0] * 90 and now[0] == 180.0
     src = (VAST / "supervise.py").read_text(encoding="utf-8")
-    assert src.count('wait_for_lock(state_path.with_suffix(".lock"))') == 2 and "acquire_lock(state_path" not in src
+    assert src.count('wait_for_lock(state_path.with_suffix(".lock"))') == 1 and "acquire_lock(state_path" not in src
 
 
-def test_supervise_destroys_a_run_that_died_after_its_complete_summary(tmp_path, monkeypatch, capsys):
-    """An xet upload still running when the trainer returns 0 can abort the interpreter's teardown (rc -6, SIGABRT):
-    the run had finished (final eval, verdict, summary.json complete), and a resume would only run the end phase and
-    its final eval again. It goes to finish --destroy, which uploads what is missing and verifies first."""
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(-6, 900, True, "complete")])
-    assert len(trainer.argvs) == 1 and [f[0] for f in finishes] == ["--destroy"]
-    assert state["attempts"][0]["rc"] == -6 and state["attempts"][0]["summary"] == "complete"
-    assert state["final"]["action"] == "destroy" and "summary complete, exit -6" in state["final"]["reason"]
-    assert "exited -6 at step 900" in capsys.readouterr().out
-    # a failed summary (a Python exception rewrites it) is a crash like any other: resume once
-    rc, trainer, finishes, state = run_supervise(tmp_path / "b", monkeypatch, [(1, 150, True, "failed"), (0, 900, True)])
-    assert len(trainer.argvs) == 2 and [f[0] for f in finishes] == ["--sync-only", "--destroy"]
-    assert "summary" not in state["attempts"][0]
-
-
-def test_supervise_restart_after_a_complete_summary_destroys(tmp_path, monkeypatch):
-    """The container restarted while a finished trainer's end-state upload drained: the interrupted attempt's
-    summary.json is complete, so the replayed decision is destroy, not a resume."""
-    run = tmp_path / "runs" / "viability-b20x2560-test"
-    (run / "checkpoints" / "full_step_900").mkdir(parents=True)
-    (run / "config.json").write_text("{}", encoding="utf-8")
-    (run / "summary.json").write_text(json.dumps({"status": "complete"}), encoding="utf-8")
-    state = {"attempts": [{"t0": 0.0, "resume": None, "run_dir": str(run)}], "final": None}
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [], state=state)
-    assert trainer.argvs == [] and [f[0] for f in finishes] == ["--destroy"]
-    assert state["attempts"][0]["summary"] == "complete" and state["final"]["action"] == "destroy"
-
-
-def test_supervise_post_crash_sync_leaves_the_full_state_to_the_stop_path(tmp_path, monkeypatch):
-    rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [(1, 150, True), (0, 900, True)])
-    assert finishes[0] == ["--sync-only", "--no-full"] and finishes[-1][0] == "--destroy"
-
-
-def test_supervise_records_the_containers_oom_kills(tmp_path, monkeypatch, capsys):
-    """An OOM kill that takes a DataLoader worker ends the trainer with a plain error (rc 1, not -9), and the logs'
-    RAM numbers are the host's: the cgroup's counter names it, in supervise.json and in the attempt's exit line."""
+def test_supervise_records_the_containers_oom_kills(tmp_path, monkeypatch):
+    """An OOM kill that takes a DataLoader worker ends a trainer with a plain error (rc 1, not -9), and the logs' RAM
+    numbers are the host's: the cgroup's counter names it in each attempt of supervise.json."""
     cg = tmp_path / "cgroup"
     cg.mkdir()
     (cg / "memory.events").write_text("low 0\nhigh 0\nmax 4\noom 1\noom_kill 1\noom_group_kill 0\n")
     monkeypatch.setattr(supervise, "CGROUP", cg)
-    trainer = FakeTrainer(tmp_path / "runs", [(1, 50, False)])
+    rcs = [1, 0]
 
-    def killed(argv, env):
+    def killed(argv, env):  # the first attempt sees one more OOM kill, the second none
         (cg / "memory.events").write_text("low 0\nhigh 0\nmax 9\noom 2\noom_kill 2\noom_group_kill 0\n")
-        return trainer(argv, env)
+        return rcs.pop(0)
 
-    monkeypatch.setattr(supervise, "run_trainer", killed)
+    monkeypatch.setattr(supervise, "run_queue", killed)
     monkeypatch.setattr(supervise, "call_finish", lambda args, timeout=None: 0)
     state_path = tmp_path / "state" / "supervise.json"
-    supervise.supervise("configs/viability.json", None, tmp_path / "runs", ["python", "04.py"], state_path)
-    assert json.loads(state_path.read_text(encoding="utf-8"))["attempts"][0]["oom_kills"] == 1
-    assert "attempt 1 exited 1 (oom_kill +1) at step 50" in capsys.readouterr().out
+    assert supervise.supervise_queue(QUEUE_CMD, state_path) == 0
+    assert [a["oom_kills"] for a in json.loads(state_path.read_text(encoding="utf-8"))["attempts"]] == [1, 0]
     assert supervise.oom_kills(tmp_path / "nowhere") is None  # no cgroup (Windows): unknown, not 0
     (cg / "memory").mkdir()
     (cg / "memory" / "memory.oom_control").write_text("oom_kill_disable 0\nunder_oom 0\noom_kill 3\n")
@@ -1488,32 +1226,32 @@ def test_supervise_records_the_containers_oom_kills(tmp_path, monkeypatch, capsy
 
 
 def test_supervise_never_reruns_after_final(tmp_path, monkeypatch):
-    state = {"attempts": [{"t0": 0.0, "rc": 0, "step": 10}], "final": {"action": "destroy"}}
+    state = {"attempts": [{"t0": 0.0, "queue": True, "rc": 0}], "final": {"action": "destroy"}}
     (tmp_path / "state").mkdir()
     (tmp_path / "state" / "halt").write_text("{}", encoding="utf-8")  # finish.py got as far as acting
-    rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [], state=state)
-    assert rc == 0 and trainer.argvs == [] and finishes == []
+    rc, calls, finishes, _ = run_queue(tmp_path, monkeypatch, [], state=state)
+    assert rc == 0 and calls == [] and finishes == []
 
 
 @pytest.mark.parametrize("raw", [b"", b"\0" * 300, b'\xff\xfe{"att', b"null", b'{"final": null}'],
                          ids=["empty", "nul", "not-utf8", "null", "no-attempts"])
-def test_supervise_unreadable_state_stops_instead_of_starting_a_fresh_run(tmp_path, monkeypatch, raw):
+def test_supervise_unreadable_state_stops_instead_of_starting_a_fresh_queue(tmp_path, monkeypatch, raw):
     """A supervise.json that is not an attempt history (empty or NUL-filled after an unclean host crash, torn bytes,
-    other JSON) may have held a final decision or a used-up resume. It used to start a fresh run from step 0 (or, for
-    bytes that are not UTF-8, crash the supervisor); now it is moved aside, a stop is recorded before finish runs, and
-    a restart replays that stop without a trainer."""
+    other JSON) may have held a final decision or the restarts already used. It used to start afresh (or, for bytes
+    that are not UTF-8, crash the supervisor); now it is moved aside, a stop is recorded before finish runs, and a
+    restart replays that stop without the queue."""
     state_path = tmp_path / "state" / "supervise.json"
     state_path.parent.mkdir(parents=True)
     state_path.write_bytes(raw)
-    rc, trainer, finishes, state = run_supervise(tmp_path, monkeypatch, [(0, 500, True)])
-    assert rc == 1 and trainer.argvs == [] and [f[0] for f in finishes] == ["--stop"]
+    rc, calls, finishes, state = run_queue(tmp_path, monkeypatch, [0])
+    assert rc == 1 and calls == [] and [f[0] for f in finishes] == ["--stop"]
     (aside,) = state_path.parent.glob("supervise.json.corrupt-*")
     assert aside.read_bytes() == raw
     assert state["attempts"] == [] and state["final"]["action"] == "stop" and "corrupt" not in state
     assert state["final"]["corrupt_state"] == str(aside) and "unreadable" in state["final"]["reason"]
-    # a restart before finish wrote its halt marker runs that stop again, still no trainer
-    rc, trainer, finishes, _ = run_supervise(tmp_path, monkeypatch, [(0, 500, True)])
-    assert rc == 0 and trainer.argvs == [] and [f[0] for f in finishes] == ["--stop"]
+    # a restart before finish wrote its halt marker runs that stop again, still no queue
+    rc, calls, finishes, _ = run_queue(tmp_path, monkeypatch, [0])
+    assert rc == 0 and calls == [] and [f[0] for f in finishes] == ["--stop"]
 
 
 def test_supervise_state_is_fsynced(tmp_path, monkeypatch):
@@ -1528,24 +1266,24 @@ def test_supervise_state_is_fsynced(tmp_path, monkeypatch):
 
 def test_supervise_reruns_an_interrupted_final_finish(tmp_path, monkeypatch):
     """A host reboot during finish --destroy's upload leaves the recorded decision but no halt marker (finish.py writes
-    it only once it acts): the rebooted supervisor runs that finish again, bounded, and never the trainer; without it
-    the box idled until the watchdog's deadline, which only stops it."""
-    state = {"attempts": [{"t0": 0.0, "rc": 0, "step": 900}],
-             "final": {"action": "destroy", "reason": "trainer finished (exit 0)", "wall": 0.0}}
+    it only once it acts): the rebooted supervisor runs that finish again, bounded, and never the queue; without it the
+    box idled until the watchdog's deadline, which only stops it."""
+    state = {"attempts": [{"t0": 0.0, "queue": True, "rc": 0}],
+             "final": {"action": "destroy", "reason": "queue finished (exit 0)", "wall": 0.0}}
     calls = []
-    rc, trainer, _, after = run_supervise(tmp_path, monkeypatch, [], state=state,
-                                          finish=lambda args, timeout=None: calls.append((list(args), timeout)) or 0)
-    assert rc == 0 and trainer.argvs == [] and after["final"] == state["final"]
-    assert calls == [(["--destroy", "--reason", "trainer finished (exit 0)"], supervise.FINISH_TIMEOUT_S["destroy"])]
+    rc, queue, _, after = run_queue(tmp_path, monkeypatch, [], state=state,
+                                    finish=lambda args, timeout=None: calls.append((list(args), timeout)) or 0)
+    assert rc == 0 and queue == [] and after["final"] == state["final"]
+    assert calls == [(["--destroy", "--reason", "queue finished (exit 0)"], supervise.FINISH_TIMEOUT_S["destroy"])]
 
 
-@pytest.mark.parametrize("script,final,finish_rc,fallback", [
-    ([(3, 120, True)], "--stop", 1, True),        # the stop request failed
-    ([(0, 500, True)], "--destroy", 124, True),   # timed out (a stalled Hub call in its sync or verification)
-    ([(0, 500, True)], "--destroy", 2, False),    # verification failed and the instance was stopped
-    ([(0, 500, True)], "--destroy", 0, False),
+@pytest.mark.parametrize("queue_rc,final,finish_rc,fallback", [
+    (4, "--stop", 1, True),        # the stop request failed
+    (0, "--destroy", 124, True),   # timed out (a stalled Hub call in its sync or verification)
+    (0, "--destroy", 2, False),    # verification failed and the instance was stopped
+    (0, "--destroy", 0, False),
 ])
-def test_supervise_bounds_the_final_finish_and_falls_back_to_a_plain_stop(tmp_path, monkeypatch, script, final,
+def test_supervise_bounds_the_final_finish_and_falls_back_to_a_plain_stop(tmp_path, monkeypatch, queue_rc, final,
                                                                            finish_rc, fallback):
     calls = []
 
@@ -1553,8 +1291,8 @@ def test_supervise_bounds_the_final_finish_and_falls_back_to_a_plain_stop(tmp_pa
         calls.append((list(args), timeout))
         return finish_rc if args[0] == final else 0
 
-    rc, _, _, _ = run_supervise(tmp_path, monkeypatch, script, finish=finish)
-    assert rc == script[0][0]
+    rc, _, _, _ = run_queue(tmp_path, monkeypatch, [queue_rc], finish=finish)
+    assert rc == queue_rc
     finals = [(a, t) for a, t in calls if a[0] != "--sync-only"]
     assert finals[0][0][0] == final and finals[0][1] == supervise.FINISH_TIMEOUT_S[final[2:]]
     if fallback:
@@ -1576,21 +1314,23 @@ def test_supervise_kills_a_hung_final_finish_and_stops_without_sync(tmp_path, mo
                     "    time.sleep(40)\n", encoding="utf-8")
     monkeypatch.setattr(supervise, "ROOT", tmp_path / "root")
     monkeypatch.setattr(supervise, "FINISH_TIMEOUT_S", {"stop": 4, "destroy": 4})
-    monkeypatch.setattr(supervise, "run_trainer", FakeTrainer(tmp_path / "runs", [(3, 120, False)]))
+    monkeypatch.setattr(supervise, "run_queue", lambda argv, env: 4)  # a halt: no --sync-only first
     t0 = time.time()
-    rc = supervise.supervise("configs/viability.json", None, tmp_path / "runs", ["python", "04.py"],
-                             tmp_path / "state" / "supervise.json")
-    assert rc == 3 and time.time() - t0 < 30
-    assert calls.read_text(encoding="utf-8").splitlines() == ["--sync-only --no-full", "--stop --reason",
-                                                              "--stop --no-sync"]
+    rc = supervise.supervise_queue(QUEUE_CMD, tmp_path / "state" / "supervise.json")
+    assert rc == 4 and time.time() - t0 < 30
+    assert calls.read_text(encoding="utf-8").splitlines() == ["--stop --reason", "--stop --no-sync"]
 
 
 # --------------------------------------------------------------------------------------------------------- finish.py
 
-def make_run(root: Path) -> Path:
-    run = root / "runs" / "viability-b20x2560-20260924"
+# a run's config.json: 04_distill.py's DEFAULTS upload the pre_cooldown and the end full states
+END_CONFIG = json.dumps({"config": {"ckpt": {"upload_full_at": ["pre_cooldown", "end"]}}}).encode()
+
+
+def make_run(root: Path, config: bytes = END_CONFIG) -> Path:
+    run = root / "runs" / "full-p01-20261001T184145Z"
     files = {
-        "config.json": b"{}",
+        "config.json": config,
         "summary.json": b'{"verdict": "GO"}',
         "metrics/scalars.jsonl": b'{"step": 1}\n' * 50,
         "tb/events.out.tfevents.1.box": os.urandom(3000),
@@ -1640,7 +1380,10 @@ class FakeHub:
                     if op.path_in_repo.endswith("/" + name))
 
 
-def test_expected_files_picks_every_weights_dir_and_the_newest_full_state(tmp_path):
+def test_expected_files_picks_every_weights_dir_and_the_full_states_the_config_uploads(tmp_path):
+    """Every weights dir, the logs, and the newest full state when the run's config uploads its "end" (04_distill.py's
+    DEFAULTS); a config that uploads only its pre_cooldown state (every configs/full/*.json) leaves the other full
+    states on the box (resume states), and so does one without a readable config.json."""
     run = make_run(tmp_path)
     exp = finish.expected_files(run)
     prefix = f"runs/{run.name}"
@@ -1649,19 +1392,24 @@ def test_expected_files_picks_every_weights_dir_and_the_newest_full_state(tmp_pa
     assert f"{prefix}/checkpoints/full_step_200/state.pt" in exp
     assert not any("full_step_100" in p or ".tmp" in p for p in exp)
     assert f"{prefix}/tb/events.out.tfevents.1.box" in exp and f"{prefix}/config.json" in exp
-    assert not any("full_step" in p for p in finish.expected_files(run, expect_full=False))
+    pre = make_run(tmp_path / "pre", json.dumps({"config": {"ckpt": {"upload_full_at": ["pre_cooldown"]}}}).encode())
+    assert not any("full_step" in p for p in finish.expected_files(pre))
+    assert f"runs/{pre.name}/checkpoints/step_200/model.safetensors" in finish.expected_files(pre)
+    assert not any("full_step" in p for p in finish.expected_files(make_run(tmp_path / "none", b"{}")))
 
 
 def test_expected_files_takes_a_full_state_whose_trainer_upload_failed(tmp_path):
     """The trainer marks a full state meant for the Hub (the pre_cooldown one) until its upload succeeds and keeps it
-    from rotation meanwhile: finish uploads and verifies a marked one too (not the marker), and --no-full none."""
-    run = make_run(tmp_path)
-    (run / "checkpoints" / "full_step_100" / finish.UPLOAD_MARK).write_bytes(b"")
-    exp = finish.expected_files(run)
-    prefix = f"runs/{run.name}"
-    assert {f"{prefix}/checkpoints/full_step_{s}/state.pt" for s in (100, 200)} <= set(exp)
-    assert not any(p.endswith(finish.UPLOAD_MARK) for p in exp)
-    assert not any("full_step" in p for p in finish.expected_files(run, expect_full=False))
+    from rotation meanwhile: finish uploads and verifies a marked one too (not the marker), whatever else the config
+    uploads."""
+    for config, steps in ((END_CONFIG, (100, 200)), (b"{}", (100,))):
+        run = make_run(tmp_path / str(len(steps)), config)
+        (run / "checkpoints" / "full_step_100" / finish.UPLOAD_MARK).write_bytes(b"")
+        exp = finish.expected_files(run)
+        prefix = f"runs/{run.name}"
+        assert {p for p in exp if "/full_step_" in p} == {f"{prefix}/checkpoints/full_step_{s}/state.pt"
+                                                          for s in steps}
+        assert not any(p.endswith(finish.UPLOAD_MARK) for p in exp)
 
 
 def test_git_blob_id_matches_git(tmp_path):
@@ -1699,8 +1447,9 @@ def finish_env(tmp_path, monkeypatch):
     monkeypatch.setattr(finish, "STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(finish, "vast_rest", lambda action, timeout=30: actions.append(action) or True)
     monkeypatch.setattr(finish, "vast_cli", lambda action: pytest.fail("CLI fallback must not be needed"))
-    for var in ("KITSUNE_OUT_REPO", "CONTAINER_ID", "CONTAINER_API_KEY"):
+    for var in ("KITSUNE_OUT_REPO", "CONTAINER_ID", "CONTAINER_API_KEY", "KITSUNE_JOB"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("KITSUNE_BOX", "p01")
 
     def go(hub, *extra):
         monkeypatch.setattr(finish, "hf_api", lambda: hub)
@@ -1767,7 +1516,7 @@ def test_finish_stop_without_sync_still_uploads_the_infra_logs(finish_env, tmp_p
     hub = FakeHub({})
     rc, actions = go(hub, "--stop", "--no-sync", "--reason", "onstart failed at line 7")
     assert rc == 0 and actions == ["stop"] and hub.uploads == []
-    assert hub.commits[0]["operations"][0].path_in_repo.startswith(f"runs/{run.name}/infra/")
+    assert hub.commits[0]["operations"][0].path_in_repo.startswith("full/box-p01/infra/local/")
     assert b"onstart failed at line 7" in hub.committed("events.jsonl")
 
 
@@ -1809,7 +1558,7 @@ def test_finish_infra_upload_redacts_the_portal_secrets(tmp_path, monkeypatch):
 
 def test_hub_forbidden_dirs_mirror_huggingface_hub():
     """finish stays stdlib-only, so HUB_FORBIDDEN_DIRS mirrors the pinned huggingface_hub's FORBIDDEN_FOLDERS; a bump
-    that adds a rule fails here, not on a box (box 53693389 lost its chain infra commit to a .cache/ path)."""
+    that adds a rule fails here, not on a box (box 53693389 lost its infra commit to a .cache/ path)."""
     from huggingface_hub import CommitOperationAdd
     from huggingface_hub.utils import _paths
 
@@ -1857,10 +1606,9 @@ def test_expected_files_leave_out_paths_the_hub_cannot_take(tmp_path):
                 "checkpoints/step_200/.cache/huggingface/y.metadata"):
         (run / rel).parent.mkdir(parents=True, exist_ok=True)
         (run / rel).write_text("{}", encoding="utf-8")
-    for kw in (dict(), dict(expect_full=False, lean=True)):
-        exp = finish.expected_files(run, **kw)
-        assert exp and all(finish.hub_path_ok(p) for p in exp), sorted(exp)
-        assert f"runs/{run.name}/checkpoints/step_200/model.safetensors" in exp
+    exp = finish.expected_files(run)
+    assert exp and all(finish.hub_path_ok(p) for p in exp), sorted(exp)
+    assert f"runs/{run.name}/checkpoints/step_200/model.safetensors" in exp
 
 
 def test_finish_sync_uploads_the_logs_before_the_checkpoints(finish_env, tmp_path):
@@ -2061,19 +1809,6 @@ def test_every_upstream_repo_is_pinned(prep):
     assert prep.REVISIONS["japanese-asr/whisper_transcriptions.reazonspeech.small"].startswith("c74b52fc")
 
 
-def test_pins_match_the_local_download_cache(prep):
-    """The pins must be the commits data/ was built from (hf_hub_download records them in refs/main)."""
-    raw = REAL / "data" / "raw"
-    checked = 0
-    for repo, sha in prep.REVISIONS.items():
-        ref = raw / f"datasets--{repo.replace('/', '--')}" / "refs" / "main"
-        if ref.exists():
-            assert ref.read_text(encoding="utf-8").strip() == sha, repo
-            checked += 1
-    if not checked:
-        no_real_data(f"no local download cache under {raw}")
-
-
 def test_downloads_use_the_pinned_revision(prep, tmp_path, monkeypatch):
     seen = []
 
@@ -2102,7 +1837,7 @@ def test_second_opinion_mirror_pins_match_01(prep):
     second = load_path("second_opinion_02b", ROOT / "scripts" / "02b_second_opinion.py")
     pins = dict(second.JOIN_SOURCES.values())
     assert pins == {repo: prep.REVISIONS[repo] for repo in pins}
-    assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (second.MODEL2_REVISION, second.WHISPER_TOK_REVISION))
+    assert re.fullmatch(r"[0-9a-f]{40}", second.WHISPER_TOK_REVISION)
 
 
 def test_student_build_reads_the_teacher_commit_the_targets_and_the_card_name():
@@ -2135,38 +1870,27 @@ def test_label_passes_read_the_hub_at_a_pin():
         calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
         reads = [c for c in calls if c.func.attr in ("from_pretrained", "list_repo_files")]
         assert reads and all(any(k.arg == "revision" for k in c.keywords) for c in reads), name
-        for c in calls:  # HfFileSystem paths carry the revision as datasets/<repo>@<rev>/<file>
-            if c.func.attr == "open" and c.args and isinstance(c.args[0], ast.JoinedStr):
-                parts = [v.value for v in c.args[0].values if isinstance(v, ast.Constant)]
-                assert "@" in parts, name
 
 
-def test_second_opinion_launcher_watches_its_one_source():
-    """The supervisor's blocking mode runs --limit-shards <files under --watch-dir>+1, which is the stuck shard only
-    when the watch dir holds exactly the outputs of the --sources being run."""
-    line = next(ln for ln in (ROOT / "scripts" / "start_second_opinion.cmd").read_text(encoding="utf-8").splitlines()
-                if "run_teacher_pass.py" in ln)
-    argv = line.split(">>")[0].split()
-    sources = argv[argv.index("--sources") + 1:]
-    sources = sources[:next((i for i, a in enumerate(sources) if a.startswith("--")), len(sources))]
-    assert len(sources) == 1 and argv[argv.index("--watch-dir") + 1] == f"second_out\\{sources[0]}"
-
-
-def test_teacher_meta_from_before_the_pin_resumes(tmp_path):
-    """A teacher_out/meta.json written before the teacher was pinned has no model_revision: it counts as the pin, so the
-    pass resumes and the key is back-filled; a meta.json from another teacher commit still stops it."""
+def test_teacher_meta_from_another_commit_stops_the_pass(tmp_path, capsys):
+    """A teacher_out/meta.json written with this pass's settings resumes, untouched; one from another teacher commit
+    (or without the pin) stops it, with 65 under --strict-existing."""
     teacher_pass = load_path("teacher_pass_02", ROOT / "scripts" / "02_teacher_pass.py")
     settings = dict(model=teacher_pass.MODEL_ID, model_revision=teacher_pass.MODEL_REVISION, language="ja",
                     punctuation=True, k=16, save_encoder=False)
-    legacy = {key: val for key, val in settings.items() if key != "model_revision"} | dict(eos_token_id=3)
     meta = tmp_path / "meta.json"
-    meta.write_text(json.dumps(legacy), encoding="utf-8")
+    written = json.dumps(settings | dict(eos_token_id=3))
+    meta.write_text(written, encoding="utf-8")
     teacher_pass.check_meta(meta, settings)
-    assert json.loads(meta.read_text(encoding="utf-8")) == legacy | {"model_revision": teacher_pass.MODEL_REVISION}
-    teacher_pass.check_meta(meta, settings)
-    meta.write_text(json.dumps(legacy | {"model_revision": "f" * 40}), encoding="utf-8")
-    with pytest.raises(SystemExit, match="model_revision"):
-        teacher_pass.check_meta(meta, settings)
+    assert meta.read_text(encoding="utf-8") == written
+    unpinned = {key: val for key, val in settings.items() if key != "model_revision"}
+    for other in (settings | {"model_revision": "f" * 40}, unpinned):
+        meta.write_text(json.dumps(other), encoding="utf-8")
+        with pytest.raises(SystemExit, match="model_revision"):
+            teacher_pass.check_meta(meta, settings)
+        with pytest.raises(SystemExit) as e:
+            teacher_pass.check_meta(meta, settings, strict=True)
+        assert e.value.code == teacher_pass.INTEGRITY_EXIT and "model_revision" in capsys.readouterr().err
 
 
 # ------------------------------------------------------------------------------------------------------ smoke model
@@ -2230,7 +1954,7 @@ def test_onstart_sizes_the_thread_pools_per_gpu_from_the_cgroup_quota(tmp_path):
     floor(quota) / KITSUNE_N_GPUS each (the owner set 15 by hand on box A), nproc / GPUs without a quota, at most 16 on a
     low pids budget; a pool set already wins; KITSUNE_CPU_QUOTA and KITSUNE_THREADS_PER_GPU go to every child."""
     pools, q, t, out = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="max", ncpu=128, gpus=4,
-                                       job="study")
+                                       job="full")
     assert set(pools.values()) == {"15"} and (q, t) == ("61", "15"), out
     pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="max", ncpu=128, gpus=2, job="full")
     assert set(pools.values()) == {"30"} and t == "30"
@@ -2238,7 +1962,7 @@ def test_onstart_sizes_the_thread_pools_per_gpu_from_the_cgroup_quota(tmp_path):
     assert set(pools.values()) == {"32"} and q == "64"
     pools, q, t, _ = onstart_threads(tmp_path, cpu_max=None, pids_max="max", ncpu=24, job="full")  # no cpu.max: nproc
     assert set(pools.values()) == {"24"} and (q, t) == ("24", "24")
-    pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="1000", ncpu=128, job="train")
+    pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="1000", ncpu=128, job="full")
     assert set(pools.values()) == {"16"} and t == "16", "a low pids budget caps at 16"
     pools, q, t, _ = onstart_threads(tmp_path, cpu_max="6144000 100000", pids_max="max", ncpu=128, gpus=4,
                                      job="full", OMP_NUM_THREADS="7")
@@ -2257,16 +1981,44 @@ def test_onstart_keeps_the_label_boxs_thread_rule(tmp_path):
     assert set(pools.values()) == {"16"} and (q, t) == ("unset", "unset")
 
 
-def test_onstart_full_job_needs_its_box_and_out_repo_and_aborts_through_finish():
-    """A full box's on-start refuses without KITSUNE_BOX and KITSUNE_OUT_REPO (as a study box), and a failure before
-    the supervisor runs finish.py --abort (a full box without a run dir is destroyed; any other job: --stop
-    --no-sync)."""
+def test_onstart_needs_a_full_or_label_job_with_its_env_and_aborts_through_finish(tmp_path):
+    """onstart refuses (its ERR trap: halt marker + stop) a job that is neither full nor label - an unset KITSUNE_JOB
+    no longer means the retired train job - and either job without its env: KITSUNE_SHA, KITSUNE_DATA_REPO,
+    KITSUNE_CONFIG and KITSUNE_MAX_HOURS (no defaults: launch.py sets them), a full box also KITSUNE_BOX and
+    KITSUNE_OUT_REPO. A failure before the supervisor runs finish.py --abort (a full box without a run dir is
+    destroyed; the label box: --stop --no-sync)."""
     text = (VAST / "onstart.sh").read_text(encoding="utf-8")
-    assert 'case "${KITSUNE_JOB:-train}" in study|full) required="$required KITSUNE_BOX KITSUNE_OUT_REPO" ;; esac' \
-        in text
     body = re.search(r"^stop_instance\(\) \{[^\n]*\n.*?^\}\n", text, re.M | re.S).group(0)
     assert '"$PY" "$KITSUNE_DIR/vast/finish.py" --abort --reason "$1"' in body
     assert "vast/README.md" in text.split("set -euo pipefail", 1)[0], "the header points to the moved prose"
+    assert "KITSUNE_CONFIG:-" not in text.replace("${KITSUNE_CONFIG:-unset}", "")
+    block = re.search(r"^required=.*?^done\n", text, re.M | re.S).group(0)
+    bash = find_bash()
+    if bash is None:
+        pytest.skip("bash not available")
+    script = tmp_path / "required.sh"
+    script.write_text("\n".join(["set -euo pipefail", "set -o errtrace", "trap 'echo \"ERR trap\"; exit 99' ERR",
+                                  "log() { printf 'LOG %s\\n' \"$*\"; }", block, "echo passed", ""]),
+                      encoding="utf-8", newline="\n")
+    base = {"KITSUNE_SHA": SHA, "KITSUNE_DATA_REPO": "u/data", "KITSUNE_CONFIG": "configs/full/data-p01.json",
+            "KITSUNE_MAX_HOURS": "22"}
+    full = dict(base, KITSUNE_JOB="full", KITSUNE_BOX="p01", KITSUNE_OUT_REPO="u/runs")
+
+    def run(**env) -> str:
+        e = {k: v for k, v in os.environ.items() if not k.startswith("KITSUNE_")}
+        r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=dict(e, **env), timeout=60)
+        assert r.returncode == (0 if "passed" in r.stdout else 99), r.stdout + r.stderr
+        return r.stdout
+
+    assert "passed" in run(**full) and "passed" in run(**base, KITSUNE_JOB="label")
+    for job in (None, "train", "study"):
+        out = run(**{k: v for k, v in dict(full, KITSUNE_JOB=job).items() if v is not None})
+        assert "ERR trap" in out and "not full or label" in out, out
+    for var in ("KITSUNE_BOX", "KITSUNE_OUT_REPO", "KITSUNE_CONFIG", "KITSUNE_MAX_HOURS"):
+        out = run(**{k: v for k, v in full.items() if k != var})
+        assert "ERR trap" in out and f"{var} is not set" in out, out
+    out = run(**{k: v for k, v in base.items() if k != "KITSUNE_CONFIG"}, KITSUNE_JOB="label")
+    assert "ERR trap" in out and "KITSUNE_CONFIG is not set" in out, out
 
 
 # ------------------------------------------------------------------------------------------ the quant pin and image step

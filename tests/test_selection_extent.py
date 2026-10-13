@@ -196,42 +196,34 @@ def test_from_selection_refusals(corpus, tmp_path):
     pd.testing.assert_frame_equal(run(thr, tmp_path / "d.parquet", "--from-selection", str(plain)), scratch)
 
 
-def test_full_configs_resolve():
-    """Both configs load through the trainer's load_config, pass kitsune.extent.validate and make_selection's recipe
-    checks, and the subset differs from full only where it must (and lies inside it)."""
+def test_the_label_config_resolves():
+    """configs/full.json, the label box's extent config, loads through the trainer's load_config (only keys it knows),
+    passes kitsune.extent.validate and make_selection's recipe checks, and carries no trainer keys of its own."""
     m = load_script("04_distill")
     assert all(m.DEFAULTS[k] is None for k in ("extent", "parakeet_root", "label"))
-    raw = {n: json.loads((ROOT / "configs" / f"{n}.json").read_text(encoding="utf-8")) for n in ("full", "full_sub3k")}
-    for name, cfg in raw.items():
-        resolved = m.load_config(str(ROOT / "configs" / f"{name}.json"), [])
-        for k, v in cfg.items():
-            if not k.startswith("_"):  # a section resolves to itself over the DEFAULTS keys it leaves out
-                d = m.DEFAULTS.get(k)
-                assert resolved[k] == (dict(d, **v) if isinstance(d, dict) and isinstance(v, dict) else v), k
-        assert resolved["loss"] == m.DEFAULTS["loss"]  # the trainer sections inherit DEFAULTS
-        assert kextent.validate(cfg) == [], name
-        recipe = cfg["selection_recipe"]
-        by_source = {s.partition("=")[0] for s in recipe["agree_max_source"]}
-        assert by_source <= set(cfg["sources"]) | set(recipe["filter_eval_sets"])
-        assert not set(recipe["filter_eval_sets"]) & set(ms.EVAL_SETS) and recipe["partial_second_opinion"] == []
-    full, sub = raw["full"], raw["full_sub3k"]
-    differ = {k for k in set(full) | set(sub) if k != "_comment" and full.get(k) != sub.get(k)}
-    assert differ == {"run_name", "selection", "sources", "extent", "selection_recipe", "label"}
-    assert dict(full["extent"], inputs=None) == dict(sub["extent"], inputs=None)
-    assert {k for k in full["selection_recipe"] if full["selection_recipe"][k] != sub["selection_recipe"][k]} == {
-        "agree_max_source"}
-    assert kextent.within(full, sub) == []
-    assert sub["extent"]["inputs"] == {"reazon_large": 216, "galgame": 16}
-    viability = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
-    assert kextent.extent_block(viability) is None
+    cfg = json.loads((ROOT / "configs" / "full.json").read_text(encoding="utf-8"))
+    resolved = m.load_config(str(ROOT / "configs" / "full.json"), [])
+    for k, v in cfg.items():
+        if not k.startswith("_"):  # a section resolves to itself over the DEFAULTS keys it leaves out
+            d = m.DEFAULTS.get(k)
+            assert resolved[k] == (dict(d, **v) if isinstance(d, dict) and isinstance(v, dict) else v), k
+    assert set(cfg) == {"_comment", "data_root", "teacher_root", "second_root", "parakeet_root", "selection", "extent",
+                        "sources", "eval_sets", "selection_recipe", "label"}
+    assert kextent.validate(cfg) == []
+    recipe = cfg["selection_recipe"]
+    by_source = {s.partition("=")[0] for s in recipe["agree_max_source"]}
+    assert by_source <= set(cfg["sources"]) | set(recipe["filter_eval_sets"])
+    assert not set(recipe["filter_eval_sets"]) & set(ms.EVAL_SETS) and recipe["partial_second_opinion"] == []
+    assert kextent.extent_block({k: v for k, v in cfg.items() if k != "extent"}) is None
     assert "labels/" in (ROOT / ".gitignore").read_text(encoding="utf-8").split()
 
 
-def test_viability_roots_equal_the_old_defaults():
-    """--config configs/viability.json resolves the roots it always used (teacher_out, second_out, data)."""
-    cfg = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
-    assert (cfg["teacher_root"], cfg["second_root"], cfg["data_root"]) == ("teacher_out", "second_out", "data")
-    assert ms._repo_path(cfg["teacher_root"]) == ROOT / "teacher_out"
+def test_the_default_roots_are_the_laptops():
+    """A config that names no roots resolves the ones the laptop always used (teacher_out, second_out, data), the
+    trainer's DEFAULTS as the viability run's config spelled them out."""
+    d = load_script("04_distill").DEFAULTS
+    assert (d["teacher_root"], d["second_root"], d["data_root"]) == ("teacher_out", "second_out", "data")
+    assert ms._repo_path(d["teacher_root"]) == ROOT / "teacher_out"
 
 
 def test_a_missing_subset_npz_or_base_stem_is_refused(corpus, tmp_path):

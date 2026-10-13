@@ -367,77 +367,14 @@ def test_verdict_v1_is_unchanged_by_the_v2_fields():
         assert a == b and "version" not in a and "cooldown_gain" not in a
 
 
-def write_ref(tmp_path, obj, name="ref.json"):
-    p = tmp_path / name
-    p.write_text(json.dumps(obj), encoding="utf-8")
-    return p
-
-
-def test_load_reference_checks_the_file(tmp_path):
-    """The reference file: a name and the corpus CER of each gate set it covers, as fractions. The config's name wins
-    over the file's; anything malformed raises at load time (the trainer reads it at setup), with the reason."""
-    good = dict(name="parakeet-tdt-0.6b-ja", scope="complete gate sets", cer=dict(eval_jsut=0.073, eval_cv8=0.079,
-                                                                                  eval_reazon=0.072))
-    r = ev.load_reference(write_ref(tmp_path, good))
-    assert r == dict(name="parakeet-tdt-0.6b-ja", path=str(tmp_path / "ref.json"), scope="complete gate sets",
-                     cer=dict(eval_jsut=0.073, eval_cv8=0.079, eval_reazon=0.072))
-    assert ev.load_reference(write_ref(tmp_path, good), name="parakeet (bake-off)")["name"] == "parakeet (bake-off)"
-    assert ev.load_reference(write_ref(tmp_path, dict(cer=dict(eval_jsut=0.07))), name="x")["cer"] == dict(
-        eval_jsut=0.07)  # a gate set left out is simply not compared
-    for bad, match in ((dict(name="x"), "non-empty"), (dict(name="x", cer={}), "non-empty"),
-                       (dict(name="x", cer=dict(jsut=0.07)), "not gate sets"),
-                       (dict(name="x", cer=dict(galgame=0.2)), "not gate sets"),
-                       (dict(name="x", cer=dict(eval_jsut=7.3)), r"fraction in \[0, 1\]"),
-                       (dict(name="x", cer=dict(eval_jsut=None)), "fraction"),
-                       (dict(name="x", cer=dict(eval_jsut=True)), "fraction"),
-                       (dict(cer=dict(eval_jsut=0.07)), "needs a name"), ([0.07], "non-empty")):
-        with pytest.raises(ValueError, match=match):
-            ev.load_reference(write_ref(tmp_path, bad))
-
-
-def test_reference_bar_next_to_the_teacher_gate(tmp_path):
-    """Per gate set the student's final corpus CER next to the reference's and their ratio; pooled, the student's sum
-    of edits / sum of chars and the reference's CERs weighted by the same chars. It never moves the tier: the verdict
-    with and without it differs only by the "reference" entry, under v1 and v2."""
-    fin = final((1.8, 2.0, 1.4))
-    chars = dict(eval_jsut=1000, eval_cv8=3000, eval_reazon=6000)
-    for s, d in fin["sets"].items():
-        d.update(ref_chars=chars[s], ref_edits=d["cer_ref_corpus"] * chars[s])
-    ref = ev.load_reference(write_ref(tmp_path, dict(name="ref", cer=dict(eval_jsut=0.10, eval_cv8=0.05,
-                                                                           eval_reazon=0.12))))
-    bar = ev.reference_bar(fin, ref)
-    assert bar["name"] == "ref" and bar["gating"] is False and bar["not_compared"] == []
-    for s, r in (("eval_jsut", 0.10), ("eval_cv8", 0.05), ("eval_reazon", 0.12)):
-        st = fin["sets"][s]["cer_ref_corpus"]
-        assert bar["sets"][s] == pytest.approx(dict(student=st, reference=r, ratio=st / r))
-    st = sum(fin["sets"][s]["ref_edits"] for s in chars) / 10_000
-    rf = (0.10 * 1000 + 0.05 * 3000 + 0.12 * 6000) / 10_000
-    assert bar["pooled"] == dict(student=pytest.approx(st), reference=pytest.approx(rf), ratio=pytest.approx(st / rf),
-                                 sets=sorted(chars))
-    # a set the file does not cover is not compared, and the pool covers the others only
-    part = ev.reference_bar(fin, dict(ref, cer=dict(eval_jsut=0.10)))
-    assert list(part["sets"]) == ["eval_jsut"] and part["not_compared"] == ["eval_cv8", "eval_reazon"]
-    assert part["pooled"]["reference"] == pytest.approx(0.10) and part["pooled"]["sets"] == ["eval_jsut"]
-    # without edit / char counts (an older summary) there is no pool, the per-set rows stay
-    assert ev.reference_bar(final((1.8, 2.0, 1.4)), ref)["pooled"] is None
-    hist = history(FALLING, KL_DOWN, PROBE_DOWN)
-    for opts in ({}, dict(version=2)):
-        base = ev.verdict(dict(final=fin, history=hist), **opts)
-        with_ref = ev.verdict(dict(final=fin, history=hist, reference=ref), **opts)
-        assert with_ref.pop("reference") == bar and with_ref == base and "reference" not in base
-
-
 FIRST_RUN = REAL / "cache" / "hf_runs" / "runs" / "viability-b20x2560-20260925T071746Z"
 
 
-def test_the_first_a100_runs_verdict_v1_and_v2():
+def test_the_first_a100_runs_verdict_v1():
     """The first A100 run (its downloaded run dir; real data, read only): v1 on its stored history and final eval gives
     its verdict.json key for key (INCONCLUSIVE, CER trend -2.46 % over steps 8512 / 9728 / 9774, all in the cooldown).
-    v2 on the same history completed from the run's files (scripts/05_evaluate.backfill_history: the LR phase from its
-    lr_phase events, the complete sets' numbers from each eval's summary.json) - what the trainer now records: still
-    INCONCLUSIVE, the CER trend -4.28 % over the pre-cooldown epochs 4-6 on the complete sets, the final eval 46 steps
-    after the epoch-8 one de-duplicated, and a cooldown gain of -10.7 % on the ratio (epoch 6 -> the final eval)."""
-    need_real(FIRST_RUN / "summary.json", FIRST_RUN / "events.jsonl", FIRST_RUN / "evals" / "step_9774")
+    """
+    need_real(FIRST_RUN / "summary.json", FIRST_RUN / "evals" / "step_9774")
 
     def load(p):
         return json.loads(p.read_text(encoding="utf-8"))
@@ -449,37 +386,11 @@ def test_the_first_a100_runs_verdict_v1_and_v2():
             return [strict(v) for v in o]
         return None if isinstance(o, float) and not np.isfinite(o) else o
 
-    from fixtures import load_script
-
     s = load(FIRST_RUN / "summary.json")
     fin = load(FIRST_RUN / "evals" / "step_9774" / "summary.json")["greedy_full"]
     v1 = ev.verdict(dict(final=fin, history=s["history"]))
     assert strict(v1) == load(FIRST_RUN / "evals" / "step_9774" / "verdict.json") == s["verdict"]
     assert v1["verdict"] == "INCONCLUSIVE" and v1["trend"]["window_steps"] == [8512, 9728, 9774]
-    hist = load_script("05_evaluate").backfill_history(s["history"], str(FIRST_RUN / "summary.json"))
-    assert [r.get("lr_phase") for r in hist] == [None] + ["stable"] * 6 + ["cooldown"] * 3
-    assert [bool(r.get("greedy_full")) for r in hist] == [False] + [True] * 9
-    v2 = ev.verdict(dict(final=fin, history=hist), version=2)
-    t = v2["trend"]
-    assert v2["verdict"] == "INCONCLUSIVE" and v2["sets"] == v1["sets"] and t["improving"]
-    assert t["cer_window_steps"] == [4864, 6080, 7296] and t["cer_scope"] == "complete"
-    assert t["cer_ratio_rel_change"] == pytest.approx(-0.04283, abs=5e-5)
-    assert t["deduplicated_steps"] == [9774] and t["window_steps"] == [7296, 8512, 9728] and not t["overfit"]
-    g = v2["cooldown_gain"]
-    assert (g["from_step"], g["to_step"], g["scope"]) == (7296, 9774, "complete")
-    assert g["cer_ratio_rel_change"] == pytest.approx(-0.1074, abs=5e-4)
-    assert g["sets"]["eval_jsut"]["cer_after"] == pytest.approx(v1["sets"]["eval_jsut"]["student"])
-
-
-def test_lr_phase_at_reads_the_lr_phase_events():
-    events = [dict(at_step=1, phase="warmup"), dict(at_step=300, phase="stable"), dict(at_step=7898, phase="cooldown"),
-              dict(at_step=7898, phase="cooldown")]  # a resume from before the cooldown logs its start again
-    assert [ev.lr_phase_at(s, events) for s in (0, 1, 299, 300, 7897, 7898, 9774)] == [
-        None, "warmup", "warmup", "stable", "stable", "cooldown", "cooldown"]
-    replay = [dict(at_step=1, phase="warmup"), dict(at_step=300, phase="stable"), dict(at_step=500, phase="cooldown"),
-              dict(at_step=300, phase="stable")]  # the largest at_step <= step holds, not the last line
-    assert ev.lr_phase_at(600, replay) == "cooldown" and ev.lr_phase_at(400, replay) == "stable"
-    assert ev.lr_phase_at(5, []) is None
 
 
 def test_eval_record_and_flatten():

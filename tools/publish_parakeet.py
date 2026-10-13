@@ -24,7 +24,8 @@ from kitsune.parakeet import (  # noqa: E402
     file_sha256,
 )
 
-NEMO_SHA256 = "a2ed2aab"  # prefix recorded by the bake-off; the full hash is taken from the cache when present
+# the sha256 prefix the laptop's ASR bake-off recorded; the full hash is taken from the cache when present
+NEMO_SHA256 = "a2ed2aab"
 NEMO_FILE = "parakeet-tdt_ctc-0.6b-ja.nemo"
 CKPT_MEMBER = "model_weights.ckpt"
 HEAD_KEYS = ("ctc_decoder.decoder_layers.0.weight", "ctc_decoder.decoder_layers.0.bias")

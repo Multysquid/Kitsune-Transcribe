@@ -2,11 +2,12 @@
 # vast.ai on-start script (SSH launch mode; runs as root at EVERY container start), exec'd from the clone by the small
 # vast/onstart_stub.sh that launch.py passes with --onstart. It syncs the env to /etc/environment, raises nofile, sizes
 # the CPU thread pools per GPU, starts TensorBoard, the vast portal and vast/watchdog.sh (the hard cost cap), then,
-# detached: vast/label.py (KITSUNE_JOB=label), or vast/bootstrap.sh and vast/supervise.py (train, study and full jobs),
-# all logging to /workspace/kitsune.log. A halt marker means the run is over; a restart with a supervisor history skips
-# bootstrap; a failure before the supervisor takes over stops the box (finish.py --abort, which destroys a full box
-# that has no run dir yet), unless KITSUNE_NO_SELF_STOP=1. `--rearm` archives a halted run's lifecycle state and boots
-# afresh. The whole story (jobs, restarts, re-arm, the instance env): vast/README.md, "onstart.sh".
+# detached: vast/label.py (KITSUNE_JOB=label), or vast/bootstrap.sh and vast/supervise.py (KITSUNE_JOB=full; any other
+# job is refused), all logging to /workspace/kitsune.log. A halt marker means the run is over; a restart with a
+# supervisor history skips bootstrap; a failure before the supervisor takes over stops the box (finish.py --abort, which
+# destroys a full box that has no run dir yet), unless KITSUNE_NO_SELF_STOP=1. `--rearm` archives a halted run's
+# lifecycle state and boots afresh. The whole story (jobs, restarts, re-arm, the instance env): vast/README.md,
+# "onstart.sh".
 set -euo pipefail
 set -o errtrace
 
@@ -14,8 +15,6 @@ export KITSUNE_REPO_URL="${KITSUNE_REPO_URL:-https://github.com/Multysquid/Kitsu
 export KITSUNE_DIR="${KITSUNE_DIR:-/workspace/Kitsune-Transcribe}"
 export KITSUNE_STATE="${KITSUNE_STATE:-/workspace/kitsune_state}"
 export KITSUNE_LOG="${KITSUNE_LOG:-/workspace/kitsune.log}"
-export KITSUNE_CONFIG="${KITSUNE_CONFIG:-configs/viability.json}"
-export KITSUNE_MAX_HOURS="${KITSUNE_MAX_HOURS:-5.5}"
 export HF_HOME="${HF_HOME:-/workspace/.hf_home}"
 export PYTHONUNBUFFERED=1
 export PATH="/venv/main/bin:$PATH"
@@ -176,8 +175,7 @@ rearm() {  # --rearm: archive the previous run's lifecycle state (see the header
     d="$KITSUNE_STATE/rearm-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$d"
     for f in halt deadline first_boot supervise.json events.jsonl bootstrap_timings.jsonl bootstrap_coverage.json \
-        label.json label_hb train_hb hb resume_plan.json watchdog_alerts.jsonl smoke_verdict.json download_gate.json \
-        watchdog_mode chain; do
+        label.json label_hb train_hb hb resume_plan.json watchdog_alerts.jsonl smoke_verdict.json download_gate.json; do
         if [ -e "$KITSUNE_STATE/$f" ]; then
             mv "$KITSUNE_STATE/$f" "$d/"
         fi
@@ -204,10 +202,12 @@ echo "$boots" > "$KITSUNE_STATE/boots"
 now=$(date +%s)
 if [ ! -s "$KITSUNE_STATE/deadline" ]; then
     echo "$now" > "$KITSUNE_STATE/first_boot"
-    echo $(( now + $(awk -v h="$KITSUNE_MAX_HOURS" 'BEGIN { printf "%d", h * 3600 }') )) > "$KITSUNE_STATE/deadline"
+    # no KITSUNE_MAX_HOURS: a deadline of now, and the required-env check below stops the box
+    echo $(( now + $(awk -v h="${KITSUNE_MAX_HOURS:-0}" 'BEGIN { printf "%d", h * 3600 }') )) \
+        > "$KITSUNE_STATE/deadline"
 fi
-log "boot $boots, instance ${CONTAINER_ID:-?}, job ${KITSUNE_JOB:-train}, sha ${KITSUNE_SHA:-unset}, " \
-    "config $KITSUNE_CONFIG, HF_TOKEN $([ -n "${HF_TOKEN:-}" ] && echo set || echo MISSING)"
+log "boot $boots, instance ${CONTAINER_ID:-?}, job ${KITSUNE_JOB:-unset}, sha ${KITSUNE_SHA:-unset}, " \
+    "config ${KITSUNE_CONFIG:-unset}, HF_TOKEN $([ -n "${HF_TOKEN:-}" ] && echo set || echo MISSING)"
 
 ulimit -Sn "$(ulimit -Hn)" 2>/dev/null || log "could not raise the nofile soft limit"
 log "nofile soft limit $(ulimit -Sn)"
@@ -236,16 +236,16 @@ g=${KITSUNE_N_GPUS:-1}
 t=$(( q / g > 1 ? q / g : 1 ))
 low=0
 [[ "$pids_max" =~ ^[0-9]+$ && "$ncpu" =~ ^[0-9]+$ ]] && (( pids_max < ncpu * 16 )) && low=1
-[ "${KITSUNE_JOB:-train}" != label ] || t=16
+[ "${KITSUNE_JOB:-}" != label ] || t=16
 (( ! low || t <= 16 )) || t=16
-if [ "${KITSUNE_JOB:-train}" != label ] || [ "$low" = 1 ]; then
+if [ "${KITSUNE_JOB:-}" != label ] || [ "$low" = 1 ]; then
     for v in OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS RAYON_NUM_THREADS \
         TOKIO_WORKER_THREADS; do
         export "$v=${!v:-$t}"  # a value already set wins
     done
     log "CPU thread pools $t (quota $q CPUs / $g GPU(s), low pids budget $low)"
 fi
-if [ "${KITSUNE_JOB:-train}" != label ]; then
+if [ "${KITSUNE_JOB:-}" != label ]; then
     export KITSUNE_CPU_QUOTA="$q" KITSUNE_THREADS_PER_GPU="$t"
 fi
 sync_env
@@ -258,8 +258,13 @@ if [ -f "$KITSUNE_STATE/halt" ]; then
     exit 0
 fi
 
-required="KITSUNE_SHA KITSUNE_DATA_REPO"
-case "${KITSUNE_JOB:-train}" in study|full) required="$required KITSUNE_BOX KITSUNE_OUT_REPO" ;; esac
+required="KITSUNE_SHA KITSUNE_DATA_REPO KITSUNE_CONFIG KITSUNE_MAX_HOURS"
+case "${KITSUNE_JOB:-}" in
+    full) required="$required KITSUNE_BOX KITSUNE_OUT_REPO" ;;
+    label) ;;
+    *) log "KITSUNE_JOB is '${KITSUNE_JOB:-}', not full or label (vast/launch.py passes it)"
+       false ;;  # -> ERR trap: halt marker + stop
+esac
 for var in $required; do
     if [ -z "${!var:-}" ]; then
         log "$var is not set (vast/launch.py passes it)"
@@ -280,12 +285,12 @@ log "watchdog started (deadline $(date -u -d "@$(cat "$KITSUNE_STATE/deadline")"
         log "a bootstrap or supervisor of this container is already running; not starting another"
         exit 0
     fi
-    if [ "${KITSUNE_JOB:-train}" = label ]; then
+    if [ "${KITSUNE_JOB:-}" = label ]; then
         log "label job: handing over to vast/label.py (it resumes from its own state file)"
         exec 7>&-  # label.py takes supervise.lock itself for its lifetime (--rearm checks it)
         exec "$PY" "$KITSUNE_DIR/vast/label.py"
     fi
-    [ "${KITSUNE_JOB:-train}" != full ] || touch "$KITSUNE_STATE/train_hb"  # its watchdog's heartbeat, fresh now
+    [ "${KITSUNE_JOB:-}" != full ] || touch "$KITSUNE_STATE/train_hb"  # its watchdog's heartbeat, fresh now
     if [ -s "$KITSUNE_STATE/supervise.json" ]; then
         # a restart of this run: the supervisor starts only after a bootstrap that passed its coverage check and
         # records its history before the first attempt (--rearm moves it aside), so the data is on disk; bootstrap's

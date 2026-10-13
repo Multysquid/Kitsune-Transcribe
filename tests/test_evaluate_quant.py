@@ -6,7 +6,7 @@ formats and fp16:
                 block (format, impl, simulated, source, counters, non-finite counts, bytes) and the new macro metrics,
                 summary.json's and evaluator.json's quant block, the quant / quant_counters / nonfinite events, no
                 verdict (verdict_skipped), the quant block in the --out identity; a rerun evaluates nothing and keeps
-                the block; another format into the same --out, a --system without the suffix, --anchor, --teachers or
+                the block; another format into the same --out, a --system without the suffix, --teachers or
                 --from-evals with --quant, and the quant flags without --quant are refused; an eval with a non-finite
                 row writes its outputs, then fails (exit 1, status nonfinite), the readout CLI too
   from a file   python -m kitsune.quant export, then 05 --ckpt <variant>: exactly the in-memory eval's hypotheses and
@@ -40,6 +40,7 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from fixtures import load_script  # noqa: E402
+from fixtures_whisper import pending_prereg  # noqa: E402
 from test_evaluate_script import env as aed_env  # noqa: E402,F401  (a tiny Transcribe student and its trainer run)
 from test_evaluate_study import ctc_env  # noqa: E402,F401  (the module-scoped fixture: a CTC student on a manifest)
 
@@ -51,13 +52,10 @@ from kitsune.store import ids_sha256  # noqa: E402
 
 @pytest.fixture(scope="module")
 def prereg(tmp_path_factory):
-    """The rules with their sidecar fields pending (the toy corpus is not the study's selection: the committed
-    PREREG.json would refuse its manifest), and Parakeet's CTC baselines taken as pending, as test_evaluate_study
-    does for its own 05 runs."""
-    from kitsune import prereg as pr
-
-    path = tmp_path_factory.mktemp("prereg") / "PREREG.json"
-    path.write_bytes(pr.rules_json(pr.rules()))
+    """A PREREG.json whose manifest and baselines blocks are pending (the toy corpus is not the study's selection: the
+    committed PREREG.json would refuse its manifest), and Parakeet's CTC baselines taken as pending, as
+    test_evaluate_study does for its own 05 runs."""
+    path = pending_prereg(tmp_path_factory.mktemp("prereg") / "PREREG.json")
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ev, "PARAKEET_CTC_CER_PREREG", None)
         yield path
@@ -164,7 +162,7 @@ def test_05_quant_refusals(ctc_env, prereg, m05, mem_run, tmp_path, monkeypatch)
         run05(m05, ctc_env, prereg, tmp_path / "a", "--quant", "int8-w8a8", "--system", "study-p01")
     with pytest.raises(SystemExit, match="need --quant"):
         run05(m05, ctc_env, prereg, tmp_path / "b", "--quant-scope", "linear")
-    for extra in (["--anchor"], ["--teachers"], ["--from-evals", str(out), "--system", "x@fp16"]):
+    for extra in (["--teachers"], ["--from-evals", str(out), "--system", "x@fp16"]):
         with pytest.raises(SystemExit) as e:
             m05.parse_args(["--config", "c.json", "--out", str(tmp_path / "c"), "--quant", "fp16", *extra])
         assert e.value.code == 2
@@ -298,7 +296,7 @@ def test_the_readout_cli(ctc_env, prereg, tmp_path, monkeypatch, capsys):
 
 
 def test_aed_variant_equals_in_memory_and_fp16(aed_env, prereg, m05, tmp_path):
-    """The AED paths box full's quant-<fmt>-full-t06 readouts take: 05 --quant int8-w8a8 in memory, and the exported
+    """The AED paths box full-t's quant-<fmt>-full-t06 readouts take: 05 --quant int8-w8a8 in memory, and the exported
     variant as --ckpt (load_quantized, setup_aed_model, the processor from the variant dir), give the same hypotheses
     and teacher-forced tables; --fp16 in memory (smoke B's fp16-study-t06) decodes with no non-finite row."""
     base = ["--root", str(aed_env["root"]), "--config", str(aed_env["relative"]), "--prereg", str(prereg)]
@@ -353,7 +351,6 @@ def test_study_block_new_metrics(m05):
     assert m["m3_ratio"] == pytest.approx(m["m3"] / m["m3_teacher"])
     assert not any(k.startswith(("m4_nostyle_", "m4_all_nostyle_")) for k in m)
     assert {"m4", "m4_teacher", "m4_ratio", "ood", "ind", "jg", "jg_nostyle", "gate_pooled"} <= set(m)
-    assert "m4_all" not in ss.METRICS and "m3" not in ss.METRICS  # the pre-registered report's list is untouched
     no_gal = {s: t for s, t in tables.items() if s != "galgame"}
     m2 = m05.study_block(man, no_gal, None)["metrics"]
     assert "m4_all" not in m2 and "m3" in m2 and "m3_teacher" not in m2

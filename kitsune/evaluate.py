@@ -36,7 +36,7 @@ The study's per-utterance tables (CONTRACT.md 5; utterance_table): id, set, ref,
 the normalize_ja strings (the alignment corpus_cer counts), edits, ref_len, hyp_len, sub, del, ins, and the no-style
 count edits_nostyle = edits minus the edits of the error regions that only change the script or the numeral style
 (STYLE_KINDS; region_kind, the first run's error analysis). Summed over the rows with a reference they are corpus_cer's
-edits and reference chars exactly, so tools/study_report.py (kitsune.study_stats) reproduces every corpus CER here.
+edits and reference chars exactly, so tools/full_report.py (kitsune.study_stats) reproduces every corpus CER here.
 """
 import json
 import math
@@ -58,12 +58,12 @@ from transformers.generation import StoppingCriteriaList
 from kitsune.generation import RepetitionStop
 from kitsune.text import cer as utt_cer
 from kitsune.text import normalize_ja
-from kitsune.trainset import EOS, EVAL_SETS, PAD, PROMPT, AudioBatchDataset, eval_batches
+from kitsune.trainset import EOS, EVAL_SETS, PAD, PROMPT, AudioBatchDataset, dataset_for, eval_batches
 
 TEACHER_ID = "CohereLabs/cohere-transcribe-03-2026"
 GATE_SETS = tuple(EVAL_SETS)  # the D32a gate: JSUT / CV8 / Reazon-test; eval_emilia and galgame are monitor-only
-# the full runs' extra macro metrics in 05's study.json (not in kitsune.study_stats.METRICS, which drives the frozen
-# pre-registered report): m4_all = M4 with Galgame's whole set in place of its neutral view, m3 = the gate sets
+# the full runs' extra macro metrics in 05's study.json (the size study's pre-registered report had no such metric):
+# m4_all = M4 with Galgame's whole set in place of its neutral view, m3 = the gate sets
 M4_ALL_STRATA = ("eval_jsut", "eval_cv8", "eval_reazon", "galgame_all")
 M3_STRATA = GATE_SETS
 # D32a, pre-registered full-set teacher corpus CER (fractions). teacher_baselines() recomputes them from teacher_out
@@ -138,8 +138,8 @@ def _cer_value(v) -> bool:
 
 def prereg_teacher_cer(system: str, prereg=None) -> dict[str, float] | None:
     """A teacher's pre-registered corpus CER per GATE set from the size study's PREREG.json "baselines" block, which
-    the PREREG fill (python -m kitsune.prereg --write study/ --sidecar ...) copies from the study selection's sidecar:
-    the teacher's stored hypotheses scored on the manifest rows, as fractions. None while the block is pending, and
+    the PREREG fill (the study's generator, removed after the study) copied from the study selection's sidecar: the
+    teacher's stored hypotheses scored on the manifest rows, as fractions. None while the block is pending, and
     when the file is missing or unreadable or lacks a number for a gate set: nothing is registered then, and nothing
     can be checked against it. `prereg`: the parsed PREREG.json or a path to one (default: the committed
     study/PREREG.json). `system` by its CONTRACT.md 5 name (parakeet-ctc; the parakeet_ctc spelling is read too)."""
@@ -460,10 +460,11 @@ def greedy_generate(model, feats: torch.Tensor, fmask: torch.Tensor, max_duratio
     prompt up to and including EOS, and whether the row ended with EOS (not truncated). The caller holds eval mode and
     the fp32 head (greedy_eval; tools/speed_probe.py times this very call).
 
-    pin_new (the speed probe's length-pinned timing only; the evaluator never pins): exactly min(pin_new, max_new)
-    decoder steps for the batch - EOS suppressed until then (min_new_tokens), no RepetitionStop - so the time is the
-    model shape's at that output length whatever the weights emit: an untrained init dir would otherwise run to max_new,
-    or stop at random. Every step is the same KV-cached forward and argmax as the free decode's."""
+    pin_new (a fixed-length decode: kitsune.quant's selftest; the evaluator never pins, and the size study's speed
+    probe timed untrained init dirs this way): exactly min(pin_new, max_new) decoder steps for the batch - EOS
+    suppressed until then (min_new_tokens), no RepetitionStop - so the time is the model shape's at that output length
+    whatever the weights emit: an untrained init dir would otherwise run to max_new, or stop at random. Every step is
+    the same KV-cached forward and argmax as the free decode's."""
     P = len(prompt_ids)
     n = feats.shape[0]
     # identical to 02_teacher_pass: ~3.6 tok/s observed (max ~6.5), 16 + 10 s is a 1.5x margin on the max
@@ -585,14 +586,10 @@ FRAME_BATCH_KEYS = ("frame_mask", "dense_mask", "blank_lp", "topk_idx", "topk_lp
 
 
 def batch_dataset(store):
-    """The micro-batch dataset of a store as the trainer reads it: kitsune.trainset.dataset_for (the CTC trainer's: a
-    FrameBatchDataset for a frame store, its rows' stored Parakeet frame targets collated into every batch, else an
-    AudioBatchDataset) where kitsune.trainset has it, else an AudioBatchDataset (a token store: the only kind before
-    the CTC trainer's frame stores). ctc_eval reads either."""
-    from kitsune import trainset
-
-    make = getattr(trainset, "dataset_for", None)
-    return make(store) if make is not None else AudioBatchDataset(store)
+    """The micro-batch dataset of a store as the trainer reads it, kitsune.trainset.dataset_for: a FrameBatchDataset
+    for a frame store (the CTC trainer's; its rows' stored Parakeet frame targets collated into every batch), else an
+    AudioBatchDataset. ctc_eval reads either."""
+    return dataset_for(store)
 
 
 def _greedy_frame(recs: list[dict], store, teacher_rows: dict | None, decode) -> pd.DataFrame:
@@ -881,7 +878,7 @@ def utterance_scores(refs: Sequence[str], hyps: Sequence[str]) -> pd.DataFrame:
 
 def utterance_table(ids: Sequence[str], sets, refs: Sequence[str], hyps: Sequence[str],
                     truncated: Sequence[bool] | None = None) -> pd.DataFrame:
-    """A system's per-utterance table in CONTRACT.md 5's format, the input of tools/study_report.py: id, set (the eval
+    """A system's per-utterance table in CONTRACT.md 5's format, the input of tools/full_report.py: id, set (the eval
     set; one string for all rows or one per row), ref and hyp as given (raw text), the counts of utterance_scores and
     truncated (False when not given: CTC decoding has no length cut). Row order as given."""
     ids = [str(x) for x in ids]
@@ -1054,20 +1051,6 @@ def eval_record(step: int, elapsed_s: float, tf: dict | None = None, greedy: dic
 LR_PHASES = ("warmup", "stable", "cooldown")
 
 
-def lr_phase_at(step: int, lr_phase_events: Iterable[dict]) -> str | None:
-    """The LR phase of optimizer step `step`, from the trainer's `lr_phase` events (each names the phase that begins at
-    its at_step): the phase of the event with the largest at_step <= step. A resume that replays steps logs the same
-    boundaries again, so the largest at_step, not the last event in the file, is the one that holds. None for step 0
-    (no step taken) and before the first event. It gives the lr_phase of history records written before the trainer
-    recorded one (the first A100 run's), exactly as the trainer now records it."""
-    best = None
-    for e in lr_phase_events:
-        at = int(e["at_step"])
-        if at <= step and (best is None or at >= best[0]):
-            best = (at, str(e["phase"]))
-    return best[1] if best is not None and step > 0 else None
-
-
 # ---------------------------------------------------------------------------------------------------- verdict
 
 
@@ -1158,10 +1141,7 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
                           the rows that could not be decoded, per set),
                "history": [eval_record(...), ...],
                "teacher": optional {set: teacher corpus CER} (default: teacher CER on the same ids from "final",
-                          else the pre-registered numbers),
-               "reference": optional load_reference(...): a reference model's per-set CER, reported as the
-                          verdict's "reference" next to the teacher gate (reference_bar), under either version; no
-                          tier depends on it}
+                          else the pre-registered numbers)}
 
     GO         student corpus CER <= 1.2x teacher on >= 2 of the 3 sets, AND truncation <= 0.5 % of the final outputs,
                AND the (held-out KL - probe KL) gap is not widening over the last 20 % of evals
@@ -1205,8 +1185,8 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
          cooldown's start, which with evals closer than min_epoch_gap can be one the trend in 3 left out), on the
          complete sets when both have them: the measure before and after, its relative change, and each gate set's
          CER before and after (null without an eval on each side)
-    A record's lr_phase is the trainer's (eval_record); lr_phase_at gives it for a history written before the trainer
-    recorded one. Records without it never count as pre-cooldown (a reason counts them).
+    A record's lr_phase is the trainer's (eval_record). Records without it never count as pre-cooldown (a reason
+    counts them).
 
     family: whose teacher the ratios are to (the size study). "aed" (default) is everything above, with Cohere: its
     output is unchanged by this option. "ctc" judges a Parakeet CTC student against ITS teacher, Parakeet's stored CTC
@@ -1360,67 +1340,4 @@ def verdict(results: dict, *, go_ratio: float = 1.2, promising_ratio: float = 1.
     if family != "aed":  # the Cohere verdict's keys stay exactly as they were
         out.update(family=family, teacher=FAMILY_TEACHER[family],
                    teacher_prereg_status="registered" if prereg else "pending")
-    if results.get("reference"):  # reported next to the tiers, never part of them
-        out["reference"] = reference_bar(fin, results["reference"])
     return out
-
-
-# ------------------------------------------------------------------------------------------- reference model
-
-
-def load_reference(path, name: str | None = None) -> dict:
-    """A reference model's corpus CER on the gate sets (eval.reference: {"name": ..., "path": ...}), for the bar the
-    verdict reports next to the teacher gate (reference_bar). The file is JSON (the numbers here only show the format):
-        {"name": "parakeet-tdt-0.6b-ja",
-         "scope": "complete gate sets, corpus CER under kitsune.text.normalize_ja",
-         "cer": {"eval_jsut": 0.0731, "eval_cv8": 0.0795, "eval_reazon": 0.0718}}
-    cer holds fractions (0.0731 = 7.31 %) of the gate's own measure, corpus CER (corpus_cer: sum of char edits / sum of
-    reference chars under normalize_ja) on the COMPLETE gate sets, so they compare with the verdict's student CER; a
-    gate set left out is not compared. name (the config's wins when it gives one) and scope are labels. Anything else
-    - no gate set, a set that is not a gate set, a CER outside [0, 1] (a percent typed as 7.31) - raises ValueError,
-    so a bad file stops the trainer at start-up rather than at its verdict 4 h later."""
-    p = Path(path)
-    raw = json.loads(p.read_text(encoding="utf-8"))
-    cer = raw.get("cer") if isinstance(raw, dict) else None
-    if not isinstance(cer, dict) or not cer:
-        raise ValueError(f"{p}: a reference file needs a non-empty \"cer\": {{set: corpus CER}} (load_reference)")
-    unknown = sorted(set(cer) - set(GATE_SETS))
-    if unknown:
-        raise ValueError(f"{p}: {unknown} are not gate sets ({', '.join(GATE_SETS)}): only those are compared")
-    out = {}
-    for s in GATE_SETS:
-        if s in cer:
-            v = cer[s]
-            if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 <= v <= 1):
-                raise ValueError(f"{p}: cer.{s} must be a fraction in [0, 1] (0.0731 = 7.31 %), got {v!r}")
-            out[s] = float(v)
-    label = name or raw.get("name")
-    if not label:
-        raise ValueError(f"{p}: the reference needs a name (in the file or eval.reference.name)")
-    return dict(name=str(label), path=str(p), scope=raw.get("scope"), cer=out)
-
-
-def reference_bar(final: dict | None, reference: dict) -> dict:
-    """The student's final corpus CER next to a reference model's (load_reference) on each gate set both have, and
-    pooled over those sets; ratio = student / reference (below 1: the student is better). Pooled: the student's sum of
-    char edits / sum of reference chars (the final summary's ref_edits / ref_chars, the headline's val_cer when all
-    three sets are there), and the reference's per-set CERs weighted by the same reference chars - what the reference
-    scores on the pooled corpus, since its numbers are on the same complete sets and references. Reported only
-    (gating false): no tier depends on it; it answers "is the student useful?", which the teacher-ratio gate does not
-    (a student at a public model's level can still fail 1.5x of this teacher on CV8 and ReazonSpeech)."""
-    fsets = (final or {}).get("sets") or {}
-    rows = {}
-    for s in GATE_SETS:
-        if s in reference["cer"] and s in fsets:
-            st, rf = float(fsets[s]["cer_ref_corpus"]), float(reference["cer"][s])
-            rows[s] = dict(student=st, reference=rf, ratio=st / rf if rf > 0 else (0.0 if st == 0 else math.inf))
-    pooled = None
-    if rows and all(fsets[s].get("ref_chars") and "ref_edits" in fsets[s] for s in rows):
-        chars = {s: float(fsets[s]["ref_chars"]) for s in rows}
-        n = sum(chars.values())
-        st = sum(float(fsets[s]["ref_edits"]) for s in rows) / n
-        rf = sum(rows[s]["reference"] * chars[s] for s in rows) / n
-        pooled = dict(student=st, reference=rf, ratio=st / rf if rf > 0 else (0.0 if st == 0 else math.inf),
-                      sets=sorted(rows))
-    return dict(name=reference["name"], scope=reference.get("scope"), path=reference.get("path"), gating=False,
-                sets=rows, pooled=pooled, not_compared=[s for s in GATE_SETS if s not in rows])

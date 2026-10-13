@@ -1,13 +1,11 @@
 """The size study's selection (scripts/make_selection.py with a selection_recipe.study block) on a synthetic label root
 with both teachers (tests/fixtures_study.py), and the checks that read it before money is spent:
-kitsune.extent.pull_plan (parakeet_out per family / pull_parakeet) and vast/launch.py selection_problems and
-data_problems.
+kitsune.extent.pull_plan (parakeet_out per family / pull_parakeet) and vast/launch.py selection_problems.
 
 The corpus plants one kind of bad row per rule and a toy extent record spreads galgame over 3 inputs, so every drop
 reason, the extent filter and the reazon_large cap readout are exercised; the expectations come from the ground truth
 the fixture WROTE, not from the code under test. CPU only, no network.
 """
-import copy
 import importlib
 import json
 import shutil
@@ -266,58 +264,6 @@ def test_manifest_views_and_baselines(st, built):
                                 "sha256": ms.file_sha256(built.manifest_path)}
 
 
-def registered(side: dict) -> dict:
-    """The toy sidecar dressed as the pre-registered selection (its recipe, seed, sources, eval sets, file names and
-    extent; eval_emilia and the two unlabelled sources borrowed from existing entries): what the fill reads is the
-    toy build's own ids, views and baselines."""
-    sc = copy.deepcopy(side)
-    sc.update(sources=list(prereg.STUDY_SOURCES), eval_sets=list(prereg.STUDY_EVAL_SETS),
-              recipe=prereg.registered_recipe(), seed=prereg.SELECTION_SEED)
-    sc["selection"]["path"] = prereg.SELECTION_FILE
-    sc["manifest"]["path"] = prereg.study_files(prereg.SELECTION_FILE)[1]
-    for k in ("ids_sha256", "n"):
-        sc[k]["eval"]["eval_emilia"] = sc[k]["eval"]["eval_cv8"]
-    for b in sc["baselines"].values():
-        b["eval_emilia"] = b["eval_cv8"]
-    sc["n"]["probe"] = prereg.STUDY_SELECTION["probe_n"] * len(prereg.STUDY_SOURCES)
-    sc["extent"] = {"name": "full", "inputs": {**{k: v for k, v in prereg.STUDY_INPUTS.items() if v is not None},
-                                               "reazon_large": 2}}
-    sc["details"]["pool_hours_if_capped"] = {"reazon_large": {"1": 1000.0, "2": 1010.0}}  # the rule: 2
-    sc["draw"].update(budget_s=float(prereg.STUDY_SELECTION["draw_audio_s"]), drawn_s=3_599_000.0,
-                      pool_s=1010.0 * 3600)
-    # the uploaded selection's drawn hours per source, so the realised mix is the recorded one (prereg.mix_problems)
-    drawn = {"reazon_small": 90.770, "reazon_large": 325.516, "emilia_yodas": 267.630, "emilia_nc": 195.987,
-             "galgame": 120.097}
-    sc["hours"] = {src: {**(sc.get("hours") or {}).get(src, {}), "drawn": {"hours": h}} for src, h in drawn.items()}
-    return sc
-
-
-def test_the_sidecar_fills_the_prereg_only_when_it_is_the_registered_selection(built):
-    """python -m kitsune.prereg --write study/ --sidecar ...: the toy build (its own recipe, sources and extent) is
-    refused, and the same sidecar with the registered recipe, seed, sources and extent fills every pending field from
-    the build's own hashes, views and baselines."""
-    side = built.sidecar
-    with pytest.raises(ValueError, match="not the pre-registered study selection"):
-        prereg.rules(side)
-    problems = prereg.sidecar_problems(side)
-    assert any(p.startswith("sources") for p in problems) and any(p.startswith("recipe") for p in problems)
-    sc = registered(side)
-    assert prereg.sidecar_problems(sc) == []
-    r = prereg.rules(sc)
-    assert prereg.pending(r) == []
-    m = r["manifest"]
-    assert m["train"] == {"ids_sha256": side["ids_sha256"]["train"], "n": side["n"]["train"],
-                          "hours": pytest.approx(3_599_000 / 3600)}
-    assert m["sets"]["galgame"]["ids_sha256"] == built.manifest["sets"]["galgame"]["ids_sha256"]
-    assert m["galgame_views"]["neutral"] == {"ids_sha256": built.manifest["galgame_views"]["neutral"]["ids_sha256"],
-                                             "n": len(built.manifest["galgame_views"]["neutral"]["ids"])}
-    assert m["manifest_sha256"] == ms.file_sha256(built.manifest_path)
-    assert r["baselines"]["cohere"]["m4"] == pytest.approx(side["baselines"]["cohere"]["m4"])
-    assert r["baselines"]["parakeet-ctc"]["galgame_neutral"] == side["baselines"]["parakeet-ctc"]["galgame_neutral"][
-        "cer"]
-    assert r["data"]["extent"]["inputs"]["reazon_large"] == 2
-
-
 def test_corpus_cer_is_the_evaluators():
     """make_selection's torch-free corpus_cer equals kitsune.evaluate.corpus_cer (the scorer's)."""
     from kitsune.evaluate import corpus_cer
@@ -522,10 +468,9 @@ def test_pull_plan_parakeet_per_family(st):
 
 
 def test_pull_plan_of_the_full_configs_is_unchanged():
-    """configs/full.json and full_sub3k.json have neither family nor pull_parakeet: never parakeet_out."""
-    for name in ("full", "full_sub3k"):
-        cfg = json.loads((ROOT / "configs" / f"{name}.json").read_text(encoding="utf-8"))
-        assert "family" not in cfg and "pull_parakeet" not in cfg
+    """configs/full.json has neither family nor pull_parakeet: never parakeet_out."""
+    cfg = json.loads((ROOT / "configs" / "full.json").read_text(encoding="utf-8"))
+    assert "family" not in cfg and "pull_parakeet" not in cfg
     cfg = json.loads((ROOT / "study" / "data.json").read_text(encoding="utf-8"))
     assert cfg["pull_parakeet"] is True and kextent.validate(cfg) == []
 
@@ -609,35 +554,6 @@ def test_selection_problems_know_the_study(tmp_path):
     ctc_have = {f for f in have | pk if "/train-" not in f or "parakeet_out" in f}
     assert launch.selection_problems(path, name, dict(LCFG, family="ctc"), ctc_have) == []
     assert launch.selection_problems(path, name, LCFG, ctc_have)  # an AED run needs the train rows' too
-
-
-def test_data_problems_know_the_parakeet_requirement():
-    """A non-extent config: a CTC student or pull_parakeet needs parakeet_out's meta and npz for every source and eval
-    set; a CTC student needs teacher npz only for the eval sets; configs without either are unchanged."""
-    cfg = {"sources": ["reazon_small", "galgame"], "eval_sets": ["eval_jsut", "galgame"], "student": "students/s",
-           "selection": "selection/s.parquet", "parakeet_root": "parakeet_out"}
-    base = ["teacher_out/meta.json", "second_out/meta.json", "selection/s.parquet",  # a CTC student: + its CC-BY card
-            *(f"students/s/{n}" for n in launch.STUDENT_FILES + (launch.CTC_CARD,))]
-    teacher = [f"teacher_out/{s}/{st}.npz" for s, st in (("reazon_small", "train-00000"), ("galgame", "train-00000"),
-                                                          ("galgame", "eval-00000"), ("eval_jsut", "eval-00000"))]
-    second = ["second_out/reazon_small/train-00000.jsonl", "second_out/galgame/train-00000.jsonl",
-              "second_out/galgame/eval-00000.jsonl"]
-    pk = [f.replace("teacher_out", "parakeet_out") for f in teacher] + ["parakeet_out/meta.json"]
-    assert launch.data_problems(base + teacher + second, cfg) == []
-    assert launch.data_problems(base + teacher + second, dict(cfg, pull_parakeet=True)) == [
-        "no parakeet_out/meta.json", "no parakeet_out/reazon_small/*.npz", "no parakeet_out/galgame/*.npz",
-        "no parakeet_out/eval_jsut/*.npz"]
-    assert launch.data_problems(base + teacher + second + pk, dict(cfg, pull_parakeet=True)) == []
-    # a CTC student: no train-only teacher npz needed; the eval sets' still are
-    no_train = [f for f in teacher if "reazon_small" not in f]
-    assert launch.data_problems(base + no_train + second + pk, dict(cfg, family="ctc")) == []
-    assert launch.data_problems(base + no_train + second + pk, cfg) == ["no teacher_out/reazon_small/*.npz"]
-    no_jsut = [f for f in teacher if "eval_jsut" not in f]
-    assert launch.data_problems(base + no_jsut + second + pk, dict(cfg, family="ctc")) == [
-        "no teacher_out/eval_jsut/*.npz"]
-    no_root = {k: v for k, v in cfg.items() if k != "parakeet_root"}
-    assert launch.data_problems(base + teacher + second, dict(no_root, family="ctc")) == [
-        "the config needs Parakeet targets (family ctc or pull_parakeet) but has no parakeet_root"]
 
 
 def test_a_real_study_selection_passes_launch(st, built):

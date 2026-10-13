@@ -1,13 +1,12 @@
 """Tests for scripts/02b_second_opinion.py on the label box (--judge parakeet, --whisper-dir, --require-npz,
---strict-existing) and tools/judge_report.py.
+--strict-existing).
 
 The box runs 02b every sync cycle next to the passes that are still writing, into a write-once root. So it must take
 only finished shards (both npz), keep an output only when its ids are the teacher's, never redo one under
---strict-existing, judge galgame from Parakeet's jsonl without ever loading kotoba (no GPU), join the whisper parts 01
-captured without touching the Hub, and stop (65) on anything that would silently become no_agree. CPU only, no network:
-the whisper tokenizer, the Hub and kotoba are faked.
+--strict-existing, judge galgame from Parakeet's jsonl, join the whisper parts 01 captured without touching the Hub,
+refuse a source whose input is not given, and stop (65) on anything that would silently become no_agree. CPU only, no
+network: the whisper tokenizer and the Hub are faked.
 """
-import importlib.util
 import json
 import sys
 import types
@@ -23,10 +22,6 @@ from kitsune import extent  # noqa: E402
 from kitsune.store import ShardWriter  # noqa: E402
 
 sb = load_script("02b_second_opinion")
-ROOT = Path(__file__).resolve().parents[1]
-_spec = importlib.util.spec_from_file_location("kitsune_tool_judge_report", ROOT / "tools" / "judge_report.py")
-judge_report = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(judge_report)
 
 LARGE_INPUT = "large/train-00000-of-00002.parquet"
 
@@ -51,17 +46,12 @@ class FakeTokenizer:
 
 @pytest.fixture(autouse=True)
 def offline(monkeypatch):
-    """No kotoba, no Hub: the box's 02b must not need either."""
-    class NoKotoba:
-        def __init__(self, *a, **kw):
-            raise AssertionError("kotoba was loaded")
-
+    """No Hub: the box's 02b runs under HF_HUB_OFFLINE=1, and only the pinned tokenizer (faked) is loaded. The stub
+    fails any Hub read: HfApi raises, and any other name of huggingface_hub cannot be imported."""
     def no_hub(*a, **kw):
         raise AssertionError("the Hub was read")
 
-    monkeypatch.setattr(sb, "Kotoba", NoKotoba)
-    monkeypatch.setattr(sb, "load_whisper_map", no_hub)
-    hub = types.SimpleNamespace(HfApi=no_hub, HfFileSystem=no_hub)
+    hub = types.SimpleNamespace(HfApi=no_hub)
     monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
     monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(AutoTokenizer=FakeTokenizer))
     FakeTokenizer.calls = []
@@ -106,11 +96,14 @@ class World:
                        p)
         return p
 
-    def run(self, *extra: str, judge="parakeet", strict=True, sources=None) -> int:
+    def run(self, *extra: str, strict=True, sources=None, parakeet=True, whisper=True) -> int:
+        """The label box's call (vast/label.py second_argv); parakeet / whisper False leave out that input."""
         argv = ["02b", "--data", str(self.data), "--teacher-out", str(self.teacher), "--out", str(self.out),
                 "--require-npz"]
-        if judge == "parakeet":
-            argv += ["--judge", "parakeet", "--parakeet-out", str(self.parakeet), "--whisper-dir", str(self.whisper)]
+        if parakeet:
+            argv += ["--judge", "parakeet", "--parakeet-out", str(self.parakeet)]
+        if whisper:
+            argv += ["--whisper-dir", str(self.whisper)]
         if strict:
             argv.append("--strict-existing")
         if sources:
@@ -135,9 +128,9 @@ def world(tmp_path):
     return World(tmp_path)
 
 
-def test_parakeet_judge_reads_the_jsonl_by_id_and_never_loads_kotoba(world):
+def test_parakeet_judge_reads_the_jsonl_by_id(world):
     """galgame's hyp2 is Parakeet's hyp of the same id (the jsonl order may differ from the teacher's), model2 names
-    the guarded decode, and meta.json records the judge; kotoba (the autouse fake raises) is never constructed."""
+    the guarded decode, and meta.json records the judge, with the keys of the sealed root's meta.json in its order."""
     stem = world.shard("galgame", ["galgame/a", "galgame/b"], parakeet_ids=["galgame/b", "galgame/a"])
     assert world.run() == 0
     rows = world.rows("galgame", stem)
@@ -146,7 +139,7 @@ def test_parakeet_judge_reads_the_jsonl_by_id_and_never_loads_kotoba(world):
     assert all(r["agree"] is not None for r in rows)
     meta = json.loads((world.out / "meta.json").read_text(encoding="utf-8"))
     assert meta["judges"] == {"galgame": sb.PARAKEET_MODEL2} and meta["fallback"] == sb.FALLBACK_MODEL2
-    assert "gpu_model" not in meta
+    assert list(meta) == list(sb.META_KEYS)
 
 
 def test_eligibility_needs_both_npz(world):
@@ -251,7 +244,7 @@ def test_a_teacher_row_without_a_parakeet_row_exits_in_strict_mode(world):
 def test_meta_is_write_once_in_strict_mode(world):
     world.shard("galgame", ["galgame/a"])
     (world.out).mkdir(parents=True)
-    other = dict(join_model="whisper-large-v3 (precomputed)", judges={"galgame": sb.MODEL2})
+    other = dict(join_model="whisper-large-v3 (precomputed)", judges={"galgame": "kotoba-tech/kotoba-whisper-v2.0"})
     (world.out / "meta.json").write_text(json.dumps(other), encoding="utf-8")
     assert world.run() == sb.INTEGRITY_EXIT
     assert json.loads((world.out / "meta.json").read_text(encoding="utf-8")) == other
@@ -262,46 +255,20 @@ def test_meta_is_write_once_in_strict_mode(world):
     assert world.run() == 0 and (world.out / "meta.json").read_bytes() == written
 
 
-def test_the_laptop_path_is_unchanged_without_the_new_flags(world):
-    """Self-text sources need no model: the laptop command (no new flags) still writes them, and meta.json has the
-    kotoba keys and none of the box's."""
-    stem = world.shard("emilia_yodas", ["emilia_yodas/a"], parakeet=False)
-    assert world.run(judge="kotoba", strict=False) == 0
-    (row,) = world.rows("emilia_yodas", stem)
-    assert row["model2"] == sb.SELF_TEXT_SOURCES["emilia_yodas"]
+def test_a_source_without_its_input_is_refused_and_self_text_needs_none(world, capsys):
+    """Nothing streams a mirror or loads a model: a join source without --whisper-dir and a judged one without
+    --parakeet-out are refused (2) before anything is written; a self-text source needs neither, and its meta.json then
+    names no judge and no fallback."""
+    emilia = world.shard("emilia_yodas", ["emilia_yodas/a"], parakeet=False)
+    world.shard("reazon_large", ["reazon_large/n0"], meta=dict(input=LARGE_INPUT, step="reazon_large"))
+    world.shard("galgame", ["galgame/a"])
+    assert world.run(whisper=False, sources=["reazon_large", "emilia_yodas"]) == 2
+    assert "reazon_large: a join source needs --whisper-dir" in capsys.readouterr().err
+    assert world.run(parakeet=False, sources=["galgame", "emilia_yodas"]) == 2
+    assert "galgame: a judged source needs --parakeet-out" in capsys.readouterr().err
+    assert not world.out.exists()
+    assert world.run(parakeet=False, whisper=False, sources=["emilia_yodas"]) == 0
+    (row,) = world.rows("emilia_yodas", emilia)
+    assert (row["hyp2"], row["model2"]) == ("こんにちは", sb.SELF_TEXT_SOURCES["emilia_yodas"])  # the reference
     meta = json.loads((world.out / "meta.json").read_text(encoding="utf-8"))
-    assert meta["gpu_model"] == sb.MODEL2 and "judges" not in meta and "fallback" not in meta
-
-
-def test_judge_report_matches_the_kotoba_threshold(tmp_path):
-    """Synthetic judges: Parakeet's agree is kotoba's halved, so the Parakeet threshold that drops kotoba@0.5's hours
-    is the one just below 0.25's worth; the 2x2 table, Spearman (1.0 for a monotone map) and the teacher CER of kept
-    vs dropped rows follow from the same rows."""
-    kdir, pdir, tdir = tmp_path / "k", tmp_path / "p", tmp_path / "t"
-    rng = np.random.default_rng(0)
-    for s in range(3):
-        stem = f"train-{s:05d}"
-        ids = [f"galgame/{s}_{i}" for i in range(20)]
-        ka = rng.uniform(0, 1.2, len(ids)).round(4)
-        for d, rows in ((kdir, [dict(id=i, hyp2="x", model2="kotoba", agree=float(a), cer2=0.1) for i, a in zip(ids, ka)]),
-                        (pdir, [dict(id=i, hyp2="y", model2="parakeet", agree=float(a) / 2, cer2=0.1)
-                                for i, a in zip(ids, ka)]),
-                        (tdir, [dict(id=i, hyp="h", ref="r", cer=float(a), duration=3600.0) for i, a in zip(ids, ka)])):
-            d.mkdir(exist_ok=True)
-            (d / f"{stem}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-    (kdir / "train-00099.jsonl").write_text("", encoding="utf-8")  # a stem only one judge has: ignored
-
-    out = tmp_path / "reports" / "galgame_judge.json"
-    assert judge_report.main(["--kotoba", str(kdir), "--parakeet", str(pdir), "--teacher", str(tdir),
-                              "--out", str(out)]) == 0
-    rep = json.loads(out.read_text(encoding="utf-8"))
-    assert (rep["stems"], rep["rows"], rep["hours"]) == (3, 60, 60.0)
-    assert rep["matched"]["dropped_hours"] == rep["reference"]["dropped_hours"] == rep["dropped_hours"]["kotoba"]["0.5"]
-    assert rep["matched"]["threshold"] <= 0.25 and rep["dropped_hours"]["parakeet"]["0.5"] < rep["reference"]["dropped_hours"]
-    assert rep["spearman"] == 1.0
-    t = rep["table"]
-    assert t["kotoba_dropped/parakeet_kept"]["rows"] > 0 and t["kotoba_kept/parakeet_dropped"]["rows"] == 0
-    assert sum(v["rows"] for v in t.values()) == 60
-    for j in ("kotoba", "parakeet"):
-        assert rep["teacher_cer"][j]["kept"] < rep["teacher_cer"][j]["dropped"]
-    assert set(rep["dropped_hours"]["kotoba"]) == {"0.2", "0.3", "0.4", "0.5", "0.7"}
+    assert "judges" not in meta and "fallback" not in meta

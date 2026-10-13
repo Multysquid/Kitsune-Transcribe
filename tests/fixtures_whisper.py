@@ -92,14 +92,17 @@ def tiny_whisper_dir(d, seed: int = 0, *, n_mels: int = 128) -> Path:
     return d
 
 
-def pending_prereg(path) -> Path:
-    """PREREG.json with the rules only (the manifest block pending): the toy manifests below are not the study's, so
-    05's manifest check against the committed (filled) PREREG.json would refuse them."""
-    from kitsune import prereg
+# study/PREREG.json's blocks 05 and kitsune.evaluate read, as they stood before the labels were sealed: pending, so
+# nothing is compared with them
+PENDING_PREREG = {"manifest": {"status": "pending"}, "baselines": {"status": "pending"}}
 
+
+def pending_prereg(path) -> Path:
+    """A PREREG.json whose manifest and baselines blocks are pending: the toy manifests and teachers of the tests are
+    not the study's, so 05's checks against the committed (filled) study/PREREG.json would refuse them."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(prereg.rules_json(prereg.rules()))
+    path.write_text(json.dumps(PENDING_PREREG, indent=1), encoding="utf-8")
     return path
 
 

@@ -146,7 +146,7 @@ def run(st, frozen: Frozen, d: Path, cfg: dict | None = None, *extra, video_rows
     """make_selection.py's real CLI in full mode: the config file in d, the label root, the toy manifest."""
     cfg = cfg or full_cfg()
     d.mkdir(parents=True, exist_ok=True)
-    cfg_p = d / "data-full.json"
+    cfg_p = d / "data.json"
     cfg_p.write_text(json.dumps(cfg), encoding="utf-8")
     out = out or d / cfg["selection"]
     argv = ["--config", str(cfg_p), "--labels-root", str(labels_root or st.fc.root), "--out", str(out),
@@ -190,7 +190,7 @@ def frozen(st, tmp_path_factory) -> Frozen:
 
 @pytest.fixture(scope="module")
 def built(st, frozen, tmp_path_factory) -> Built:
-    return build(st, frozen, tmp_path_factory.mktemp("full"), None, "--study-selection", str(frozen.parquet))
+    return build(st, frozen, tmp_path_factory.mktemp("full"))
 
 
 @pytest.fixture(scope="module")

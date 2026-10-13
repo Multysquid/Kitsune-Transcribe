@@ -1,5 +1,5 @@
-"""vast/bootstrap.sh in extent mode: the A100 pulls exactly a config's extent of the label box's labels, rebuilds its
-audio with `01 --extent-config` and checks the join exactly (plan §12.2, §3.5). The viability path is unchanged.
+"""vast/bootstrap.sh: a full box pulls exactly a config's extent of the label box's labels, rebuilds its audio with
+`01 --extent-config` and checks the join exactly (plan §12.2, §3.5); a config without an extent is refused.
 
 CPU only, no network: huggingface_hub is replaced by a stub that serves a fake data repo from a local directory (the
 real filter_repo_objects matcher is loaded from the installed package, as snapshot_download filters with it); the
@@ -44,8 +44,8 @@ def helper_source() -> str:
 
 
 def make_cfg(inputs: dict | None = None, extent: bool = True) -> dict:
-    """A small extent config shaped like configs/full_sub3k.json: galgame (train and hold-out, capped) and a gate
-    set."""
+    """A small extent config, a capped subset of configs/full.json's extent: galgame (train and hold-out, capped) and
+    a gate set."""
     cfg = {"run_name": "sub", "student": STUDENT, "data_root": "data",
            "teacher_root": f"{LR}/teacher_out", "second_root": f"{LR}/second_out",
            "parakeet_root": f"{LR}/parakeet_out", "selection": f"{LR}/selections/sub.parquet",
@@ -210,7 +210,7 @@ def test_extent_plan_pulls_exactly_the_subset_files(box):
     r = box.helper("plan")
     assert r.returncode == 0, r.stdout + r.stderr
     plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
-    assert plan["extent"] is True and plan["parked"] == [] and plan["rebuild"] == ["galgame", "eval_jsut"]
+    assert plan["extent"] is True and plan["rebuild"] == ["galgame", "eval_jsut"] and "parked" not in plan
     assert plan["revision"] == "0123abc" and Path(plan["record"]).is_file()
     calls = box.calls()
     assert calls == [["hf_hub_download", f"{LR}/extent.json", "dataset", "0123abc"]], "the record at the pinned rev"
@@ -242,8 +242,8 @@ def test_extent_plan_pulls_exactly_the_subset_files(box):
 
 def test_extent_plan_refuses_an_unsealed_root_or_missing_files(box):
     """Only a sealed label root is consumed: without COMPLETE.json (or extent.json) the plan refuses with exit 3,
-    which bootstrap's retry() does not repeat, before downloading anything. A subset stem, a second opinion or a
-    student file the repo lacks is refused the same way."""
+    which bootstrap's retry() does not repeat, before downloading anything. A subset stem or a second opinion the repo
+    lacks is refused the same way (a full box's student files: test_full_plan_pulls_the_registrys_students_...)."""
     box.config(make_cfg())
     for gone in ("COMPLETE.json", "extent.json"):
         (box.remote_dir / LR / gone).rename(box.remote_dir / f"{gone}.away")
@@ -252,7 +252,7 @@ def test_extent_plan_refuses_an_unsealed_root_or_missing_files(box):
         assert f"lacks ['{LR}/{gone}']" in r.stderr and "has not sealed" in r.stderr
         assert not (box.state_dir / "bootstrap_plan.json").exists() and box.calls() == []
         (box.remote_dir / f"{gone}.away").rename(box.remote_dir / LR / gone)
-    for gone in (f"{LR}/second_out/galgame/train-00000.jsonl", f"{STUDENT}/tokenizer.json"):
+    for gone in (f"{LR}/second_out/galgame/train-00000.jsonl", f"{LR}/teacher_out/eval_jsut/eval-00000.npz"):
         (box.remote_dir / gone).unlink()
         r = box.helper("plan")
         assert r.returncode == 3 and "cannot serve extent 'sub'" in r.stderr, r.stdout + r.stderr
@@ -271,23 +271,17 @@ def test_extent_plan_refuses_an_unsealed_root_or_missing_files(box):
     assert r.returncode == 3 and "extent.inputs.galgame" in r.stderr, r.stdout + r.stderr
 
 
-def test_the_viability_plan_is_unchanged(box):
-    """A config without an extent takes the legacy path: no record download, no extent keys in the plan, and the pull
-    uses snapshot_download alone."""
+def test_a_config_without_an_extent_is_refused(box):
+    """A full box rebuilds the label box's sealed extent: a config without an `extent` is refused (exit 3, not retried)
+    after the token checks, before anything is downloaded."""
     box.config(make_cfg(extent=False))
     for f in ["teacher_out/meta.json", "second_out/meta.json", "teacher_out/galgame/train-00000.npz",
-              "teacher_out/galgame/eval-00000.npz", "teacher_out/eval_jsut/eval-00000.npz",
-              "second_out/galgame/train-00000.jsonl", "second_out/galgame/eval-00000.jsonl"]:
+              "second_out/galgame/train-00000.jsonl"]:
         (box.remote_dir / f).parent.mkdir(parents=True, exist_ok=True)
         (box.remote_dir / f).write_bytes(b"x")
     r = box.helper("plan")
-    assert r.returncode == 0, r.stdout + r.stderr
-    plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
-    assert not {"extent", "explicit", "record"} & set(plan) and plan["rebuild"] == ["galgame", "eval_jsut"]
-    assert box.calls() == []
-    assert box.helper("pull").returncode == 0
-    assert [c[0] for c in box.calls()] == ["snapshot_download"]
-    assert not any(f.startswith("labels/") for f in box.on_disk())
+    assert r.returncode == 3 and "configs/c.json has no extent" in r.stderr and "(not retried)" in r.stderr, r.stderr
+    assert not (box.state_dir / "bootstrap_plan.json").exists() and box.calls() == []
 
 
 def write_rebuilt(kdir: Path, rows: dict):
@@ -308,16 +302,15 @@ def write_teacher(kdir: Path, stems: dict):
 
 
 def test_extent_coverage_is_exact(box):
-    """In extent mode every pulled stem's rebuilt ids must hash to the record's ids_sha256 and hold its teacher ids,
-    and every split must join at 1.0 whatever KITSUNE_MIN_COVERAGE says: the rebuild replays the label box's ingest,
-    so anything less is another extent (an upstream that changed, another canonical sequence) and would train on
-    rows the trainer silently drops."""
+    """Every pulled stem's rebuilt ids must hash to the record's ids_sha256 and hold its teacher ids, and every split
+    must join at 1.0: the rebuild replays the label box's ingest, so anything less is another extent (an upstream that
+    changed, another canonical sequence) and would train on rows the trainer silently drops."""
     box.config(make_cfg())
     assert box.helper("plan").returncode == 0
     subset = {k: v for k, v in ROWS.items() if k != ("galgame", "train-00001")}  # the capped subset: tar 0 only
     write_rebuilt(box.root, ROWS)  # 01 --extent-config rebuilt tar 0 of galgame (and more) plus eval_jsut
     write_teacher(box.root, {k: v[:-1] if k[1] == "train-00000" else v for k, v in subset.items()})  # a skipped row
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode == 0, r.stdout + r.stderr
     report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
     assert report["extent_stems"] == {"checked": 3, "failed": 0, "failures": []}
@@ -327,73 +320,86 @@ def test_extent_coverage_is_exact(box):
     rec = make_record({**ROWS, ("galgame", "eval-00000"): ["galgame/e0_1", "galgame/e0_0"]})
     plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
     Path(plan["record"]).write_text(json.dumps(rec), encoding="utf-8")
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "galgame/eval-00000: rebuilt ids_sha256" in r.stdout, r.stdout + r.stderr
     assert "1 extent stem(s)" in r.stderr and "coverage below 1.0" in r.stderr
     Path(plan["record"]).write_text(json.dumps(make_record()), encoding="utf-8")
 
     # a teacher id the rebuilt stem lacks: refused per stem, and the split's join is below the exact floor
     write_teacher(box.root, {("eval_jsut", "eval-00000"): ROWS[("eval_jsut", "eval-00000")] + ["eval_jsut/X"]})
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "eval_jsut/eval-00000: 1 teacher ids not in the rebuilt stem" in r.stdout
-    assert "eval_jsut/eval" in r.stderr, "0.667 joined passes the env floor but not the extent's 1.0"
+    assert "eval_jsut/eval" in r.stderr, "0.667 joined: below the exact floor"
     write_teacher(box.root, {("eval_jsut", "eval-00000"): ROWS[("eval_jsut", "eval-00000")]})
 
     # a pulled stem 01 never rebuilt
     lines = (box.root / "data" / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
     (box.root / "data" / "manifest.jsonl").write_text(
         "".join(ln + "\n" for ln in lines if "galgame/train-00000" not in ln), encoding="utf-8")
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "galgame/train-00000: not rebuilt" in r.stdout, r.stdout + r.stderr
 
 
-def test_the_legacy_rebuild_line_stays_first_and_the_helper_is_the_first_heredoc():
-    """The regexes of tests/test_infra.py find the first `phase rebuild_audio` line and the first heredoc: the legacy
-    rebuild stays first and literally unchanged, the extent line comes after it, and the helper stays the first
-    heredoc."""
+def test_extent_coverage_is_held_per_split(box):
+    """The trainer joins a split's label ids only against that split's audio shards (<split>-*.parquet). Pooled over
+    a source's splits, galgame's 1,000-row hold-out is 0.5 % of its ids: all of it moved into a train shard (by a
+    rebuild that split the rows differently) once passed the pooled check, and the eval store then dropped the hold-out
+    with one printed line. Every split is held to 1.0 on its own, here while every stem's id sidecar still matches the
+    record."""
+    box.config(make_cfg())
+    assert box.helper("plan").returncode == 0
+    write_rebuilt(box.root, ROWS)
+    write_teacher(box.root, {k: v for k, v in ROWS.items() if k != ("galgame", "train-00001")})
+    shards = box.root / "data" / "shards" / "galgame"
+    (shards / "eval-00000.parquet").rename(shards / "train-00009.parquet")  # the hold-out's audio in a train shard
+    r = box.helper("coverage")
+    assert r.returncode != 0 and "coverage below 1.0 for ['galgame/eval']" in r.stderr, r.stdout + r.stderr
+    report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
+    assert report["extent_stems"]["failed"] == 0, "the id sidecars still match the record"
+    assert report["galgame/train"]["coverage"] == 1.0 and report["galgame/eval"]["joined"] == 0
+    (shards / "train-00009.parquet").rename(shards / "eval-00000.parquet")
+    r = box.helper("coverage")
+    assert r.returncode == 0, r.stdout + r.stderr
+    report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
+    assert {"galgame/train", "galgame/eval", "eval_jsut/eval"} <= set(report)
+    assert report["galgame/eval"]["coverage"] == 1.0
+
+
+def test_the_rebuild_line_and_the_helper_is_the_first_heredoc():
+    """The regexes of tests/test_infra.py find the first heredoc: the helper stays it. One rebuild line, `01
+    --extent-config $CONFIG` under KITSUNE_REBUILD_TIMEOUT_MIN (the header documents it); KITSUNE_PREP_ARGS and the
+    `--sources` rebuild of a config without an extent are gone."""
     text = BOOTSTRAP.read_text(encoding="utf-8")
     assert helper_source().startswith('"""bootstrap helper: plan / pull / coverage.')
     lines = [ln.strip() for ln in text.splitlines() if ln.lstrip().startswith("phase rebuild_audio")]
-    assert len(lines) == 2
-    assert lines[0] == ('phase rebuild_audio retry 3 timeout -k 60 60m "$PY" scripts/01_prepare_data.py --data '
-                        '"$KITSUNE_DIR/$DATA_ROOT" \\')
-    assert re.search(r"phase rebuild_audio retry \d+ timeout -k \d+ \d+m \"\$PY\" scripts/01_prepare_data\.py",
-                     lines[0])
-    assert lines[1] == 'phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \\'
-    assert '--sources "${REBUILD[@]}" "${PREP_ARGS[@]}"' in text
+    assert lines == ['phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \\']
     assert 'scripts/01_prepare_data.py --data "$KITSUNE_DIR/$DATA_ROOT" --extent-config "$CONFIG"' in text
     assert "KITSUNE_REBUILD_TIMEOUT_MIN" in text.split("set -euo pipefail", 1)[0], "the header documents it"
+    assert "KITSUNE_PREP_ARGS" not in text and "--sources" not in text
     assert b"\r\n" not in BOOTSTRAP.read_bytes()
 
 
-@pytest.mark.parametrize("extent", [False, True])
-def test_the_rebuild_dispatch(tmp_path, extent):
-    """The shell picks the rebuild from the plan: the legacy `--sources` call with KITSUNE_PREP_ARGS, or in extent mode
-    `01 --extent-config $CONFIG` under KITSUNE_REBUILD_TIMEOUT_MIN, with KITSUNE_PREP_ARGS ignored (and logged)."""
+def test_the_rebuild_runs_01_on_the_extent_under_its_timeout(tmp_path):
+    """The shell rebuilds the audio with `01 --extent-config $CONFIG` under KITSUNE_REBUILD_TIMEOUT_MIN (launch.py sizes
+    it; the download gate may raise it), into the plan's data root."""
     bash = find_bash()
     if bash is None:
         pytest.skip("bash not available")
     text = BOOTSTRAP.read_text(encoding="utf-8")
-    block = re.search(r"^EXTENT=.*?^fi\n", text, re.M | re.S).group(0)
-    plan = dict(rebuild=["galgame", "eval_jsut"], data_root="data", **({"extent": True} if extent else {}))
-    (tmp_path / "bootstrap_plan.json").write_text(json.dumps(plan), encoding="utf-8")
-    script = tmp_path / "dispatch.sh"
+    block = re.search(r"^DATA_ROOT=.*?--extent-config \"\$CONFIG\"\n", text, re.M | re.S).group(0)
+    (tmp_path / "bootstrap_plan.json").write_text(json.dumps(dict(rebuild=["galgame"], data_root="data")),
+                                                  encoding="utf-8")
+    script = tmp_path / "rebuild.sh"
     script.write_text("\n".join([
         "set -euo pipefail", "log() { printf 'LOG %s\\n' \"$*\"; }", "phase() { printf 'PHASE %s\\n' \"$*\"; }",
-        f'PY="{Path(sys.executable).as_posix()}"', f'STATE="{tmp_path.as_posix()}"', 'KITSUNE_DIR=/k', "DATA_ROOT=data",
-        "CONFIG=configs/sub.json", "REBUILD=(galgame eval_jsut)", block, ""]), encoding="utf-8", newline="\n")
-    env = dict(os.environ, KITSUNE_PREP_ARGS="--galgame-shards 8", KITSUNE_REBUILD_TIMEOUT_MIN="95")
-    r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
+        f'PY="{Path(sys.executable).as_posix()}"', f'STATE="{tmp_path.as_posix()}"', 'KITSUNE_DIR=/k',
+        "CONFIG=configs/sub.json", block, ""]), encoding="utf-8", newline="\n")
+    r = subprocess.run([bash, str(script)], capture_output=True, text=True,
+                       env=dict(os.environ, KITSUNE_REBUILD_TIMEOUT_MIN="95"), timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     (phase,) = [ln for ln in r.stdout.splitlines() if ln.startswith("PHASE")]
-    if extent:
-        assert phase == ("PHASE rebuild_audio retry 3 timeout -k 60 95m " + Path(sys.executable).as_posix()
-                         + " scripts/01_prepare_data.py --data /k/data --extent-config configs/sub.json")
-        assert "LOG KITSUNE_PREP_ARGS ignored: the config's extent defines the rebuild" in r.stdout
-    else:
-        assert phase.endswith("scripts/01_prepare_data.py --data /k/data --sources galgame eval_jsut "
-                              "--galgame-shards 8") and " 60m " in phase
-        assert "ignored" not in r.stdout
+    assert phase == ("PHASE rebuild_audio retry 3 timeout -k 60 95m " + Path(sys.executable).as_posix()
+                     + " scripts/01_prepare_data.py --data /k/data --extent-config configs/sub.json")
 
 
 # ======================================================================================= full-data boxes (WP3)
@@ -470,7 +476,7 @@ def test_ctc_only_extent_plan_and_coverage_read_the_parakeet_ids(box):
     write_rebuilt(box.root, ROWS)
     write_teacher(box.root, {k: v for k, v in subset.items() if k[1].startswith("eval-")})  # no train npz at all
     write_parakeet(box.root, subset)
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.99")
+    r = box.helper("coverage")
     assert r.returncode == 0, r.stdout + r.stderr
     report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
     assert report["extent_stems"] == {"checked": 3, "failed": 0, "failures": []}
@@ -480,11 +486,11 @@ def test_ctc_only_extent_plan_and_coverage_read_the_parakeet_ids(box):
     assert re.search(r"galgame/train +parakeet ", r.stdout), r.stdout
     # a Parakeet id the rebuilt stem lacks is refused per stem, like a teacher id
     write_parakeet(box.root, {("galgame", "train-00000"): ROWS[("galgame", "train-00000")] + ["galgame/X"]})
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "galgame/train-00000: 1 parakeet ids not in the rebuilt stem" in r.stdout
     # a stem whose labels are not on disk is a failure, not a crash
     (box.root / LR / "parakeet_out" / "galgame" / "train-00000.npz").unlink()
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.5")
+    r = box.helper("coverage")
     assert r.returncode != 0 and "galgame/train-00000: no parakeet labels" in r.stdout, r.stdout + r.stderr
     assert "Traceback" not in r.stderr
 
@@ -499,7 +505,7 @@ def test_both_roots_and_aed_coverage_read_teacher_ids_as_before(box, cfg):
     write_rebuilt(box.root, ROWS)
     write_teacher(box.root, subset)
     write_parakeet(box.root, {k: v + ["not/rebuilt"] for k, v in subset.items()})
-    r = box.helper("coverage", KITSUNE_MIN_COVERAGE="0.99")
+    r = box.helper("coverage")
     assert r.returncode == 0, r.stdout + r.stderr
     report = json.loads((box.state_dir / "bootstrap_coverage.json").read_text(encoding="utf-8"))
     assert all("root" not in v for k, v in report.items() if k != "extent_stems")
@@ -582,10 +588,13 @@ def test_full_plan_pulls_the_registrys_students_and_extra_files_and_the_labels_a
     assert r.returncode == 0, r.stdout + r.stderr
     assert box.on_disk() == derived | labels
     assert "pulled the labels" in r.stdout
-    # a missing extra file refuses the plan (exit 3), as a missing student file does
-    (box.remote_dir / SIDECAR).unlink()
-    r = box.helper("plan", **env)
-    assert r.returncode == 3 and f"no {SIDECAR}" in r.stderr, r.stdout + r.stderr
+    # a missing extra file refuses the plan (exit 3), and so does a missing file of a registry student
+    for gone in (SIDECAR, f"{P01_STUDENT}/tokenizer.json", f"{P01_STUDENT}/MODEL_CARD.md"):
+        data = (box.remote_dir / gone).read_bytes()
+        (box.remote_dir / gone).unlink()
+        r = box.helper("plan", **env)
+        assert r.returncode == 3 and f"no {gone}" in r.stderr, r.stdout + r.stderr
+        (box.remote_dir / gone).write_bytes(data)
 
 
 def test_full_plan_checks_the_scratch_repo_with_the_box_token(box):
@@ -623,31 +632,28 @@ def test_full_plan_refuses_a_registry_it_cannot_load(box):
 
 
 def test_the_full_phases_are_new_lines_and_the_shared_lines_stay_byte_identical():
-    """Job full reuses the plan, pull_derived, both rebuild and the coverage lines exactly as they were; its own phases
-    are separate lines in `if [ "${KITSUNE_JOB:-}" = "full" ]` blocks, in the contract's order, and the full
-    check_students comes after the study one."""
+    """Job full reuses the plan, pull_derived, rebuild and coverage lines exactly as they were; its own phases are
+    separate lines, in the contract's order (the gate only with KITSUNE_GATE_BYTES, resume_pull only on a resume)."""
     text = BOOTSTRAP.read_text(encoding="utf-8")
     shared = ['phase plan retry 3 timeout -k 30 10m "$PY" "$HELPER" plan',
               'phase pull_derived retry 3 timeout -k 30 30m "$PY" "$HELPER" pull',
-              'phase rebuild_audio retry 3 timeout -k 60 60m "$PY" scripts/01_prepare_data.py --data '
-              '"$KITSUNE_DIR/$DATA_ROOT" \\',
               'phase rebuild_audio retry 3 timeout -k 60 "${KITSUNE_REBUILD_TIMEOUT_MIN:-60}m" "$PY" \\',
               'phase coverage "$PY" "$HELPER" coverage']
     lines = [ln.strip() for ln in text.splitlines()]
     for s in shared:
         assert lines.count(s) == 1, s
-    for prefix in ("phase plan", "phase pull_derived", "phase rebuild_audio", "phase coverage"):
-        assert len([ln for ln in lines if ln.startswith(prefix)]) == (2 if prefix == "phase rebuild_audio" else 1)
-    order = ["phase download_gate", "phase plan ", "phase pull_derived", "phase check_students \"$PY\" -m "
-             "kitsune.study_queue", "phase resume_pull", "phase check_students \"$PY\" -m kitsune.fullrun",
-             "phase pull_labels retry", "phase rebuild_audio", "phase pull_labels_wait", "phase coverage"]
+    for prefix in ("phase plan", "phase pull_derived", "phase rebuild_audio", "phase coverage", "phase check_students"):
+        assert len([ln for ln in lines if ln.startswith(prefix)]) == 1, prefix
+    order = ["phase download_gate", "phase plan ", "phase pull_derived", "phase resume_pull",
+             "phase check_students \"$PY\" -m kitsune.fullrun", "phase pull_labels retry", "phase rebuild_audio",
+             "phase pull_labels_wait", "phase coverage"]
     at = [text.index(o) for o in order]
     assert at == sorted(at), [o for o, _ in sorted(zip(order, at), key=lambda x: x[1])]
     body = text.split("PYEOF\n")[-1]
-    for name in ("download_gate", "resume_pull", "check_students \"$PY\" -m kitsune.fullrun", "pull_labels retry",
-                 "pull_labels_wait"):
+    for name, cond in (("download_gate", 'if [ -n "${KITSUNE_GATE_BYTES:-}" ]; then'),
+                       ("resume_pull", 'if [ "${KITSUNE_RESUME:-}" = 1 ] ||')):
         i = body.index(f"phase {name}")
-        assert 'if [ "${KITSUNE_JOB:-}" = "full" ]' in body[max(0, body.rfind("\nif ", 0, i)):i], name
+        assert body[body.rfind("\nif ", 0, i) + 1:].startswith(cond), name
     assert 'retry 3 timeout -k 30 "${KITSUNE_PULL_TIMEOUT_MIN:-30}m" "$PY" "$HELPER" pull_labels &' in text
     assert 'retry 3 timeout -k 30 60m "$PY" -m kitsune.full_queue resume-pull --box "$KITSUNE_BOX"' in text
     assert 'retry 2 timeout -k 30 30m "$PY" -m kitsune.netgate --out "$STATE/download_gate.json"' in text
@@ -675,8 +681,8 @@ case "$*" in
                                  exit "${FAKE_REBUILD_RC:-0}" ;;
 esac
 case "${2:-}" in
-    plan) printf '{"data_root": "data", "rebuild": ["galgame"], "extent": %s}\n' "${FAKE_EXTENT:-true}" \
-              > "$STATE/bootstrap_plan.json"; exit 0 ;;
+    plan) printf '{"data_root": "data", "rebuild": ["galgame"], "extent": true}\n' > "$STATE/bootstrap_plan.json"
+          exit 0 ;;
     pull) exit 0 ;;
     pull_labels) echo $$ > "$STATE/labels_pid"; command sleep "${FAKE_LABELS_S:-1}"
                  [ "${FAKE_LABELS_RC:-0}" = 0 ] && touch "$STATE/labels_done"; exit "${FAKE_LABELS_RC:-0}" ;;
@@ -810,7 +816,7 @@ def test_each_phase_keeps_train_hb_fresh_for_its_own_worst_case(tmp_path):
     assert got["rebuild_audio"] == budget_s(3, 481) == 87540 > 43200 and got["pull_labels"] == budget_s(3, 77)
     assert got["plan"] == got["coverage"] == 600  # the default is the operator's to set
     r, _, _ = run_bootstrap(tmp_path / "short", FAKE_TIMEOUTS="30 45")
-    assert hb_bounds(r.stdout)["rebuild_audio"] == budget_s(3, 60), "never below the non-extent line's 60 min"
+    assert hb_bounds(r.stdout)["rebuild_audio"] == budget_s(3, 60), "never below the rebuild line's 60 min default"
 
 
 def test_a_failed_bootstrap_stops_the_background_label_pull_and_its_toucher(tmp_path):
@@ -854,114 +860,20 @@ def test_a_toucher_stops_at_its_bound(tmp_path):
     assert 1.0 < time.monotonic() - t0 < 30 and (tmp_path / "train_hb").exists()  # date +%s: whole seconds
 
 
-def test_other_jobs_run_no_full_phase(tmp_path):
-    """Without KITSUNE_JOB=full nothing of the above runs, whatever gate env is set: no gate, no train_hb, no label
-    pull; the plan, pull, rebuild and coverage as before."""
-    r, calls, state = run_bootstrap(tmp_path, KITSUNE_JOB=None, KITSUNE_RESUME="1")
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert [c.split(" ")[0] + " " + c.split(" ")[1] for c in calls] == [
-        "HELPER plan", "HELPER pull", "scripts/01_prepare_data.py --data", "HELPER coverage"], calls
-    assert not (state / "train_hb").exists()
+def test_bootstrap_refuses_any_job_but_full(tmp_path):
+    """bootstrap prepares a full-data box only, as onstart.sh, supervise.py and finish.py run one (the label box runs no
+    bootstrap): without KITSUNE_JOB=full, or without its KITSUNE_BOX, it exits 2 before any phase, whatever gate or
+    resume env is set; no train_hb, no timings."""
+    for env, says in ((dict(KITSUNE_JOB=None), "KITSUNE_JOB is '', not full"),
+                      (dict(KITSUNE_JOB="train"), "KITSUNE_JOB is 'train', not full"),
+                      (dict(KITSUNE_BOX=None), "KITSUNE_BOX is not set")):
+        r, calls, state = run_bootstrap(tmp_path, KITSUNE_RESUME="1", **env)
+        assert r.returncode == 2 and says in r.stdout, (env, r.stdout + r.stderr)
+        assert calls == [] and not (state / "train_hb").exists(), (env, calls)
+        assert not (state / "bootstrap_timings.jsonl").exists()
 
 
-# ------------------------------------------------------------------------------------- a chain box (addendum E)
-
-P03_STUDENT = "students/study/p03"
-SB_SELECTION = f"{LR}/selections/sb.parquet"  # smoke-b's own (study) selection, next to stage 1's rebuild
-
-
-def chain_box(box) -> dict:
-    """A chain p01-chain on the toy extent, written into the box's checkout: stage 1 = full-smoke (a CTC train item,
-    student p03; its data config the capped extent, both label roots: the rebuild) + smoke-b (its own study selection
-    on the same extent: its selection files join stage 1's pull); stage 2 = p01 (student p01) on the uncapped extent.
-    The remote gains every student, extra file and dir."""
-    from kitsune import fullrun
-
-    stub = box.root.parent / "stub" / "huggingface_hub" / "__init__.py"
-    stub.write_text(FULL_STUB, encoding="utf-8")
-    folder = box.root / "configs" / "full"
-    folder.mkdir(parents=True, exist_ok=True)
-    base = {k: v for k, v in make_cfg().items() if k not in ("student", "run_name")}
-    s1 = dict(base, pull_parakeet=True)
-    sb = dict(s1, selection=SB_SELECTION, selection_recipe=dict(base["selection_recipe"], study={"draw_audio_s": 1}))
-    s2 = dict({k: v for k, v in make_cfg(inputs={}).items() if k not in ("student", "run_name")}, family="ctc",
-              selection=f"{LR}/selections/full.parquet")
-    configs = {"data-s1": s1, "data-sb": sb, "data-s2": s2,
-               "smoke-p03": dict(s1, run_name="smoke-p03", family="ctc", student=P03_STUDENT),
-               "sb-eval": dict(sb, run_name="sb-eval", student=P03_STUDENT),
-               "full-p01": dict(s2, run_name="full-p01", student=P01_STUDENT)}
-    for name, cfg in configs.items():
-        (folder / f"{name}.json").write_text(json.dumps(cfg), encoding="utf-8")
-
-    def box_of(dc, items, **kw):
-        return dict({"gpus": 1, "data_config": f"configs/full/{dc}.json", "est_hours": 1.0, "max_hours": 9,
-                     "max_dph": 1.0, "deadline_reserve_min": 20, "watchdog": {"orphan_s": 3600, "action": "stop"},
-                     "timed_states": False, "items": items}, **kw)
-
-    reg = {"version": 1, "boxes": {
-        "full-smoke": box_of("data-s1", [{"name": "smoke-p03", "kind": "train", "config": "configs/full/smoke-p03.json",
-                                          "study_run": "study-p03", "family": "ctc", "max_hours": 0.75}],
-                             smoke=True, watchdog={"orphan_s": 600, "action": "alert"},
-                             extra_files=[SIDECAR, MANIFEST]),
-        "smoke-b": box_of("data-sb", [{"name": "stores-eval", "kind": "stores", "config": "configs/full/sb-eval.json",
-                                       "eval_only": True}], smoke=True, gate=False, max_hours=3,
-                          extra_dirs=[PARAKEET_MODEL]),
-        "p01": box_of("data-s2", [{"name": "full-p01", "kind": "train", "config": "configs/full/full-p01.json",
-                                   "study_run": "study-p01", "family": "ctc", "max_hours": 13.56}],
-                      est_hours=19.5, max_hours=22, extra_files=[MANIFEST]),
-        "p01-chain": {"est_hours": 25.2, "max_hours": 35, "max_dph": 1.0, "extra_gb": 120, "chain": [
-            {"parts": ["full-smoke", "smoke-b"], "gate_box": "full-smoke", "max_hours": 10.5},
-            {"parts": ["p01"]}]}}}
-    (folder / "boxes.json").write_text(json.dumps(reg), encoding="utf-8")
-    fullrun.load_registry(reg, root=box.root)  # a valid chain (the file rules included)
-    for f in [*(f"{s}/{n}" for s in (P01_STUDENT, P03_STUDENT) for n in (*STUDENT_FILES, "MODEL_CARD.md")), SIDECAR,
-              MANIFEST, SB_SELECTION, f"{LR}/selections/sb.json", f"{PARAKEET_MODEL}/config.json"]:
-        (box.remote_dir / f).parent.mkdir(parents=True, exist_ok=True)
-        (box.remote_dir / f).write_bytes(b"x")
-    return dict(KITSUNE_JOB="full", KITSUNE_BOX="p01-chain", KITSUNE_FULL_REGISTRY="", KITSUNE_SCRATCH_REPO="")
-
-
-def test_a_chains_plan_serves_its_stage(box):
-    """KITSUNE_BOX=p01-chain: stage 1 pulls both selections (its rebuild's and smoke-b's study selection with its
-    sidecar and manifest) and stage 1's students only; stage 2 box 1's student and the uncapped extent's labels; a
-    KITSUNE_CONFIG that is not the stage's rebuild is refused (exit 3, not retried)."""
-    env = chain_box(box)
-    r = box.helper("plan", **env, KITSUNE_CHAIN_STAGE="1", CONFIG="configs/full/data-s1.json")
-    assert r.returncode == 0, r.stdout + r.stderr
-    plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
-    files = set(plan["files"])
-    assert {f"{LR}/selections/sub.parquet", SB_SELECTION, f"{LR}/selections/sb.json", SIDECAR, MANIFEST} <= files
-    assert {f"{P03_STUDENT}/{n}" for n in (*STUDENT_FILES, "MODEL_CARD.md")} <= files
-    assert not any(f.startswith(P01_STUDENT) for f in files), "box 1's student is stage 2's"
-    assert f"{PARAKEET_MODEL}/config.json" in files and plan["rebuild"] == ["galgame", "eval_jsut"]
-    stage1_labels = set(plan["labels"]["files"])
-    assert f"{LR}/parakeet_out/galgame/train-00001.npz" not in stage1_labels, "stage 1: the capped extent"
-    r = box.helper("plan", **env, KITSUNE_CHAIN_STAGE="2", CONFIG="configs/full/data-s2.json")
-    assert r.returncode == 0, r.stdout + r.stderr
-    plan = json.loads((box.state_dir / "bootstrap_plan.json").read_text(encoding="utf-8"))
-    files = set(plan["files"])
-    assert {f"{P01_STUDENT}/{n}" for n in (*STUDENT_FILES, "MODEL_CARD.md")} <= files
-    assert not any(f.startswith(P03_STUDENT) for f in files) and SB_SELECTION not in files
-    assert f"{LR}/parakeet_out/galgame/train-00001.npz" in plan["labels"]["files"], "stage 2: the uncapped extent"
-    for stage, config in (("2", "configs/full/data-s1.json"), ("1", "configs/full/data-s2.json")):
-        r = box.helper("plan", **env, KITSUNE_CHAIN_STAGE=stage, CONFIG=config)
-        assert r.returncode == 3 and f"chain stage {stage} rebuilds" in r.stderr and "(not retried)" in r.stderr, (
-            stage, r.stdout + r.stderr)
-
-
-def test_a_chains_phase_timings_carry_its_stage(tmp_path):
-    """bootstrap_timings.jsonl: every phase of a chain stage carries "stage" (the controller's stage-2 bootstrap
-    appends to the boot's file); no other box's records change."""
-    r, calls, state = run_bootstrap(tmp_path, KITSUNE_CHAIN_STAGE="2")
-    assert r.returncode == 0, r.stdout + r.stderr
-    recs = [json.loads(ln) for ln in (state / "bootstrap_timings.jsonl").read_text().splitlines()]
-    assert recs and all(x["stage"] == 2 and set(x) == {"phase", "seconds", "end", "stage"} for x in recs), recs
-    r, calls, state = run_bootstrap(tmp_path / "plain")
-    recs = [json.loads(ln) for ln in (state / "bootstrap_timings.jsonl").read_text().splitlines()]
-    assert recs and all(set(x) == {"phase", "seconds", "end"} for x in recs), recs
-
-
-# ---------------------------------------- the EXIT trap and onstart's supervise.lock (box p01-chain, 2026-10-01)
+# ----------------------------------------- the EXIT trap and onstart's supervise.lock (box 53693389, 2026-10-01)
 
 def bootstrap_funcs(*names: str) -> str:
     """The named top-level functions of vast/bootstrap.sh, verbatim."""
@@ -1006,39 +918,6 @@ def test_the_exit_trap_acts_in_bootstraps_own_process_only(tmp_path):
             break
         time.sleep(0.1)
     assert not alive, "bootstrap's own exit stops the label pull"
-
-
-def toucher_script(tmp_path: Path, func: str) -> Path:
-    """beat_train_hb started and killed as phase does, with a `sleep` on PATH that notes its pid when the toucher calls
-    it (`sleep 60`) and then sleeps 60 s in place (exec): the script says whether that sleep outlived its toucher. The
-    killed sleep gets 20 s to go (a busy Git Bash took over 3 s), well short of the old toucher's 60 s sleep."""
-    fake = tmp_path / "bin"
-    fake.mkdir()
-    bash_script(fake / "sleep", "#!/bin/bash", '[ "$1" != 60 ] || { echo $$ >> "$SLEEP_PIDS"; set -- 60; }',
-                'exec "$REAL_SLEEP" "$@"')
-    pids = tmp_path / "sleep_pids"
-    return bash_script(
-        tmp_path / "toucher.sh", "set -euo pipefail", 'export REAL_SLEEP="$(command -v sleep)"',
-        f'fake="$(cd "{fake.as_posix()}" && pwd)"  # /d/... under Git Bash: PATH splits at the colon of D:/',
-        f'export SLEEP_PIDS="{pids.as_posix()}" PATH="$fake:$PATH"', 'chmod +x "$fake/sleep"',
-        f'STATE="{tmp_path.as_posix()}"', func,
-        "beat_train_hb 100 &", "hb=$!",
-        'for i in $(seq 200); do [ -s "$SLEEP_PIDS" ] && break; "$REAL_SLEEP" 0.05; done',
-        'kill "$hb"; wait "$hb" || true', 'p=$(head -1 "$SLEEP_PIDS")',
-        'for i in $(seq 400); do kill -0 "$p" 2>/dev/null || { echo "sleep gone"; exit 0; }; "$REAL_SLEEP" 0.05; done',
-        'kill "$p"; echo "sleep outlived its toucher"')
-
-
-def test_a_toucher_takes_its_sleep_with_it(tmp_path):
-    """phase kills its train_hb toucher, not the toucher's child: a `sleep 60` left behind kept onstart's supervise.lock
-    (fd 7) up to a minute after bootstrap, and supervise.py, started right then, refused to run. The toucher now sleeps
-    in the background and kills that sleep when it is killed (the old toucher fails this under Git Bash and Linux)."""
-    bash = find_bash()
-    if bash is None:
-        pytest.skip("bash not available")
-    script = toucher_script(tmp_path, bootstrap_funcs("beat_train_hb"))
-    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=120)
-    assert r.returncode == 0 and "sleep gone" in r.stdout, r.stdout + r.stderr
 
 
 def test_nothing_of_bootstraps_holds_onstarts_supervise_lock():
@@ -1202,6 +1081,36 @@ def test_linux_onstarts_exit_trap_unlocks_in_onstart_only(tmp_path):
         f'flock -n "{lock}" true && echo "SIGTERM exit: unlocked"')
     r = run_linux(driver)
     assert "normal exit: unlocked" in r.stdout and "SIGTERM exit: unlocked" in r.stdout, r.stdout + r.stderr
+
+
+def toucher_script(tmp_path: Path, func: str) -> Path:
+    """beat_train_hb started and killed as phase does, under Linux bash, with a `sleep` on PATH that notes its pid when
+    the toucher calls it (`sleep 60`) and then sleeps 60 s in place (exec): the script says whether that sleep outlived
+    its toucher. The killed sleep gets 20 s to go, well short of the old toucher's 60 s sleep."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    bash_script(fake / "sleep", "#!/bin/bash", '[ "$1" != 60 ] || { echo $$ >> "$SLEEP_PIDS"; set -- 60; }',
+                'exec "$REAL_SLEEP" "$@"')
+    pids = tmp_path / "sleep_pids"
+    return bash_script(
+        tmp_path / "toucher.sh", "set -euo pipefail", 'export REAL_SLEEP="$(command -v sleep)"',
+        f'fake="{linux_path(fake)}"', f'export SLEEP_PIDS="{linux_path(pids)}" PATH="$fake:$PATH"',
+        'chmod +x "$fake/sleep"', f'STATE="{linux_path(tmp_path)}"', func,
+        "beat_train_hb 100 &", "hb=$!",
+        'for i in $(seq 200); do [ -s "$SLEEP_PIDS" ] && break; "$REAL_SLEEP" 0.05; done',
+        'kill "$hb"; wait "$hb" || true', 'p=$(head -1 "$SLEEP_PIDS")',
+        'for i in $(seq 400); do kill -0 "$p" 2>/dev/null || { echo "sleep gone"; exit 0; }; "$REAL_SLEEP" 0.05; done',
+        'kill "$p"; echo "sleep outlived its toucher"')
+
+
+def test_linux_a_toucher_takes_its_sleep_with_it(tmp_path):
+    """phase kills its train_hb toucher, not the toucher's child: a `sleep 60` left behind kept onstart's supervise.lock
+    (fd 7) up to a minute after bootstrap, and supervise.py, started right then, refused to run. The toucher now sleeps
+    in the background and kills that sleep when it is killed (the old toucher fails this). Under Linux bash only - the
+    boxes' bash: Git Bash's emulated signals lose the trap's kill, as with the test below (PR #41), so there it tested
+    MSYS's signal emulation, not the toucher."""
+    r = run_linux(toucher_script(tmp_path, bootstrap_funcs("beat_train_hb")), timeout=120)
+    assert r.returncode == 0 and "sleep gone" in r.stdout, r.stdout + r.stderr
 
 
 def toucher_term_script(path: Path, trap: str) -> Path:

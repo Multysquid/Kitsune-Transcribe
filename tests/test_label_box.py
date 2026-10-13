@@ -84,13 +84,19 @@ class FakeFinish:
 def box(tmp_path, monkeypatch):
     kdir, state = tmp_path / "repo", tmp_path / "ws" / "kitsune_state"
     (kdir / "configs").mkdir(parents=True)
-    for c in ("full.json", "full_sub3k.json"):
-        shutil.copy(ROOT / "configs" / c, kdir / "configs" / c)
+    shutil.copy(ROOT / "configs" / "full.json", kdir / "configs" / "full.json")
+    # a second label config, a subset of full.json's extent: the box serves every label config (its selection is
+    # derived from full's, and the consumer check runs per config)
+    full = json.loads((ROOT / "configs" / "full.json").read_text(encoding="utf-8"))
+    sub = dict({k: v for k, v in full.items() if k not in ("_comment", "label")},
+               selection="labels/full/selections/sub.parquet",
+               extent=dict(full["extent"], inputs={"reazon_large": 216, "galgame": 16}))
+    (kdir / "configs" / "sub.json").write_text(json.dumps(sub), encoding="utf-8")
     state.mkdir(parents=True)
     (state / "deadline").write_text(str(int(T0 + 30 * 3600)))
     write_manifest(kdir / "data", [("eval_jsut", "eval", 0, ["j1", "j2"])])
     env = {"KITSUNE_DIR": str(kdir), "KITSUNE_STATE": str(state), "KITSUNE_CONFIG": "configs/full.json",
-           "KITSUNE_LABEL_CONFIGS": "configs/full.json,configs/full_sub3k.json", "KITSUNE_CORES": "16",
+           "KITSUNE_LABEL_CONFIGS": "configs/full.json,configs/sub.json", "KITSUNE_CORES": "16",
            "CONTAINER_ID": "c1", "KITSUNE_MACHINE_ID": "m1", "KITSUNE_DATA_REPO": "me/data",
            "KITSUNE_DATA_REVISION": "rev1", "PATH": os.environ.get("PATH", "")}
     monkeypatch.setattr(label.Controller, "disk_free", lambda self: 500e9)
@@ -304,7 +310,8 @@ def test_pull_downloads_only_missing_files_and_never_overwrites(stepctx, box):
     assert have.read_bytes() == b"local!"
     assert (box.kdir / "labels/full/teacher_out/galgame/train-00001.jsonl").read_bytes() == b"new"
     pats = [p for s in api.snapshots for p in s["allow_patterns"]]
-    assert "second_out/galgame/*" in pats and f"{label.PARAKEET_PATH}/*" in pats
+    assert "teacher_out/meta.json" in pats and f"{label.PARAKEET_PATH}/*" in pats
+    assert not any(p.startswith("second_out/") for p in pats), "the laptop's second opinions are no seed"
     assert all(s["revision"] == "rev1" for s in api.snapshots)
     ledger = json.loads((box.state / "label_ledger.json").read_text())
     assert "labels/full/teacher_out/galgame/train-00001.jsonl" in ledger["remote"]
@@ -356,6 +363,15 @@ def test_golden_tolerance(stepctx, box, monkeypatch, box_hyp, rc):
     res = json.loads((box.state / "golden.json").read_text())
     assert res["parakeet"]["tdt_cer"] == 0 and res["parakeet"]["n"] == 32
     assert (res["cohere"]["cer"] <= 0.01) == (rc == 0)
+
+
+def test_golden_reference_is_the_published_parallel_lists():
+    """kitsune/parakeet_golden.json as tools/publish_parakeet.py writes it ({ids, tdt, ctc}); an absent file is {}."""
+    golden = json.loads((ROOT / "kitsune" / "parakeet_golden.json").read_text(encoding="utf-8"))
+    ref = label.golden_reference(golden)
+    first = golden["ids"][0]
+    assert list(ref) == golden["ids"] and ref[first] == {"hyp": golden["tdt"][0], "ctc_hyp": golden["ctc"][0]}
+    assert label.golden_reference({}) == {}
 
 
 def test_golden_fails_on_a_bad_parakeet_shard(stepctx, box, monkeypatch):
@@ -767,7 +783,7 @@ def test_finalize_selections_and_final_sync_argv(box, monkeypatch):
     c.f_selections()
     sel = [a for n, a, _ in runner.started if n == "make_selection"]
     assert sel == [["py", "scripts/make_selection.py", "--config", "configs/full.json"],
-                   ["py", "scripts/make_selection.py", "--config", "configs/full_sub3k.json", "--from-selection",
+                   ["py", "scripts/make_selection.py", "--config", "configs/sub.json", "--from-selection",
                     "labels/full/selections/full.parquet"]]
     c.f_final_sync()
     assert [a[2:] for n, a, _ in runner.started if n in ("sync", "verify")] == [["--job", "label", "--sync-only"],

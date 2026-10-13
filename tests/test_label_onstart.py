@@ -48,12 +48,12 @@ def subshell_body() -> str:
     return re.search(r"^\(\n(.*?)^\) < /dev/null &$", text, re.M | re.S).group(1)
 
 
-def test_label_dispatch_sits_after_the_lock_and_before_the_train_path():
+def test_label_dispatch_sits_after_the_lock_and_before_the_full_path():
     """label.py must start only under the supervise.lock check (a second onstart, or --rearm's check, sees it), and the
-    train body (supervise.json shortcut, then bootstrap.sh) must stay as it was when KITSUNE_JOB is unset."""
+    full box's body (supervise.json shortcut, then bootstrap.sh) comes after it."""
     body = subshell_body()
     lock = body.index("supervise.lock")
-    job = body.index('"${KITSUNE_JOB:-train}" = label')
+    job = body.index('"${KITSUNE_JOB:-}" = label')
     assert lock < job < body.index('-s "$KITSUNE_STATE/supervise.json"') < body.index(
         'bash "$KITSUNE_DIR/vast/bootstrap.sh"')
     dispatch = body[job:body.index("\n    fi\n", job)]
@@ -63,13 +63,14 @@ def test_label_dispatch_sits_after_the_lock_and_before_the_train_path():
 
 @pytest.mark.parametrize("job,history,expect", [
     ("label", False, ["label.py"]),
-    ("label", True, ["label.py"]),  # a supervise.json (train history) does not divert a label box
-    (None, False, ["bootstrap.sh", "supervise.py"]),
-    ("train", True, ["supervise.py"]),
-], ids=["label", "label-with-train-history", "unset", "train-restart"])
+    ("label", True, ["label.py"]),  # a supervise.json (a supervisor's history) does not divert a label box
+    ("full", False, ["bootstrap.sh", "supervise.py"]),
+    ("full", True, ["supervise.py"]),
+], ids=["label", "label-with-supervisor-history", "full", "full-restart"])
 def test_onstart_subshell_dispatches_on_kitsune_job(tmp_path, job, history, expect):
     """With KITSUNE_JOB=label the detached subshell execs vast/label.py and runs neither bootstrap.sh nor supervise.py;
-    without it (or =train) the train path is unchanged."""
+    with KITSUNE_JOB=full it runs bootstrap.sh and then supervise.py, or supervise.py alone on a restart with a
+    supervisor history (onstart refuses any other job before: tests/test_infra.py)."""
     bash = need_bash()
     state, repo = tmp_path / "state", tmp_path / "repo"
     (repo / "vast").mkdir(parents=True)
@@ -77,14 +78,12 @@ def test_onstart_subshell_dispatches_on_kitsune_job(tmp_path, job, history, expe
     for name in ("bootstrap.sh", "supervise.py", "label.py"):  # run by bash (PY=bash below): each notes that it ran
         (repo / "vast" / name).write_text(f'echo {name} >> "$KITSUNE_STATE/ran"\n', encoding="utf-8", newline="\n")
     if history:
-        (state / "supervise.json").write_text('{"attempts": [{"t0": 1.0, "resume": null}]}', encoding="utf-8")
+        (state / "supervise.json").write_text('{"attempts": [{"t0": 1.0, "queue": true}]}', encoding="utf-8")
     script = tmp_path / "subshell.sh"
     script.write_text("\n".join(["set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }", "PY=bash", subshell_body()]),
                       encoding="utf-8", newline="\n")
     env = dict(os.environ, KITSUNE_STATE=state.as_posix(), KITSUNE_DIR=repo.as_posix())
-    env.pop("KITSUNE_JOB", None)
-    if job is not None:
-        env["KITSUNE_JOB"] = job
+    env["KITSUNE_JOB"] = job
     r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     assert (state / "ran").read_text(encoding="utf-8").split() == expect
@@ -117,7 +116,7 @@ def test_rearm_moves_the_label_state_aside(tmp_path):
 def test_boot_log_names_the_job():
     text = (VAST / "onstart.sh").read_text(encoding="utf-8")
     line = next(ln for ln in text.splitlines() if ln.startswith('log "boot $boots'))
-    assert "job ${KITSUNE_JOB:-train}" in line
+    assert "job ${KITSUNE_JOB:-unset}" in line
 
 
 # --------------------------------------------------------------------------------------------------------- watchdog
@@ -207,7 +206,7 @@ def test_watchdog_ignores_a_previous_boots_heartbeat_until_twice_the_limit(tmp_p
 @pytest.mark.parametrize("orphan_s,halt", [("0", False), (None, False), ("1", True)],
                          ids=["orphan-0", "unset", "halted"])
 def test_watchdog_orphan_rule_stays_off(tmp_path, orphan_s, halt):
-    """ORPHAN_S=0 (the train job) never looks at label_hb, and a halt marker (finish.py has taken over the end) turns
+    """ORPHAN_S=0 (the default) never looks at label_hb, and a halt marker (finish.py has taken over the end) turns
     the rule off: a stale heartbeat for 5 polls triggers nothing."""
     bash = need_bash()
     env, state, record = watchdog_env(tmp_path, orphan_s, FAKE_SLEEP_MAX="5")
@@ -235,7 +234,7 @@ def test_watchdog_uses_kitsune_py():
 
 def test_rearm_also_moves_a_full_boxs_lifecycle_state(tmp_path):
     """A re-armed full box starts its heartbeats, resume plan, gate record, watchdog alerts and smoke verdict afresh;
-    its queue.json stays (the queue resumes from it), as a study box's does."""
+    its queue.json stays (the queue resumes from it)."""
     text = (VAST / "onstart.sh").read_text(encoding="utf-8")
     body = re.search(r"^rearm\(\) \{[^\n]*\n.*?^\}\n", text, re.M | re.S).group(0)
     bash = need_bash()
@@ -258,8 +257,8 @@ def test_rearm_also_moves_a_full_boxs_lifecycle_state(tmp_path):
 
 
 def test_a_full_box_boots_bootstrap_then_the_supervisor_with_a_fresh_train_hb(tmp_path):
-    """KITSUNE_JOB=full takes the train path (bootstrap.sh, then supervise.py), and train_hb is touched before
-    bootstrap starts, so the watchdog's rule is armed from the first minute."""
+    """KITSUNE_JOB=full runs bootstrap.sh, then supervise.py, and train_hb is touched before bootstrap starts, so the
+    watchdog's rule is armed from the first minute."""
     bash = need_bash()
     state, repo = tmp_path / "state", tmp_path / "repo"
     (repo / "vast").mkdir(parents=True)
@@ -275,12 +274,6 @@ def test_a_full_box_boots_bootstrap_then_the_supervisor_with_a_fresh_train_hb(tm
     r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     assert (state / "ran").read_text(encoding="utf-8").split() == ["bootstrap.sh", "hb", "supervise.py", "hb"]
-    (state / "ran").unlink()
-    (state / "train_hb").unlink()
-    env.pop("KITSUNE_JOB")  # the train job: unchanged, no train_hb
-    r = subprocess.run([bash, str(script)], capture_output=True, text=True, env=env, timeout=60)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert (state / "ran").read_text(encoding="utf-8").split() == ["bootstrap.sh", "supervise.py"]
 
 
 def test_the_watchdog_keeps_the_label_defaults():
@@ -289,27 +282,3 @@ def test_the_watchdog_keeps_the_label_defaults():
     assert 'HB_NAME="${KITSUNE_WATCHDOG_HB_FILE:-label_hb}"' in text and 'HB="$STATE/$HB_NAME"' in text
     assert 'ACTION="${KITSUNE_WATCHDOG_ORPHAN_ACTION:-stop}"' in text
     assert 'REASON="watchdog: label controller dead"' in text
-
-
-def test_rearm_also_moves_a_chain_boxs_mode_file_and_its_chain_state(tmp_path):
-    """A re-armed chain box (contract addendum E) starts with the watchdog in its env's mode (no watchdog_mode left)
-    and its controller from the gate part again (chain/ moved aside: chain.json, the parts' state dirs, stage1/)."""
-    text = (VAST / "onstart.sh").read_text(encoding="utf-8")
-    body = re.search(r"^rearm\(\) \{[^\n]*\n.*?^\}\n", text, re.M | re.S).group(0)
-    bash = need_bash()
-    state = tmp_path / "state"
-    (state / "chain" / "full-smoke").mkdir(parents=True)
-    (state / "chain" / "chain.json").write_text("{}", encoding="utf-8")
-    (state / "chain" / "full-smoke" / "queue.json").write_text("{}", encoding="utf-8")
-    (state / "watchdog_mode").write_text("stop 3600\n", encoding="utf-8")
-    (state / "queue.json").write_text("x", encoding="utf-8")
-    script = tmp_path / "rearm.sh"
-    script.write_text("\n".join(["set -euo pipefail", "log() { printf '%s\\n' \"$*\"; }",
-                                 f'KITSUNE_STATE="{state.as_posix()}"', body, "rearm", ""]),
-                      encoding="utf-8", newline="\n")
-    r = subprocess.run([bash, str(script)], capture_output=True, text=True, timeout=60)
-    assert r.returncode == 0, r.stdout + r.stderr
-    (moved,) = [d for d in state.iterdir() if d.name.startswith("rearm-")]
-    assert sorted(p.name for p in moved.iterdir()) == ["chain", "watchdog_mode"]
-    assert (moved / "chain" / "full-smoke" / "queue.json").exists() and (state / "queue.json").exists()
-    assert len((VAST / "onstart.sh").read_bytes()) < 16 * 1024

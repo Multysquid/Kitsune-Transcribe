@@ -1,4 +1,4 @@
-"""Shared shard runner for the label passes (scripts/02_teacher_pass.py now, scripts/02p_parakeet_pass.py next).
+"""Shared shard runner for the label passes (scripts/02_teacher_pass.py and scripts/02p_parakeet_pass.py).
 
 A pass is a set of callbacks; `run` owns the pipeline around them:
   load_table(job) -> table                       reads one shard (a single reader thread, one shard ahead)

@@ -1,11 +1,11 @@
-"""The canonical ingest sequence and the extent record: the one definition the label box and the A100 rebuild share.
+"""The canonical ingest sequence and the extent record: the one definition the label box and a full box's rebuild share.
 
 Utterance ids depend on the order the sources are ingested in (scripts/01_prepare_data.py): reazon_large skips the
 rows already in reazon_small, eval_emilia leaves out the videos already in emilia_yodas, and emilia_yodas those already
 in eval_emilia. The laptop ran Emilia as 300 h, then eval_emilia, then the rest, so its labelled emilia_yodas stems and
 its eval_emilia hold-out come out again only if that chain is replayed: a single `--emilia-hours inf` call keeps clips
 the laptop dropped and picks another hold-out. CANONICAL is that order, and `01 --extent-config CFG` runs it
-(plan_steps), so the label box and a later A100 rebuild produce the same ids AND the same shard stems: stems are
+(plan_steps), so the label box and a full box's rebuild produce the same ids AND the same shard stems: stems are
 numbered from the manifest, every input is flushed on its own, and a capped source reads a sorted prefix of its upstream
 files, so a prefix of the inputs gives a prefix of the full run's stems.
 
@@ -24,9 +24,10 @@ Files:
                                  audio (its id sidecar stays), so the record still knows the shard's size
     <root>/extent.json           build_record, at the label box's finalize: every upstream input of every ingested
                                  source with the stems it produced (split, step, rows, hours, ids_sha256, shard_bytes)
-The A100 reads extent.json to pull only a subset's label files (pull_plan), to size its disk and rebuild timeout
-(sizing) and to check that its rebuilt stems are the labelled ones (the sidecars' ids_sha256 against the record's; the
-ids of each stem come from the label root label_root_for names: parakeet_out on a CTC box without pull_parakeet).
+A full box (vast/bootstrap.sh) reads extent.json to pull only a subset's label files (pull_plan), to size its disk and
+rebuild timeout (sizing) and to check that its rebuilt stems are the labelled ones (the sidecars' ids_sha256 against
+the record's; the ids of each stem come from the label root label_root_for names: parakeet_out on a CTC box without
+pull_parakeet).
 
 Pure Python (stdlib + kitsune.store); no torch.
 """
@@ -74,15 +75,10 @@ CANONICAL = (
 # step key -> the steps whose ids it reads (the 300 h step and eval_emilia read nothing the rest step writes)
 DEPENDS = {"reazon_large": ("reazon_small",), "eval_emilia": ("emilia_yodas@300h",),
            "emilia_yodas": ("emilia_yodas@300h", "eval_emilia")}
-REFUSED = {
-    "reazon_medium": "no canonical step: reazon_large already holds its rows, and ingested after reazon_large it would "
-                     "dedup against reazon_small only and duplicate ~1,500 h",
-    "cv": "a manual download (not on the Hub), so no box can rebuild it",
-}
 EXTENT_KEYS = ("name", "root", "inputs")
-# A100 sizing (vast/launch.py): everything on its disk but audio and labels (image, caches, train states, weights and
-# 01's 30 GB free-space floor), the label files per audio-hour (teacher npz + jsonl + second opinion, laptop-measured)
-# and a conservative upstream download rate for the rebuild
+# A full box's sizing (vast/launch.py): everything on its disk but audio and labels (image, caches, train states,
+# weights and 01's 30 GB free-space floor), the label files per audio-hour (teacher npz + jsonl + second opinion,
+# laptop-measured) and a conservative upstream download rate for the rebuild
 DISK_BASE_GB = 127
 DISK_MARGIN, DISK_STEP_GB = 1.1, 50
 LABEL_GB_PER_HOUR = 0.0016
@@ -95,7 +91,7 @@ REBUILD_BYTES_PER_S, REBUILD_SLACK, REBUILD_BASE_MIN = 40e6, 1.5, 30
 
 
 def extent_block(cfg: dict) -> dict | None:
-    """The config's extent block, or None (the viability config has none)."""
+    """The config's extent block, or None (a config without one: the trainer's DEFAULTS, the template)."""
     return cfg.get("extent") or None
 
 
@@ -166,11 +162,10 @@ def validate(cfg: dict) -> list[str]:
     """Problems with the config's extent block; [] if it is a valid extent config.
 
     sources and eval_sets are spelled out (the trainer's defaults are the viability run's, which the extent would not
-    rebuild or pull); every name must be a canonical source (reazon_medium and cv are refused); `inputs` caps only
-    CAPPABLE sources the config names, each with 1..UPSTREAM_INPUTS files (emilia_yodas: "300h" or
-    >= EMILIA_300H_INPUTS); selection_recipe judges every source in full (partial_second_opinion is []); `root` is
-    labels/<name> and the common parent of teacher_root, second_root, parakeet_root (if set) and selection, which all
-    lie under it. All of them normalized paths."""
+    rebuild or pull); every name must be a canonical source; `inputs` caps only CAPPABLE sources the config names, each
+    with 1..UPSTREAM_INPUTS files (emilia_yodas: "300h" or >= EMILIA_300H_INPUTS); selection_recipe judges every
+    source in full (partial_second_opinion is []); `root` is labels/<name> and the common parent of teacher_root,
+    second_root, parakeet_root (if set) and selection, which all lie under it. All of them normalized paths."""
     ext = extent_block(cfg)
     if not isinstance(ext, dict):
         return ["the config has no extent block ({\"name\", \"root\", \"inputs\"})"]
@@ -203,9 +198,7 @@ def validate(cfg: dict) -> list[str]:
         problems.append("the config names no sources or eval_sets")
     known = {s.source for s in CANONICAL}
     for n in ns:
-        if n in REFUSED:
-            problems.append(f"{n}: refused, {REFUSED[n]}")
-        elif n not in known:
+        if n not in known:
             problems.append(f"{n}: not a canonical source ({', '.join(sorted(known))})")
     for src, n in inputs.items():
         if src not in CAPPABLE:
@@ -519,7 +512,7 @@ def stores(cfg: dict) -> int:
 
 def sizing(record: dict, cfg: dict, kept_hours: dict[str, float | dict] | None = None,
            extra_gb: float = 0.0) -> dict:
-    """The A100's rebuild of the extent `cfg` from the record, in GB (unrounded) and minutes:
+    """A full box's rebuild of the extent `cfg` from the record, in GB (unrounded) and minutes:
     - down_gb: the upstream bytes every planned step downloads (tar 8 twice: the 300 h step cuts it, the rest reads it
       again);
     - shard_gb: the rebuilt stems of every planned step, dependencies included;
@@ -528,7 +521,8 @@ def sizing(record: dict, cfg: dict, kept_hours: dict[str, float | dict] | None =
       subset stem. stores: how many stores hold it (stores(): two when both label roots are pulled);
     - hours: the audio of the subset stems; labels_gb: their label files, LABEL_GB_PER_HOUR each, plus
       PARAKEET_GB_PER_HOUR when parakeet_out is pulled (a CTC run or pull_parakeet);
-    - extra_gb: what the caller adds beyond one run's states (the study box: its concurrent runs' checkpoints);
+    - extra_gb: what the caller adds beyond one run's states (vast/launch.py: the registry box's extra_gb, its other
+      states, exports and extra dirs);
     - disk_gb = DISK_MARGIN x (DISK_BASE_GB + shard + stores x sel + labels + extra_gb), up to a multiple of
       DISK_STEP_GB;
     - rebuild_timeout_min = REBUILD_BASE_MIN + REBUILD_SLACK x the download time at REBUILD_BYTES_PER_S."""

@@ -1,4 +1,4 @@
-"""Parakeet-family students of the size study: a pruned copy of Parakeet's CTC path, initialised from its weights.
+"""Parakeet-family students: a pruned copy of Parakeet's CTC path, initialised from its weights.
 
 The teacher is nvidia/parakeet-tdt_ctc-0.6b-ja as converted for the label box (kitsune/parakeet.py pins the files):
 a 24-layer FastConformer encoder (d 1024, 8 heads, FFN 4096, 8x subsampling of 80 log-mels) with two heads. Only the
@@ -18,7 +18,7 @@ Why each step is done the way it is:
   function looks. Kept neurons are sorted by original index (select_ffn_neurons).
 - BatchNorm keeps the teacher's running stats (decision 16: best step-0 KL at P-0.3B; recalibration was worse).
 - Dropout, attention/activation dropout and layerdrop are set to 0 explicitly: the converted config carries HF's
-  default 0.1, but NeMo trained this model with stochastic depth 0, and the study runs dropout 0 everywhere.
+  default 0.1, but NeMo trained this model with stochastic depth 0, and the students train with dropout 0 too.
 - Attention is sdpa (like the Cohere students): the padded query rows are fully masked, and sdpa returns 0 there
   (checked: no NaN, and a padded row equals the same utterance alone to ~1e-6).
 - Saved like the Transcribe students: bf16 weights, fp32 BN running stats. The label box ran this encoder in bf16, so
@@ -55,7 +55,6 @@ CTC_BLANK = 3072
 FRAME_S = 0.08
 SUBSAMPLING = 8
 TEACHER_LAYERS = 24
-TEACHER_FFN = 4096
 TEACHER_REPO = "nvidia/parakeet-tdt_ctc-0.6b-ja"
 TEACHER_REVISION = "44edb27eea9317daf89333e75eb830db4b1cc298"  # == kitsune.parakeet.NEMO_REVISION (asserted in tests)
 CTC_HEAD_FILE = "ctc_head.safetensors"
@@ -249,12 +248,6 @@ def build_ctc_student(teacher, enc_layers: Sequence[int], ffn: int, importance: 
     return student.eval()
 
 
-def kept_neurons(importance: dict | None, enc_layers: Sequence[int], ffn: int, teacher_ffn: int = TEACHER_FFN) -> dict:
-    """{'<teacher layer>.<ffn name>': kept indices} for student_meta.json ({} when nothing is pruned)."""
-    keep = select_ffn_neurons(importance, list(enc_layers), int(ffn), teacher_ffn)
-    return {f"{l}.{n}": idx for (l, n), idx in sorted(keep.items())}
-
-
 # ------------------------------------------------------------------------------------------------ save / load
 
 
@@ -291,12 +284,12 @@ tags:
 - parakeet
 ---
 
-# Kitsune size study: Parakeet CTC student ({meta.get("name", "init")})
+# Kitsune Parakeet CTC student ({meta.get("name", "init")})
 
 A pruned copy of the CTC path of NVIDIA's Parakeet TDT-CTC 0.6B Japanese model, made by
-[Kitsune-Transcribe](https://github.com/Multysquid/Kitsune-Transcribe) as the initialisation of a size-study student
-(transformers `ParakeetForCTC`, {n:,} parameters). It has not been trained by Kitsune yet unless a training run's files
-say so.
+[Kitsune-Transcribe](https://github.com/Multysquid/Kitsune-Transcribe) as the initialisation of a Kitsune student
+(transformers `ParakeetForCTC`, {n:,} parameters). It has not been trained by Kitsune unless a training run's files say
+so.
 
 ## Attribution (CC BY 4.0)
 
@@ -465,7 +458,3 @@ def decode_ids(tokenizer, ids) -> str:
     (the ParakeetTokenizer groups repeats by default; a processor may too). Accepts a tokenizer or a processor."""
     tok = getattr(tokenizer, "tokenizer", tokenizer)
     return tok.decode([int(x) for x in ids], skip_special_tokens=True, group_tokens=False)
-
-
-def decode_batch(tokenizer, batch) -> list[str]:
-    return [decode_ids(tokenizer, ids) for ids in batch]

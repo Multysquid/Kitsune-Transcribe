@@ -2,12 +2,12 @@
 the Parakeet baselines, and scripts/05_evaluate.py's family switch, manifest checks and table modes.
 
   tables      kitsune.evaluate.utterance_table / utterance_scores sum to corpus_cer exactly, match kitsune.study_stats'
-              own scorer, and load in tools/study_report.py; the no-style count forgives exactly the style regions
+              own scorer, and load in tools/full_report.py; the no-style count forgives exactly the style regions
   CTC eval    a tiny Parakeet CTC student (tests/fixtures_ctc.py) whose stored "teacher" targets are its own: ctc_eval
               gives frame argmax agreement 1, a KL of the fp16 storage only, the teacher's text on every row; a row
               whose stored n_frames differs is left out of the frame metrics and counted; a frame store's batches
               (their own targets, as the CTC trainer's FrameBatchDataset collates them) give the same numbers, and
-              where the CTC trainer's frame stores exist, ctc_eval on one is its kitsune.ctc_eval pass to the bit
+              ctc_eval on one of the CTC trainer's frame stores is its kitsune.ctc_eval pass to the bit
   verdict     family "ctc" judges against Parakeet's CTC path, registered or pending; the Cohere verdict is unchanged
   05 (ctc)    the same student through scripts/05_evaluate.py on a study manifest, with the probe: tables, study.json,
               verdict v2 with family ctc; --teachers and --from-evals; the refusals: a manifest that does not hash to
@@ -17,8 +17,8 @@ the Parakeet baselines, and scripts/05_evaluate.py's family switch, manifest che
               more than 0.1 % of the probe's rows
   real data   (skipped without it) the stored ctc_hyp of the label box's eval shards scores to its stored ctc_cer on
               every row and to the measured corpus CERs (Parakeet TDT / CTC JSUT 6.62 / 6.71, CV8 7.50 / 7.58, Reazon
-              10.20 / 9.71 %; Cohere 8.30 / 4.07 / 6.28 %); the first A100 run's per-set CER from its eval parquets;
-              ctc_eval of the real Parakeet CTC teacher on real eval rows against its stored frame targets and text
+              10.20 / 9.71 %; Cohere 8.30 / 4.07 / 6.28 %); ctc_eval of the real Parakeet CTC teacher on real eval
+              rows against its stored frame targets and text
 CPU only, synthetic data in the repo's formats; nothing needs the network.
 """
 import json
@@ -40,6 +40,7 @@ import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from fixtures import REAL, load_script, make_fake_corpus, make_fake_selection, need_real  # noqa: E402
+from fixtures_whisper import pending_prereg as write_pending_prereg  # noqa: E402
 
 from kitsune import evaluate as ev  # noqa: E402
 from kitsune import study_stats as ss  # noqa: E402
@@ -47,20 +48,17 @@ from kitsune.store import ids_sha256  # noqa: E402
 from kitsune.text import cer as utt_cer  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "tools"))
-import study_report  # noqa: E402
+import full_report  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
 def pending_prereg(tmp_path_factory):
     """The toy corpora here are not the study's selection: 05_evaluate's default --prereg (the committed
     study/PREREG.json, filled from the uploaded selection) would refuse their manifests and teachers. Every 05 loaded
-    by this module defaults to the rules with their sidecar fields pending instead, and the Parakeet CTC registration
-    kitsune.evaluate read from the committed file at import is taken as pending; a test that needs a filled PREREG
-    passes --prereg or sets PARAKEET_CTC_CER_PREREG itself."""
-    from kitsune import prereg
-
-    path = tmp_path_factory.mktemp("prereg") / "PREREG.json"
-    path.write_bytes(prereg.rules_json(prereg.rules()))
+    by this module defaults to a PREREG.json whose manifest and baselines blocks are pending instead, and the Parakeet
+    CTC registration kitsune.evaluate read from the committed file at import is taken as pending; a test that needs a
+    filled PREREG passes --prereg or sets PARAKEET_CTC_CER_PREREG itself."""
+    path = write_pending_prereg(tmp_path_factory.mktemp("prereg") / "PREREG.json")
     real = load_script
 
     def load_pending(name: str):
@@ -150,8 +148,8 @@ def test_region_kind(ref, hyp, kind):
                                                  "kana-other"))
 
 
-def test_tables_load_in_the_study_report(tmp_path):
-    """A system's tables in the layout 05 writes (tables/<system>/<set>.parquet) load in tools/study_report.py and
+def test_tables_load_in_the_report(tmp_path):
+    """A system's tables in the layout 05 writes (tables/<system>/<set>.parquet) load in tools/full_report.py and
     align to the manifest; the report's corpus CER per stratum is utterance_table's, and a table that misses one
     manifest id is refused by the report."""
     rng = np.random.default_rng(5)
@@ -170,7 +168,7 @@ def test_tables_load_in_the_study_report(tmp_path):
     for s, t in tables.items():
         t.to_parquet(d / f"{s}.parquet", index=False)
     manifest = ss.parse_manifest(man)
-    loaded, ignored = study_report.load_tables(tmp_path / "tables", manifest.sets)
+    loaded, ignored = full_report.load_tables(tmp_path / "tables", manifest.sets)
     corpus = ss.build_corpus(loaded, manifest)
     point = ss.point_sums(corpus)
     for s in ("eval_jsut", "eval_cv8", "eval_reazon"):
@@ -180,7 +178,7 @@ def test_tables_load_in_the_study_report(tmp_path):
     assert float(ss.stratum_cer(point, "galgame_neutral")[0]) == pytest.approx(neutral)
     tables["eval_cv8"].iloc[1:].to_parquet(d / "eval_cv8.parquet", index=False)
     with pytest.raises(ss.ManifestError, match="missing"):
-        ss.build_corpus(study_report.load_tables(tmp_path / "tables", manifest.sets)[0], manifest)
+        ss.build_corpus(full_report.load_tables(tmp_path / "tables", manifest.sets)[0], manifest)
 
 
 def test_the_greedy_summary_equals_its_table():
@@ -560,15 +558,12 @@ def test_ctc_eval_reads_a_frame_stores_batches(ctc_env, monkeypatch):
 
 
 def test_the_ctc_eval_is_the_ctc_trainers_on_its_frame_store(ctc_env, tmp_path):
-    """Where the CTC trainer's frame stores exist (kitsune.trainset.build_frame_stores, kitsune.ctc_eval; skipped
-    before they do): ctc_eval over a frame store of the eval sets gives, row for row, the sums of the trainer's own
-    pass (ctc_eval_records), and summarise_ctc_tf its summary and per-utterance table to the bit, key for key; the
-    greedy CTC paths are the same."""
+    """On the CTC trainer's frame store (kitsune.trainset.build_frame_stores, kitsune.ctc_eval): ctc_eval over a frame
+    store of the eval sets gives, row for row, the sums of the trainer's own pass (ctc_eval_records), and
+    summarise_ctc_tf its summary and per-utterance table to the bit, key for key; the greedy CTC paths are the same."""
+    from kitsune import ctc_eval as CE
     from kitsune import trainset
 
-    if not hasattr(trainset, "build_frame_stores"):
-        pytest.skip("no frame stores in kitsune.trainset (the CTC trainer's, wave 2)")
-    CE = pytest.importorskip("kitsune.ctc_eval")
     env = ctc_env
     fc = env["fc"]
     fstore = trainset.build_frame_stores(env["sel"], fc.data, env["root"] / "corpus" / "parakeet_out", tmp_path / "fs",
@@ -671,7 +666,7 @@ def test_05_ctc_family_end_to_end(ctc_env, ctc_run):
 
 
 def test_05_tables_and_study_json(ctc_env, ctc_run):
-    """The student's tables (one per set, manifest order, CONTRACT.md 5 columns) load in tools/study_report.py against
+    """The student's tables (one per set, manifest order, CONTRACT.md 5 columns) load in tools/full_report.py against
     the manifest; study.json holds every stratum with the Galgame views separate, the teacher's CER on the same rows
     (ratio 1 here) and M4."""
     out, tables = ctc_run["out"], ctc_run["tables"]
@@ -682,7 +677,7 @@ def test_05_tables_and_study_json(ctc_env, ctc_run):
         g = pd.read_parquet(out / f"greedy_{e}.parquet").set_index("id").loc[man.sets[e]]
         assert df["hyp"].tolist() == g["hyp"].tolist()
         assert ev.table_cer(df)["cer"] == load(out / "summary.json")["greedy_full"]["sets"][e]["cer_ref_corpus"]
-    loaded, _ = study_report.load_tables(tables, man.sets)
+    loaded, _ = full_report.load_tables(tables, man.sets)
     corpus = ss.build_corpus(loaded, man)
     assert set(corpus.strata) == {"eval_jsut", "eval_cv8", "eval_reazon", "galgame_neutral", "galgame_all",
                                   "galgame_label_box"}
@@ -724,7 +719,7 @@ def test_05_teachers_and_from_evals(ctc_env, ctc_run, tmp_path):
     for e in EVAL_SETS:
         pd.testing.assert_frame_equal(pd.read_parquet(tables / "study-p01-copy" / f"{e}.parquet"),
                                       pd.read_parquet(ctc_run["tables"] / "study-p01" / f"{e}.parquet"))
-    corpus = ss.build_corpus(study_report.load_tables(tables, man.sets)[0], man)
+    corpus = ss.build_corpus(full_report.load_tables(tables, man.sets)[0], man)
     assert set(corpus.systems) == {"cohere", "parakeet-ctc", "parakeet-tdt", "study-p01-copy"}
     # the student's teacher is itself here: its tables equal parakeet-ctc's hypotheses
     j = corpus.index("study-p01-copy")
@@ -832,25 +827,9 @@ def test_05_refuses_frames_that_do_not_align(ctc_env, tmp_path, monkeypatch):
     assert all((out2 / f"greedy_{e}.parquet").exists() for e in EVAL_SETS)  # the sets were done first
 
 
-def test_later_keys_are_set_aside_only_while_the_trainer_lacks_them():
-    """A study config's family / loss.w_ctc / pull_parakeet / selection_recipe.study pass the trainer's merge before
-    04_distill.DEFAULTS has them, and come back with their values; a key DEFAULTS knows is merged as usual."""
-    m05 = load_script("05_evaluate")
-
-    class FakeD:
-        DEFAULTS = {"loss": {"w_kl": 1.0}, "selection_recipe": {"agree_max": 0.5}, "family": "aed"}
-
-    raw = {"family": "ctc", "loss": {"w_kl": 1.0, "w_ctc": 0.5}, "selection_recipe": {"study": {"x": 1}},
-           "pull_parakeet": True}
-    later = m05.set_aside_later_keys(FakeD, raw)
-    assert later == {"loss.w_ctc": 0.5, "pull_parakeet": True, "selection_recipe.study": {"x": 1}}
-    assert raw == {"family": "ctc", "loss": {"w_kl": 1.0}, "selection_recipe": {}}
-
-
 # ------------------------------------------------------------------------------------------------ real data
 
 LABELS = Path(os.environ.get("KITSUNE_LABELS_ROOT") or "D:/kitsune-labels/full")
-FIRST_RUN = REAL / "cache" / "hf_runs" / "runs" / "viability-b20x2560-20260925T071746Z"
 
 
 def test_the_label_boxs_stored_hyps_score_to_their_stored_cers_and_the_measured_baselines():
@@ -920,30 +899,6 @@ def test_the_real_parakeet_ctc_teacher_through_ctc_eval(tmp_path):
     assert 0.5 < a["teacher_blank"] < 0.8
 
 
-def test_the_first_a100_runs_per_set_cer_from_its_eval_parquets():
-    """The first A100 run's final eval (its downloaded run dir, read only): the tables made from its
-    greedy_<set>.parquet give its summary.json's per-set corpus CER to the edit (cer_ref_corpus, ref_edits, ref_chars)
-    and the teacher's on the same rows, and load in the study report's corpus (manifest = its own ids)."""
-    step = FIRST_RUN / "evals" / "step_9774"
-    need_real(step / "summary.json", *(step / f"greedy_{s}.parquet" for s in ev.GATE_SETS))
-    summ = load(step / "summary.json")["greedy_full"]["sets"]
-    tables, teach, man = {}, {}, {"sets": {}}
-    for s in summ:
-        g = pd.read_parquet(step / f"greedy_{s}.parquet")
-        tables[s] = ev.utterance_table(g["id"], s, g["ref"], g["hyp"], g["truncated"])
-        teach[s] = ev.utterance_table(g["id"], s, g["ref"], g["teacher_hyp"], g["teacher_truncated"])
-        c, d = ev.table_cer(tables[s]), summ[s]
-        assert (c["edits"], c["ref_chars"]) == (d["ref_edits"], d["ref_chars"]) and c["cer"] == d["cer_ref_corpus"]
-        assert ev.table_cer(teach[s])["cer"] == d["teacher_cer_ref_corpus"]
-        assert int(tables[s]["truncated"].sum()) == d["n_truncated"]
-        man["sets"][s] = {"ids": g["id"].tolist(), "ids_sha256": ids_sha256(g["id"].tolist())}
-    assert round(100 * summ["eval_jsut"]["cer_ref_corpus"], 2) == 12.65
-    corpus = ss.build_corpus({"anchor-b20": pd.concat(tables.values(), ignore_index=True),
-                              "cohere": pd.concat(teach.values(), ignore_index=True)}, man)
-    pooled = ss.metric_values(ss.point_sums(corpus), "gate_pooled")
-    assert float(pooled[corpus.index("anchor-b20")]) == pytest.approx(0.1215, abs=5e-5)  # the run's val_cer 12.15 %
-
-
 def test_05_from_evals_without_a_teacher_column(ctc_env, ctc_run, tmp_path):
     """--from-evals on an eval dir whose greedy parquets have no teacher columns (a Whisper model's, WP6): the tables
     are the system's, and there is no teacher table - teacher null, no teacher_cer, no m4_teacher / m4_ratio - also when
@@ -989,5 +944,5 @@ def test_05_from_evals_without_a_teacher_column(ctc_env, ctc_run, tmp_path):
     no_teacher(st)
     assert st["family"] == "whisper" and st["whisper"]["model"]["repo"] == "openai/whisper-small"
     assert st["whisper"]["decode"] == dict(language="ja")
-    corpus = ss.build_corpus(study_report.load_tables(tmp_path / "tables", man.sets)[0], man)
+    corpus = ss.build_corpus(full_report.load_tables(tmp_path / "tables", man.sets)[0], man)
     assert {"no-teacher", "mixed", "whisper-x"} <= set(corpus.systems)

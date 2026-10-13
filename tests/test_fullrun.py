@@ -28,7 +28,7 @@ RID = "full-p03-20260927T120000Z"
 def test_constants_exact_values():
     assert fr.JOB == "full"
     assert (fr.BOXES_FILE, fr.ENV_REGISTRY) == ("configs/full/boxes.json", "KITSUNE_FULL_REGISTRY")
-    assert fr.BOX_NAMES == ("full-smoke", "p01", "full", "smoke-b", "full-t", "full-p", "p005", "p-cool")
+    assert fr.BOX_NAMES == ("full-smoke", "p01", "smoke-b", "full-t", "full-p", "p005")
     assert fr.HUB_DIR == "full" and fr.STATE_DEFAULT == "/workspace/kitsune_state"
     assert (fr.TRAIN_HB, fr.HB_DIR, fr.RESUME_PLAN, fr.VERDICT_FILE, fr.ALERTS_FILE, fr.GATE_FILE, fr.SUMMARY_FILE,
             fr.DEADLINE_FILE) == ("train_hb", "hb", "resume_plan.json", "smoke_verdict.json",
@@ -36,7 +36,6 @@ def test_constants_exact_values():
     assert (fr.TIMED_POINTER, fr.SCRATCH_MARK, fr.TIMED_REASON, fr.POINTER_FORMAT) == (
         "timed_state.json", ".scratch_pending", "timed", 1)
     assert fr.STATE_FILES_REQUIRED == ("model.pt", "optimizer.pt", "l2sp.pt", "trainer.pt", "trainer.json")
-    assert fr.STATE_FILES_OPTIONAL == ("aux_ctc.pt",)
     assert fr.FROZEN_MANIFEST == "labels/full/selections/study_manifest.json"
     assert fr.FROZEN_MANIFEST_SHA256 == "ef56dec2b69bfe54f96a5ad1df36bde38255b68799873ab5f12346da78ac3796"
     assert fr.FULL_DIR == "labels/full/selections/full_study"
@@ -53,22 +52,21 @@ def test_constants_exact_values():
     assert fr.RUN_ID_RE == r"^[a-z0-9][a-z0-9.-]*-\d{8}T\d{6}Z(?:-\d+)?$"
     assert fr.ITEM_RE == r"^[a-z0-9][a-z0-9.-]*$"
     assert fr.RESUME_SET_KEYS == ("schedule.epochs", "early_stop.patience", "augment.enabled", "augment.truncate_p",
-                                  "augment.concat_p", "augment.mix_p", "augment.truncate_min_row_s",
-                                  "augment.end_trim_p", "augment.noise_p", "augment.noise_bank",
-                                  "augment.noise_bank_sha256", "augment.speech_p", "augment.reverb_p",
-                                  "augment.rir_bank", "augment.rir_bank_sha256", "augment.gain_p", "augment.codec_p",
-                                  "augment.background_min_row_s", "schedule.deadline_cooldown",
+                                  "augment.concat_p", "augment.truncate_min_row_s", "augment.end_trim_p",
+                                  "augment.noise_p", "augment.noise_bank", "augment.noise_bank_sha256",
+                                  "augment.speech_p", "augment.reverb_p", "augment.rir_bank", "augment.rir_bank_sha256",
+                                  "augment.gain_p", "augment.codec_p", "schedule.deadline_cooldown",
                                   "augment.cut_keep_word", "augment.guard_per_piece", "augment.end_trim_voiced")
     assert fr.RESUME_SET_INT_MIN == {"schedule.epochs": 1, "early_stop.patience": 1}
     assert fr.RESUME_SET_KINDS == {"schedule.epochs": "int", "early_stop.patience": "int", "augment.enabled": "bool",
-                                   "augment.truncate_p": "prob", "augment.concat_p": "prob", "augment.mix_p": "prob",
+                                   "augment.truncate_p": "prob", "augment.concat_p": "prob",
                                    "augment.truncate_min_row_s": "seconds", "augment.end_trim_p": "prob",
                                    "augment.noise_p": "prob", "augment.noise_bank": "path",
                                    "augment.noise_bank_sha256": "sha256", "augment.speech_p": "prob",
                                    "augment.reverb_p": "prob", "augment.rir_bank": "path",
                                    "augment.rir_bank_sha256": "sha256", "augment.gain_p": "prob",
-                                   "augment.codec_p": "prob", "augment.background_min_row_s": "seconds",
-                                   "schedule.deadline_cooldown": "bool", "augment.cut_keep_word": "bool",
+                                   "augment.codec_p": "prob", "schedule.deadline_cooldown": "bool",
+                                   "augment.cut_keep_word": "bool",
                                    "augment.guard_per_piece": "bool", "augment.end_trim_voiced": "bool"}
     assert fr.CODEC_NAMES == ("mp3", "gsm", "ulaw8k", "vorbis", "opus")
     assert fr.CONTINUE_LIST_KINDS == {"augment.noise_snr_db": "db_range", "augment.speech_snr_db": "db_range",
@@ -106,7 +104,7 @@ def test_data_blocks():
     study = json.loads((ROOT / "study" / "data.json").read_text(encoding="utf-8"))
     for k in ("data_root", "teacher_root", "second_root", "parakeet_root", "sources", "eval_sets"):
         assert fr.FULL_DATA[k] == study[k] == fr.SMOKE_DATA[k]
-    rec = {k: v for k, v in prereg.registered_recipe().items() if k != "study"}
+    rec = {k: v for k, v in study["selection_recipe"].items() if k != "study"}  # the registered recipe (PREREG.json)
     assert {k: v for k, v in fr.FULL_DATA["selection_recipe"].items() if k not in ("study", "full_study")} == rec
     assert fr.SMOKE_DATA["extent"] == study["extent"]
     assert fr.FULL_DATA["selection_recipe"]["full_study"] is not fr.FULL_STUDY  # no aliasing of the module constant
@@ -247,9 +245,9 @@ def test_parse_resume_sets():
     assert fr.parse_resume_sets(f"{RID}:early_stop.patience=12,{RID}:schedule.epochs=8") == {
         RID: ["early_stop.patience=12", "schedule.epochs=8"]}
     only = "only schedule.epochs, early_stop.patience, augment.enabled, augment.truncate_p, augment.concat_p, " \
-           "augment.mix_p, augment.truncate_min_row_s, augment.end_trim_p, augment.noise_p, augment.noise_bank, " \
-           "augment.noise_bank_sha256, augment.speech_p, augment.reverb_p, augment.rir_bank, augment.rir_bank_sha256, " \
-           "augment.gain_p, augment.codec_p, augment.background_min_row_s, schedule.deadline_cooldown, " \
+           "augment.truncate_min_row_s, augment.end_trim_p, augment.noise_p, augment.noise_bank, " \
+           "augment.noise_bank_sha256, augment.speech_p, augment.reverb_p, augment.rir_bank, " \
+           "augment.rir_bank_sha256, augment.gain_p, augment.codec_p, schedule.deadline_cooldown, " \
            "augment.cut_keep_word, augment.guard_per_piece, augment.end_trim_voiced may change on a resume"
     for bad in (f"{RID}:early_stop.patience=0", f"{RID}:early_stop.patience=-1", f"{RID}:early_stop.patience=1.5",
                 f"{RID}:early_stop.patience=x", f"{RID}:early_stop.patience=",
@@ -271,8 +269,10 @@ def test_parse_resume_sets():
             fr.parse_resume_sets(bad)
 
 
+# DECISIONS H1, H4: the recipe test box's sets (its launch --resume-set values), its weak mix (augment.mix_p 0.05,
+# retired since: 04_distill RETIRED_KEYS) swapped for recipe v3's end trim
 RECIPE_SETS = ["schedule.epochs=4", "augment.enabled=true", "augment.truncate_p=0.3", "augment.concat_p=0.5",
-               "augment.mix_p=0.05"]  # DECISIONS H1, H4: the recipe test box's sets (make_full_configs CONTINUATIONS)
+               "augment.end_trim_p=0.3"]
 
 
 def test_parse_resume_sets_types_and_normalises_each_value():
@@ -281,13 +281,14 @@ def test_parse_resume_sets_types_and_normalises_each_value():
     round-trips to itself, and two spellings of one continuation are one continuation on the box (full_queue adopt's
     resume_sets_differ compares them)."""
     loose = [f"{RID}:schedule.epochs=04", f"{RID}:augment.enabled=True", f"{RID}:augment.truncate_p=.30",
-             f"{RID}:augment.concat_p=5e-1", f"{RID}:augment.mix_p=.050"]
+             f"{RID}:augment.concat_p=5e-1", f"{RID}:augment.end_trim_p=.30"]
     got = fr.parse_resume_sets(",".join(loose))
     assert got == {RID: RECIPE_SETS}
     word = ",".join(f"{rid}:{kv}" for rid, kvs in got.items() for kv in kvs)  # vast/launch.py's env word
     assert re.fullmatch(fr._ENV_WORD, word) and fr.parse_resume_sets(word) == got
     for key, val, want in (("augment.enabled", "FALSE", "false"), ("augment.enabled", "true", "true"),
-                           ("augment.mix_p", "0", "0.0"), ("augment.mix_p", "1", "1.0"), ("augment.mix_p", "1.", "1.0"),
+                           ("augment.speech_p", "0", "0.0"), ("augment.speech_p", "1", "1.0"),
+                           ("augment.speech_p", "1.", "1.0"), ("augment.speech_p", ".050", "0.05"),
                            ("augment.concat_p", "0.50", "0.5"), ("augment.truncate_p", "3E-1", "0.3"),
                            ("augment.truncate_p", "1e-7", "1e-07"), ("schedule.epochs", "008", "8"),
                            ("early_stop.patience", "12", "12"), ("augment.truncate_min_row_s", "3", "3.0"),
@@ -310,29 +311,29 @@ def test_parse_resume_sets_types_and_normalises_each_value():
     assert {k: fr.resume_set_rule(k) for k in fr.RESUME_SET_KEYS} == {
         "schedule.epochs": "an int >= 1", "early_stop.patience": "an int >= 1", "augment.enabled": "true or false",
         "augment.truncate_p": "a probability in [0, 1]", "augment.concat_p": "a probability in [0, 1]",
-        "augment.mix_p": "a probability in [0, 1]", "augment.truncate_min_row_s": "a number of seconds >= 0",
+        "augment.truncate_min_row_s": "a number of seconds >= 0",
         "augment.end_trim_p": "a probability in [0, 1]", "augment.noise_p": "a probability in [0, 1]",
         "augment.noise_bank": "a relative data-repo path (letters, digits, _ . - and /, no ..)",
         "augment.noise_bank_sha256": "a sha256 (64 lowercase hex digits)",
         "augment.speech_p": "a probability in [0, 1]", "augment.reverb_p": "a probability in [0, 1]",
         "augment.rir_bank": "a relative data-repo path (letters, digits, _ . - and /, no ..)",
         "augment.rir_bank_sha256": "a sha256 (64 lowercase hex digits)", "augment.gain_p": "a probability in [0, 1]",
-        "augment.codec_p": "a probability in [0, 1]", "augment.background_min_row_s": "a number of seconds >= 0",
-        "schedule.deadline_cooldown": "true or false", "augment.cut_keep_word": "true or false",
+        "augment.codec_p": "a probability in [0, 1]", "schedule.deadline_cooldown": "true or false",
+        "augment.cut_keep_word": "true or false",
         "augment.guard_per_piece": "true or false", "augment.end_trim_voiced": "true or false"}
     for bad, msg in ((f"{RID}:augment.enabled=yes", "augment.enabled must be true or false, not 'yes'"),
                      (f"{RID}:augment.enabled=1", "augment.enabled must be true or false"),
                      (f"{RID}:augment.enabled=", "augment.enabled must be true or false"),
                      (f"{RID}:augment.truncate_p=1.5", "augment.truncate_p must be a probability in \\[0, 1\\]"),
                      (f"{RID}:augment.concat_p=-0.1", "augment.concat_p must be a probability"),
-                     (f"{RID}:augment.mix_p=+0.2", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=nan", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=inf", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=1_0", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=0.2.1", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=x", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=", "augment.mix_p must be a probability"),
-                     (f"{RID}:augment.mix_p=0.2,{RID}:augment.mix_p=0.3", "augment.mix_p given twice"),
+                     (f"{RID}:augment.speech_p=+0.2", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=nan", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=inf", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=1_0", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=0.2.1", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=x", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=", "augment.speech_p must be a probability"),
+                     (f"{RID}:augment.speech_p=0.2,{RID}:augment.speech_p=0.3", "augment.speech_p given twice"),
                      (f"{RID}:augment.truncate_min_row_s=-1", "truncate_min_row_s must be a number of seconds >= 0"),
                      (f"{RID}:augment.truncate_min_row_s=inf", "truncate_min_row_s must be a number of seconds"),
                      (f"{RID}:augment.end_trim_p=1.5", "augment.end_trim_p must be a probability"),
@@ -353,12 +354,16 @@ def test_parse_resume_sets_types_and_normalises_each_value():
                      # the recipe's other keys keep the trainer's defaults: another value would be another recipe
                      (f"{RID}:augment.seed=1", "may change on a resume"),
                      (f"{RID}:augment.concat_max_s=20", "may change on a resume"),
-                     (f"{RID}:augment.mix_snr_db=[0,5]", "may change on a resume")):
+                     (f"{RID}:augment.mix_snr_db=[0,5]", "may change on a resume"),
+                     # mixing and the background's short-row guard are retired (04_distill RETIRED_KEYS)
+                     (f"{RID}:augment.mix_p=0.05", "may change on a resume"),
+                     (f"{RID}:augment.mix_p=0", "may change on a resume"),
+                     (f"{RID}:augment.background_min_row_s=3", "may change on a resume")):
         with pytest.raises(ValueError, match=msg):
             fr.parse_resume_sets(bad)
     # one run's int and recipe sets together, another run's apart, in the order given
-    two = f"{RID}:augment.mix_p=0.2,full-p01-20261001T184145Z:augment.enabled=false,{RID}:schedule.epochs=4"
-    assert fr.parse_resume_sets(two) == {RID: ["augment.mix_p=0.2", "schedule.epochs=4"],
+    two = f"{RID}:augment.speech_p=0.2,full-p01-20261001T184145Z:augment.enabled=false,{RID}:schedule.epochs=4"
+    assert fr.parse_resume_sets(two) == {RID: ["augment.speech_p=0.2", "schedule.epochs=4"],
                                          "full-p01-20261001T184145Z": ["augment.enabled=false"]}
 
 
@@ -381,17 +386,18 @@ def test_codec_names_are_the_acoustics_codecs():
 
 
 def test_h14_resume_set_keys():
-    """Two of DECISIONS H14's three scalar keys are resume sets too (launch --resume-set, KITSUNE_RESUME_SETS),
-    normalised like the others. schedule.resume_reset_keep_cooldown is not: only a registry continuation sets it
-    (CONTINUE_ONLY_KINDS; launch's continuation_preflight checks the state's cooldown record before renting), and
-    neither are the list-valued continuation keys (the env word is comma-separated)."""
-    got = fr.parse_resume_sets(f"{RID}:augment.background_min_row_s=3,{RID}:schedule.deadline_cooldown=FALSE")
-    assert got == {RID: ["augment.background_min_row_s=3.0", "schedule.deadline_cooldown=false"]}
-    assert fr.resume_set_value("augment.background_min_row_s", "0") == "0.0"
+    """Of DECISIONS H14's three scalar keys, schedule.deadline_cooldown is a resume set too (launch --resume-set,
+    KITSUNE_RESUME_SETS), normalised like the others. schedule.resume_reset_keep_cooldown is not: only a registry
+    continuation sets it (CONTINUE_ONLY_KINDS; launch's continuation_preflight checks the state's cooldown record before
+    renting), and neither are the list-valued continuation keys (the env word is comma-separated).
+    augment.background_min_row_s is retired (04_distill RETIRED_KEYS): neither a resume nor a continuation sets it."""
+    got = fr.parse_resume_sets(f"{RID}:schedule.deadline_cooldown=FALSE")
+    assert got == {RID: ["schedule.deadline_cooldown=false"]}
     assert "schedule.resume_reset_keep_cooldown" not in fr.RESUME_SET_KEYS + tuple(fr.RESUME_SET_KINDS)
     assert fr.resume_set_rule("schedule.resume_reset_keep_cooldown") == "true or false"  # a continuation's refusals
-    for bad, msg in ((f"{RID}:augment.background_min_row_s=-1", "background_min_row_s must be a number of seconds"),
-                     (f"{RID}:augment.background_min_row_s=inf", "background_min_row_s must be a number of seconds"),
+    assert "augment.background_min_row_s" not in fr.CONTINUE_SET_KEYS + tuple(fr.RESUME_SET_KINDS)
+    for bad, msg in ((f"{RID}:augment.background_min_row_s=3", "may change on a resume"),
+                     (f"{RID}:augment.background_min_row_s=0", "may change on a resume"),
                      (f"{RID}:schedule.resume_reset_keep_cooldown=true", "may change on a resume"),
                      (f"{RID}:schedule.resume_reset_keep_cooldown=1", "may change on a resume"),
                      (f"{RID}:schedule.deadline_cooldown=no", "deadline_cooldown must be true or false"),
@@ -415,8 +421,8 @@ def test_continue_set_text_spells_each_value_once():
             ("schedule.resume_reset_keep_cooldown", "False", "false"),
             ("augment.enabled", "true", "true"), ("augment.enabled", "True", "true"),
             ("schedule.epochs", 6, "6"), ("schedule.epochs", "06", "6"),
-            ("augment.background_min_row_s", 3.0, "3.0"), ("augment.background_min_row_s", 3, "3.0"),
-            ("augment.background_min_row_s", 0, "0.0"), ("augment.background_min_row_s", "3.0", "3.0"),
+            ("augment.truncate_min_row_s", 3.0, "3.0"), ("augment.truncate_min_row_s", 3, "3.0"),
+            ("augment.truncate_min_row_s", 0, "0.0"), ("augment.truncate_min_row_s", "3.0", "3.0"),
             ("augment.noise_p", 0.30, "0.3"), ("augment.noise_p", 1, "1.0"), ("augment.noise_p", 0, "0.0"),
             ("augment.noise_bank", "aug/musan-bg-v2", "aug/musan-bg-v2"),
             ("augment.rir_bank_sha256", sha.upper(), sha)):
@@ -469,15 +475,17 @@ def test_continue_set_text_spells_each_value_once():
     ("schedule.resume_reset_keep_cooldown", 1, r"keep_cooldown must be true or false, not '1'"),
     ("augment.noise_p", 1.5, r"noise_p must be a probability"),
     ("augment.noise_p", float("nan"), r"noise_p must be a probability"),
-    ("augment.background_min_row_s", -1, r"background_min_row_s must be a number of seconds >= 0"),
-    ("augment.background_min_row_s", True, r"background_min_row_s must be a number of seconds"),
-    ("augment.background_min_row_s", float("inf"), r"background_min_row_s must be a number of seconds"),
+    ("augment.truncate_min_row_s", -1, r"truncate_min_row_s must be a number of seconds >= 0"),
+    ("augment.truncate_min_row_s", True, r"truncate_min_row_s must be a number of seconds"),
+    ("augment.truncate_min_row_s", float("inf"), r"truncate_min_row_s must be a number of seconds"),
     ("augment.noise_bank", 12, r"noise_bank must be a relative data-repo path"),
     ("augment.noise_bank", "12", r"noise_bank must be a relative data-repo path"),  # JSON would read a number
     ("augment.noise_bank", None, r"noise_bank must be a relative data-repo path"),
     ("optim.lr", 0.001, r"'optim.lr' is not a key a continuation may set"),
     ("schedule.resume_reset", True, r"'schedule.resume_reset' is not a key a continuation may set"),
     ("augment.mix_snr_db", [0.0, 5.0], r"is not a key a continuation may set"),
+    ("augment.mix_p", 0.0, r"'augment.mix_p' is not a key a continuation may set"),  # retired (RETIRED_KEYS)
+    ("augment.background_min_row_s", 0.0, r"'augment.background_min_row_s' is not a key a continuation may set"),
 ])
 def test_continue_set_text_refuses(key, value, match):
     with pytest.raises(ValueError, match=match):
@@ -491,12 +499,12 @@ def test_continue_sets_in_the_sets_order():
                      "schedule.resume_reset_keep_cooldown": True, "_comment": "the gentle recipe",
                      "augment.noise_snr_db": [5.0, 20.0], "augment.speech_snr_db": [15, 25],
                      "augment.gain_db": [-10.0, 10.0], "augment.codecs": ["mp3", "ulaw8k"],
-                     "augment.background_min_row_s": 3.0, "augment.speech_p": 0.3}}
+                     "augment.truncate_min_row_s": 3.0, "augment.speech_p": 0.3}}
     words = fr.continue_sets(cont)
     assert words == ["schedule.epochs=10", "schedule.deadline_cooldown=false",
                      "schedule.resume_reset_keep_cooldown=true", "augment.noise_snr_db=[5.0,20.0]",
                      "augment.speech_snr_db=[15.0,25.0]", "augment.gain_db=[-10.0,10.0]",
-                     'augment.codecs=["mp3","ulaw8k"]', "augment.background_min_row_s=3.0", "augment.speech_p=0.3"]
+                     'augment.codecs=["mp3","ulaw8k"]', "augment.truncate_min_row_s=3.0", "augment.speech_p=0.3"]
     # 04_distill's apply_set: key=value, the value json-parsed (a list / bool / number)
     assert [json.loads(w.partition("=")[2]) for w in words][:5] == [10, False, True, [5.0, 20.0], [15.0, 25.0]]
     assert fr.continue_sets(dict(cont, sets={})) == []
@@ -515,7 +523,7 @@ def test_run_id_of():
 def test_hub_and_scratch_paths():
     assert fr.box_summary_path("p01") == "full/box-p01/queue_summary.json"
     assert fr.box_verdict_path("full-smoke") == "full/box-full-smoke/smoke_verdict.json"
-    assert fr.box_infra_dir("full", "12345") == "full/box-full/infra/12345"
+    assert fr.box_infra_dir("full-p", "12345") == "full/box-full-p/infra/12345"
     assert fr.scratch_state_dir(RID, 5200) == f"runs/{RID}/checkpoints/full_step_5200"
     assert fr.scratch_pointer(RID) == f"runs/{RID}/timed_state.json"
 
@@ -534,7 +542,6 @@ def test_pointer_problems_accepts_a_good_pointer():
     assert fr.pointer_problems(_pointer()) == []
     p = _pointer(kitsune_sha=None, selection_sha256=None, epoch=1, host={"hostname": "h", "machine_id": None,
                                                                           "container_id": None})
-    p["files"]["aux_ctc.pt"] = {"size": 0, "sha256": "a" * 64}
     assert fr.pointer_problems(p) == []
     assert fr.pointer_problems(json.loads(json.dumps(_pointer()))) == []  # survives the JSON round trip
 
@@ -545,6 +552,7 @@ def test_pointer_problems_accepts_a_good_pointer():
     (lambda p: p["files"].pop("trainer.json"), "lacks"),
     (lambda p: p["files"].pop("model.pt"), "lacks"),
     (lambda p: p["files"].update({"events.jsonl": {"size": 1, "sha256": "0" * 64}}), "not state files"),
+    (lambda p: p["files"].update({"aux_ctc.pt": {"size": 1, "sha256": "0" * 64}}), "not state files"),  # retired
     (lambda p: p["files"]["model.pt"].update(sha256="xyz"), "64 hex"),
     (lambda p: p["files"]["model.pt"].update(sha256="A" * 64), "64 hex"),
     (lambda p: p["files"]["model.pt"].update(size=-1), "size"),
@@ -587,7 +595,7 @@ def test_tiny_registry_validates(tmp_path, reg):
     assert fr.registry_problems(reg, root=tmp_path) == []
     assert (tmp_path / "configs" / "full" / "data-p01.json").is_file()
     loaded = fr.load_registry(reg, root=tmp_path)
-    assert set(loaded["boxes"]) == {"full-smoke", "p01", "full", "smoke-b"} < set(fr.BOX_NAMES)  # the four of section 7
+    assert set(loaded["boxes"]) == {"full-smoke", "p01", "full-p", "smoke-b"} < set(fr.BOX_NAMES)  # tiny_registry's
     assert fr.load_registry(loaded, root=tmp_path) == loaded  # filling the defaults again changes nothing
     # every value a box env or command line carries is one env-string word (launch.env_string's rule)
     for b in loaded["boxes"].values():
@@ -603,7 +611,7 @@ def test_load_registry_does_not_change_its_argument(tmp_path, reg):
 
 def test_defaults_are_filled(tmp_path, reg):
     loaded = fr.load_registry(reg, root=tmp_path)
-    full = loaded["boxes"]["full"]
+    full = loaded["boxes"]["full-p"]
     assert (full["gate"], full["smoke"], full["max_attempts"], full["extra_dirs"], full["faults"]) == (
         True, False, 4, [], [])
     items = {i["name"]: i for i in full["items"]}
@@ -655,12 +663,13 @@ def _refused(reg, root, match, **kw):
 
 RULES = {
     "unknown kind": (lambda r: _item(r, "p01", "stores-ctc").update(kind="calib"), r"kind 'calib'"),
-    "unknown placeholder": (lambda r: _item(r, "full", "whisper-small")["argv"].append("{outdir}"),
+    "unknown placeholder": (lambda r: _item(r, "full-p", "whisper-small")["argv"].append("{outdir}"),
                             r"unknown placeholder \{outdir\}"),
-    "unknown colon placeholder": (lambda r: _item(r, "full", "whisper-small")["argv"].append("{root:x}"),
+    "unknown colon placeholder": (lambda r: _item(r, "full-p", "whisper-small")["argv"].append("{root:x}"),
                                   r"unknown placeholder \{root:x\}"),
-    "unmatched brace": (lambda r: _item(r, "full", "whisper-small")["argv"].append("{out/x"), r"unmatched brace"),
-    "{config} without of": (lambda r: _item(r, "full", "whisper-small")["argv"].append("{config}"), r"needs the item"),
+    "unmatched brace": (lambda r: _item(r, "full-p", "whisper-small")["argv"].append("{out/x"), r"unmatched brace"),
+    "{config} without of": (lambda r: _item(r, "full-p", "whisper-small")["argv"].append("{config}"),
+                            r"needs the item"),
     "{ckpt:<name>} not in weights": (lambda r: _item(r, "smoke-b", "selftest")["argv"].append("{ckpt:study-p01}"),
                                      r"names no entry of the item's weights"),
     "{out:<item>} of a later item": (lambda r: _item(r, "smoke-b", "selftest")["argv"].append("{out:whisper-large-v3}"),
@@ -690,7 +699,7 @@ RULES = {
     "duplicate fault id": (lambda r: _box(r, "full-smoke")["faults"][1].update(id="F1"), r"given twice"),
     "bad family": (lambda r: _item(r, "p01", "full-p01").update(family="rnnt"), r"family 'rnnt'"),
     "non-droppable readout": (lambda r: _item(r, "p01", "m4-full-p01").update(droppable=False), r"always droppable"),
-    "non-droppable eval": (lambda r: _item(r, "full", "whisper-small").update(droppable=False), r"always droppable"),
+    "non-droppable eval": (lambda r: _item(r, "full-p", "whisper-small").update(droppable=False), r"always droppable"),
     "data_config outside configs/full/": (lambda r: _box(r, "p01").update(data_config="configs/study/data.json"),
                                           r"not under configs/full/"),
     "data_config absolute": (lambda r: _box(r, "p01").update(data_config="/configs/full/data-p01.json"),
@@ -728,13 +737,13 @@ RULES = {
                                  r"not a kitsune.prereg run"),
     "plan steps without hours": (lambda r: _item(r, "full-smoke", "smoke-t06").pop("plan_hours"),
                                  r"go together"),
-    "of_box of a missing train item": (lambda r: _item(r, "full", "quant-int8-w8a8-full-p01").update(of="full-p03"),
+    "of_box of a missing train item": (lambda r: _item(r, "full-p", "quant-int8-w8a8-full-p01").update(of="full-p03"),
                                        r"not a train item of box p01"),
-    "of_box of the same box": (lambda r: _item(r, "full", "quant-int8-w8a8-full-p01").update(of_box="full"),
+    "of_box of the same box": (lambda r: _item(r, "full-p", "quant-int8-w8a8-full-p01").update(of_box="full-p"),
                                r"not another registry box"),
     "of_box not in the registry": (lambda r: r["boxes"].pop("p01"), r"of_box 'p01' is not a registry box"),
-    "of_box without of": (lambda r: _item(r, "full", "quant-int8-w8a8-full-p01").pop("of"), r"without of"),
-    "same-box of of a later item": (lambda r: _box(r, "full")["items"].insert(2, {
+    "of_box without of": (lambda r: _item(r, "full-p", "quant-int8-w8a8-full-p01").pop("of"), r"without of"),
+    "same-box of of a later item": (lambda r: _box(r, "full-p")["items"].insert(2, {
         "name": "early-eval", "kind": "eval", "of": "full-t06", "argv": ["x"], "max_hours": 0.3}),
         r"early-eval: of 'full-t06' is not an earlier train item"),
     "model not in extra_dirs": (lambda r: _item(r, "full-smoke", "speed-parakeet-tdt").update(model="models/x"),
@@ -743,12 +752,12 @@ RULES = {
                            r"not a run id"),
     "duplicate weights name": (lambda r: _item(r, "smoke-b", "selftest")["weights"][1].update(name="study-p03"),
                                r"given twice"),
-    "speed with two sources": (lambda r: _item(r, "full", "speed-study-t06").update(of="full-t06"),
+    "speed with two sources": (lambda r: _item(r, "full-p", "speed-study-t06").update(of="full-t06"),
                                r"times one model"),
     "cohere with a model": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
         model="models/parakeet-tdt_ctc-0.6b-ja-hf"), r"cohere"),
     # speed_probe refuses these kinds without --model at once: a dropped source must fail here, not on the rented box
-    "aed speed item without a model source": (lambda r: _item(r, "full", "speed-study-t06").pop("weights"),
+    "aed speed item without a model source": (lambda r: _item(r, "full-p", "speed-study-t06").pop("weights"),
                                               r"speed_kind aed times one student"),
     "ctc speed item without a model source": (lambda r: _item(r, "full-smoke", "speed-study-p01").update(weights=[]),
                                               r"speed_kind ctc times one student"),
@@ -775,13 +784,13 @@ RULES = {
         r"speed_kind whisper needs --model"),
     "whisper speed item with an empty --model=": (lambda r: _item(r, "full-smoke", "speed-cohere").update(
         speed_kind="whisper", system="whisper-small", args=["--model="]), r"speed_kind whisper needs --model"),
-    "unknown speed kind": (lambda r: _item(r, "full", "speed-study-t06").update(speed_kind="tdt"),
+    "unknown speed kind": (lambda r: _item(r, "full-p", "speed-study-t06").update(speed_kind="tdt"),
                            r"speed_kind 'tdt'"),
     "only_if_new_machine unknown": (lambda r: _item(r, "smoke-b", "speed-study-p03").update(
         only_if_new_machine="box-a"), r"only_if_new_machine"),
     "only_if_new_machine itself": (lambda r: _item(r, "smoke-b", "speed-study-p03").update(
         only_if_new_machine="smoke-b"), r"only_if_new_machine"),
-    "verdict on a non-smoke box": (lambda r: _item(r, "full", "whisper-small").update(verdict=[{"check": "15"}]),
+    "verdict on a non-smoke box": (lambda r: _item(r, "full-p", "whisper-small").update(verdict=[{"check": "15"}]),
                                    r"not a smoke box"),
     "verdict check 17": (lambda r: _item(r, "smoke-b", "speed-study-p03").update(verdict=[{"check": "17"}]),
                          r"check '17'"),
@@ -797,8 +806,8 @@ RULES = {
                                  r"not key=value"),
     "a path with a space": (lambda r: _box(r, "p01")["extra_files"].append("labels/full/a b.json"),
                             r"env-string word"),
-    "eval without argv": (lambda r: _item(r, "full", "whisper-small").pop("argv"), r"no argv"),
-    "eval with an empty argv": (lambda r: _item(r, "full", "whisper-small").update(argv=[]), r"argv"),
+    "eval without argv": (lambda r: _item(r, "full-p", "whisper-small").pop("argv"), r"no argv"),
+    "eval with an empty argv": (lambda r: _item(r, "full-p", "whisper-small").update(argv=[]), r"argv"),
     "not an object": (lambda r: r["boxes"].update(p01=[]), r"not an object"),
 }
 
@@ -832,7 +841,7 @@ def test_pull_parakeet_missing_counts_as_false(tmp_path, reg):
 
 
 def test_family_must_be_the_configs(tmp_path, reg):
-    _item(reg, "full", "full-p03").update(family="aed")
+    _item(reg, "full-p", "full-p03").update(family="aed")
     _refused(reg, tmp_path, r"family 'aed', but configs/full/full-p03.json trains 'ctc'")
     reg = tiny_registry(tmp_path)
     p = tmp_path / "configs" / "full" / "full-t06.json"
@@ -859,9 +868,9 @@ def test_family_must_be_the_data_configs_without_pull_parakeet(tmp_path, reg):
     probs = _refused(reg, tmp_path, r"full-p01: configs/full/full-p01.json trains family ctc, but the box data "
                                     r"config configs/full/data-p01.json is family aed")
     assert any(p.startswith("boxes.p01.items.stores-ctc:") for p in probs)
-    # with pull_parakeet both teachers' labels come for every stem, so one box trains both families (box full)
+    # with pull_parakeet both teachers' labels come for every stem, so one box trains both families (box full-p)
     loaded = fr.load_registry(tiny_registry(tmp_path))
-    assert {i["family"] for i in fr.train_items("full", loaded)} == {"aed", "ctc"}
+    assert {i["family"] for i in fr.train_items("full-p", loaded)} == {"aed", "ctc"}
 
 
 def test_missing_configs_are_refused_only_with_check_files(tmp_path, reg):
@@ -917,22 +926,22 @@ def test_speed_sources_that_pass(tmp_path, reg):
     assert _problems(reg, tmp_path) == []
 
 
-# a continuation box built on the tiny registry: box p01's run re-run from its pre_cooldown state (H14's p01 row)
+# a continuation box built on the tiny registry: box p01's run re-run from its pre_cooldown state (H14's p01 row), on
+# box full-t (a name the tiny registry leaves free; DECISIONS H14's box is retired)
 COOL_RID = "full-p01-20261001T184145Z"
 CONT_P01 = {"box": "p01", "run_id": COOL_RID, "from_step": 86328, "to_step": 107910, "resets_before": 1,
             "sets": {"schedule.epochs": 4, "schedule.deadline_cooldown": False, "augment.enabled": True,
                      "augment.noise_snr_db": [0.0, 20.0], "augment.speech_snr_db": [10.0, 25.0],
-                     "augment.gain_db": [-20.0, 10.0], "augment.codecs": ["mp3", "gsm", "ulaw8k"],
-                     "augment.background_min_row_s": 0.0}}
+                     "augment.gain_db": [-20.0, 10.0], "augment.codecs": ["mp3", "gsm", "ulaw8k"]}}
 
 
 def with_cool(reg: dict, **changes) -> dict:
-    """reg (a copy) plus box p-cool: box p01's items, its train item full-p01 continuing box p01's run (CONT_P01 with
-    `changes`)."""
+    """reg (a copy) plus the continuation box full-t: box p01's items, its train item full-p01 continuing box p01's
+    run (CONT_P01 with `changes`)."""
     reg = copy.deepcopy(reg)
     box = copy.deepcopy(reg["boxes"]["p01"])
     next(i for i in box["items"] if i["name"] == "full-p01")["continues"] = dict(copy.deepcopy(CONT_P01), **changes)
-    reg["boxes"]["p-cool"] = box
+    reg["boxes"]["full-t"] = box
     return reg
 
 
@@ -941,26 +950,22 @@ def test_a_continuation_box_validates_and_lists_its_continuations(tmp_path, reg)
     assert fr.registry_problems(cool, root=tmp_path) == []
     loaded = fr.load_registry(cool, root=tmp_path)
     assert fr.load_registry(loaded, root=tmp_path) == loaded  # the filled block validates again unchanged
-    assert fr.train_items("p-cool", loaded)[0]["continues"] == CONT_P01
+    assert fr.train_items("full-t", loaded)[0]["continues"] == CONT_P01
     assert fr.train_items("p01", loaded)[0]["continues"] is None  # the default: a run of its own
-    assert fr.continues_of("p-cool", loaded) == {"full-p01": CONT_P01}
-    assert fr.continues_of("p01", loaded) == {} and fr.continues_of("full", loaded) == {}
-    fr.continues_of("p-cool", loaded)["full-p01"]["sets"].clear()  # a copy
-    assert fr.continues_of("p-cool", loaded)["full-p01"] == CONT_P01
-    assert fr.continue_sets(fr.continues_of("p-cool", loaded)["full-p01"]) == [
+    assert fr.continues_of("full-t", loaded) == {"full-p01": CONT_P01}
+    assert fr.continues_of("p01", loaded) == {} and fr.continues_of("full-p", loaded) == {}
+    fr.continues_of("full-t", loaded)["full-p01"]["sets"].clear()  # a copy
+    assert fr.continues_of("full-t", loaded)["full-p01"] == CONT_P01
+    assert fr.continue_sets(fr.continues_of("full-t", loaded)["full-p01"]) == [
         "schedule.epochs=4", "schedule.deadline_cooldown=false", "augment.enabled=true",
         "augment.noise_snr_db=[0.0,20.0]", "augment.speech_snr_db=[10.0,25.0]", "augment.gain_db=[-20.0,10.0]",
-        'augment.codecs=["mp3","gsm","ulaw8k"]', "augment.background_min_row_s=0.0"]
-    from fixtures_chain import CHAIN_BOX, with_chain
-    chained = with_chain(cool)  # p01-chain runs box p01 (the source), never p-cool
-    assert fr.registry_problems(chained, root=tmp_path, check_files=False) == []
-    assert fr.continues_of(CHAIN_BOX, chained) == {}
-    with pytest.raises(fr.RegistryError, match="'full-p' is not in the registry"):
-        fr.continues_of("full-p", loaded)
+        'augment.codecs=["mp3","gsm","ulaw8k"]']
+    with pytest.raises(fr.RegistryError, match="'p005' is not in the registry"):
+        fr.continues_of("p005", loaded)
     # comments are allowed in the block and in its sets, and the sets' comments are no --set words
     commented = with_cool(reg, _comment="H14", sets=dict(CONT_P01["sets"], _why="explicit ranges"))
     assert fr.registry_problems(commented, root=tmp_path) == []
-    assert fr.continue_sets(fr.continues_of("p-cool", commented)["full-p01"]) == fr.continue_sets(CONT_P01)
+    assert fr.continue_sets(fr.continues_of("full-t", commented)["full-p01"]) == fr.continue_sets(CONT_P01)
 
 
 def _set(**sets):
@@ -995,15 +1000,17 @@ CONT_RULES = {
     "sets a bad int": (_set(**{"schedule.epochs": 0}), r"continues.sets: schedule.epochs must be an int >= 1, not "
                                                        r"'0'"),
     "sets a bad bool": (_set(**{"schedule.deadline_cooldown": "no"}), r"deadline_cooldown must be true or false"),
-    "sets a bad seconds": (_set(**{"augment.background_min_row_s": -3.0}), r"background_min_row_s must be a number"),
+    "sets a bad seconds": (_set(**{"augment.truncate_min_row_s": -3.0}), r"truncate_min_row_s must be a number"),
+    "sets a retired key": (_set(**{"augment.background_min_row_s": 0.0}), r"'augment.background_min_row_s' is not a "
+                                                                           r"key a continuation"),
     "sets a bad range": (_set(**{"augment.gain_db": [10.0, -10.0]}), r"continues.sets: augment.gain_db must be a "
                                                                      r"list \[low, high\]"),
     "sets a bad codec": (_set(**{"augment.codecs": ["mp3", "aac"]}), r"continues.sets: augment.codecs must be a "
                                                                      r"non-empty list of distinct codec names"),
-    "box its own": ({"box": "p-cool"}, r"continues.box 'p-cool' is the item's own box"),
-    "box not in the registry": ({"box": "full-p"}, r"continues.box 'full-p' is not a registry box"),
+    "box its own": ({"box": "full-t"}, r"continues.box 'full-t' is the item's own box"),
+    "box not in the registry": ({"box": "p005"}, r"continues.box 'p005' is not a registry box"),
     "box unknown": ({"box": "box-a"}, r"continues.box 'box-a' is not a registry box"),
-    "box without the item": ({"box": "full"}, r"continues.box 'full' has no train item 'full-p01'"),
+    "box without the item": ({"box": "full-p"}, r"continues.box 'full-p' has no train item 'full-p01'"),
     "box with other train items": ({"box": "smoke-b"}, r"continues.box 'smoke-b' has no train item"),
 }
 
@@ -1012,7 +1019,7 @@ CONT_RULES = {
 def test_each_continues_rule_is_refused(tmp_path, reg, name):
     change, match = CONT_RULES[name]
     cool = with_cool(reg)
-    item = next(i for i in cool["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")
+    item = next(i for i in cool["boxes"]["full-t"]["items"] if i["name"] == "full-p01")
     if isinstance(change, str):
         item["continues"].pop(change.partition(":")[2])
     elif "_whole" in change:
@@ -1020,12 +1027,12 @@ def test_each_continues_rule_is_refused(tmp_path, reg, name):
     else:
         item["continues"].update(copy.deepcopy(change))
     probs = _refused(cool, tmp_path, match)
-    assert all("p-cool.items.full-p01.continues" in p for p in probs), probs  # nothing else breaks
+    assert all("full-t.items.full-p01.continues" in p for p in probs), probs  # nothing else breaks
 
 
 def test_a_continuation_keeps_its_runs_config(tmp_path, reg):
     cool = with_cool(reg)
-    next(i for i in cool["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")["config"] = \
+    next(i for i in cool["boxes"]["full-t"]["items"] if i["name"] == "full-p01")["config"] = \
         "configs/full/full-p03.json"
     probs = _refused(cool, tmp_path, r"continues.box 'p01': its train item 'full-p01' trains config "
                                      r"'configs/full/full-p01.json', this one 'configs/full/full-p03.json'",
@@ -1037,36 +1044,22 @@ def test_a_continuation_box_continues_each_run_once(tmp_path, reg):
     cool = with_cool(reg)
     p03 = {"name": "full-p03", "kind": "train", "config": "configs/full/full-p03.json", "study_run": "study-p03",
            "family": "ctc", "max_hours": 5.0, "needs": ["stores-ctc"],
-           "continues": dict(copy.deepcopy(CONT_P01), box="full")}  # box full runs a full-p03 with that config
-    cool["boxes"]["p-cool"]["items"].append(p03)
-    probs = _refused(cool, tmp_path, rf"p-cool.items.full-p03.continues.run_id '{COOL_RID}' is continued by item "
-                                     rf"'full-p01' of box p-cool too: one item per run", check_files=False)
+           "continues": dict(copy.deepcopy(CONT_P01), box="full-p")}  # box full-p runs a full-p03 with that config
+    cool["boxes"]["full-t"]["items"].append(p03)
+    probs = _refused(cool, tmp_path, rf"full-t.items.full-p03.continues.run_id '{COOL_RID}' is continued by item "
+                                     rf"'full-p01' of box full-t too: one item per run", check_files=False)
     assert len(probs) == 1, probs
     p03["continues"]["run_id"] = "full-p03-20261003T230143Z"
     assert fr.registry_problems(cool, root=tmp_path, check_files=False) == []
-    assert list(fr.continues_of("p-cool", fr.load_registry(cool, root=tmp_path, check_files=False))) == [
+    assert list(fr.continues_of("full-t", fr.load_registry(cool, root=tmp_path, check_files=False))) == [
         "full-p01", "full-p03"]  # registry order
-
-
-def test_a_continues_box_is_never_a_chain_part(tmp_path, reg):
-    from fixtures_chain import CHAIN, CHAIN_BOX, with_chain
-    stages = copy.deepcopy(CHAIN["chain"])
-    stages[1]["parts"] = ["p-cool"]
-    chained = with_chain(with_cool(reg), chain=stages)
-    probs = _refused(chained, tmp_path, rf"boxes.{CHAIN_BOX}.chain\[1\]: part 'p-cool' has continues items "
-                                        r"\['full-p01'\]: a box that continues other boxes' runs runs alone",
-                     check_files=False)
-    assert len(probs) == 1, probs
-    # a chain box is no continuation's source either
-    _refused(with_chain(with_cool(reg, box=CHAIN_BOX)), tmp_path, rf"continues.box '{CHAIN_BOX}' is a chain box",
-             check_files=False)
 
 
 def test_malformed_registries_do_not_crash(tmp_path):
     for bad in (None, [], "x", {}, {"version": 1}, {"version": 1, "boxes": []},
                 {"version": 1, "boxes": {"p01": {"items": [None, 3, {"kind": ["train"]}, {"kind": "eval",
                                                                                         "weights": 5}]}}},
-                {"version": 1, "boxes": {"full": {"items": [{"name": "a", "kind": "speed", "system": ["x"],
+                {"version": 1, "boxes": {"full-p": {"items": [{"name": "a", "kind": "speed", "system": ["x"],
                                                              "speed_kind": {}, "only_if_new_machine": ["p01"],
                                                              "weights": [{"name": ["x"]}], "args": "x"}]}}}):
         assert fr.registry_problems(bad, root=tmp_path)
@@ -1122,8 +1115,8 @@ def test_a_loaded_registry_remembers_its_checkout(tmp_path, monkeypatch):
     tiny_registry(tmp_path, write_boxes=True)
     loaded = fr.load_registry(tmp_path / "configs" / "full" / "boxes.json")  # a path, no root=
     assert fr.box_students("p01", loaded) == ["students/study/p01"]
-    assert fr.box_ctc_students("full", loaded) == ["students/study/p03", "students/study/p005"]
-    assert fr.student_checks("full", lambda s: _metas()[s], loaded) == []
+    assert fr.box_ctc_students("full-p", loaded) == ["students/study/p03", "students/study/p005"]
+    assert fr.student_checks("full-p", lambda s: _metas()[s], loaded) == []
     assert fr.registry_problems(loaded) == []
     assert fr.load_registry(loaded) == loaded
     assert fr.box_students("p01", copy.deepcopy(loaded)) == ["students/study/p01"]  # a copy keeps it
@@ -1153,10 +1146,10 @@ def test_read_json_reads_the_configs_instead_of_a_root(tmp_path, reg):
     assert fr.registry_problems(plain, root=nowhere, read_json=read) == []
     assert "configs/full/data-p01.json" in seen and "configs/full/smoke-b-t06.json" in seen
     loaded = fr.load_registry(plain, root=nowhere, read_json=read)
-    assert fr.box_students("full", loaded, read_json=read) == ["students/study/t06", "students/study/p03",
+    assert fr.box_students("full-p", loaded, read_json=read) == ["students/study/t06", "students/study/p03",
                                                                "students/study/p005"]
-    assert fr.box_ctc_students("full", loaded, read_json=read) == ["students/study/p03", "students/study/p005"]
-    assert fr.student_checks("full", lambda s: _metas()[s], loaded, read_json=read) == []
+    assert fr.box_ctc_students("full-p", loaded, read_json=read) == ["students/study/p03", "students/study/p005"]
+    assert fr.student_checks("full-p", lambda s: _metas()[s], loaded, read_json=read) == []
     # what the reader gives is checked like a file: a data-key mismatch at the sha is refused
     files["configs/full/full-p03.json"]["selection"] = fr.SMOKE_SELECTION
     assert any("full-p03.json differs from the box data config" in p
@@ -1166,7 +1159,7 @@ def test_read_json_reads_the_configs_instead_of_a_root(tmp_path, reg):
     probs = fr.registry_problems(plain, root=nowhere, read_json=read)
     assert any("full-p03.json: not readable JSON (KeyError" in p for p in probs), probs
     with pytest.raises(fr.RegistryError, match="full-p03.json: cannot read it with read_json"):
-        fr.box_students("full", loaded, read_json=read)
+        fr.box_students("full-p", loaded, read_json=read)
 
     def missing(rel):
         raise FileNotFoundError(rel)
@@ -1182,17 +1175,17 @@ def test_box_readers(tmp_path, reg):
     with pytest.raises(fr.RegistryError, match="'smoke-c'"):
         fr.box_spec("smoke-c", reg)
     assert [i["name"] for i in fr.box_items("p01", reg)] == ["stores-ctc", "full-p01", "m4-full-p01"]
-    assert [i["name"] for i in fr.train_items("full", reg)] == ["full-t06", "full-p03", "full-p005"]
+    assert [i["name"] for i in fr.train_items("full-p", reg)] == ["full-t06", "full-p03", "full-p005"]
     assert [i["name"] for i in fr.train_items("full-smoke", reg)] == ["smoke-t06", "smoke-p03", "smoke-p01",
                                                                       "smoke-p005", "smoke-nostart"]
-    assert fr.box_configs("full", reg) == ["configs/full/data-full.json", "configs/full/full-p03.json",
+    assert fr.box_configs("full-p", reg) == ["configs/full/data-both.json", "configs/full/full-p03.json",
                                            "configs/full/full-t06.json", "configs/full/full-p005.json",
                                            "configs/full/boxes.json"]
-    assert fr.box_students("full", reg, tmp_path) == ["students/study/t06", "students/study/p03",
+    assert fr.box_students("full-p", reg, tmp_path) == ["students/study/t06", "students/study/p03",
                                                       "students/study/p005"]
     assert fr.box_students("full-smoke", reg, tmp_path) == ["students/study/t06", "students/study/p03",
                                                             "students/study/p01", "students/study/p005"]
-    assert fr.box_ctc_students("full", reg, tmp_path) == ["students/study/p03", "students/study/p005"]
+    assert fr.box_ctc_students("full-p", reg, tmp_path) == ["students/study/p03", "students/study/p005"]
     assert fr.box_ctc_students("smoke-b", reg, tmp_path) == []
     assert fr.box_students("smoke-b", reg, tmp_path) == []
     assert fr.box_extra_files("p01", reg) == [fr.FROZEN_MANIFEST, "labels/full/selections/full_study/full.json"]
@@ -1207,7 +1200,7 @@ def test_box_readers(tmp_path, reg):
 def test_box_env(reg):
     assert fr.box_env("p01", reg) == {"KITSUNE_N_GPUS": "1", "KITSUNE_WATCHDOG_HB_FILE": "train_hb",
                                       "KITSUNE_WATCHDOG_ORPHAN_S": "3600", "KITSUNE_WATCHDOG_ORPHAN_ACTION": "stop"}
-    assert fr.box_env("full", reg)["KITSUNE_N_GPUS"] == "2"
+    assert fr.box_env("full-p", reg)["KITSUNE_N_GPUS"] == "2"
     assert fr.box_env("full-smoke", reg)["KITSUNE_WATCHDOG_ORPHAN_ACTION"] == "alert"
 
 
@@ -1235,7 +1228,7 @@ def test_student_checks(tmp_path, reg):
     assert fr.student_checks("full-smoke", read, reg, tmp_path) == []
     assert seen == ["students/study/t06", "students/study/p03", "students/study/p01", "students/study/p005"]  # once
     metas = _metas(**{"study-p03": {"params_total": 1}})
-    probs = fr.student_checks("full", lambda s: metas[s], reg, tmp_path)
+    probs = fr.student_checks("full-p", lambda s: metas[s], reg, tmp_path)
     assert probs and all(p.startswith("students/study/p03: study-p03: ") for p in probs)
 
     def boom(s):
@@ -1263,19 +1256,18 @@ def test_cli(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("KITSUNE_FULL_REGISTRY", raising=False)
     monkeypatch.delenv("KITSUNE_BOX", raising=False)
     root = ["--root", str(tmp_path)]
-    assert _cli(["students", "--box", "full", *root], capsys)[:2] == (
-        0, "students/study/t06\nstudents/study/p03\nstudents/study/p005\n")
-    assert _cli(["extra-files", "--box", "p01", *root], capsys)[:2] == (
-        0, f"{fr.FROZEN_MANIFEST}\nlabels/full/selections/full_study/full.json\n")
-    assert _cli(["extra-dirs", "--box", "full-smoke", *root], capsys)[:2] == (
-        0, "models/parakeet-tdt_ctc-0.6b-ja-hf\n")
-    assert _cli(["extra-dirs", "--box", "p01", *root], capsys)[:2] == (0, "")
+    rc, out, _ = _cli(["show", "--box", "full-p", *root], capsys)
+    shown = json.loads(out)
+    assert rc == 0 and shown["students"] == ["students/study/t06", "students/study/p03", "students/study/p005"]
+    assert shown["env"]["KITSUNE_N_GPUS"] == "2" and shown["configs"][0] == "configs/full/data-both.json"
     rc, out, _ = _cli(["show", "--box", "p01", *root], capsys)
     shown = json.loads(out)
     assert rc == 0 and shown["box"] == "p01" and shown["env"]["KITSUNE_N_GPUS"] == "1"
     assert shown["spec"]["items"][2]["needs"] == ["full-p01"] and shown["students"] == ["students/study/p01"]
+    assert shown["spec"]["extra_files"] == [fr.FROZEN_MANIFEST, "labels/full/selections/full_study/full.json"]
     monkeypatch.setenv("KITSUNE_BOX", "p01")  # --box defaults to the env
-    assert _cli(["students", *root], capsys)[:2] == (0, "students/study/p01\n")
+    rc, out, _ = _cli(["show", *root], capsys)
+    assert rc == 0 and json.loads(out)["box"] == "p01"
 
 
 def test_cli_check_students(tmp_path, monkeypatch, capsys):
@@ -1284,11 +1276,11 @@ def test_cli_check_students(tmp_path, monkeypatch, capsys):
     for s, m in _metas().items():
         (tmp_path / s).mkdir(parents=True)
         (tmp_path / s / "student_meta.json").write_text(json.dumps(m), encoding="utf-8")
-    rc, out, _ = _cli(["check-students", "--box", "full", "--root", str(tmp_path)], capsys)
+    rc, out, _ = _cli(["check-students", "--box", "full-p", "--root", str(tmp_path)], capsys)
     assert rc == 0 and "3 student(s) are the registered builds" in out
     (tmp_path / "students/study/p005/student_meta.json").write_text(json.dumps(_meta("study-p005", seed=1)),
                                                                      encoding="utf-8")
-    rc, _, err = _cli(["check-students", "--box", "full", "--root", str(tmp_path)], capsys)
+    rc, _, err = _cli(["check-students", "--box", "full-p", "--root", str(tmp_path)], capsys)
     assert rc == 2 and "student refused: students/study/p005: study-p005: seed 1" in err
     (tmp_path / "students/study/p01/student_meta.json").unlink()
     rc, _, err = _cli(["check-students", "--box", "p01", "--root", str(tmp_path)], capsys)
@@ -1298,7 +1290,7 @@ def test_cli_check_students(tmp_path, monkeypatch, capsys):
 def test_cli_refusals(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("KITSUNE_FULL_REGISTRY", raising=False)
     monkeypatch.delenv("KITSUNE_BOX", raising=False)
-    rc, _, err = _cli(["students", "--box", "p01", "--root", str(tmp_path)], capsys)
+    rc, _, err = _cli(["show", "--box", "p01", "--root", str(tmp_path)], capsys)
     assert rc == 2 and "not in this checkout" in err  # no registry
     reg = tiny_registry(tmp_path)
     reg["boxes"].pop("smoke-b")
@@ -1310,32 +1302,31 @@ def test_cli_refusals(tmp_path, monkeypatch, capsys):
     rc, _, err = _cli(["check-students", "--box", "p01", "--root", str(tmp_path)], capsys)
     assert rc == 2 and "gpus 0" in err
     with pytest.raises(SystemExit) as e:
-        fr.main(["students", "--root", str(tmp_path)])  # no --box and no KITSUNE_BOX
+        fr.main(["show", "--root", str(tmp_path)])  # no --box and no KITSUNE_BOX
     assert e.value.code == 2
     with pytest.raises(SystemExit) as e:
-        fr.main(["students", "--box", "box-a"])  # not a full box
+        fr.main(["show", "--box", "box-a"])  # not a full box
     assert e.value.code == 2
 
 
 def test_cli_has_continues(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("KITSUNE_FULL_REGISTRY", raising=False)
     monkeypatch.delenv("KITSUNE_BOX", raising=False)
-    monkeypatch.setenv("KITSUNE_CHAIN_STAGE", "x")  # a chain's stage is no business of has-continues
     root = ["--root", str(tmp_path)]
-    rc, _, err = _cli(["has-continues", "--box", "p-cool", *root], capsys)
+    rc, _, err = _cli(["has-continues", "--box", "full-t", *root], capsys)
     assert rc == 2 and "not in this checkout" in err  # no registry
     reg = with_cool(tiny_registry(tmp_path))
     (tmp_path / fr.BOXES_FILE).write_text(json.dumps(reg), encoding="utf-8")
-    assert _cli(["has-continues", "--box", "p-cool", *root], capsys) == (0, "1\n", "")
+    assert _cli(["has-continues", "--box", "full-t", *root], capsys) == (0, "1\n", "")
     assert _cli(["has-continues", "--box", "p01", *root], capsys) == (0, "0\n", "")
-    assert _cli(["has-continues", "--box", "full", *root], capsys) == (0, "0\n", "")
-    monkeypatch.setenv("KITSUNE_BOX", "p-cool")  # bootstrap: --box from the env
+    assert _cli(["has-continues", "--box", "full-p", *root], capsys) == (0, "0\n", "")
+    monkeypatch.setenv("KITSUNE_BOX", "full-t")  # bootstrap: --box from the env
     assert _cli(["has-continues", *root], capsys) == (0, "1\n", "")
-    rc, out, err = _cli(["has-continues", "--box", "full-p", *root], capsys)
-    assert (rc, out) == (2, "") and "'full-p' is not in the registry" in err  # an unknown box
-    next(i for i in reg["boxes"]["p-cool"]["items"] if i["name"] == "full-p01")["continues"]["from_step"] = 0
+    rc, out, err = _cli(["has-continues", "--box", "p005", *root], capsys)
+    assert (rc, out) == (2, "") and "'p005' is not in the registry" in err  # an unknown box
+    next(i for i in reg["boxes"]["full-t"]["items"] if i["name"] == "full-p01")["continues"]["from_step"] = 0
     (tmp_path / fr.BOXES_FILE).write_text(json.dumps(reg), encoding="utf-8")
-    rc, out, err = _cli(["has-continues", "--box", "p-cool", *root], capsys)
+    rc, out, err = _cli(["has-continues", "--box", "full-t", *root], capsys)
     assert (rc, out) == (2, "") and "from_step 0 is not an int > 0" in err  # a bad registry
     with pytest.raises(SystemExit) as e:
         fr.main(["has-continues", "--box", "box-a", *root])  # not a full box name
@@ -1345,6 +1336,6 @@ def test_cli_has_continues(tmp_path, monkeypatch, capsys):
 def test_cli_as_a_module(tmp_path):
     tiny_registry(tmp_path, write_boxes=True)
     env = {k: v for k, v in __import__("os").environ.items() if k not in ("KITSUNE_FULL_REGISTRY", "KITSUNE_BOX")}
-    out = subprocess.run([sys.executable, "-m", "kitsune.fullrun", "students", "--box", "p01", "--root",
+    out = subprocess.run([sys.executable, "-m", "kitsune.fullrun", "show", "--box", "p01", "--root",
                           str(tmp_path)], cwd=ROOT, capture_output=True, text=True, timeout=120, env=env)
-    assert (out.returncode, out.stdout) == (0, "students/study/p01\n"), out.stderr
+    assert out.returncode == 0 and json.loads(out.stdout)["students"] == ["students/study/p01"], out.stderr

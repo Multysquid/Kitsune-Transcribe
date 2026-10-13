@@ -4,6 +4,7 @@ Everything runs on CPU on a TINY random CohereAsr model built from the teacher's
 that loads the real 2B teacher is marked `slow`."""
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -75,6 +76,11 @@ def rand_importance(layers, width, seed=0) -> dict:
     return {(l, n): torch.rand(width, generator=g) for l in layers for n in S.FFN_NAMES}
 
 
+def b20_spec() -> S.StudentSpec:
+    """B20x2560 / dec4, the first run's T-0.6B shape (S.EXPECTED_DEFAULT_PARAMS)."""
+    return S.StudentSpec(enc_layers=S.evenly_spaced(20, S.TEACHER_ENC_LAYERS), ffn_dim=2560, dec_layers=[0, 2, 5, 7])
+
+
 def expected_tensor(teacher_sd: dict, key: str, spec: S.StudentSpec, keep: dict) -> torch.Tensor:
     """What the student tensor `key` must equal, spelled out case by case."""
     parts = key.split(".")
@@ -112,7 +118,7 @@ def teacher_forced_logits(model, feats, mask, n_dec: int = 5) -> torch.Tensor:
 def test_evenly_spaced():
     assert S.evenly_spaced(20, 48) == [0, 2, 5, 7, 10, 12, 15, 17, 20, 22, 25, 27, 30, 32, 35, 37, 40, 42, 45, 47]
     assert S.evenly_spaced(4, 8) == [0, 2, 5, 7]
-    assert S.evenly_spaced(4, 48) == [0, 16, 31, 47]  # the laptop smoke student
+    assert S.evenly_spaced(4, 48) == [0, 16, 31, 47]  # a 4-layer encoder
     assert S.evenly_spaced(1, 48) == [0]
     assert S.evenly_spaced(48, 48) == list(range(48))
     for n in range(1, 49):  # strictly increasing, both ends kept
@@ -124,8 +130,8 @@ def test_evenly_spaced():
         S.evenly_spaced(0, 48)
 
 
-def test_default_spec_and_real_param_count_on_meta():
-    spec = S.default_spec()
+def test_b20_spec_and_real_param_count_on_meta():
+    spec = b20_spec()
     assert spec.enc_layers == S.evenly_spaced(20, 48) and spec.ffn_dim == 2560
     assert spec.dec_layers == [0, 2, 5, 7] and spec.tie_head
     cfg = S.student_config(CohereAsrConfig(), spec)  # CohereAsrConfig() defaults are the teacher's dims
@@ -423,11 +429,12 @@ def test_save_load_roundtrip(tmp_path):
     # the model card (licence terms, the Apache-2.0 modified-from notice) travels with the weights
     card = (out / "README.md").read_text(encoding="utf-8")
     assert card == S.MODEL_CARD.read_text(encoding="utf-8")
-    assert "license: other" in card and f"base_model: {S.TEACHER_ID}" in card
+    # CC BY-NC 4.0, the released models' licence (2026-10-12), as a Hub licence id: no custom license_name/link
+    assert "license: cc-by-nc-4.0\n" in card and "license_name" not in card and f"base_model: {S.TEACHER_ID}" in card
     assert "b1eacc2686a3d08ceaae5f24a88b1d519620bc09" in card and "non-commercial" in card
     # the licence texts it names (the Galgame card's own license_link points to a missing LICENSE.md)
     assert "https://www.gnu.org/licenses/gpl-3.0.txt" in card and "3fb86654222b3f0af0f7c332ae6a0ef9752a9451" in card
-    assert all(f"https://creativecommons.org/licenses/by/{v}/" in card for v in ("4.0", "3.0"))
+    assert all(f"https://creativecommons.org/licenses/{v}/" in card for v in ("by-nc/4.0", "by/4.0", "by/3.0"))
     with safe_open(out / "model.safetensors", "pt") as f:
         keys = set(f.keys())
         dtypes = {k: f.get_slice(k).get_dtype() for k in keys}
@@ -500,12 +507,14 @@ def test_build_script_help_is_light():
 
 
 def test_build_script_calibrates_on_the_viability_sources_by_default():
-    """The documented plain command rebuilds students/b20x2560-d4, which was calibrated on every viability source."""
+    """The documented plain command rebuilds students/b20x2560-d4, which was calibrated on every source the viability
+    run trained on, from its selection."""
     from fixtures import load_script
 
-    viability = json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))
     args = load_script("03_build_student").parse_args([])
-    assert args.sources == viability["sources"] and args.out == ROOT / viability["student"]
+    assert args.sources == ["reazon_small", "emilia_yodas", "galgame"]
+    assert args.out == ROOT / "students" / "b20x2560-d4"
+    assert Path(args.selection) == ROOT / "selection" / "viability.parquet"
 
 
 def test_build_script_end_to_end_tiny(tmp_path):
@@ -582,9 +591,9 @@ def test_build_script_end_to_end_tiny(tmp_path):
 
 def test_build_script_study_flags_end_to_end_tiny(tmp_path):
     """The size study's pruned builds on a tiny saved teacher: --bn keep (teacher BN stats, no calibration audio for
-    BN), --importance-layers all (one cache over every teacher layer) reused by another size through
-    --importance-cache, and --ffn-from (another student's FFN selection, cross-checked against its importance.pt;
-    no calibration audio at all). Plus the step-0 function check and the build identity guard."""
+    BN), another size on the same --calib-ids (its kept layers' importance is the first build's for those layers:
+    measured inside the full teacher), and --ffn-from (another student's FFN selection, cross-checked against its
+    importance.pt; no calibration audio at all). Plus the build identity guard."""
     try:
         from transformers import AutoProcessor
 
@@ -606,20 +615,17 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
               "--calib-per-group", "4", "--calib-batch-s", "20", "--eval-batch-s", "20", "--teacher-dtype", "fp32"]
     mod = load_script("03_build_student")
 
-    a = tmp_path / "a"  # B3x48 / dec {0,2}, BN kept, importance over all 4 teacher layers
+    a = tmp_path / "a"  # B3x48 / dec {0,2}, BN kept, importance over its 3 kept layers
     argv_a = common + ["--enc-layers", "3", "--ffn", "48", "--dec-layers", "0", "2", "--bn", "keep",
-                       "--importance-layers", "all", "--step0-eval-utts", "3", "--out", str(a)]
+                       "--step0-eval-utts", "3", "--out", str(a)]
     assert mod.main(argv_a) == 0
     ma = S.load_meta(a)
     assert ma["bn"] == "teacher" and "bn_recal" not in ma and ma["calibration"]["n_bn"] == 0
-    assert ma["calibration"]["n_importance"] == 10 and ma["importance"]["n_layers"] == 4
+    assert ma["calibration"]["n_importance"] == 10 and ma["importance"]["n_layers"] == 3
     assert ma["importance"]["teacher_dtype"] == "torch.float32" and not ma["importance"]["reused"]
     assert (ma["family"], ma["init_class"], ma["enc_layers"], ma["ffn"]) == ("aed", "pruned_kept", [0, 2, 3], 48)
     assert ma["params_total"] == ma["closed_form_params"] and ma["expected_params"] is None  # not a study shape
-    fcheck = ma["function_check"]
-    assert fcheck["on_gate"] is False and fcheck["threshold"] == 0.9 and isinstance(fcheck["over_threshold"], bool)
-    assert fcheck["function"] == "kept" and fcheck["by"] == mod.AED_FUNCTION_RULE  # the owner's decision, not the rule
-    assert fcheck["cer_vs_teacher"] == ma["step0"]["greedy"]["all"]["cer_teacher_corpus"]
+    assert "function_check" not in ma and ma["step0"]["n_per_set"] == {"eval_x": 3}
     assert ma["build"]["seed"] == 1234 and ma["build"]["calibration"] == dict(
         sources=["src_a"], calib_utts=10, bn_utts=6, per_group=4, ids_sha256=None)
     card = (a / "README.md").read_text(encoding="utf-8")
@@ -627,7 +633,7 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
            "the token embedding, then trained by distillation from the teacher's outputs. Its BatchNorm statistics " \
            "are the teacher's." in card and "recalibrated" not in card
     cache = torch.load(a / "importance.pt", weights_only=True)
-    assert cache["layers"] == [0, 1, 2, 3] and len(cache["importance"]) == 8
+    assert cache["layers"] == [0, 2, 3] and len(cache["importance"]) == 6
     tsd = teacher.state_dict()
     sd = load_file(a / "model.safetensors")
     for j, tl in enumerate([0, 2, 3]):  # the teacher's BN stats, fp32, bitwise
@@ -635,45 +641,26 @@ def test_build_script_study_flags_end_to_end_tiny(tmp_path):
             assert torch.equal(sd[f"model.encoder.layers.{j}.conv.norm.{b}"],
                                tsd[f"model.encoder.layers.{tl}.conv.norm.{b}"])
 
-    # another size reuses the all-layer cache: nothing recomputed, nothing written
-    b = tmp_path / "b"
-    mtime = (a / "importance.pt").stat().st_mtime_ns
-    assert mod.main(common + ["--enc-layers", "2", "--ffn", "32", "--dec-layers", "1", "--bn", "keep",
-                              "--importance-cache", str(a / "importance.pt"), "--step0-eval-utts", "0",
-                              "--out", str(b)]) == 0
-    mb = S.load_meta(b)
-    assert mb["importance"]["reused"] and mb["importance"]["path"] == str(a / "importance.pt")
-    assert (a / "importance.pt").stat().st_mtime_ns == mtime and not (b / "importance.pt").exists()
-    imp = S.importance_from_state(cache["importance"])
-    want = S.select_ffn_neurons(imp, [0, 3], 32, 128)
-    assert mb["kept"]["ffn"] == {f"{l}.{n}": v.tolist() for (l, n), v in sorted(want.items())}
-    # a named cache that does not match (other calibration ids; the same ids through a bf16 teacher, which ranks the
-    # neurons at the cut differently) is an input: refused, never overwritten
-    with pytest.raises(SystemExit, match="does not match"):
-        mod.main([x if x != "10" else "9" for x in common] + [
-            "--enc-layers", "2", "--ffn", "32", "--dec-layers", "1", "--bn", "keep", "--importance-cache",
-            str(a / "importance.pt"), "--step0-eval-utts", "0", "--out", str(tmp_path / "b2")])
-    with pytest.raises(SystemExit, match="does not match"):
-        mod.main([x if x != "fp32" else "bf16" for x in common] + [
-            "--enc-layers", "2", "--ffn", "32", "--dec-layers", "1", "--bn", "keep", "--importance-cache",
-            str(a / "importance.pt"), "--step0-eval-utts", "0", "--out", str(tmp_path / "b2")])
-    assert (a / "importance.pt").stat().st_mtime_ns == mtime
-    assert cache["key"]["teacher_dtype"] == "torch.float32"
-
     # the sampled ids are written in sample order; --calib-ids reads exactly them back (another seed would draw
-    # others), so the cache key matches again
+    # others): another size on them measures its kept layers exactly as the first build did (FFN importance is
+    # measured inside the full teacher, whichever layers a student keeps)
     ids_a = (a / "calibration_ids.txt").read_text(encoding="utf-8").split()
     assert len(ids_a) == 10 and ma["calibration"]["ids_file"] == "calibration_ids.txt"
     assert mod.ids_sha(ids_a) == ma["calibration"]["importance_ids_sha256"] == cache["key"]["ids_sha256"]
     b3 = tmp_path / "b3"
     assert mod.main(common + [
         "--seed", "99", "--calib-ids", str(a / "calibration_ids.txt"), "--enc-layers", "2", "--ffn", "32",
-        "--dec-layers", "1", "--bn", "keep", "--importance-cache", str(a / "importance.pt"), "--step0-eval-utts", "0",
-        "--out", str(b3)]) == 0
+        "--dec-layers", "1", "--bn", "keep", "--step0-eval-utts", "0", "--out", str(b3)]) == 0
     mb3 = S.load_meta(b3)
-    assert mb3["importance"]["reused"] and mb3["calibration"]["ids_from"] == str(a / "calibration_ids.txt")
+    assert not mb3["importance"]["reused"] and mb3["calibration"]["ids_from"] == str(a / "calibration_ids.txt")
     assert mb3["build"]["seed"] == 99 and mb3["build"]["calibration"]["ids_sha256"] == mod.ids_sha(ids_a)
     assert (b3 / "calibration_ids.txt").read_text(encoding="utf-8").split() == ids_a
+    c3 = torch.load(b3 / "importance.pt", weights_only=True)
+    assert c3["layers"] == [0, 3] and c3["key"] == cache["key"]
+    imp_a, imp_b = S.importance_from_state(cache["importance"]), S.importance_from_state(c3["importance"])
+    assert all(torch.equal(imp_b[k], imp_a[k]) for k in imp_b)
+    want = S.select_ffn_neurons(imp_a, [0, 3], 32, 128)
+    assert mb3["kept"]["ffn"] == {f"{l}.{n}": v.tolist() for (l, n), v in sorted(want.items())}
     (tmp_path / "bad_ids.txt").write_text("\n".join(ids_a[:9] + ["no-such-id"]) + "\n", encoding="utf-8")
     with pytest.raises(SystemExit, match="not kept train rows"):
         mod.main(common + ["--calib-ids", str(tmp_path / "bad_ids.txt"), "--enc-layers", "2", "--ffn", "32",
@@ -837,7 +824,7 @@ def test_feature_batches_leave_grad_mode_alone():
 
 def test_build_identity_gate_and_legacy_meta():
     """A pruned build's identity holds the seed and the calibration inputs; the first run's format-1 meta still reads
-    as the default build; function_check's on_gate needs the gate's 20 per set AND its seed."""
+    as the default build."""
     from fixtures import load_script
 
     mod = load_script("03_build_student")
@@ -851,28 +838,12 @@ def test_build_identity_gate_and_legacy_meta():
     assert mod.legacy_identity(first_run) == default
     assert mod.build_identity(mod.parse_args(["--seed", "7"])) != default
 
-    step0 = dict(n_per_set={s: 20 for s in mod.EVAL_SETS}, seed=1234, greedy={"all": {"cer_teacher_corpus": 0.95}},
-                 teacher_forced={"all": {"kl": 4.0}})
-    fc = mod.function_check(step0)
-    # the owner's decision of 2026-09-26: a pruned Transcribe student is function kept even over the 90 % line (T-0.6B
-    # measures 132 %); the 90 % rule classifies the Parakeet students only (03c)
-    assert fc == dict(cer_vs_teacher=0.95, kl=4.0, threshold=0.9, over_threshold=True, function="kept",
-                      by=mod.AED_FUNCTION_RULE, on_gate=True)
-    assert "Parakeet students only" in mod.AED_FUNCTION_RULE and "kept-t03" in mod.AED_FUNCTION_RULE
-    assert mod.function_check(dict(step0, seed=7))["on_gate"] is False  # another 60 utterances
-    assert mod.function_check(dict(step0, n_per_set={"eval_jsut": 20}))["on_gate"] is False
-    no_seed = {k: v for k, v in step0.items() if k != "seed"}  # recorded before step-0 held its seed
-    assert mod.function_check(no_seed)["on_gate"] is False
-    under = mod.function_check(dict(step0, greedy={"all": {"cer_teacher_corpus": 0.6}}))
-    assert (under["over_threshold"], under["function"]) == (False, "kept")
-
 
 def test_model_card_describes_the_student():
     """README.md's Apache-2.0 modification notice says what was done to the teacher: the first run's student keeps
-    the card as written; a study student gets its own shape and BN mode; a scratch student says its weights are
-    random. The card's wording is what model_card rewrites (a changed card would only warn)."""
-    from dataclasses import asdict
-
+    the card as written; a study student gets its own shape and BN mode; a from-scratch student's (the size study's,
+    whose builder and sentence were removed after it) keeps the card as written, with a warning. The card's wording
+    is what model_card rewrites (a changed card would only warn)."""
     card = S.MODEL_CARD.read_bytes().decode("utf-8").replace("\r\n", "\n")  # LF, whatever the checkout's endings
     assert S._CARD_CHANGES.search(card)
     assert S.model_card({}) == card and S.model_card({"format": 1, "bn": {"n_utts": 1000}}) == card
@@ -900,30 +871,40 @@ def test_model_card_describes_the_student():
                           "outputs. Its BatchNorm statistics are the teacher's.") and "recalibrated" not in t03
     untied = notice(dict(pruned, bn="recal", ffn=5120, build={"tie_head": False}))
     assert "FFN 5120;" in untied and "tied" not in untied and "BatchNorm statistics recalibrated" in untied
-    scratch = notice(dict(init_class="scratch", bn="fresh", scratch=dict(name="t01", **asdict(S.SCRATCH_SHAPES["t01"])),
-                          build={"init": "scratch"}))
-    assert scratch.startswith("It has that model's architecture at another size (encoder: 12 layers, width 512, FFN "
-                              "2048; decoder: 4 layers, width 512, FFN 2048;") and "randomly initialised" in scratch
-    assert "pruned" not in scratch and "FFN neurons kept" not in scratch
+    with pytest.warns(UserWarning, match="from-scratch"):
+        assert S.model_card(dict(init_class="scratch", bn="fresh", build={"init": "scratch"})) == card
 
 
 STUDY_STUDENTS = Path(os.environ.get("KITSUNE_STUDY_STUDENTS", "D:/kitsune-students/study"))
+_CARD_INTRO_END = "[Kitsune-Transcribe](https://github.com/Multysquid/Kitsune-Transcribe).\n"
 
 
-@pytest.mark.parametrize("name", ["t06", "t03", "bridge", "t01", "t01-s1235", "t005"])
+def _card_without_licence(card: str) -> tuple[str, str]:
+    """(the card up to its introduction without the front matter's licence lines, the card from Terms on): what the
+    licence change of 2026-10-12 left alone. It set the front matter's licence to cc-by-nc-4.0 (dropping the custom
+    license_name / license_link) and replaced the Status paragraph between the introduction and Terms with Licence."""
+    head, rest = card.split(_CARD_INTRO_END, 1)
+    return re.sub(r"(?m)^license.*\n", "", head) + _CARD_INTRO_END, rest[rest.index("\n## Terms\n"):]
+
+
+@pytest.mark.parametrize("name", ["t06", "t03"])
 def test_model_card_is_the_uploaded_readme(name):
-    """model_card renders exactly the README.md uploaded with each Transcribe student init of the size study
+    """model_card renders the README.md uploaded with each pruned Transcribe student init of the size study
     (Multy123/kitsune-data students/study/<name>/, local copies under D:/kitsune-students/study; skipped without
-    them), from its student_meta.json alone; a checkpoint trained from it (its meta plus the trainer's `trained`
-    block, 04_distill save_weights) gets the same card."""
+    them) from its student_meta.json alone, except for the licence: those READMEs predate the release and still say
+    `license: other` and that the licence is fixed at release, while MODEL_CARD.md now says CC BY-NC 4.0. Everything
+    else - the front matter's datasets, the terms, the notice describing the student and the training data - is
+    byte for byte the uploaded card's; a checkpoint trained from the init (its meta plus the trainer's `trained`
+    block, 04_distill save_weights) gets the same card. (The from-scratch inits' cards - bridge, t01, t01-s1235,
+    t005 - came from the builder removed after the study; the last commit with it is 76b28a1.)"""
     d = STUDY_STUDENTS / name
     if not (d / "README.md").is_file() or not (d / "student_meta.json").is_file():
         pytest.skip(f"no uploaded student {d}")
     meta = json.loads((d / "student_meta.json").read_text(encoding="utf-8"))
-    want = (d / "README.md").read_bytes().decode("utf-8")
-    assert S.model_card(meta) == want
+    want = _card_without_licence((d / "README.md").read_bytes().decode("utf-8"))
+    assert _card_without_licence(S.model_card(meta)) == want
     trained = dict(meta, trained=dict(run_id=f"study-{name}", step=9370, reason="final", lr_phase="cooldown"))
-    assert S.model_card(trained) == want
+    assert S.model_card(trained) == S.model_card(meta)
 
 
 def test_importance_state_roundtrip(tmp_path):
@@ -953,7 +934,7 @@ def test_build_default_student_from_real_teacher():
     teacher = CohereAsrForConditionalGeneration.from_pretrained(S.TEACHER_ID, dtype=torch.bfloat16,
                                                                 attn_implementation="sdpa")
     t_load = time.time() - t0
-    spec = S.default_spec()
+    spec = b20_spec()
     imp = rand_importance(spec.enc_layers, 5120, seed=7)
     student = S.build_student(teacher, spec, imp)  # strict=True inside: raises on any missing/unexpected key
     t_build = time.time() - t0 - t_load

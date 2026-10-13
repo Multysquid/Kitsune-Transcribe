@@ -16,19 +16,11 @@ aggregate per step, source, utterance and confidence bucket; its loss is (w_kl*s
 
 L2-SP (Li et al. 2018) pulls the weights back towards the init: a loss-form L2 would be rescaled per coordinate by
 Adam, so it is applied decoupled, like AdamW's decay, right after optimizer.step(): p -= lr*lam*(p - p0).
-
-Aux CTC (the from-scratch students, scripts/04_distill.py loss.aux_ctc_weight): a training-only linear head d_enc ->
-V + 1 on the encoder's final hidden states, whose extra class V is the blank (so it can never collide with a target),
-trained with CTC on the teacher's stored greedy ids of each utterance (no prompt, no EOS): aux_ctc_targets builds them
-from a collated micro-batch, aux_ctc_loss sums F.ctc_loss over it (log_softmax in fp32, zero_infinity: an utterance
-with more targets than encoder frames adds 0). The trainer divides the step's sum by the step's target tokens, the
-same N the KD objective divides by.
 """
 from collections import defaultdict
 from typing import Iterable
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 W_KL, W_CE = 1.0, 0.8  # D15c
@@ -79,25 +71,6 @@ def kd_objective(losses: dict[str, Tensor], n_tokens: int, w_kl: float = W_KL, w
     return (w_kl * losses["kl"].sum() + w_ce * losses["ce"].sum()) / n_tokens
 
 
-def aux_ctc_targets(greedy: Tensor, tgt_row: Tensor, n_rows: int, eos: int) -> tuple[Tensor, Tensor]:
-    """The aux-CTC targets of a collated micro-batch: greedy = top_idx[:, 0] (N,), the teacher's greedy token at every
-    target position in the collate's row-major order, tgt_row (N,) its row. EOS is dropped (a truncated utterance has
-    none; the prompt is never a target). Returns (targets (sum U,) long, concatenated in row order; target_lengths
-    (n_rows,) long)."""
-    keep = greedy != int(eos)
-    return greedy[keep].long(), torch.bincount(tgt_row[keep], minlength=int(n_rows)).long()
-
-
-def aux_ctc_loss(logits: Tensor, input_lengths: Tensor, targets: Tensor, target_lengths: Tensor, blank: int) -> Tensor:
-    """Sum over the batch of the CTC loss of logits (B, T, V + 1) with valid frames input_lengths (B,): log_softmax in
-    fp32 outside autocast, reduction "sum", zero_infinity (an infeasible utterance, U + repeats > frames, adds 0 and no
-    gradient). A 0-dim fp32 tensor."""
-    with torch.autocast(device_type=logits.device.type, enabled=False):
-        lp = logits.float().log_softmax(-1).transpose(0, 1)  # (T, B, C)
-        return F.ctc_loss(lp, targets, input_lengths.long(), target_lengths, blank=int(blank), reduction="sum",
-                          zero_infinity=True)
-
-
 def module_key(name: str) -> str:
     """Parameter name -> top-level module for logging: encoder.layers.7, decoder.layers.2, encoder.subsampling,
     decoder.embed_tokens, decoder.proj, proj_out, ..."""
@@ -142,25 +115,14 @@ class L2SP:
             yield self.params[start:], self.ref[start:]
 
     @torch.no_grad()
-    def apply_(self, lr: float, value: bool = False) -> Tensor | None:
-        """p -= lr*lam*(p - p0). Call right after optimizer.step() with that step's lr. value=True also returns
-        value() of the updated weights, from the same pass over them: p' - p0 = (1 - lr*lam)(p - p0), so it equals
-        value() up to fp32 rounding (a second pass costs ~1 s for 617M params in host memory)."""
+    def apply_(self, lr: float):
+        """p -= lr*lam*(p - p0). Call right after optimizer.step() with that step's lr."""
         a = lr * self.lam
-        if a == 0.0 and not value:
-            return None
-        sq = []
+        if a == 0.0:
+            return
         for ps, rs in self._chunks():
             diff = torch._foreach_sub(ps, rs)  # promotes the bf16 reference to the params' fp32
-            if value:
-                sq.extend(n.float().square() for n in torch._foreach_norm(diff))
-            if a != 0.0:
-                torch._foreach_add_(ps, diff, alpha=-a)
-        if not value:
-            return None
-        if not sq:
-            return torch.zeros((), dtype=torch.float32)
-        return 0.5 * self.lam * (1.0 - a) ** 2 * torch.stack(sq).sum()
+            torch._foreach_add_(ps, diff, alpha=-a)
 
     @torch.no_grad()
     def _sq_dists(self) -> list[Tensor]:

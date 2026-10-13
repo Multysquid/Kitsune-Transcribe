@@ -2,9 +2,9 @@
 extent record.
 
 Utterance ids depend on the ingest order, and the label box decides per shard stem what is labelled. So the canonical
-sequence must give the laptop's ids AND stems; a capped extent must give a prefix of the full run's stems, because the
-A100 rebuilds a subset and pulls the label box's files for exactly those stems; and the record must say which stems a
-subset takes, which files to pull and how big the rebuild is.
+sequence must give the laptop's ids AND stems; a capped extent must give a prefix of the full run's stems, because a
+full box rebuilds a subset and pulls the label box's files for exactly those stems; and the record must say which stems
+a subset takes, which files to pull and how big the rebuild is.
 
 The upstreams are faked with tests/test_prepare_data.py's tar and parquet builders, but per repo: one 01 process now
 reads every source. Toy sizes: 4 rows per shard, a 3-row galgame hold-out, and a 300 h step whose budget (5 s) cuts
@@ -112,7 +112,7 @@ def world(upstream, tmp_path, monkeypatch) -> SimpleNamespace:
 
 def make_cfg(name: str = "full", inputs: dict | None = None, sources=FULL_SOURCES, eval_sets=EVAL_SETS,
              root: str = "labels/full") -> dict:
-    """A run config shaped like configs/full.json."""
+    """A training config on an extent: configs/full.json's keys plus a trainer's run_name and student."""
     return {"run_name": f"{name}-b20x2560", "student": "students/b20x2560-d4", "data_root": "data",
             "teacher_root": f"{root}/teacher_out", "second_root": f"{root}/second_out",
             "parakeet_root": f"{root}/parakeet_out", "selection": f"{root}/selections/{name}.parquet",
@@ -234,7 +234,7 @@ def test_a_single_uncapped_emilia_call_differs(full, world, tmp_path):
 ], ids=["caps", "300h", "few-names"])
 def test_capped_extent_is_a_prefix_of_the_full_run(full, world, tmp_path, monkeypatch, sources, eval_sets, inputs):
     """A subset config rebuilds only its closure's inputs, and every stem it rebuilds is the full run's stem with the
-    same rows, so the A100 joins the label box's files by stem. The stems it takes are what subset_stems says, their
+    same rows, so a full box joins the label box's files by stem. The stems it takes are what subset_stems says, their
     ids_sha256 the record's, and sizing's download and shard bytes are what the rebuild really moved."""
     cfg = make_cfg("sub", inputs, sources, eval_sets)
     assert extent.validate(cfg) == [] and extent.within(full.cfg, cfg) == []
@@ -281,8 +281,6 @@ def test_validate(monkeypatch):
         assert len(got) == 1, got
         return got[0]
 
-    assert problems(sources=FULL_SOURCES + ["reazon_medium"]).startswith("reazon_medium: refused")
-    assert problems(sources=FULL_SOURCES + ["cv"]).startswith("cv: refused")
     assert problems(sources=FULL_SOURCES + ["eval"]).startswith("eval: not a canonical source")
     assert "emilia_yodas is \"300h\" or an int 9..29, not 8" in problems({"emilia_yodas": 8})
     assert "not 30" in problems({"emilia_yodas": 30})
@@ -381,8 +379,7 @@ def test_closure_and_plan_steps():
     assert extent.closure(["galgame", "eval_jsut", "emilia_yodas@300h"]) == {"galgame", "eval_jsut",
                                                                               "emilia_yodas@300h"}
     keys = [s.key for s in extent.CANONICAL]
-    assert len(set(keys)) == len(keys) and {s.source for s in extent.CANONICAL} == set(prep.ALL_SOURCES) - {
-        "reazon_medium", "cv", "eval"}
+    assert len(set(keys)) == len(keys) and {s.source for s in extent.CANONICAL} == set(prep.ALL_SOURCES) - {"eval"}
     # the orders the ids depend on
     assert keys.index("reazon_small") < keys.index("reazon_large")
     assert keys.index("emilia_yodas@300h") < keys.index("eval_emilia") < keys.index("emilia_yodas")
@@ -614,15 +611,31 @@ def test_sizing_from_a_toy_record():
     assert extent.sizing(rec, h300)["down_gb"] == pytest.approx(9) and extent.sizing(rec, h300)["hours"] == 270
     assert extent.sizing(rec, make_cfg("e", sources=["emilia_yodas"], eval_sets=[]))["down_gb"] == pytest.approx(
         9 + 0.4 + 4)
-    # the full extent's ~570 GB upstream: a ~6.4 h rebuild cap on the A100
+    # the full extent's ~570 GB upstream: a ~6.4 h rebuild cap on a full box
     assert extent.REBUILD_BASE_MIN + extent.REBUILD_SLACK * 570e9 / extent.REBUILD_BYTES_PER_S / 60 == pytest.approx(
         386.25)
 
 
+def test_sizing_counts_both_stores_the_parakeet_labels_and_the_extra():
+    """A box that reads both label roots (pull_parakeet) builds two stores and pulls both roots' labels; extra_gb (a
+    registry box's extra disk: its checkpoints) goes onto the disk too."""
+    rec = {"schema": 1, "sources": {"reazon_small": {"hours": 100.0, "bytes": 3e9, "inputs": [
+        {"ordinal": 0, "bytes": 3e9, "stems": [{"stem": "train-00000", "step": "reazon_small", "hours": 100.0,
+                                                 "shard_bytes": 3e9}]}]}}}
+    cfg = {"extent": {"name": "full", "root": "labels/full", "inputs": {}}, "sources": ["reazon_small"],
+           "eval_sets": []}
+    one = extent.sizing(rec, cfg)
+    both = extent.sizing(rec, dict(cfg, pull_parakeet=True), extra_gb=100)
+    assert one["stores"] == 1 and both["stores"] == 2 and both["extra_gb"] == 100
+    assert both["labels_gb"] == pytest.approx(100 * (extent.LABEL_GB_PER_HOUR + extent.PARAKEET_GB_PER_HOUR))
+    need = extent.DISK_MARGIN * (extent.DISK_BASE_GB + 3 + 2 * 3 + both["labels_gb"] + 100)
+    assert both["disk_gb"] == int(-(-need // extent.DISK_STEP_GB) * extent.DISK_STEP_GB) > one["disk_gb"]
+
+
 def test_extent_config_run_writes_progress_and_a_rerun_is_a_noop(full, world, tmp_path, monkeypatch, capsys):
-    """01 records every finished step, so a restarted ingest lane or a retried A100 rebuild skips them: no listing, no
-    download, nothing on disk changes. Progress recorded for another plan is dropped, and running every step again is
-    still a no-op on what is already on disk."""
+    """01 records every finished step, so a restarted ingest lane or a full box's retried rebuild skips them: no
+    listing, no download, nothing on disk changes. Progress recorded for another plan is dropped, and running every
+    step again is still a no-op on what is already on disk."""
     prog = extent.read_progress(full.root)
     keys = [s.key for s in extent.CANONICAL]
     repos = {s.source: prep.source_repo(s.source) for s in extent.CANONICAL}
@@ -656,7 +669,7 @@ def test_extent_config_refuses_other_flags_and_invalid_configs(full, world, tmp_
         with pytest.raises(SystemExit) as e:
             run01(monkeypatch, tmp_path / f"flags{i}", "--extent-config", str(full.config), *flags)
         assert e.value.code == 2 and f"drop {flags[0]}" in capsys.readouterr().err
-    bad = write_cfg(tmp_path / "bad.json", make_cfg(sources=FULL_SOURCES + ["reazon_medium"]))
+    bad = write_cfg(tmp_path / "bad.json", make_cfg(sources=FULL_SOURCES + ["eval"]))
     malformed = write_cfg(tmp_path / "malformed.json", dict(make_cfg(), eval_sets=5))  # a refusal, not a traceback
     for i, config in enumerate((bad, malformed, tmp_path / "missing.json")):
         with pytest.raises(SystemExit) as e:
@@ -664,7 +677,7 @@ def test_extent_config_refuses_other_flags_and_invalid_configs(full, world, tmp_
         assert e.value.code == prep.REFUSED_EXIT == 3
         assert f"{config}: not an extent config: " in capsys.readouterr().err
         assert not (tmp_path / f"bad{i}" / "manifest.jsonl").exists()
-    assert "reazon_medium: refused" in extent.validate(json.loads(bad.read_text(encoding="utf-8")))[0]
+    assert "eval: not a canonical source" in extent.validate(json.loads(bad.read_text(encoding="utf-8")))[0]
     assert world.listings == []
     # a relative CFG not found in the working directory is the checkout's, as for make_selection.py --config
     checkout = tmp_path / "checkout"

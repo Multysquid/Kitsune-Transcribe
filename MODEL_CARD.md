@@ -1,7 +1,5 @@
 ---
-license: other
-license_name: kitsune-noncommercial
-license_link: https://github.com/Multysquid/Kitsune-Transcribe/blob/main/MODEL_CARD.md
+license: cc-by-nc-4.0
 base_model: CohereLabs/cohere-transcribe-03-2026
 language:
 - ja
@@ -17,9 +15,19 @@ datasets:
 A Japanese-only speech-to-text model distilled from Cohere Transcribe by
 [Kitsune-Transcribe](https://github.com/Multysquid/Kitsune-Transcribe).
 
-**Status.** The checkpoints a training run keeps, locally and in its private run repo, are working copies. As
-Galgame's terms require (see Terms), the checkpoint chosen for release is published openly under a non-commercial
-licence; the exact licence is fixed at release. The terms below apply to every copy of these files, private or public.
+## Licence
+
+[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (Creative Commons Attribution-NonCommercial 4.0
+International). You may use, share and adapt this model for non-commercial purposes if you credit
+"Kitsune-Transcribe by Multy123", link the licence and indicate your changes. Commercial use is not allowed because of
+the training data: Galgame_Speech_ASR forbids commercial use of models trained on it (see Terms), and so does the
+CC BY-NC 4.0 licence of Emilia's non-YODAS part wherever a run trained on it (see Training data). Cohere's tokenizer
+and processor files keep their own licence, Apache-2.0 (see Modification notice).
+
+The released Kitsune-Transcribe models
+([Multy123/kitsune-transcribe-ja](https://huggingface.co/Multy123/kitsune-transcribe-ja) and the model repos it lists)
+are CC BY-NC 4.0 for the same reasons. The checkpoints a training run keeps, locally and in its private run repo, are
+working copies. These terms apply to every copy of these files, private or public.
 
 ## Terms
 

@@ -175,6 +175,8 @@ def test_a_crash_closes_the_logs_before_waiting_on_uploads(tmp_path, monkeypatch
     import time
     from types import SimpleNamespace
 
+    from kitsune import evaluate  # noqa: F401  make_summary's import (transformers: up to a minute cold): not timed
+
     m = load_script("04_distill")
     monkeypatch.setattr(m, "FAILED_UPLOAD_WAIT_S", 0.3)
     release, order = threading.Event(), []
@@ -264,6 +266,8 @@ def test_a_failure_with_an_upload_running_skips_finalization_too(tmp_path, monke
     import copy
     import threading
     from types import SimpleNamespace
+
+    from kitsune import evaluate  # noqa: F401  make_summary's import, cold, could outlast the stalled upload's 30 s
 
     m = load_script("04_distill")
     monkeypatch.setattr(m, "FAILED_UPLOAD_WAIT_S", 0.3)
@@ -423,6 +427,8 @@ def test_a_failed_pre_cooldown_upload_is_kept_for_finish(tmp_path, pre_upload_ok
     assert ("ckpt_upload_failed", "full_step_4") in evs or pre_upload_ok
     assert not (R.ckpt_dir / "full_step_8" / m.UPLOAD_MARK).exists()  # uploaded: nothing to keep it for
     assert all(ign == [m.UPLOAD_MARK] for _, _, ign in hub.folders)  # the marker never leaves the box
+    # the run's config.json (the trainer writes it at start): DEFAULTS upload the pre_cooldown and the end states
+    (run / "config.json").write_text(json.dumps({"config": m.DEFAULTS}), encoding="utf-8")
     spec = importlib.util.spec_from_file_location("finish", ROOT / "vast" / "finish.py")
     finish = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(finish)
@@ -651,35 +657,42 @@ def test_trainer_hub_client_has_a_timeout():
         huggingface_hub.set_client_factory(_http.default_client_factory)
 
 
-def test_configs_resolve():
+def test_the_defaults_resolve():
+    """A config that names nothing is DEFAULTS: early stopping off (a config that does not mention it trains to its
+    budget, as before early stopping existed), the eval cadence the fallback's (every_min) with no full eval per epoch,
+    no mini eval and no greedy probe decode (a config that does not mention them evaluates as before); the full configs
+    and the viability run's (git show 76b28a1:configs/viability.json) turn them on."""
     m = load_script("04_distill")
-    via = m.load_config(str(ROOT / "configs" / "viability.json"), [])
-    # the file spells out the defaults, turns early stopping on (off in DEFAULTS: a config that does not mention it
-    # trains to its budget, as before early stopping existed) and sets the eval cadence: a full eval (complete eval
-    # sets) at every epoch end, a mini eval every 500 steps (the combined_loss/val curve's cadence), a greedy decode of
-    # ~600 s of the probe for the train CER (all off in DEFAULTS: a config that does not mention them evaluates as
-    # before)
-    assert not m.DEFAULTS["early_stop"]["enabled"] and via["early_stop"]["enabled"]
-    ev_via = dict(m.DEFAULTS["eval"], full_every_epochs=1, probe_greedy_audio_s=600,
-                  mini=dict(every_steps=500, val_per_set=32, train_utts=64, greedy=True))
-    assert via == dict(m.DEFAULTS, early_stop=dict(m.DEFAULTS["early_stop"], enabled=True), eval=ev_via)
-    assert via["eval"]["every_min"] == 20 and via["eval"]["gate"] is True  # every_min: the fallback cadence only
-    assert m.epoch_cadence(via) == 1 and m.DEFAULTS["eval"]["mini"]["every_steps"] is None
-    smoke = m.load_config(str(ROOT / "configs" / "smoke_laptop.json"), ["hf.output_repo=u/r", "seed=7"])
-    assert smoke["student"] == "students/b4x2560-d2" and smoke["schedule"]["train_hours"] == 0.1
-    assert smoke["batch"]["micro_audio_s"] == 60 and smoke["batch"]["step_audio_s"] == 120
-    assert smoke["eval"]["greedy_subset"] == 20 and smoke["eval"]["every_min"] == 2
-    assert smoke["perf"]["num_workers"] == 2 and smoke["hf"]["output_repo"] == "u/r" and smoke["seed"] == 7
-    assert smoke["loss"] == m.DEFAULTS["loss"]  # untouched sections keep the viability values
-    with pytest.raises(SystemExit):
+    assert m.load_config(None, []) == m.DEFAULTS
+    assert not m.DEFAULTS["early_stop"]["enabled"]
+    assert m.DEFAULTS["eval"]["every_min"] == 20
+    assert m.DEFAULTS["eval"]["mini"]["every_steps"] is None and m.DEFAULTS["eval"]["probe_greedy_audio_s"] is None
+    assert m.epoch_cadence(m.DEFAULTS) is None
+    on = m.load_config(None, ["early_stop.enabled=true", "eval.full_every_epochs=1", "eval.mini.every_steps=500"])
+    assert on["early_stop"]["enabled"] and m.epoch_cadence(on) == 1 and on["eval"]["mini"]["every_steps"] == 500
+
+
+def test_load_config_applies_sets_over_a_file_and_refuses_bad_ones(tmp_path):
+    """A config file overrides DEFAULTS where it says so and --set (JSON values) overrides the file; the sections
+    neither names keep DEFAULTS. An unknown key is refused, and so is a Python-style or quoted boolean."""
+    m = load_script("04_distill")
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"batch": {"micro_audio_s": 60, "step_audio_s": 120}, "perf": {"num_workers": 2},
+                                "seed": 3}), encoding="utf-8")
+    cfg = m.load_config(str(path), ["hf.output_repo=u/r", "seed=7"])
+    assert cfg["batch"]["micro_audio_s"] == 60 and cfg["batch"]["step_audio_s"] == 120
+    assert cfg["perf"]["num_workers"] == 2 and cfg["hf"]["output_repo"] == "u/r" and cfg["seed"] == 7
+    assert cfg["loss"] == m.DEFAULTS["loss"] and cfg["eval"] == m.DEFAULTS["eval"]
+    with pytest.raises(SystemExit, match="unknown config key optim.lrr"):
         m.load_config(None, ["optim.lrr=1"])
+    path.write_text(json.dumps({"optim": {"lrr": 1}}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="unknown config key optim.lrr"):
+        m.load_config(str(path), [])
     # a Python-style or quoted boolean is not JSON true/false: apply_set keeps the truthy string, so validate refuses it
     for bad in ("perf.tf32=False", "eval.probe_is_train=False", 'smoke.enabled="false"'):
         with pytest.raises(SystemExit, match="must be true or false"):
             m.load_config(None, [bad])
     assert m.load_config(None, ["perf.tf32=false"])["perf"]["tf32"] is False
-    for key in ("sources", "eval_sets", "teacher_root", "second_root", "data_root", "selection", "student"):
-        assert key in json.loads((ROOT / "configs" / "viability.json").read_text(encoding="utf-8"))  # bootstrap.sh
 
 
 def test_throughput_floor_exits_3(env, hub):
@@ -1120,56 +1133,3 @@ def test_train_crash_resume_export(crash_resume, tmp_path):
     np.testing.assert_array_equal(tr["value"].to_numpy(), steps["loss/objective"].to_numpy())
     assert cl.loc[cl["series"] == "val_full", "step"].tolist() == [MAX_STEPS]
 
-
-def _tool(name: str):
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(name, ROOT / "tools" / f"{name}.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def test_regroup_tb_on_a_copy_of_the_run(crash_resume, tmp_path):
-    """tools/regroup_tb.py on a copy of the crash + resume run (the crash_resume fixture, made here if no other test
-    made it yet): TensorBoard shows the same points after the rebuild (the resume's purge replayed from events.jsonl),
-    the original event files are kept under names TensorBoard skips, and a second run rebuilds the same file again
-    instead of adding one."""
-    import shutil
-
-    from kitsune.runlog import TB_BUCKETS, load_tag_map, read_scalars_jsonl
-
-    src = crash_resume["run"]
-    run = tmp_path / "runs" / src.name
-    shutil.copytree(src, run, ignore=shutil.ignore_patterns("checkpoints"))
-    exp, rg = _tool("export_run"), _tool("regroup_tb")
-
-    def view():
-        t = exp.tb_tables(run / "tb", load_tag_map(run / "metrics" / "tag_map.json"))
-        return {k: df.drop(columns=["wall_time", *(["sum", "sum_squares"] if k == "tb_histograms" else [])])
-                .sort_values(["tag", "step"], kind="stable").reset_index(drop=True) for k, df in t.items()}
-
-    before = view()
-    originals = sorted(p.name for p in (run / "tb").iterdir())
-    assert len(originals) == 2  # the crashed launch's event file and the resumed launch's
-    assert rg.live_reason(run) is None
-    res = rg.regroup(run)
-    assert res["records"]["purge"] == 1 and res["unmapped"] == []
-    after = view()
-    for k in before:
-        assert len(before[k]) and before[k].equals(after[k]), k
-    kl = after["tb_scalars"][after["tb_scalars"]["tag"] == "loss/kl"]
-    assert kl["step"].tolist() == list(range(1, MAX_STEPS + 1))  # steps 11-13 of the crashed launch purged
-    logged = set(read_scalars_jsonl(run / "metrics" / "scalars.jsonl").column("tag").to_pylist())
-    assert sum(res["counts"][b]["scalars"] for b in TB_BUCKETS) == len(logged)
-    assert all(res["counts"][b]["scalars"] for b in TB_BUCKETS) and res["counts"]["3_misc"]["histograms"] > 0
-    files = sorted(p.name for p in (run / "tb").iterdir())
-    assert sorted(f for f in files if f.endswith(".bak")) == sorted(rg.backup_name(f) for f in originals)
-    assert len([f for f in files if "tfevents" in f]) == 1
-
-    res2 = rg.regroup(run)
-    files2 = sorted(p.name for p in (run / "tb").iterdir())
-    assert [f for f in files2 if f.endswith(".bak")] == [f for f in files if f.endswith(".bak")]
-    assert len([f for f in files2 if "tfevents" in f]) == 1 and res2["counts"] == res["counts"]
-    again = view()
-    assert all(again[k].equals(after[k]) for k in after)
