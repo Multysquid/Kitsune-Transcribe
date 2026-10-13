@@ -738,8 +738,6 @@ class FullQueue(Q.Queue):
             self.hold_freeze()
             self.end_faults()
             rc, status, reason = self.outcome()
-        except Q.Halt as e:
-            rc, status, reason = EXIT_STOP, "halted", str(e)
         except Q.QueueError as e:
             rc, status, reason = EXIT_FAIL, "failed", str(e)
         finally:

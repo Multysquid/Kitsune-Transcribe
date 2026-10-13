@@ -48,10 +48,6 @@ class QueueError(RuntimeError):
     """Anything the queue cannot go on from."""
 
 
-class Halt(RuntimeError):
-    """A halt: the box stops for the owner."""
-
-
 def log(msg: str):
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} [queue] {msg}", flush=True)
 
@@ -400,7 +396,7 @@ class Queue:
     def execute(self, todo: list[str], *, monitor=None):
         """Run the items of `todo` on the free GPUs until each has ended (done, failed or skipped): per free GPU the
         item _next_for gives, started from its resume_point; monitor(running) runs at every poll (the full queue's
-        stalls, faults and resources). A Halt or QueueError from a hook stops every running item and propagates."""
+        stalls, faults and resources). A QueueError from a hook stops every running item and propagates."""
         running: dict[str, dict] = {}  # gpu -> {"name", "proc"}
         try:
             while True:

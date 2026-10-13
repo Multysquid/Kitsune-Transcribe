@@ -1,4 +1,5 @@
-"""Distil the Kitsune student from the stored teacher outputs: the viability run (run sheet D19-D52, spec section 8).
+"""Distil a Kitsune student (family aed or ctc) from the stored teacher outputs: the trainer of every run, from the
+viability run (run sheet D19-D52, spec section 8) to the full-data runs.
 
 One run, in order (every phase is an event in runs/<run_id>/events.jsonl):
   1. setup     config (JSON; every key overridable with --set a.b=value), RunLogger (env capture, TensorBoard,
@@ -644,7 +645,8 @@ CTC_FRAME_TAGS = dict(argmax_agree="ctc/argmax_agree", argmax_blank="ctc/argmax_
 
 
 class ThroughputTooLow(RuntimeError):
-    """Smoke-phase throughput below smoke.min_audio_s_per_s: exit code 3 (the supervisor stops, never resumes)."""
+    """Smoke-phase throughput below smoke.min_audio_s_per_s: exit code 3 (kitsune/full_queue.py fails that item and
+    never retries it; the box goes on)."""
 
 
 class SmokeFailed(RuntimeError):

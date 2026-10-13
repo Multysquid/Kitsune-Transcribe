@@ -39,7 +39,8 @@ def test_supervise_main_runs_the_full_queue_for_a_full_box(tmp_path, monkeypatch
         assert supervise.main(["--state", str(tmp_path / "s.json")]) == 2 and seen == {}
 
 
-@pytest.mark.parametrize("rc, n_fail, action", [(0, 0, "destroy"), (4, 1, "stop"), (3, 1, "stop"), (1, 1, "restart"),
+# the queue never exits 3 (a trainer's throughput floor fails that item only): a 3 is any other failure
+@pytest.mark.parametrize("rc, n_fail, action", [(0, 0, "destroy"), (4, 1, "stop"), (3, 1, "restart"), (1, 1, "restart"),
                                                (None, 2, "restart"), (1, 3, "stop")])
 def test_decide_queue(rc, n_fail, action):
     assert supervise.decide_queue(rc, n_fail)[0] == action

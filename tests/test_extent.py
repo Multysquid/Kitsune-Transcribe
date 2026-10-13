@@ -2,9 +2,9 @@
 extent record.
 
 Utterance ids depend on the ingest order, and the label box decides per shard stem what is labelled. So the canonical
-sequence must give the laptop's ids AND stems; a capped extent must give a prefix of the full run's stems, because the
-A100 rebuilds a subset and pulls the label box's files for exactly those stems; and the record must say which stems a
-subset takes, which files to pull and how big the rebuild is.
+sequence must give the laptop's ids AND stems; a capped extent must give a prefix of the full run's stems, because a
+full box rebuilds a subset and pulls the label box's files for exactly those stems; and the record must say which stems
+a subset takes, which files to pull and how big the rebuild is.
 
 The upstreams are faked with tests/test_prepare_data.py's tar and parquet builders, but per repo: one 01 process now
 reads every source. Toy sizes: 4 rows per shard, a 3-row galgame hold-out, and a 300 h step whose budget (5 s) cuts
@@ -234,7 +234,7 @@ def test_a_single_uncapped_emilia_call_differs(full, world, tmp_path):
 ], ids=["caps", "300h", "few-names"])
 def test_capped_extent_is_a_prefix_of_the_full_run(full, world, tmp_path, monkeypatch, sources, eval_sets, inputs):
     """A subset config rebuilds only its closure's inputs, and every stem it rebuilds is the full run's stem with the
-    same rows, so the A100 joins the label box's files by stem. The stems it takes are what subset_stems says, their
+    same rows, so a full box joins the label box's files by stem. The stems it takes are what subset_stems says, their
     ids_sha256 the record's, and sizing's download and shard bytes are what the rebuild really moved."""
     cfg = make_cfg("sub", inputs, sources, eval_sets)
     assert extent.validate(cfg) == [] and extent.within(full.cfg, cfg) == []
@@ -611,7 +611,7 @@ def test_sizing_from_a_toy_record():
     assert extent.sizing(rec, h300)["down_gb"] == pytest.approx(9) and extent.sizing(rec, h300)["hours"] == 270
     assert extent.sizing(rec, make_cfg("e", sources=["emilia_yodas"], eval_sets=[]))["down_gb"] == pytest.approx(
         9 + 0.4 + 4)
-    # the full extent's ~570 GB upstream: a ~6.4 h rebuild cap on the A100
+    # the full extent's ~570 GB upstream: a ~6.4 h rebuild cap on a full box
     assert extent.REBUILD_BASE_MIN + extent.REBUILD_SLACK * 570e9 / extent.REBUILD_BYTES_PER_S / 60 == pytest.approx(
         386.25)
 
@@ -633,9 +633,9 @@ def test_sizing_counts_both_stores_the_parakeet_labels_and_the_extra():
 
 
 def test_extent_config_run_writes_progress_and_a_rerun_is_a_noop(full, world, tmp_path, monkeypatch, capsys):
-    """01 records every finished step, so a restarted ingest lane or a retried A100 rebuild skips them: no listing, no
-    download, nothing on disk changes. Progress recorded for another plan is dropped, and running every step again is
-    still a no-op on what is already on disk."""
+    """01 records every finished step, so a restarted ingest lane or a full box's retried rebuild skips them: no
+    listing, no download, nothing on disk changes. Progress recorded for another plan is dropped, and running every
+    step again is still a no-op on what is already on disk."""
     prog = extent.read_progress(full.root)
     keys = [s.key for s in extent.CANONICAL]
     repos = {s.source: prep.source_repo(s.source) for s in extent.CANONICAL}

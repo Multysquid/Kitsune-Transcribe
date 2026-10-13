@@ -59,11 +59,11 @@ How these were measured:
   numbers are not comparable with the Open ASR Leaderboard's.
 
 Caveats:
-- **Whisper large-v3 is clearly better on spontaneous long-form speech.** It leads on Emilia (podcast and YouTube
-  talk) and on the owner's own video tests (VRChat recordings: T-0.6B 21.6 %, P-0.3B 22.7 %, large-v3 15.6 %; a
-  vlog: 22.2 / 19.1 / 10.0 %). The teachers trail it there as well, so the gap looks set by the teachers and the
-  training data. Emilia's references are themselves Whisper-medium transcripts, which favours the Whisper family on
-  that column.
+- **Whisper large-v3 is clearly better on spontaneous long-form speech.** It leads on Emilia (YouTube talk) and on
+  the owner's own video tests (VRChat recordings: T-0.6B 21.6 %, P-0.3B 22.7 %, large-v3 15.6 %; a vlog:
+  22.2 / 19.1 / 10.0 %). The teachers trail it there as well, so the gap looks set by the teachers and the training
+  data. Emilia's references are themselves Whisper-medium transcripts, which favours the Whisper family on that
+  column.
 - **T-0.6B's M4 lead over P-0.3B comes from ReazonSpeech.** Most of that gap is P-0.3B transcribing speech at the
   clip edges that the ReazonSpeech references leave out; on JSUT T-0.6B trails P-0.3B and on CV8 they tie.
 - **In-domain sets.** The Galgame hold-out comes from the same games and voices as the training clips, and the
@@ -150,7 +150,7 @@ a lot.
 | Folder | Weights / activations | T-0.6B | P-0.3B | P-0.1B | P-0.05B |
 |---|---|---|---|---|---|
 | (root) | bfloat16 | 1.23 GB, 9.42 | 617 MB, 9.73 | 197 MB, 11.45 | 104 MB, 16.35 |
-| `fp16/` | float16 (encoder self-attention in float32) | 1.23 GB, 9.42 | 617 MB, not scored | 197 MB, not scored | 104 MB, not scored |
+| `fp16/` | float16, encoder self-attention and norms in bfloat16 / float16, encoder self-attention in float32 | 1.23 GB, 9.42 | 617 MB, not scored | 197 MB, not scored | 104 MB, not scored |
 | `fp8-w8a8/` | FP8 E4M3 / FP8 E4M3 | 638 MB, 9.45 | 314 MB, 9.70 | 103 MB, not scored | 56 MB, 16.29 |
 | `int8-w8a16/` | int8 / bfloat16 | 638 MB, 9.42 | 314 MB, 9.70 | 103 MB, not scored | 56 MB, 16.34 |
 | `int8-w8a8/` | int8 / int8 | 638 MB, 9.44 | 314 MB, 9.73 | 103 MB, not scored | 56 MB, 16.55 |
@@ -354,11 +354,16 @@ python scripts/02b_second_opinion.py --whisper-dir data/whisper --parakeet-out p
 
 `--whisper-dir` keeps the ReazonSpeech mirrors' Whisper transcripts while each file is local; 02b reads them as the
 second opinion of the ReazonSpeech rows. The label box's whole extent (about 571 GB of downloads and 1.4 TB of disk)
-and its selection, the same scripts at full size:
+and its selection, the same scripts at full size, with the label roots `configs/full.json` names (as `vast/label.py`
+runs them):
 
 ```bash
 python scripts/01_prepare_data.py --extent-config configs/full.json --whisper-dir data/whisper
-python scripts/make_selection.py --config configs/full.json
+python scripts/02_teacher_pass.py --out labels/full/teacher_out
+python scripts/02p_parakeet_pass.py --model-dir models/parakeet-tdt_ctc-0.6b-ja-hf --out labels/full/parakeet_out
+python scripts/02b_second_opinion.py --teacher-out labels/full/teacher_out --parakeet-out labels/full/parakeet_out \
+  --out labels/full/second_out --whisper-dir data/whisper
+python scripts/make_selection.py --config configs/full.json    # reads those labels/full/* roots
 ```
 
 The output formats are documented at the top of `scripts/02_teacher_pass.py` and `kitsune/parakeet_targets.py`.
@@ -375,10 +380,10 @@ python -m pytest tests -n 8 --dist loadfile -m "not slow" -p no:cacheprovider --
 ```
 
 `requirements.txt` is unpinned. `-c requirements-train.txt` (the image's pins, as a constraints file: it installs
-nothing of its own) holds each package to the exact version the image, the boxes and the tests used. Some tests pin
-library behaviour (`GOLDEN` in `tests/test_recipe_v5.py` pins numpy 2.5.3's random streams), so other versions can
-fail them. On the owner's laptop
-use the command in [AGENTS.md](AGENTS.md) instead (one pytest process, `-n 3`, `OMP_NUM_THREADS=2`,
+nothing of its own) holds every package the image pins to the exact version the image, the boxes and the tests used;
+`httpx`, `rapidfuzz` and `pytest-xdist` are not among them and install unpinned. Some tests pin library behaviour
+(`GOLDEN` in `tests/test_recipe_v5.py` pins numpy 2.5.3's random streams), so other versions can fail them. On the
+owner's laptop use the command in [AGENTS.md](AGENTS.md) instead (one pytest process, `-n 3`, `OMP_NUM_THREADS=2`,
 `KITSUNE_REAL_DATA_ROOT` pointing at an empty directory).
 
 - **CPU only.** `tests/conftest.py` hides the GPU (`CUDA_VISIBLE_DEVICES=-1`) and gives each xdist worker
@@ -414,8 +419,8 @@ The removed code stays in git history at `76b28a1`, the commit the release cards
 `git show 76b28a1:<path>` (for example `configs/viability.json`, `study/PREREG.md`, `tools/study_report.py`) and list
 them with `git diff --stat --diff-filter=D 76b28a1 HEAD`. Removed with them: the laptop launchers and supervisors, the
 viability (`--job train`) and size-study (`--job study`) box paths, the study's config-generator CLI
-(`tools/make_study_configs.py` keeps only `run_config`) and its configs except `configs/study/study-t06.json`, the study
-queue's phases (`kitsune/study_queue.py` keeps the queue base), the chained box p01-chain and box p-cool with their registry entries, the trainer's
-study-only modes (old run configs still load: see `RETIRED_KEYS` in `scripts/04_distill.py`), the 02b Kotoba judge,
-and `tools/asr_bakeoff.py`, `tools/box1_go.py`, `tools/judge_report.py`, `tools/label_checks.py` and
-`tools/regroup_tb.py`.
+(`tools/make_study_configs.py` keeps only its run-config layer) and its configs except `configs/study/study-t06.json`,
+the study queue's phases (`kitsune/study_queue.py` keeps the queue base), the chained box p01-chain and box p-cool
+with their registry entries, the trainer's study-only modes (old run configs still load: see `RETIRED_KEYS` in
+`scripts/04_distill.py`), the 02b Kotoba judge, and `tools/asr_bakeoff.py`, `tools/box1_go.py`,
+`tools/judge_report.py`, `tools/label_checks.py` and `tools/regroup_tb.py`.

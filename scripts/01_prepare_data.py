@@ -37,7 +37,7 @@ files, --whisper-dir keeps the ReazonSpeech mirrors' whisper transcripts while e
 before the next download while the file exists, and --heartbeat is touched while the ingest makes progress.
 
 --extent-config CFG ingests the extent of a run config (its extent block, sources and eval_sets) in the canonical order
-of kitsune/extent.py, in this one process: the label box and the A100 rebuild run exactly that call, so they get the
+of kitsune/extent.py, in this one process: the label box and a full box's rebuild run exactly that call, so they get the
 same ids and stems (the order changes ids: reazon_small before reazon_large, Emilia as 300 h -> eval_emilia -> the
 rest). It replaces --sources and the per-source flags, and <data>/extent_progress.json records the finished steps.
 
@@ -754,7 +754,7 @@ def main():
     ap.add_argument("--force", action="store_true", help="wipe and re-ingest sources that are already present")
     ap.add_argument("--extent-config", type=Path, default=None, metavar="CFG",
                     help="ingest the extent of run config CFG (extent block, sources, eval_sets) in the canonical "
-                         "order of kitsune/extent.py, as the label box and the A100 rebuild do; replaces --sources "
+                         "order of kitsune/extent.py, as the label box and a full box's rebuild do; replaces --sources "
                          "and the per-source flags")
     args = ap.parse_args()
     cfg = None

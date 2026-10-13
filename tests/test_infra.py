@@ -1278,7 +1278,7 @@ def test_supervise_reruns_an_interrupted_final_finish(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("queue_rc,final,finish_rc,fallback", [
-    (3, "--stop", 1, True),        # the stop request failed
+    (4, "--stop", 1, True),        # the stop request failed
     (0, "--destroy", 124, True),   # timed out (a stalled Hub call in its sync or verification)
     (0, "--destroy", 2, False),    # verification failed and the instance was stopped
     (0, "--destroy", 0, False),
@@ -1314,10 +1314,10 @@ def test_supervise_kills_a_hung_final_finish_and_stops_without_sync(tmp_path, mo
                     "    time.sleep(40)\n", encoding="utf-8")
     monkeypatch.setattr(supervise, "ROOT", tmp_path / "root")
     monkeypatch.setattr(supervise, "FINISH_TIMEOUT_S", {"stop": 4, "destroy": 4})
-    monkeypatch.setattr(supervise, "run_queue", lambda argv, env: 3)  # a throughput stop: no --sync-only first
+    monkeypatch.setattr(supervise, "run_queue", lambda argv, env: 4)  # a halt: no --sync-only first
     t0 = time.time()
     rc = supervise.supervise_queue(QUEUE_CMD, tmp_path / "state" / "supervise.json")
-    assert rc == 3 and time.time() - t0 < 30
+    assert rc == 4 and time.time() - t0 < 30
     assert calls.read_text(encoding="utf-8").splitlines() == ["--stop --reason", "--stop --no-sync"]
 
 

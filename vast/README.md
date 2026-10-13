@@ -203,8 +203,9 @@ Every phase keeps `$KITSUNE_STATE/train_hb` fresh for at most its own worst case
 build, the training, its M4 readout right after it, then the eval pool (quantised readouts, Whisper, speed probes; a
 speed probe has the host to itself). Each child beats its own `hb/<item>` (the queue's stall check), the queue beats
 `train_hb` (the watchdog's: stale for `orphan_s`, 3600 s, means a dead controller; smoke A's is 600 s and only
-alerts, because its fault test freezes the beat). A trainer keeps a local full state every 30 min and uploads one to the scratch repo every
-120 min (T-0.6B's is ~8.6 GB); its pre-cooldown state and its weights go to the runs repo. Two files steer it by hand:
+alerts, because its fault test freezes the beat). A trainer keeps a local full state every 30 min and uploads one to
+the scratch repo every 120 min (T-0.6B's is ~8.6 GB); its pre-cooldown state and its weights go to the runs repo. Two
+files steer it by hand:
 
 ```bash
 touch /workspace/Kitsune-Transcribe/runs/<run_id>/COOLDOWN   # start the WSD cooldown now (once)

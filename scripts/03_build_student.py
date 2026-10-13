@@ -41,7 +41,7 @@ modification notice that describes this student (kitsune.student.model_card).
 Usage:
   python scripts/03_build_student.py                                  # B20x2560 / dec 0 2 5 7 -> students/b20x2560-d4
                                                                       # (calibrated on reazon_small emilia_yodas galgame)
-  python scripts/03_build_student.py --enc-layers 4 --dec-layers 0 7  # laptop smoke student   -> students/b4x2560-d2
+  python scripts/03_build_student.py --enc-layers 4 --dec-layers 0 7  # a small test student  -> students/b4x2560-d2
 The size study's Transcribe students (on the laptop CPU; the first run's data dirs and its 1,000 calibration ids,
 importance_ids_sha256 5e31cd68..., recovered from the HF dataset history and kept in students/study/t03/
 calibration_ids.txt):

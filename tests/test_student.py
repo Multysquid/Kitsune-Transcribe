@@ -118,7 +118,7 @@ def teacher_forced_logits(model, feats, mask, n_dec: int = 5) -> torch.Tensor:
 def test_evenly_spaced():
     assert S.evenly_spaced(20, 48) == [0, 2, 5, 7, 10, 12, 15, 17, 20, 22, 25, 27, 30, 32, 35, 37, 40, 42, 45, 47]
     assert S.evenly_spaced(4, 8) == [0, 2, 5, 7]
-    assert S.evenly_spaced(4, 48) == [0, 16, 31, 47]  # the laptop smoke student
+    assert S.evenly_spaced(4, 48) == [0, 16, 31, 47]  # a 4-layer encoder
     assert S.evenly_spaced(1, 48) == [0]
     assert S.evenly_spaced(48, 48) == list(range(48))
     for n in range(1, 49):  # strictly increasing, both ends kept

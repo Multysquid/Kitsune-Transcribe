@@ -3,7 +3,7 @@
 vast/onstart.sh execs this on a full box (KITSUNE_JOB=full, vast/launch.py --job full) once bootstrap has passed. It
 runs `python -m kitsune.full_queue run --box $KITSUNE_BOX` (kitsune/full_queue.py) and decides with decide_queue:
   exit 0                       -> vast/finish.py --destroy  (it verifies the HF uploads first, and stops if it can't)
-  exit 4 (a training or store item failed for good) or 3 (a trainer's throughput floor)
+  exit 4 (a training or store item failed for good, or a non-droppable training item did not finish)
                                -> vast/finish.py --stop     (the disk is kept for a human to inspect)
   any other exit, or a container restart during the queue
                                -> the queue again, up to MAX_QUEUE_RESTARTS times, then --stop
@@ -57,7 +57,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:  # kitsune.heartbeat (a full box's bounded beats around finish.py)
     sys.path.insert(1, str(ROOT))
 
-EXIT_OK, EXIT_THROUGHPUT, EXIT_HALT = 0, 3, 4  # EXIT_HALT: the queue's halt (an item failed for good)
+# EXIT_HALT: the queue's halt (an item failed for good). A trainer's throughput floor (its exit 3) fails that item only
+# (kitsune/full_queue.py): the queue never exits 3, so a 3 here is any other failure
+EXIT_OK, EXIT_HALT = 0, 4
 MAX_QUEUE_RESTARTS = 2  # the queue: restarted after a crash at most this often, then the box stops
 FINISH_BEAT_EVERY_S = 30.0  # train_hb beats while a finish.py call runs (kitsune.heartbeat.beating)
 SYNC_TIMEOUT_S = 1800
@@ -82,8 +84,6 @@ def decide_queue(rc: int | None, n_failures: int, reason: str | None = None) -> 
         return "destroy", "queue finished (exit 0)"
     if rc == EXIT_HALT:
         return "stop", f"queue halted (exit 4): {reason or 'see queue_summary.json'}"
-    if rc == EXIT_THROUGHPUT:
-        return "stop", f"queue: throughput below the floor (exit 3): {reason or ''}".rstrip(": ")
     what = "interrupted by a container restart" if rc is None else f"exit {rc}"
     if n_failures > MAX_QUEUE_RESTARTS:
         return "stop", f"queue failed {n_failures} times ({what}): {reason or 'see queue_summary.json'}"
@@ -157,7 +157,7 @@ def supervise_queue(queue_cmd: list[str], state_path: Path, dry_run: bool = Fals
         save_state(state_path, state)
         log(f"queue attempt {len(state['attempts'])} exited {rc} after {(attempt['t1'] - attempt['t0']) / 60:.1f} min")
         # the stop and destroy paths sync everything anyway
-        if rc not in (EXIT_OK, EXIT_HALT, EXIT_THROUGHPUT):
+        if rc not in (EXIT_OK, EXIT_HALT):
             with beating(hb, SYNC_TIMEOUT_S):
                 call_finish(["--sync-only", *dry], timeout=SYNC_TIMEOUT_S)
 
