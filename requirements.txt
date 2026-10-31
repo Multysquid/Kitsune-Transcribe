@@ -25,7 +25,7 @@ scipy
 jiwer
 rapidfuzz  # kitsune.aed_cuts' text alignment (also a jiwer dependency)
 tensorboard
-setuptools<81  # the TensorBoard server imports pkg_resources, which setuptools 82 removed
+setuptools<85  # the TensorBoard server imports pkg_resources, which setuptools 82 removed
 tqdm
 psutil
 nvidia-ml-py  # NVML: GPU stats (kitsune.runlog) and 05_evaluate's thermal guard; both fall back without it
